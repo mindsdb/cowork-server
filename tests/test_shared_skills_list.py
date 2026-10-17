@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from cowork import shared_skills
+from cowork import managed, shared_skills
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.managed import SharedSkill, SharedSkills
 from cowork.shared_skills import (
@@ -136,16 +136,16 @@ def test_a_change_leaves_a_list_the_filesystem_refuses_to_read(shared_root, monk
     kept = (_skill("bobs-skill"), _skill("carols-skill"))
     SharedSkills(kept).write(path)
     written = path.read_bytes()
-    read_bytes = Path.read_bytes
+    real_open_fd = managed.open_fd
     refused: list[Path] = []
 
-    def refuse_the_list_once(self: Path) -> bytes:
-        if self == path and not refused:
-            refused.append(self)
+    def refuse_the_list_once(fd_path, flags, mode=0o777, *, dir_fd=None):
+        if Path(fd_path) == path and not refused:
+            refused.append(Path(fd_path))
             raise OSError(errno.EMFILE, "Too many open files")
-        return read_bytes(self)
+        return real_open_fd(fd_path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(Path, "read_bytes", refuse_the_list_once)
+    monkeypatch.setattr(managed, "open_fd", refuse_the_list_once)
     owned_logger("cowork.shared_skills", level=logging.WARNING)
     alice = _skill("alices-skill")
 
@@ -185,6 +185,116 @@ def test_two_writers_at_once_both_land(shared_root):
 
     assert errors == []
     assert {entry.skill for entry in read_shared_skills().root} == {entry.skill for entry in entries}
+
+
+def _read_without_hanging(timeout: float = 2.0) -> SharedSkills:
+    """read_shared_skills() off the calling thread, so a read that blocks on a
+    FIFO with no writer fails the test instead of hanging it forever."""
+    result: list[SharedSkills] = []
+
+    def read() -> None:
+        result.append(read_shared_skills())
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "read_shared_skills() blocked on a non-regular file"
+    return result[0]
+
+
+def _make_fifo(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(path)
+
+
+def _make_directory(path: Path) -> None:
+    path.mkdir(parents=True)
+
+
+def _make_symlink(path: Path) -> None:
+    """A link to a valid list holding one entry, so only the refusal to follow
+    the link keeps the read empty."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    elsewhere = path.parent / "elsewhere.json"
+    SharedSkills((_skill("linked-skill"),)).write(elsewhere)
+    path.symlink_to(elsewhere)
+
+
+@pytest.mark.parametrize("make", [_make_fifo, _make_directory, _make_symlink], ids=["fifo", "directory", "symlink"])
+def test_a_non_regular_list_shares_nothing_without_hanging(shared_root, make):
+    make(shared_skills_file())
+
+    assert _read_without_hanging() == SharedSkills(())
+
+
+def test_a_fifo_at_the_path_makes_a_change_answer_busy(shared_root):
+    _make_fifo(shared_skills_file())
+    raised: list[Exception] = []
+
+    def change() -> None:
+        try:
+            change_shared_skills(change=_adding(_skill("team-report")))
+        except Exception as error:
+            raised.append(error)
+
+    thread = threading.Thread(target=change, daemon=True)
+    thread.start()
+    thread.join(2.0)
+    assert not thread.is_alive(), "change_shared_skills() blocked on a FIFO"
+    assert len(raised) == 1
+    assert isinstance(raised[0], SharedSkillsBusyError)
+    assert SKILL_SHARING_BUSY in str(raised[0])
+
+
+def test_a_list_larger_than_the_cap_shares_nothing(shared_root, caplog, owned_logger):
+    from cowork.managed import MAX_REGISTRY_BYTES
+
+    path = shared_skills_file()
+    path.parent.mkdir(parents=True)
+    # A valid list padded past the cap, so only the size check keeps it out.
+    entry = SharedSkills((_skill("team-report"),)).dump_json().encode()
+    path.write_bytes(entry[:1] + b" " * (MAX_REGISTRY_BYTES + 1) + entry[1:])
+    owned_logger("cowork.shared_skills", level=logging.WARNING)
+
+    assert read_shared_skills() == SharedSkills(())
+    assert any(str(path) in message and "larger than" in message for message in _warnings(caplog))
+
+
+def test_a_failed_write_leaves_no_temporary_file(shared_root, monkeypatch):
+    path = shared_skills_file()
+    path.parent.mkdir(parents=True)
+
+    def boom(self: SharedSkills) -> str:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(SharedSkills, "dump_json", boom)
+
+    with pytest.raises(OSError, match="No space left on device"):
+        SharedSkills((_skill("team-report"),)).write(path)
+
+    assert list(path.parent.iterdir()) == []
+
+
+def test_a_write_reaches_the_disk_before_it_replaces_the_list(shared_root, monkeypatch):
+    path = shared_skills_file()
+    synced: list[int] = []
+    real_replace = os.replace
+
+    def fsync(descriptor: int) -> None:
+        synced.append(os.fstat(descriptor).st_size)
+
+    def replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        assert synced, "the list replaced the old one before its bytes were flushed to disk"
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+
+    written = SharedSkills((_skill("team-report"),))
+    written.write(path)
+
+    assert synced == [len(written.dump_json().encode())]
+    assert path.read_bytes() == written.dump_json().encode()
 
 
 def test_a_held_lock_answers_busy_after_the_timeout(shared_root, monkeypatch):

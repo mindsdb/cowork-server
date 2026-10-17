@@ -13,10 +13,13 @@ keeps today's arguments and environment.
 
 What a cell reaches under the policy:
 
-- read, write and execute: the conversation's project folder;
-- read and write, no execute: the asker's own HOME and TMPDIR, ``home/`` and
-  ``tmp/`` in the ``sandbox`` store of their partition, and
-  ``<cowork-home>/shared-files``, which every person's agent uses;
+- read, write and execute: the conversation's project folder, and the asker's
+  own HOME and TMPDIR, ``home/`` and ``tmp/`` in the ``sandbox`` store of
+  their partition;
+- read and write, no execute: ``<cowork-home>/shared-files``, which every
+  person's agent uses. No file there runs by its path, so nothing one person
+  leaves there starts as a program in another's cell; an interpreter can
+  still run a script it reads from there (``python script.py``);
 - read only: the folders the caller names (the turn's skill folders and the
   conversation's attachment folders), plus the system files anton's policy
   always carries.
@@ -30,8 +33,16 @@ optional one out, instead of granting another person's folder.
 
 ``forbidden_roots`` names the folders no grant may equal or contain:
 cowork-home, the shared root, its ``shared/`` folder, every partition, and the
-managed folder. The policy model refuses such a grant when it is built, so a
-builder bug fails the session instead of opening every person's space.
+managed folder. ``other_partitions`` names every partition but the asker's,
+inside which the policy model refuses a writable grant. The model refuses
+such a grant when it is built, so a builder bug fails the session instead of
+opening every person's space.
+
+The server itself isn't locked, and it reads and writes some of a person's
+stores outside the sandbox: their data vault, the memory tiers a turn hands
+anton, and the publish store. ``refuse_planted_links`` refuses a link, or a
+hard-linked file, that agent code before the sandbox left there, before the
+server follows it into another person's space.
 
 ``check_startup`` runs in create_app. It refuses identity headers with the
 sandbox off, and ``landlock`` where it can't hold. ``_probe_abi`` and
@@ -45,13 +56,23 @@ import errno
 import getpass
 import inspect
 import os
+import stat
 from collections.abc import Iterable
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
 
 from cowork.common.logger import get_logger
-from cowork.common.paths import cowork_home, opened_subdir_nofollow
+from cowork.common.paths import (
+    PinnedDir,
+    cowork_home,
+    dir_lstat,
+    dir_scandir,
+    open_pinned_child,
+    opened_subdir_nofollow,
+    pinned_dir,
+)
 from cowork.common.settings.app_settings import AppSettings, get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, scoped_storage_root
@@ -75,6 +96,23 @@ NO_CODE_MODE_DETAIL = (
 def code_sandbox_on() -> bool:
     """Whether agent code runs under Landlock on this deployment."""
     return get_app_settings().code_sandbox == "landlock"
+
+
+def refuse_a_missing_policy(cell_sandbox: CellSandbox | None, *, site: str) -> None:
+    """Raise RuntimeError when the sandbox is on and ``cell_sandbox`` is None.
+
+    Called where anton's executor is built (build_chat_session, and the
+    backend pool's _make_runtime and get_or_create), behind the static
+    test that reads each construction (tests/test_no_subprocess_static.py):
+    a construction that drops the policy would run the agent's code
+    unlocked. ``site`` names what was being built.
+    """
+    if cell_sandbox is None and code_sandbox_on():
+        raise RuntimeError(
+            f"COWORK_CODE_SANDBOX=landlock, and {site} was built without a code-sandbox "
+            "policy, so its agent code would run unlocked. Build the policy with "
+            "cowork.code_sandbox.build_cell_sandbox and pass it as cell_sandbox."
+        )
 
 
 def shared_files_dir() -> Path:
@@ -223,13 +261,113 @@ def _private_dir(root: Path, *, name: str) -> Path:
 
 def refuse_a_linked_project(project_dir: Path) -> None:
     """Raise OSError when a folder on the way to ``project_dir`` below the
-    server's roots is a link or not a folder (``_required_dir``).
+    server's roots is a link or not a folder (``_required_dir``), and make
+    the project folder, and any missing folder above it, without following
+    links when it is gone, as a turn with the sandbox off makes it.
 
     The harness calls it under the sandbox before the server writes into the
     project: the server isn't locked, so its own writes would follow such a
     link into another person's space before the policy refused it.
     """
-    _required_dir(project_dir)
+    _required_dir(project_dir, create=True)
+
+
+class PlantedLinkError(OSError):
+    """A link, or a file with a second name (a hard link), in a store the
+    server reads and writes outside the sandbox (refuse_planted_links)."""
+
+
+def _planted(path: Path, *, what: str) -> PlantedLinkError:
+    return PlantedLinkError(
+        f"{path} is {what}, and the server reads and writes it outside the code "
+        "sandbox, so it would follow it wherever it leads. Agent code that ran before "
+        "the sandbox may have left it there: remove it, then try again."
+    )
+
+
+def _refuse_planted_entry(folder: PinnedDir, *, name: str, path: Path) -> None:
+    """Refuse ``name`` in ``folder`` when it is a link, or a regular file with
+    more than one name, and walk it when it is a folder. ``path`` is where it
+    sits, for the error. Nothing is followed."""
+    try:
+        info = dir_lstat(folder, name)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise _planted(path, what="a link")
+    if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+        raise _planted(path, what=f"a file with {info.st_nlink} names (a hard link)")
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    below = open_pinned_child(folder, name)
+    try:
+        with dir_scandir(below) as entries:
+            children = [entry.name for entry in entries]
+        for child in children:
+            _refuse_planted_entry(below, name=child, path=path / child)
+    finally:
+        below.close()
+
+
+def refuse_planted_links(path: Path, *, only: tuple[str, ...] = ()) -> None:
+    """Under the sandbox, raise PlantedLinkError when ``path``, anything below
+    it, or a folder on the way to it from its trusted root (``_anchored``) is
+    a link, or when a regular file there has more than one name. Does nothing
+    with the sandbox off. Outside every trusted root, ``path`` is trusted as
+    configured and resolved, as _granted_dir has it, and what is below it is
+    checked.
+
+    With ``only``, ``path`` is a folder holding more than the store, and just
+    those names in it are checked: the publish store's files, in a folder
+    that may be cowork-home itself, or one the operator sets outside every
+    trusted root. Then only the folder is trusted as configured, never a
+    link at one of those names.
+
+    For the stores of a person that the server reads and writes outside the
+    sandbox: their data vault, the memory tiers a turn hands anton, and the
+    publish store. No locked cell can plant either kind of link there (no
+    grant carries the right to make one, and none reaches these stores), but
+    agent code that ran before the sandbox could, and the server would follow
+    it into another person's space. So this checks the stores as they are,
+    not against a race. Neither the server nor anton makes a link in them:
+    skill links sit in a project's ``skills/`` and a turn's scratch folder,
+    and the memory layout's runtime links (MemoryLayout.ensure_layout) at a
+    harness's own path, outside every store. So no link is exempt. A missing
+    folder passes: the caller makes it below folders this checked.
+    """
+    if not code_sandbox_on():
+        return
+    anchored = _anchored(path)
+    if anchored is None:
+        resolved = _real(path)
+        anchored = _Anchored(resolved, ()) if only else _Anchored(resolved.parent, (resolved.name,))
+    # The folders opened on the way, and the names checked in the last one.
+    # Without ``only`` that is ``path`` itself, or everything in its trusted
+    # root when ``path`` is that root.
+    if only:
+        on_the_way, checked = anchored.names, only
+    else:
+        on_the_way, checked = anchored.names[:-1], anchored.names[-1:]
+    here = anchored.root
+    try:
+        with ExitStack() as opened:
+            folder = opened.enter_context(pinned_dir(here))
+            for name in on_the_way:
+                here = here / name
+                info = dir_lstat(folder, name)
+                if stat.S_ISLNK(info.st_mode):
+                    raise _planted(here, what="a link")
+                if not stat.S_ISDIR(info.st_mode):
+                    return
+                folder = open_pinned_child(folder, name)
+                opened.callback(folder.close)
+            if not checked:
+                with dir_scandir(folder) as entries:
+                    checked = tuple(entry.name for entry in entries)
+            for name in checked:
+                _refuse_planted_entry(folder, name=name, path=here / name)
+    except FileNotFoundError:
+        return
 
 
 def probe_workspaces_dir(scope: TenantScope | None) -> Path:
@@ -256,12 +394,44 @@ def _partition_roots(shared_root: Path) -> list[Path]:
     return roots
 
 
-def _forbidden_roots(settings: AppSettings) -> tuple[Path, ...]:
+def _forbidden_roots(settings: AppSettings, *, partitions: list[Path]) -> tuple[Path, ...]:
     shared_root = Path(settings.storage.shared_root)
-    roots = [cowork_home(), shared_root, shared_root / "shared", *_partition_roots(shared_root)]
+    roots = [cowork_home(), shared_root, shared_root / "shared", *partitions]
     if settings.managed_dir is not None:
         roots.append(settings.managed_dir)
     return tuple(dict.fromkeys(_real(root) for root in roots))
+
+
+def _other_partitions(scope: TenantScope | None, *, partitions: list[Path]) -> tuple[Path, ...]:
+    """Every partition but the asker's own: all of them for the operator view."""
+    own = scope.org_id if scope is not None and scope.personal else None
+    return tuple(dict.fromkeys(_real(root) for root in partitions if root.name != own))
+
+
+def _cell_sandbox(
+    *,
+    project_dir: Path,
+    home_dir: Path,
+    tmp_dir: Path,
+    shared_dir: Path,
+    read_only_dirs: tuple[Path, ...],
+    forbidden_roots: tuple[Path, ...],
+    other_partitions: tuple[Path, ...],
+) -> CellSandbox:
+    """anton's policy model with these fields: the one construction of it, so
+    the startup check (_policy_model_gap) builds exactly what a session does."""
+    from anton.core.backends.sandbox import CellSandbox
+
+    return CellSandbox(
+        project_dir=project_dir,
+        home_dir=home_dir,
+        tmp_dir=tmp_dir,
+        shared_dir=shared_dir,
+        read_only_dirs=read_only_dirs,
+        forbidden_roots=forbidden_roots,
+        other_partitions=other_partitions,
+        user_name=getpass.getuser(),
+    )
 
 
 def build_cell_sandbox(
@@ -278,24 +448,24 @@ def build_cell_sandbox(
     its cells may read. HOME and TMPDIR are created here, in ``scope``'s
     sandbox store, before the first spawn needs them, and so is the shared
     folder. Raises ValueError when a grant equals or contains a forbidden
-    root, OSError when a folder on the way to the project, HOME, TMPDIR or
-    the shared folder is a link (``_required_dir``), and
-    MissingTenantScopeError when a partitioned deployment passes no scope.
+    root, or when a writable grant sits inside another person's partition,
+    OSError when a folder on the way to the project, HOME, TMPDIR or the
+    shared folder is a link (``_required_dir``), and MissingTenantScopeError
+    when a partitioned deployment passes no scope.
     """
     settings = get_app_settings()
     if settings.code_sandbox != "landlock":
         return None
-    from anton.core.backends.sandbox import CellSandbox
-
     root = _sandbox_root(scope)
-    return CellSandbox(
+    partitions = _partition_roots(Path(settings.storage.shared_root))
+    return _cell_sandbox(
         project_dir=_required_dir(project_dir),
         home_dir=_private_dir(root, name="home"),
         tmp_dir=_private_dir(root, name="tmp"),
         shared_dir=_required_dir(shared_files_dir(), create=True),
         read_only_dirs=_read_only_dirs(read_only_dirs),
-        forbidden_roots=_forbidden_roots(settings),
-        user_name=getpass.getuser(),
+        forbidden_roots=_forbidden_roots(settings, partitions=partitions),
+        other_partitions=_other_partitions(scope, partitions=partitions),
     )
 
 
@@ -347,7 +517,50 @@ def _anton_sandbox_gap() -> str | None:
     # so a link agent code planted there is refused rather than followed.
     if "refuse_links" not in inspect.signature(Workspace.initialize).parameters:
         return "has a Workspace.initialize that takes no refuse_links"
+    return _policy_model_gap()
+
+
+def _policy_model_gap() -> str | None:
+    """What anton's CellSandbox refuses of the fields build_cell_sandbox
+    passes, or None when it takes them all: a throwaway policy built the same
+    way (_cell_sandbox), over folders nothing opens. Without it every session
+    would fail to build its policy rather than the server refusing to start."""
+    check = Path("/cowork-code-sandbox-check")
+    other = check / "another-person"
+    try:
+        _cell_sandbox(
+            project_dir=check / "project",
+            home_dir=check / "home",
+            tmp_dir=check / "tmp",
+            shared_dir=check / "shared-files",
+            read_only_dirs=(check / "skills",),
+            forbidden_roots=(check / "cowork-home", other),
+            other_partitions=(other,),
+        )
+    except (TypeError, ValueError) as error:
+        return f"has a CellSandbox that refuses the policy this server builds ({error})"
     return None
+
+
+#: cowork-home's own files and folders the server reads and writes at fixed
+#: names: its settings (.env), the encryption key, every answer stream, the
+#: turns' scratch folders and the self-test's, and the shared registries.
+_COWORK_HOME_ENTRIES = (".env", ".master_key", "streams", "tmp", "shared")
+
+
+def _refuse_linked_cowork_home_entries() -> None:
+    """Raise RuntimeError when one of _COWORK_HOME_ENTRIES is a link. The
+    server isn't locked, so it would read and write wherever the link leads,
+    such as every person's answer streams into the shared folder."""
+    for name in _COWORK_HOME_ENTRIES:
+        entry = cowork_home() / name
+        if entry.is_symlink():
+            raise RuntimeError(
+                f"COWORK_CODE_SANDBOX=landlock: {entry} is a link, and the server reads "
+                "and writes it outside the sandbox, so it would follow it wherever it "
+                "leads. Agent code that ran before the sandbox may have left it there: "
+                "remove the link and put the real file or folder back, then start again."
+            )
 
 
 def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
@@ -356,9 +569,10 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
 
     Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
     headers with the sandbox off; and with ``landlock``, org tenancy, remote
-    turns, an anton without the launcher, a kernel below the Landlock floor,
-    or a self-test that can't confirm a denied path is denied. Then creates
-    the shared folder.
+    turns, an anton without the launcher or whose policy model refuses this
+    server's policy, a kernel below the Landlock floor, a link at one of
+    cowork-home's own entries (_COWORK_HOME_ENTRIES), or a self-test that
+    can't confirm a denied path is denied. Then creates the shared folder.
     """
     if settings.trust_identity_headers and settings.code_sandbox == "off":
         raise RuntimeError(
@@ -386,8 +600,9 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
     if gap is not None:
         raise RuntimeError(
             f"COWORK_CODE_SANDBOX=landlock needs an anton with the Landlock launcher. The "
-            f"installed anton {gap}, so the policy would be dropped and agent code would "
-            "run unlocked. Install an anton release that ships anton.core.backends.sandbox."
+            f"installed anton {gap}, so agent code would run unlocked or not at all. "
+            "Install the anton this cowork-server pins (launcher API version "
+            f"{LAUNCHER_API_VERSION})."
         )
     from anton.core.backends.sandbox import MIN_LANDLOCK_ABI
 
@@ -400,6 +615,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "enabled (Debian 12 needs the bookworm-backports kernel, or Debian 13), "
             "under Docker Engine 20.10.18 or later."
         )
+    _refuse_linked_cowork_home_entries()
     try:
         _run_self_test()
     except Exception as error:

@@ -9,8 +9,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
-from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
-from cowork.db.personal_resources import PersonalResource
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
@@ -64,13 +63,16 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
             service, request, OAuthSettings(),
             {"client_id": body.client_id, "client_secret": body.client_secret, "extra_fields": body.extra_fields},
         )
-    if scope.partitioned_for(PersonalResource.CONNECTIONS):
-        # The local flow carries no person: OAuthStateStore keeps one pending
-        # start per service for the whole deployment, so two people's
-        # sign-ins would clobber each other's. Where a person keeps their own
-        # connections it is refused up front. Where connections are shared it
-        # runs as on the desktop, and oauth_callback saves into the shared
-        # vault, stamped with the caller's sub.
+    if get_app_settings().trust_identity_headers:
+        # The provider redirects the browser back to the callback as a
+        # top-level navigation with no identity: the recording proxy refuses
+        # it, and reaching cowork-server directly it is the operator view, so
+        # the connection would be saved with no creator rather than the
+        # person's. OAuthStateStore also keeps one pending start per service
+        # for the whole deployment, which two people's sign-ins would clobber.
+        # Refused up front wherever identity headers are trusted, whether
+        # connections are personal or left shared; connect the service with
+        # its credentials instead.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -248,12 +250,9 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
 def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    # The caller's own scope. For a person whose connections are shared,
-    # start_oauth lets the sign-in start, and vault_for_scope resolves their
-    # scope to the shared vault and stamps the connection with their sub, so
-    # it stays theirs to change. A request with no person is the operator
-    # view and stamps nobody. An org scope with no org fails closed when it
-    # saves.
+    # This runs only on the desktop: start_oauth refuses the sign-in wherever
+    # identity headers are trusted, and in org mode auth runs the handshake
+    # and its own callback.
     html = oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope)
     return HTMLResponse(content=html)
 

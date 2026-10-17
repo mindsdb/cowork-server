@@ -56,7 +56,8 @@ class SettingService:
     A personal partition (a trusted-identity deployment with settings per
     person) routes like an org whose ``org_id`` is the person's partition, with
     one exception: an operator-pinned key (``setting_is_operator_pinned``: the
-    model, its endpoint, memory and cost) reads and writes the global row only,
+    model, its endpoint, memory and cost, and how the agent acts: act_first,
+    proactive_dashboards) reads and writes the global row only,
     so it resolves from that row, then the environment, and a person's own row
     for it is ignored. Admin gating on org-key writes is an endpoint concern;
     this layer only routes.

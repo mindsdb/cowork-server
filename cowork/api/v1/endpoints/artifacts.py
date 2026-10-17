@@ -230,26 +230,7 @@ def _scoped_project_cards(session, project_ref: str) -> list[dict]:
     identity rather than the request string.
     """
     server_project_id, sources = _scoped_project_sources(session, project_ref)
-    _refuse_a_persons_project_in_the_operator_view(session, server_project_id)
     return _artifact_cards(session, sources)
-
-
-def _refuse_a_persons_project_in_the_operator_view(session, project_id: UUID) -> None:
-    """The operator view (no person, so LOCAL_SCOPE) lists every project row,
-    but a card's serveUrl names its project by name alone, which the serve
-    route looks up in the unkeyed projects root. A person's project, a row
-    with an org_id, would list cards that serve 404 or the deployment's own
-    same-named artifact, so the operator view is refused it."""
-    if session.scope.partitioned:
-        return
-    if ProjectService(session).get_project(project_id).org_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                "This project is a person's own; the operator view lists only "
-                "the deployment's artifacts."
-            ),
-        )
 
 
 def _all_artifact_cards(session) -> list[dict]:
@@ -1173,13 +1154,13 @@ def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
             desktop_publish_credential,
         )
 
-        artifact, artifacts_base = desktop_artifact_and_base(path, scope=scope)
+        found = desktop_artifact_and_base(path, scope=scope)
         # Credential resolved after the path so an unresolvable artifact still
         # reports 404 rather than "configure your API key". Only needed at all
         # because delete unpublishes first.
         api_key, publish_url = desktop_publish_credential()
         _delete_artifact(
-            artifact, artifacts_base=artifacts_base,
+            found.artifact, artifacts_base=found.artifacts_base,
             api_key=api_key, publish_url=publish_url,
         )
     except FileNotFoundError as e:

@@ -28,8 +28,9 @@ class ConnectionsService:
     Every read and write goes through vault_for_scope, so a scope lists and
     reads the operator's managed connections and the ones others share with
     it beside its own. ``managed`` marks a connection the caller can't
-    change, ``shared`` one in the shared-connection registry, and every
-    write to one the caller can't change raises SharedConnectionError.
+    change, ``shared`` one shared with the caller (LayeredDataVault.is_shared),
+    and every write to one the caller can't change raises
+    SharedConnectionError.
     """
 
     def __init__(self, scope: TenantScope | None = None) -> None:

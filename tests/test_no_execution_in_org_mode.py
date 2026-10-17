@@ -16,6 +16,16 @@ def org_mode(monkeypatch):
     get_app_settings.cache_clear()
 
 
+@pytest.fixture
+def desktop(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_backend_launch_refused_in_org_mode(org_mode, tmp_path, monkeypatch):
     """No subprocess, no port probe, no anton import. Just a refusal."""
@@ -132,6 +142,37 @@ async def test_export_pdf_docx_refused_in_org_mode(org_mode, fmt):
             _ExportBody(path="/tmp/whatever.md", format=fmt), scope=LOCAL_SCOPE
         )
     assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["pdf", "docx"])
+async def test_export_pdf_docx_not_refused_on_desktop(desktop, tmp_path, fmt):
+    """PDF and Word export are default-on desktop paths: the gate widened to
+    `_org_mode() or scope.personal`, both false on desktop, so a desktop export
+    must reach path resolution. The 404 (not 403) proves it got past the gate;
+    it comes before any URI fetch, so nothing is executed."""
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.artifacts import _ExportBody, export_artifact_endpoint
+
+    with pytest.raises(HTTPException) as exc:
+        await export_artifact_endpoint(
+            _ExportBody(path=str(tmp_path / "missing.md"), format=fmt), scope=LOCAL_SCOPE
+        )
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_open_not_refused_on_desktop(desktop, tmp_path):
+    """Open is a default-on desktop path. The 404 proves the request reached
+    path resolution instead of the gate, and it comes before any subprocess."""
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.artifacts import _PathBody, open_artifact
+
+    with pytest.raises(HTTPException) as exc:
+        await open_artifact(_PathBody(path=str(tmp_path / "missing.html")), scope=LOCAL_SCOPE)
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio

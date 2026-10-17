@@ -12,7 +12,11 @@ Hosted org tenancy partitions every resource and never reads the list.
 ``MODEL_RESOURCE`` and ``STORE_RESOURCE`` are how cowork.db.scoped finds the
 resource behind a table or a filesystem store. tests/test_personal_resources.py
 fails when a table with an ``org_id`` or ``created_by`` column, or a store name
-passed to a scoped storage root, has no entry.
+passed to a scoped storage root, has no entry. It also fails when a store root
+is read straight from settings (``*.root_dir``, ``*.vault_dir``,
+``StreamSettings().dir`` or ``cowork_home() / ...``) without passing through a
+scoped storage root and without an allowlist entry, so a new per-person store
+can't ship built from the unkeyed root.
 """
 
 from __future__ import annotations
@@ -87,7 +91,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "settings": PersonalResource.SETTINGS,
 }
 
-STORE_RESOURCE: dict[str, PersonalResource] = {
+# None keeps a store in each person's partition in every personal scope,
+# whatever COWORK_PERSONAL_RESOURCES lists.
+STORE_RESOURCE: dict[str, PersonalResource | None] = {
     "projects": PersonalResource.PROJECTS,
     # Publish history (cowork.services.publish), part of an artifact's
     # publish state.
@@ -97,10 +103,11 @@ STORE_RESOURCE: dict[str, PersonalResource] = {
     "code-skills": PersonalResource.SKILLS,
     "data-vault": PersonalResource.CONNECTIONS,
     "memory": PersonalResource.MEMORY,
-    # The HOME and TMPDIR each person's agent code runs with
-    # (cowork.code_sandbox). Memory, because create_app refuses identity
-    # headers with memory left off the list: this keeps the store per person
-    # whenever identity headers are on, whatever else the list leaves shared,
-    # so one person's pip cache or temp files never reach another's cells.
-    "sandbox": PersonalResource.MEMORY,
+    # The HOME and TMPDIR each person's agent code runs with, and the
+    # folders of their credential probes (cowork.code_sandbox). Every
+    # person's own whenever identity headers are on, whatever the list leaves
+    # shared, memory included: one person's pip cache, temporary files or
+    # candidate credentials never reach another person's cells. The operator
+    # view keeps the base store.
+    "sandbox": None,
 }

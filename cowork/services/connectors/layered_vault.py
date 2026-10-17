@@ -9,13 +9,16 @@ anton reads it as it reads its own vault.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from anton.core.datasources.data_vault import DataVault
+from anton.core.datasources.data_vault import DataVault, _slug_env_prefix
 
 from cowork.creators import Changer
 from cowork.managed import SharedConnection
+
+logger = logging.getLogger(__name__)
 
 SHARED_CONNECTION_REFUSAL = "This connection is shared with you and can't be changed here."
 # A create under a name the registry still shares for one of the reader's
@@ -67,6 +70,14 @@ class SharedFrom:
 class _Found(NamedTuple):
     vault: DataVault
     record: dict[str, Any] | None
+
+
+class _PrefixHolder(NamedTuple):
+    """The first connection listed under one DS_ env prefix, and its layer."""
+
+    layer: int
+    engine: str
+    name: str
 
 
 class LayeredDataVault:
@@ -142,13 +153,29 @@ class LayeredDataVault:
         return self._may_change(self._find(engine, name))
 
     def is_shared(self, engine: str, name: str) -> bool:
-        """Whether (engine, name) is in the shared-connection registry: one
-        someone shares with this scope, or one of the scope's own it shares."""
+        """Whether (engine, name) reads as shared with this scope rather than
+        the scope's own to change: one someone shares through the registry, one
+        of the scope's own it shares, or, in a deployment-wide vault, another
+        person's own entry this person didn't create. A managed entry and a
+        creator-less base entry stay the operator's (not shared), so the UI
+        shows "your operator provides this" for those and "shared with you" for
+        a teammate's."""
         found = self._find(engine, name)
         if found.record is None or found.vault is self._managed:
             return False
         if found.vault is self._own:
-            return (engine, name) in self._shared_by_own
+            if (engine, name) in self._shared_by_own:
+                return True
+            changer = self._changer
+            creator = self._creator(found.record)
+            return (
+                changer is not None
+                and changer.deployment_wide
+                and not changer.operator_view
+                and changer.user_id is not None
+                and creator is not None
+                and creator != changer.user_id
+            )
         return True
 
     def _stamped(self, found: _Found, credentials: dict[str, str]) -> dict[str, str]:
@@ -197,23 +224,72 @@ class LayeredDataVault:
             raise SharedConnectionError(engine=engine, name=name)
         return self._own.delete(engine, name)
 
+    def _own_layers(self) -> list[list[dict[str, str]]]:
+        """The own vault's entries as listing layers: one layer, or, where
+        the vault is deployment-wide, the entries the changer may change
+        first and everyone else's after them, so the reader's own entry wins
+        a DS_ env prefix over another person's."""
+        entries = self._own.list_connections()
+        if self._changer is None or not self._changer.deployment_wide:
+            return [entries]
+        mine: list[dict[str, str]] = []
+        others: list[dict[str, str]] = []
+        for entry in entries:
+            record = self._own.read_record(entry["engine"], entry["name"])
+            (mine if self._may_change(_Found(self._own, record)) else others).append(entry)
+        return [mine, others]
+
     def list_connections(self) -> list[dict[str, str]]:
+        """Every connection this scope reads, in layers: the managed folder's,
+        the scope's own (in a deployment-wide vault, the reader's own before
+        everyone else's), then the ones shared with it.
+
+        A same-named entry in an earlier layer hides a later one. So does an
+        earlier layer's entry under the same DS_ env prefix: anton builds the
+        agent's DS_* environment per listed connection, keyed by
+        _slug_env_prefix, which maps '-', '_' and case onto one name, so the
+        later entry's credentials would overwrite the earlier one's. Two
+        entries of one layer that share a prefix both stay listed, as on the
+        desktop.
+        """
         listed: list[dict[str, str]] = []
         taken: set[tuple[str, str]] = set()
-        for vault in (self._managed, self._own):
-            if vault is None:
-                continue
-            for entry in vault.list_connections():
+        prefixes: dict[str, _PrefixHolder] = {}
+
+        def admits(layer: int, engine: str, name: str) -> bool:
+            prefix = _slug_env_prefix(engine, name)
+            holder = prefixes.get(prefix)
+            if holder is None:
+                prefixes[prefix] = _PrefixHolder(layer=layer, engine=engine, name=name)
+                return True
+            if holder.layer == layer:
+                return True
+            logger.warning(
+                "connection %s/%s shares the DS_ env prefix %r with %s/%s, listed "
+                "ahead of it; it is hidden from this scope so its credentials never "
+                "stand in for that connection's",
+                engine, name, prefix, holder.engine, holder.name,
+            )
+            return False
+
+        layers = [
+            *([] if self._managed is None else [self._managed.list_connections()]),
+            *self._own_layers(),
+        ]
+        for layer, entries in enumerate(layers):
+            for entry in entries:
                 key = (entry["engine"], entry["name"])
-                if key not in taken:
-                    taken.add(key)
-                    listed.append(entry)
+                if key in taken or not admits(layer, *key):
+                    continue
+                taken.add(key)
+                listed.append(entry)
+        shared_layer = len(layers)
         for source in self._shared:
             key = (source.entry.engine, source.entry.name)
             if key in taken:
                 continue
             record = source.vault.read_record(*key)
-            if record is None:
+            if record is None or not admits(shared_layer, *key):
                 continue
             taken.add(key)
             listed.append(
@@ -327,10 +403,39 @@ class FilteredDataVault:
     def for_connecting(self) -> FilteredDataVault:
         """This vault as anton's connect_new_datasource matches a new
         connection against it: over the source's ConnectingDataVault where
-        the source is a LayeredDataVault, with the same connections hidden."""
+        the source is a LayeredDataVault, with the same connections listed by
+        label alone (_ConnectingFilteredDataVault)."""
         source = (
             self._source.for_connecting()
             if isinstance(self._source, LayeredDataVault)
             else self._source
         )
-        return FilteredDataVault(source=source, hidden=self._hidden)
+        return _ConnectingFilteredDataVault(source=source, hidden=self._hidden)
+
+
+class _ConnectingFilteredDataVault(FilteredDataVault):
+    """The connecting view of a FilteredDataVault.
+
+    A hidden connection is still listed, so a pasted connection's label is
+    de-duplicated against it and the turn's new connection never repeats a
+    hidden one's label. It loads as its label fields alone, so it matches no
+    identity field anton keys on: the paste is saved as the reader's own
+    rather than silently updating the hidden connection. Every other read is
+    the filtered vault's, so the turn's environment and listing still hide it.
+    """
+
+    def list_connections(self) -> list[dict[str, str]]:
+        return self._source.list_connections()
+
+    def load(self, engine: str, name: str) -> dict[str, str] | None:
+        fields = self._source.load(engine, name)
+        if fields is None or not self._hides(engine, name):
+            return fields
+        return {key: value for key, value in fields.items() if key in LABEL_FIELDS}
+
+    def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
+        record = self._source.read_record(engine, name)
+        if record is None or not self._hides(engine, name):
+            return record
+        fields = {k: v for k, v in (record.get("fields") or {}).items() if k in LABEL_FIELDS}
+        return {**record, "fields": fields}

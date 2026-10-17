@@ -37,6 +37,7 @@ from cowork.common.paths import dir_rmdir, dir_unlink, pinned_dir, safe_join_lex
 from cowork.common.settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, tenant_scope_required
+from cowork.managed import managed_folder
 from cowork.models.skill import Skill
 
 logger = logging.getLogger(__name__)
@@ -261,7 +262,13 @@ def reconcile_skill_links(skill: Skill) -> None:
     """Make each project's ``skills/<slug>`` link match the skill's metadata."""
     canon = safe_join_lexical(_canon_root(), skill.name)
     all_projects = _all_projects()
-    if not skill.enabled:
+    managed = managed_folder()
+    if not skill.enabled or (managed is not None and skill.name in managed.skill_slugs()):
+        # A slug the operator's managed folder holds is loaded from that folder,
+        # so a same-named store skill must link into no project, or the agent
+        # would recall the store copy over the managed one. Treated like a
+        # disabled skill, which also removes a link left from before the
+        # managed copy on the next fan-out.
         desired: set[str] = set()
     elif skill.projects:
         desired = set(skill.projects)
@@ -309,8 +316,14 @@ def reconcile_project(
     if selected_project is None:
         return
     canon_root = _canon_root()
+    managed = managed_folder()
+    managed_slugs = frozenset() if managed is None else managed.skill_slugs()
     for skill in skills:
         if not skill.enabled:
+            continue
+        # A slug the managed folder holds is loaded from there; a same-named
+        # store skill must never link into the new project.
+        if skill.name in managed_slugs:
             continue
         if skill.projects and selected_project.name not in skill.projects:
             continue

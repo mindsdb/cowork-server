@@ -244,6 +244,16 @@ def test_bearer_without_a_pair_under_audit_is_the_operator_view(trusted):
     assert res.json()["local"] is True
 
 
+def test_an_encoded_dotdot_path_is_refused(trusted):
+    """A path whose decoded form carries a `..` segment is 400, before it can
+    read as the page shell and normalize onto an API route as the operator."""
+    client = _client(scope_route=True)
+
+    assert client.get("/%2e%2e/api/v1/_scope", headers=BEARER).status_code == 400
+    # A clean operator-view request still answers.
+    assert client.get("/api/v1/_scope", headers=BEARER).status_code == 200
+
+
 def test_bearer_without_a_pair_under_enforce_is_401(trusted):
     trusted.setenv("COWORK_IDENTITY_ENFORCE", "enforce")
     get_app_settings.cache_clear()
@@ -719,3 +729,75 @@ def test_a_shared_project_holding_only_the_deleters_rows_is_deleted(trusted, mad
     assert client.delete(f"/api/v1/projects/{pid}", headers=A).status_code == 204
     with Session(get_engine(get_app_settings().database.uri)) as raw:
         assert raw.get(Project, UUID(pid)) is None
+
+
+def test_a_personal_project_with_an_operator_row_is_409_not_a_lost_delete(trusted, made_projects):
+    """Where projects are personal (the default list), an operator-view write
+    can leave a NULL-org conversation in a person's project. The person's
+    delete must answer 409, not orphan the row (a 500 on Postgres, a silent
+    orphan on SQLite)."""
+    client = _client()
+    pid = _made_project(client, A, made_projects)
+    op_cid = _conversation(client, BEARER, project_id=pid, topic="operator-row")
+
+    res = client.delete(f"/api/v1/projects/{pid}", headers=A)
+
+    assert res.status_code == 409, res.text
+    assert "Other people still have conversations or schedules" in res.json()["detail"]
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        assert raw.get(Project, UUID(pid)) is not None
+        assert raw.get(Conversation, UUID(op_cid)) is not None
+
+
+def test_a_personal_project_with_an_operator_schedule_is_409_not_a_lost_delete(trusted, made_projects):
+    """The same holds for an operator-view schedule in a person's project: the
+    schedules cascade would otherwise remove it with the project."""
+    client = _client()
+    pid = _made_project(client, A, made_projects)
+    op_sid = _schedule(client, BEARER, project_id=pid, title="operator-schedule")
+
+    res = client.delete(f"/api/v1/projects/{pid}", headers=A)
+
+    assert res.status_code == 409, res.text
+    assert "Other people still have conversations or schedules" in res.json()["detail"]
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        assert raw.get(Project, UUID(pid)) is not None
+        assert raw.get(Schedule, UUID(op_sid)) is not None
+
+
+def test_the_other_people_check_locks_the_project_before_its_reads(trusted, made_projects):
+    """The check takes a FOR UPDATE lock on the project row before the
+    conversation and schedule existence reads, so a concurrent child insert
+    blocks on the foreign key instead of being cascade-removed. (The lock only
+    bites on Postgres; the ORM flag it sets is dialect-independent.)"""
+    from sqlalchemy import event
+
+    from cowork.db.scoped import ScopedSession, scope_for_identity, unsafe_unscoped_session
+    from cowork.db.session import get_open_session
+    from cowork.services.projects import ProjectService
+
+    _personal_resources(trusted, SHARED_PROJECTS[1])
+    client = _client()
+    pid = _made_project(client, A, made_projects)
+
+    scope = scope_for_identity(org_id=personal_partition_id(DEPLOYMENT, SUB_A), user_id=SUB_A)
+    scoped = ScopedSession(get_open_session(), scope)
+    seen: list[tuple[str, bool]] = []
+
+    @event.listens_for(unsafe_unscoped_session(scoped), "do_orm_execute")
+    def record(state):
+        statement = state.statement
+        seen.append((str(statement).lower(), getattr(statement, "_for_update_arg", None) is not None))
+
+    try:
+        ProjectService(scoped)._refuse_while_others_use(UUID(pid))
+    finally:
+        scoped.close()
+
+    project_locked = next((i for i, (sql, locked) in enumerate(seen) if locked and "project" in sql), None)
+    child_read = next(
+        (i for i, (sql, _) in enumerate(seen) if "conversation" in sql or "schedule" in sql), None
+    )
+    assert project_locked is not None, "the project row is never locked FOR UPDATE"
+    assert child_read is not None
+    assert project_locked < child_read

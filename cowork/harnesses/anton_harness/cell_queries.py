@@ -42,16 +42,49 @@ it. A string bound to a name is a candidate where the code reads that name on
 its own, not where it binds it, so a base query that ``+``, ``+=`` or an
 f-string extends is not one. A candidate counts when, past its comments, it
 starts with SELECT or a WITH ... AS ( common table expression, reads FROM, and
-does not end like a sentence: that drops ``df.query('qty > 5')``, DDL, writes
-and a printed label such as ``"With rows from stock.csv:"``. A candidate that
-counts is split at each ``;`` outside a string literal, a quoted name, a
+does not end like a sentence: that drops ``df.query('qty > 5')``, DDL, a write
+that starts with its own keyword such as INSERT, and a printed label such as
+``"With rows from stock.csv:"``. Only the opening keyword is read, so a write
+after a common table expression (``WITH old AS (...) DELETE ...``) and a
+``SELECT ... INTO`` count as queries and are listed. A candidate that counts
+is split at each ``;`` outside a string literal, a quoted name, a
 dollar-quoted string or a comment, and a statement is listed only when it
 counts by the same rule, so a statement after a query in the same string (DDL
-that sets a password, a write) is not. The split is read with both backslash
-quote rules and both line-comment rules: MySQL requires whitespace or a
-control character after ``--`` and also recognizes ``#``. When any reading
-splits a candidate differently, nothing from it is listed. Dollar quoting
-is checked both ways too: MySQL may read ``$tag$`` as a bare alias instead.
+that sets a password, a write that starts with its own keyword) is not. The
+split is read with both backslash quote rules, for both quotes, for single
+quotes only (a Postgres ``E''`` string beside a double-quoted name) or for
+``E''`` only (beside a standard string), and with four line-comment rules: the
+standard ``--``; MySQL's, which requires whitespace or a control character
+after ``--`` and also recognizes ``#``; BigQuery's and ClickHouse's ``#``
+beside any ``--``; and Snowflake's ``//`` beside ``--``. When any reading
+splits a candidate differently, nothing from it is listed, so a query whose
+last ``;`` follows a Postgres ``#`` operator or DuckDB's ``//`` division
+lists nothing. Dollar quoting is checked both ways too: MySQL may read
+``$tag$`` as a bare alias instead. A bracket is read as a quoted name, and
+again as one a quote ends, as in a Postgres array whose string holds a ``]``.
+A reading runs only when the string holds a character that can make it split
+differently (a backslash, ``--``, ``#``, ``//``, ``[`` or ``$``), so a query
+with none of them is read once. The split still misses a ``;`` inside a
+bracket before any quote, which SQLite and SQL Server read as part of a name
+and Postgres and MySQL as the end of a statement; a ``]]`` inside a bracket,
+which SQL Server reads as a ``]`` in the name and every reading as its end; a
+``;`` or a quote after a lone carriage return in a comment, where every
+reading ends the comment and SQLite (``--``) and MySQL (``--`` and ``#``)
+read it on to the line feed; a quote inside Oracle's alternative quoting
+(``q'[...]'``) or a BigQuery triple-quoted string (``'''...'''``, or the
+same with double quotes), which every reading reads as the end of the
+string; a backslash-escaped backtick in a quoted name, which BigQuery and
+ClickHouse read as part of the name and every reading as its end; an ``E''``
+string right after a dollar-quoted string, which Postgres reads as one and
+the reading for ``E''`` only as a standard string after a name; an ``E''``
+string right after a digit (``1E'...'``), whose digit and E the reading for
+``E''`` only reads as a name and Postgres 14 as a number and an ``E''``
+string (newer versions reject the number); and a ``;`` between backticks,
+which every reading reads as inside a quoted name while Postgres reads a
+backtick as an operator character. The credential sweep masks the password
+a statement listed by such a miss sets with ``IDENTIFIED BY``, or with a
+quoted value after a secret key's name such as ``PASSWORD`` or ``SECRET``
+(``figure_sources._redacted``).
 
 A function the cell defines keeps the queries, requests and environment reads
 its body shows, so a later cell that calls it makes them too. Rebinding one
@@ -157,23 +190,109 @@ _SQL_CTE = re.compile(
 _SQL_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
 # A name in backticks or brackets, a dollar-quoted string, which only the
 # $tag$ that opened it closes (a $ inside a name and a $1 parameter open
-# none), or a comment, inside which a ; ends no statement, or a ; that does.
+# none; Postgres reads any non-ASCII character as part of a name or a tag),
+# or a comment, inside which a ; ends no statement, or a ; that does.
 # A name, string or comment left open runs to the end of the text, so the
 # scan stays linear.
 _SQL_QUOTED_NAME = r"`[^`]*+`?|\[[^\]]*+\]?"
-_SQL_DOLLAR_STRING = r"(?<![\w$])\$(?P<tag>(?:[A-Za-z_]\w*)?)\$.*?(?:\$(?P=tag)\$|\Z)"
-# MySQL recognizes -- only before a space or control character, and # starts
-# a comment there. Its NO_BACKSLASH_ESCAPES mode makes quote and comment
-# rules independent, so check every combination rather than only two scans.
-_SQL_TOKENS = tuple(
-    re.compile(quote + "|" + quoted_name + "|" + comment + r"|/\*.*?(?:\*/|\Z)|;", re.DOTALL)
-    for quote in (
-        r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|\\.|[^\"\\])*+\"?",
-        r"'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?",
-    )
-    for comment in (r"--[^\r\n]*+", r"--(?=[\x00-\x20\x7f])[^\r\n]*+|\#[^\r\n]*+")
-    for quoted_name in (_SQL_QUOTED_NAME + "|" + _SQL_DOLLAR_STRING, _SQL_QUOTED_NAME)
+# The same, with a bracket that a quote ends: Postgres reads [ as an array or
+# a subscript, whose string literal may hold a ] (ARRAY['a]']). A ; inside a
+# bracket before any quote stays inside it here too, so [a;b] keeps its query.
+_SQL_QUOTED_NAME_TO_A_QUOTE = r"`[^`]*+`?|\[[^\]'\"]*+\]?"
+_SQL_DOLLAR_STRING = (
+    r"(?<![\w$\x80-\U0010ffff])\$(?P<tag>(?:[A-Za-z_\x80-\U0010ffff][\w\x80-\U0010ffff]*)?)\$"
+    r".*?(?:\$(?P=tag)\$|\Z)"
 )
+
+
+@dataclass(frozen=True)
+class _SqlRule:
+    """One form of a rule a SQL reading is built from, and the text a string
+    must hold for this form to read it differently from its rule's first
+    form. A string that holds none of ``marks`` reads alike under both."""
+
+    pattern: str
+    marks: frozenset[str] = frozenset()
+
+
+# Postgres escapes a quote in an E'' string but not in a double-quoted name,
+# as MySQL with ANSI_QUOTES does, and MySQL's NO_BACKSLASH_ESCAPES mode reads
+# no backslash escape. Postgres escapes none in a standard string either, so
+# the last form reads escapes only in a string an E opens, where an E after a
+# name character is part of the name. Without a backslash these read alike.
+_SQL_QUOTES = (
+    _SqlRule(pattern=r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|\\.|[^\"\\])*+\"?"),
+    _SqlRule(pattern=r"'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?", marks=frozenset({"\\"})),
+    _SqlRule(pattern=r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|[^\"])*+\"?", marks=frozenset({"\\"})),
+    _SqlRule(
+        pattern=r"(?<![\w$\x80-\U0010ffff])[Ee]'(?:''|\\.|[^'\\])*+'?|'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?",
+        marks=frozenset({"\\"}),
+    ),
+)
+# MySQL recognizes -- only before a space or control character, and # starts
+# a comment there. BigQuery and ClickHouse read # and any -- as comments, and
+# Snowflake reads // as one too.
+_SQL_LINE_COMMENTS = (
+    _SqlRule(pattern=r"--[^\r\n]*+"),
+    _SqlRule(pattern=r"--(?=[\x00-\x20\x7f])[^\r\n]*+|\#[^\r\n]*+", marks=frozenset({"--", "#"})),
+    _SqlRule(pattern=r"--[^\r\n]*+|\#[^\r\n]*+", marks=frozenset({"#"})),
+    _SqlRule(pattern=r"(?:--|//)[^\r\n]*+", marks=frozenset({"//"})),
+)
+_SQL_QUOTED_NAMES = (
+    _SqlRule(pattern=_SQL_QUOTED_NAME),
+    _SqlRule(pattern=_SQL_QUOTED_NAME_TO_A_QUOTE, marks=frozenset({"["})),
+)
+# MySQL may read $tag$ as a bare alias rather than a dollar-quoted string,
+# so its form has no pattern.
+_SQL_DOLLAR_QUOTES = (
+    _SqlRule(pattern=_SQL_DOLLAR_STRING),
+    _SqlRule(pattern="", marks=frozenset({"$"})),
+)
+
+
+@dataclass(frozen=True)
+class _SqlReading:
+    """One reading of where a SQL string's statements end: one form of each
+    rule, as a token for a string, a quoted name, a dollar-quoted string, a
+    comment or a ;. Each one is a linear scan."""
+
+    token: re.Pattern[str]
+    # The marks of each of its forms that is not its rule's first form.
+    marks: tuple[frozenset[str], ...]
+
+    def can_differ(self, *, held: frozenset[str]) -> bool:
+        """Whether this reading may split a string that holds the marks
+        ``held`` differently from the other readings that run. A form whose
+        marks the string lacks reads it as its rule's first form does, so
+        then this reading splits it as the reading with the first form in
+        that place does, and need not run."""
+        return all(marks & held for marks in self.marks)
+
+
+# The dialects disagree on each rule, and MySQL's modes make the quote and
+# comment rules independent, so every combination is a reading rather than
+# only a few. The first reading takes every rule's first form, so it runs on
+# every string. A form with no pattern adds no branch to the token.
+_SQL_READINGS = tuple(
+    _SqlReading(
+        token=re.compile(
+            "|".join(
+                pattern
+                for pattern in (quote.pattern, name.pattern, dollar.pattern, comment.pattern, r"/\*.*?(?:\*/|\Z)", ";")
+                if pattern
+            ),
+            re.DOTALL,
+        ),
+        marks=tuple(rule.marks for rule in (quote, comment, name, dollar) if rule.marks),
+    )
+    for quote in _SQL_QUOTES
+    for comment in _SQL_LINE_COMMENTS
+    for name in _SQL_QUOTED_NAMES
+    for dollar in _SQL_DOLLAR_QUOTES
+)
+_SQL_MARKS = frozenset().union(*(
+    rule.marks for rules in (_SQL_QUOTES, _SQL_LINE_COMMENTS, _SQL_QUOTED_NAMES, _SQL_DOLLAR_QUOTES) for rule in rules
+))
 
 URL_START = re.compile(r"https?://", re.IGNORECASE)
 # A URL with a scheme and a host but no path, which can carry no token.
@@ -1335,9 +1454,9 @@ def _queries(texts: Iterable[str]) -> tuple[str, ...]:
     dedented and stripped. A text that reads as a query is split into its
     statements (_statements), and only those that read as a query themselves
     are listed, so a statement after a query in the same text (DDL that sets
-    a password, a write) is listed only where the database ends a statement
-    at a ``;`` that _statements reads as inside a literal, a quoted name or a
-    comment."""
+    a password, a write that starts with its own keyword) is listed only
+    where the database ends a statement at a ``;`` that _statements reads as
+    inside a literal, a quoted name or a comment."""
     statements = (
         textwrap.dedent(statement).strip()
         for text in dict.fromkeys(texts) if is_sql(text)
@@ -1349,10 +1468,15 @@ def _queries(texts: Iterable[str]) -> tuple[str, ...]:
 def _statements(text: str) -> list[str]:
     """``text`` split after each ``;`` outside a string literal, a quoted
     name, a dollar-quoted string or a comment; each statement keeps its
-    ``;``. Empty when supported quote or comment rules disagree about a
-    split, because no database dialect accompanies the extracted text."""
-    ends = _statement_ends(text, token=_SQL_TOKENS[0])
-    if ends is None or any(ends != _statement_ends(text, token=token) for token in _SQL_TOKENS[1:]):
+    ``;``. Empty when the supported quote, comment, bracket or dollar-quote
+    rules disagree about a split, because no database dialect accompanies
+    the extracted text. Only the readings the text's characters can tell
+    apart run (``_SqlReading.can_differ``), so a query that holds no
+    backslash, #, //, --, [ or $ is read once."""
+    held = frozenset(mark for mark in _SQL_MARKS if mark in text)
+    tokens = [reading.token for reading in _SQL_READINGS if reading.can_differ(held=held)]
+    ends = _statement_ends(text, token=tokens[0])
+    if ends is None or any(ends != _statement_ends(text, token=token) for token in tokens[1:]):
         return []
     return [text[start:end] for start, end in pairwise([0, *ends, len(text)])]
 

@@ -155,10 +155,10 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
         )
     managed = managed_folder()
     readonly: list[tuple[SkillSource, list[Path]]] = [
-        ("host", list(readonly_skill_dirs(HOST_SKILLS_DIR).values())),
+        ("host", list(readonly_skill_dirs(HOST_SKILLS_DIR).readable.values())),
         ("managed", [] if managed is None else list(managed.skill_dirs().values())),
         ("shared", [skill.path for skill in shared_turn_skills(service=service, project_name=project)]),
-        ("anton", list(readonly_skill_dirs(SkillStore().builtin_root).values())),
+        ("anton", list(readonly_skill_dirs(SkillStore().builtin_root).readable.values())),
     ]
     for source, skill_dirs in readonly:
         for skill_dir in skill_dirs:

@@ -49,9 +49,6 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
     monkeypatch.setattr(artifacts.os.path, "basename", sanitize)
     monkeypatch.setattr(artifacts, "_scoped_project_sources", discover)
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
-    monkeypatch.setattr(
-        artifacts, "_refuse_a_persons_project_in_the_operator_view", lambda _session, _project_id: None
-    )
 
     cards = await artifacts.list_artifacts(
         session,

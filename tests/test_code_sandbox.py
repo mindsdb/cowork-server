@@ -6,17 +6,20 @@ token's copy in cowork-home's .env. The policy build_cell_sandbox builds, with
 the real anton model checking it. What a turn, the credential probe and the
 backend pool pass, with the sandbox on and off: off passes exactly what it
 passed before. The refusals of app backends (the preview mount, its proxy
-and the launch), Code mode and the old .env fallback. Links agent code left
-before the sandbox: no grant follows one, and under the sandbox neither do the
-server's own folders in a project, while off keeps the desktop's behavior. The
-kernel itself is stubbed (conftest's stub_landlock_kernel): anton's own tests
-run the launcher.
+and the launch), Code mode, the old .env fallback, and a session or pad built
+without the policy. Links agent code left before the sandbox: no grant follows
+one, and under the sandbox neither do the server's own folders in a project,
+nor its reads and writes of a person's vault, memory and publish store, nor
+cowork-home's own entries, while off keeps the desktop's behavior. The kernel
+itself is stubbed (conftest's stub_landlock_kernel): anton's own tests run the
+launcher, and the one real-kernel test here runs it where Landlock is.
 """
 from __future__ import annotations
 
 import getpass
 import json
 import logging
+import os
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -31,7 +34,7 @@ from fastapi.testclient import TestClient
 import cowork.server as cowork_server
 from cowork import code_sandbox
 from cowork.auth_middleware import remove_auth_token
-from cowork.code_sandbox import NO_CODE_MODE_DETAIL, build_cell_sandbox
+from cowork.code_sandbox import NO_CODE_MODE_DETAIL, PlantedLinkError, build_cell_sandbox
 from cowork.common.paths import makedirs_below_nofollow
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -137,12 +140,26 @@ def test_a_kernel_below_landlock_abi_3_is_refused(stack, abi):
     assert "bookworm-backports" in message
 
 
+def _landlock_required() -> bool:
+    """Whether a missing Landlock fails the real-kernel test instead of
+    skipping it: on a Linux runner in GitHub Actions, or wherever
+    LANDLOCK_REQUIRED=1 asks for it."""
+    on_ci_linux = sys.platform == "linux" and os.environ.get("GITHUB_ACTIONS") == "true"
+    return on_ci_linux or os.environ.get("LANDLOCK_REQUIRED") == "1"
+
+
 def test_the_real_self_test_passes_where_the_kernel_has_landlock(monkeypatch, tmp_path):
     """The seam unstubbed: anton's launcher, in a child process, on this
-    kernel. Runs on a Linux runner with Landlock ABI 3 or later."""
+    kernel. Runs on a Linux runner with Landlock ABI 3 or later, and fails
+    there rather than skipping when the kernel has none (_landlock_required)."""
     from anton.core.backends.sandbox import MIN_LANDLOCK_ABI
 
-    if code_sandbox._probe_abi() < MIN_LANDLOCK_ABI:
+    abi = code_sandbox._probe_abi()
+    if abi < MIN_LANDLOCK_ABI:
+        if _landlock_required():
+            pytest.fail(
+                f"this runner must have Landlock ABI {MIN_LANDLOCK_ABI} or later, and it reports ABI {abi}"
+            )
         pytest.skip("this kernel has no usable Landlock")
     monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
     code_sandbox._run_self_test()
@@ -179,19 +196,52 @@ def test_an_anton_with_another_launcher_api_is_refused(stack):
     from anton.core.backends import sandbox
 
     stack.setattr(sandbox, "LAUNCHER_API_VERSION", 2)
-    assert "has launcher API version 2" in _refusal()
+    message = _refusal()
+    assert "has launcher API version 2" in message
+    assert message.endswith("Install the anton this cowork-server pins (launcher API version 1).")
 
 
-def test_an_anton_whose_session_config_takes_no_policy_is_refused(stack):
-    import anton.core.session as session_module
+def test_an_anton_without_a_launcher_api_version_is_refused(stack):
+    from anton.core.backends import sandbox
+
+    stack.delattr(sandbox, "LAUNCHER_API_VERSION")
+    message = _refusal()
+    assert "has no LAUNCHER_API_VERSION in anton.core.backends.sandbox" in message
+    assert message.endswith("Install the anton this cowork-server pins (launcher API version 1).")
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [("anton.core.session", "ChatSessionConfig"), ("anton.core.backends.local", "LocalScratchpadRuntime")],
+)
+def test_an_anton_whose_spawning_classes_take_no_policy_is_refused(stack, module, name):
+    import importlib
 
     @dataclass
-    class OlderChatSessionConfig:
+    class Older:
         llm_client: object = None
 
-    OlderChatSessionConfig.__name__ = "ChatSessionConfig"
-    stack.setattr(session_module, "ChatSessionConfig", OlderChatSessionConfig)
-    assert "has a ChatSessionConfig that takes no cell_sandbox" in _refusal()
+    Older.__name__ = name
+    stack.setattr(importlib.import_module(module), name, Older)
+    assert f"has a {name} that takes no cell_sandbox" in _refusal()
+
+
+def test_an_anton_whose_policy_model_refuses_the_policy_is_refused(stack):
+    """A throwaway policy, built as a session builds one, at start: a model
+    without one of the fields would otherwise fail every session."""
+    from anton.core.backends import sandbox
+    from pydantic import BaseModel, ConfigDict
+
+    class OlderCellSandbox(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+
+        project_dir: Path
+        user_name: str
+
+    stack.setattr(sandbox, "CellSandbox", OlderCellSandbox)
+    message = _refusal()
+    assert "has a CellSandbox that refuses the policy this server builds" in message
+    assert "home_dir" in message
 
 
 def test_an_anton_whose_workspace_follows_links_is_refused(stack):
@@ -247,6 +297,28 @@ def test_the_shared_folder_is_made_at_start(stack, tmp_path):
     assert (tmp_path / "home" / "shared-files").is_dir()
 
 
+@pytest.mark.parametrize("name", [".env", ".master_key", "streams", "tmp", "shared"])
+def test_a_link_at_one_of_cowork_homes_own_entries_is_refused(stack, tmp_path, name):
+    """Agent code before the sandbox could swap streams/ for a link into the
+    shared folder, and every answer stream would land where every cell reads."""
+    home = tmp_path / "home"
+    where_it_leads = _project(tmp_path, "shared-files-before", name)
+    _plant_link(home / name, where_it_leads)
+    message = _refusal()
+    assert message.startswith(f"COWORK_CODE_SANDBOX=landlock: {home / name} is a link")
+    assert "remove the link and put the real file or folder back" in message
+    assert list(where_it_leads.iterdir()) == []
+
+
+def test_cowork_homes_own_entries_start_as_real_files_and_folders(stack, tmp_path):
+    home = tmp_path / "home"
+    for name in ("streams", "tmp", "shared"):
+        _project(home, name)
+    for name in (".env", ".master_key"):
+        (home / name).write_text("", encoding="utf-8")
+    cowork_server.create_app()
+
+
 # ── the token's copy in cowork-home's .env ───────────────────────────────────
 
 
@@ -298,6 +370,36 @@ def test_remove_auth_token_keeps_every_other_line(tmp_path):
     )
     assert remove_auth_token(env) is True
     assert env.read_text(encoding="utf-8") == "A=1\nCOWORK_AUTH_TOKEN_NOTE=kept\nB=2"
+
+
+def test_remove_auth_token_replaces_the_file_and_keeps_its_mode(tmp_path):
+    """The kept lines are written beside .env and moved over it, never into
+    it, so a second name for the old file keeps what it held."""
+    env = tmp_path / ".env"
+    env.write_text("A=1\nCOWORK_AUTH_TOKEN=one\nB=2\n", encoding="utf-8")
+    env.chmod(0o640)
+    second_name = tmp_path / "second-name"
+    os.link(env, second_name)
+
+    assert remove_auth_token(env) is True
+
+    assert env.read_text(encoding="utf-8") == "A=1\nB=2\n"
+    assert env.stat().st_mode & 0o777 == 0o640
+    assert second_name.read_text(encoding="utf-8") == "A=1\nCOWORK_AUTH_TOKEN=one\nB=2\n"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".env", "second-name"]
+
+
+def test_remove_auth_token_replaces_a_linked_env_instead_of_writing_through_it(tmp_path):
+    elsewhere = _project(tmp_path, "elsewhere") / "settings"
+    elsewhere.write_text("A=1\nCOWORK_AUTH_TOKEN=one\n", encoding="utf-8")
+    env = tmp_path / ".env"
+    env.symlink_to(elsewhere)
+
+    assert remove_auth_token(env) is True
+
+    assert not env.is_symlink()
+    assert env.read_text(encoding="utf-8") == "A=1\n"
+    assert elsewhere.read_text(encoding="utf-8") == "A=1\nCOWORK_AUTH_TOKEN=one\n"
 
 
 def test_remove_auth_token_leaves_a_file_without_one(tmp_path):
@@ -352,13 +454,50 @@ def test_a_persons_policy(stack, tmp_path):
 
 
 def test_a_persons_home_stays_theirs_with_everything_else_shared(stack, tmp_path):
-    """The sandbox store follows memory, which identity headers keep personal."""
-    stack.setenv("COWORK_PERSONAL_RESOURCES", "memory")
-    get_app_settings.cache_clear()
-    alice = _person(PARTITION_A, SUB_A, frozenset({PersonalResource.MEMORY}))
+    """The sandbox store is the person's own whatever the list leaves shared,
+    memory included."""
+    alice = _person(PARTITION_A, SUB_A, frozenset())
     project = _project(tmp_path / "home", "projects", "general")
     policy = build_cell_sandbox(scope=alice, project_dir=project)
     assert policy.home_dir == (tmp_path / "home").resolve() / PARTITION_A / "sandbox" / "home"
+
+
+@pytest.mark.parametrize("memory", ["personal", "shared"])
+def test_two_people_never_share_a_sandbox_store(stack, tmp_path, memory):
+    """HOME, TMPDIR and the probes' folder are each person's own, with memory
+    personal and with memory shared, which a later release lets the
+    operator choose: one person's pip cache must never reach another's
+    installs."""
+    resources = (
+        ALL_PERSONAL_RESOURCES
+        if memory == "personal"
+        else ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY}
+    )
+    home = tmp_path / "home"
+    real = home.resolve()
+    stores = {}
+    for partition, sub in ((PARTITION_A, SUB_A), (PARTITION_B, SUB_B)):
+        scope = _person(partition, sub, resources)
+        policy = build_cell_sandbox(scope=scope, project_dir=_project(home, partition, "projects", "p"))
+        probes = code_sandbox.probe_workspaces_dir(scope)
+        stores[partition] = (policy.home_dir, policy.tmp_dir, probes)
+        assert (policy.home_dir, policy.tmp_dir, probes) == tuple(
+            real / partition / "sandbox" / name for name in ("home", "tmp", "probes")
+        )
+    assert set(stores[PARTITION_A]).isdisjoint(stores[PARTITION_B])
+
+
+def test_a_persons_policy_names_every_other_partition(stack, tmp_path):
+    """The policy model refuses a writable grant inside another person's
+    partition, so the builder names every partition but the asker's; the
+    operator view has none of its own."""
+    home = tmp_path / "home"
+    real = home.resolve()
+    _project(home, PARTITION_B)
+    alice = build_cell_sandbox(scope=ALICE, project_dir=_project(home, PARTITION_A, "projects", "p"))
+    assert alice.other_partitions == (real / PARTITION_B,)
+    operator = build_cell_sandbox(scope=LOCAL_SCOPE, project_dir=_project(home, "projects", "general"))
+    assert set(operator.other_partitions) == {real / PARTITION_A, real / PARTITION_B}
 
 
 def test_two_people_never_share_a_home(stack, tmp_path):
@@ -509,6 +648,171 @@ async def test_a_turn_leaves_a_linked_folder_out_of_its_grants(
     assert warning.startswith(f"code sandbox: not granting {link}")
 
 
+# ── links left in a person's stores ──────────────────────────────────────────
+#
+# The server isn't locked, and it reads and writes a person's data vault, the
+# memory tiers a turn hands anton and the publish store by path. A link, or a
+# second name for another person's file, that agent code left in one before
+# the sandbox fails that read or write (refuse_planted_links). Neither the
+# server nor anton makes a link in these stores.
+
+PLANTED = "Agent code that ran before the sandbox may have left it there"
+
+
+def _tree(folder: Path) -> dict[str, bytes | None]:
+    """Every file and folder below ``folder``, with each file's bytes."""
+    return {
+        str(path.relative_to(folder)): None if path.is_dir() else path.read_bytes()
+        for path in sorted(folder.rglob("*"))
+    }
+
+
+def _plant_in_store(planted: str, *, store: Path, name: str, bobs: Path) -> None:
+    """Agent code before the sandbox: ``store`` swapped for a link to Bob's
+    folder, or ``store/name`` made a second name for Bob's file ``name``."""
+    if planted == "link":
+        _plant_link(store, bobs)
+        return
+    (bobs / name).write_text("bob's\n", encoding="utf-8")
+    store.mkdir(parents=True, exist_ok=True)
+    os.link(bobs / name, store / name)
+
+
+@pytest.mark.parametrize("planted", ["link", "hard link"])
+def test_a_planted_link_in_a_persons_vault_is_refused(stack, tmp_path, planted):
+    from cowork.services.connectors.persist import own_vault_root, persist_connection, vault_for_scope
+
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects", "general")
+    _plant_in_store(planted, store=own_vault_root(ALICE), name="postgres-prod", bobs=bobs)
+    before = _tree(bobs)
+
+    with pytest.raises(PlantedLinkError, match=PLANTED):
+        persist_connection("postgres", None, "prod", {"host": "db", "password": "alice-s3cret"}, scope=ALICE)
+    with pytest.raises(PlantedLinkError, match=PLANTED):
+        vault_for_scope(ALICE).list_connections()
+
+    assert _tree(bobs) == before
+
+
+@pytest.mark.parametrize("planted", ["link", "hard link"])
+async def test_a_planted_link_in_a_persons_memory_fails_their_turn(
+    stack, monkeypatch, tmp_path, planted
+):
+    """anton's Hippocampus appends to a tier's files by path, so Alice's
+    lessons would land in Bob's project, and his in her recall."""
+    from cowork.harnesses.memory.store import GlobalMemoryStore
+
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects", "general")
+    _plant_in_store(planted, store=GlobalMemoryStore(scope=ALICE).root, name="lessons.md", bobs=bobs)
+    before = _tree(bobs)
+
+    with pytest.raises(PlantedLinkError, match=PLANTED):
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=ALICE):
+            pass
+
+    assert _tree(bobs) == before
+
+
+@pytest.mark.parametrize("planted", ["link", "hard link"])
+def test_a_planted_link_in_a_persons_publish_store_is_refused(stack, tmp_path, planted):
+    from cowork.services import publish
+
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects", "general")
+    _plant_in_store(planted, store=tmp_path / "home" / PARTITION_A / "publish", name="state.json", bobs=bobs)
+    before = _tree(bobs)
+
+    with pytest.raises(PlantedLinkError, match=PLANTED):
+        publish._save_state({"publish_history": [{"artifact": "alice's"}]}, scope=ALICE)
+    with pytest.raises(PlantedLinkError, match=PLANTED):
+        publish._load_state(scope=ALICE)
+
+    assert _tree(bobs) == before
+
+
+async def test_a_persons_stores_without_planted_links_work(stack, monkeypatch, tmp_path):
+    from cowork.harnesses.memory.store import GlobalMemoryStore
+    from cowork.services import publish
+    from cowork.services.connectors.persist import persist_connection, vault_for_scope
+
+    slug = persist_connection("postgres", None, "prod", {"host": "db", "password": "pw"}, scope=ALICE)
+    assert vault_for_scope(ALICE).load("postgres", slug)["host"] == "db"
+    publish._save_state({"publish_history": [{"artifact": "a"}]}, scope=ALICE)
+    assert publish._load_state(scope=ALICE) == {"publish_history": [{"artifact": "a"}]}
+    tier = GlobalMemoryStore(scope=ALICE).root
+    tier.mkdir(parents=True, exist_ok=True)
+    (tier / "lessons.md").write_text("- check the fiscal year\n", encoding="utf-8")
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=ALICE) as turn:
+        assert turn.config.cortex is not None
+
+
+def test_a_link_on_the_way_to_a_store_is_refused(stack, tmp_path):
+    """The folders from the trusted root down to the store are opened without
+    following links too: here Alice's partition itself is Bob's."""
+    home = tmp_path / "home"
+    bobs = _project(home, PARTITION_B)
+    _plant_link(home / PARTITION_A, bobs)
+    with pytest.raises(PlantedLinkError, match=f"{home.resolve() / PARTITION_A} is a link"):
+        code_sandbox.refuse_planted_links(home / PARTITION_A / "data-vault")
+    assert list(bobs.iterdir()) == []
+
+
+def test_a_link_deep_in_a_store_is_refused_and_a_missing_store_passes(stack, tmp_path):
+    store = _project(tmp_path / "home", PARTITION_A, "memory", "users", SUB_A, "projects", "p")
+    _plant_link(store / "deeper" / "lessons", _project(tmp_path, "elsewhere"))
+    with pytest.raises(PlantedLinkError, match="lessons is a link"):
+        code_sandbox.refuse_planted_links(tmp_path / "home" / PARTITION_A / "memory")
+    code_sandbox.refuse_planted_links(tmp_path / "home" / PARTITION_B / "data-vault")
+
+
+def test_a_store_outside_the_servers_roots_is_trusted_as_configured(stack, tmp_path):
+    """Such as ANTON_COWORK_STATE_DIR set to a folder of the operator's: the
+    configured path is resolved, and what is there is still checked."""
+    elsewhere = _project(tmp_path, "operators-state")
+    (elsewhere / "state.json").write_text("{}", encoding="utf-8")
+    linked = tmp_path / "operators-state-link"
+    linked.symlink_to(elsewhere, target_is_directory=True)
+    code_sandbox.refuse_planted_links(linked / "state.json")
+    os.link(elsewhere / "state.json", _project(tmp_path, "bobs") / "state.json")
+    with pytest.raises(PlantedLinkError, match="a file with 2 names"):
+        code_sandbox.refuse_planted_links(linked / "state.json")
+
+
+def test_a_link_at_the_state_file_of_a_publish_store_outside_the_roots_is_refused(stack, tmp_path):
+    """ANTON_COWORK_STATE_DIR set to a folder of the operator's outside the
+    server's roots is trusted as configured, through a link too, and only the
+    store's own files in it are checked: a link at state.json is refused, not
+    followed."""
+    from cowork.services import publish
+
+    elsewhere = _project(tmp_path, "operators-state")
+    (elsewhere / "unrelated").symlink_to(tmp_path)
+    linked = tmp_path / "operators-state-link"
+    linked.symlink_to(elsewhere, target_is_directory=True)
+    stack.setenv("ANTON_COWORK_STATE_DIR", str(linked))
+    publish._save_state({"publish_history": [{"artifact": "a"}]}, scope=LOCAL_SCOPE)
+    assert publish._load_state(scope=LOCAL_SCOPE) == {"publish_history": [{"artifact": "a"}]}
+
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects", "general")
+    (bobs / "notes.json").write_text('{"bob": "private"}', encoding="utf-8")
+    (elsewhere / "state.json").unlink()
+    (elsewhere / "state.json").symlink_to(bobs / "notes.json")
+    before = _tree(bobs)
+
+    with pytest.raises(PlantedLinkError, match="state.json is a link"):
+        publish._load_state(scope=LOCAL_SCOPE)
+    with pytest.raises(PlantedLinkError, match="state.json is a link"):
+        publish._save_state({"publish_history": []}, scope=LOCAL_SCOPE)
+    assert _tree(bobs) == before
+
+
+def test_off_never_checks_a_store_for_links(monkeypatch, tmp_path):
+    monkeypatch.delenv("COWORK_CODE_SANDBOX", raising=False)
+    get_app_settings.cache_clear()
+    store = tmp_path / "store"
+    _plant_link(store, _project(tmp_path, "linked-on-purpose"))
+    code_sandbox.refuse_planted_links(store)
+
+
 # ── the turn ─────────────────────────────────────────────────────────────────
 
 
@@ -529,7 +833,9 @@ def _record_configs(monkeypatch) -> list[dict]:
 
 
 async def test_a_turn_off_passes_what_it_passed_before(monkeypatch, tmp_path):
-    """Off adds no keyword and keeps the backend sentence; on adds only the policy."""
+    """Off adds no keyword and keeps the backend sentence and the rules on
+    other files; on adds only the policy, and tells the agent about the
+    shared folder every person's agent reads and changes."""
     monkeypatch.setattr(code_sandbox, "_probe_abi", _never)
     calls = _record_configs(monkeypatch)
     monkeypatch.delenv("COWORK_CODE_SANDBOX", raising=False)
@@ -554,6 +860,17 @@ async def test_a_turn_off_passes_what_it_passed_before(monkeypatch, tmp_path):
     assert harness._SANDBOXED_BACKENDS_RULE in on_suffix
     assert "fullstack apps" not in on_suffix
     assert policy.project_dir == Path(on.project.path).resolve()
+    # The shared folder: absent off, named and allowed on.
+    shared = str(code_sandbox.shared_files_dir())
+    assert harness._OTHER_FILES_RULE in off_suffix
+    assert harness._ATTACHMENT_AFFORDANCE in off_suffix
+    assert "shared folder" not in off_suffix and shared not in off_suffix
+    assert f"and the files in the shared folder at `{shared}`. " in on_suffix
+    assert "Every person's agent on this deployment can read and change the shared folder" in on_suffix
+    assert f"or they are in the shared folder at `{shared}`" in on_suffix
+    assert harness._OTHER_FILES_RULE not in on_suffix
+    assert harness._ATTACHMENT_AFFORDANCE not in on_suffix
+    assert "strictly forbidden" in on_suffix and "exactly two ways" not in on_suffix
 
 
 async def test_a_persons_turn_grants_its_skills_and_attachments(personal_deployment, monkeypatch, tmp_path):
@@ -591,6 +908,27 @@ async def test_a_persons_turn_grants_its_skills_and_attachments(personal_deploym
     assert shared_root.resolve() in granted
     assert str(attachment) in suffix
     assert harness._SANDBOXED_BACKENDS_RULE in suffix
+
+
+async def test_a_turn_grants_the_managed_skills_its_links_point_at(
+    personal_deployment, monkeypatch, tmp_path, managed_dir
+):
+    """The turn links each managed skill into its scratch folder, and Landlock
+    checks where a link resolves, so the managed skill folders are granted
+    themselves, read-only."""
+    skill = managed_dir.skills_dir / "quarterly-report"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: quarterly-report\n---\n", encoding="utf-8")
+    monkeypatch.setattr(harness, "link_turn_skills", lambda **_: ())
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=ALICE) as turn:
+        policy = turn.config.cell_sandbox
+        links = turn.scratch / "managed-skills"
+
+    granted = set(policy.read_only_dirs)
+    assert skill.resolve() in granted
+    assert links.resolve() in granted
+    assert managed_dir.root.resolve() not in granted
 
 
 def _plant_link(link: Path, target: Path) -> None:
@@ -650,6 +988,35 @@ async def test_a_sandboxed_turn_refuses_a_project_reached_through_a_link(landloc
     assert list(someone_elses.iterdir()) == []
 
 
+async def test_a_sandboxed_turn_makes_a_missing_project_folder_again(landlock_alone, monkeypatch, tmp_path):
+    """As a turn with the sandbox off does, without following links."""
+    landlock_alone.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    async with built_turn(
+        monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None, before_build=lambda project: project.rmdir(),
+    ) as turn:
+        project = Path(turn.project.path)
+
+    assert project.is_dir() and (project / "skills").is_dir()
+    assert turn.config.cell_sandbox.project_dir == project.resolve()
+
+
+async def test_a_sandboxed_turn_refuses_a_context_folder_outside_the_project(
+    landlock_alone, monkeypatch, tmp_path
+):
+    """The server makes the context folder unlocked, so it makes none outside
+    the project, where it couldn't refuse a link on the way."""
+    elsewhere = tmp_path / "elsewhere" / "context"
+    landlock_alone.setenv("ANTON_CONTEXT_DIR", str(elsewhere))
+
+    with pytest.raises(RuntimeError, match="Unset ANTON_CONTEXT_DIR, or set it to a folder inside the project"):
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None):
+            pass
+
+    assert not elsewhere.parent.exists()
+
+
 def test_the_env_fallback_is_refused_under_the_sandbox(landlock_alone):
     workspace = SimpleNamespace(applied=False)
     workspace.apply_env_to_process = lambda: setattr(workspace, "applied", True)
@@ -707,7 +1074,13 @@ async def _run_probe(
 
 
 async def test_a_sandboxed_probe_hands_the_credentials_to_the_pad(stack, monkeypatch, tmp_path):
+    """The probe's prompt names the flat DS_<KEY> variables, and anton's
+    connection listing in its system prompt the namespaced ones: the pad
+    holds every name either one gives, and neither holds a value."""
+    import re
+
     from anton.core.backends.manager import ScratchpadManager
+    from anton.utils.datasources import build_datasource_context
 
     from cowork.services.connectors.probe import (
         CandidateCredentialsVault,
@@ -749,7 +1122,16 @@ async def test_a_sandboxed_probe_hands_the_credentials_to_the_pad(stack, monkeyp
         runtime_factory=lambda **_: None, coding_provider="", coding_model="",
         coding_api_key="", coding_base_url="", data_vault=vault,
     )
-    assert manager._derive_ds_env() == {"DS_HOST": "db", "DS_PASSWORD": "hunter2"}
+    pad_env = manager._derive_ds_env()
+    assert pad_env == {
+        "DS_HOST": "db", "DS_PASSWORD": "hunter2",
+        "DS_POSTGRES_PROBE__HOST": "db", "DS_POSTGRES_PROBE__PASSWORD": "hunter2",
+    }
+    listing = build_datasource_context(vault)
+    listed = set(re.findall(r"^ - (DS_\w+)$", listing, re.MULTILINE))
+    assert listed == {"DS_POSTGRES_PROBE__HOST", "DS_POSTGRES_PROBE__PASSWORD"}
+    assert listed <= pad_env.keys() and {"DS_HOST", "DS_PASSWORD"} <= pad_env.keys()
+    assert "hunter2" not in listing and "Host: db" not in listing
     assert vault.load("postgres", "probe") is None
     tmp = _probe_tmp_dir()
     assert not tmp.exists() or list(tmp.iterdir()) == []
@@ -855,6 +1237,41 @@ def test_a_probe_off_without_a_conversation_runs_in_the_system_tmp(monkeypatch):
     (created,) = _run_probe_handler(monkeypatch, scope=LOCAL_SCOPE)
     assert created["cell_sandbox"] is None
     assert created["workspace"].base.parent == Path(tempfile.gettempdir())
+
+
+# ── a construction without the policy ───────────────────────────────────────
+#
+# Behind tests/test_no_subprocess_static.py, which reads each construction:
+# under the sandbox, a session or a backend pool's pad built without the
+# policy raises rather than running the agent's code unlocked.
+
+
+def test_a_chat_session_without_the_policy_is_refused_under_the_sandbox(landlock_alone):
+    from cowork.common.chat_session import build_chat_session
+
+    with pytest.raises(RuntimeError, match="a chat session was built without a code-sandbox policy"):
+        build_chat_session(SimpleNamespace(cell_sandbox=None))
+
+
+def test_a_backend_pad_without_the_policy_is_refused_under_the_sandbox(landlock_alone, monkeypatch, tmp_path):
+    from cowork.services import scratchpad_runtime
+
+    monkeypatch.setattr(_RecordingRuntime, "calls", [])
+    monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
+    monkeypatch.setattr(scratchpad_runtime, "_pads", {})
+    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **coding: tuple(coding.values()))
+    refusal = "a backend pool's scratchpad was built without a code-sandbox policy"
+
+    with pytest.raises(RuntimeError, match=refusal):
+        scratchpad_runtime._make_runtime(
+            "app", workspace=tmp_path, coding_provider="openai", coding_model="m",
+            coding_api_key="k", coding_base_url="u",
+        )
+    with pytest.raises(RuntimeError, match=refusal):
+        scratchpad_runtime.get_or_create("app", workspace_path=str(tmp_path))
+
+    assert _RecordingRuntime.calls == []
+    assert scratchpad_runtime._pads == {}
 
 
 # ── app backends ─────────────────────────────────────────────────────────────
@@ -968,6 +1385,7 @@ async def test_the_backend_pool_carries_the_policy(landlock_kernel, monkeypatch,
     artifact_dir = _project(project, ".anton", "artifacts", "app")
 
     await artifacts._launch_backend_locked(artifact_dir, project_root=project, scope=LOCAL_SCOPE)
+    get_app_settings.cache_clear()
 
     (pool,) = pools
     if sandbox == "off":
@@ -986,6 +1404,8 @@ class _RecordingRuntime:
 def test_the_pool_runtime_off_gets_todays_arguments(monkeypatch, tmp_path):
     from cowork.services import scratchpad_runtime
 
+    monkeypatch.delenv("COWORK_CODE_SANDBOX", raising=False)
+    get_app_settings.cache_clear()
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
     scratchpad_runtime._make_runtime(
@@ -1022,6 +1442,8 @@ def test_a_pad_is_never_handed_to_a_caller_under_another_policy(monkeypatch, tmp
     when it starts, so another policy's caller is refused, not handed it."""
     from cowork.services import scratchpad_runtime
 
+    monkeypatch.delenv("COWORK_CODE_SANDBOX", raising=False)
+    get_app_settings.cache_clear()
     alices, bobs = object(), object()
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)

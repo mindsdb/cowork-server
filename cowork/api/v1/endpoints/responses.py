@@ -82,9 +82,11 @@ def _authorized_handle(
 
     A conversation_id is not an authorization token — the registry is keyed by
     it and would otherwise hand any authenticated caller another org's live
-    turn. Local mode never filters (today's single-user behavior); in org mode
-    a handle owned by a different org reads as absent, never 403 (no existence
-    leak). Assumes the scope was already validated by _require_streaming_scope.
+    turn. Where conversations are shared (local mode, the operator view, or a
+    personal scope that keeps them shared) it never filters. Where they are
+    partitioned, a handle owned by a different org/partition or user reads as
+    absent, never 403 (no existence leak). Assumes the scope was already
+    validated by _require_streaming_scope.
     """
     if handle is None:
         return None
@@ -210,8 +212,8 @@ def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> 
     Runs before any database read and before the routing gate, so the refusal
     costs nothing. RunRegistry.start repeats the check under its lock for a
     request that gets past this one while the running turn is still in its
-    own gate. In org mode only the caller's own turn counts, so the refusal
-    never reveals someone else's.
+    own gate. Where conversations are partitioned only the caller's own turn
+    counts, so the refusal never reveals someone else's.
     """
     if not conversation:
         return

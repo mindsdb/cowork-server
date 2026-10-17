@@ -6,7 +6,7 @@ import stat
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Iterator, Literal
+from typing import TYPE_CHECKING, Annotated, Iterator, Literal, NamedTuple
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -21,9 +21,15 @@ from pydantic import (
 from cowork.common.paths import dir_lstat, dir_rmtree, dir_unlink, opened_subdir_nofollow, pinned_dir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.db.scoped import (
+    ScopedSession,
+    TenantScope,
+    user_store_segments,
+    user_store_tiers_segments,
+)
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import (
+    MEMORY_STORE,
     PERSONAL_PROJECTS_DIRNAME,
     GlobalMemoryStore,
     PROJECT_SLOTS,
@@ -516,6 +522,13 @@ def _real_child_dirs(path: Path) -> list[str]:
         return []
 
 
+class PersonTier(NamedTuple):
+    """One person's memory tier: their partition and their sub."""
+
+    partition: str
+    sub: str
+
+
 def remove_project_memory_tiers(*, scope: TenantScope, project_id: UUID) -> int:
     """Remove each person's memory tier for a deleted project; return how many.
 
@@ -538,22 +551,24 @@ def remove_project_memory_tiers(*, scope: TenantScope, project_id: UUID) -> int:
     ):
         return 0
     shared = Path(settings.storage.shared_root)
-    # <shared>/<partition>/memory/users/<sub>, as scoped_user_storage_root
-    # lays out a person's global tier.
+    # <shared>/<partition>/memory/users/<sub>, the layout scoped_user_storage_root
+    # gives a person's global tier (user_store_segments).
     if scope.partitioned_for(PersonalResource.PROJECTS):
-        people = [(scope.org_id, scope.user_id)] if scope.org_id and scope.user_id else []
+        people = [PersonTier(scope.org_id, scope.user_id)] if scope.org_id and scope.user_id else []
     else:
         people = [
-            (partition, sub)
+            PersonTier(partition, sub)
             for partition in _real_child_dirs(shared)
-            for sub in _real_child_dirs(shared / partition / "memory" / "users")
+            for sub in _real_child_dirs(shared.joinpath(*user_store_tiers_segments(partition, store=MEMORY_STORE)))
         ]
     name = str(UUID(str(project_id)))
     removed = 0
-    for partition, sub in people:
+    for tier in people:
         try:
             with opened_subdir_nofollow(
-                shared, partition, "memory", "users", sub, PERSONAL_PROJECTS_DIRNAME
+                shared,
+                *user_store_segments(tier.partition, tier.sub, store=MEMORY_STORE),
+                PERSONAL_PROJECTS_DIRNAME,
             ) as projects:
                 if stat.S_ISDIR(dir_lstat(projects, name).st_mode):
                     dir_rmtree(projects, name)

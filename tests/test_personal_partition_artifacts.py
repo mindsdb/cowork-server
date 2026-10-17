@@ -351,6 +351,48 @@ def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people):
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
 
 
+def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monkeypatch):
+    """B's agent can replace B's whole `projects` root with a link to A's. The
+    path routes still reach none of A's artifacts through it."""
+    import shutil
+
+    dash, notes = two_people
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("publish-key", "https://publish.example"),
+    )
+    bob_projects = _general(BOB).parent
+    alice_projects = _general(ALICE).parent
+    shutil.rmtree(bob_projects)
+    bob_projects.symlink_to(alice_projects, target_is_directory=True)
+    primary = str(dash / "index.html")
+    client = _client()
+
+    assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
+    assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B).status_code == 404
+    assert client.delete("/api/v1/artifacts/", params={"path": str(notes)}, headers=B).status_code == 404
+    assert notes.is_dir()
+    assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+
+
+def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people):
+    """B's agent can replace B's whole partition folder with a link to A's. The
+    path routes still reach none of A's artifacts through it."""
+    import shutil
+
+    dash, _notes = two_people
+    bob_partition = _general(BOB).parent.parent
+    alice_partition = _general(ALICE).parent.parent
+    shutil.rmtree(bob_partition)
+    bob_partition.symlink_to(alice_partition, target_is_directory=True)
+    primary = str(dash / "index.html")
+    client = _client()
+
+    assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
+    assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B).status_code == 404
+    assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+
+
 def test_serve_by_project_name_reads_the_callers_own_project(two_people):
     url = "/api/v1/artifacts/serve/general/dash/index.html"
     client = _client()
@@ -376,6 +418,32 @@ def test_delete_by_path_reaches_only_the_owner(two_people, monkeypatch):
 
     assert client.delete("/api/v1/artifacts/", params={"path": str(notes)}, headers=A).status_code == 204
     assert not notes.exists()
+
+
+def test_the_operator_view_cannot_delete_a_persons_artifact_by_id(two_people, monkeypatch):
+    """A bearer-only (operator view) delete by id with a person's project_id is
+    refused where the list already refuses it, so it can't reach that person's
+    partition root; the artifact stays."""
+    dash, _notes = two_people
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("publish-key", "https://publish.example"),
+    )
+    client = _client()
+    artifact_id = _artifact_id(dash)
+    project_id = _general_id(ALICE)
+
+    refused = client.delete(
+        f"/api/v1/artifacts/{artifact_id}", params={"project_id": project_id}, headers=BEARER
+    )
+
+    assert refused.status_code == 404
+    assert dash.is_dir()
+    # The owner still lists it, so the refusal is the operator-view rule, not a
+    # missing artifact.
+    assert dash.name in {card["slug"] for card in client.get(
+        "/api/v1/artifacts/", params={"project_id": project_id}, headers=A
+    ).json()}
 
 
 def test_open_and_reveal_are_refused_in_a_personal_scope(two_people):
@@ -821,6 +889,39 @@ def test_desktop_previews_the_unkeyed_projects_root(monkeypatch, tmp_path):
             "/api/v1/artifacts/preview-mount", json={"path": str(dash / "index.html")}, headers=BEARER
         )
         assert mounted.status_code == 200
+        asset = client.get(
+            f"/api/v1/artifacts/preview-asset/{mounted.json()['token']}/index.html", headers=BEARER
+        )
+        assert asset.status_code == 200
+    finally:
+        get_app_settings.cache_clear()
+
+
+def test_desktop_preview_asset_does_not_rescan_the_projects_root(monkeypatch, tmp_path):
+    """On the desktop the per-asset scan guards nobody (one user, no mounts in
+    org mode), so preview_mount_for must not run it: a scan that raises still
+    serves the asset, which it wouldn't if each sub-asset rescanned."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "home" / "projects"))
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    get_app_settings.cache_clear()
+    from cowork.services import artifacts
+    try:
+        dash = _artifact(tmp_path / "home" / "projects" / "proj", "dash", title="Desktop forecast")
+        client = _client()
+        mounted = client.post(
+            "/api/v1/artifacts/preview-mount", json={"path": str(dash / "index.html")}, headers=BEARER
+        )
+        assert mounted.status_code == 200
+
+        def _no_scan(**_kw):
+            raise AssertionError("the desktop preview must not rescan the projects root")
+
+        monkeypatch.setattr(artifacts, "_scan_artifact_dirs", _no_scan)
+
         asset = client.get(
             f"/api/v1/artifacts/preview-asset/{mounted.json()['token']}/index.html", headers=BEARER
         )

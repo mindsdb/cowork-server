@@ -1014,7 +1014,8 @@ async def _cowork_connect_datasource(session: Any, tc_input: dict) -> str:
     change, so it runs against that vault's ConnectingDataVault, where those
     match nothing and a new connection is saved as the asker's own. A turn
     with connections turned off reads a FilteredDataVault over it, whose
-    for_connecting keeps them hidden.
+    connecting view lists them by label alone, so a paste never matches or
+    relabels one.
     """
     from anton.tools import handle_connect_datasource
 

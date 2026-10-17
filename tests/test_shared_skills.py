@@ -24,9 +24,12 @@ before, and share nothing.
 """
 from __future__ import annotations
 
+import errno
 import io
 import json
 import logging
+import os
+import threading
 import zipfile
 from pathlib import Path
 
@@ -38,7 +41,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 import cowork.server as cowork_server
-from cowork import shared_skills
+from cowork import managed, shared_skills
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -57,8 +60,11 @@ from cowork.services.skills import (
     SHARED_SKILL_RENAME_REFUSAL,
     SKILL_SHARING_BUSY,
     SKILL_SHARING_UNAVAILABLE,
+    SharedSkillsBusyError,
+    SkillAlreadyExistsError,
     SkillImmutableError,
     SkillService,
+    SkillSharingError,
     agent_skill_names,
     link_turn_skills,
 )
@@ -211,26 +217,39 @@ def _refused(call, detail: str = SHARED_SKILL_REFUSAL) -> None:
     assert (refused.value.status_code, refused.value.detail) == (403, detail)
 
 
+def _name_taken_by_shared(slug: str) -> str:
+    return f"Someone else shares a skill named '{slug}'. Choose another name."
+
+
+def _create_refused(call, slug: str) -> None:
+    """A create, upload or rename into a name someone else shares answers 409
+    with a message that fits a new skill, not the shared-skill refusal."""
+    with pytest.raises(HTTPException) as refused:
+        call()
+    assert (refused.value.status_code, refused.value.detail) == (409, _name_taken_by_shared(slug))
+
+
 def _every_change_is_refused(scoped, scope: TenantScope, slug: str) -> None:
-    """Every mutating skills route for ``scope`` on ``slug``: edit, disable,
-    rename it, rename one of ``scope``'s own into it, create it, upload it as
-    a SKILL.md and as a zip, and delete it. The service refuses each too."""
+    """Every mutating skills route for ``scope`` on ``slug``, which someone
+    else shares: an edit, disable, rename-away and delete answer 403 with the
+    shared sentence, while a create, upload and rename into the name answer
+    409 with a message that fits a new skill. The service refuses each too."""
     session = scoped(scope)
     service = SkillService(scope)
     service.create_skill("own-notes", "Mine.")
     _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(instructions="x"), session, None))
     _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(enabled=False), session, None))
     _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(label="taken-over"), session, None))
-    _refused(lambda: skills_ep.update_skill("own-notes", SkillUpdateRequest(label=slug), session, None))
-    _refused(lambda: skills_ep.create_skill(SkillCreateRequest(label=slug, instructions="x"), session, None))
-    _refused(lambda: skills_ep._upload_skill_bytes(_skill_md(slug, "x").encode(), "SKILL.md", session, None))
-    _refused(lambda: skills_ep._upload_skill_bytes(_zip(slug, "x"), "skill.zip", session, None))
+    _create_refused(lambda: skills_ep.update_skill("own-notes", SkillUpdateRequest(label=slug), session, None), slug)
+    _create_refused(lambda: skills_ep.create_skill(SkillCreateRequest(label=slug, instructions="x"), session, None), slug)
+    _create_refused(lambda: skills_ep._upload_skill_bytes(_skill_md(slug, "x").encode(), "SKILL.md", session, None), slug)
+    _create_refused(lambda: skills_ep._upload_skill_bytes(_zip(slug, "x"), "skill.zip", session, None), slug)
     _refused(lambda: skills_ep.delete_skill(slug, session, None))
     with pytest.raises(SkillImmutableError, match="shared with you"):
         service.update_skill(slug, instructions="x")
     with pytest.raises(SkillImmutableError, match="shared with you"):
         service.delete_skill(slug)
-    with pytest.raises(SkillImmutableError, match="shared with you"):
+    with pytest.raises(SkillAlreadyExistsError, match="Choose another name"):
         service.create_skill(slug, "x")
     service.delete_skill("own-notes")
 
@@ -330,6 +349,154 @@ def test_every_change_bob_tries_is_refused(sharing, scoped):
     assert (SkillService(ALICE).root / SHARED / "SKILL.md").read_bytes() == before
     assert not (SkillService(BOB).root / SHARED).exists()
     assert not (SkillService(BOB).root / "taken-over").exists()
+
+
+def test_a_dead_own_entry_does_not_hide_anothers_live_share(trusted, scoped):
+    """A share must not slip past the live-share check when a dead own entry
+    is listed ahead of someone else's live share: everyone reads the first
+    entry, so a duplicate would silently shadow the live one."""
+    SkillService(BOB).create_skill("x", "Bob's x.")
+    alice = SkillService(ALICE)
+    alice.create_skill("x", "Alice's x.")
+    _write_list([
+        _entry(sub=SUB_A, partition=PARTITION_A, skill="x"),
+        _entry(sub=SUB_B, partition=PARTITION_B, skill="x"),
+    ])
+
+    with pytest.raises(SkillSharingError, match="Someone else already shares"):
+        SkillService(ALICE)._share_new_skill("x")
+
+    # Alice's folder is removed and Bob's live share stays first in the list.
+    assert not (alice.root / "x").exists()
+    assert [(e["partition_id"], e["skill"]) for e in _list_entries()] == [
+        (PARTITION_A, "x"),
+        (PARTITION_B, "x"),
+    ]
+
+
+def test_a_read_error_on_the_other_creators_folder_answers_busy(trusted, scoped, monkeypatch):
+    """A transient read error on the other creator's folder must answer busy,
+    not count the live skill as gone and let a duplicate share through."""
+    SkillService(BOB).create_skill("x", "Bob's x.")
+    alice = SkillService(ALICE)
+    alice.create_skill("x", "Alice's x.")
+    _write_list([_entry(sub=SUB_B, partition=PARTITION_B, skill="x")])
+
+    real = SkillService.has_complete_skill
+
+    def flaky(self, slug, *, strict=False):
+        if slug == "x" and self._scope.org_id == PARTITION_B and strict:
+            raise OSError(errno.EIO, "I/O error")
+        return real(self, slug, strict=strict)
+
+    monkeypatch.setattr(SkillService, "has_complete_skill", flaky)
+
+    with pytest.raises(SharedSkillsBusyError):
+        SkillService(ALICE)._share_new_skill("x")
+
+
+def _refuse_the_list(patch: pytest.MonkeyPatch) -> None:
+    """Make every read of the shared-skill list raise, as the filesystem
+    would for a list it can't read, for as long as ``patch`` holds."""
+    real_open_fd = managed.open_fd
+    list_path = shared_skills.shared_skills_file()
+
+    def refuse(fd_path, flags, mode=0o777, *, dir_fd=None):
+        if Path(fd_path) == list_path:
+            raise OSError(errno.EIO, "I/O error")
+        return real_open_fd(fd_path, flags, mode, dir_fd=dir_fd)
+
+    patch.setattr(managed, "open_fd", refuse)
+
+
+def test_a_stale_entry_cant_resurrect_while_the_list_is_unreadable(trusted, scoped, monkeypatch, owned_logger):
+    """A delete that strands an entry, then a recreate while the list can't be
+    read, must answer busy and write nothing: the stale entry can never
+    silently re-share the new skill."""
+    skills_ep.create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
+    assert [e["skill"] for e in _list_entries()] == ["x"]
+
+    # The delete's unshare write fails, so the delete succeeds best-effort and
+    # the dead entry stays.
+    real_change = shared_skills.change_shared_skills
+    failing = {"on": True}
+
+    def maybe_fail(*, change):
+        if failing["on"]:
+            raise OSError(errno.EIO, "I/O error")
+        return real_change(change=change)
+
+    monkeypatch.setattr(shared_skills, "change_shared_skills", maybe_fail)
+    owned_logger("cowork.services.skills", level=logging.WARNING)
+    skills_ep.delete_skill("x", scoped(ALICE), None)
+    failing["on"] = False
+    assert not (SkillService(ALICE).root / "x").exists()
+    assert [e["skill"] for e in _list_entries()] == ["x"]
+
+    # The list now can't be read. Recreating X must answer busy, not write it.
+    with monkeypatch.context() as patch:
+        _refuse_the_list(patch)
+        with pytest.raises(HTTPException) as busy:
+            skills_ep.create_skill(SkillCreateRequest(label="x", instructions="second"), scoped(ALICE), None)
+    assert busy.value.status_code == 503
+    assert not (SkillService(ALICE).root / "x").exists()
+
+    # Reads recover. The stale entry still names a gone skill, so nobody reads it.
+    assert [e["skill"] for e in _list_entries()] == ["x"]
+    assert "x" not in _listed(scoped, BOB)
+    assert not (SkillService(ALICE).root / "x").exists()
+
+
+def test_a_delete_while_the_list_is_unreadable_logs_the_entry_it_may_leave(
+    trusted, scoped, monkeypatch, caplog, owned_logger
+):
+    """Deleting a shared skill while the list can't be read still deletes it,
+    and attempts the unshare whatever the forgiving cached read said: the
+    failure is logged naming the file, never skipped silently."""
+    skills_ep.create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
+    owned_logger("cowork.services.skills", level=logging.WARNING)
+
+    with monkeypatch.context() as patch:
+        _refuse_the_list(patch)
+        skills_ep.delete_skill("x", scoped(ALICE), None)
+
+    assert not (SkillService(ALICE).root / "x").exists()
+    list_file = str(shared_skills.shared_skills_file())
+    assert any(
+        "couldn't confirm deleted skill x is no longer listed as shared" in record.getMessage()
+        and list_file in record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.services.skills" and record.levelno == logging.WARNING
+    )
+
+
+def test_stop_sharing_sees_another_writers_change_to_the_list(trusted):
+    """An operator's unshare between a request's first read of the list and
+    its own stop_sharing leaves nothing to remove there; the skill then reads
+    as not shared, never as the request's earlier read had it."""
+    SkillService(ALICE).create_skill("x", "Alice's x.")
+    SkillService(ALICE).share("x")
+    service = SkillService(ALICE)
+    assert "x" in service.shared_by_owner()
+
+    _write_list([])
+
+    assert service.stop_sharing("x") is False
+    assert "x" not in service.shared_by_owner()
+
+
+def test_renaming_a_shared_skill_while_the_list_is_unreadable_answers_busy(trusted, scoped, monkeypatch, owned_logger):
+    skills_ep.create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
+    _refuse_the_list(monkeypatch)
+    owned_logger("cowork.shared_skills", level=logging.WARNING)
+
+    with pytest.raises(HTTPException) as busy:
+        skills_ep.update_skill("x", SkillUpdateRequest(label="x-v2"), scoped(ALICE), None)
+
+    assert busy.value.status_code == 503
+    # Nothing is half-renamed: the old name stays, the new one is never written.
+    assert (SkillService(ALICE).root / "x").exists()
+    assert not (SkillService(ALICE).root / "x-v2").exists()
 
 
 def test_alice_changes_her_shared_skill_and_bob_sees_each_change(sharing, scoped, stores):
@@ -440,7 +607,7 @@ async def test_bobs_turn_reads_shared_skills_from_its_last_read_only_root(sharin
 
     async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB) as turn:
         roots = turn.config.settings.skills_extra_roots
-        assert roots == [HOST_SKILLS_DIR, sharing.skills_dir, turn.scratch / "shared-skills"]
+        assert roots == [HOST_SKILLS_DIR, turn.scratch / "managed-skills", turn.scratch / "shared-skills"]
         assert _links(roots[-1]) == {SHARED: SkillService(ALICE).root.resolve() / SHARED}
         own = _links(turn.config.settings.skills_root)
         assert SHARED not in own and "alices-private" not in own
@@ -490,7 +657,7 @@ def test_a_skill_the_agent_already_has_is_never_shared(sharing, scoped, stores, 
     one shares nothing, and Bob still makes his own of that name."""
     from anton.core.memory.skills import SkillStore
 
-    slug = sorted(readonly_skill_dirs(SkillStore().builtin_root if root == "anton" else HOST_SKILLS_DIR))[0]
+    slug = sorted(readonly_skill_dirs(SkillStore().builtin_root if root == "anton" else HOST_SKILLS_DIR).readable)[0]
     assert slug in agent_skill_names()
     SkillService(ALICE).create_skill(slug, "Alice's version, for everyone.")
     _write_list([_entry(sub=SUB_A, partition=PARTITION_A, skill=slug)])
@@ -647,7 +814,7 @@ def test_each_share_check_answers_409_saying_why(sharing, scoped, tmp_path):
     alice = SkillService(ALICE)
     alice.ensure_builtin_skills()
     builtin = sorted(BUILTIN_SKILL_SLUGS)[0]
-    agent_name = sorted(readonly_skill_dirs(SkillStore().builtin_root))[0]
+    agent_name = sorted(readonly_skill_dirs(SkillStore().builtin_root).readable)[0]
     alice.create_skill(agent_name, "Alice's own version.")
     alice.create_skill("linked", "Holds a link.")
     secret = tmp_path / "secret.txt"
@@ -791,7 +958,7 @@ def test_a_skill_created_with_only_me_is_shared_with_nobody(trusted, scoped):
 def test_a_skill_created_shared_under_an_agent_skill_name_answers_409(trusted, scoped, way):
     from anton.core.memory.skills import SkillStore
 
-    slug = sorted(readonly_skill_dirs(SkillStore().builtin_root))[0]
+    slug = sorted(readonly_skill_dirs(SkillStore().builtin_root).readable)[0]
     detail = (
         f"Everyone's agent already has a skill named {slug}, so sharing yours would reach nobody. "
         "Rename your skill before you share it."
@@ -834,9 +1001,7 @@ def test_where_skills_are_shared_nobody_shares_one_at_a_time(all_shared, scoped)
     assert not any(skill["capabilities"]["canShare"] for skill in listing["skills"])
 
     # The 409's text, which the Cowork toast shows and the README quotes.
-    assert SKILL_SHARING_UNAVAILABLE == (
-        "Sharing one skill at a time isn't available here: every skill is already shared with everyone."
-    )
+    assert SKILL_SHARING_UNAVAILABLE == "Sharing one skill at a time isn't available here."
     # Unavailable answers before the skill is looked up.
     for slug in ("team-notes", "never-made"):
         for shared in (True, False):
@@ -939,6 +1104,29 @@ def test_the_sharing_route_answers_401_to_a_caller_with_no_person(trusted, monke
 
     assert (response.status_code, response.json()) == (401, {"detail": "Unauthorized"})
     assert not shared_skills.shared_skills_file().exists()
+
+
+def test_create_app_starts_when_a_fifo_stands_in_for_the_list(trusted, monkeypatch):
+    """A FIFO at skills.json must not block the start: create_app reads the
+    list once and a non-regular file reads as empty, never hanging."""
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    get_app_settings.cache_clear()
+    path = shared_skills.shared_skills_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(path)
+
+    ready: list[bool] = []
+
+    def start() -> None:
+        cowork_server.create_app()
+        ready.append(True)
+
+    thread = threading.Thread(target=start, daemon=True)
+    thread.start()
+    thread.join(30.0)
+
+    assert not thread.is_alive(), "create_app() blocked reading a FIFO at the shared-skill list"
+    assert ready == [True]
 
 
 # ── every skill shared ──────────────────────────────────────────────────────

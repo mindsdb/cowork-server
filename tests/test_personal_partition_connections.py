@@ -271,33 +271,67 @@ async def test_local_oauth_start_is_refused_for_a_person(stack, monkeypatch):
     assert refused.value.status_code == 403
 
 
-async def test_local_oauth_start_runs_for_a_person_whose_connections_are_shared(stack, monkeypatch):
-    """A resource left off the list stays shared, as with the setting off."""
+async def test_local_oauth_start_is_refused_where_connections_are_shared(stack, monkeypatch):
+    """Even with connections left shared, a trusted-identity deployment refuses
+    the local sign-in: the provider's redirect to the callback carries no
+    identity, so the connection would be saved with no creator."""
+    from fastapi import HTTPException
+
     from cowork.api.v1.endpoints.connectors import oauth
     from cowork.schemas.connectors import OAuthStartRequest
 
-    started = []
-    monkeypatch.setattr(oauth.oauth_service, "start", lambda service, *_a, **_k: started.append(service) or "ok")
+    monkeypatch.setattr(
+        oauth.oauth_service, "start",
+        lambda *_a, **_k: pytest.fail("the sign-in must not start where identity headers are trusted"),
+    )
     shared = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS})
     alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shared)
 
-    assert await oauth.start_oauth("gmail", MagicMock(), alice, OAuthStartRequest()) == "ok"
-    assert started == ["gmail"]
+    with pytest.raises(HTTPException) as refused:
+        await oauth.start_oauth("gmail", MagicMock(), alice, OAuthStartRequest())
+
+    assert refused.value.status_code == 403
+
+
+async def test_local_oauth_start_is_refused_for_the_operator_view(stack, monkeypatch):
+    """The operator view (no person) is refused too: the gate is the trusted
+    deployment, not the caller's partition."""
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.connectors import oauth
+    from cowork.schemas.connectors import OAuthStartRequest
+
+    monkeypatch.setattr(
+        oauth.oauth_service, "start",
+        lambda *_a, **_k: pytest.fail("the operator view's sign-in must not start the local flow"),
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await oauth.start_oauth("gmail", MagicMock(), LOCAL_SCOPE, OAuthStartRequest())
+
+    assert refused.value.status_code == 403
 
 
 @pytest.fixture
-def pending_gmail_sign_in(stack, monkeypatch):
-    """A trusted stack create_app accepts, with a Gmail sign-in pending as
-    start_oauth leaves it and the provider's side stubbed."""
+def trusted_app(stack, monkeypatch):
+    """A trusted stack create_app accepts: the bearer token, a home folder,
+    and the operator view for a request with no identity."""
+    monkeypatch.setenv("COWORK_HOME", str(stack / "home"))
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    return stack
+
+
+@pytest.fixture
+def pending_gmail_sign_in(trusted_app, monkeypatch):
+    """A trusted_app stack with a Gmail sign-in pending, as a start would
+    leave it, and the provider's side stubbed."""
     from datetime import datetime, timezone
 
     from cowork.common.settings.app_settings import OAuthSettings
     from cowork.services.connectors.oauth import google
 
-    monkeypatch.setenv("COWORK_HOME", str(stack / "home"))
-    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
-    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
-    get_app_settings.cache_clear()
     google.oauth_service._store(OAuthSettings()).set_pending(
         "gmail",
         state="s-1",
@@ -322,20 +356,11 @@ def _finish_gmail_sign_in(headers: dict) -> str:
     return page.text
 
 
-def test_a_shared_connections_sign_in_saves_into_the_shared_vault(pending_gmail_sign_in, monkeypatch):
-    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "memory")
-    get_app_settings.cache_clear()
-
-    page = _finish_gmail_sign_in(A)
-
-    assert "Gmail connected" in page
-    assert {engine for engine, _name in _names(vault_for_scope(LOCAL_SCOPE))} == {"gmail"}
-
-
-def test_a_shared_connections_sign_in_is_the_persons_own(pending_gmail_sign_in, monkeypatch):
-    """Connections shared: the sign-in records the person who finished it as
-    the connection's creator, so their delete goes through and someone
-    else's answers 403."""
+def test_a_shared_connections_connection_is_the_creators_own(trusted_app, monkeypatch):
+    """Connections shared: a connection records the person who created it, so
+    their delete goes through and someone else's answers 403. The connection
+    is saved through the person's vault, as a save with their credentials
+    would."""
     from cowork.api.v1.endpoints.connectors import connections as connections_ep
     from cowork.services.connectors.layered_vault import CREATED_BY_FIELD, SHARED_CONNECTION_REFUSAL
 
@@ -344,9 +369,11 @@ def test_a_shared_connections_sign_in_is_the_persons_own(pending_gmail_sign_in, 
     revoked = []
     monkeypatch.setattr(connections_ep.oauth_service, "revoke", lambda engine, name, *_a, **_k: revoked.append(name))
 
-    _finish_gmail_sign_in(A)
+    shared = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS})
+    alice_shared = _person(partition=PARTITION_A, sub=SUB_A, resources=shared)
+    engine, name = "gmail", "team@example.com"
+    vault_for_scope(alice_shared).save(engine, name, {"access_token": "at-1"})
 
-    [(engine, name)] = _names(vault_for_scope(LOCAL_SCOPE))
     assert vault_for_scope(LOCAL_SCOPE).read_record(engine, name)["fields"][CREATED_BY_FIELD] == SUB_A
     client = TestClient(cowork_server.create_app())
     path = f"/api/v1/connectors/connections/{engine}/{name}"
@@ -360,8 +387,8 @@ def test_a_shared_connections_sign_in_is_the_persons_own(pending_gmail_sign_in, 
 
 
 def test_the_operator_views_sign_in_saves_into_the_base_vault(pending_gmail_sign_in):
-    """Every resource personal: the operator view (no person) still finishes
-    its own sign-in, into the base vault, which no person's turn reads."""
+    """Every resource personal: the callback, for a request with no person,
+    saves into the base vault, which no person's turn reads."""
     page = _finish_gmail_sign_in(BEARER)
 
     assert "Gmail connected" in page

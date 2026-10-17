@@ -34,6 +34,7 @@ from cowork.services.shared_resources import (
 )
 from cowork.services.skills import (
     SharedSkillsBusyError,
+    SkillAlreadyExistsError,
     SkillOrigin,
     SkillService,
     SkillSharingError,
@@ -251,13 +252,14 @@ def list_skills(
     skill_service = SkillService(scoped.scope)
     skill_service.ensure_builtin_skills()
     access = SharedResourceAccess(scoped, principal)
-    return {
-        "skills": [
+    # The typed response carries can_share's "canShare" alias from the model.
+    return SkillListResponse(
+        skills=[
             _skill_response(visible, access=access, service=skill_service)
             for visible in skill_service.list_visible_skills()
         ],
-        "canShare": skill_service.sharing_available,
-    }
+        can_share=skill_service.sharing_available,
+    ).model_dump(by_alias=True)
 
 
 @router.post(
@@ -366,7 +368,7 @@ def _upload_skill_bytes(
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail=str(e)
                 )
-            except FileExistsError as e:
+            except (FileExistsError, SkillAlreadyExistsError) as e:
                 _release_new_skill_claim(access, claim, claim_token)
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
             except ValueError as e:
@@ -468,7 +470,12 @@ def update_skill(
                 if body.label is not None
                 else current.name
             )
-            service.refuse_unchangeable(current.name, target_slug)
+            service.refuse_unchangeable(current.name)
+            if target_slug != current.name:
+                # A rename into a name someone else shares is making a new
+                # skill of the caller's own, so it answers "choose another
+                # name", not the shared-skill refusal that fits an edit.
+                service.refuse_unchangeable(target_slug, creating=True)
             if scoped.scope.org_mode:
                 for slug in sorted({current.name, target_slug}):
                     resource_coordination.enter_context(
@@ -582,6 +589,8 @@ def update_skill(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
             )
+        except SkillAlreadyExistsError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except PermissionError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except ValueError as e:
@@ -604,10 +613,12 @@ def set_skill_sharing(
     """Share one of the caller's own skills with everyone, read-only, or stop
     sharing it. Both directions are idempotent.
 
-    409 where sharing is unavailable, before anything else is read; 403 for
-    a managed skill's name or one someone else shares with the caller; 404
-    when the caller's own store holds no such skill; 409 for a share a check
-    refuses, with the reason; 503 while another change holds the list.
+    401 for a caller with no person (the operator view, the desktop), from
+    the require(Authenticated) dependency before the body runs; 409 where
+    sharing is unavailable, before anything else is read; 403 for a managed
+    skill's name or one someone else shares with the caller; 404 when the
+    caller's own store holds no such skill; 409 for a share a check refuses,
+    with the reason; 503 while another change holds the list.
     """
     service = SkillService(scoped.scope)
     try:

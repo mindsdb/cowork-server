@@ -122,6 +122,16 @@ def _rename_rewrites_skill_store(scope: TenantScope) -> bool:
     )
 
 
+def projects_root(*, scope: TenantScope | None) -> Path:
+    """The projects root for ``scope``: org- or person-keyed where projects
+    are partitioned, the unkeyed root otherwise. The one expression for the
+    projects store, so ProjectService's own root, the artifact scan and the
+    workspace-path resolver can never key it differently."""
+    return scoped_storage_root(
+        Path(get_app_settings().project.root_dir), scope, store="projects"
+    )
+
+
 class ProjectNotFoundError(ValueError):
     """The requested project is absent from the caller's scoped view."""
 
@@ -367,11 +377,7 @@ class ProjectService:
         the same project name collided, and the second create hit an existing
         dir — a cross-org existence oracle.
         """
-        return scoped_storage_root(
-            Path(get_app_settings().project.root_dir),
-            self.session.scope,
-            store="projects",
-        )
+        return projects_root(scope=self.session.scope)
 
     # --- Symlink-safe filesystem ops on the projects root -------------------
     #
@@ -1248,24 +1254,36 @@ class ProjectService:
         return True
 
     def _refuse_while_others_use(self, project_id: UUID) -> None:
-        """Raise ProjectInUseError while a shared project holds another
-        partition's conversations or schedules.
+        """Raise ProjectInUseError while this project holds a conversation or
+        schedule of another partition's.
 
         A person's delete reaches only rows their scope can delete. The
-        scoped select misses another person's conversations, which the
+        scoped select misses another partition's conversations, which the
         ``conversations.project_id`` foreign key then refuses on Postgres, or
         which are left pointing at nothing on SQLite; and the schedules
-        cascade loads another person's schedule, which the flush hook refuses.
-        Only where projects are shared and the rows are not; the read goes
-        through the unscoped session, since the scoped one can't see them.
+        cascade loads another partition's schedule, which the flush hook
+        refuses. This covers a shared project another person still uses, and a
+        personal project the operator view wrote into (a NULL-org row an
+        ``is_distinct_from`` catches). The read goes through the unscoped
+        session, since the scoped one can't see those rows.
+
+        The project row is locked FOR UPDATE first, in the delete's own
+        transaction, so a concurrent create of a schedule or conversation
+        under it blocks on the foreign key until this delete commits or rolls
+        back: without the lock that child row is created between the check and
+        the cascade and is silently removed by ON DELETE CASCADE.
         """
         scope = self.session.scope
-        if not scope.personal or scope.partitioned_for(PersonalResource.PROJECTS):
+        if not scope.personal:
             return
         from cowork.models.conversation import Conversation
         from cowork.models.schedule import Schedule
 
         raw = unsafe_unscoped_session(self.session)
+        # FOR UPDATE, not FOR NO KEY UPDATE: a child insert's foreign-key check
+        # takes FOR KEY SHARE, which only FOR UPDATE conflicts with. SQLite
+        # drops it, so nothing changes there.
+        raw.execute(sa.select(Project.id).where(Project.id == project_id).with_for_update())
         for model, resource in (
             (Conversation, PersonalResource.CONVERSATIONS),
             (Schedule, PersonalResource.SCHEDULES),

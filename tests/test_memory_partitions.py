@@ -122,6 +122,34 @@ async def test_the_listing_holds_only_the_callers_own_tiers(env):
     assert not (root / "shared" / PARTITION_A / "projects" / "general" / ".anton" / "memory").exists()
 
 
+MEMORY_ONLY = frozenset({PersonalResource.MEMORY})
+
+
+async def test_memory_only_keeps_each_persons_memory_their_own(env):
+    """AC7: with memory the only personal resource and everything else shared,
+    each person's turn reads and writes only its own memory/users/<sub> tier,
+    and its Memories listing holds only its own items, even for a project both
+    share."""
+    engine, root = env
+    alice = _person(partition=PARTITION_A, sub=SUB_A, resources=MEMORY_ONLY)
+    bob = _person(partition=PARTITION_B, sub=SUB_B, resources=MEMORY_ONLY)
+    shared_project = _project(engine=engine, scope=alice, path=root / "projects" / "team")
+    await _remember(engine=engine, scope=alice, project_id=shared_project, rule="A: rule", lesson="A: lesson")
+    await _remember(engine=engine, scope=bob, project_id=shared_project, rule="B: rule", lesson="B: lesson")
+
+    assert _contents(_service(engine=engine, scope=alice).list_memory_sync()) == {"A: rule", "A: lesson"}
+    assert _contents(_service(engine=engine, scope=bob).list_memory_sync()) == {"B: rule", "B: lesson"}
+
+    a_tier = _person_tier(root=root, partition=PARTITION_A, sub=SUB_A)
+    b_tier = _person_tier(root=root, partition=PARTITION_B, sub=SUB_B)
+    assert (a_tier / "rules.md").read_text().strip() == "A: rule"
+    assert (b_tier / "rules.md").read_text().strip() == "B: rule"
+    assert (a_tier / "projects" / str(shared_project) / "lessons.md").read_text().strip() == "A: lesson"
+    assert (b_tier / "projects" / str(shared_project) / "lessons.md").read_text().strip() == "B: lesson"
+    # The shared project's own folder holds nobody's memory.
+    assert not (root / "projects" / "team" / ".anton" / "memory").exists()
+
+
 async def test_a_shared_projects_memory_is_still_per_person(env):
     engine, root = env
     alice = _person(partition=PARTITION_A, sub=SUB_A, resources=WITHOUT_PROJECTS)

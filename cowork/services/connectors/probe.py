@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
-from anton.core.datasources.data_vault import LocalDataVault
+from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
@@ -89,15 +89,20 @@ class CandidateCredentialsVault:
     credentials as its one connection, held in memory.
 
     anton's ScratchpadManager derives the pad's DS_* from ``env_for`` and
-    hands them to the launcher's environment, so the cell reads the same
-    ``DS_<KEY>`` names the probe's prompt lists, and no plaintext file is
-    written for it. It stores nothing, so nothing on disk can add a
-    connection to it. ``load`` and ``read_record`` answer None, so the prompt's
-    datasource listing names the connection without its fields.
+    hands them to the launcher's environment, so no plaintext file is written
+    for them. It stores nothing, so nothing on disk can add a connection to it.
+
+    Two prompts name those variables. The probe's own names the flat
+    ``DS_<KEY>`` ones (_credential_env). anton's datasource listing in the
+    system prompt names the namespaced ``DS_<ENGINE>_PROBE__<KEY>`` ones it
+    derives from ``read_record``'s fields, and says credentials are
+    namespaced. So the pad gets both, and ``read_record`` gives the field
+    names with empty values: every name either prompt gives is set in the
+    pad, and no value reaches a prompt. ``load`` answers None.
     """
 
     engine: str
-    env: Mapping[str, str]
+    credentials: Mapping[str, Any]
 
     def _is_candidate(self, engine: str, name: str) -> bool:
         return (engine, name) == (self.engine, PROBE_CONNECTION_NAME)
@@ -106,13 +111,25 @@ class CandidateCredentialsVault:
         return [{"engine": self.engine, "name": PROBE_CONNECTION_NAME, "created_at": ""}]
 
     def env_for(self, engine: str, name: str, *, flat: bool = False) -> dict[str, str] | None:
-        return dict(self.env) if self._is_candidate(engine, name) else None
+        if not self._is_candidate(engine, name):
+            return None
+        env = _credential_env(self.credentials)
+        if flat:
+            return env
+        prefix = _slug_env_prefix(engine, name)
+        return {
+            **env,
+            **{f"{prefix}__{str(key).upper()}": str(value) for key, value in self.credentials.items() if key},
+        }
 
     def load(self, engine: str, name: str) -> dict[str, str] | None:
         return None
 
     def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
-        return None
+        if not self._is_candidate(engine, name):
+            return None
+        keys = [str(key) for key in self.credentials if key]
+        return {"fields": dict.fromkeys(keys, ""), "secure_keys": keys}
 
     def save(self, engine: str, name: str, credentials: dict[str, str], *, secure_keys: list[str] | None = None) -> object:
         raise NotImplementedError("a probe's candidate credentials are never saved from the probe")
@@ -438,9 +455,8 @@ class CredentialProbe:
             # tmp/, which the sandbox denies, and no shared folder a stray
             # connection file could join.
             env_path = None
-            candidate_env = _credential_env(self.credentials)
-            var_names = list(candidate_env)
-            data_vault = CandidateCredentialsVault(engine=self.engine, env=candidate_env)
+            var_names = list(_credential_env(self.credentials))
+            data_vault = CandidateCredentialsVault(engine=self.engine, credentials=self.credentials)
 
         SET_STATUS_TOOL = ToolDef(
             name="set_status",

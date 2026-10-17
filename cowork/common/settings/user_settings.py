@@ -378,7 +378,8 @@ ORG = _OrgScoped()
 
 class _OperatorPinned:
     """Annotated marker: the operator sets this for the whole deployment (the
-    model, its endpoint, memory and cost), so a personal partition reads and
+    model, its endpoint, memory and cost, and how the agent acts: act_first,
+    proactive_dashboards), so a personal partition reads and
     writes it on the global row and never keeps a row of its own. SecretStr
     credentials are pinned regardless. Read by setting_is_operator_pinned."""
 
@@ -795,17 +796,25 @@ class UserSettings(Settings):
         title="History Compaction",
         description="Replay anton's compacted summary + recent tail instead of full history each turn.",
     )
-    proactive_dashboards: bool = Field(
+    proactive_dashboards: Annotated[bool, PINNED] = Field(
         default=False,
         title="Proactive Dashboards",
         description="Enable proactive dashboard suggestions.",
     )
-    act_first: bool = Field(
+    act_first: Annotated[bool, PINNED] = Field(
         default=True,
         title="Act first, ask later",
         description=(
             "Act on reasonable defaults and state assumptions inline instead of "
             "stopping to ask. Turn off for a more cautious, ask-first agent."
+        ),
+    )
+    first_take_enabled: bool = Field(
+        default=True,
+        title="Instant first take",
+        description=(
+            "While the agent works, show a quick reply on the fast model saying "
+            "what it is about to do, until the agent starts writing."
         ),
     )
     # ── Advanced agent budgets ──
@@ -1405,8 +1414,9 @@ def setting_is_org_scoped(key: str) -> bool:
 
 def setting_is_operator_pinned(key: str) -> bool:
     """True for a key the operator sets for the whole deployment: the model and
-    provider choices, their endpoints and credentials, memory and the per-turn
-    budgets. SecretStr credentials are pinned structurally; other fields iff
+    provider choices, their endpoints and credentials, memory, the per-turn
+    budgets, and how the agent acts (act_first, proactive_dashboards).
+    SecretStr credentials are pinned structurally; other fields iff
     tagged with the PINNED marker. A personal partition resolves these from the
     global row, then the environment, and ignores a row of its own
     (SettingService). Org mode routes them as setting_is_org_scoped says."""

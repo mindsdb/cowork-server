@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from fastapi import HTTPException
 from pydantic import SecretStr
 
+from cowork.code_sandbox import refuse_planted_links
 from cowork.common.paths import cowork_home, pod_local_only
 # Imported for its side effect on the module namespace as well as its use:
 # tests monkeypatch `publish.get_app_settings`, so removing it because a
@@ -106,6 +107,11 @@ def raise_publish_permission_error(exc: Exception) -> None:
             raise ProductPermissionDenied() from exc
 
 
+#: The files the publish store holds: its state, and the temporary file a
+#: save writes and moves over it.
+_STATE_FILES = ("state.json", "state.json.tmp")
+
+
 def _cowork_state_dir(*, scope: TenantScope | None) -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
@@ -126,6 +132,11 @@ def _cowork_state_dir(*, scope: TenantScope | None) -> Path:
         from cowork.db.scoped import scoped_storage_root
 
         path = scoped_storage_root(path, scope, store="publish")
+    # Under the code sandbox, a link or hard-linked file that agent code left
+    # on the way to state.json, or at it, fails the read or write instead of
+    # being followed. Only the store's own files are checked: the operator
+    # view's store is cowork-home itself.
+    refuse_planted_links(path, only=_STATE_FILES)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -202,9 +213,24 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             pass
 
 
+class DesktopArtifact(NamedTuple):
+    """An artifact and the artifacts root it sits under (desktop_artifact_and_base)."""
+
+    artifact: Path
+    artifacts_base: Path
+
+
+class ResolvedReport(NamedTuple):
+    """A published artifact's state file, its key, and its report id (_resolve_report_id)."""
+
+    published_json: Path
+    published_key: str
+    report_id: str
+
+
 def desktop_artifact_and_base(
     raw_path: str, *, scope: TenantScope | None
-) -> tuple[Path, Path]:
+) -> DesktopArtifact:
     """(artifact, artifacts_base) for a desktop request path, resolved only
     inside ``scope``'s artifacts roots.
 
@@ -223,7 +249,7 @@ def desktop_artifact_and_base(
             artifact.resolve().relative_to(root.resolve())
         except (ValueError, OSError):
             continue
-        return artifact, root
+        return DesktopArtifact(artifact, root)
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
@@ -255,10 +281,13 @@ def desktop_publish_context(
     both. The org path supplies these four values from the DB and a minted turn
     key instead.
     """
-    artifact, root = desktop_artifact_and_base(raw_path, scope=scope)
+    found = desktop_artifact_and_base(raw_path, scope=scope)
     api_key, publish_url = desktop_publish_credential()
     return PublishContext(
-        artifact=artifact, artifacts_base=root, api_key=api_key, publish_url=publish_url
+        artifact=found.artifact,
+        artifacts_base=found.artifacts_base,
+        api_key=api_key,
+        publish_url=publish_url,
     )
 
 
@@ -797,7 +826,8 @@ def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
     """
     # Path first, credential later: an artifact with nothing published must
     # report that, not "configure your API key".
-    artifact, artifacts_base = desktop_artifact_and_base(raw_path, scope=scope)
+    found = desktop_artifact_and_base(raw_path, scope=scope)
+    artifact, artifacts_base = found.artifact, found.artifacts_base
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
@@ -825,7 +855,7 @@ def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
     return result
 
 
-def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> tuple[Path, str, str]:
+def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> ResolvedReport:
     """Resolve (published_json_path, published_key, report_id) for an artifact
     of ``scope``.
 
@@ -846,7 +876,7 @@ def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> tuple[Pat
     report_id = entry.get("report_id") if isinstance(entry, dict) else None
     if not report_id:
         raise FileNotFoundError("Artifact is not published")
-    return published_json, published_key, report_id
+    return ResolvedReport(published_json, published_key, report_id)
 
 
 def _publisher_http_detail(exc: Exception) -> str:
@@ -870,7 +900,7 @@ def list_versions(raw_path: str, *, scope: TenantScope | None) -> dict:
     if not api_key:
         raise ValueError("Configure your provider API key in Settings to view versions")
 
-    _published_json, _key, report_id = _resolve_report_id(raw_path, scope=scope)
+    report_id = _resolve_report_id(raw_path, scope=scope).report_id
 
     try:
         from anton.publisher import list_versions as _list_versions
@@ -926,7 +956,8 @@ def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> d
     if not api_key:
         raise ValueError("Configure your provider API key in Settings before rolling back")
 
-    published_json, published_key, report_id = _resolve_report_id(raw_path, scope=scope)
+    report = _resolve_report_id(raw_path, scope=scope)
+    published_json, published_key, report_id = report.published_json, report.published_key, report.report_id
 
     try:
         from anton.publisher import activate_version as _activate_version

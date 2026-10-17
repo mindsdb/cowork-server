@@ -31,7 +31,12 @@ from cowork.db.personal_resources import PersonalResource, check_personal_resour
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
-from cowork.managed import SharedRegistryError, cortex_takes_managed_layer, managed_folder
+from cowork.managed import (
+    ManagedFolder,
+    SharedRegistryError,
+    cortex_takes_managed_layer,
+    managed_folder,
+)
 from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
@@ -323,6 +328,47 @@ class _NoStoreMiddleware:
         await self.app(scope, receive, send_with_no_store)
 
 
+def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
+    """Refuse to start when the server's user can't read the managed skills or
+    data-vault folder, or a managed skill folder or its SKILL.md. Each would
+    otherwise crash a page, a turn, or the restart the runbook names as the
+    remedy, rather than surface here with the path and the fix."""
+    from anton.core.tools.skill_format import SKILL_FILE
+
+    for folder in (managed.skills_dir, managed.vault_dir):
+        if not os.access(folder, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
+                "server's user needs read and search permission on it. Run "
+                f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
+                f"{folder}` if it is owned by another user)."
+            )
+    for slug_dir in sorted(managed.skills_dir.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        if not os.access(slug_dir, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's skill folder {slug_dir} can't be read: run "
+                f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
+            )
+        skill_file = slug_dir / SKILL_FILE
+        if skill_file.exists() and not os.access(skill_file, os.R_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's skill file {skill_file} can't be read: run "
+                f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
+            )
+    # A managed connection file the server's user can't read vanishes for
+    # everyone and frees its name, so a tester could save their own under it.
+    # Refuse at start rather than silently share less.
+    for vault_file in sorted(managed.vault_dir.iterdir()):
+        if vault_file.is_file() and not os.access(vault_file, os.R_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's connection file {vault_file} can't be read: run "
+                f"`chown 1000:1000 {vault_file}` on the host copy so it is not freed and "
+                "re-saved by a tester."
+            )
+
+
 def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -442,6 +488,11 @@ def create_app() -> FastAPI:
                 "the server's user needs read and search permission on it (for example "
                 "chmod 755), or every turn fails reading its rules."
             )
+        # A skills/ or data-vault/ folder the server's user can't read, or a
+        # managed skill folder or its SKILL.md it can't read, would crash every
+        # person's Skills or Connections page and every turn. Refuse at start,
+        # with the path and the fix, rather than loop on a crash.
+        _refuse_unreadable_managed_stores(managed)
         if not cortex_takes_managed_layer():
             raise RuntimeError(
                 "COWORK_MANAGED_DIR needs an anton whose Cortex takes managed_hc, the "

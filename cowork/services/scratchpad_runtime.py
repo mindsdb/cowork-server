@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
+from cowork.code_sandbox import refuse_a_missing_policy
+
 if TYPE_CHECKING:
     from anton.core.backends.sandbox import CellSandbox
 
@@ -132,6 +134,7 @@ def _make_runtime(
     coding_base_url: str,
     cell_sandbox: CellSandbox | None = None,
 ):
+    refuse_a_missing_policy(cell_sandbox, site="a backend pool's scratchpad")
     from anton.core.backends.local import LocalScratchpadRuntime
 
     return LocalScratchpadRuntime(
@@ -162,6 +165,7 @@ def get_or_create(
     coding_base_url: str = "",
     cell_sandbox: CellSandbox | None = None,
 ):
+    refuse_a_missing_policy(cell_sandbox, site="a backend pool's scratchpad")
     _touch_activity()
     workspace = _resolve_workspace(workspace_path)
     pads = _pads.setdefault(workspace, {})

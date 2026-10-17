@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -108,6 +109,89 @@ def test_a_memory_folder_the_server_cannot_search_is_refused(managed_dir):
     finally:
         managed_dir.memory_dir.chmod(0o755)
     assert str(managed_dir.memory_dir) in str(refused.value)
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX modes, enforced for non-root")
+def test_a_managed_skill_file_the_server_cannot_read_is_refused(managed_dir):
+    """A managed skill whose SKILL.md the server can't read would crash every
+    person's Skills page and every turn, and loop the restart; the start stops
+    instead, naming the file and the fix."""
+    skill = managed_dir.skills_dir / "forecast-review"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: forecast-review\n---\nbody\n")
+    (skill / "SKILL.md").chmod(0o000)
+    try:
+        with pytest.raises(RuntimeError, match="skill file .* can't be read") as refused:
+            cowork_server.create_app()
+    finally:
+        (skill / "SKILL.md").chmod(0o644)
+    assert str(skill / "SKILL.md") in str(refused.value)
+    assert "chmod" in str(refused.value)
+
+
+def test_an_unreadable_managed_skill_stays_reserved_but_not_readable(managed_dir, caplog, owned_logger, monkeypatch):
+    """One managed skill the server can't stat must not crash the listing: it
+    drops out of readable but stays reserved, so its name is still refused for a
+    create. Driven by a monkeypatch, so it holds whether or not CI runs as root."""
+    from cowork.managed import readonly_skill_dirs
+
+    for slug in ("good", "bad"):
+        folder = managed_dir.skills_dir / slug
+        folder.mkdir()
+        (folder / "SKILL.md").write_text(f"---\nname: {slug}\n---\nx\n")
+    bad_skill_file = managed_dir.skills_dir / "bad" / "SKILL.md"
+    real_is_file = Path.is_file
+
+    def flaky_is_file(self):
+        if self == bad_skill_file:
+            raise PermissionError(13, "Permission denied")
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", flaky_is_file)
+    owned_logger("cowork.managed", level=logging.ERROR)
+
+    result = readonly_skill_dirs(managed_dir.skills_dir)
+
+    assert set(result.readable) == {"good"}
+    assert result.reserved == frozenset({"good", "bad"})
+    assert any(
+        "bad" in record.getMessage() and "chmod" in record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.managed" and record.levelno == logging.ERROR
+    )
+
+
+def test_a_skill_root_that_is_a_file_reads_as_empty_without_an_error(tmp_path, caplog, owned_logger):
+    """A read-only skill root that is missing or a file holds no skills, and
+    logs nothing: only a root the server's user can't list is an error."""
+    from cowork.managed import ManagedSkills, readonly_skill_dirs
+
+    root = tmp_path / "not-a-folder"
+    root.write_text("")
+    owned_logger("cowork.managed", level=logging.ERROR)
+
+    assert readonly_skill_dirs(root) == ManagedSkills({}, frozenset())
+    assert readonly_skill_dirs(tmp_path / "missing") == ManagedSkills({}, frozenset())
+    assert not [record for record in caplog.records if record.name == "cowork.managed"]
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX modes, enforced for non-root")
+def test_a_managed_connection_file_the_server_cannot_read_is_refused(managed_dir):
+    """A managed connection file the server can't read vanishes for everyone and
+    frees its name, so a tester could save their own under it; the start stops
+    instead, naming the file and the chown."""
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    LocalDataVault(managed_dir.vault_dir).save("postgres", "warehouse", {"host": "w.example"})
+    vault_file = next(path for path in managed_dir.vault_dir.iterdir() if path.is_file())
+    vault_file.chmod(0o000)
+    try:
+        with pytest.raises(RuntimeError, match="connection file .* can't be read") as refused:
+            cowork_server.create_app()
+    finally:
+        vault_file.chmod(0o644)
+    assert str(vault_file) in str(refused.value)
+    assert "chown" in str(refused.value)
 
 
 def test_refused_with_remote_turns(managed_dir, monkeypatch):
@@ -261,3 +345,13 @@ def test_the_folder_model_names_its_folders(tmp_path):
     # The skills people share are listed in the shared root, not here.
     assert not hasattr(folder, "shared_skills_file")
     assert folder.missing_dirs() == [tmp_path / "memory", tmp_path / "skills", tmp_path / "data-vault"]
+
+
+def test_a_registry_reads_where_os_has_no_nonblocking_flag(monkeypatch, tmp_path):
+    """Windows Python has no os.O_NONBLOCK; reading a registry there must not
+    raise AttributeError, even for a missing file."""
+    from cowork.managed import SharedConnections
+
+    monkeypatch.delattr(os, "O_NONBLOCK")
+
+    assert SharedConnections.read(tmp_path / "missing.json") == SharedConnections(())

@@ -38,6 +38,9 @@ O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 # LF into CRLF. The built-in ``open()`` always sets it; raw descriptors get it
 # from ``open_fd`` (ENG-2950). 0 on POSIX, where there is no text mode.
 O_BINARY = getattr(os, "O_BINARY", 0)
+# ``O_NONBLOCK`` is POSIX-only too. An open with it never waits on a FIFO at
+# the path; Windows has no FIFOs a path can name, so 0 there loses nothing.
+O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 def cowork_home() -> Path:

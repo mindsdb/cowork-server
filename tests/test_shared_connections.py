@@ -12,6 +12,9 @@ reads it live from its creator's vault, marked ``managed`` (they can't change
 it) and ``shared``, and every change they try answers 403 with the shared
 sentence, a delete before its OAuth revoke. Its creator sees it shared and
 changes, reconnects and deletes it as before, and everyone sees each change.
+Under the code sandbox, a link left in a sharer's vault before the sandbox
+fails only that person's own reads: everyone else goes on without what they
+share.
 
 With connections shared, everyone reads the one base vault. A person
 changes only an entry they created, the operator view changes any, and a
@@ -25,8 +28,6 @@ import logging
 import os
 from pathlib import Path
 
-from types import SimpleNamespace
-from typing import NamedTuple
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
@@ -37,6 +38,7 @@ from sqlalchemy import delete
 
 import cowork.server as cowork_server
 from cowork.api.v1.endpoints.connectors import connections as connections_ep
+from cowork.code_sandbox import PlantedLinkError
 from cowork.api.v1.endpoints.connectors import submissions as submissions_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import use_settings_scope
@@ -66,7 +68,7 @@ from cowork.services.connectors.persist import (
     vault_for_scope,
 )
 from tests._fakes import FakeRequest
-from tests._turns import built_turn
+from tests._turns import built_turn, connect_in_chat
 
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 SUB_A = "11111111-1111-4111-8111-111111111111"
@@ -485,35 +487,6 @@ async def test_alice_changes_her_shared_connection_and_bob_sees_each_change(shar
     assert [c.name for c in await connections_ep.list_connections(BOB, None)] == []
 
 
-class ConnectedInChat(NamedTuple):
-    # What the tool told the agent.
-    answer: str
-    # The vault the session holds once the tool returns.
-    session_vault: object
-
-
-async def _connect_in_chat(turn, monkeypatch, *, known_variables: dict[str, str]) -> ConnectedInChat:
-    """Run the turn's own connect_new_datasource tool as the agent calls it
-    with credentials pasted in chat, its connection test passing."""
-
-    async def connection_test_passes(*_args, **_kwargs) -> bool:
-        return True
-
-    monkeypatch.setattr(
-        "anton.commands.datasource.verify.run_connection_test", connection_test_passes
-    )
-    [tool] = [tool for tool in turn.config.tools if tool.name == "connect_new_datasource"]
-    session = SimpleNamespace(
-        _data_vault=turn.config.data_vault,
-        _console=None,
-        _settings=SimpleNamespace(analytics_enabled=False),
-        _scratchpads=None,
-        _active_datasource=None,
-    )
-    answer = await tool.handler(session, {"engine": "postgres", "known_variables": known_variables})
-    return ConnectedInChat(answer=answer, session_vault=session._data_vault)
-
-
 BOBS_DB = {"host": "bob-db.example", "database": "postgres", "user": "bob", "password": "bobSecret123"}
 
 
@@ -528,7 +501,7 @@ async def test_bobs_pasted_connection_with_a_shared_ones_database_is_his_own(sha
     assert alices["fields"]["_user_label"] == "postgres"
 
     async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB) as turn:
-        connected = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
+        connected = await connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
         assert connected.session_vault is turn.config.data_vault
     answer = connected.answer
 
@@ -557,7 +530,7 @@ async def test_with_a_connection_turned_off_bobs_paste_is_still_his_own(sharing,
     ) as turn:
         listed = _names(turn.config.data_vault)
         assert ("postgres", "erp") in listed and ("mysql", "old") not in listed
-        connected = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
+        connected = await connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
         assert connected.session_vault is turn.config.data_vault
 
     assert connected.answer.startswith("Saved connection"), connected.answer
@@ -578,12 +551,12 @@ async def test_where_all_are_shared_a_pasted_connection_never_lands_on_someone_e
     alices = own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp")
 
     async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB_SHARED) as turn:
-        answer = (await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))).answer
+        answer = (await connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))).answer
         assert answer.startswith("Saved connection"), answer
         [bobs] = [c["name"] for c in own_vault_for_scope(LOCAL_SCOPE).list_connections() if c["name"] != "erp"]
         assert _stored(LOCAL_SCOPE, bobs)[CREATED_BY_FIELD] == SUB_B
 
-        connected = await _connect_in_chat(
+        connected = await connect_in_chat(
             turn, monkeypatch, known_variables={**BOBS_DB, "password": "rotatedSecret1"}
         )
     answer = connected.answer
@@ -694,6 +667,33 @@ def test_a_malformed_registry_shares_nothing_and_says_so(sharing, caplog, owned_
     assert errors and str(sharing.shared_connections_file) in errors[0]
 
 
+def test_a_link_left_in_a_sharers_vault_fails_only_their_own_reads(sharing, stores, caplog, owned_logger):
+    """Under the code sandbox (personal_deployment), a hard link that agent
+    code left in Alice's vault before the sandbox fails her own vault reads.
+    Bob's reads and turns go on without the connections she shares, and an
+    error names her vault and each connection left out."""
+    persist_connection("postgres", None, "mine", {**ERP, "host": "bob.example"}, scope=BOB)
+    elsewhere = stores / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "target").write_text("someone else's\n", encoding="utf-8")
+    os.link(elsewhere / "target", own_vault_root(ALICE) / "planted")
+    owned_logger("cowork.services.connectors.persist", level=logging.ERROR)
+
+    assert _names(vault_for_scope(BOB)) == {("postgres", "mine")}
+    assert _names(turn_vault_for_scope(BOB)) == {("postgres", "mine")}
+    with pytest.raises(PlantedLinkError):
+        vault_for_scope(ALICE)
+    with pytest.raises(PlantedLinkError):
+        turn_vault_for_scope(ALICE)
+
+    errors = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.services.connectors.persist" and record.levelno == logging.ERROR
+    ]
+    assert errors and str(own_vault_root(ALICE)) in errors[0] and "postgres/erp" in errors[0]
+
+
 def test_only_a_scope_with_personal_connections_reads_the_registry(sharing):
     """Where connections are shared the base vault already holds everyone's:
     a person's scope that keeps connections shared reads no registry."""
@@ -734,9 +734,12 @@ async def test_where_all_are_shared_only_the_creator_changes_an_entry(all_shared
     bobs = await connections_ep.list_connections(BOB_SHARED, None)
     alices = await connections_ep.list_connections(ALICE_SHARED, None)
     operators = await connections_ep.list_connections(LOCAL_SCOPE, None)
-    assert [(c.name, c.managed, c.shared) for c in bobs] == [("erp", True, False)]
+    # Bob didn't create it, so it reads as shared with him, not the operator's.
+    assert [(c.name, c.managed, c.shared) for c in bobs] == [("erp", True, True)]
     assert [(c.name, c.managed, c.shared) for c in alices] == [("erp", False, False)]
     assert [(c.name, c.managed, c.shared) for c in operators] == [("erp", False, False)]
+    detail = await connections_ep.get_connection("postgres", "erp", BOB_SHARED, None)
+    assert (detail.managed, detail.shared) == (True, True)
 
     await connections_ep.patch_access_mode(
         "postgres", "erp", connections_ep.PatchAccessModeBody(access_mode="write"), ALICE_SHARED, None
@@ -744,6 +747,19 @@ async def test_where_all_are_shared_only_the_creator_changes_an_entry(all_shared
     assert vault_for_scope(BOB_SHARED).load("postgres", "erp")["_access_mode"] == "write"
     await connections_ep.delete_connection("postgres", "erp", ALICE_SHARED, None)
     assert own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp") is None
+
+
+async def test_a_base_vault_entry_with_no_creator_stays_the_operators(all_shared):
+    # A base-vault entry nobody created (a legacy row, or an operator save with
+    # no person) stays "your operator provides this": managed, not shared, for
+    # a person, and the operator's own to change.
+    own_vault_for_scope(LOCAL_SCOPE).save("postgres", "legacy", dict(ERP))
+
+    bobs = await connections_ep.list_connections(BOB_SHARED, None)
+    operators = await connections_ep.list_connections(LOCAL_SCOPE, None)
+
+    assert [(c.name, c.managed, c.shared) for c in bobs] == [("legacy", True, False)]
+    assert [(c.name, c.managed, c.shared) for c in operators] == [("legacy", False, False)]
 
 
 async def test_where_all_are_shared_the_operator_view_changes_anyones_entry(all_shared, monkeypatch):

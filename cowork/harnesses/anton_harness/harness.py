@@ -12,7 +12,13 @@ from uuid import UUID
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
-from cowork.code_sandbox import build_cell_sandbox, code_sandbox_on, refuse_a_linked_project
+from cowork.code_sandbox import (
+    build_cell_sandbox,
+    code_sandbox_on,
+    refuse_a_linked_project,
+    refuse_planted_links,
+    shared_files_dir,
+)
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
@@ -43,12 +49,15 @@ from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REP
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
+from cowork.services.conversations import read_earlier_answers
 from cowork.services.projects import display_label
-from cowork.services.skill_links import links_apply_to
+from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
+    from anton.core.session import ChatSession
+
     from cowork.services.conversations import ReplayHistory
 
 
@@ -88,8 +97,9 @@ HOST_SKILLS_DIR = Path(__file__).parent / "skills"
 
 def _vault_scratch_dir() -> Path:
     """Where a turn's temporary folder is staged when it needs one: the
-    empty memory tiers of a turn with no person, and the links to the skills
-    others share with the asker (see ``_new_turn_scratch_dir``).
+    empty memory tiers of a turn with no person, and the links to the
+    operator's managed skills and to the skills others share with the asker
+    (see ``_new_turn_scratch_dir``).
 
     Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
     EFS storage by pod_local_only (see its docstring), because this directory
@@ -284,6 +294,28 @@ def _make_project_folder(base: Path, folder: Path, *, sandboxed: bool) -> None:
         folder.mkdir(parents=True, exist_ok=True)
 
 
+def _inside_project(base: Path, *, folder: Path) -> Path:
+    """``folder``, the agent's context folder (anton's context_dir, which
+    ANTON_CONTEXT_DIR sets), written below the project at ``base`` so
+    _make_project_folder makes it without following links. anton resolves
+    the folder against the resolved project, so a folder below ``base``
+    resolved counts as inside too.
+
+    The harness calls it under the code sandbox, where the server makes no
+    folder of its own outside the project: a folder outside it raises
+    RuntimeError naming the setting.
+    """
+    folder = Path(os.path.abspath(folder))
+    for root in (Path(os.path.abspath(base)), Path(os.path.realpath(base))):
+        if folder.is_relative_to(root):
+            return base / folder.relative_to(root)
+    raise RuntimeError(
+        f"The agent's context folder {folder} is outside the project {base}, and under "
+        "COWORK_CODE_SANDBOX=landlock the server makes its folders only inside the "
+        "project. Unset ANTON_CONTEXT_DIR, or set it to a folder inside the project."
+    )
+
+
 settings = AntonHarnessSettings()
 
 
@@ -316,9 +348,11 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     two must agree byte for byte. Desktop and SaaS read the same `messages`
     table, so a divergence would not fail here — it would surface as an invalid
     tool_use -> tool_result sequence many turns later, in whichever path did not
-    write the row. anton owns the implementation (ENG-1808); the slicing and the
-    compaction/cancel guards stay on this side, which is the only side that
-    knows whether a turn ended cleanly.
+    write the row. anton owns the implementation (ENG-1808) and the turn's
+    messages (`ChatSession.turn_messages`). The cancel guard stays on this
+    side, which is the only side that knows whether a turn ended cleanly, and
+    so does the choice to store no rows for a turn that compacted
+    (`_captured_turn_history`).
 
     Imported inside the function, like every other anton import in this file.
     `anton.cloud_turn.__init__` re-exports the pod entrypoint's contract and
@@ -330,6 +364,45 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     from anton.cloud_turn.history_rows import split_turn_into_rows
 
     return split_turn_into_rows(history_slice)
+
+
+def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, compacted: bool) -> TurnHistory | None:
+    """The tool block-rows of a turn that completed cleanly, or None when it
+    has none.
+
+    They come from `ChatSession.turn_messages()`, which holds every message
+    the turn appended, those a mid-turn compaction or hard truncation folded
+    out of `session.history` included. A turn that compacted ran near or over
+    the model's context window, and rows this process captures have no size
+    cap (`reject_unreplayable_tool_rows` in cowork/handlers/_turn_history.py),
+    so its rows are read and not stored: the formatter finds the answer's
+    figures in them, and the next turn replays this one as text only. A turn
+    that did not compact stores its rows.
+
+    An anton without `turn_messages` (PyPI-channel desktop installs resolve
+    anton from the floor in pyproject.toml) gets the slice of
+    `session.history` past `seed_len`, and no rows after a compaction: the
+    compaction replaced the list, so the slice could drop rows or keep a
+    tool_result whose tool_use was folded away. A session with neither
+    `turn_messages` nor `history` has no rows.
+    """
+    if hasattr(session, "turn_messages"):
+        turn_slice = session.turn_messages()
+    elif seed_len is not None and not compacted:
+        turn_slice = session.history[seed_len:]
+    else:
+        return None
+    # Drop this turn's user input (and anything before the first assistant
+    # message) so the slice starts where the model replied.
+    while turn_slice and (
+        not isinstance(turn_slice[0], dict)
+        or turn_slice[0].get("role") != "assistant"
+    ):
+        turn_slice = turn_slice[1:]
+    rows = _split_turn_into_rows(turn_slice)
+    if not rows:
+        return None
+    return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
 
 
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
@@ -485,6 +558,49 @@ _ATTACHMENT_AFFORDANCE = (
     "files that are neither in the project nor attached."
 )
 
+# The same rule under the code sandbox, where the shared folder every person's
+# agent reads and changes (cowork.code_sandbox.shared_files_dir) is a third
+# way in.
+_SANDBOXED_ATTACHMENT_AFFORDANCE = (
+    " Files reach you in exactly three ways: they are already in the project "
+    "directory above, the user attaches them to this conversation, or they are "
+    "in the shared folder at `{shared}`. If the user refers to a file you cannot "
+    "find in any of these places, ask them to attach it to the conversation, "
+    "which is how they grant you access. Do not ask them to type or paste a "
+    "filesystem path; you are not permitted to read files that are not in the "
+    "project, attached, or in the shared folder."
+)
+
+
+def _attachment_affordance() -> str:
+    """How a file the agent cannot reach gets to it: _ATTACHMENT_AFFORDANCE,
+    or under the code sandbox _SANDBOXED_ATTACHMENT_AFFORDANCE."""
+    if not code_sandbox_on():
+        return _ATTACHMENT_AFFORDANCE
+    return _SANDBOXED_ATTACHMENT_AFFORDANCE.format(shared=shared_files_dir())
+
+
+# What the agent may reach beside the project, in the project context.
+_OTHER_FILES_RULE = (
+    "The only other files that you are allowed to access are any items that are attached to the conversation. "
+    "Access to any files not attached to the conversation or located outside the project is strictly forbidden. "
+)
+
+
+def _other_files_rule(*, sandboxed: bool) -> str:
+    """_OTHER_FILES_RULE, or under the code sandbox the same rule with the
+    shared folder allowed, named, and said to be every person's agent's."""
+    if not sandboxed:
+        return _OTHER_FILES_RULE
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation, "
+        f"and the files in the shared folder at `{shared_files_dir()}`. "
+        "Every person's agent on this deployment can read and change the shared folder: use it to hand files "
+        "to other people, never put anything private there, and read and write it in the scratchpad. "
+        "Access to any other files outside the project is strictly forbidden. "
+    )
+
+
 # What the agent hears about long-running services under the code sandbox, in
 # place of the full-stack artifact and `launch_backend`, which anton refuses
 # there.
@@ -590,7 +706,7 @@ async def _conversation_attachment_context(conversation, *, scope: TenantScope |
     files were uploaded (the Cyberdeck bug). Handing it the exact paths lets
     it read them on demand on any turn — not just the turn they arrived on.
 
-    Never returns "": every turn carries ``_ATTACHMENT_AFFORDANCE`` so the
+    Never returns "": every turn carries ``_attachment_affordance()`` so the
     agent always knows attaching is the route to a file it cannot reach
     (ENG-1357). Two distinct outcomes, and the distinction is load-bearing:
 
@@ -612,7 +728,7 @@ def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -
     """``_conversation_attachment_context`` for rows already read: None is a
     listing that could not be read."""
     if rows is None:
-        return _ATTACHMENT_AFFORDANCE
+        return _attachment_affordance()
     # Only list files that still exist on disk — a row whose file was
     # deleted would otherwise hand the agent a dead path to chase.
     # Resolve one row at a time: a single bad row (e.g. a path the OS
@@ -632,7 +748,7 @@ def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -
     if not attached:
         return (
             " No files are currently attached to this conversation."
-            + _ATTACHMENT_AFFORDANCE
+            + _attachment_affordance()
         )
     return (
         " The user has attached the following files to THIS conversation. "
@@ -742,7 +858,7 @@ class AntonHarness:
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
         turn_scope = None
-        turn_rows: list[dict] | None = None
+        turn_history: TurnHistory | None = None
         session = None
         seed_info: dict | None = None
 
@@ -804,12 +920,15 @@ class AntonHarness:
             )
             if model_wait is not None:
                 model_wait.attach(session=session)
-            # Length of the seeded history — everything anton appends past this
-            # index is this turn's block-messages (tool_use / tool_result / text).
-            # Guarded: an anton build (or test double) without `.history` simply
-            # skips capture and falls back to text-only replay.
+            # Length of the seeded history, for an anton without
+            # `turn_messages`: everything it appends past this index is this
+            # turn's block-messages (tool_use / tool_result / text) until a
+            # compaction replaces the list (_captured_turn_history). Guarded
+            # for that fallback slice only: an anton build (or test double)
+            # with neither `turn_messages` nor `.history` skips capture and
+            # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
-            compacted = False  # set if anton summarizes history mid-turn
+            compacted = False  # set if anton compacts or hard-truncates history mid-turn
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Deployed cowork-server resolves anton
             # from PyPI/main, which may predate the trace-tags kwargs (anton
@@ -830,30 +949,23 @@ class AntonHarness:
                 ),
                 # A copy: the session appends this turn to its own list.
                 history=list(getattr(session, "history", ())),
+                # Read from the saved answers, since the session's history is
+                # what anton seeds the model with, not the figures' events.
+                earlier_answers=await read_earlier_answers(conversation_id=conv_id, scope=_units_scope()),
             )
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
-                # Under context pressure anton summarizes history mid-turn,
-                # reassigning session.history and invalidating seed_len.
+                # Under context pressure anton summarizes or hard-truncates
+                # history mid-turn, replacing session.history, and says so
+                # with this event.
                 if type(event).__name__ == "StreamContextCompacted":
                     compacted = True
                 yield event
-            # Turn completed cleanly: capture its tool block-rows for
-            # persistence. Skipped on cancel/error (the block below never runs),
-            # so a partial turn falls back to text-only replay and anton's own
-            # dangling-tool_use sealing keeps its in-memory history valid.
-            #
-            # Also skipped after a mid-turn compaction: seed_len no longer marks
-            # this turn's start, so slicing could drop rows or surface an orphan
-            # tool_result (its tool_use summarized away) → invalid replay. Text-
-            # only replay stays valid, so degrade to it.
-            if seed_len is not None and not compacted:
-                turn_slice = session.history[seed_len:]
-                while turn_slice and (
-                    not isinstance(turn_slice[0], dict)
-                    or turn_slice[0].get("role") != "assistant"
-                ):
-                    turn_slice = turn_slice[1:]
-                turn_rows = _split_turn_into_rows(turn_slice) or None
+            # Turn completed cleanly: capture its tool block-rows. Skipped on
+            # cancel/error (this line never runs), so a partial turn falls
+            # back to text-only replay and anton's own dangling-tool_use
+            # sealing keeps its in-memory history valid. A turn that compacted
+            # hands its rows to the formatter and stores none.
+            turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
         finally:
             if model_wait is not None:
                 model_wait.detach()
@@ -884,8 +996,8 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
-        if turn_rows:
-            yield TurnHistory(turn_rows)
+        if turn_history is not None:
+            yield turn_history
 
     @staticmethod
     def _stamp_message(m) -> dict:
@@ -1143,15 +1255,10 @@ class AntonHarness:
         # Host skills: read-only, they back
         # the deferred tool bundles (e.g. `connect-datasource` unlocks the
         # interactive connection tools). The operator's managed skills follow
-        # them, so a host skill keeps its name; anton ranks every read-only
-        # root below the turn's own skills folder, which never links a slug a
-        # managed skill holds (link_turn_skills). A person's turn adds the
-        # skills others share with them after these, below.
-        managed = managed_folder()
-        anton_settings.skills_extra_roots = [
-            HOST_SKILLS_DIR,
-            *([] if managed is None else [managed.skills_dir]),
-        ]
+        # them, so a host skill keeps its name, and a person's turn adds the
+        # skills others share with them after those (both linked into the
+        # turn's scratch folder below).
+        anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
@@ -1211,11 +1318,14 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
-        # Skills the agent builds stage here (sibling of artifacts, under the
-        # off-limits .anton/) — never the live skills store, so a built skill is
-        # surfaced as a draft card rather than auto-saved.
+        # Skills the agent builds stage here, a sibling of artifacts and the one
+        # .anton/ folder besides the artifacts the agent writes in. It is never
+        # the live skills store, so a built skill is surfaced as a draft card
+        # rather than auto-saved.
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
+        if sandboxed:
+            context_dir = _inside_project(base, folder=context_dir)
         episodes_dir = anton_dir / "episodes"
         # In a personal partition the project's .anton/memory is never this
         # turn's project tier (person_turn_memory); anton's Workspace above
@@ -1262,14 +1372,15 @@ class AntonHarness:
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
-            f"You are operating in the project {display_label(conversation.project)}."
-            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
-            "They are off limits. Do not mention the .anton/ directory in your responses."
+            f"You are operating in the project {display_label(conversation.project)}. "
+            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory "
+            f"(the artifacts under `{str(artifacts_dir)}` and the skill drafts under `{str(skill_drafts_dir)}` "
+            "are the exceptions). "
+            "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
-            + "The only other files that you are allowed to access are any items that are attached to the conversation."
-            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
-            "ALWAYS use the scratchpad to interact with files."
+            + _other_files_rule(sandboxed=sandboxed)
+            + "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
@@ -1294,8 +1405,8 @@ class AntonHarness:
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
-            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find its slug, "
-            "then `open_artifact(slug)` to get the path again.\n"
+            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find it; its folder is `<root>/<slug>`. "
+            "Read the files you will change with `read_text_file`.\n"
             "  3. Use absolute paths from a scratchpad cell so the file always lands in the right place: "
             "`with open(f\"{path}/dashboard.html\", \"w\") as f: ...`\n"
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
@@ -1427,6 +1538,11 @@ class AntonHarness:
                     "learned memory and writes none",
                     conversation.id,
                 )
+            # anton's Hippocampus writes the tiers by path, so under the code
+            # sandbox a link or hard-linked file that agent code left in one
+            # fails the turn instead of being written through.
+            for tier in (memory_layout.global_dir, memory_layout.project_dir):
+                refuse_planted_links(tier)
             memory_layout.global_dir.mkdir(parents=True, exist_ok=True)
             memory_layout.project_dir.mkdir(parents=True, exist_ok=True)
             cortex = _turn_cortex(
@@ -1439,6 +1555,30 @@ class AntonHarness:
                 llm_client=llm_client,
             )
 
+            # The operator's managed skills: each readable folder
+            # (ManagedFolder.skill_dirs) linked into the turn's scratch folder,
+            # which anton reads as the read-only root after the host skills.
+            # anton drops a whole root's skills when it can't stat one folder
+            # in it, so the turn never hands it the managed folder itself: a
+            # managed skill the server can't read is left out alone, and the
+            # asker's own, the host's and the shared skills still load. The
+            # turn's own skills folder, which anton ranks above every
+            # read-only root, never links a slug the managed folder reserves
+            # (linked_turn_skills), and neither do the fan-outs into projects
+            # (reconcile_skill_links, reconcile_project).
+            managed = managed_folder()
+            managed_skill_dirs: dict[str, Path] = {}
+            if managed is not None:
+                if turn_scratch_dir is None:
+                    turn_scratch_dir = _new_turn_scratch_dir()
+                managed_skills_dir = turn_scratch_dir / "managed-skills"
+                managed_skill_dirs = managed.skill_dirs()
+                sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed_skill_dirs)
+                anton_settings.skills_extra_roots = [
+                    *anton_settings.skills_extra_roots,
+                    managed_skills_dir,
+                ]
+
             # Skills. Where nothing fans links into this turn's project
             # (skill_links.links_apply_to), the turn links its own from the
             # asker's store, builtins seeded first. A project that is the
@@ -1449,9 +1589,10 @@ class AntonHarness:
             # host root: read-only, after the managed skills.
             turn_scope = current_settings_scope()
             # The folders a sandboxed cell reads beside its project: every
-            # read-only skill root, each linked skill's own folder, and each
-            # attachment's folder.
-            read_only_dirs: list[Path] = []
+            # read-only skill root, each linked skill's own folder (the
+            # managed ones included, since Landlock checks where a link
+            # resolves), and each attachment's folder.
+            read_only_dirs: list[Path] = list(managed_skill_dirs.values())
             if links_apply_to(turn_scope):
                 # The project's skills/ holds links into the one shared store.
                 read_only_dirs.append(Path(get_app_settings().skill.root_dir))

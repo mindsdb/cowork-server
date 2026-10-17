@@ -20,6 +20,8 @@ import logging
 import os
 import re
 import secrets
+import stat
+import tempfile
 from collections.abc import Collection
 from pathlib import Path
 
@@ -112,7 +114,10 @@ def remove_auth_token(env_path: Path) -> bool:
     lines as they are. Returns whether one was there.
 
     For a deployment whose token must not sit in cowork-home's .env, where an
-    earlier start mirrored it (sync_auth_token).
+    earlier start mirrored it (sync_auth_token). The kept lines go to a
+    temporary file beside it, with the file's mode, flushed to disk and moved
+    over it: a kill midway never leaves a torn .env, and a link or second
+    name at env_path is replaced rather than written through.
     """
     if not env_path.exists():
         return False
@@ -120,9 +125,21 @@ def remove_auth_token(env_path: Path) -> bool:
     kept = _TOKEN_LINE_RE.sub("", existing)
     if kept == existing:
         return False
-    fd = open_fd(env_path, os.O_WRONLY | os.O_TRUNC)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(kept)
+    mode = stat.S_IMODE(env_path.stat().st_mode)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=env_path.parent, prefix=".env-", delete=False
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(kept)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, env_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     logger.info("auth: removed COWORK_AUTH_TOKEN from %s", env_path)
     return True
 
