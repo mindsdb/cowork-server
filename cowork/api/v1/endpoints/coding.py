@@ -44,6 +44,7 @@ from cowork.coding.contracts import (
     TurnRequest,
     GitIdentity,
     GitIdentityRequest,
+    WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
@@ -227,6 +228,15 @@ def _require_inference_client(request: Request) -> None:
 @router.get("/engines")
 def engines():
     return _service().capabilities()
+
+
+@router.get("/workspace-usage", response_model=WorkspaceUsagePage)
+def workspace_usage(session_id: str | None = Query(default=None, min_length=1, max_length=128)):
+    """Approximate storage Cowork manages for each task; measured in the background.
+
+    Passing the task being looked at measures again if the last measurement predates it.
+    """
+    return _service().workspace_usage_page(session_id)
 
 
 @router.get("/models")

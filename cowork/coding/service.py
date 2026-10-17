@@ -29,6 +29,7 @@ from cowork.coding.contracts import (
     TaskCapabilities,
     TaskCapability,
     WorkspaceInspection,
+    WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import CodeTask, RunStatus
@@ -68,6 +69,7 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.coding.workspace_usage import WorkspaceUsage
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,10 @@ class CodingService(
         self.registry = registry or engine_registry
         self.store = store or CodingStore(root)
         self.workspaces = workspaces or WorkspaceManager(root)
+        self.workspace_usage = WorkspaceUsage(
+            self.workspaces.usage_roots,
+            lambda: [session.id for session in self.store.list_sessions()],
+        )
         shell_options = [item.id.value for item in shell_inventory().items]
         available_engines = [item.id for item in self.registry.capabilities() if item.available]
         self.control = ControlPlaneService(
@@ -247,6 +253,10 @@ class CodingService(
                 self.expire_stale_state()
             except Exception:
                 logger.exception("Could not expire stale coding control-plane state")
+
+    def workspace_usage_page(self, session_id: str | None = None) -> WorkspaceUsagePage:
+        """Approximate storage Cowork manages for each task, measured in the background."""
+        return self.workspace_usage.snapshot(session_id)
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
