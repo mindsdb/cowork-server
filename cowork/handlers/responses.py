@@ -1594,11 +1594,20 @@ class ResponsesHandler:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
 
+        Honours the user's memory settings the way the desktop harness does:
+        memory disabled, or the mode "off", writes nothing. A settings read that
+        fails writes nothing either, like every other error on this path.
+
         Never fails the turn — a lost memory is recoverable, a lost reply isn't.
         """
         if not entries:
             return
         try:
+            settings = get_user_settings(session.scope)
+            if not settings.memory_enabled or settings.memory_mode == "off":
+                logger.info("[responses] memory is off; dropped %d memory entr(ies) for conversation %s",
+                            len(entries), conv_id, extra=log_context(conversation_id=conv_id))
+                return
             conversation = ConversationService(session).get_conversation(conv_id)
             from cowork.models.project import Project
             from cowork.services.shared_resources import (

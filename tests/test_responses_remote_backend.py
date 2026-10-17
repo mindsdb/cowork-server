@@ -669,6 +669,10 @@ def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "apply_turn_memory", fake_apply)
     monkeypatch.setattr(shared_resources, "SharedResourceAccess", FakeAccess)
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(memory_enabled=True, memory_mode="autopilot"),
+    )
 
     entries = [{"text": "remember", "kind": "always", "scope": "project"}]
     ResponsesHandler._persist_turn_memory(FakeSession(), uuid4(), entries, object())
@@ -683,6 +687,99 @@ def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
         ("apply", "/projects/renamed", entries),
         "lock-exit",
     ]
+
+
+@pytest.fixture()
+def memory_write_fakes(monkeypatch):
+    """The collaborators of ``_persist_turn_memory`` as fakes that record what
+    reached the write, so a test can tell "dropped" from "written"."""
+    import cowork.services.shared_resources as shared_resources
+
+    project_id = uuid4()
+    conversation = SimpleNamespace(project_id=project_id)
+    project = SimpleNamespace(id=project_id, path="/projects/one")
+    written: list[list] = []
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return conversation
+
+    class FakeSession:
+        scope = _FakeScope()
+
+        def get(self, model, ident):
+            return project
+
+        def refresh(self, row):
+            pass
+
+    class FakeAccess:
+        def __init__(self, session, principal):
+            pass
+
+        @contextmanager
+        def coordination_lock(self, kind, key):
+            yield
+
+    def fake_apply(scope, path, entries, **kwargs):
+        written.append(entries)
+        return len(entries)
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "apply_turn_memory", fake_apply)
+    monkeypatch.setattr(shared_resources, "SharedResourceAccess", FakeAccess)
+    return SimpleNamespace(session=FakeSession(), written=written)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        SimpleNamespace(memory_enabled=True, memory_mode="off"),
+        SimpleNamespace(memory_enabled=False, memory_mode="autopilot"),
+    ],
+    ids=["mode-off", "memory-disabled"],
+)
+def test_memory_off_drops_what_the_pod_asked_to_remember(monkeypatch, memory_write_fakes, settings):
+    """The desktop harness turns either setting into mode "off" and writes
+    nothing; the cloud path honours the same two settings."""
+    monkeypatch.setattr(responses_mod, "get_user_settings", lambda scope=None: settings)
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+
+    ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert memory_write_fakes.written == []
+
+
+@pytest.mark.parametrize("mode", ["autopilot", "copilot"])
+def test_memory_on_still_writes(monkeypatch, memory_write_fakes, mode):
+    """Guards the test above: a settings read that raised would also skip the
+    write, so the on modes must be seen to reach it."""
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(memory_enabled=True, memory_mode=mode),
+    )
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+
+    ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert memory_write_fakes.written == [entries]
+
+
+def test_a_failed_settings_read_writes_nothing(monkeypatch, memory_write_fakes):
+    """Fail closed: with the settings unknown, a user who turned memory off must
+    not get a write, and the turn itself must not fail over it."""
+    def raising(scope=None):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(responses_mod, "get_user_settings", raising)
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+
+    ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert memory_write_fakes.written == []
 
 
 def _units_on_the_test_database(monkeypatch, *, scope=None):
