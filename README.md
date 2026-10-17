@@ -48,80 +48,28 @@ uv run pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
-Post-deploy integration runs use the target cluster's self-hosted runner. Dev
-and staging obtain the fixed `cowork` test suite through auth's cluster-only
-service URL. Production must not mutate that shared `@emailsink.dev` identity
-while the fixed password remains committed. The production test path therefore
-accepts a dedicated `COWORK_TEST_API_KEY` secret, a reviewed
-`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain, and
-the immutable dedicated organization id in `COWORK_TEST_ORG_ID`. The suite
-resolves and matches that principal and organization through production auth,
-and refuses an employee-classified or Hub-admin identity before testing. A
-missing or mismatched identity fails the required prod run instead of falling
-back to provisioning or reporting skipped tests. Standing-identity mode also
-requires the test target to be exactly `https://cowork.mindshub.ai` before the
-first network call, so a changed environment file or workflow cannot send the
-production key to another origin.
+Post-deploy integration runs use GitHub-hosted runners, which GitHub recommends for public repositories like this one, and reach each environment through its public host. [`tests-integration.yml`](.github/workflows/tests-integration.yml) picks the identity for each target:
 
-Do not store or use `COWORK_TEST_API_KEY` yet, or configure its paired email and
-organization id for a production run. The live `prod` GitHub Environment has no
-protection rules or deployment-branch policy. Although `publish.yml` refuses to
-enter its production build/deploy job from a non-main ref, a manually selected
-branch runs that branch's workflow text and can remove the check. Workflow code
-is therefore defense in depth, not the authority that protects an Environment
-secret.
+- **PR environments** mint a throwaway user through auth's `/dev/mint-test-user/`, so the run needs no secret, and its caller passes none.
+- **Staging** uses a standing test user. Its key is the `COWORK_TEST_API_KEY` secret on the `staging` GitHub Environment, and its ids are the `COWORK_TEST_USER_ID` and `COWORK_TEST_ORG_ID` variables there. The suite reserves that user for itself.
+- **Production** must not mutate the shared `@emailsink.dev` identity. The production test path therefore accepts a dedicated `COWORK_TEST_API_KEY` secret, a reviewed `COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain, and the immutable dedicated organization id in `COWORK_TEST_ORG_ID`. The suite resolves and matches that principal and organization through production auth, and refuses an employee-classified or Hub-admin identity before testing. A missing or mismatched identity fails the required prod run instead of falling back to provisioning or reporting skipped tests. Standing-identity mode also requires the test target to be exactly `https://cowork.mindshub.ai` before the first network call, so a changed environment file or workflow cannot send the production key to another origin.
 
-Before `COWORK_TEST_API_KEY` is stored or used, or any production evidence run
-starts, the `prod` Environment must have a nonempty required-reviewer rule with
-`prevent_self_review: true`, `can_admins_bypass: false`, and a selected-branches
-deployment policy whose only entry is the `main` branch, created as an exact
-Branch rule (no tag, wildcard, or second branch rule). Verify the live settings
-without reading any secret value:
+The cross-replica test in `tests/integration/test_post_deploy.py` talks to two pods through port-forwards, which a hosted runner cannot open, so CI leaves it out. CI runs `tests/integration/test_two_replicas.py` against a Redis service container instead: two readers that share nothing but Redis, the way two replicas run. Run the pod test by hand with the port-forwards its docstring shows.
+
+The `prod` GitHub Environment is the boundary that protects the production key. It allows deployments only from the `main` branch, through one exact Branch rule, and `can_admins_bypass` is `false`. It has no required reviewers, so a release never waits for an approval. Although `publish.yml` refuses to enter its production build/deploy job from a non-main ref, a manually selected branch runs that branch's workflow text and can remove the check. Workflow code is therefore defense in depth, not the authority that protects an Environment secret. Terraform manages these settings through `github_environment_protections` in the `newprod/us-east-1/mindsdb` stack of mindsdb/terraform, so a change made in the GitHub UI is undone by the next apply. Verify the live settings without reading any secret value:
 
 ```sh
 gh api repos/mindsdb/cowork-server/environments/prod \
-  --jq '
-    [.protection_rules[]?
-      | select(.type == "required_reviewers")
-      | {
-          prevent_self_review,
-          reviewers: [.reviewers[]?
-            | {type, name: (.reviewer.login // .reviewer.slug)}]
-        }] as $required_reviewers
-    | {
-        can_admins_bypass,
-        required_reviewers: $required_reviewers,
-        deployment_branch_policy
-      }
-  '
+  --jq '{can_admins_bypass, rules: [.protection_rules[].type], deployment_branch_policy}'
 gh api 'repos/mindsdb/cowork-server/environments/prod/deployment-branch-policies?per_page=100' \
   --jq '[.branch_policies[] | {name, type}]'
 ```
 
-The first command must show exactly one required-reviewer rule with at least one
-named reviewer and `prevent_self_review: true`, plus `can_admins_bypass: false`,
-`protected_branches: false`, and `custom_branch_policies: true`. The second must
-print exactly `[{"name":"main","type":"branch"}]`. Only after both checks pass
-may an operator store `COWORK_TEST_API_KEY`, `COWORK_TEST_USER_EMAIL`, and
-`COWORK_TEST_ORG_ID` on that Environment. Evidence must come from a fresh
-main-branch run started after the
-protection was active, with `run_attempt: 1`; an eligible reviewer other than the
-run's `actor` and `triggering_actor` must approve its `prod` Environment gate. A
-rerun of an attempt that began before protection does not count. Keeping the
-values at Environment scope prevents non-prod jobs from receiving them, but that
-scope is safe only when these Environment controls are active.
+The first command must show `can_admins_bypass: false`, `branch_policy` as the only rule, `protected_branches: false`, and `custom_branch_policies: true`. The second must print exactly `[{"name":"main","type":"branch"}]`. The `staging` Environment has the same shape with two Branch rules, `staging` and `main`, because the nightly below starts from `main` and tests staging. The `newdev/us-east-1/mindsdb` stack manages those staging settings through the same variable. Check them with the two commands above, with `staging` in place of `prod`. Keeping the test values at Environment scope keeps each environment's key out of every other environment's jobs.
 
 #### Nightly production read-only smoke
 
-The production nightly reads production on `mdb-prod` at `43 7 * * *` once its
-schedule is live. It is held today; the Environment prerequisites below say what
-turns it on. It uses the same guarded standing identity, but selects only
-`tests/integration/test_production_read_only.py`. That selection is GET-only:
-it reads health, conversations, schedules, files, and pins. It never
-provisions an identity and does not create conversations, schedules, files,
-artifacts, or model turns. The broad integration target excludes the
-`production_read_only` marker, so release and staging callers cannot include
-this production-only selection by accident.
+The production nightly reads production from a GitHub-hosted runner at `43 7 * * *` once its schedule is live. It is held today; the Environment prerequisites below say what turns it on. It uses the same guarded standing identity, but selects only `tests/integration/test_production_read_only.py`. That selection is GET-only: it reads health, conversations, schedules, files, and pins. It never provisions an identity and does not create conversations, schedules, files, artifacts, or model turns. The broad integration target excludes the `production_read_only` marker, so release and staging callers cannot include this production-only selection by accident.
 
 Failures and the next recovery use the shared engineering-channel notifier.
 The nightly is an alert, not a release gate. Review any new endpoint in
@@ -129,22 +77,9 @@ The nightly is an alert, not a release gate. Review any new endpoint in
 `tests/test_production_read_only_workflow.py`, which rejects mutating HTTP calls
 and pins the complete request list.
 
-The unattended nightly cannot reference the existing `prod` Environment.
-That Environment must retain its required-reviewer gate for production deploys,
-and GitHub pauses every job that references such an Environment until a reviewer
-approves it. The monitor instead uses a dedicated `prod-read-only` Environment
-with unique `COWORK_PROD_READ_ONLY_API_KEY`,
-`COWORK_PROD_READ_ONLY_USER_EMAIL`, and
-`COWORK_PROD_READ_ONLY_ORG_ID` inputs. Unique names prevent a missing
-Environment value from falling back to a repository or organization credential.
+The unattended nightly does not reference the `prod` Environment. That Environment holds the deploy and full-suite credentials, and a read-only monitor needs neither. The monitor instead uses a dedicated `prod-read-only` Environment with unique `COWORK_PROD_READ_ONLY_API_KEY`, `COWORK_PROD_READ_ONLY_USER_EMAIL`, and `COWORK_PROD_READ_ONLY_ORG_ID` inputs. Unique names prevent a missing Environment value from falling back to a repository or organization credential.
 
-Before promoting this workflow to `main`, an operator must create
-`prod-read-only` with no required-reviewer or wait-timer rule and a custom
-deployment policy whose only entry is the exact `main` branch. The repository's
-`main` protection must continue to require a pull-request approval, resolve
-review conversations, and apply to administrators. These controls let the
-scheduled job start without weakening the separately protected `prod`
-Environment:
+Before the first dispatch, an operator must give `prod-read-only` no required-reviewer or wait-timer rule, admin bypass off, and a custom deployment policy whose only entry is the exact `main` branch. The repository's `main` protection must continue to require a pull-request approval, resolve review conversations, and apply to administrators. These controls let the scheduled job start without touching the separately protected `prod` Environment:
 
 ```bash
 gh api --method PUT repos/mindsdb/cowork-server/environments/prod-read-only \
@@ -153,6 +88,7 @@ gh api --method PUT repos/mindsdb/cowork-server/environments/prod-read-only \
   "wait_timer": 0,
   "prevent_self_review": false,
   "reviewers": [],
+  "can_admins_bypass": false,
   "deployment_branch_policy": {
     "protected_branches": false,
     "custom_branch_policies": true
@@ -181,7 +117,7 @@ Verify policy and names without reading credential values:
 
 ```bash
 gh api repos/mindsdb/cowork-server/environments/prod-read-only \
-  --jq '{protection_rules, deployment_branch_policy}'
+  --jq '{can_admins_bypass, protection_rules, deployment_branch_policy}'
 gh api \
   'repos/mindsdb/cowork-server/environments/prod-read-only/deployment-branch-policies?per_page=100' \
   --jq '[.branch_policies[] | {name, type}]'
@@ -193,12 +129,7 @@ gh variable list --repo mindsdb/cowork-server --env prod-read-only \
   | rg '^COWORK_PROD_READ_ONLY_(USER_EMAIL|ORG_ID)\b'
 ```
 
-The Environment response must have no `required_reviewers` or `wait_timer`
-entry and must enable only custom branch policies. The branch-policy response
-must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection
-response must show at least one required approval, administrator enforcement,
-and required conversation resolution. Do not dispatch until every check passes
-and the cowork-server#472 prerequisite has landed.
+The Environment response must show `can_admins_bypass: false`, have no `required_reviewers` or `wait_timer` entry, and enable only custom branch policies. The branch-policy response must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection response must show at least one required approval, administrator enforcement, and required conversation resolution. Do not dispatch until every check passes and the cowork-server#472 prerequisite has landed.
 
 The nightly schedule is held out of the workflow until those checks pass.
 GitHub arms a `schedule:` trigger as soon as the file reaches the default
@@ -246,23 +177,23 @@ reusable in [mindsdb/github-actions](https://github.com/mindsdb/github-actions)
 workflows: PyPI trusted publishing matches the OIDC claim on the workflow
 filename and does not support reusable workflows.
 
+### Container image and hosted deploys
+
+The same two pipelines build the container image for the hosted deployment through [`build-deploy.yml`](.github/workflows/build-deploy.yml), on GitHub-hosted runners. So does every pull request from a branch in this repository, except a promotion PR whose head is `staging` or `main`.
+
+- PR and staging images go to the dev-tier ECR repository, `mindsdb-cowork-server-dev`. Images built from `main` go to the prod-tier repository, `mindsdb-cowork-server`. The build assumes each tier's push role through GitHub OIDC. [deployment/cowork-server/README.md](deployment/cowork-server/README.md#image-repositories) lists the repositories and roles.
+- After the build and scan pass, the `deploy` job asks [mindsdb/deployer](https://github.com/mindsdb/deployer) to run the Helm rollout and waits for it. That private repository runs the rollout from the chart at the same commit. Its README says how to roll back by dispatching it by hand.
+- mindsdb/deployer also rolls out the environment of every PR from a branch in this repository that carries the `deploy` label, once that PR's image is built. The PR's integration job waits until that environment serves the PR's build, then tests it.
+
+The `deploy` job reads the `DEPLOYER_APP_CLIENT_ID` variable and the `DEPLOYER_APP_PRIVATE_KEY` secret from the `staging` and `prod` GitHub Environments.
+
 ### Nightly staging integration
 
-The cowork-server maintainers own the deployed integration signal and its
-staging prerequisites. [`nightly-staging-integration.yml`](.github/workflows/nightly-staging-integration.yml)
-runs every day at 06:41 UTC and can also be dispatched by hand. It calls the
-same `tests-integration.yml` reusable workflow as a deployment on `mdb-dev`,
-then reports a failure or the first recovery through the shared
-engineering-channel notifier. It is a standalone monitor and never gates a
-publish, release, or deployment.
+The cowork-server maintainers own the deployed integration signal and its staging prerequisites. [`nightly-staging-integration.yml`](.github/workflows/nightly-staging-integration.yml) runs every day at 06:41 UTC and can also be dispatched by hand. It calls the same `tests-integration.yml` reusable workflow as a deployment, on a GitHub-hosted runner, then reports a failure or the first recovery through the shared engineering-channel notifier. It is a standalone monitor and never gates a publish, release, or deployment.
 
 **The nightly runs staging's copy of the tests, not main's.** GitHub starts every scheduled run on the default branch, so the checkout would otherwise take `main`. `main` trails `staging` by every commit waiting for the weekly release. Any behavior change among those commits fails `main`'s tests against staging's pods, even though staging works as intended. So the job passes `ref: staging`, and `tests-integration.yml` hands that input to `actions/checkout`. The deploy callers leave `ref` empty and keep testing the commit they just deployed. [`test_nightly_integration_workflow.py`](tests/test_nightly_integration_workflow.py) fails if a scheduled caller's `ref` differs from its `deploy-env`.
 
-The suite may create and delete test conversations, schedules, files, and agent
-turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
-the workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging so a missing
-target, identity source, replica, or port-forward fails instead of becoming a
-green skip.
+The suite may create and delete test conversations, schedules, files, and agent turns in staging, as the standing staging test user. The workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging, so a missing target, identity, or Redis service fails instead of becoming a green skip.
 
 In the packaged Electron app, a background updater checks PyPI on every launch and upgrades automatically (with rollback on failure). See [`server-updater.ts`](https://github.com/mindsdb/cowork/blob/main/src/main/server-updater.ts) in the frontend repo.
 

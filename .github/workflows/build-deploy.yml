@@ -7,8 +7,12 @@
 # What actually ships this repo is the PyPI wheel, not a container image: the
 # desktop app installs `cowork-server` from PyPI (or git, per channel), so
 # `publish.yml` and `publish-staging.yml` are the real deploy path. The image
-# build exists for the per-PR environments and for the staging/prod Helm deploy
-# below.
+# build exists for the per-PR environments and for the staging/prod Helm deploy,
+# which mindsdb/deployer runs when the `deploy` job below asks it to.
+#
+# Every job here runs on a GitHub-hosted runner, which GitHub recommends for
+# public repositories. The build reaches ECR through GitHub OIDC, and the Helm
+# rollout happens in the private deployer repository.
 #
 # ON PERMISSIONS. A called workflow can never exceed its caller's grant, and that
 # cap is checked when the workflow FILE IS LOADED, not when a job runs. A job here
@@ -36,12 +40,8 @@ on:
         description: "Image flavour and tag prefix (development | staging | production)"
         type: string
         required: true
-      build-runner:
-        description: "Runner label for deploy and integration; build stays on mdb-dev"
-        type: string
-        default: mdb-dev
       pr-environment:
-        description: "Run the per-PR environment rollout and its access comment"
+        description: "Test the per-PR environment and report it to the access comment"
         type: boolean
         default: false
       deploy-enabled:
@@ -55,28 +55,44 @@ on:
     outputs:
       pr-env-deployed:
         description: >-
-          "true" only when the per-PR environment actually rolled out. The
-          pipeline succeeding does not mean one exists: without the `deploy`
-          label the rollout is skipped and everything else still passes, so a
+          "true" only when the per-PR environment serves this PR's build. The
+          pipeline succeeding does not mean one does: without the `deploy`
+          label nothing is tested and everything else still passes, so a
           caller keying off the pipeline result advertises URLs for an
           environment nobody created.
-        value: ${{ jobs.deploy-pr-env.outputs.deployed }}
+        value: ${{ jobs.integration-tests-pr-env.outputs.pr-env-serving }}
 
 defaults:
   run:
     shell: bash
 
+# Which ECR repository an image lands in, and the role that may push it. PR and
+# staging images go to the dev tier and main's to the prod tier, so nothing a PR
+# can run is able to write a tag prod deploys. The dev role trusts this
+# repository's `pull_request` subject and the `staging` Environment on
+# `staging`; the prod role trusts only the `prod` Environment on `main`. That is
+# why build and scan name those Environments.
+env:
+  ECR_REPOSITORY: ${{ inputs.build-environment == 'production' && 'mindsdb-cowork-server' || 'mindsdb-cowork-server-dev' }}
+  ECR_ROLE: ${{ inputs.build-environment == 'production' && 'arn:aws:iam::168681354662:role/gha-cowork-server-ecr-prod' || 'arn:aws:iam::168681354662:role/gha-cowork-server-ecr-dev' }}
+
 jobs:
 
   build:
-    # Always build on dev runner because thats where buildkit is
-    runs-on: mdb-dev
+    runs-on: ubuntu-latest
+    # No Environment for a PR build, so its OIDC token carries the
+    # `pull_request` subject. Staging and production builds take the subject of
+    # their Environment, whose branch policy decides which refs may build.
+    environment: ${{ inputs.build-environment == 'production' && 'prod' || inputs.build-environment == 'staging' && 'staging' || '' }}
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       image: ${{ steps.build.outputs.image }}
     env:
       AWS_REGION: us-east-1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # hatch-vcs derives the version by describing against tags, and the
           # default fetch-depth of 1 fetches none of them — so the image
@@ -106,19 +122,40 @@ jobs:
           # the Dockerfile COPYs the build context into the builder stage. It
           # deletes .git after the sync so the runtime image does not carry it.
           fetch-depth: 0
-      - uses: mindsdb/github-actions/setup-env@main
+          # .git rides into the builder stage, whose layers go to the build
+          # cache, so the checkout must not leave a token in .git/config.
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ECR_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
       - id: build
         uses: mindsdb/github-actions/build-push-ecr@main
         with:
-          module-name: ${{ env.CI_REPOSITORY_SLUG }}
+          module-name: ${{ env.ECR_REPOSITORY }}
           build-for-environment: ${{ inputs.build-environment }}
+          builder: local
 
   scan:
-    runs-on: mdb-dev
+    runs-on: ubuntu-latest
     needs: [build]
     name: Scan Minds Image
+    # The same Environment and role as the build, which also let it pull the
+    # image it scans.
+    environment: ${{ inputs.build-environment == 'production' && 'prod' || inputs.build-environment == 'staging' && 'staging' || '' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ECR_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
       - uses: mindsdb/github-actions/snyk-docker-scan@main
         with:
           image: ${{ needs.build.outputs.image }}
@@ -127,45 +164,33 @@ jobs:
           # not stop someone iterating, and should stop a release.
           allow-vulns: ${{ inputs.pr-environment && 'true' || '' }}
 
-  deploy-pr-env:
-    runs-on: ${{ inputs.build-runner }}
+  integration-tests-pr-env:
+    # mindsdb/deployer rolls a labeled same-repository PR's image into its
+    # environment on its own schedule; nothing here deploys it. The suite waits
+    # until the environment serves this build, then tests it with a throwaway
+    # user. No `secrets:` line: a PR environment needs none, so this job gets
+    # none.
     needs: [build]
     if: inputs.pr-environment && contains(github.event.pull_request.labels.*.name, 'deploy')
-    environment:
-      name: pr-cowork-server-${{ github.event.pull_request.number }}
-      url: https://pr-cowork-server-${{ github.event.pull_request.number }}.dev.mindshub.ai
-    outputs:
-      deployed: ${{ steps.rollout.outputs.deployed }}
-    steps:
-      - uses: mindsdb/github-actions/argocd-pr-env-deploy@main
-        with:
-          argocd-token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-          gh-token: ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}
-      - name: Record that the environment is up
-        id: rollout
-        run: echo "deployed=true" >> "$GITHUB_OUTPUT"
-
-  integration-tests-pr-env:
-    needs: [deploy-pr-env]
+    permissions:
+      contents: read
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: pr-cowork-server-${{ github.event.pull_request.number }}
-      runner: ${{ inputs.build-runner }}
-    secrets: inherit
 
   deploy:
-    runs-on: ${{ inputs.build-runner }}
+    runs-on: ubuntu-latest
     # `scan` too: it is blocking on a deploy branch (see `allow-vulns` above), and
     # needing only `build` meant a failing scan and a rollout ran side by side.
     needs: [build, scan]
     # Only the two long-lived environments have a cluster to deploy to. A
-    # `development` build is either a PR (handled by `deploy-pr-env`) or nothing.
-    # `deploy-enabled` gates it further: having a cluster is not the same as
-    # having something deployed in it, and a rollout into an environment that
-    # was never stood up fails every run without saying anything useful.
+    # `development` build is either a PR (deployed by mindsdb/deployer) or
+    # nothing. `deploy-enabled` gates it further: having a cluster is not the
+    # same as having something deployed in it, and a rollout into an environment
+    # that was never stood up fails every run without saying anything useful.
     if: inputs.deploy-enabled && (inputs.build-environment == 'staging' || inputs.build-environment == 'production')
     env:
-      # `build-environment` names the image flavour (production); the Helm chart,
+      # `build-environment` names the image flavour (production); the deployer,
       # namespace and Slack message name the environment (prod). One is not the
       # other, so map once here rather than at each use.
       DEPLOY_ENV: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
@@ -175,43 +200,35 @@ jobs:
       # vars/inputs.
       name: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
       url: ${{ vars.MDB_ENV_URL }}
+    timeout-minutes: 45
+    # The rollout runs in mindsdb/deployer, from the chart at this commit. This
+    # job only asks for it and waits. The GitHub App token can dispatch and
+    # watch that one repository's workflows, and the job's own token needs
+    # nothing.
+    permissions: {}
     steps:
-      - uses: actions/checkout@v5
-      - uses: mindsdb/github-actions/setup-env@main
-      - name: Notify of deployment starting
-        id: slack
-        uses: mindsdb/github-actions/slack-deploy-msg@main
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
         with:
-          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
-          status: 'started'
-          color: '#0099CC'
-          env-name: ${{ env.DEPLOY_ENV }}
-          env-url: ${{ vars.MDB_ENV_URL }}
-          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
-      - uses: DevOps-Nirvana/aws-helm-multi-deploy-nodocker@v8
-        with:
-          environment-slug: ${{ env.DEPLOY_ENV }}
-          k8s-namespace: ${{ env.DEPLOY_ENV }}
-          # build-push-ecr tags the image `<build-for-environment>-<sha>`, so this
-          # is the image flavour, not DEPLOY_ENV.
-          image-tag: ${{ inputs.build-environment }}-${{ env.SLUG }}
-          timeout: 600s
-      - name: Notify of deployment finish
-        uses: mindsdb/github-actions/slack-deploy-msg@main
-        if: always()
-        with:
-          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
-          status: "${{ job.status == 'success' && 'finished' || 'failed' }}"
-          color: "${{ job.status == 'success' && '#00C851' || '#FF4444' }}"
-          env-name: ${{ env.DEPLOY_ENV }}
-          env-url: ${{ vars.MDB_ENV_URL }}
-          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
-          update-message-id: ${{ steps.slack.outputs.ts }}
+          client-id: ${{ vars.DEPLOYER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOYER_APP_PRIVATE_KEY }}
+          owner: mindsdb
+          repositories: deployer
+          permission-actions: write
+      - name: Deploy through mindsdb/deployer
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          # gh >= 2.87 prints the created run's URL. The deployer's jobs run only
+          # from its `main`, so the dispatch names that ref.
+          url=$(gh workflow run deploy.yml -R mindsdb/deployer --ref main -f repo=cowork-server -f env="$DEPLOY_ENV" -f sha="$GITHUB_SHA")
+          gh run watch "${url##*/}" -R mindsdb/deployer --exit-status
 
   integration-tests:
     needs: [deploy]
+    permissions:
+      contents: read
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
-      runner: ${{ inputs.build-runner }}
     secrets: inherit

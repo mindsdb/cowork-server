@@ -5,17 +5,16 @@ Redis, the scratchpad controller and a real scratchpad pod together.
 
 Skipped unless COWORK_BASE_URL is set, so a normal `pytest` run ignores them.
 
-The identity comes from auth, which provisions throwaway test users for CI.
-Permanent dev/staging POST to its internal endpoint with the provisioning
-secret; PR envs POST to /dev/mint-test-user/, which is mounted only where
-`ephemeral` is on and needs no secret. Prod uses a dedicated standing identity
-while its fixture password remains committed. Every source
-provides the user_id and organization_id these tests send as headers.
+The identity comes from one of the sources `_provision_identity` lists. CI's
+staging runs use a standing test user whose key and ids live on the `staging`
+GitHub Environment. PR envs POST to /dev/mint-test-user/, which is mounted only
+where `ephemeral` is on and needs no secret. Prod uses a dedicated standing
+identity. Every source provides the user_id and organization_id these tests
+send as headers.
 
-The provisioning call uses auth's Service so it works both before and after
-Cloudflare Access protects /v1/internal* on the public host. CI uses cluster
-DNS from a runner in the target cluster; by hand, forward the port first with
-`kubectl port-forward -n staging svc/auth 8080:80`.
+By hand, dev and staging can also provision through auth's internal endpoint.
+It is reached through auth's Service rather than the public host, so forward
+the Service first with `kubectl port-forward -n staging svc/auth 8080:80`.
 
     COWORK_BASE_URL=https://cowork.staging.example.com \\
     TEST_USER_PROVISION_URL=http://localhost:8080/v1/internal/test-users/ \\
@@ -216,14 +215,16 @@ def _provision_identity() -> _Identity:
 
     Three sources, in order:
 
-    1. COWORK_TEST_API_KEY + COWORK_TEST_USER_ID + COWORK_TEST_ORG_ID, for
-       running by hand against an environment where you already have a tenant.
+    1. COWORK_TEST_API_KEY + COWORK_TEST_USER_ID + COWORK_TEST_ORG_ID, a
+       standing test user. CI's staging runs take these from the `staging`
+       GitHub Environment, and they also serve a run by hand against an
+       environment where you already have a tenant.
     2. TEST_USER_MINT_URL, auth's /dev/mint-test-user/. Mounted only in
        ephemeral PR envs, needs no secret, mints a fresh user per call.
     3. TEST_USER_PROVISION_URL + TEST_USER_PROVISION_SECRET, auth's internal
-       endpoint. Used for dev/staging, where the dev route is not mounted.
-       Provisions the fixed `cowork` suite: one @emailsink.dev tenant, reused
-       across runs, with a fresh key each time.
+       endpoint, for a run by hand against dev or staging, where the dev route
+       is not mounted. Provisions the fixed `cowork` suite: one @emailsink.dev
+       tenant, reused across runs, with a fresh key each time.
 
     Production sets COWORK_TEST_IDENTITY_MODE=standing. In that mode a dedicated
     controlled-domain API key and its expected email are mandatory. Auth
