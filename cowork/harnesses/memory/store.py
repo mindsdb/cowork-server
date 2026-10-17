@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 from cowork.common.paths import (
     PinnedDir,
@@ -21,10 +22,18 @@ from cowork.common.paths import (
     pinned_dir,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, scoped_user_storage_root
 from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
 
 PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
+
+# Inside a person's global tier: one folder per project they have memory for.
+PERSONAL_PROJECTS_DIRNAME = "projects"
+
+# The filesystem store name for memory, shared so every reference keys it the
+# same (scoped_user_storage_root here and remove_project_memory_tiers).
+MEMORY_STORE = "memory"
 
 # Every slot filename is a fixed, hardcoded value in the registry; a slot id is a
 # validated `MemorySlot` enum. `_filename` re-checks the resolved name against
@@ -273,7 +282,7 @@ class GlobalMemoryStore(MemoryStore):
             if root is not None
             else Path(get_app_settings().memory.root_dir).expanduser()
         )
-        super().__init__(scoped_user_storage_root(base, scope, store="memory"))
+        super().__init__(scoped_user_storage_root(base, scope, store=MEMORY_STORE))
 
     def list_slots(self) -> list[MemorySlot]:
         return list(SLOT_REGISTRY.keys())
@@ -298,3 +307,56 @@ class ProjectMemoryStore(MemoryStore):
             raise ValueError(
                 f"{slot_id.value} is not supported for project-scoped memory."
             )
+
+
+class PersonalProjectMemoryStore(ProjectMemoryStore):
+    """One person's project tier: ``<their global tier>/projects/<project id>/``.
+
+    In a personal partition project memory is the person's own, so it lives
+    under their global tier rather than in the project's ``.anton/memory``,
+    which stays untouched there. The walk from the global tier down is
+    O_NOFOLLOW, as for a project's own store: the agent's code runs as the
+    server's user and could plant a link in that chain.
+    """
+
+    def __init__(self, *, global_root: Path, project_id: UUID | str) -> None:
+        self._global_root = Path(global_root)
+        tail = (PERSONAL_PROJECTS_DIRNAME, str(UUID(str(project_id))))
+        MemoryStore.__init__(
+            self,
+            self._global_root.joinpath(*tail),
+            nofollow_base=self._global_root,
+            nofollow_tail=tail,
+        )
+
+    @contextmanager
+    def _root_fd(self, *, create: bool) -> Iterator[PinnedDir]:
+        # The global tier is created on first use, like the store above it.
+        if create:
+            self._global_root.mkdir(parents=True, exist_ok=True)
+        with super()._root_fd(create=create) as d:
+            yield d
+
+
+def project_memory_store(
+    *, scope: TenantScope | None, project_path: Path, project_id: UUID | str
+) -> ProjectMemoryStore:
+    """The project tier ``scope`` reads and writes for one project.
+
+    A personal scope that keeps memory per person gets its own tier under its
+    global one (PersonalProjectMemoryStore), whether or not its projects are
+    personal. Everyone else keeps the project's ``.anton/memory``: hosted org
+    mode (shared per project there), the desktop, the operator view, and a
+    personal scope that leaves memory shared. The one resolver for the
+    in-process turn, the memory API and a person's reset, so they can never
+    disagree on where a person's project memory is. A remote turn keeps memory
+    in the project's own folder and is refused where identity headers are
+    trusted (cowork.server.create_app), so it never reaches this tier; the
+    tier deletion (remove_project_memory_tiers) derives its own path from the
+    same user_store_segments layout.
+    """
+    if scope is not None and scope.personal and scope.partitioned_for(PersonalResource.MEMORY):
+        return PersonalProjectMemoryStore(
+            global_root=GlobalMemoryStore(scope=scope).root, project_id=project_id
+        )
+    return ProjectMemoryStore(Path(project_path))

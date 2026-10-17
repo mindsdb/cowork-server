@@ -40,13 +40,19 @@ def _distribute_skill_links() -> None:
     project dir. Cloud turns read skills straight off the shared mount instead
     (no payload); the pod's org gets seeded lazily, see
     `_stage_remote_workspace_files` and `SkillService.ensure_builtin_skills`.
+    The base store is LOCAL_SCOPE's, named explicitly because a deployment that
+    trusts identity headers refuses a store with no scope. Wherever skills are
+    partitioned (org tenancy, or a trusted-identity deployment that keeps
+    skills per person) nothing is fanned out: each turn links its own skills.
     """
-    if get_app_settings().tenancy_mode == "org":
+    from cowork.services.skill_links import reconcile_all, skill_partitions_enabled
+
+    if skill_partitions_enabled():
         return
-    from cowork.services.skill_links import reconcile_all
+    from cowork.db.scoped import LOCAL_SCOPE
     from cowork.services.skills import SkillService
 
-    reconcile_all(SkillService().list_skills())
+    reconcile_all(SkillService(LOCAL_SCOPE).list_skills())
 
 
 def run_dev_setup() -> None:

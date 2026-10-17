@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.artifacts import html_artifacts
 from cowork.services.publish import publish_artifact
 
@@ -27,9 +28,9 @@ def _meta(folder: Path, **fields) -> None:
 
 
 def _entries(*containers: Path) -> list[dict]:
-    with patch("cowork.services.artifacts._scan_artifact_dirs", lambda: list(containers)), \
+    with patch("cowork.services.artifacts._scan_artifact_dirs", lambda *, scope: list(containers)), \
             patch("cowork.services.artifacts._fullstack_types", lambda: frozenset({_FULLSTACK})):
-        return html_artifacts()
+        return html_artifacts(scope=LOCAL_SCOPE)
 
 
 def _listed(container: Path) -> set[str]:

@@ -7,6 +7,7 @@ and all necessary configurations for the Cowork service.
 
 import asyncio
 import contextlib
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,15 +21,24 @@ from starlette.responses import JSONResponse
 
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
 from cowork.coding.inference_proxy import INFERENCE_PATHS
+from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
+from cowork.managed import (
+    ManagedFolder,
+    SharedRegistryError,
+    cortex_takes_managed_layer,
+    managed_folder,
+)
+from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
+from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
@@ -312,6 +322,47 @@ class _NoStoreMiddleware:
         await self.app(scope, receive, send_with_no_store)
 
 
+def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
+    """Refuse to start when the server's user can't read the managed skills or
+    data-vault folder, or a managed skill folder or its SKILL.md. Each would
+    otherwise crash a page, a turn, or the restart the runbook names as the
+    remedy, rather than surface here with the path and the fix."""
+    from anton.core.tools.skill_format import SKILL_FILE
+
+    for folder in (managed.skills_dir, managed.vault_dir):
+        if not os.access(folder, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
+                "server's user needs read and search permission on it. Run "
+                f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
+                f"{folder}` if it is owned by another user)."
+            )
+    for slug_dir in sorted(managed.skills_dir.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        if not os.access(slug_dir, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's skill folder {slug_dir} can't be read: run "
+                f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
+            )
+        skill_file = slug_dir / SKILL_FILE
+        if skill_file.exists() and not os.access(skill_file, os.R_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's skill file {skill_file} can't be read: run "
+                f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
+            )
+    # A managed connection file the server's user can't read vanishes for
+    # everyone and frees its name, so a tester could save their own under it.
+    # Refuse at start rather than silently share less.
+    for vault_file in sorted(managed.vault_dir.iterdir()):
+        if vault_file.is_file() and not os.access(vault_file, os.R_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's connection file {vault_file} can't be read: run "
+                f"`chown 1000:1000 {vault_file}` on the host copy so it is not freed and "
+                "re-saved by a tester."
+            )
+
+
 def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -358,6 +409,14 @@ def create_app() -> FastAPI:
     async def _turn_in_progress(request, exc):
         return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
 
+    # A save or delete that reached a connection the caller can't change, or
+    # a create under a name the registry still shares (LayeredDataVault). The
+    # connections routes refuse a change up front; this answers the same for
+    # a save whose derived name lands on one, and the create.
+    @app.exception_handler(SharedConnectionError)
+    async def _shared_connection(request, exc: SharedConnectionError):
+        return JSONResponse({"detail": exc.detail}, status_code=403)
+
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when
     # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
@@ -373,15 +432,126 @@ def create_app() -> FastAPI:
     # layer lets them through.
     channel_webhook_paths: set[str] = set()
 
-    # Org mode: build a per-request Principal from gateway-injected identity
-    # headers. Added first so it sits inner of the bearer/CORS layers.
-    if settings.tenancy_mode == "org":
+    # Trusted identity headers name a person in local tenancy. Only a request
+    # that already passed the bearer token may name one, and each person's
+    # partition needs every resource its rows point at, and memory of its own.
+    if settings.trust_identity_headers:
+        if settings.tenancy_mode == "org":
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS is not supported in org tenancy mode: "
+                "org deployments already build each request's principal from the "
+                "gateway's identity headers."
+            )
+        if not settings.require_auth:
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS requires COWORK_REQUIRE_AUTH: without the "
+                "bearer token check, any caller could name any person in the identity headers."
+            )
+        check_personal_resource_dependencies(settings.personal_resources)
+        if PersonalResource.MEMORY not in settings.personal_resources:
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS needs memory in COWORK_PERSONAL_RESOURCES. "
+                "Memory left off is one store that every person's turns learn into and "
+                "read back, so each person would read the others' lessons and profile "
+                "lines. Add memory to the list."
+            )
+
+    # The operator's managed folder reaches every turn read-only. A missing
+    # folder stops the start: its skill and connection names would otherwise
+    # stop being reserved, and its rules would silently reach no turn.
+    managed = managed_folder()
+    if managed is not None:
+        if settings.tenancy_mode == "org":
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR is not supported in org tenancy mode: turns run on "
+                "remote workers, which receive none of the managed folder."
+            )
+        missing = managed.missing_dirs()
+        if missing:
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR names missing folders: "
+                + ", ".join(str(path) for path in missing)
+                + ". Create or mount each one; the managed folder needs memory/, "
+                "skills/ and data-vault/."
+            )
+        # anton reads memory/ on every turn, and a folder it can't search
+        # fails each turn on its first rule.
+        if not os.access(managed.memory_dir, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's memory folder {managed.memory_dir} can't be read: "
+                "the server's user needs read and search permission on it (for example "
+                "chmod 755), or every turn fails reading its rules."
+            )
+        # A skills/ or data-vault/ folder the server's user can't read, or a
+        # managed skill folder or its SKILL.md it can't read, would crash every
+        # person's Skills or Connections page and every turn. Refuse at start,
+        # with the path and the fix, rather than loop on a crash.
+        _refuse_unreadable_managed_stores(managed)
+        if not cortex_takes_managed_layer():
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR needs an anton whose Cortex takes managed_hc, the "
+                "read-only memory layer. The installed anton has none, so the "
+                "managed rules would reach no turn."
+            )
+        # A malformed connection registry stops the start, where the operator
+        # sees it. One broken later shares nothing until fixed
+        # (SharedRegistry.read_live).
+        try:
+            shared_connections = managed.shared_connections()
+        except SharedRegistryError as error:
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's shared registry is malformed: {error}. "
+                "Fix or remove the file; a missing one shares nothing."
+            ) from error
+        from anton.core.datasources.data_vault import LocalDataVault
+
+        logger.info(
+            "managed folder: %s (%d skills, %d connections, %d shared connections)",
+            managed.root,
+            len(managed.skill_slugs()),
+            len(LocalDataVault(managed.vault_dir).list_connections()),
+            len(shared_connections.root),
+        )
+
+    # The skills people share, which Cowork writes itself. A malformed list
+    # never stops the start: it shares nothing, with a warning naming the
+    # file (read_shared_skills), until the next share or hide replaces it.
+    if settings.trust_identity_headers and PersonalResource.SKILLS in settings.personal_resources:
+        logger.info(
+            "shared skills: %d in %s", len(read_shared_skills().root), shared_skills_file()
+        )
+
+    # A remote turn runs on a worker that reads and learns memory in the
+    # project's own folder, not in a person's tier, and receives none of the
+    # managed folder.
+    if TurnQueueSettings().is_remote and (settings.trust_identity_headers or managed is not None):
+        raise RuntimeError(
+            "COWORK_TURN_BACKEND=remote is not supported with COWORK_TRUST_IDENTITY_HEADERS "
+            "or COWORK_MANAGED_DIR: remote turns keep memory in each project's own folder, "
+            "not in each person's, and receive none of the managed folder. Leave "
+            "COWORK_TURN_BACKEND unset to run turns in this process."
+        )
+
+    # Org mode, or local tenancy that trusts identity headers: build a
+    # per-request Principal from the identity headers. Added first so it sits
+    # inner of the bearer/CORS layers: in local tenancy it reads the headers
+    # only on a request that passed the bearer token.
+    if settings.tenancy_mode == "org" or settings.trust_identity_headers:
         enforce = settings.identity_enforce == "enforce"
         app.add_middleware(
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
+            personal_partitions=settings.trust_identity_headers,
         )
+    if settings.trust_identity_headers:
+        logger.info(
+            "auth: local tenancy, trusted identity headers enabled "
+            "(identity=%s, personal resources=%s)",
+            settings.identity_enforce,
+            ",".join(sorted(settings.personal_resources)) or "none",
+        )
+    elif settings.tenancy_mode == "org":
         logger.info(
             "auth: org tenancy mode — principal middleware enabled "
             "(identity=%s)",

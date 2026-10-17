@@ -197,6 +197,7 @@ def test_pending_claims_hide_attribution_and_fail_capabilities_closed(org_engine
         "canEdit": False,
         "canDelete": False,
         "canDisable": False,
+        "canShare": False,
     }
 
 
@@ -1228,6 +1229,7 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
         "canEdit",
         "canDelete",
         "canDisable",
+        "canShare",
     }
 
     bob = _scoped(org_engine, BOB)
@@ -1546,6 +1548,7 @@ def test_builtin_identity_uses_directory_slug_when_frontmatter_drifts(org_engine
             "canEdit": False,
             "canDelete": False,
             "canDisable": False,
+            "canShare": False,
         }
     with pytest.raises(HTTPException) as edit_denied:
         skills.update_skill(
@@ -2533,9 +2536,10 @@ async def test_skill_upload_endpoint_offloads_the_owned_session_worker(monkeypat
     principal = _principal(ALICE)
     upload = UploadFile(filename="worker.md", file=io.BytesIO(b"skill bytes"))
 
-    async def fake_run_in_threadpool(function, *args):
+    async def fake_run_in_threadpool(function, *args, **kwargs):
         captured["function"] = function
         captured["args"] = args
+        captured["kwargs"] = kwargs
         return {"worker": True}
 
     monkeypatch.setattr(skills, "run_in_threadpool", fake_run_in_threadpool)
@@ -2545,6 +2549,7 @@ async def test_skill_upload_endpoint_offloads_the_owned_session_worker(monkeypat
     assert result == {"worker": True}
     assert captured["function"] is skills._upload_skill_in_new_session
     assert captured["args"] == (b"skill bytes", "worker.md", scope, principal)
+    assert captured["kwargs"] == {"shared": False}
 
 
 @pytest.mark.asyncio
@@ -2556,7 +2561,7 @@ async def test_skill_upload_worker_keeps_the_event_loop_responsive(monkeypatch):
     release = Event()
     worker_thread = {}
 
-    def blocking_worker(*args):
+    def blocking_worker(*args, **kwargs):
         worker_thread["id"] = get_ident()
         started.set()
         release.wait(timeout=5)
@@ -2599,7 +2604,7 @@ def test_skill_upload_worker_closes_its_session_on_failure(monkeypatch):
     monkeypatch.setattr(skills, "get_open_session", lambda: raw_session)
     monkeypatch.setattr(skills, "ScopedSession", lambda raw, scope: scoped)
 
-    def fail_upload(*args):
+    def fail_upload(*args, **kwargs):
         raise RuntimeError("upload failed")
 
     monkeypatch.setattr(skills, "_upload_skill_bytes", fail_upload)
@@ -3632,6 +3637,7 @@ async def test_a_peer_member_reads_every_shared_resource_with_no_capabilities(
         "canEdit": False,
         "canDelete": False,
         "canDisable": False,
+        "canShare": False,
     }
 
     peer_memory = await MemoryService(bob, _principal(BOB)).get_memory(
@@ -3741,6 +3747,7 @@ def test_a_packaged_skill_slug_cannot_be_squatted(org_engine):
         "canEdit": False,
         "canDelete": False,
         "canDisable": False,
+        "canShare": False,
     }
 
 

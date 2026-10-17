@@ -13,9 +13,9 @@ makes sense for a server process: no console.print, no Live spinner,
 no webbrowser.open. Status flows back to the desktop UI through the
 normal SSE event stream and the response string the LLM renders.
 
-Right now we only override PUBLISH_TOOL — the only one users have hit.
-Add more here as needed (CONNECT_DATASOURCE_TOOL is the next likely
-candidate; same pattern).
+PUBLISH_TOOL is overridden here, and CONNECT_DATASOURCE_TOOL keeps anton's
+handler with a vault that matches only the asker's own connections. Add more
+here as needed; same pattern.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import uuid
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 
@@ -38,9 +39,15 @@ logger = logging.getLogger(__name__)
 
 def _published_state(raw_path: str) -> dict:
     """Delegate to the publish service so the tool and GUI agree on where
-    `.published.json` lives. Imported lazily to avoid a startup import cycle."""
+    `.published.json` lives. Imported lazily to avoid a startup import cycle.
+
+    Every helper here resolves paths in the turn's own scope, the one the
+    producer binds (use_settings_scope): a person's partition where projects
+    are personal. Unbound, the scan refuses on a partitioned deployment.
+    """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_state
-    return published_state(raw_path)
+    return published_state(raw_path, scope=current_settings_scope())
 
 
 def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
@@ -49,12 +56,16 @@ def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
     Resolves the artifact, its root and the credential the same way the HTTP
     endpoints do — `publish_artifact` takes all three explicitly now.
     """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import desktop_publish_context, publish_artifact
 
-    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(raw_path)
+    scope = current_settings_scope()
+    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
+        raw_path, scope=scope
+    )
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
-        api_key=api_key, publish_url=publish_url, access=access,
+        api_key=api_key, publish_url=publish_url, access=access, scope=scope,
     )
 
 
@@ -62,8 +73,9 @@ def _published_owner_state(raw_path: str) -> dict:
     """Raw owner-side `.published.json` entry (mode/access_password/…) so the
     tool can preserve prior access on re-publish. Lazily imported to avoid a
     startup import cycle."""
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_owner_state
-    return published_owner_state(raw_path)
+    return published_owner_state(raw_path, scope=current_settings_scope())
 
 
 def _access_from_state(entry: dict) -> dict:
@@ -591,18 +603,34 @@ def build_cowork_lookup_connector_tool():
 # After the lookup_connector tool surfaces the canonical form spec, the agent calls
 # `request_credentials` to render the form for the user.
 
-def _saved_connection_exists(engine: str, name: str) -> bool:
-    """Whether this turn's vault holds connection ``engine``/``name``.
+def _extends_refusal(engine: str, name: str) -> str | None:
+    """Why a later step can't add fields to connection ``engine``/``name``, or
+    None when it can: this turn's vault must hold it, and the asker must be
+    able to change it (ConnectionsService.can_change), as submit_form checks.
+    A connection someone shares with the asker reads like their own, so
+    without the second check the form would render and its submission answer
+    403.
 
-    Returns True when there is no tenant scope to read the vault with, so the
-    form still renders and submit_form makes the same check.
+    None when there is no tenant scope to read the vault with, so the form
+    still renders and submit_form makes the same checks.
     """
+    scope = current_settings_scope()
     try:
-        vault = vault_for_scope(current_settings_scope())
+        vault = vault_for_scope(scope)
     except MissingTenantScopeError:
         logger.warning("request_credentials: no tenant scope to check extends_connection against")
-        return True
-    return vault.read_record(engine, name) is not None
+        return None
+    if vault.read_record(engine, name) is None:
+        return (
+            f"request_credentials: there is no {engine} connection named "
+            f"{name!r} to extend. Use the name the first save reported."
+        )
+    if not ConnectionsService(scope).can_change(engine, name):
+        return (
+            f"request_credentials: the {engine} connection {name!r} is shared with the "
+            "user and can't be changed here, so no step can add fields to it."
+        )
+    return None
 
 
 def _ensure_form_id(spec: dict) -> dict:
@@ -699,11 +727,9 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
                 "request_credentials: `extends_connection` applies only to handcrafted "
                 "forms; a built-in connector's form saves its connection in one step."
             )
-        if not _saved_connection_exists(connector_id, extends_name.strip()):
-            return (
-                f"request_credentials: there is no {connector_id} connection named "
-                f"{extends_name.strip()!r} to extend. Use the name the first save reported."
-            )
+        refusal = _extends_refusal(connector_id, extends_name.strip())
+        if refusal is not None:
+            return refusal
         # The renderer submits `_existing_name` as the record name; the server
         # reads `_extends_connection` to merge instead of creating a sibling.
         spec["_extends_connection"] = extends_name.strip()
@@ -931,10 +957,22 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     label = str(tc_input.get("label", "")).strip()
     if not engine or not name or not label:
         return "label_connection: `engine`, `name`, and `label` are all required."
-    try:
-        from cowork.services.connectors.persist import set_connection_label
+    from cowork.services.connectors.layered_vault import SharedConnectionError
 
-        stored = set_connection_label(engine, name, label)
+    try:
+        from cowork.common.settings.user_settings import current_settings_scope
+        from cowork.services.connectors.persist import set_connection_label, turn_vault_for_scope
+
+        # The turn's own vault: the label lands on the asker's connection, an
+        # unbound turn on a partitioned deployment is refused, and a turn with
+        # no person changes no connection already saved.
+        scope = current_settings_scope()
+        stored = set_connection_label(
+            engine, name, label, vault=turn_vault_for_scope(scope), scope=scope
+        )
+    except SharedConnectionError as exc:
+        # A connection the asker can't change, such as one shared with them.
+        return f"label_connection: {exc}"
     except Exception as exc:
         logger.exception("Cowork label_connection failed")
         return f"label_connection: could not set label ({exc})"
@@ -959,6 +997,51 @@ def build_cowork_label_connection_tool():
         # `connect-datasource` SKILL.md (see lookup_connector above).
         unlock_skill="connect-datasource",
     )
+
+
+#########################
+# Connect Datasource Tool
+#########################
+
+
+async def _cowork_connect_datasource(session: Any, tc_input: dict) -> str:
+    """Tool handler for `connect_new_datasource`: anton's own
+    (anton.tools.handle_connect_datasource), matched only against the
+    connections the asker can change.
+
+    anton's handler updates the saved connection whose identity fields match
+    the new one's. The turn's vault also lists connections the asker can't
+    change, so it runs against that vault's ConnectingDataVault, where those
+    match nothing and a new connection is saved as the asker's own. A turn
+    with connections turned off reads a FilteredDataVault over it, whose
+    connecting view lists them by label alone, so a paste never matches or
+    relabels one.
+    """
+    from anton.tools import handle_connect_datasource
+
+    from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
+
+    vault = session._data_vault
+    if not isinstance(vault, (LayeredDataVault, FilteredDataVault)):
+        return await handle_connect_datasource(session, tc_input)
+    # anton's handler reads the vault off the session, and a session runs its
+    # tool calls one at a time, so the swap holds for this call alone.
+    session._data_vault = vault.for_connecting()
+    try:
+        return await handle_connect_datasource(session, tc_input)
+    finally:
+        session._data_vault = vault
+
+
+def build_cowork_connect_datasource_tool():
+    """anton's console-less connect_new_datasource, the one its ChatSession
+    swaps in where there is no console, as cowork's turns have none, with
+    _cowork_connect_datasource as its handler."""
+    import dataclasses
+
+    from anton.tools import CONNECT_DATASOURCE_TOOL_NO_CONSOLE
+
+    return dataclasses.replace(CONNECT_DATASOURCE_TOOL_NO_CONSOLE, handler=_cowork_connect_datasource)
 
 
 ##################

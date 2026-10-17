@@ -167,3 +167,48 @@ def test_delete_as_removes_the_row_and_audits(org_id):
         assert _access(raw, org_id).delete_as(KIND, "p/a", actor_id=actor) is False
     assert _row(org_id, "p/a") is None
     assert _events(org_id, "p/a") == sorted([("create", owner), ("delete", actor)])
+
+
+# ── attribution outside org mode ───────────────────────────────────────────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+SUB_A = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+
+
+def test_a_personal_scope_reports_no_author_for_its_own_items():
+    """A person's own project carries their sub as created_by and a skill's
+    creator_id answers the caller outside org mode, so a fallback would name
+    the caller with no email, which the web UI renders as "Another member"."""
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+    from cowork.principal import Principal
+
+    scope = TenantScope(
+        personal=True, org_id=PARTITION_A, user_id=SUB_A, personal_resources=ALL_PERSONAL_RESOURCES
+    )
+    with Session(_engine()) as raw:
+        access = SharedResourceAccess(
+            ScopedSession(raw, scope), Principal(user_id=SUB_A, org_id=PARTITION_A)
+        )
+        creator = access.creator_id("skill", "documents")
+        assert creator == SUB_A
+        attribution = access.attribution("skill", "documents", fallback_creator_id=creator)
+        assert attribution.created_by is None
+        assert attribution.last_modified_by is None
+        # The operator view of the same row names nobody either.
+        operator = SharedResourceAccess(ScopedSession(raw, LOCAL_SCOPE))
+        assert operator.attribution("project", "p", fallback_creator_id=SUB_A).created_by is None
+
+
+def test_org_mode_still_reports_the_fallback_author(org_id):
+    """Hosted regression: an unattributed resource still names its creator."""
+    from cowork.principal import Principal
+
+    with Session(_engine()) as raw:
+        scope = TenantScope(org_mode=True, org_id=org_id, user_id="viewer")
+        access = SharedResourceAccess(
+            ScopedSession(raw, scope), Principal(user_id="viewer", org_id=org_id, email="v@example.com")
+        )
+        other = access.attribution("project", str(uuid4()), fallback_creator_id="someone-else")
+        assert other.created_by is not None and other.created_by.user_id == "someone-else"
+        mine = access.attribution("project", str(uuid4()), fallback_creator_id="viewer")
+        assert mine.created_by is not None and mine.created_by.email == "v@example.com"

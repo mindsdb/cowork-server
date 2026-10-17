@@ -22,6 +22,7 @@ from starlette.responses import JSONResponse, Response as HTTPResponse
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     MissingTenantScopeError,
     TenantScope,
@@ -37,7 +38,7 @@ from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, request_cancel
 from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 from cowork.streaming.buffer import RedisStreamBuffer
-from cowork.streaming.turn_index import get_turn, list_turns
+from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
@@ -64,13 +65,13 @@ TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 def _require_streaming_scope(scope: TenantScope) -> None:
     """Fail closed BEFORE any registry access.
 
-    In org mode a caller with no org in scope (e.g. audit mode with no
-    identity headers) gets 401 — exactly like every ScopedSession-backed
-    endpoint. Checked up front, independent of whether the target turn
-    exists, so an empty list or an unknown conversation_id can't mask the
-    missing-identity case behind a 200/404.
+    Where conversations are partitioned (org mode, or a personal scope that
+    keeps them per person) a caller with no org in scope gets 401 — exactly
+    like every ScopedSession-backed endpoint. Checked up front, independent of
+    whether the target turn exists, so an empty list or an unknown
+    conversation_id can't mask the missing-identity case behind a 200/404.
     """
-    if scope.org_mode and scope.org_id is None:
+    if scope.partitioned_for(PersonalResource.CONVERSATIONS) and scope.org_id is None:
         raise MissingTenantScopeError("streaming access requires an org in scope")
 
 
@@ -81,27 +82,33 @@ def _authorized_handle(
 
     A conversation_id is not an authorization token — the registry is keyed by
     it and would otherwise hand any authenticated caller another org's live
-    turn. Local mode never filters (today's single-user behavior); in org mode
-    a handle owned by a different org reads as absent, never 403 (no existence
-    leak). Assumes the scope was already validated by _require_streaming_scope.
+    turn. Where conversations are shared (local mode, the operator view, or a
+    personal scope that keeps them shared) it never filters. Where they are
+    partitioned, a handle owned by a different org/partition or user reads as
+    absent, never 403 (no existence leak). Assumes the scope was already
+    validated by _require_streaming_scope.
     """
     if handle is None:
         return None
-    return handle if _owner_matches(handle.org_id, handle.user_id, scope) else None
+    owner = TurnOwner(org_id=handle.org_id, user_id=handle.user_id)
+    return handle if _owner_matches(owner, scope) else None
 
 
-def _owner_matches(org_id: str | None, user_id: str | None, scope: TenantScope) -> bool:
-    """Whether the caller may touch a turn owned by (org_id, user_id).
+def _owner_matches(owner: TurnOwner, scope: TenantScope) -> bool:
+    """Whether the caller may touch a turn ``owner`` started.
 
-    Turns are personal — a conversation belongs to its creator — so in org mode
-    BOTH the org and the owning user must match. Matching the org alone let any
-    member tail/cancel/answer a teammate's live turn and read its prompts and
-    output (staging audit P0). Local mode never filters (single user). Shared by
-    the local-handle check and the Redis turn index so the two can't disagree.
+    Turns are personal — a conversation belongs to its creator — so wherever
+    conversations are partitioned BOTH the org (or person's partition) and the
+    owning user must match. Matching the org alone let any member tail/cancel/
+    answer a teammate's live turn and read its prompts and output (staging
+    audit P0). Local mode never filters (single user), and neither does a
+    personal scope that keeps conversations shared, nor the operator view of a
+    trusted-identity deployment (LOCAL_SCOPE). Shared by the local-handle check
+    and the Redis turn index so the two can't disagree.
     """
-    if not scope.org_mode:
+    if not scope.partitioned_for(PersonalResource.CONVERSATIONS):
         return True   # today's single-user behavior
-    return org_id == scope.org_id and user_id == scope.user_id
+    return owner.org_id == scope.org_id and owner.user_id == scope.user_id
 
 
 class SharedTurn(NamedTuple):
@@ -131,7 +138,7 @@ async def _shared_turn(
     if not conversation_id or get_backend() != "redis":
         return None
     turn = await get_turn(conversation_id)
-    if turn is None or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
+    if turn is None or not _owner_matches(TurnOwner.from_index(turn), scope):
         return None
     buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
     await buf.refresh()
@@ -205,8 +212,8 @@ def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> 
     Runs before any database read and before the routing gate, so the refusal
     costs nothing. RunRegistry.start repeats the check under its lock for a
     request that gets past this one while the running turn is still in its
-    own gate. In org mode only the caller's own turn counts, so the refusal
-    never reveals someone else's.
+    own gate. Where conversations are partitioned only the caller's own turn
+    counts, so the refusal never reveals someone else's.
     """
     if not conversation:
         return
@@ -277,7 +284,7 @@ async def in_flight_list(scope: TenantScopeDep):
         seen = {row["conversation_id"] for row in out}
         for turn in await list_turns():
             cid = turn["conversation_id"]
-            if cid in seen or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
+            if cid in seen or not _owner_matches(TurnOwner.from_index(turn), scope):
                 continue
             buf = RedisStreamBuffer(conversation_id=cid, turn_id=int(turn["turn_id"]))
             await buf.refresh()

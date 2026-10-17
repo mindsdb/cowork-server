@@ -121,7 +121,7 @@ from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
-from cowork.services.projects import ProjectService
+from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
@@ -868,8 +868,16 @@ class ResponsesHandler:
                         # registry refuses whichever reaches it second, while
                         # the first turn answers or after it has ended, since
                         # that turn saved its question.
+                        #
+                        # Or the id is a conversation outside the caller's
+                        # scope, which the read above could not see either:
+                        # another person's or another org's. That reads as
+                        # absent, a 404, never the IntegrityError's 500.
                         session.rollback()
-                        conversation = conversation_service.get_conversation(conv_id)
+                        try:
+                            conversation = conversation_service.get_conversation(conv_id)
+                        except ValueError as exc:
+                            raise HTTPException(status_code=404, detail="Conversation not found") from exc
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
                 # allocator, or a name-based format) — it can't become the
@@ -1469,14 +1477,11 @@ class ResponsesHandler:
         """
         from pathlib import Path
 
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.scoped import scoped_storage_root
+        from cowork.services.projects import projects_root
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            org_root = scoped_storage_root(
-                Path(get_app_settings().project.root_dir), session.scope, store="projects"
-            ).parent
+            org_root = projects_root(scope=session.scope).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
             return RemoteWorkspace(project_id=str(conversation.project.id), workspace_rel_path=rel)
         except Exception:
@@ -3100,7 +3105,13 @@ class ResponsesHandler:
         """
         service = ProjectService(session)
         if request.project_id is not None:
-            return request.project_id
+            # An id outside the caller's scope answers like one that never
+            # existed. create_conversation anchors the parent too, but its
+            # ValueError would surface as a 500.
+            try:
+                return service.get_project(request.project_id).id
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=f"Project not found: {request.project_id}") from exc
         if request.project:
             try:
                 # Provisions the org's default when the name is `general` — a fresh
