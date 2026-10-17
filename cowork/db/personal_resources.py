@@ -12,7 +12,11 @@ Hosted org tenancy partitions every resource and never reads the list.
 ``MODEL_RESOURCE`` and ``STORE_RESOURCE`` are how cowork.db.scoped finds the
 resource behind a table or a filesystem store. tests/test_personal_resources.py
 fails when a table with an ``org_id`` or ``created_by`` column, or a store name
-passed to a scoped storage root, has no entry.
+passed to a scoped storage root, has no entry. It also fails when a store root
+is read straight from settings (``*.root_dir``, ``*.vault_dir``,
+``StreamSettings().dir`` or ``cowork_home() / ...``) without passing through a
+scoped storage root and without an allowlist entry, so a new per-person store
+can't ship built from the unkeyed root.
 """
 
 from __future__ import annotations

@@ -331,7 +331,7 @@ def select_settings():
     return select(Setting)
 
 
-def test_operator_pinned_keys_are_the_model_endpoint_memory_and_cost():
+def test_operator_pinned_keys_are_the_deployment_wide_ones():
     from cowork.common.settings.user_settings import setting_is_operator_pinned
 
     for key in (
@@ -340,6 +340,9 @@ def test_operator_pinned_keys_are_the_model_endpoint_memory_and_cost():
         "coding_reasoning_effort", "model_mode", "model_overrides", "providers_json",
         "minds_url", "openai_base_url", "publish_url",
         "max_tool_rounds", "max_continuations", "max_turn_tokens",
+        # "How the agent acts" keys the recording proxy locks deployment-wide:
+        # pinned here too, so a person row can't beat the operator's global one.
+        "proactive_dashboards", "act_first",
     ):
         assert setting_is_operator_pinned(key) is True, key
     for key in UserSettings.model_fields:
@@ -368,24 +371,27 @@ def test_personal_keys_are_per_person(engine):
 def test_pinned_key_ignores_a_persons_own_row(engine, monkeypatch):
     # A stray row in a person's partition (the agent's code can write the
     # database) must not turn memory off for that person.
-    monkeypatch.setenv("MEMORY_MODE", "autopilot")
+    # The env differs from memory_mode's own default ("autopilot"), so reading
+    # it back proves the environment is consulted, not the field default.
+    monkeypatch.setenv("MEMORY_MODE", "copilot")
     alice = _person(partition=PARTITION_A, user="alice")
     with Session(engine) as s:
         s.add(Setting(key="memory_mode", value="off", scope="user", org_id=PARTITION_A, user_id="alice"))
         s.add(Setting(key="max_tool_rounds", value="7", scope="org", org_id=PARTITION_A))
         s.commit()
 
-    # No global row: the environment decides.
+    # No global row: the environment decides, and the stray person row is ignored.
     assert _svc(engine, alice).get_setting("memory_mode").is_set is False
-    assert _svc(engine, alice).load().memory_mode == "autopilot"
+    assert _svc(engine, alice).load().memory_mode == "copilot"
     assert _svc(engine, alice).load().max_tool_rounds != 7
 
-    # A global row beats the environment, for every person.
-    _svc(engine, LOCAL_SCOPE).upsert_setting("memory_mode", "copilot")
-    assert _svc(engine, alice).load().memory_mode == "copilot"
-    assert _svc(engine, alice).get_setting("memory_mode").value == "copilot"
+    # A global row beats the environment, for every person. Its value differs
+    # from the env's, so this proves the global row wins.
+    _svc(engine, LOCAL_SCOPE).upsert_setting("memory_mode", "autopilot")
+    assert _svc(engine, alice).load().memory_mode == "autopilot"
+    assert _svc(engine, alice).get_setting("memory_mode").value == "autopilot"
     listed = {item.key: item.value for item in _svc(engine, alice).list_settings()}
-    assert listed["memory_mode"] == "copilot"
+    assert listed["memory_mode"] == "autopilot"
 
 
 def test_pinned_key_write_in_a_partition_lands_on_the_global_row(engine):

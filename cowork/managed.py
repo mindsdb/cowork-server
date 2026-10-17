@@ -39,15 +39,24 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import stat
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Generic, Self, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Generic, NamedTuple, Self, TypeVar
 from uuid import UUID
 
 from anton.core.tools.skill_format import SKILL_FILE, validate_name
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError, field_validator
 
+from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, open_fd, read_bounded
 from cowork.common.settings.app_settings import get_app_settings
+
+# A shared registry is a short JSON list. A file past this cap is treated as
+# malformed rather than read into memory, so a symlink to a huge file or
+# /dev/zero can't be read in full.
+MAX_REGISTRY_BYTES = 1 << 20  # 1 MiB
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from cowork.db.personal_resources import PersonalResource
@@ -121,16 +130,33 @@ class SharedRegistry(RootModel[tuple[EntryT, ...]], Generic[EntryT]):
     def read(cls, path: Path) -> Self:
         """The registry at ``path``, or none when the file is missing.
 
-        Raises SharedRegistryUnreadableError for a file the filesystem
-        refuses to read, and SharedRegistryError for one that isn't a JSON
-        list of entries, each naming the file and what is wrong with it.
+        Opens the file non-blocking and without following a final symlink,
+        then checks it is a regular file no larger than MAX_REGISTRY_BYTES
+        before reading: a FIFO, a device, a directory or a symlink at ``path``
+        never blocks the read or exhausts memory. A non-regular file, a read
+        the filesystem refuses, and a symlink all raise
+        SharedRegistryUnreadableError; a file past the size cap or one that
+        isn't a JSON list of entries raises SharedRegistryError, each naming
+        the file and what is wrong with it.
         """
         try:
-            raw = path.read_bytes()
+            fd = open_fd(path, os.O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
         except FileNotFoundError:
             return cls(())
-        except OSError as error:
+        except OSError as error:  # ELOOP for a symlink, EACCES, ...
             raise SharedRegistryUnreadableError(f"{path} can't be read: {error}") from error
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SharedRegistryUnreadableError(f"{path} can't be read: not a regular file")
+            if info.st_size > MAX_REGISTRY_BYTES:
+                raise SharedRegistryError(
+                    f"{path} is not a list of shared {cls.entry_noun}s: "
+                    f"larger than {MAX_REGISTRY_BYTES} bytes"
+                )
+            raw = b"".join(read_bounded(fd, info.st_size))
+        finally:
+            os.close(fd)
         try:
             return cls.model_validate_json(raw)
         except ValidationError as error:
@@ -160,14 +186,18 @@ class SharedRegistry(RootModel[tuple[EntryT, ...]], Generic[EntryT]):
     def write(self, path: Path) -> None:
         """Replace the registry file at ``path`` at once, so no reader ever
         reads half of it: a temporary file in the same folder, readable by
-        the server's user whatever the writer's umask, moved over it."""
+        the server's user whatever the writer's umask, flushed to disk and
+        moved over it, so a crash never leaves a torn list in its place."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
+        handle = tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", dir=path.parent, prefix=f".{path.stem}-", suffix=".json", delete=False
-        ) as handle:
-            handle.write(self.dump_json())
+        )
         temporary = Path(handle.name)
         try:
+            with handle:
+                handle.write(self.dump_json())
+                handle.flush()
+                os.fsync(handle.fileno())
             temporary.chmod(0o644)
             os.replace(temporary, path)
         except BaseException:
@@ -197,17 +227,57 @@ def reads_shared_registry(scope: TenantScope | None, *, resource: PersonalResour
     return scope is not None and scope.personal and scope.partitioned_for(resource)
 
 
-def readonly_skill_dirs(root: Path) -> dict[str, Path]:
+class ManagedSkills(NamedTuple):
+    """The skill folders a read-only skill root holds."""
+
+    # The folders a turn can load and the listing shows, by slug: a directory
+    # with a readable ``SKILL.md``.
+    readable: dict[str, Path]
+    # Every slug the root reserves, readable or not. A folder whose ``SKILL.md``
+    # the server's user can't stat still reserves its name, so a create under it
+    # is refused rather than clobbering the operator's skill.
+    reserved: frozenset[str]
+
+
+def readonly_skill_dirs(root: Path) -> ManagedSkills:
     """Each skill folder anton's SkillStore reads from the read-only skill
     root ``root``, by slug, sorted: every directory holding a ``SKILL.md``
-    file. Empty when ``root`` is not a directory."""
-    if not root.is_dir():
-        return {}
-    return {
-        entry.name: entry
-        for entry in sorted(root.iterdir())
-        if entry.is_dir() and (entry / SKILL_FILE).is_file()
-    }
+    file, and every slug the root reserves.
+
+    A folder the server's user can't list or stat never crashes a listing, a
+    turn or a share change: it is logged with its path and the ``chmod``
+    remedy, left out of ``readable``, and kept in ``reserved`` so its name
+    stays taken. Empty, with nothing logged, when ``root`` is missing or is
+    not a directory."""
+    try:
+        entries = sorted(root.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return ManagedSkills({}, frozenset())
+    except OSError as error:
+        logger.error(
+            "read-only skill root %s can't be listed (%s); run `chmod -R a+rX` on it", root, error
+        )
+        return ManagedSkills({}, frozenset())
+    readable: dict[str, Path] = {}
+    reserved: set[str] = set()
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            has_skill = (entry / SKILL_FILE).is_file()
+        except OSError as error:
+            logger.error(
+                "skill folder %s can't be read (%s); run `chmod -R a+rX` on it; "
+                "its name stays reserved",
+                entry,
+                error,
+            )
+            reserved.add(entry.name)
+            continue
+        if has_skill:
+            readable[entry.name] = entry
+            reserved.add(entry.name)
+    return ManagedSkills(readable, frozenset(reserved))
 
 
 class ManagedFolder(BaseModel):
@@ -251,13 +321,14 @@ class ManagedFolder(BaseModel):
         return SharedConnections.read(self.shared_connections_file)
 
     def skill_dirs(self) -> dict[str, Path]:
-        """Each managed skill's folder, by slug, sorted (readonly_skill_dirs),
-        so the names reserved here are exactly the skills a turn can load
-        from this folder."""
-        return readonly_skill_dirs(self.skills_dir)
+        """Each managed skill's readable folder, by slug, sorted
+        (readonly_skill_dirs): what a turn can load and the listing shows."""
+        return readonly_skill_dirs(self.skills_dir).readable
 
     def skill_slugs(self) -> frozenset[str]:
-        return frozenset(self.skill_dirs())
+        """Every slug the managed folder reserves, readable or not, so an
+        unreadable skill's name is still refused for a create."""
+        return readonly_skill_dirs(self.skills_dir).reserved
 
 
 def managed_folder() -> ManagedFolder | None:

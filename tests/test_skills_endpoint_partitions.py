@@ -108,3 +108,35 @@ def test_with_shared_skills_a_builtin_copy_is_the_operator_views(scoped, skills_
         _builtin(), SkillUpdateRequest(instructions="the operator's"), scoped(LOCAL_SCOPE), None
     )
     assert edited["declarative"] == "the operator's"
+
+
+@pytest.fixture()
+def desktop(tmp_path, monkeypatch):
+    """The desktop sidecar: local tenancy, no trusted identity, no managed
+    folder, every store under tmp_path. Yields its LOCAL_SCOPE session."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    monkeypatch.delenv("COWORK_MANAGED_DIR", raising=False)
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    raw = get_open_session()
+    try:
+        yield ScopedSession(raw, LOCAL_SCOPE)
+    finally:
+        raw.close()
+        get_app_settings.cache_clear()
+
+
+def test_a_desktop_rename_into_an_existing_name_answers_409(desktop):
+    service = SkillService(LOCAL_SCOPE)
+    service.create_skill("a-skill", "A.")
+    service.create_skill("b-skill", "B.")
+
+    with pytest.raises(HTTPException) as taken:
+        skills_ep.update_skill("a-skill", SkillUpdateRequest(label="b-skill"), desktop, None)
+
+    assert taken.value.status_code == 409
+    assert service.get_skill("a-skill").instructions.strip() == "A."
+    assert service.get_skill("b-skill").instructions.strip() == "B."

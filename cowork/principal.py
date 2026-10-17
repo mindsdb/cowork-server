@@ -136,6 +136,16 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         if request.url.path in _EXEMPT_PATHS or request.url.path in self._exempt_paths:
             return await call_next(request)
 
+        # A decoded ``.`` or ``..`` segment is refused before the page-shell
+        # pass-through below: otherwise a path like ``/%2e%2e/api/...`` reads as
+        # the page shell here, names no person, and then normalizes onto an API
+        # route served as the operator view. The proxy already blocks this; this
+        # is the same guard on the server side.
+        if self._personal_partitions and any(
+            segment in (".", "..") for segment in request.url.path.split("/")
+        ):
+            return JSONResponse({"detail": "Bad Request"}, status_code=400)
+
         # Every data route sits under /api/. The rest is the web UI's page
         # shell, which a browser loads with no pair, so it names no person
         # and logs nothing.

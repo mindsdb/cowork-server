@@ -80,6 +80,8 @@ def _store_names_passed_to_roots() -> tuple[set[str], list[str]]:
                 value = keyword.value
                 if isinstance(value, ast.Constant) and isinstance(value.value, str):
                     literals.add(value.value)
+                elif ast.unparse(value) == "MEMORY_STORE":
+                    literals.add("memory")  # the shared memory-store-name constant
                 elif ast.unparse(value) in {"store", "self.store_name"}:
                     continue  # scoped_user_storage_root's and SkillService's pass-through
                 else:
@@ -103,6 +105,100 @@ def test_every_store_passed_to_a_scoped_root_has_a_resource():
     assert dynamic == [], "a store name the scan can't read; pass a literal so it can be mapped"
     assert {"projects", "files", "skills", "data-vault", "memory"} <= literals  # the scan sees the calls
     assert sorted(literals - STORE_RESOURCE.keys()) == []
+
+
+# Files that read a store root straight from settings without scoped_storage_root
+# or scoped_user_storage_root, each for a reason that makes the unscoped read
+# correct. A NEW store read not on this list fails the test below, so a
+# per-person store built straight from settings can't ship unpartitioned
+# unnoticed. Keyed by file for stability against line shifts.
+_ALLOWED_UNSCOPED_ROOT_READS: dict[str, str] = {
+    "common/settings/app_settings.py": "defines the root_dir/vault_dir settings fields and their cowork_home() defaults",
+    "harnesses/anton_harness/settings.py": "anton harness settings defaults under cowork_home()",
+    "harnesses/anton_harness/harness.py": "cowork_home() for the turn scratch root, not a partitioned store",
+    "harnesses/memory/layout.py": "the memory layout is scoped by GlobalMemoryStore, not here",
+    "harnesses/memory/migration.py": "one-time desktop .env->DB migration over the unkeyed root",
+    "harnesses/memory/store.py": "base memory root; scoped_user_storage_root wraps it in MemoryStore",
+    "db/alembic/versions/93375a6617f4_init.py": "initial migration over the unkeyed root",
+    "dev_setup.py": "desktop boot over the unkeyed project root (LOCAL_SCOPE)",
+    "migrations.py": ".env->DB migration over the unkeyed root",
+    "managed.py": "the operator's managed vault is deployment-wide, read unscoped by design",
+    "ops/connections.py": "operator command over the managed vault",
+    "server.py": "startup reads of the managed vault and cowork_home, deployment-wide",
+    "services/connectors/persist.py": "the managed vault is deployment-wide (own_vault_root scopes the person's own)",
+    "services/connectors/probe.py": "cowork_home() for a desktop probe, not a partitioned store",
+    "services/projects.py": "projects_root passes this into scoped_storage_root at its one call site",
+    "services/skill_links.py": "the unpartitioned fan-out only runs where skills and projects stay shared (links_apply_to)",
+    "services/skills.py": "remove_project_memory_tiers walks the shared root with an O_NOFOLLOW guard",
+    "api/v1/endpoints/settings.py": "cowork_home() for the .env a desktop setting writes",
+    "coding/engines/codex.py": "the coding product's skill root; the proxy refuses coding on the shipped stack",
+    "coding/service.py": "the coding store is owner-checked and the proxy refuses coding on the shipped stack",
+    "streaming/backend.py": "turn stream buffers are owner-checked, not a per-person filesystem store",
+}
+
+
+def _files_with_unscoped_root_reads() -> set[str]:
+    """Every file that reads a ``*.root_dir``/``*.vault_dir``, ``StreamSettings().dir``
+    or ``cowork_home() / ...`` store root without passing it through
+    scoped_storage_root or scoped_user_storage_root."""
+    flagged: set[str] = set()
+    for path in sorted(COWORK_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parent: dict[int, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parent[id(child)] = node
+        scoped_first_args: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in _ROOT_FUNCTIONS and node.args:
+                    scoped_first_args.add(id(node.args[0]))
+
+        def _inside_scoped(node: ast.AST) -> bool:
+            cur: ast.AST | None = node
+            for _ in range(8):
+                if cur is None or id(cur) in scoped_first_args:
+                    return cur is not None
+                cur = parent.get(id(cur))
+            return False
+
+        for node in ast.walk(tree):
+            target = None
+            if isinstance(node, ast.Attribute) and node.attr in {"root_dir", "vault_dir"}:
+                target = node
+            elif (
+                isinstance(node, ast.Attribute)
+                and node.attr == "dir"
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "StreamSettings"
+            ):
+                target = node
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "cowork_home"
+                and isinstance(parent.get(id(node)), ast.BinOp)
+                and isinstance(parent[id(node)].op, ast.Div)
+            ):
+                target = parent[id(node)]
+            if target is not None and not _inside_scoped(target):
+                flagged.add(path.relative_to(COWORK_ROOT).as_posix())
+    return flagged
+
+
+def test_no_store_root_is_read_unscoped_outside_the_allowlist():
+    flagged = _files_with_unscoped_root_reads()
+    # The scan sees the known intentional readers (so it isn't silently empty).
+    assert "coding/service.py" in flagged and "streaming/backend.py" in flagged
+    unexplained = sorted(flagged - _ALLOWED_UNSCOPED_ROOT_READS.keys())
+    assert unexplained == [], (
+        "a store root is read without scoped_storage_root/scoped_user_storage_root; "
+        "scope it, or add it to _ALLOWED_UNSCOPED_ROOT_READS with a reason: "
+        + ", ".join(unexplained)
+    )
 
 
 def test_store_map_names_only_real_stores():

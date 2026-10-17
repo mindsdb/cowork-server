@@ -43,7 +43,7 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.projects import display_label
-from cowork.services.skill_links import links_apply_to
+from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
@@ -87,8 +87,9 @@ HOST_SKILLS_DIR = Path(__file__).parent / "skills"
 
 def _vault_scratch_dir() -> Path:
     """Where a turn's temporary folder is staged when it needs one: the
-    empty memory tiers of a turn with no person, and the links to the skills
-    others share with the asker (see ``_new_turn_scratch_dir``).
+    empty memory tiers of a turn with no person, and the links to the
+    operator's managed skills and to the skills others share with the asker
+    (see ``_new_turn_scratch_dir``).
 
     Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
     EFS storage by pod_local_only (see its docstring), because this directory
@@ -1096,15 +1097,10 @@ class AntonHarness:
         # Host skills: read-only, they back
         # the deferred tool bundles (e.g. `connect-datasource` unlocks the
         # interactive connection tools). The operator's managed skills follow
-        # them, so a host skill keeps its name; anton ranks every read-only
-        # root below the turn's own skills folder, which never links a slug a
-        # managed skill holds (link_turn_skills). A person's turn adds the
-        # skills others share with them after these, below.
-        managed = managed_folder()
-        anton_settings.skills_extra_roots = [
-            HOST_SKILLS_DIR,
-            *([] if managed is None else [managed.skills_dir]),
-        ]
+        # them, so a host skill keeps its name, and a person's turn adds the
+        # skills others share with them after those (both linked into the
+        # turn's scratch folder below).
+        anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
@@ -1378,6 +1374,28 @@ class AntonHarness:
                 ),
                 llm_client=llm_client,
             )
+
+            # The operator's managed skills: each readable folder
+            # (ManagedFolder.skill_dirs) linked into the turn's scratch folder,
+            # which anton reads as the read-only root after the host skills.
+            # anton drops a whole root's skills when it can't stat one folder
+            # in it, so the turn never hands it the managed folder itself: a
+            # managed skill the server can't read is left out alone, and the
+            # asker's own, the host's and the shared skills still load. The
+            # turn's own skills folder, which anton ranks above every
+            # read-only root, never links a slug the managed folder reserves
+            # (linked_turn_skills), and neither do the fan-outs into projects
+            # (reconcile_skill_links, reconcile_project).
+            managed = managed_folder()
+            if managed is not None:
+                if turn_scratch_dir is None:
+                    turn_scratch_dir = _new_turn_scratch_dir()
+                managed_skills_dir = turn_scratch_dir / "managed-skills"
+                sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed.skill_dirs())
+                anton_settings.skills_extra_roots = [
+                    *anton_settings.skills_extra_roots,
+                    managed_skills_dir,
+                ]
 
             # Skills. Where nothing fans links into this turn's project
             # (skill_links.links_apply_to), the turn links its own from the

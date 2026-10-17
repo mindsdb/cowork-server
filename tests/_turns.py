@@ -8,6 +8,8 @@ from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
+from typing import NamedTuple
 from uuid import uuid4
 
 from pydantic import SecretStr
@@ -125,3 +127,32 @@ async def built_turn(
             if made_project is not None:
                 db.exec(delete(Project).where(Project.id == made_project.id))
             db.commit()
+
+
+class ConnectedInChat(NamedTuple):
+    # What the tool told the agent.
+    answer: str
+    # The vault the session holds once the tool returns.
+    session_vault: object
+
+
+async def connect_in_chat(turn: BuiltTurn, monkeypatch, *, known_variables: dict[str, str]) -> ConnectedInChat:
+    """Run the turn's own connect_new_datasource tool as the agent calls it
+    with postgres credentials pasted in chat, its connection test passing."""
+
+    async def connection_test_passes(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        "anton.commands.datasource.verify.run_connection_test", connection_test_passes
+    )
+    [tool] = [tool for tool in turn.config.tools if tool.name == "connect_new_datasource"]
+    session = SimpleNamespace(
+        _data_vault=turn.config.data_vault,
+        _console=None,
+        _settings=SimpleNamespace(analytics_enabled=False),
+        _scratchpads=None,
+        _active_datasource=None,
+    )
+    answer = await tool.handler(session, {"engine": "postgres", "known_variables": known_variables})
+    return ConnectedInChat(answer=answer, session_vault=session._data_vault)

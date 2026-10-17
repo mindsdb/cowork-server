@@ -70,7 +70,9 @@ def test_update_lets_the_typed_error_through_and_keeps_the_record(tmp_path, monk
         "mode": "public", "requires_password": False,
     }}
     (tmp_path / ".published.json").write_text(json.dumps(record), encoding="utf-8")
-    monkeypatch.setattr(publish_mod, "desktop_artifact_and_base", lambda raw, *, scope: (page, tmp_path))
+    monkeypatch.setattr(
+        publish_mod, "desktop_artifact_and_base", lambda raw, *, scope: publish_mod.DesktopArtifact(page, tmp_path)
+    )
     monkeypatch.setattr(publish_mod, "desktop_publish_credential", lambda: ("k", "https://view.example"))
     calls = []
 

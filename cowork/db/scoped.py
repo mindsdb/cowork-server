@@ -243,6 +243,24 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
     return shared / scope.org_id / store
 
 
+# The segment under a store's partition that holds the per-person tiers.
+USER_STORE_TIER_SEGMENT = "users"
+
+
+def user_store_tiers_segments(partition: str, *, store: str) -> tuple[str, ...]:
+    """The path segments, below the shared root, of the folder holding every
+    person's ``store`` tier in one partition: ``(<partition>, <store>, "users")``."""
+    return (partition, store, USER_STORE_TIER_SEGMENT)
+
+
+def user_store_segments(partition: str, user_id: str, *, store: str) -> tuple[str, ...]:
+    """The path segments, below the shared root, of one person's ``store`` tier:
+    ``(<partition>, <store>, "users", <user_id>)``. scoped_user_storage_root and
+    the per-person tier walks (remove_project_memory_tiers) both build their
+    paths from these segments, so the layout is spelled once."""
+    return (*user_store_tiers_segments(partition, store=store), user_id)
+
+
 def scoped_user_storage_root(
     base: Path, scope: TenantScope | None, *, store: str
 ) -> Path:
@@ -272,7 +290,11 @@ def scoped_user_storage_root(
         raise MissingTenantScopeError(
             "per-user filesystem store requires a user in scope"
         )
-    return scoped_storage_root(base, scope, store=store) / "users" / scope.user_id
+    # scoped_storage_root checks the org and the store segment.
+    scoped_storage_root(base, scope, store=store)
+    return Path(get_app_settings().storage.shared_root).joinpath(
+        *user_store_segments(scope.org_id, scope.user_id, store=store)
+    )
 
 
 def scope_of_session(session: Session) -> TenantScope | None:

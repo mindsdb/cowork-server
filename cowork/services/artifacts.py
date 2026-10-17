@@ -233,17 +233,15 @@ def _human_mtime(ts: float) -> str:
 def _projects_root(*, scope: TenantScope | None) -> Path:
     """The projects root the filesystem scan reads for ``scope``.
 
-    The same expression ProjectService uses for its own root, so a person whose
-    projects are personal scans their partition's projects and nobody else's,
-    and LOCAL_SCOPE scans the unkeyed root as the desktop always has.
-    scoped_storage_root keys it by the projects resource and refuses
-    ``scope=None`` on a partitioned deployment.
+    The canonical ProjectService helper, so a person whose projects are
+    personal scans their partition's projects and nobody else's, and
+    LOCAL_SCOPE scans the unkeyed root as the desktop always has. It keys the
+    path by the projects resource and refuses ``scope=None`` on a partitioned
+    deployment.
     """
-    from cowork.db.scoped import scoped_storage_root
+    from cowork.services.projects import projects_root
 
-    return scoped_storage_root(
-        Path(get_app_settings().project.root_dir), scope, store="projects"
-    )
+    return projects_root(scope=scope)
 
 
 def _registered_project_dirs(*, scope: TenantScope | None) -> list[Path]:
@@ -259,7 +257,19 @@ def _registered_project_dirs(*, scope: TenantScope | None) -> list[Path]:
     ``/private/var/folders/...``; a stub returning the raw temp path passes on
     Linux and fails on a Mac, which is how that state went unnoticed.
     """
-    root = _projects_root(scope=scope).resolve(strict=False)
+    raw_root = _projects_root(scope=scope)
+    if scope is not None and scope.partitioned_for(PersonalResource.PROJECTS):
+        # Reject a link planted at the projects level (<shared>/<org_id>/projects)
+        # or the partition level (<shared>/<org_id>): resolving the root blindly
+        # would follow it into another person's projects and hand the caller
+        # their artifacts. Each level must be a real directory, not a symlink.
+        for level in (raw_root, raw_root.parent):
+            try:
+                if not stat.S_ISDIR(os.lstat(level).st_mode):
+                    return []
+            except OSError:
+                return []
+    root = raw_root.resolve(strict=False)
     if not root.is_dir():
         return []
     out: list[Path] = []
@@ -1758,6 +1768,12 @@ def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
     mounted = _PREVIEW_MOUNTS.get(token)
     if mounted is None:
         return None
+    # Desktop has one user and org mode has no mounts, so the per-asset scan
+    # guards nobody there; skipping it keeps a 30-asset preview from rescanning
+    # and resolving every project folder on each sub-asset request and stalling
+    # the event loop. The scan runs only where identity headers are trusted.
+    if not get_app_settings().trust_identity_headers:
+        return mounted
     try:
         resolved = mounted.resolve(strict=False)
     except OSError:

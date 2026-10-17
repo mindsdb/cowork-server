@@ -31,6 +31,10 @@ PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
 # Inside a person's global tier: one folder per project they have memory for.
 PERSONAL_PROJECTS_DIRNAME = "projects"
 
+# The filesystem store name for memory, shared so every reference keys it the
+# same (scoped_user_storage_root here and remove_project_memory_tiers).
+MEMORY_STORE = "memory"
+
 # Every slot filename is a fixed, hardcoded value in the registry; a slot id is a
 # validated `MemorySlot` enum. `_filename` re-checks the resolved name against
 # this closed set (and rejects any separator) so the value reaching os.open /
@@ -278,7 +282,7 @@ class GlobalMemoryStore(MemoryStore):
             if root is not None
             else Path(get_app_settings().memory.root_dir).expanduser()
         )
-        super().__init__(scoped_user_storage_root(base, scope, store="memory"))
+        super().__init__(scoped_user_storage_root(base, scope, store=MEMORY_STORE))
 
     def list_slots(self) -> list[MemorySlot]:
         return list(SLOT_REGISTRY.keys())
@@ -343,9 +347,13 @@ def project_memory_store(
     global one (PersonalProjectMemoryStore), whether or not its projects are
     personal. Everyone else keeps the project's ``.anton/memory``: hosted org
     mode (shared per project there), the desktop, the operator view, and a
-    personal scope that leaves memory shared. The one resolver for the turn,
-    the memory API and the reset, so they can never disagree on where a
-    person's project memory is.
+    personal scope that leaves memory shared. The one resolver for the
+    in-process turn, the memory API and a person's reset, so they can never
+    disagree on where a person's project memory is. A remote turn keeps memory
+    in the project's own folder and is refused where identity headers are
+    trusted (cowork.server.create_app), so it never reaches this tier; the
+    tier deletion (remove_project_memory_tiers) derives its own path from the
+    same user_store_segments layout.
     """
     if scope is not None and scope.personal and scope.partitioned_for(PersonalResource.MEMORY):
         return PersonalProjectMemoryStore(

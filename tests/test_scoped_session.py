@@ -701,6 +701,19 @@ def test_personal_store_lives_in_the_partition(_roots, personal_deployment):
     )
 
 
+def test_user_store_segments_match_scoped_user_storage_root(_roots, personal_deployment):
+    """The per-person tier walk (remove_project_memory_tiers) derives its path
+    from user_store_segments, so it must land exactly where
+    scoped_user_storage_root puts the tier."""
+    from cowork.db.scoped import user_store_segments
+
+    shared = _roots / "shared"
+    scope = _personal_scope(PARTITION, ALL_PERSONAL_RESOURCES)
+    assert shared.joinpath(*user_store_segments(PARTITION, "user-1", store="memory")) == (
+        scoped_user_storage_root(_roots / "base-memory", scope, store="memory")
+    )
+
+
 def test_shared_store_stays_at_the_base(_roots, personal_deployment):
     scope = _personal_scope(PARTITION, ALL_PERSONAL_RESOURCES - {PersonalResource.SKILLS, PersonalResource.MEMORY})
     assert scoped_storage_root(_roots / "base-skills", scope, store="skills") == _roots / "base-skills"

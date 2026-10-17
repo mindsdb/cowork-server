@@ -271,7 +271,7 @@ def test_share_skill_refuses_what_it_cannot_share(stack, capsys, slug, message):
 
 
 def _first_skill_in(root: Path) -> str:
-    return sorted(readonly_skill_dirs(root))[0]
+    return sorted(readonly_skill_dirs(root).readable)[0]
 
 
 @pytest.mark.parametrize("root", ["anton", "host"])

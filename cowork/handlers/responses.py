@@ -1366,14 +1366,11 @@ class ResponsesHandler:
         """
         from pathlib import Path
 
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.scoped import scoped_storage_root
+        from cowork.services.projects import projects_root
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            org_root = scoped_storage_root(
-                Path(get_app_settings().project.root_dir), session.scope, store="projects"
-            ).parent
+            org_root = projects_root(scope=session.scope).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
             return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}
         except Exception:

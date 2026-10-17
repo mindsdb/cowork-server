@@ -13,7 +13,9 @@ turn's roots are unchanged.
 from __future__ import annotations
 
 import io
+import os
 import zipfile
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -166,6 +168,56 @@ def test_every_change_to_a_managed_slug_is_refused(managed_skill, scoped, own_co
     assert (service.root / MANAGED).exists() is own_copy
 
 
+LOCKED = "locked-report"
+
+
+def _unreadable_managed_skill(managed_dir, monkeypatch) -> Path:
+    """A managed skill whose SKILL.md the server's user can't stat, as a
+    folder left 0000 after the start would be. Driven by a patch, so it holds
+    whether or not the tests run as root."""
+    _write_skill(managed_dir.skills_dir, LOCKED, "Locked.")
+    locked_file = managed_dir.skills_dir / LOCKED / "SKILL.md"
+    real_is_file = Path.is_file
+
+    def is_file(self: Path) -> bool:
+        if self == locked_file:
+            raise PermissionError(13, "Permission denied")
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    return locked_file
+
+
+def test_an_unreadable_managed_skill_is_unlisted_but_keeps_its_name(managed_skill, scoped, monkeypatch):
+    """The listing answers without a managed skill it can't read, and its name
+    stays the operator's: a create under it is refused, not written."""
+    _unreadable_managed_skill(managed_skill, monkeypatch)
+
+    listed = _listed(scoped, ALICE)
+
+    assert MANAGED in listed
+    assert LOCKED not in listed
+    _refusal(lambda: skills_ep.create_skill(SkillCreateRequest(label=LOCKED, instructions="x"), scoped(ALICE), None))
+    assert not (SkillService(ALICE).root / LOCKED).exists()
+
+
+def test_a_turn_never_links_an_own_skill_over_an_unreadable_managed_one(managed_skill, stores, monkeypatch):
+    """While the managed copy can't be read, a person's same-named skill still
+    stays out of the turn: the reserved name, not the readable folders, is the
+    rule every link path uses."""
+    service = SkillService(ALICE)
+    service.create_skill("my-notes", "Mine.")
+    _write_skill(service.root, LOCKED, "My own version.")
+    _unreadable_managed_skill(managed_skill, monkeypatch)
+    turn_skills = stores / "turn-skills"
+
+    link_turn_skills(scope=ALICE, project_name="general", skills_dir=turn_skills)
+
+    linked = {entry.name for entry in turn_skills.iterdir()}
+    assert "my-notes" in linked
+    assert LOCKED not in linked
+
+
 def test_the_service_refuses_too_in_every_scope(managed_dir, stores):
     get_app_settings.cache_clear()
     _write_skill(managed_dir.skills_dir, MANAGED, MANAGED_BODY)
@@ -205,13 +257,51 @@ def test_a_turn_never_links_a_same_named_own_skill(managed_skill, stores):
     assert MANAGED not in linked
 
 
+def _links(folder) -> dict[str, object]:
+    return {entry.name: entry.resolve() for entry in folder.iterdir() if entry.is_symlink()}
+
+
 async def test_a_turn_reads_managed_skills_after_the_host_skills(monkeypatch, managed_skill, stores):
+    """The turn links each managed skill into its scratch folder, never handing
+    anton the managed folder itself, and reads that folder after the host
+    skills and before the skills others share."""
     async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=ALICE) as turn:
         assert turn.config.settings.skills_extra_roots == [
             HOST_SKILLS_DIR,
-            managed_skill.skills_dir,
+            turn.scratch / "managed-skills",
             turn.scratch / "shared-skills",
         ]
+        assert _links(turn.scratch / "managed-skills") == {
+            MANAGED: (managed_skill.skills_dir / MANAGED).resolve()
+        }
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX modes, enforced for non-root")
+async def test_an_unreadable_managed_skill_leaves_the_turns_other_skills(monkeypatch, managed_skill, stores):
+    """A managed skill folder the server can't read, added after the start (no
+    restart), leaves every other skill in the turn: anton drops a whole root's
+    skills when it can't stat one folder in it, so the turn lists the readable
+    managed skill and the person's own beside it, never none."""
+    from anton.core.memory.skills import SkillStore
+
+    SkillService(ALICE).create_skill("my-notes", "Mine.")
+    locked = managed_skill.skills_dir / "locked-report"
+    _write_skill(managed_skill.skills_dir, locked.name, "Locked.")
+    locked.chmod(0o000)
+    try:
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=ALICE) as turn:
+            settings = turn.config.settings
+            listed = {
+                summary["label"]
+                for summary in SkillStore(
+                    root=settings.skills_root, extra_roots=settings.skills_extra_roots
+                ).list_summaries()
+            }
+    finally:
+        locked.chmod(0o755)
+
+    assert {MANAGED, "my-notes"} <= listed
+    assert locked.name not in listed
 
 
 async def test_without_a_managed_folder_a_turn_reads_the_host_skills_only(monkeypatch, stores):

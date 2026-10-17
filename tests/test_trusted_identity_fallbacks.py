@@ -95,6 +95,21 @@ def test_draft_seeding_without_a_scope_reads_the_base_store_on_a_desktop(desktop
     assert [p.name for p in base_skill.iterdir()] == ["SKILL.md"]
 
 
+def test_draft_seeding_in_org_tenancy_with_a_non_org_scope_copies_nothing(base_skill, monkeypatch):
+    """Hosted org tenancy with a non-org scope bound (which no current caller
+    does) must seed nothing from the unkeyed shared store rather than reading
+    it as the operator would."""
+    from cowork.common.settings.user_settings import use_settings_scope
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+
+    with use_settings_scope(LOCAL_SCOPE):
+        task_objects._seed_draft_from_store(base_skill, "report")
+
+    assert list(base_skill.iterdir()) == []
+
+
 # ── attachments for an in-process turn ──────────────────────────────────────
 
 async def test_attachments_without_a_scope_are_skipped(scope_required, monkeypatch, caplog, owned_logger):

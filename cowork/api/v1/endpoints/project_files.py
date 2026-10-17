@@ -104,6 +104,19 @@ PREVIEW_TOKEN_TTL_SECONDS = 30 * 60
 PREVIEW_MOUNT_LIMIT = 2048
 
 
+def _workspaces_private(scope: TenantScope) -> bool:
+    """Whether `conversations/<id>/` is a per-conversation PRIVATE workspace
+    under `scope`: org mode, or a trusted-identity deployment that shares a
+    project while keeping conversations per person. Elsewhere (desktop, the
+    operator view, a partition's own projects) every workspace is the one
+    reader's, so nothing is kept apart."""
+    return scope.org_mode or (
+        scope.personal
+        and scope.partitioned_for(PersonalResource.CONVERSATIONS)
+        and not scope.partitioned_for(PersonalResource.PROJECTS)
+    )
+
+
 @dataclass(frozen=True)
 class _PreviewMount:
     """A directory one preview token may read, and who may read it.
@@ -127,16 +140,25 @@ class _PreviewMount:
     workspace: str | None
     org_id: str | None
     user_id: str | None
+    # Whether conversation workspaces are private under the scope that minted
+    # this token (org mode, or a shared project with per-person conversations).
+    # The token stores it so the session-free asset route keeps the decision
+    # without re-reading the scope.
+    workspaces_private: bool
     expires_at: float
 
     def readable_by(self, scope: TenantScope) -> bool:
-        """Desktop has one user and no organization, so nothing to compare, and
-        neither does a scope that keeps projects shared. Where projects are
-        partitioned (org mode, or a person's partition) the reader must be the
-        minter, in the org or partition it was minted in."""
-        if not scope.partitioned_for(PersonalResource.PROJECTS):
-            return True
-        return self.org_id == scope.org_id and self.user_id == scope.user_id
+        """Where projects are partitioned (org mode, or a person's partition)
+        the reader must be the minter. Where projects are shared but
+        conversations are private, a workspace mount must also be the minter's,
+        so a teammate's token doesn't open another person's workspace. A shared
+        project's root mount stays shareable (desktop has one user, the operator
+        view reads everyone's)."""
+        if scope.partitioned_for(PersonalResource.PROJECTS) or (
+            self.workspaces_private and self.workspace is not None
+        ):
+            return self.org_id == scope.org_id and self.user_id == scope.user_id
+        return True
 
     def serves(self, target: Path) -> bool:
         """Whether this mount may hand out `target`.
@@ -147,10 +169,10 @@ class _PreviewMount:
         mounted file itself lived in is reachable, and a mount taken on a shared
         file reaches no workspace at all.
         """
-        if self.org_id is None:
-            # Desktop: one user, nothing to keep apart. An org-mode mount always
-            # carries an org, because minting reads the project through a scoped
-            # session and that raises without one.
+        if not self.workspaces_private:
+            # Nowhere keeps workspaces apart (desktop, the operator view, a
+            # partition's own projects, or a deployment that shares
+            # conversations too), so every path the mount contains is served.
             return True
         try:
             rel = target.relative_to(self.project_base).as_posix()
@@ -202,9 +224,9 @@ def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str
         )
         _PROJECT_PREVIEW_MOUNTS.pop(oldest, None)
     token = secrets.token_urlsafe(32)
-    # Bound to the scope the project itself is read under: a person whose
-    # projects are shared mints a mount as the desktop does, with no owner.
-    owner = scope.for_resource(PersonalResource.PROJECTS)
+    # Always the minter's real partition and sub, so a token minted where
+    # projects are shared but conversations are private still names the one
+    # person who may open a workspace mount through it.
     # `target` is already fully resolved by `_safe_relpath`, so its parent is too.
     # Resolving again would be a no-op, and it reads as a containment check that
     # has in fact already happened one frame up.
@@ -212,8 +234,9 @@ def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str
         parent=target.parent,
         project_base=base.resolve(),
         workspace=_mount_workspace(target, base),
-        org_id=owner.org_id,
-        user_id=owner.user_id,
+        org_id=scope.org_id,
+        user_id=scope.user_id,
+        workspaces_private=_workspaces_private(scope),
         expires_at=now + PREVIEW_TOKEN_TTL_SECONDS,
     )
     return token
@@ -682,12 +705,7 @@ def _conversation_workspace_ok(
     desktop has one user, the operator view reads everyone's, and a personal
     partition's own projects hold only that person's conversations."""
     scope = scoped.scope
-    shared_project_private_conversations = (
-        scope.personal
-        and scope.partitioned_for(PersonalResource.CONVERSATIONS)
-        and not scope.partitioned_for(PersonalResource.PROJECTS)
-    )
-    if not (scope.org_mode or shared_project_private_conversations):
+    if not _workspaces_private(scope):
         return True
     parts = rel_posix.split("/", 2)
     if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
