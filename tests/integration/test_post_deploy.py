@@ -392,6 +392,21 @@ def _stream_turn(
     return events
 
 
+def test_api_key_lists_conversations_without_browser_expectation(api, identity):
+    """The public ingress accepts an API key without the browser-only header."""
+    if not identity["api_key"].startswith("mdb_"):
+        pytest.fail("This regression check requires a MindsDB API key")
+    if "X-Cowork-Expected-Organization-Id" in api.headers:
+        pytest.fail("The API-key client must omit the browser expectation")
+
+    response = api.get("/api/v1/conversations/")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload, dict)
+    assert isinstance(payload.get("conversations"), list)
+
+
 def test_a_turn_runs_end_to_end(api, conversation_id):
     """A turn posted over HTTP reaches a pod and its replies reach the client."""
     failures: list[str] = []
