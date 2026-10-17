@@ -5,11 +5,16 @@ folders those are depends on who asked the turn:
 
 - The desktop, and a deployment that does not trust identity headers: the base
   global tier and the project's ``.anton/memory``, as always.
-- A person on a deployment that trusts identity headers: their own tiers
-  (GlobalMemoryStore and project_memory_store resolve them from the scope).
+- A person on a deployment that trusts identity headers: their own tiers where
+  memory is per person, and the deployment's shared global tier with its tier
+  for the turn's project where memory is shared (GlobalMemoryStore and
+  project_memory_store resolve them from the scope).
 - A turn with no person on such a deployment, such as an operator call under
-  audit: two empty folders the turn removes when it ends, and no learning at
-  all, so it neither reads nor writes anyone's memory.
+  audit, and every turn there while memory is off
+  (cowork.harnesses.memory.policy): two empty folders the turn removes when it
+  ends, and no learning at all, so it neither reads nor writes anyone's
+  memory. The operator's managed rules still reach it, through the Cortex the
+  harness builds.
 """
 
 from __future__ import annotations
@@ -31,8 +36,9 @@ class TurnMemoryLayout(BaseModel):
 
     global_dir: Path
     project_dir: Path
-    # False only for a turn with no person: its tiers are empty scratch
-    # folders, and the turn runs with memory off and no background passes.
+    # False for a turn with no person, and while memory is off: its tiers are
+    # empty scratch folders, and the turn runs with memory off and no
+    # background passes.
     learns: bool
 
 
@@ -59,7 +65,8 @@ def person_turn_memory(
 
 
 def empty_turn_memory(scratch_dir: Path) -> TurnMemoryLayout:
-    """Two empty tiers under ``scratch_dir``, for a turn with no person.
+    """Two empty tiers under ``scratch_dir``, for a turn with no person or
+    with memory off.
 
     The caller owns ``scratch_dir`` and removes it when the turn ends, so
     nothing anton writes here outlives the turn.

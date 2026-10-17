@@ -40,9 +40,10 @@ opening every person's space.
 
 The server itself isn't locked, and it reads and writes some of a person's
 stores outside the sandbox: their data vault, the memory tiers a turn hands
-anton, and the publish store. ``refuse_planted_links`` refuses a link, or a
-hard-linked file, that agent code before the sandbox left there, before the
-server follows it into another person's space.
+anton (the deployment's shared ones where memory is shared), and the publish
+store. ``refuse_planted_links`` refuses a link, or a hard-linked file, that
+agent code before the sandbox left there, before the server follows it into
+another person's space.
 
 ``check_startup`` runs in create_app. It refuses identity headers with the
 sandbox off, and ``landlock`` where it can't hold. ``_probe_abi`` and
@@ -324,11 +325,12 @@ def refuse_planted_links(path: Path, *, only: tuple[str, ...] = ()) -> None:
     link at one of those names.
 
     For the stores of a person that the server reads and writes outside the
-    sandbox: their data vault, the memory tiers a turn hands anton, and the
-    publish store. No locked cell can plant either kind of link there (no
-    grant carries the right to make one, and none reaches these stores), but
-    agent code that ran before the sandbox could, and the server would follow
-    it into another person's space. So this checks the stores as they are,
+    sandbox: their data vault, the memory tiers a turn hands anton (the
+    deployment's shared ones where memory is shared), and the publish store.
+    No locked cell can plant either kind of link there (no grant carries the
+    right to make one, and none reaches these stores), but agent code that
+    ran before the sandbox could, and the server would follow it into
+    another person's space. So this checks the stores as they are,
     not against a race. Neither the server nor anton makes a link in them:
     skill links sit in a project's ``skills/`` and a turn's scratch folder,
     and the memory layout's runtime links (MemoryLayout.ensure_layout) at a

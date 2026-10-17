@@ -50,6 +50,7 @@ PARTITION_A = personal_partition_id(DEPLOYMENT, SUB_A)
 PARTITION_B = personal_partition_id(DEPLOYMENT, SUB_B)
 TOKEN = "code-sandbox-test-token"
 SHARED_PROJECTS = "conversations,files,skills,connections,schedules,pins,memory,settings"
+SHARED_MEMORY = "conversations,projects,files,skills,connections,schedules,pins,settings"
 BACKEND_SENTENCE = (
     "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
 )
@@ -292,6 +293,22 @@ def test_personal_projects_start_without_the_warning(stack, owned_logger, caplog
     assert _sandbox_warnings(caplog) == []
 
 
+@pytest.mark.parametrize(
+    "resources, enabled",
+    [(SHARED_MEMORY, "true"), (SHARED_MEMORY, "false"), (None, "false")],
+    ids=["memory shared", "memory shared and off", "memory personal and off"],
+)
+def test_memory_shared_or_off_starts_under_the_sandbox(stack, resources, enabled):
+    """Memory left off COWORK_PERSONAL_RESOURCES, or MEMORY_ENABLED false,
+    starts with the sandbox on: neither changes whose sandbox store a cell
+    gets."""
+    if resources is not None:
+        stack.setenv("COWORK_PERSONAL_RESOURCES", resources)
+    stack.setenv("MEMORY_ENABLED", enabled)
+    get_app_settings.cache_clear()
+    cowork_server.create_app()
+
+
 def test_the_shared_folder_is_made_at_start(stack, tmp_path):
     cowork_server.create_app()
     assert (tmp_path / "home" / "shared-files").is_dir()
@@ -465,9 +482,8 @@ def test_a_persons_home_stays_theirs_with_everything_else_shared(stack, tmp_path
 @pytest.mark.parametrize("memory", ["personal", "shared"])
 def test_two_people_never_share_a_sandbox_store(stack, tmp_path, memory):
     """HOME, TMPDIR and the probes' folder are each person's own, with memory
-    personal and with memory shared, which a later release lets the
-    operator choose: one person's pip cache must never reach another's
-    installs."""
+    personal and with memory shared: one person's pip cache must never reach
+    another's installs."""
     resources = (
         ALL_PERSONAL_RESOURCES
         if memory == "personal"
@@ -709,6 +725,61 @@ async def test_a_planted_link_in_a_persons_memory_fails_their_turn(
     with pytest.raises(PlantedLinkError, match=PLANTED):
         async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=ALICE):
             pass
+
+    assert _tree(bobs) == before
+
+
+@pytest.mark.parametrize("planted", ["link", "hard link"])
+async def test_a_planted_link_in_the_shared_memory_fails_a_turn(
+    stack, monkeypatch, tmp_path, planted
+):
+    """With memory left off COWORK_PERSONAL_RESOURCES every person's turn
+    appends to the deployment's one store by path, so a link there fails the
+    turn as it does in a person's own tier."""
+    from cowork.harnesses.memory.store import GlobalMemoryStore, deployment_memory_root
+
+    stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_MEMORY)
+    get_app_settings.cache_clear()
+    alice = _person(PARTITION_A, SUB_A, ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY})
+    store = GlobalMemoryStore(scope=alice).root
+    assert store == deployment_memory_root()
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects", "general")
+    _plant_in_store(planted, store=store, name="lessons.md", bobs=bobs)
+    before = _tree(bobs)
+
+    with pytest.raises(PlantedLinkError, match=PLANTED):
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=alice):
+            pass
+
+    assert _tree(bobs) == before
+
+
+@pytest.mark.parametrize("memory", ["personal", "shared"])
+async def test_memory_off_uses_no_stored_tier_and_keeps_the_sandbox_store(
+    stack, monkeypatch, tmp_path, memory
+):
+    """With MEMORY_ENABLED false a turn gets two empty tiers in its scratch
+    folder and uses no stored one, so a link left in a stored tier neither
+    fails the turn nor is followed. The cell's HOME is still the person's own."""
+    from cowork.harnesses.memory.store import GlobalMemoryStore
+
+    resources = ALL_PERSONAL_RESOURCES
+    if memory == "shared":
+        resources = ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY}
+        stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_MEMORY)
+    stack.setenv("MEMORY_ENABLED", "false")
+    get_app_settings.cache_clear()
+    alice = _person(PARTITION_A, SUB_A, resources)
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects", "general")
+    _plant_in_store("link", store=GlobalMemoryStore(scope=alice).root, name="lessons.md", bobs=bobs)
+    before = _tree(bobs)
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=alice) as turn:
+        assert turn.config.cortex.mode == "off"
+        assert turn.config.background_memory is False
+        assert turn.config.cell_sandbox.home_dir == (
+            (tmp_path / "home").resolve() / PARTITION_A / "sandbox" / "home"
+        )
 
     assert _tree(bobs) == before
 

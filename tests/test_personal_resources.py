@@ -279,3 +279,126 @@ def test_unknown_name_fails_settings_load(_settings_env):
 def test_trust_identity_headers_defaults_off(_settings_env):
     _settings_env.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
     assert AppSettings().trust_identity_headers is False
+
+
+# ── memory off and memory shared (cowork.harnesses.memory.policy) ───────────
+
+SHARES_MEMORY = "conversations,projects,files,skills,connections,schedules,pins,settings"
+
+
+def test_memory_left_off_the_list_is_shared_and_warns_that_turns_learn_into_one_store(
+    personal_deployment, _settings_env
+):
+    from cowork.harnesses.memory.policy import resolve_memory_policy
+
+    _settings_env.setenv("COWORK_PERSONAL_RESOURCES", SHARES_MEMORY)
+    _settings_env.delenv("MEMORY_ENABLED", raising=False)
+    get_app_settings.cache_clear()
+
+    policy = resolve_memory_policy()
+
+    assert (policy.shared, policy.off) == (True, False)
+    warning = policy.start_warning()
+    assert "every person's turns learn into one store" in warning
+    assert "profile included" in warning
+    assert "no turn learns" not in warning
+
+
+def test_shared_memory_turned_off_warns_that_the_store_is_kept(personal_deployment, _settings_env):
+    from cowork.harnesses.memory.policy import resolve_memory_policy
+
+    _settings_env.setenv("COWORK_PERSONAL_RESOURCES", SHARES_MEMORY)
+    _settings_env.setenv("MEMORY_ENABLED", "false")
+    get_app_settings.cache_clear()
+
+    policy = resolve_memory_policy()
+
+    assert (policy.shared, policy.off) == (True, True)
+    warning = policy.start_warning()
+    assert "MEMORY_ENABLED is off: no turn learns" in warning
+    assert "the shared store is kept, unread, until memory goes back on" in warning
+    assert "learn into one store" not in warning
+
+
+@pytest.mark.parametrize("enabled, off", [("true", False), ("false", True)])
+def test_memory_kept_per_person_warns_of_nothing(personal_deployment, _settings_env, enabled, off):
+    from cowork.harnesses.memory.policy import resolve_memory_policy
+
+    _settings_env.setenv("MEMORY_ENABLED", enabled)
+    get_app_settings.cache_clear()
+
+    policy = resolve_memory_policy()
+
+    assert (policy.shared, policy.off) == (False, off)
+    assert policy.start_warning() is None
+
+
+@pytest.mark.parametrize("stored, environment, off", [("false", "true", True), ("true", "false", False)])
+def test_a_stored_memory_setting_decides_over_the_environment(
+    personal_deployment, _settings_env, stored_memory_enabled, stored, environment, off
+):
+    """memory_enabled is operator-pinned: the deployment's stored row wins over
+    MEMORY_ENABLED, for the operator view and a person alike, as a turn's
+    settings resolve it."""
+    from cowork.db.scoped import LOCAL_SCOPE, scope_for_identity
+    from cowork.harnesses.memory.policy import resolve_memory_policy
+    from cowork.principal import personal_partition_id
+
+    _settings_env.setenv("MEMORY_ENABLED", environment)
+    get_app_settings.cache_clear()
+    stored_memory_enabled(stored)
+    deployment = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
+    person = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+    person_scope = scope_for_identity(org_id=personal_partition_id(deployment, person), user_id=person)
+
+    assert resolve_memory_policy(scope=LOCAL_SCOPE).off is off
+    assert resolve_memory_policy(scope=person_scope).off is off
+
+
+def test_memory_settings_change_nothing_without_trusted_identity(_settings_env):
+    """The desktop: MEMORY_ENABLED only sets anton's memory mode, and memory
+    left off the list means nothing, so neither part of the policy applies."""
+    from cowork.harnesses.memory.policy import memory_policy, resolve_memory_policy
+
+    _settings_env.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    _settings_env.setenv("COWORK_PERSONAL_RESOURCES", "")
+    _settings_env.setenv("MEMORY_ENABLED", "false")
+    get_app_settings.cache_clear()
+
+    for policy in (resolve_memory_policy(), memory_policy(memory_enabled=False)):
+        assert (policy.shared, policy.off) == (False, False)
+        assert policy.start_warning() is None
+
+
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_memory_kept_per_person_reads_no_stored_setting_for_the_start_warning(
+    personal_deployment, _settings_env, monkeypatch, enabled
+):
+    """Only shared memory has a start warning, so the stored settings are read
+    for it only where memory is shared."""
+    from cowork.harnesses.memory import policy
+
+    _settings_env.setenv("MEMORY_ENABLED", enabled)
+    get_app_settings.cache_clear()
+
+    def unreadable(*_args, **_kwargs):
+        raise AssertionError("the start warning read the stored settings")
+
+    monkeypatch.setattr(policy, "get_user_settings", unreadable)
+
+    assert policy.memory_shared() is False
+    assert policy.memory_start_warning() is None
+
+
+def test_shared_memory_reads_the_stored_setting_for_the_start_warning(
+    personal_deployment, _settings_env, stored_memory_enabled
+):
+    from cowork.harnesses.memory.policy import memory_shared, memory_start_warning
+
+    _settings_env.setenv("COWORK_PERSONAL_RESOURCES", SHARES_MEMORY)
+    _settings_env.setenv("MEMORY_ENABLED", "true")
+    get_app_settings.cache_clear()
+    stored_memory_enabled("false")
+
+    assert memory_shared() is True
+    assert "MEMORY_ENABLED is off: no turn learns" in memory_start_warning()

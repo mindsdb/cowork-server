@@ -28,15 +28,20 @@ from cowork.db.scoped import (
     user_store_segments,
     user_store_tiers_segments,
 )
+from cowork.harnesses.memory.policy import MEMORY_OFF_KEPT, resolve_memory_policy
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import (
     MEMORY_STORE,
-    PERSONAL_PROJECTS_DIRNAME,
+    PROJECT_TIERS_DIRNAME,
     GlobalMemoryStore,
     PROJECT_SLOTS,
     ProjectMemoryStore,
     SlotRead,
+    deployment_memory_root,
+    deployment_memory_store,
+    nested_project_memory_store,
     project_memory_store,
+    project_tier_ids,
 )
 from cowork.models.project import Project
 from cowork.principal import Principal
@@ -88,9 +93,12 @@ def _project_slot_coordination(
 
 
 def _project_store(*, scope: TenantScope, project: Project) -> ProjectMemoryStore:
-    """The project tier ``scope`` reads and writes for ``project``: a person's
-    own tier in a personal partition, the project's ``.anton/memory`` elsewhere
-    (project_memory_store)."""
+    """The project tier ``scope`` reads and writes for ``project``
+    (project_memory_store): a person's own tier inside their global tier where
+    memory is per person, the deployment's tier inside its global tier where
+    memory is shared, the operator view included, and the project's
+    ``.anton/memory`` for the operator view where memory is per person, on the
+    desktop and in hosted org mode."""
     return project_memory_store(
         scope=scope, project_path=Path(project.path), project_id=project.id
     )
@@ -530,33 +538,55 @@ class PersonTier(NamedTuple):
     sub: str
 
 
+def _remove_tier(*, base: Path, parents: tuple[str, ...], name: str) -> bool:
+    """Remove the tier ``name`` in ``base/<parents...>``; False when it is missing.
+
+    Every level below ``base`` opens without following a link
+    (opened_subdir_nofollow), and a link in the tier's place is unlinked, never
+    followed: the agent's code runs as the server's user and could plant one.
+    """
+    try:
+        with opened_subdir_nofollow(base, *parents) as folder:
+            if stat.S_ISDIR(dir_lstat(folder, name).st_mode):
+                dir_rmtree(folder, name)
+            else:
+                dir_unlink(folder, name)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def remove_project_memory_tiers(*, scope: TenantScope, project_id: UUID) -> int:
-    """Remove each person's memory tier for a deleted project; return how many.
+    """Remove a deleted project's memory tiers; return how many.
 
-    On a deployment that trusts identity headers a person's project tier lives
-    under their own global tier (PersonalProjectMemoryStore), outside the
-    project's folder, so deleting the project leaves it, listed nowhere. Where
-    projects are personal only the deleter can have one. Where they are
-    shared, or the operator view deletes, every person's tier for that
-    project id goes. Everywhere else project memory sits in the project's own
-    folder and goes with it.
+    On a deployment that trusts identity headers a project's tiers can live
+    inside global tiers (NestedProjectMemoryStore), outside the project's
+    folder, so deleting the project would leave them behind: a person's tier
+    listed nowhere, and the deployment's tier listed to every person while
+    memory is shared. Both kinds go whichever way COWORK_PERSONAL_RESOURCES
+    treats memory now, since a tier from before a switch stays on disk: the
+    deployment's tier for the project, and each person's. Where projects are
+    personal only the deleter can have a tier of their own; where they are
+    shared, or the operator view deletes, every person's tier for that project
+    id goes. Everywhere else project memory sits in the project's own folder
+    and goes with it.
 
-    The walk from the shared root down to each tier's ``projects`` folder
-    opens every level without following a link (opened_subdir_nofollow), as
-    the agent's code runs as the server's user and could plant one.
+    The scope's ids are checked before anything is removed. The deployment's
+    tier goes first, and an error there is raised. A person's tier that can't
+    be removed, such as one behind a link planted in their chain, is logged
+    and skipped, so it never keeps another person's tier.
     """
     settings = get_app_settings()
-    if not (
-        settings.trust_identity_headers
-        and PersonalResource.MEMORY in settings.personal_resources
-    ):
+    if not settings.trust_identity_headers:
         return 0
+    name = str(UUID(str(project_id)))
     shared = Path(settings.storage.shared_root)
     # <shared>/<partition>/memory/users/<sub>, the layout scoped_user_storage_root
     # gives a person's global tier (user_store_segments).
     if scope.partitioned_for(PersonalResource.PROJECTS):
         # The scope's ids come from the request, so each must be one folder
-        # name; the walk below takes names that are already folders.
+        # name, refused here before any tier goes; the walk below takes names
+        # that are already folders.
         people = (
             [PersonTier(storage_segment(scope.org_id, what="partition"), storage_segment(scope.user_id, what="user"))]
             if scope.org_id and scope.user_id
@@ -568,25 +598,67 @@ def remove_project_memory_tiers(*, scope: TenantScope, project_id: UUID) -> int:
             for partition in _real_child_dirs(shared)
             for sub in _real_child_dirs(shared.joinpath(*user_store_tiers_segments(partition, store=MEMORY_STORE)))
         ]
-    name = str(UUID(str(project_id)))
     removed = 0
-    for tier in people:
-        try:
-            with opened_subdir_nofollow(
-                shared,
-                *user_store_segments(tier.partition, tier.sub, store=MEMORY_STORE),
-                PERSONAL_PROJECTS_DIRNAME,
-            ) as projects:
-                if stat.S_ISDIR(dir_lstat(projects, name).st_mode):
-                    dir_rmtree(projects, name)
-                else:
-                    dir_unlink(projects, name)
-        except FileNotFoundError:
-            continue
+    if _remove_tier(base=deployment_memory_root(), parents=(PROJECT_TIERS_DIRNAME,), name=name):
         removed += 1
+    for tier in people:
+        parents = (
+            *user_store_segments(tier.partition, tier.sub, store=MEMORY_STORE),
+            PROJECT_TIERS_DIRNAME,
+        )
+        try:
+            if _remove_tier(base=shared, parents=parents, name=name):
+                removed += 1
+        except OSError:
+            logger.warning(
+                "memory: could not remove the tier of deleted project %s in %s",
+                name,
+                shared.joinpath(*parents),
+                exc_info=True,
+            )
     if removed:
         logger.info("memory: removed %d memory tier(s) of deleted project %s", removed, name)
     return removed
+
+
+@dataclass(frozen=True)
+class DeploymentMemoryClear:
+    """What ``clear_deployment_memory`` removed."""
+
+    # The deployment's own global tier, which holds its project tiers.
+    root: Path
+    # How many global slots and project tiers were there to remove.
+    removed: int
+
+
+def clear_deployment_memory() -> DeploymentMemoryClear:
+    """Remove everything learned in the deployment's own memory tiers.
+
+    Those are the one store every person shares where COWORK_PERSONAL_RESOURCES
+    leaves out memory: the global tier's slots, and each project tier in its
+    ``projects/`` folder (project_tier_ids). Only those slot files and project
+    folders go, so no person's tier, which sits in their own partition, and
+    nothing of the operator's managed folder is touched. A link named like a
+    project tier is no tier: it stays, and so does what it points at.
+
+    The project tiers are found before anything is removed, so a link in place
+    of ``projects/``, which project_tier_ids refuses, stops the clear with
+    nothing removed.
+    """
+    store = deployment_memory_store()
+    root = store.root
+    tier_ids = project_tier_ids(global_root=root)
+    removed = 0
+    for slot in MemorySlot:
+        if store.read_state(slot).exists:
+            store.delete(slot)
+            removed += 1
+    for tier_id in tier_ids:
+        if _remove_tier(base=root, parents=(PROJECT_TIERS_DIRNAME,), name=str(tier_id)):
+            removed += 1
+    if removed:
+        logger.info("memory: cleared the deployment's shared memory at %s", root)
+    return DeploymentMemoryClear(root=root, removed=removed)
 
 
 class MemoryService:
@@ -616,6 +688,7 @@ class MemoryService:
     ) -> MemoryResponse:
         scope = MemoryScope(scope)
         category = MemorySlot(category)
+        self._refuse_while_memory_off(refused="Reading it is refused.")
         state = self._read_for_response(scope, category, project_id)
         return self._response(
             scope,
@@ -643,6 +716,7 @@ class MemoryService:
     ) -> MemoryResponse:
         scope = MemoryScope(scope)
         category = MemorySlot(category)
+        self._refuse_while_memory_off(refused="Changing it is refused.")
         self._write(scope, category, content, project_id)
         return self._response(scope, category, content, project_id)
 
@@ -662,6 +736,7 @@ class MemoryService:
     ) -> None:
         scope = MemoryScope(scope)
         category = MemorySlot(category)
+        self._refuse_while_memory_off(refused="Deleting it is refused.")
         self._delete(scope, category, project_id)
 
     async def list_memory(self, project_id: UUID | None = None) -> list[MemoryResponse]:
@@ -671,45 +746,59 @@ class MemoryService:
         self,
         project_id: UUID | None = None,
     ) -> list[MemoryResponse]:
-        items: list[MemoryResponse] = []
+        # While memory is off on a deployment that trusts identity headers,
+        # what is stored stays unread (cowork.harnesses.memory.policy).
+        policy = resolve_memory_policy(scope=self.session.scope)
+        if policy.off:
+            return []
 
-        for category in MemorySlot:
-            items.append(
-                self._response(
-                    MemoryScope.global_,
-                    category,
-                    self._global_store.read(category),
-                    None,
-                )
-            )
+        items = [
+            self._global_response(category=category, content=self._global_store.read(category))
+            for category in MemorySlot
+        ]
 
         projects = list(self.session.exec(self.session.select(Project)).all())
+        visible = {project.id for project in projects}
+        stores: dict[UUID, ProjectMemoryStore]
+        if policy.shared:
+            # The deployment's own tiers, one store every scope reads where
+            # memory is shared (reads_deployment_tiers): every project tier on
+            # disk, whoever's project it is, beside each project the caller
+            # can see. A tier is listed by its id alone, so no other person's
+            # project row is read and no project name reaches the response.
+            stores = {
+                tier_id: nested_project_memory_store(scope=self.session.scope, project_id=tier_id)
+                for tier_id in sorted(
+                    set(project_tier_ids(global_root=self._global_store.root)) | visible, key=str
+                )
+            }
+        else:
+            # Everywhere else each project the caller can see keeps its tier
+            # where project_memory_store puts it: the caller's own tier where
+            # memory is per person, so the listing holds nothing of anyone
+            # else, and the project's .anton/memory for the operator view
+            # there, on the desktop and in hosted org mode (shared per project
+            # there).
+            stores = {
+                project.id: _project_store(scope=self.session.scope, project=project)
+                for project in projects
+            }
         if project_id is not None:
-            projects = [p for p in projects if p.id == project_id]
+            stores = {tier_id: store for tier_id, store in stores.items() if tier_id == project_id}
 
-        # In a personal partition each project tier is the caller's own
-        # (project_memory_store), so the listing holds nothing of anyone else.
-        for project in projects:
-            store = _project_store(scope=self.session.scope, project=project)
+        for tier_id, store in stores.items():
             for category in PROJECT_SLOTS:
                 state = store.read_state(category)
                 items.append(
-                    self._response(
-                        MemoryScope.project,
-                        category,
-                        state.content,
-                        project.id,
+                    self._project_response(
+                        category=category,
+                        content=state.content,
+                        project_id=tier_id,
+                        store=store,
                         read_verified=state.readable,
+                        writable=tier_id in visible,
                     )
                 )
-
-        if project_id is not None:
-            items = [
-                item
-                for item in items
-                if item.scope == MemoryScope.global_ or item.project_id == project_id
-            ]
-
         return items
 
     def _read(
@@ -938,28 +1027,67 @@ class MemoryService:
         read_verified: bool = True,
     ) -> MemoryResponse:
         if scope == MemoryScope.global_:
-            # Private per-member memory: nobody else can see it, so there is no
-            # shared authorship to report and nothing to gate.
-            return MemoryResponse(
-                scope=scope,
-                category=category,
-                content=content,
-                project_id=None,
-                attribution=ResourceAttribution(
-                    created_by=None,
-                    last_modified_by=None,
-                    last_modified_at=None,
-                ),
-                capabilities=MutableResourceCapabilities(
-                    can_edit=True,
-                    can_delete=True,
-                ),
-            )
-
+            return self._global_response(category=category, content=content)
         if project_id is None:
             raise ValueError("project_id is required for project-scoped memory.")
-        key = project_memory_resource_key(project_id, category.value)
         store = _project_store(scope=self.session.scope, project=self._resolve_project(project_id))
+        return self._project_response(
+            category=category,
+            content=content,
+            project_id=project_id,
+            store=store,
+            read_verified=read_verified,
+        )
+
+    def _refuse_while_memory_off(self, *, refused: str) -> None:
+        """Answer 409 while memory is off on a deployment that trusts identity
+        headers, so stored memory stays as it is, unread
+        (cowork.harnesses.memory.policy). ``refused`` names what is refused."""
+        if resolve_memory_policy(scope=self.session.scope).off:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{MEMORY_OFF_KEPT} {refused}",
+            )
+
+    def _global_response(self, *, category: MemorySlot, content: str) -> MemoryResponse:
+        # The global tier records no per-slot authorship. Where memory is
+        # shared (reads_deployment_tiers) it is the deployment's one store that
+        # every person reads, and nothing here refuses a person's write to it,
+        # so the fronting proxy must. Everywhere else it is the caller's own.
+        # Either way any caller may edit or delete its slots.
+        return MemoryResponse(
+            scope=MemoryScope.global_,
+            category=category,
+            content=content,
+            project_id=None,
+            attribution=ResourceAttribution(
+                created_by=None,
+                last_modified_by=None,
+                last_modified_at=None,
+            ),
+            capabilities=MutableResourceCapabilities(
+                can_edit=True,
+                can_delete=True,
+            ),
+        )
+
+    def _project_response(
+        self,
+        *,
+        category: MemorySlot,
+        content: str,
+        project_id: UUID,
+        store: ProjectMemoryStore,
+        read_verified: bool = True,
+        writable: bool = True,
+    ) -> MemoryResponse:
+        """One project slot's response, built from its tier's id and store.
+
+        ``writable`` is False for a shared tier whose project the caller can't
+        see: a write resolves the project first (_project_slot_coordination),
+        so it would refuse.
+        """
+        key = project_memory_resource_key(project_id, category.value)
 
         if (
             self.session.scope.org_mode
@@ -990,10 +1118,10 @@ class MemoryService:
             can_change = self.access.has_trusted_actor
         # A live reservation is not authorship yet. It cannot advertise a
         # capability to its reserver (or an admin) that PUT will reject.
-        if not read_verified or pending:
+        if not read_verified or pending or not writable:
             can_change = False
         return MemoryResponse(
-            scope=scope,
+            scope=MemoryScope.project,
             category=category,
             content=content,
             project_id=project_id,

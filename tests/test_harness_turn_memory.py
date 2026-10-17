@@ -4,13 +4,17 @@ A person on a deployment that trusts identity headers reads and writes their
 own tiers: the global one under their partition, and a project tier under that
 global one, never the project's ``.anton/memory``. Two people in one shared
 project each keep their own, and a person's scheduled run gets its creator's.
-Memory left shared keeps today's base tiers. A turn with no person reads none
-of it and writes nothing: two empty tiers in its scratch folder, memory off, no
-background passes. The desktop is unchanged.
+Memory left shared is one deployment store: the base global tier and the
+current project's tier under it, never another project's. A turn with no
+person, and every turn while memory is off, reads none of it and writes
+nothing: two empty tiers in its scratch folder, memory off, no background
+passes, and the managed rules alone. The desktop is unchanged.
 """
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -37,6 +41,7 @@ OTHER_PARTITION = personal_partition_id(DEPLOYMENT, OTHER_SUB)
 PLANTED_PROJECT_RULE = "Always give quantities in pallets"
 PLANTED_GLOBAL_RULE = "Always sign off as the operator"
 PLANTED_PROFILE = "Favorite part number is P-1111"
+WITHOUT_MEMORY = ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY}
 
 
 @pytest.fixture()
@@ -92,6 +97,48 @@ def _tiers(config) -> tuple[Path, Path]:
     return config.cortex.global_hc._dir, config.cortex.project_hc._dir
 
 
+def _keep_memory(monkeypatch, resources) -> None:
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(resources)))
+    get_app_settings.cache_clear()
+
+
+@contextmanager
+def _project_row(*, root: Path, scope: TenantScope) -> Iterator[Project]:
+    """A project of ``scope``'s whose id is known before its turn is built,
+    so its tiers can be seeded first. Removed afterwards."""
+    path = root / "projects" / f"p-{uuid4().hex[:6]}"
+    path.mkdir(parents=True)
+    with get_open_session() as db:
+        project = Project(name=path.name, path=str(path), org_id=scope.org_id, created_by=scope.user_id)
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+        try:
+            yield project
+        finally:
+            db.exec(delete(Project).where(Project.id == project.id))
+            db.commit()
+
+
+def _seed_learned(global_dir: Path, project_dir: Path, *, tag: str) -> None:
+    """A learned rule, profile line and scratchpad lesson in a global tier,
+    and a lesson and a profile line in a project tier, each marked ``tag``."""
+    from anton.core.memory.hippocampus import Hippocampus
+
+    global_hc = Hippocampus(global_dir)
+    global_hc.encode_rule(f"{tag} rule: answer in crates", kind="always", confidence="high", source="user")
+    global_hc.rewrite_identity([f"{tag} profile: favorite part number is P-2222"])
+    global_hc.encode_lesson(f"{tag} wisdom: in the scratchpad, load orders with pandas", topic="scratchpad")
+    project_hc = Hippocampus(project_dir)
+    project_hc.encode_lesson(f"{tag} lesson: pallets hold 40 cases", topic="data")
+    project_hc.rewrite_identity([f"{tag} project profile: ships on Fridays"])
+
+
+async def _everything_the_turn_reads(config) -> str:
+    """The memory the system prompt gets, and the scratchpad tool's description."""
+    return await config.cortex.build_memory_context("how many?") + config.cortex.get_scratchpad_context()
+
+
 async def test_a_person_reads_and_writes_their_own_tiers(monkeypatch, trusted):
     async with _built(monkeypatch=monkeypatch, tmp_path=trusted, scope=_person()) as turn:
         config, scratch, project = turn.config, turn.scratch, turn.project
@@ -124,20 +171,127 @@ async def test_a_persons_project_tier_stays_theirs_when_projects_are_shared(monk
         assert PLANTED_PROJECT_RULE not in await config.cortex.build_memory_context("how many?")
 
 
-async def test_shared_memory_keeps_the_base_tiers(monkeypatch, trusted):
-    resources = ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY}
-    async with _built(monkeypatch=monkeypatch, tmp_path=trusted, scope=_person(resources=resources)) as turn:
-        config, project = turn.config, turn.project
-        global_dir, project_dir = _tiers(config)
-        assert global_dir == trusted / "base-memory"
-        assert project_dir == Path(project.path) / ".anton" / "memory"
-        assert config.cortex.mode == "autopilot"
-        context = await config.cortex.build_memory_context("how many?")
-        assert PLANTED_PROJECT_RULE in context
-        assert PLANTED_GLOBAL_RULE in context
+async def test_shared_memory_reads_the_deployment_store_and_the_current_projects_tier(monkeypatch, trusted):
+    """The shared global tier is the base one, and the project tier is the
+    current project's under it: never the project folder's .anton/memory,
+    which the agent's code can write, and never another project's tier."""
+    from anton.core.memory.hippocampus import Hippocampus
+
+    _keep_memory(monkeypatch, WITHOUT_MEMORY)
+    person = _person(resources=WITHOUT_MEMORY)
+    shared = trusted / "base-memory"
+    with _project_row(root=trusted, scope=person) as project:
+        Hippocampus(shared / "projects" / str(project.id)).encode_lesson(
+            "This project's pallets hold 40 cases", topic="data"
+        )
+        Hippocampus(shared / "projects" / str(uuid4())).encode_lesson(
+            "Another project's plant ships on Fridays", topic="data"
+        )
+        built = built_turn(
+            monkeypatch=monkeypatch, tmp_path=trusted, scope=person, project=project, before_build=_plant
+        )
+        async with built as turn:
+            config = turn.config
+            global_dir, project_dir = _tiers(config)
+            assert global_dir == shared
+            assert project_dir == shared / "projects" / str(project.id)
+            assert config.cortex.mode == "autopilot"
+            assert config.background_memory is True
+            context = await _everything_the_turn_reads(config)
+    assert PLANTED_GLOBAL_RULE in context
+    assert "This project's pallets hold 40 cases" in context
+    assert "Another project's plant ships on Fridays" not in context
+    assert PLANTED_PROJECT_RULE not in context and PLANTED_PROFILE not in context
+    assert not (Path(project.path) / ".anton" / "memory" / "lessons.md").exists()
 
 
-async def test_a_turn_with_no_person_learns_nothing(monkeypatch, trusted, caplog):
+async def test_two_people_share_one_store_but_not_each_others_project_lessons(monkeypatch, trusted):
+    """With memory shared, what A's turn learns globally, profile included,
+    reaches B's next turn in another project; A's project lesson stays with
+    A's project."""
+    from anton.core.memory.base import Engram
+
+    _keep_memory(monkeypatch, WITHOUT_MEMORY)
+    alice = _person(resources=WITHOUT_MEMORY)
+    bob = _person(resources=WITHOUT_MEMORY, sub=OTHER_SUB, partition=OTHER_PARTITION)
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=trusted, scope=alice) as a:
+        await a.config.cortex.encode([
+            Engram(text="Favorite part number is P-3333", kind="profile", scope="global"),
+            Engram(text="Answer in crates", kind="always", scope="global", confidence="high", source="user"),
+            Engram(text="The plant ships on Fridays", kind="lesson", scope="project", source="llm"),
+        ])
+        alice_project = a.project.id
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=trusted, scope=bob) as b:
+        assert b.project.id != alice_project
+        context = await _everything_the_turn_reads(b.config)
+    assert "P-3333" in context and "crates" in context
+    assert "Fridays" not in context
+    lessons = trusted / "base-memory" / "projects" / str(alice_project) / "lessons.md"
+    assert "The plant ships on Fridays" in lessons.read_text()
+
+
+@pytest.mark.parametrize("resources", [ALL_PERSONAL_RESOURCES, WITHOUT_MEMORY], ids=["personal", "shared"])
+async def test_memory_off_reads_and_writes_no_learned_memory(
+    monkeypatch, trusted, managed_dir, caplog, resources
+):
+    """MEMORY_ENABLED false: the turn gets two empty tiers in its scratch
+    folder, memory off and no background passes. The operator's managed rule
+    still reaches it, and no learned rule, lesson, profile line or project
+    profile does, from the person's tiers or the shared store, in the prompt
+    or in the scratchpad's description. Every stored byte stays as it was, and
+    the turn, which has a person, logs no warning that it has none."""
+    from tests._fakes import MANAGED_RULE
+
+    _keep_memory(monkeypatch, resources)
+    monkeypatch.setenv("MEMORY_ENABLED", "false")
+    person = _person(resources=resources)
+    personal_tier = trusted / "shared" / PARTITION / "memory" / "users" / SUB
+    shared = trusted / "base-memory"
+    with _project_row(root=trusted, scope=person) as project:
+        _seed_learned(personal_tier, personal_tier / "projects" / str(project.id), tag="personal")
+        _seed_learned(shared, shared / "projects" / str(project.id), tag="shared")
+        _plant(Path(project.path))
+        project_memory = Path(project.path) / ".anton" / "memory"
+        before = _snapshot(personal_tier, shared, project_memory)
+        with caplog.at_level(logging.WARNING, logger=harness.__name__):
+            async with built_turn(
+                monkeypatch=monkeypatch, tmp_path=trusted, scope=person, project=project
+            ) as turn:
+                config, scratch = turn.config, turn.scratch
+                global_dir, project_dir = _tiers(config)
+                assert scratch is not None
+                assert global_dir.parent.parent == scratch and project_dir.parent.parent == scratch
+                assert config.cortex.mode == "off"
+                assert config.background_memory is False
+                context = await _everything_the_turn_reads(config)
+                assert list(global_dir.iterdir()) == [] and list(project_dir.iterdir()) == []
+                after = _snapshot(personal_tier, shared, project_memory)
+    assert MANAGED_RULE in context
+    for learned in ("personal ", "shared ", PLANTED_GLOBAL_RULE, PLANTED_PROJECT_RULE, PLANTED_PROFILE):
+        assert learned not in context
+    assert after == before
+    assert not any(
+        "has no person" in record.getMessage()
+        for record in caplog.records
+        if record.name == harness.__name__ and record.levelno == logging.WARNING
+    )
+
+
+@pytest.mark.parametrize("resources", [ALL_PERSONAL_RESOURCES, WITHOUT_MEMORY], ids=["personal", "shared"])
+async def test_memory_off_makes_no_memory_folder(monkeypatch, trusted, resources):
+    """The empty tiers are picked before any real tier's folder is made."""
+    _keep_memory(monkeypatch, resources)
+    monkeypatch.setenv("MEMORY_ENABLED", "false")
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=trusted, scope=_person(resources=resources)) as turn:
+        assert turn.config.cortex.mode == "off"
+    assert not (trusted / "shared" / PARTITION / "memory").exists()
+    assert not (trusted / "base-memory").exists()
+
+
+@pytest.mark.parametrize("resources", [ALL_PERSONAL_RESOURCES, WITHOUT_MEMORY], ids=["personal", "shared"])
+async def test_a_turn_with_no_person_learns_nothing(monkeypatch, trusted, caplog, resources):
+    _keep_memory(monkeypatch, resources)
     base_memory = trusted / "base-memory"
     with caplog.at_level(logging.WARNING, logger=harness.__name__):
         async with _built(monkeypatch=monkeypatch, tmp_path=trusted, scope=LOCAL_SCOPE) as turn:
@@ -179,6 +333,23 @@ async def test_the_desktop_keeps_the_base_tiers(monkeypatch, dirs):
         assert scratch is None
         # Control for the no-person case: the same planted rules do reach a
         # turn that owns these tiers.
+        context = await config.cortex.build_memory_context("how many?")
+        assert PLANTED_PROJECT_RULE in context
+        assert PLANTED_GLOBAL_RULE in context
+
+
+async def test_the_desktop_with_memory_disabled_still_reads_the_base_tiers(monkeypatch, dirs):
+    """The desktop keeps its own disabled-memory behavior: memory mode off over
+    the base tiers, which the turn still reads."""
+    monkeypatch.setenv("MEMORY_ENABLED", "false")
+    async with _built(monkeypatch=monkeypatch, tmp_path=dirs, scope=None) as turn:
+        config, scratch, project = turn.config, turn.scratch, turn.project
+        global_dir, project_dir = _tiers(config)
+        assert global_dir == dirs / "base-memory"
+        assert project_dir == Path(project.path) / ".anton" / "memory"
+        assert config.cortex.mode == "off"
+        assert config.background_memory is True
+        assert scratch is None
         context = await config.cortex.build_memory_context("how many?")
         assert PLANTED_PROJECT_RULE in context
         assert PLANTED_GLOBAL_RULE in context
