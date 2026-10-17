@@ -41,6 +41,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.projects import display_label
@@ -1367,6 +1368,10 @@ class AntonHarness:
                 # `data_vault` is already filtered by `disabled_connections`.
                 connector_usage_notes = registry.usage_notes_for(
                     c["engine"] for c in vault_connections
+                )
+
+                integration_guidance += describe_project_pages(
+                    service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
                 )
 
             cells = extract_scratchpad_cells(history.events)
