@@ -793,6 +793,132 @@ def test_deleting_a_shared_project_removes_every_persons_tier(db, personal_deplo
     assert other_tier.is_dir() and outside.is_dir()
 
 
+def test_deleting_a_project_with_memory_shared_removes_its_shared_tier_and_kept_personal_ones(
+    db, personal_deployment, monkeypatch, tmp_path
+):
+    """Memory shared: the deleted project's tier in the deployment store goes,
+    and so does a person's tier for it kept from before the switch. Another
+    project's tiers stay, and a link planted in the tier's place is unlinked
+    without being followed."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    shares_memory = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY})
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(shares_memory)))
+    get_app_settings.cache_clear()
+    shared_alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shares_memory)
+    alice = _svc(db, shared_alice)
+    doomed = alice.create_project("doomed")
+    kept = alice.create_project("kept")
+    linked = alice.create_project("linked")
+    kept_personal = _lesson_in_tier(_person(partition=PARTITION_A, sub=SUB_A), doomed, "- From before")
+    shared_doomed = _lesson_in_tier(shared_alice, doomed, "- Shared pallets")
+    shared_kept = _lesson_in_tier(shared_alice, kept, "- Shared Fridays")
+    assert shared_doomed == tmp_path / "memory" / "projects" / str(doomed.id)
+    outside = tmp_path / "outside-memory"
+    outside.mkdir()
+    (outside / "lessons.md").write_text("- Not a tier\n")
+    (tmp_path / "memory" / "projects" / str(linked.id)).symlink_to(outside, target_is_directory=True)
+
+    assert alice.delete_project(doomed.id) is True
+    assert alice.delete_project(linked.id) is True
+
+    assert not shared_doomed.exists() and not kept_personal.exists()
+    assert (shared_kept / "lessons.md").read_text().strip() == "- Shared Fridays"
+    assert not (tmp_path / "memory" / "projects" / str(linked.id)).is_symlink()
+    assert (outside / "lessons.md").read_text() == "- Not a tier\n"
+
+
+def test_deleting_a_project_with_memory_per_person_removes_a_kept_shared_tier(
+    db, personal_deployment, monkeypatch, tmp_path
+):
+    """The tier written into the deployment store while memory was shared stays
+    there after the switch back, and goes when its project is deleted."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    shares_memory = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY})
+    alice_scope = _person(partition=PARTITION_A, sub=SUB_A)
+    alice = _svc(db, alice_scope)
+    doomed = alice.create_project("doomed")
+    kept = alice.create_project("kept")
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(shares_memory)))
+    get_app_settings.cache_clear()
+    shared_scope = _person(partition=PARTITION_A, sub=SUB_A, resources=shares_memory)
+    kept_shared = _lesson_in_tier(shared_scope, doomed, "- From the shared days")
+    assert kept_shared == tmp_path / "memory" / "projects" / str(doomed.id)
+    other_shared = _lesson_in_tier(shared_scope, kept, "- Stays")
+    monkeypatch.delenv("COWORK_PERSONAL_RESOURCES")
+    get_app_settings.cache_clear()
+
+    assert alice.delete_project(doomed.id) is True
+
+    assert not kept_shared.exists()
+    assert (other_shared / "lessons.md").read_text().strip() == "- Stays"
+
+
+def test_one_persons_planted_link_never_keeps_a_deleted_projects_other_tiers(
+    db, personal_deployment, monkeypatch, caplog, tmp_path
+):
+    """Memory and projects shared: a link planted in place of one person's
+    project tiers is refused, never followed, and logged. The deployment's
+    tier for the deleted project still goes, so no one's Memories listing
+    holds it, and so does every other person's kept tier."""
+    import logging
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.harnesses.memory.store import deployment_memory_root, project_tier_ids
+
+    shared_both = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY, PersonalResource.PROJECTS})
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(shared_both)))
+    get_app_settings.cache_clear()
+    shared_alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shared_both)
+    alice = _svc(db, shared_alice)
+    doomed = alice.create_project("doomed")
+    shared_tier = _lesson_in_tier(shared_alice, doomed, "- Shared pallets")
+    assert shared_tier == tmp_path / "memory" / "projects" / str(doomed.id)
+    # Bob kept a tier of his own from when memory was per person.
+    bob_personal = _person(
+        partition=PARTITION_B, sub=SUB_B, resources=ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS}
+    )
+    bobs_kept = _lesson_in_tier(bob_personal, doomed, "- From before")
+    assert bobs_kept == tmp_path / PARTITION_B / "memory" / "users" / SUB_B / "projects" / str(doomed.id)
+    # Alice's partition sorts first, so her refused chain comes before Bob's.
+    outside = tmp_path / "outside-memory"
+    (outside / str(doomed.id)).mkdir(parents=True)
+    (outside / str(doomed.id) / "lessons.md").write_text("- Not a tier\n")
+    alice_users = tmp_path / PARTITION_A / "memory" / "users" / SUB_A
+    alice_users.mkdir(parents=True)
+    (alice_users / "projects").symlink_to(outside, target_is_directory=True)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.memory"):
+        assert alice.delete_project(doomed.id) is True
+
+    assert not shared_tier.exists()
+    assert doomed.id not in project_tier_ids(global_root=deployment_memory_root())
+    assert not bobs_kept.exists()
+    assert (alice_users / "projects").is_symlink()
+    assert (outside / str(doomed.id) / "lessons.md").read_text() == "- Not a tier\n"
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.services.memory" and record.levelno == logging.WARNING
+    ] == [f"memory: could not remove the tier of deleted project {doomed.id} in {alice_users / 'projects'}"]
+
+
+def test_the_desktop_leaves_project_memory_to_the_project_folder(db, tmp_path):
+    """Without trusted identity no project tier lives outside its project, so
+    a delete removes none."""
+    from uuid import uuid4
+
+    from cowork.services.memory import remove_project_memory_tiers
+
+    project_id = uuid4()
+    stray = tmp_path / "memory" / "projects" / str(project_id)
+    stray.mkdir(parents=True)
+
+    assert remove_project_memory_tiers(scope=LOCAL_SCOPE, project_id=project_id) == 0
+    assert stray.is_dir()
+
+
 def test_operator_rename_leaves_a_shared_skill_store_alone(db, personal_deployment, monkeypatch, tmp_path):
     """Skills shared, projects personal: a v1.2.0 base project and Alice's own
     share a name, and a shared skill names it. The operator view's rename of

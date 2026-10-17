@@ -1234,8 +1234,10 @@ class ProjectService:
             remove_project_memory_tiers(scope=self.session.scope, project_id=project_id)
         except Exception:
             # Committed already, like the tombstone below: a tier left behind
-            # is listed nowhere and goes with `cowork.ops.memory clear`, never
-            # with a retry.
+            # goes with `cowork.ops.memory clear`, never with a retry. A
+            # person's tier left behind is listed nowhere; the deployment's
+            # stays in every person's Memories listing while memory is shared,
+            # until that clear.
             logger.exception(
                 "Could not remove the deleted project's memory tiers",
                 extra=log_context(project_id=project_id),

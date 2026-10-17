@@ -5,8 +5,10 @@ acts for one person on a local deployment that trusts identity headers
 (COWORK_TRUST_IDENTITY_HEADERS). Every action takes the pair that deployment's
 proxy sends for the person: ``--organization-id``, the deployment's own id
 (X-Organization-Id), and ``--user-id``, the person's ``sub`` (X-User-Id).
-cowork-server works out the person's space from them, as it does for their
-requests, so a caller never repeats the storage layout.
+The one exception is memory left shared, where the memory actions act on the
+deployment's one store and take neither (cowork.ops.memory). cowork-server
+works out the person's space from the pair, as it does for their requests, so
+a caller never repeats the storage layout.
 
 Results go to stdout as plain text, and errors and log lines to stderr. A
 command that can't do what it was asked prints why and exits with status 1.
@@ -89,17 +91,19 @@ def _uuid_argument(value: str) -> str:
         raise argparse.ArgumentTypeError(f"{value!r} is not a UUID") from None
 
 
-def add_person_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the two required person arguments to one action's parser."""
+def add_person_arguments(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
+    """Add the two person arguments to one action's parser. A command whose
+    need for a person depends on the deployment passes ``required=False`` and
+    checks them itself."""
     parser.add_argument(
         "--organization-id",
-        required=True,
+        required=required,
         type=_uuid_argument,
         help="the deployment's id, the X-Organization-Id its proxy sends",
     )
     parser.add_argument(
         "--user-id",
-        required=True,
+        required=required,
         type=_uuid_argument,
         help="the person's id, their sub, the X-User-Id the proxy sends",
     )
@@ -107,6 +111,16 @@ def add_person_arguments(parser: argparse.ArgumentParser) -> None:
 
 def person_from_arguments(arguments: argparse.Namespace) -> Person:
     return Person(organization_id=arguments.organization_id, user_id=arguments.user_id)
+
+
+def require_trusted_identity() -> None:
+    """Refuse a deployment that does not trust identity headers, which keeps
+    no space per person for a command to act on."""
+    if not get_app_settings().trust_identity_headers:
+        raise OperatorCommandError(
+            "COWORK_TRUST_IDENTITY_HEADERS is off, so this deployment keeps no "
+            "space per person."
+        )
 
 
 def personal_scope(person: Person) -> TenantScope:
@@ -117,11 +131,7 @@ def personal_scope(person: Person) -> TenantScope:
     resources COWORK_PERSONAL_RESOURCES lists in the person's space and the
     others shared, exactly as their requests do.
     """
-    if not get_app_settings().trust_identity_headers:
-        raise OperatorCommandError(
-            "COWORK_TRUST_IDENTITY_HEADERS is off, so this deployment keeps no "
-            "space per person."
-        )
+    require_trusted_identity()
     return scope_from_principal(
         Principal(user_id=person.user_id, org_id=person.partition_id)
     )

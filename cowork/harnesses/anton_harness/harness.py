@@ -23,6 +23,7 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_sco
 from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
+from cowork.harnesses.memory.policy import memory_policy
 from cowork.harnesses.memory.turn_layout import (
     TurnMemoryLayout,
     empty_turn_memory,
@@ -1201,9 +1202,9 @@ class AntonHarness:
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
-        # In a personal partition the project's .anton/memory is never this
-        # turn's project tier (person_turn_memory); anton's Workspace above
-        # still creates it, empty.
+        # On a deployment that trusts identity headers the project's
+        # .anton/memory is never this turn's project tier (person_turn_memory);
+        # anton's Workspace above still creates it, empty.
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -1387,25 +1388,31 @@ class AntonHarness:
                 initial_history = [self._stamp_message(m) for m in replayable]
                 seed_info = None
 
-            # The memory of the person who asked: their own tiers, read through
-            # the same resolvers as the /memory API. A turn with no person on a
-            # trusted-identity deployment gets two empty tiers in its scratch
-            # folder, memory off and no background passes, so it reads and
-            # writes nobody's memory.
-            memory_layout = person_turn_memory(
-                scope=current_settings_scope(),
-                project_path=base,
-                project_id=conversation.project_id,
-            )
+            # The memory of the person who asked: their own tiers, or the
+            # deployment's shared ones, read through the same resolvers as the
+            # /memory API. A turn with no person on a trusted-identity
+            # deployment, and every turn there while memory is off, gets two
+            # empty tiers in its scratch folder, memory off and no background
+            # passes, so it reads and writes nobody's memory. The layout is
+            # picked before any real tier's folder is made or read.
+            memory_off = memory_policy(memory_enabled=anton_settings.memory_enabled).off
+            memory_layout: TurnMemoryLayout | None = None
+            if not memory_off:
+                memory_layout = person_turn_memory(
+                    scope=current_settings_scope(),
+                    project_path=base,
+                    project_id=conversation.project_id,
+                )
+                if memory_layout is None:
+                    logger.warning(
+                        "memory: conversation %s has no person; the turn reads no "
+                        "learned memory and writes none",
+                        conversation.id,
+                    )
             if memory_layout is None:
                 if turn_scratch_dir is None:
                     turn_scratch_dir = _new_turn_scratch_dir()
                 memory_layout = empty_turn_memory(turn_scratch_dir / "memory")
-                logger.warning(
-                    "memory: conversation %s has no person; the turn reads no "
-                    "learned memory and writes none",
-                    conversation.id,
-                )
             memory_layout.global_dir.mkdir(parents=True, exist_ok=True)
             memory_layout.project_dir.mkdir(parents=True, exist_ok=True)
             cortex = _turn_cortex(
