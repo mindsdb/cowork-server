@@ -162,6 +162,13 @@ def test_preview_mount_and_asset_work_for_the_owner(client, tree):
     assert sidecar.status_code == 200
 
 
+def test_preview_mount_takes_htm_and_refuses_other_files(client, tree):
+    (tree["root"] / "page.htm").write_text("<p>htm</p>")
+
+    assert _mount(client, A, "page.htm").status_code == 200
+    assert _mount(client, A, "shared.txt").status_code == 415
+
+
 # ── the preview token ─────────────────────────────────────────────────────
 
 def test_the_token_is_random_rather_than_derived_from_the_path(client, tree):

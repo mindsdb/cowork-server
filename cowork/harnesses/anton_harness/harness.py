@@ -42,12 +42,15 @@ from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REP
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
+from cowork.services.conversations import read_earlier_answers
 from cowork.services.projects import display_label
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
+    from anton.core.session import ChatSession
+
     from cowork.services.conversations import ReplayHistory
 
 
@@ -292,9 +295,11 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     two must agree byte for byte. Desktop and SaaS read the same `messages`
     table, so a divergence would not fail here — it would surface as an invalid
     tool_use -> tool_result sequence many turns later, in whichever path did not
-    write the row. anton owns the implementation (ENG-1808); the slicing and the
-    compaction/cancel guards stay on this side, which is the only side that
-    knows whether a turn ended cleanly.
+    write the row. anton owns the implementation (ENG-1808) and the turn's
+    messages (`ChatSession.turn_messages`). The cancel guard stays on this
+    side, which is the only side that knows whether a turn ended cleanly, and
+    so does the choice to store no rows for a turn that compacted
+    (`_captured_turn_history`).
 
     Imported inside the function, like every other anton import in this file.
     `anton.cloud_turn.__init__` re-exports the pod entrypoint's contract and
@@ -306,6 +311,45 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     from anton.cloud_turn.history_rows import split_turn_into_rows
 
     return split_turn_into_rows(history_slice)
+
+
+def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, compacted: bool) -> TurnHistory | None:
+    """The tool block-rows of a turn that completed cleanly, or None when it
+    has none.
+
+    They come from `ChatSession.turn_messages()`, which holds every message
+    the turn appended, those a mid-turn compaction or hard truncation folded
+    out of `session.history` included. A turn that compacted ran near or over
+    the model's context window, and rows this process captures have no size
+    cap (`reject_unreplayable_tool_rows` in cowork/handlers/_turn_history.py),
+    so its rows are read and not stored: the formatter finds the answer's
+    figures in them, and the next turn replays this one as text only. A turn
+    that did not compact stores its rows.
+
+    An anton without `turn_messages` (PyPI-channel desktop installs resolve
+    anton from the floor in pyproject.toml) gets the slice of
+    `session.history` past `seed_len`, and no rows after a compaction: the
+    compaction replaced the list, so the slice could drop rows or keep a
+    tool_result whose tool_use was folded away. A session with neither
+    `turn_messages` nor `history` has no rows.
+    """
+    if hasattr(session, "turn_messages"):
+        turn_slice = session.turn_messages()
+    elif seed_len is not None and not compacted:
+        turn_slice = session.history[seed_len:]
+    else:
+        return None
+    # Drop this turn's user input (and anything before the first assistant
+    # message) so the slice starts where the model replied.
+    while turn_slice and (
+        not isinstance(turn_slice[0], dict)
+        or turn_slice[0].get("role") != "assistant"
+    ):
+        turn_slice = turn_slice[1:]
+    rows = _split_turn_into_rows(turn_slice)
+    if not rows:
+        return None
+    return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
 
 
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
@@ -703,7 +747,7 @@ class AntonHarness:
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
         turn_scope = None
-        turn_rows: list[dict] | None = None
+        turn_history: TurnHistory | None = None
         session = None
         seed_info: dict | None = None
 
@@ -765,12 +809,15 @@ class AntonHarness:
             )
             if model_wait is not None:
                 model_wait.attach(session=session)
-            # Length of the seeded history — everything anton appends past this
-            # index is this turn's block-messages (tool_use / tool_result / text).
-            # Guarded: an anton build (or test double) without `.history` simply
-            # skips capture and falls back to text-only replay.
+            # Length of the seeded history, for an anton without
+            # `turn_messages`: everything it appends past this index is this
+            # turn's block-messages (tool_use / tool_result / text) until a
+            # compaction replaces the list (_captured_turn_history). Guarded
+            # for that fallback slice only: an anton build (or test double)
+            # with neither `turn_messages` nor `.history` skips capture and
+            # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
-            compacted = False  # set if anton summarizes history mid-turn
+            compacted = False  # set if anton compacts or hard-truncates history mid-turn
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Deployed cowork-server resolves anton
             # from PyPI/main, which may predate the trace-tags kwargs (anton
@@ -791,30 +838,23 @@ class AntonHarness:
                 ),
                 # A copy: the session appends this turn to its own list.
                 history=list(getattr(session, "history", ())),
+                # Read from the saved answers, since the session's history is
+                # what anton seeds the model with, not the figures' events.
+                earlier_answers=await read_earlier_answers(conversation_id=conv_id, scope=_units_scope()),
             )
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
-                # Under context pressure anton summarizes history mid-turn,
-                # reassigning session.history and invalidating seed_len.
+                # Under context pressure anton summarizes or hard-truncates
+                # history mid-turn, replacing session.history, and says so
+                # with this event.
                 if type(event).__name__ == "StreamContextCompacted":
                     compacted = True
                 yield event
-            # Turn completed cleanly: capture its tool block-rows for
-            # persistence. Skipped on cancel/error (the block below never runs),
-            # so a partial turn falls back to text-only replay and anton's own
-            # dangling-tool_use sealing keeps its in-memory history valid.
-            #
-            # Also skipped after a mid-turn compaction: seed_len no longer marks
-            # this turn's start, so slicing could drop rows or surface an orphan
-            # tool_result (its tool_use summarized away) → invalid replay. Text-
-            # only replay stays valid, so degrade to it.
-            if seed_len is not None and not compacted:
-                turn_slice = session.history[seed_len:]
-                while turn_slice and (
-                    not isinstance(turn_slice[0], dict)
-                    or turn_slice[0].get("role") != "assistant"
-                ):
-                    turn_slice = turn_slice[1:]
-                turn_rows = _split_turn_into_rows(turn_slice) or None
+            # Turn completed cleanly: capture its tool block-rows. Skipped on
+            # cancel/error (this line never runs), so a partial turn falls
+            # back to text-only replay and anton's own dangling-tool_use
+            # sealing keeps its in-memory history valid. A turn that compacted
+            # hands its rows to the formatter and stores none.
+            turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
         finally:
             if model_wait is not None:
                 model_wait.detach()
@@ -845,8 +885,8 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
-        if turn_rows:
-            yield TurnHistory(turn_rows)
+        if turn_history is not None:
+            yield turn_history
 
     @staticmethod
     def _stamp_message(m) -> dict:
@@ -1154,9 +1194,10 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
-        # Skills the agent builds stage here (sibling of artifacts, under the
-        # off-limits .anton/) — never the live skills store, so a built skill is
-        # surfaced as a draft card rather than auto-saved.
+        # Skills the agent builds stage here, a sibling of artifacts and the one
+        # .anton/ folder besides the artifacts the agent writes in. It is never
+        # the live skills store, so a built skill is surfaced as a draft card
+        # rather than auto-saved.
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
@@ -1202,14 +1243,16 @@ class AntonHarness:
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
-            f"You are operating in the project {display_label(conversation.project)}."
-            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
-            "They are off limits. Do not mention the .anton/ directory in your responses."
+            f"You are operating in the project {display_label(conversation.project)}. "
+            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory "
+            f"(the artifacts under `{str(artifacts_dir)}` and the skill drafts under `{str(skill_drafts_dir)}` "
+            "are the exceptions). "
+            "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
-            + "The only other files that you are allowed to access are any items that are attached to the conversation."
-            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
-            "ALWAYS use the scratchpad to interact with files."
+            + "The only other files that you are allowed to access are any items that are attached to the conversation. "
+            "Access to any files not attached to the conversation or located outside the project is strictly forbidden. "
+            "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
@@ -1230,8 +1273,8 @@ class AntonHarness:
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
-            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find its slug, "
-            "then `open_artifact(slug)` to get the path again.\n"
+            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find it; its folder is `<root>/<slug>`. "
+            "Read the files you will change with `read_text_file`.\n"
             "  3. Use absolute paths from a scratchpad cell so the file always lands in the right place: "
             "`with open(f\"{path}/dashboard.html\", \"w\") as f: ...`\n"
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."

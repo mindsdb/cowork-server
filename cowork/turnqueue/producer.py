@@ -15,6 +15,8 @@ import time
 import uuid
 from datetime import datetime
 
+from pydantic import BaseModel, ConfigDict
+
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import (
     RESET_AT_CODES,
@@ -46,6 +48,20 @@ logger = logging.getLogger(__name__)
 # controller-added fields.
 _MAX_REQUEST_BYTES = 10 * 1024 * 1024
 _REQUEST_BYTES_MARGIN = 64 * 1024
+# The project a turn runs in when its conversation's project could not be
+# read: the org's default one.
+_DEFAULT_WORKSPACE_PATH = "projects/general"
+
+
+class RemoteWorkspace(BaseModel):
+    """The project a remote turn runs in: its id, which travels on the job,
+    and its path relative to the org root, which the pod joins to its own
+    mount (ResponsesHandler._remote_workspace)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    project_id: str
+    workspace_rel_path: str
 
 
 def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> dict[str, str]:
@@ -499,8 +515,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
                                 memory: dict | None = None,
-                                project_id: str | None = None,
-                                workspace_rel_path: str = "projects/general",
+                                workspace: RemoteWorkspace | None = None,
                                 correlation_id: str | None = None,
                                 run_id: str | None = None,
                                 llm: dict | None = None,
@@ -519,7 +534,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
-    user (the cowork UI does; channel turns never)."""
+    user (the cowork UI does; channel turns never).
+    `workspace` is the project the turn runs in; None runs it in the org's
+    default project with no project on the job."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -613,6 +630,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         if isinstance(project_memory, dict) and project_memory
         else None
     )
+    workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -652,7 +670,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         reply_stream=reply_stream,
         organization_id=org_id,
         user_id=user_id,
-        project_id=project_id,
+        project_id=workspace.project_id if workspace is not None else None,
         params=params,
     )
     # Read replies from after the reply stream's newest entry as it is now,
