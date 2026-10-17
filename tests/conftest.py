@@ -230,6 +230,28 @@ def managed_dir(monkeypatch, tmp_path):
 
 
 @pytest.fixture
+def stored_memory_enabled():
+    """Store ``memory_enabled`` for one test as the operator's Settings write
+    does (SettingService), and remove the row afterwards.
+
+    The key is operator-pinned, so the row is the deployment's global one,
+    which every scope resolves ahead of MEMORY_ENABLED. Call the yielded
+    function with ``"true"`` or ``"false"``.
+    """
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    def store(value: str) -> None:
+        with get_open_session() as db:
+            SettingService(db, LOCAL_SCOPE).upsert_setting("memory_enabled", value)
+
+    yield store
+    with get_open_session() as db:
+        SettingService(db, LOCAL_SCOPE).delete_setting("memory_enabled")
+
+
+@pytest.fixture
 def granted_product_permissions(monkeypatch):
     """Model built-in Member grants only for suites testing resource ownership.
 

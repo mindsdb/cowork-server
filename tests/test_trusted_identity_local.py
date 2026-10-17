@@ -1,5 +1,6 @@
 """COWORK_TRUST_IDENTITY_HEADERS through create_app: the startup refusals, the
-middleware's place inside the bearer check, and two people kept apart over HTTP.
+start's warning where memory is shared, the middleware's place inside the
+bearer check, and two people kept apart over HTTP.
 
 The two-person cases here cover what this layer decides on its own: the scope
 each request gets, the rows it stamps, and the 404 for a turn posted into
@@ -132,14 +133,120 @@ def test_a_broken_dependency_is_ignored_with_trust_off(trusted):
 
 
 @pytest.mark.parametrize("resources", ["", "pins,schedules", "projects,conversations,files,pins,schedules"])
-def test_refuses_memory_left_off_the_list(trusted, resources):
-    """Memory left off is one store every person's turns learn into, so a
-    deployment that names people refuses it, the empty list included."""
+def test_boots_with_memory_left_off_the_list(trusted, resources):
+    """Memory left off is one store every person's turns share: the server
+    starts, the empty list included, and its start warns of it (below)."""
     trusted.setenv("COWORK_PERSONAL_RESOURCES", resources)
     get_app_settings.cache_clear()
-    with pytest.raises(RuntimeError, match="needs memory in COWORK_PERSONAL_RESOURCES") as refused:
-        cowork_server.create_app()
-    assert "read the others' lessons" in str(refused.value)
+    cowork_server.create_app()
+
+
+class _StoppedAfterTheMemoryWarning(Exception):
+    """Raised by the start step after the memory warning, so the lifespan
+    goes no further than that."""
+
+
+async def _memory_warnings_at_start(monkeypatch, caplog) -> list[str]:
+    """Run the real lifespan up to the step after its memory warning, and
+    return the memory warnings it logged."""
+
+    def stop() -> None:
+        raise _StoppedAfterTheMemoryWarning
+
+    app = cowork_server.create_app()
+    monkeypatch.setattr(cowork_server, "run_dev_setup", lambda: None)
+    monkeypatch.setattr(cowork_server, "consume_pending_credential_clear", lambda *args: None)
+    monkeypatch.setattr(cowork_server, "_warm_agent_runtime", stop)
+    with pytest.raises(_StoppedAfterTheMemoryWarning):
+        async with cowork_server.lifespan(app):
+            pass
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.common.logger"
+        and record.levelno == logging.WARNING
+        and record.getMessage().startswith("memory: ")
+    ]
+
+
+@pytest.mark.parametrize(
+    "enabled, says, never",
+    [
+        ("true", "every person's turns learn into one store and read it back", "no turn learns"),
+        ("false", "no turn learns, and the shared store is kept, unread", "learn into one store"),
+    ],
+)
+async def test_the_start_warns_that_memory_is_shared(
+    trusted, monkeypatch, caplog, owned_logger, tmp_path, enabled, says, never
+):
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
+    trusted.setenv("MEMORY_ENABLED", enabled)
+    get_app_settings.cache_clear()
+    owned_logger("cowork.common.logger", level=logging.WARNING)
+
+    [warning] = await _memory_warnings_at_start(monkeypatch, caplog)
+
+    assert says in warning and never not in warning
+    assert warning.endswith(f"({tmp_path / 'memory'})")
+
+
+@pytest.mark.parametrize("enabled", ["true", "false"])
+async def test_the_start_warns_of_nothing_while_memory_is_per_person(
+    trusted, monkeypatch, caplog, owned_logger, enabled
+):
+    trusted.setenv("MEMORY_ENABLED", enabled)
+    get_app_settings.cache_clear()
+    owned_logger("cowork.common.logger", level=logging.WARNING)
+
+    assert await _memory_warnings_at_start(monkeypatch, caplog) == []
+
+
+def _unreadable_stored_settings(monkeypatch) -> list[object]:
+    """Make the policy's stored-settings read raise, and return the calls."""
+    from cowork.harnesses.memory import policy
+
+    calls: list[object] = []
+
+    def unreadable(*args, **_kwargs):
+        calls.append(args)
+        raise RuntimeError("the stored settings can't be read")
+
+    monkeypatch.setattr(policy, "get_user_settings", unreadable)
+    return calls
+
+
+async def test_the_start_reads_no_stored_setting_while_memory_is_per_person(
+    trusted, monkeypatch, caplog, owned_logger
+):
+    """Only shared memory has a start warning, so the start resolves
+    MEMORY_ENABLED, which loads the stored settings, only where memory is
+    shared."""
+    calls = _unreadable_stored_settings(monkeypatch)
+    owned_logger("cowork.common.logger", level=logging.WARNING)
+
+    assert await _memory_warnings_at_start(monkeypatch, caplog) == []
+    assert calls == []
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+async def test_a_failed_memory_warning_does_not_stop_the_start(
+    trusted, monkeypatch, caplog, owned_logger, tmp_path
+):
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
+    get_app_settings.cache_clear()
+    calls = _unreadable_stored_settings(monkeypatch)
+    owned_logger("cowork.common.logger", level=logging.WARNING)
+
+    # The lifespan still reaches the step after the warning.
+    assert await _memory_warnings_at_start(monkeypatch, caplog) == []
+    assert calls
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.common.logger" and record.levelno == logging.ERROR
+    ] == ["memory start warning failed (non-fatal)"]
 
 
 @pytest.mark.parametrize("resources", ["memory", "projects,conversations,files,pins,schedules,memory"])
@@ -460,6 +567,94 @@ def _memory_cell(client: TestClient) -> CrossCell:
     return CrossCell(requests=(CrossRequest("GET", f"/api/v1/memory/?project_id={pid}", status=200),), intact=intact)
 
 
+# ── memory shared and memory off, two people over HTTP ──────────────────────
+
+SHARES_MEMORY = "conversations,projects,files,skills,connections,schedules,pins,settings"
+
+
+def test_with_memory_shared_b_lists_as_private_project_tier_by_id_alone(trusted, tmp_path):
+    """A's lesson lands in the deployment store, never in A's project folder.
+    B's Memories listing holds it under the project's id, with no name and no
+    capability, as does the project_id filter."""
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", SHARES_MEMORY)
+    get_app_settings.cache_clear()
+    client = _client()
+    name = f"secret-{uuid4().hex[:6]}"
+    created = client.post("/api/v1/projects/", json={"name": name}, headers=A)
+    assert created.status_code == 201, created.text
+    pid = created.json()["id"]
+    lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
+    assert client.put("/api/v1/memory/", json=lesson, headers=A).status_code == 200
+    assert (tmp_path / "memory" / "projects" / pid / "lessons.md").read_text().strip() == "- Pallets of 40"
+
+    listed = client.get("/api/v1/memory/", headers=B)
+    filtered = client.get("/api/v1/memory/", params={"project_id": pid}, headers=B)
+
+    assert listed.status_code == 200 and filtered.status_code == 200
+    for res in (listed, filtered):
+        entries = [entry for entry in res.json() if entry["project_id"] == pid]
+        assert [entry["content"].strip() for entry in entries if entry["category"] == "lessons"] == [
+            "- Pallets of 40"
+        ]
+        assert not any(entry["capabilities"]["canEdit"] for entry in entries)
+        assert name not in res.text
+    assert {entry["project_id"] for entry in filtered.json()} == {None, pid}
+
+
+@pytest.mark.parametrize("resources", [None, SHARES_MEMORY], ids=["personal", "shared"])
+def test_with_memory_off_every_memories_listing_is_empty(trusted, tmp_path, resources):
+    if resources is not None:
+        trusted.setenv("COWORK_PERSONAL_RESOURCES", resources)
+        get_app_settings.cache_clear()
+    client = _client()
+    pid = _project(client, A)
+    lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
+    assert client.put("/api/v1/memory/", json=lesson, headers=A).status_code == 200
+    rule = {"scope": "global", "category": "rules", "content": "- Answer in cases"}
+    assert client.put("/api/v1/memory/", json=rule, headers=A).status_code == 200
+    assert "- Answer in cases" in client.get("/api/v1/memory/", headers=A).text
+
+    trusted.setenv("MEMORY_ENABLED", "false")
+    for headers in (A, B, BEARER):
+        res = client.get("/api/v1/memory/", headers=headers)
+        assert res.status_code == 200 and res.json() == []
+
+
+@pytest.mark.parametrize("resources", [None, SHARES_MEMORY], ids=["personal", "shared"])
+def test_with_memory_off_no_one_changes_or_deletes_stored_memory(trusted, tmp_path, resources):
+    """Off keeps stored memory as it is: each person's and the operator view's
+    change or delete of a slot answers 409, and the bytes on disk stay."""
+    trusted.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
+    if resources is not None:
+        trusted.setenv("COWORK_PERSONAL_RESOURCES", resources)
+    get_app_settings.cache_clear()
+    client = _client()
+    pid = _project(client, A)
+    lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
+    rule = {"scope": "global", "category": "rules", "content": "- Answer in cases"}
+    for body in (lesson, rule):
+        assert client.put("/api/v1/memory/", json=body, headers=A).status_code == 200
+    if resources is None:
+        tier = tmp_path / "shared" / personal_partition_id(DEPLOYMENT, SUB_A) / "memory" / "users" / SUB_A
+    else:
+        tier = tmp_path / "memory"
+    stored = [tier / "rules.md", tier / "projects" / pid / "lessons.md"]
+    before = [path.read_bytes() for path in stored]
+
+    trusted.setenv("MEMORY_ENABLED", "false")
+    for headers in (A, B, BEARER):
+        for body in (lesson, rule):
+            changed = client.put("/api/v1/memory/", json={**body, "content": "- Changed"}, headers=headers)
+            assert changed.status_code == 409, changed.text
+            assert "Changing it is refused." in changed.text
+            target = {key: value for key, value in body.items() if key != "content"}
+            deleted = client.request("DELETE", "/api/v1/memory/", json=target, headers=headers)
+            assert deleted.status_code == 409, deleted.text
+            assert "Deleting it is refused." in deleted.text
+    assert [path.read_bytes() for path in stored] == before
+
+
 @pytest.mark.parametrize(
     "cell",
     [_conversation_cell, _project_cell, _file_cell, _skill_cell, _connection_cell, _setting_cell, _memory_cell],
@@ -508,9 +703,8 @@ def test_turn_under_another_persons_project_is_404(trusted):
 # ── pins and schedules, two people over HTTP ─────────────────────────────────
 
 # Every resource personal (the default), and only pins and schedules personal
-# beside memory, which a trusted deployment always keeps per person: the
-# second case fails if either table is ever mapped to conversations or
-# projects instead of its own resource.
+# beside memory: the second case fails if either table is ever mapped to
+# conversations or projects instead of its own resource.
 PINS_AND_SCHEDULES_PERSONAL = [None, "pins,schedules,memory"]
 
 
