@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
-from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
@@ -62,6 +62,23 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
         return await auth_proxy.proxy_start(
             service, request, OAuthSettings(),
             {"client_id": body.client_id, "client_secret": body.client_secret, "extra_fields": body.extra_fields},
+        )
+    if get_app_settings().trust_identity_headers:
+        # The provider redirects the browser back to the callback as a
+        # top-level navigation with no identity: the recording proxy refuses
+        # it, and reaching cowork-server directly it is the operator view, so
+        # the connection would be saved with no creator rather than the
+        # person's. OAuthStateStore also keeps one pending start per service
+        # for the whole deployment, which two people's sign-ins would clobber.
+        # Refused up front wherever identity headers are trusted, whether
+        # connections are personal or left shared; connect the service with
+        # its credentials instead.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Signing in to a service from here is not available on this deployment. "
+                "Connect it with its credentials instead."
+            ),
         )
     return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
@@ -230,10 +247,13 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
 # — there is no principal to check by construction, same as auth's own
 # OAuthCallbackView.
 @router.get("/{service}/callback", response_class=HTMLResponse, dependencies=[Depends(require(OpenByDesign))])
-def oauth_callback(service: str, code: str = "", state: str = "", error: str = ""):
+def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    html = oauth_service.callback(service, code, state, error, OAuthSettings())
+    # This runs only on the desktop: start_oauth refuses the sign-in wherever
+    # identity headers are trusted, and in org mode auth runs the handshake
+    # and its own callback.
+    html = oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope)
     return HTMLResponse(content=html)
 
 

@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import os
 import secrets
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import HTTPException, status
 
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, tenant_scope_required
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
     artifacts_sources_for_scope,
 )
 from cowork.services.artifacts import _org_mode
+
+if TYPE_CHECKING:
+    from cowork.services.projects import ProjectService
 
 
 def _project_dir_matches(source, wanted: str) -> bool:
@@ -79,10 +83,11 @@ def scoped_project_id_for_request(session: ScopedSession, project_ref: str) -> U
 
     from cowork.services.projects import ProjectService
 
+    service = ProjectService(session)
     project_id = next(
         (
             project.id
-            for project in ProjectService(session).list_projects()
+            for project in service.list_projects()
             if secrets.compare_digest(project.id.hex, wanted_project_id)
         ),
         None,
@@ -92,7 +97,32 @@ def scoped_project_id_for_request(session: ScopedSession, project_ref: str) -> U
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Unknown project",
         )
+    _refuse_a_persons_project_in_the_operator_view(service, project_id)
     return project_id
+
+
+def _refuse_a_persons_project_in_the_operator_view(service: ProjectService, project_id: UUID) -> None:
+    """The operator view (no person, so LOCAL_SCOPE) lists every project row,
+    but a card's serveUrl names its project by name alone, which the serve
+    route looks up in the unkeyed projects root, and a delete by id would act
+    on that person's partition root. A person's project, a row with an org_id,
+    is refused the operator view so neither a list nor a delete reaches it.
+
+    Placed here, in the one project-id resolver every artifact route shares, so
+    the list, the delete by id, and the drafts/workspace/review routes all
+    refuse it alike. Returns early on the desktop (no tenant scope required)
+    and where the scope partitions (hosted, a person), so only the operator
+    view pays the extra row read."""
+    if not tenant_scope_required() or service.session.scope.partitioned:
+        return
+    if service.get_project(project_id).org_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "This project is a person's own; the operator view lists only "
+                "the deployment's artifacts."
+            ),
+        )
 
 
 def _sources_for_project_ref(

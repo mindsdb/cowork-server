@@ -182,14 +182,18 @@ packages = ["cowork"]
 # error and the per-request API-key supplier that refresh desktop credentials
 # without rebuilding an active session (ENG-2116).
 # Pin the tested revision so frozen image builds use the role-aware provider
-# and cached turn setup. This is the head of mindsdb/anton#585, which adds
-# `ChatSession.turn_messages()`, the `history` frame `anton.cloud_turn` sends
-# after a compaction, `anton.core.mcp.access.returns_records` and
-# `anton.core.mcp.names.parse_namespaced_tool_name`. It sits on anton's
-# v2.26.10.16.1rc1 staging tag, which builds on the v2.26.10.14.1 release
-# commit, so it also carries what the floor above requires, along with
-# staging's unreleased changes such as `ChatSessionConfig.tool_messages` and
-# mindsdb/anton#545, which replaces `open_artifact` with `read_text_file`.
+# and cached turn setup. This is anton staging at the squash of mindsdb/anton#572,
+# which adds Cortex's read-only managed memory layer (`managed_hc`), which
+# create_app requires whenever COWORK_MANAGED_DIR is set
+# (cowork.managed.cortex_takes_managed_layer). It also carries
+# mindsdb/anton#585, which adds `ChatSession.turn_messages()`,
+# the `history` frame `anton.cloud_turn` sends after a compaction,
+# `anton.core.mcp.access.returns_records` and
+# `anton.core.mcp.names.parse_namespaced_tool_name`; the turn-end stream event
+# and the token filter; staging's unreleased changes such as
+# `ChatSessionConfig.tool_messages` and mindsdb/anton#545, which replaces
+# `open_artifact` with `read_text_file`; and what the floor above requires. It
+# moves to the first anton staging tag that holds it.
 # tests/test_agent_prompt_tools.py checks that each tool name of two or more
 # words the agent prompt's project, output and skill-output sections put in
 # backticks is one the locked anton defines in tool_defs or cowork adds.
@@ -201,7 +205,7 @@ packages = ["cowork"]
 # capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
 # predate the `anton-agent` floor above, which no longer admits a release that
 # needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "2b04131f4cea3d7b1d6308563d009f168342155a" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "2bce5a8fd7e4f9929c71d1adad0c1083a81f1f57" }
 
 [dependency-groups]
 dev = [

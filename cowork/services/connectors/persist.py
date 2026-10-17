@@ -7,31 +7,46 @@ save that never overwrites a different account.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from anton.utils.datasources import ensure_unique_user_label
 
-from cowork.common.settings.app_settings import ConnectorSettings
+from cowork.common.settings.app_settings import ConnectorSettings, get_app_settings
+from cowork.creators import Changer, changer_for, turn_changer_for
+from cowork.managed import (
+    ManagedFolder,
+    SharedConnection,
+    SharedConnections,
+    managed_folder,
+    reads_shared_registry,
+)
 from cowork.services.connectors.identity import (
     derive_connection_name,
     resolve_keep_sentinels,
     resolve_unique_slug,
     secure_keys_for,
 )
+from cowork.services.connectors.layered_vault import LayeredDataVault, SharedFrom
 from cowork.services.connectors.vault_lock import lock_for
 
 if TYPE_CHECKING:
+    from anton.core.datasources.data_vault import LocalDataVault
+
     from cowork.db.scoped import TenantScope
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionNotFoundError(LookupError):
     """An ``extends`` save named a connection that does not exist."""
 
 
-def vault_for_scope(scope: "TenantScope | None" = None):
-    from anton.core.datasources.data_vault import LocalDataVault
+def own_vault_root(scope: "TenantScope | None" = None) -> Path:
+    """The folder of the vault ``scope`` saves into (own_vault_for_scope), and
+    the root its record locks are keyed by (vault_lock)."""
     from cowork.db.scoped import scoped_storage_root
 
     # Org mode keys the persisted vault per org, the same as SkillService and
@@ -39,7 +54,100 @@ def vault_for_scope(scope: "TenantScope | None" = None):
     # org deployment a missing scope RAISES rather than falling back, because
     # the fallback path is the shared namespace root and saved credentials
     # must never land there.
-    return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
+    return scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault")
+
+
+def own_vault_for_scope(scope: "TenantScope | None" = None) -> LocalDataVault:
+    """The vault ``scope`` saves into, without the operator's managed entries."""
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    return LocalDataVault(own_vault_root(scope))
+
+
+def _registry_for(scope: "TenantScope | None", managed: ManagedFolder | None) -> SharedConnections:
+    """The shared-connection registry ``scope`` reads (reads_shared_registry),
+    read live: a malformed one shares nothing and logs an error naming the
+    file (SharedRegistry.read_live)."""
+    from cowork.db.personal_resources import PersonalResource
+
+    if managed is None or not reads_shared_registry(scope, resource=PersonalResource.CONNECTIONS):
+        return SharedConnections(())
+    return SharedConnections.read_live(managed.shared_connections_file, logger=logger)
+
+
+def _shared_from(entry: SharedConnection) -> SharedFrom:
+    """A registry entry with its creator's own vault, never their layered one."""
+    from cowork.db.scoped import scope_for_identity
+
+    creator = scope_for_identity(org_id=entry.partition_id, user_id=entry.user_id)
+    return SharedFrom(entry=entry, vault=own_vault_for_scope(creator))
+
+
+def vault_for_scope(scope: "TenantScope | None" = None) -> LocalDataVault | LayeredDataVault:
+    """``scope``'s saved connections, for reading and for saving, in a
+    request or an operator command.
+
+    On the desktop without a managed folder, and in org tenancy, that is its
+    own vault (own_vault_for_scope). With COWORK_MANAGED_DIR set or
+    COWORK_TRUST_IDENTITY_HEADERS on, it is a LayeredDataVault: the managed
+    folder's connections, the scope's own, then the ones others share with a
+    person whose connections are personal (``shared/connections.json``).
+    Every save there records its creator, and a save or delete of a
+    connection the scope can't change raises SharedConnectionError. A scope
+    with no person is the operator view (cowork.creators.changer_for).
+    """
+    from cowork.db.personal_resources import PersonalResource
+
+    return _vault_changed_by(
+        scope=scope, changer=changer_for(scope, resource=PersonalResource.CONNECTIONS)
+    )
+
+
+def _vault_changed_by(
+    *, scope: "TenantScope | None", changer: Changer | None
+) -> LocalDataVault | LayeredDataVault:
+    """vault_for_scope's vault for ``scope``, whose saves and deletes
+    ``changer`` makes."""
+    own = own_vault_for_scope(scope)
+    managed = managed_folder()
+    if managed is None and not get_app_settings().trust_identity_headers:
+        return own
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    registry = _registry_for(scope, managed).root
+    own_partition = None if scope is None else scope.org_id
+    return LayeredDataVault(
+        own=own,
+        managed=None if managed is None else LocalDataVault(managed.vault_dir),
+        shared=tuple(
+            _shared_from(entry) for entry in registry if entry.partition_id != own_partition
+        ),
+        shared_by_own=frozenset(
+            (entry.engine, entry.name) for entry in registry if entry.partition_id == own_partition
+        ),
+        changer=changer,
+    )
+
+
+def turn_vault_for_scope(scope: "TenantScope | None") -> LocalDataVault | LayeredDataVault:
+    """The saved connections an in-process turn and an artifact's live backend
+    read for ``scope``.
+
+    That is vault_for_scope's: the person's own where connections are
+    personal, the base vault where they are shared, the operator's managed
+    connections over either and the ones others share after them, and a
+    refusal for ``scope=None`` on a partitioned deployment, so an unbound
+    turn reads nobody's connections. A save through it, such as the agent's
+    own in a turn, lands in the scope's own vault and outlives the turn. A
+    turn with no person, such as a scheduled run where schedules are shared,
+    is not the operator view: it changes no connection already in the base
+    vault (cowork.creators.turn_changer_for).
+    """
+    from cowork.db.personal_resources import PersonalResource
+
+    return _vault_changed_by(
+        scope=scope, changer=turn_changer_for(scope, resource=PersonalResource.CONNECTIONS)
+    )
 
 
 def persist_connection(
@@ -96,6 +204,10 @@ def persist_connection(
     MCP connector defaulting ``_access_mode`` to ``"read"`` — a token
     refresh/re-auth reaching this same save path must not clobber a value the
     user already upgraded to ``"write"``).
+
+    ``scope`` names the vault saved into and the record lock the save takes
+    (own_vault_root); a caller passing ``vault`` passes the scope it built
+    that vault for.
     """
     if vault is None:
         vault = vault_for_scope(scope)
@@ -119,7 +231,7 @@ def persist_connection(
     # new connection can't race anything since nothing else references it
     # yet), and an unlocked interleaving with one of those would silently
     # revert whichever side saves first.
-    with lock_for(connector_id, base_slug):
+    with lock_for(vault_root=own_vault_root(scope), engine=connector_id, name=base_slug):
         # Resolve modify-flow "keep" sentinels against the record being
         # updated, so an unchanged secret keeps its stored value instead of
         # persisting the literal sentinel.
@@ -200,14 +312,15 @@ def set_connection_label(engine: str, name: str, label: str, *, vault=None,
     or None if the connection doesn't exist or `label` is blank. Used by the
     agent's learn-and-persist flow (e.g. after the user confirms which address
     is "Support") — updates only the non-secret ``_user_label`` and leaves the
-    identity/slug and secrets untouched.
+    identity/slug and secrets untouched. ``scope`` names the vault and the
+    record lock, as in persist_connection.
     """
     clean_label = str(label or "").strip()
     if not clean_label:
         return None
     if vault is None:
         vault = vault_for_scope(scope)
-    with lock_for(engine, name):
+    with lock_for(vault_root=own_vault_root(scope), engine=engine, name=name):
         record = vault.read_record(engine, name)
         if record is None:
             return None

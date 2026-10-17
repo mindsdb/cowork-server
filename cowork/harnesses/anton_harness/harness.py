@@ -18,10 +18,16 @@ from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
+from cowork.harnesses.memory.turn_layout import (
+    TurnMemoryLayout,
+    empty_turn_memory,
+    person_turn_memory,
+)
 from cowork.harnesses.anton_harness.stream_formatter import (
     ArtifactCreated,
     SkillCreated,
@@ -29,6 +35,7 @@ from cowork.harnesses.anton_harness.stream_formatter import (
     TurnHistory,
     format_responses_stream,
 )
+from cowork.managed import managed_folder
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
@@ -37,6 +44,8 @@ from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.projects import display_label
+from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
+from cowork.services.skills import link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -74,17 +83,61 @@ def _anton_mcp_wiring():
     return wiring
 
 
+#: Skills this harness ships for its own tools, read-only: the first of
+#: anton's extra skill roots on every turn.
+HOST_SKILLS_DIR = Path(__file__).parent / "skills"
+
+
 def _vault_scratch_dir() -> Path:
-    """Where the temporary filtered data-vault directory is staged when a
-    turn disables one or more connections (see ``_build_chat_session``).
+    """Where a turn's temporary folder is staged when it needs one: the
+    empty memory tiers of a turn with no person, and the links to the
+    operator's managed skills and to the skills others share with the asker
+    (see ``_new_turn_scratch_dir``).
 
     Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
     EFS storage by pod_local_only (see its docstring), because this directory
     carries no org_id segment: left on cowork_home() it would put every
-    organization's temporary vault contents under the same shared, readable
+    organization's temporary turn files under the same shared, readable
     location.
     """
     return pod_local_only(cowork_home() / "tmp", "tmp")
+
+
+def _new_turn_scratch_dir() -> Path:
+    """A fresh per-turn folder under ``_vault_scratch_dir()``.
+
+    ``_build_chat_session`` returns it, and ``stream_response`` removes it, with
+    everything under it, when the turn ends.
+    """
+    base = _vault_scratch_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="cowork-turn-", dir=base))
+
+
+def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
+    """The turn's Cortex over its two learned tiers.
+
+    The one place an in-process turn builds its Cortex, so the operator's
+    read-only managed memory layer joins the turn here: every turn with a
+    managed folder gets its rules and lessons, a turn with no person included.
+    The argument is passed directly, never through supported_kwargs: create_app
+    refuses a managed folder on an anton without it (cortex_takes_managed_layer),
+    and a dropped layer would silently lose the operator's rules.
+    """
+    from anton.core.memory.cortex import Cortex
+    from anton.core.memory.hippocampus import Hippocampus
+
+    managed = managed_folder()
+    managed_layer = (
+        {} if managed is None else {"managed_hc": Hippocampus(managed.memory_dir)}
+    )
+    return Cortex(
+        global_hc=Hippocampus(layout.global_dir),
+        project_hc=Hippocampus(layout.project_dir),
+        mode=mode,
+        llm_client=llm_client,
+        **managed_layer,
+    )
 
 
 #: Settings copied from the Cowork DB onto anton's own settings object, in
@@ -299,16 +352,6 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
 
 
-def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
-    disabled_keys = {(d["engine"], d["name"]) for d in disabled_connections}
-    filtered = LocalDataVault(temp_dir)
-    for conn in source_vault.list_connections():
-        if (conn["engine"], conn["name"]) not in disabled_keys:
-            creds = source_vault.load(conn["engine"], conn["name"]) or {}
-            filtered.save(conn["engine"], conn["name"], creds)
-    return filtered
-
-
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
     """Prompt text naming the Google-Picker-granted Drive files, or "".
 
@@ -504,21 +547,28 @@ async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[
     they could not be looked up.
 
     ``scope`` is the turn's bound scope (use_settings_scope), never one derived
-    from the row. No scope in org mode is an invariant violation, and so is a
-    conversation of another org: both log and list nothing. A failed read logs
-    too. A wait for a connection that runs out is the turn's failure, not a
-    missing listing, so it propagates.
+    from the row. No scope on a partitioned deployment (tenant_scope_required)
+    is an invariant violation, and so is a conversation of another org or
+    person, wherever the scope partitions conversations: both log and list
+    nothing. The check keys on conversations, not files: a conversation shared
+    across persons carries no org_id, while each person's attachments to it
+    are still filtered by the files partition in the read below. A failed read
+    logs too. A wait for a connection that runs out is the turn's failure, not
+    a missing listing, so it propagates.
     """
     try:
         if scope is None:
-            if get_app_settings().tenancy_mode == "org":
+            if tenant_scope_required():
                 logger.warning(
-                    "attachments: no tenant scope is bound in org mode; "
+                    "attachments: no tenant scope is bound on a partitioned deployment; "
                     "listing skipped (conversation %s)", conversation.id,
                 )
                 return None
             scope = LOCAL_SCOPE
-        if scope.org_mode and conversation.org_id != scope.org_id:
+        if (
+            scope.partitioned_for(PersonalResource.CONVERSATIONS)
+            and conversation.org_id != scope.org_id
+        ):
             logger.warning(
                 "attachments: conversation %s org %r does not match scope org %r — listing skipped",
                 conversation.id, conversation.org_id, scope.org_id,
@@ -649,7 +699,7 @@ class AntonHarness:
                 "Turns must run on the remote worker in this deployment; "
                 "in-process execution is disabled."
             )
-        temp_vault_dir: Path | None = None
+        turn_scratch_dir: Path | None = None
         # Attribute + surface any artifact this turn created or edited. Anton's
         # artifact tools record what they touch as they run
         # (ChatSession.artifacts_touched), and that set — not a bare diff of the
@@ -749,7 +799,7 @@ class AntonHarness:
             skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
 
         try:
-            session, temp_vault_dir, seed_info = await self._build_chat_session(
+            session, turn_scratch_dir, seed_info = await self._build_chat_session(
                 conversation,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -808,8 +858,8 @@ class AntonHarness:
         finally:
             if model_wait is not None:
                 model_wait.detach()
-            if temp_vault_dir:
-                shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            if turn_scratch_dir:
+                shutil.rmtree(turn_scratch_dir, ignore_errors=True)
             if session is not None:
                 # Before the steps below, so none of them raising can skip it.
                 # Scheduled rather than awaited; see close_session_scratchpads.
@@ -1036,24 +1086,23 @@ class AntonHarness:
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
-        from anton.core.memory.cortex import Cortex
         # from anton.core.memory.episodes import EpisodicMemory
-        from anton.core.memory.hippocampus import Hippocampus
         from anton.core.session import ChatSessionConfig, SystemPromptContext
         # from anton.memory.history_store import HistoryStore
-        from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
         # Cowork override — anton's stock PUBLISH_TOOL prints to a Rich
         # Console and pops a webbrowser, both of which die in the FastAPI
         # process. The wrapper exposes the same schema to the LLM but
         # routes through a server-aware handler.
         from .tools import (
+            build_cowork_connect_datasource_tool,
             build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             build_cowork_create_skill_draft_tool,
         )
+        CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
@@ -1087,9 +1136,11 @@ class AntonHarness:
 
         # Host skills: read-only, they back
         # the deferred tool bundles (e.g. `connect-datasource` unlocks the
-        # interactive connection tools). Path relative to this module.
-        host_skills_dir = Path(__file__).parent / "skills"
-        anton_settings.skills_extra_roots = [host_skills_dir]
+        # interactive connection tools). The operator's managed skills follow
+        # them, so a host skill keeps its name, and a person's turn adds the
+        # skills others share with them after those (both linked into the
+        # turn's scratch folder below).
+        anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
@@ -1150,32 +1201,18 @@ class AntonHarness:
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
-        project_memory_dir = anton_dir / "memory"
-        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
+        # In a personal partition the project's .anton/memory is never this
+        # turn's project tier (person_turn_memory); anton's Workspace above
+        # still creates it, empty.
+        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
         llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
         _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
-        from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import current_settings_scope
-        from cowork.db.scoped import scoped_user_storage_root
 
-        # Per-(org, user) via the turn's ambient scope — the in-process harness
-        # must read/write the same global-scope memory the /memory API serves.
-        global_memory_dir = scoped_user_storage_root(
-            Path(get_app_settings().memory.root_dir).expanduser(),
-            current_settings_scope(),
-            store="memory",
-        )
-        global_memory_dir.mkdir(parents=True, exist_ok=True)
-        cortex = Cortex(
-            global_hc=Hippocampus(global_memory_dir),
-            project_hc=Hippocampus(project_memory_dir),
-            mode=anton_settings.memory_mode if anton_settings.memory_enabled else "off",
-            llm_client=llm_client,
-        )
         # TODO: Is episodic memory required given that we are handling history outside of the harness?
         # episodic = EpisodicMemory(episodes_dir, enabled=settings.episodic_memory)
         # episodic.resume_session(conversation_id)
@@ -1260,19 +1297,28 @@ class AntonHarness:
             "The staged skill surfaces as a card the user explicitly saves or downloads; it is not saved until they do."
         )
 
-        from cowork.common.settings.app_settings import get_app_settings
-
-        # When connections are disabled, a temporary data vault is created because within Anton,
-        # the vault is used to inject a prompt related to the connected data sources.
+        # When connections are disabled, the turn reads its vault through a
+        # FilteredDataVault that hides them, because anton lists the vault's
+        # connections in the prompt and in the agent's environment.
         data_vault = None
-        temp_vault_dir: Path | None = None
+        turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
-            source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+            from cowork.services.connectors.layered_vault import FilteredDataVault
+            from cowork.services.connectors.persist import turn_vault_for_scope
+
+            # The asker's own connections, with the operator's managed ones
+            # over them and the ones others share with the asker after them,
+            # from the turn's bound scope (use_settings_scope), never the
+            # operator view _units_scope falls back to: an unbound turn on a
+            # partitioned deployment is refused here rather than handed the
+            # base vault. A connection the agent saves through it lands in
+            # the asker's own vault, stamped with its creator.
+            source_vault = turn_vault_for_scope(current_settings_scope())
             if disabled_connections:
-                _tmp_base = _vault_scratch_dir()
-                _tmp_base.mkdir(parents=True, exist_ok=True)
-                temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
-                data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
+                data_vault = FilteredDataVault(
+                    source=source_vault,
+                    hidden=frozenset((d["engine"], d["name"]) for d in disabled_connections),
+                )
             else:
                 data_vault = source_vault
             # Registers this turn's DS_* names and values for scrubbing, and
@@ -1341,11 +1387,104 @@ class AntonHarness:
                 initial_history = [self._stamp_message(m) for m in replayable]
                 seed_info = None
 
+            # The memory of the person who asked: their own tiers, read through
+            # the same resolvers as the /memory API. A turn with no person on a
+            # trusted-identity deployment gets two empty tiers in its scratch
+            # folder, memory off and no background passes, so it reads and
+            # writes nobody's memory.
+            memory_layout = person_turn_memory(
+                scope=current_settings_scope(),
+                project_path=base,
+                project_id=conversation.project_id,
+            )
+            if memory_layout is None:
+                if turn_scratch_dir is None:
+                    turn_scratch_dir = _new_turn_scratch_dir()
+                memory_layout = empty_turn_memory(turn_scratch_dir / "memory")
+                logger.warning(
+                    "memory: conversation %s has no person; the turn reads no "
+                    "learned memory and writes none",
+                    conversation.id,
+                )
+            memory_layout.global_dir.mkdir(parents=True, exist_ok=True)
+            memory_layout.project_dir.mkdir(parents=True, exist_ok=True)
+            cortex = _turn_cortex(
+                layout=memory_layout,
+                mode=(
+                    anton_settings.memory_mode
+                    if anton_settings.memory_enabled and memory_layout.learns
+                    else "off"
+                ),
+                llm_client=llm_client,
+            )
+
+            # The operator's managed skills: each readable folder
+            # (ManagedFolder.skill_dirs) linked into the turn's scratch folder,
+            # which anton reads as the read-only root after the host skills.
+            # anton drops a whole root's skills when it can't stat one folder
+            # in it, so the turn never hands it the managed folder itself: a
+            # managed skill the server can't read is left out alone, and the
+            # asker's own, the host's and the shared skills still load. The
+            # turn's own skills folder, which anton ranks above every
+            # read-only root, never links a slug the managed folder reserves
+            # (linked_turn_skills), and neither do the fan-outs into projects
+            # (reconcile_skill_links, reconcile_project).
+            managed = managed_folder()
+            if managed is not None:
+                if turn_scratch_dir is None:
+                    turn_scratch_dir = _new_turn_scratch_dir()
+                managed_skills_dir = turn_scratch_dir / "managed-skills"
+                sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed.skill_dirs())
+                anton_settings.skills_extra_roots = [
+                    *anton_settings.skills_extra_roots,
+                    managed_skills_dir,
+                ]
+
+            # Skills. Where nothing fans links into this turn's project
+            # (skill_links.links_apply_to), the turn links its own from the
+            # asker's store, builtins seeded first. A project that is the
+            # asker's alone takes them in its skills folder; a shared project's
+            # folder is every person's at once, so the turn's scratch folder
+            # takes them instead. The skills others share with the asker are
+            # linked into the scratch folder too, which anton reads as its last
+            # host root: read-only, after the managed skills.
+            turn_scope = current_settings_scope()
+            if not links_apply_to(turn_scope):
+                if turn_scope is not None and turn_scope.partitioned_for(
+                    PersonalResource.PROJECTS
+                ):
+                    turn_skills_dir = project_skills_dir
+                else:
+                    if turn_scratch_dir is None:
+                        turn_scratch_dir = _new_turn_scratch_dir()
+                    turn_skills_dir = turn_scratch_dir / "skills"
+                shared_skills_dir = None
+                if reads_shared_skills(turn_scope):
+                    if turn_scratch_dir is None:
+                        turn_scratch_dir = _new_turn_scratch_dir()
+                    shared_skills_dir = turn_scratch_dir / "shared-skills"
+                    anton_settings.skills_extra_roots = [
+                        *anton_settings.skills_extra_roots,
+                        shared_skills_dir,
+                    ]
+                link_turn_skills(
+                    scope=turn_scope,
+                    project_name=conversation.project.name,
+                    skills_dir=turn_skills_dir,
+                    shared_skills_dir=shared_skills_dir,
+                )
+                anton_settings.skills_root = turn_skills_dir
+
             config = ChatSessionConfig(
                 llm_client=llm_client,
                 settings=anton_settings,
                 self_awareness=self_awareness,
                 cortex=cortex,
+                # A turn that may not learn runs no end-of-turn memory pass
+                # either. Passed directly, as _turn_cortex passes managed_hc:
+                # every anton the floor admits has the field, and a dropped
+                # one would silently bring the memory passes back.
+                background_memory=memory_layout.learns,
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
@@ -1426,8 +1565,11 @@ class AntonHarness:
             # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
             # call under cowork/ as a new, unreviewed execution site.
             session = build_chat_session(config)
-            return session, temp_vault_dir, seed_info
+            return session, turn_scratch_dir, seed_info
         except Exception:
+            # The turn never starts, so nothing else removes its scratch folder.
+            if turn_scratch_dir is not None:
+                shutil.rmtree(turn_scratch_dir, ignore_errors=True)
             # Mirrors anton's own build_cloud_chat_session fix (ENG-1816
             # code review): ChatSession.close() is what closes mcp_sessions,
             # so a failure ANYWHERE below MCP discovery — not just

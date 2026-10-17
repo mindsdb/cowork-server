@@ -15,6 +15,7 @@ import pytest
 from fastapi import HTTPException
 
 import cowork.services.publish as publish_mod
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.publish import PublishOwnedByOtherUser
 
 DETAIL = {
@@ -69,7 +70,9 @@ def test_update_lets_the_typed_error_through_and_keeps_the_record(tmp_path, monk
         "mode": "public", "requires_password": False,
     }}
     (tmp_path / ".published.json").write_text(json.dumps(record), encoding="utf-8")
-    monkeypatch.setattr(publish_mod, "desktop_artifact_and_base", lambda raw: (page, tmp_path))
+    monkeypatch.setattr(
+        publish_mod, "desktop_artifact_and_base", lambda raw, *, scope: publish_mod.DesktopArtifact(page, tmp_path)
+    )
     monkeypatch.setattr(publish_mod, "desktop_publish_credential", lambda: ("k", "https://view.example"))
     calls = []
 
@@ -80,7 +83,7 @@ def test_update_lets_the_typed_error_through_and_keeps_the_record(tmp_path, monk
     monkeypatch.setattr("anton.publisher.publish", reject)
 
     with pytest.raises(PublishOwnedByOtherUser):
-        publish_mod.update_artifact(str(page))
+        publish_mod.update_artifact(str(page), scope=LOCAL_SCOPE)
     assert [c["report_id"] for c in calls] == ["theirs"]
     assert json.loads((tmp_path / ".published.json").read_text(encoding="utf-8")) == record
 
