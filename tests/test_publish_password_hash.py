@@ -126,11 +126,11 @@ def test_the_real_publisher_resends_the_hash_while_the_password_is_unchanged(pag
     """
     sent: list[dict] = []
 
-    def fake_request(url, api_key, method="GET", payload=None, verify=True):
+    def fake_request(url, api_key, method="GET", payload=None, verify=True, timeout=30):
         sent.append(json.loads(payload))
-        return json.dumps({"view_url": "https://view.example/a/r1", "report_id": "r1", "md5": "m1"})
+        return 200, json.dumps({"view_url": "https://view.example/a/r1", "report_id": "r1", "md5": "m1"}).encode()
 
-    monkeypatch.setattr("anton.publisher.minds_request", fake_request)
+    monkeypatch.setattr("anton.publisher.minds_request_with_status", fake_request)
 
     _publish(page, {"mode": "password", "password": "hunter2"})
     _publish(page, {"mode": "password", "password": "hunter2"})

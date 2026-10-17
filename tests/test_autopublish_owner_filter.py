@@ -107,7 +107,7 @@ def published(monkeypatch) -> list[str]:
     slugs: list[str] = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None, project_id=None):
+                     access=None, scope=None, project_id=None, job_budget_s=None, on_job_accepted=None):
         slugs.append(artifact.name)
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
