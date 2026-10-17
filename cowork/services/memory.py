@@ -24,6 +24,7 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
     TenantScope,
+    storage_segment,
     user_store_segments,
     user_store_tiers_segments,
 )
@@ -554,7 +555,13 @@ def remove_project_memory_tiers(*, scope: TenantScope, project_id: UUID) -> int:
     # <shared>/<partition>/memory/users/<sub>, the layout scoped_user_storage_root
     # gives a person's global tier (user_store_segments).
     if scope.partitioned_for(PersonalResource.PROJECTS):
-        people = [PersonTier(scope.org_id, scope.user_id)] if scope.org_id and scope.user_id else []
+        # The scope's ids come from the request, so each must be one folder
+        # name; the walk below takes names that are already folders.
+        people = (
+            [PersonTier(storage_segment(scope.org_id, what="partition"), storage_segment(scope.user_id, what="user"))]
+            if scope.org_id and scope.user_id
+            else []
+        )
     else:
         people = [
             PersonTier(partition, sub)

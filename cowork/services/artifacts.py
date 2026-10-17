@@ -2025,7 +2025,10 @@ def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> P
     registered = _registered_project_dirs(scope=scope)
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
-            return parent
+            # The registered entry, equal to the ancestor: the caller hands it
+            # to the code sandbox, so it is a path this module listed rather
+            # than one built from the request's artifact path.
+            return next(root for root in registered if root == parent)
     return None
 
 
