@@ -263,21 +263,21 @@ class CodingService(
         """The workspace modes a new task on this project and computer could use.
 
         A task with no computer chosen is shown as running here, matching the
-        composer's default target. Given the folder a folder task would use,
-        the answer also reflects whether that folder can be worked in
-        directly, checked the same way creating the task checks it.
+        composer's default target. For a project, or given the folder a
+        folder task would use, the answer also reflects whether those folders
+        can be worked in directly, checked the same way creating the task
+        checks them.
         """
         project = self.projects.get(project_id) if project_id else None
         options = workspace_mode_options(
             project.default_workspace_mode if project else None,
             runs_locally=computer_id in {None, self.control.local_computer.id},
             org_mode=_org_mode(),
-            project_task=project is not None,
         )
-        if project is None and path and WorkspaceMode.in_place in options.supported:
+        if WorkspaceMode.in_place in options.supported and (project is not None or path):
             try:
-                self.workspaces.in_place_root(path)
-            except WorkspaceError as exc:
+                self.session_factory.in_place_roots(project, None, path)
+            except (WorkspaceError, ValueError) as exc:
                 return without_in_place(options, str(exc))
         return options
 
