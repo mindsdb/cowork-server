@@ -10,6 +10,8 @@ from cowork.coding.contracts import (
     EventType,
     SessionStatus,
     TaskWorkspace,
+    WorkspaceKind,
+    WorkspaceMode,
     utc_now,
 )
 from cowork.coding.control_errors import StateConflict
@@ -209,6 +211,13 @@ class SessionLifecycleOperations:
                     "scope_all_project_resources": True,
                     "workspace_path": str(prepared.workspace_path),
                     "workspace_kind": prepared_kind,
+                    # An in-place task forks into a worktree of its changes.
+                    "workspace_mode": (
+                        WorkspaceMode.worktree
+                        if parent.workspace_mode == WorkspaceMode.in_place
+                        and prepared_kind != WorkspaceKind.direct_folder
+                        else parent.workspace_mode
+                    ),
                     "repository_root": str(prepared.repository_root) if prepared.repository_root else None,
                     "base_revision": prepared.base_revision,
                     "source_dirty": prepared.source_dirty,

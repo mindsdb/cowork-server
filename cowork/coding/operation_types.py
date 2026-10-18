@@ -17,6 +17,11 @@ class EventEmitter(Protocol):
     ) -> CodingEvent: ...
 
 
-MaintenanceSession = Callable[[str, str], AbstractContextManager[CodingSession]]
+class MaintenanceSession(Protocol):
+    def __call__(
+        self, session_id: str, active_turn_error: str, *, touches_source: bool = False,
+    ) -> AbstractContextManager[CodingSession]: ...
+
+
 GetSession = Callable[[str], CodingSession]
 GetExecutionProject = Callable[[CodingSession], CodeProject | None]

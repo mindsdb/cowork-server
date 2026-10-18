@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cowork.coding.contracts import CodingEvent, CodingSession, EventType, WorkspaceKind
+from cowork.coding.contracts import CodingEvent, CodingSession, EventType, WorkspaceKind, WorkspaceMode
 from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.operation_types import (
@@ -149,6 +149,7 @@ class ProjectTaskOperations:
         with self.maintenance_session(
             session_id,
             "Wait for the active turn to finish before applying task changes",
+            touches_source=True,
         ) as session:
             if session.workspaces:
                 applied = self.project_workspaces.apply(session.id, session.workspaces)
@@ -162,7 +163,11 @@ class ProjectTaskOperations:
                 )
                 return {"status": "applied" if applied else "no_changes", "snapshot": None}
             if session.workspace_kind == WorkspaceKind.direct_folder:
-                raise WorkspaceError("This legacy task uses its source folder directly and has no isolated handoff")
+                raise WorkspaceError(
+                    "This task works in the original folder, so its changes are already there"
+                    if session.workspace_mode == WorkspaceMode.in_place
+                    else "This legacy task uses its source folder directly and has no isolated handoff"
+                )
             snapshot = self.workspaces.apply_to_source(
                 session.id,
                 session.source_path,
