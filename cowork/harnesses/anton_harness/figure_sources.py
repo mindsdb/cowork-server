@@ -110,6 +110,7 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from itertools import accumulate
 from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import urlsplit
@@ -358,16 +359,29 @@ _HEDGE = re.compile(
     re.IGNORECASE,
 )
 
+
+class _TimeUnit(StrEnum):
+    """A unit a duration is written in."""
+
+    second = "second"
+    minute = "minute"
+    hour = "hour"
+    day = "day"
+    week = "week"
+    month = "month"
+    year = "year"
+
+
 # The time units a figure can be written in, by the words and short forms
 # that name each one: glued to its digits (12h) or the word after it.
 _TIME_UNITS = {
-    "sec": "second", "secs": "second", "second": "second", "seconds": "second",
-    "min": "minute", "mins": "minute", "minute": "minute", "minutes": "minute",
-    "h": "hour", "hr": "hour", "hrs": "hour", "hour": "hour", "hours": "hour",
-    "d": "day", "day": "day", "days": "day",
-    "wk": "week", "wks": "week", "week": "week", "weeks": "week",
-    "month": "month", "months": "month",
-    "yr": "year", "yrs": "year", "year": "year", "years": "year",
+    "sec": _TimeUnit.second, "secs": _TimeUnit.second, "second": _TimeUnit.second, "seconds": _TimeUnit.second,
+    "min": _TimeUnit.minute, "mins": _TimeUnit.minute, "minute": _TimeUnit.minute, "minutes": _TimeUnit.minute,
+    "h": _TimeUnit.hour, "hr": _TimeUnit.hour, "hrs": _TimeUnit.hour, "hour": _TimeUnit.hour, "hours": _TimeUnit.hour,
+    "d": _TimeUnit.day, "day": _TimeUnit.day, "days": _TimeUnit.day,
+    "wk": _TimeUnit.week, "wks": _TimeUnit.week, "week": _TimeUnit.week, "weeks": _TimeUnit.week,
+    "month": _TimeUnit.month, "months": _TimeUnit.month,
+    "yr": _TimeUnit.year, "yrs": _TimeUnit.year, "year": _TimeUnit.year, "years": _TimeUnit.year,
 }
 # The words that name a time unit anywhere in a step's text: the plurals a
 # duration's name takes (lead_time_days, hours=21.98). A singular counts only
@@ -862,7 +876,7 @@ class _DescribedStep:
     document_has_pages: bool
     # The time units its output, input and label name (``_time_units_named``);
     # none for an earlier turn's step.
-    time_units: frozenset[str]
+    time_units: frozenset[_TimeUnit]
     # The cells, by tool_use_id, that read the data this cell's code draws on
     # through names earlier cells bound.
     drawn_from: frozenset[str] = frozenset()
@@ -1629,7 +1643,7 @@ def _output_values(numbers: Sequence[_Number]) -> _OutputValues:
 
 
 def _holders(
-    steps: Sequence[_DescribedStep], *, outputs: Sequence[_OutputValues], figure: _Number, time_unit: str,
+    steps: Sequence[_DescribedStep], *, outputs: Sequence[_OutputValues], figure: _Number, time_unit: _TimeUnit | None,
 ) -> list[int]:
     """The steps whose output holds the figure, in step order. With the
     figure's ``time_unit``, a step that names time units, none of them that
@@ -1637,22 +1651,22 @@ def _holders(
     return [
         index for index, step in enumerate(steps)
         if _holds(step, values=outputs[index], figure=figure, tolerance=figure.tolerance)
-        and (not time_unit or not step.time_units or time_unit in step.time_units)
+        and (time_unit is None or not step.time_units or time_unit in step.time_units)
     ]
 
 
-def _time_unit(text: str, *, number: _Number) -> str:
+def _time_unit(text: str, *, number: _Number) -> _TimeUnit | None:
     """The time unit a number of ``text`` is written in, glued to its digits
-    (12h) or the word after it (22 hours, a 13.08-day lead time), or "" for
-    none. A rate ("$42 per hour", "10 units/day") has none, and nor does a
-    number with another unit glued to it (40kg)."""
+    (12h) or the word after it (22 hours, a 13.08-day lead time), or None. A
+    rate ("$42 per hour", "10 units/day") has none, and nor does a number
+    with another unit glued to it (40kg)."""
     if number.unit:
-        return _TIME_UNITS.get(number.unit, "")
+        return _TIME_UNITS.get(number.unit)
     after = _WORD_AFTER.match(text, number.end)
-    return _TIME_UNITS.get(after["word"].lower(), "") if after else ""
+    return _TIME_UNITS.get(after["word"].lower()) if after else None
 
 
-def _time_units_named(text: str) -> frozenset[str]:
+def _time_units_named(text: str) -> frozenset[_TimeUnit]:
     """The time units a step's text names: by their plurals
     (``_STEP_TIME_WORDS``), as words and inside identifiers, and in any form
     right after a number (36h, a 30-day window), read as a figure's is
@@ -1660,7 +1674,7 @@ def _time_units_named(text: str) -> frozenset[str]:
     plurals = {
         _TIME_UNITS[word] for match in _WORD.finditer(text) if (word := match.group().lower()) in _STEP_TIME_WORDS
     }
-    after_numbers = {unit for number in _numbers(text) if (unit := _time_unit(text, number=number))}
+    after_numbers = {unit for number in _numbers(text) if (unit := _time_unit(text, number=number)) is not None}
     return frozenset(plurals | after_numbers)
 
 
