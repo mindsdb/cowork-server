@@ -81,9 +81,10 @@ A figure written in a time unit, glued to its digits (12h) or as the word
 after it (22 hours, a 13.08-day lead time), is not held by a step that names
 time units but never the figure's: the 22 in a lead_time_days column is not
 the "22 hours" the model worked out. A step names a unit by its plural, in
-its output, input or label and inside identifiers too, since a singular is
-more often a rate's (cost_per_day) or a date part's (GROUP BY month). A step
-that names no time unit may hold the figure. A rate ("$42 per hour", "10
+its output, input or label and inside identifiers too, or in any form right
+after a number (36h, a 30-day window). A singular elsewhere doesn't count,
+since it is more often a rate's (cost_per_day) or a date part's (GROUP BY
+month). A step that names no time unit may hold the figure. A rate ("$42 per hour", "10
 units/day") has no time unit: the word after its figure names none. The rule
 misses a step that prints the figure's value while it names only another
 unit, such as a cell that turns days into hours (days_left * 24) or calls
@@ -367,8 +368,9 @@ _TIME_UNITS = {
     "month": "month", "months": "month",
     "yr": "year", "yrs": "year", "year": "year", "years": "year",
 }
-# The words that name a time unit in a step's text: the plurals a duration's
-# name takes (lead_time_days, hours=21.98). A singular is more often a rate's
+# The words that name a time unit anywhere in a step's text: the plurals a
+# duration's name takes (lead_time_days, hours=21.98). A singular counts only
+# right after a number (a 30-day window); elsewhere it is more often a rate's
 # (holding_cost_per_day) or a date part's (GROUP BY month).
 _STEP_TIME_WORDS = frozenset({
     "secs", "seconds", "mins", "minutes", "hrs", "hours", "days", "wks", "weeks", "months", "yrs", "years",
@@ -754,7 +756,7 @@ def find_figure_sources(
     named: set[int] = set()
     figures: list[Figure] = []
     for number in numbers:
-        held = _holders(described, outputs=outputs, figure=number, time_unit=_time_unit(answer, figure=number))
+        held = _holders(described, outputs=outputs, figure=number, time_unit=_time_unit(answer, number=number))
         holders = _named_holders(described, outputs=outputs, figure=number, holders=held)
         readers = _readers(described, holders=holders, index_of=index_of)
         named.update(holders, readers)
@@ -1636,23 +1638,27 @@ def _holders(
     ]
 
 
-def _time_unit(answer: str, *, figure: _Number) -> str:
-    """The time unit the figure is written in, glued to its digits (12h) or
-    the word after it (22 hours, a 13.08-day lead time), or "" for none. A
-    rate ("$42 per hour", "10 units/day") has none, and nor does a figure
-    with another unit glued to it (40kg)."""
-    if figure.unit:
-        return _TIME_UNITS.get(figure.unit, "")
-    after = _WORD_AFTER.match(answer, figure.end)
+def _time_unit(text: str, *, number: _Number) -> str:
+    """The time unit a number of ``text`` is written in, glued to its digits
+    (12h) or the word after it (22 hours, a 13.08-day lead time), or "" for
+    none. A rate ("$42 per hour", "10 units/day") has none, and nor does a
+    number with another unit glued to it (40kg)."""
+    if number.unit:
+        return _TIME_UNITS.get(number.unit, "")
+    after = _WORD_AFTER.match(text, number.end)
     return _TIME_UNITS.get(after["word"].lower(), "") if after else ""
 
 
 def _time_units_named(text: str) -> frozenset[str]:
-    """The time units a step's text names by their plurals
-    (``_STEP_TIME_WORDS``), as words and inside identifiers."""
-    return frozenset(
+    """The time units a step's text names: by their plurals
+    (``_STEP_TIME_WORDS``), as words and inside identifiers, and in any form
+    right after a number (36h, a 30-day window), read as a figure's is
+    (``_time_unit``)."""
+    plurals = {
         _TIME_UNITS[word] for match in _WORD.finditer(text) if (word := match.group().lower()) in _STEP_TIME_WORDS
-    )
+    }
+    after_numbers = {unit for number in _numbers(text) if (unit := _time_unit(text, number=number))}
+    return frozenset(plurals | after_numbers)
 
 
 def _named_holders(

@@ -203,6 +203,38 @@ class TestSourcedFigures:
 
         assert _figure(sources, "22").sources == [FigureSource(tool_use_id="toolu_q")]
 
+    @pytest.mark.parametrize(("body", "answer", "figure"), [
+        (
+            "Each production run takes a 36-hour cycle.\nThe supplier ships within 5 business days.\n",
+            "Each run takes 36 hours.", "36",
+        ),
+        (
+            "Returns are accepted within a 30-day window.\nThe warranty runs 2 years from delivery.\n",
+            "You have 30 days to return it.", "30",
+        ),
+    ], ids=["36-hour", "30-day"])
+    def test_a_figure_matches_a_document_that_writes_its_unit_right_after_a_number(
+        self, body: str, answer: str, figure: str,
+    ):
+        """A unit right after a number names that unit, singular or not, so
+        the document names the figure's unit beside the plural of another."""
+        read = _tool("toolu_doc", "read_text_file", {"path": "ops.txt"}, _whole_file_read(path="ops.txt", body=body))
+
+        sources = find_figure_sources(answer=answer, question="", steps=[read])
+
+        assert _figure(sources, figure).sources == [FigureSource(tool_use_id="toolu_doc")]
+
+    def test_a_figure_in_hours_matches_a_cell_that_prints_hours_glued_to_a_number(self):
+        cell = _cell(
+            "toolu_c",
+            code="row = fetch()\nprint(f'lead: {row.lead_time_days}d, cycle: {row.cycle}h')",
+            stdout="lead: 5d, cycle: 36h\n",
+        )
+
+        sources = find_figure_sources(answer="Each run takes 36 hours.", question="", steps=[cell])
+
+        assert _figure(sources, "36").sources == [FigureSource(tool_use_id="toolu_c")]
+
     def test_a_figure_in_days_matches_a_step_that_names_a_unit_only_as_a_date_part(self):
         """A singular unit names a date part here, not the unit of the
         values printed beside it."""
