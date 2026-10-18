@@ -87,8 +87,9 @@ since it is more often a rate's (cost_per_day) or a date part's (GROUP BY
 month). A step that names no time unit may hold the figure. A rate ("$42 per hour", "10
 units/day") has no time unit: the word after its figure names none. The rule
 misses a step that prints the figure's value while it names only another
-unit, such as a cell that turns days into hours (days_left * 24) or calls
-total_seconds() and prints a bare number; that figure has no source.
+unit, such as a cell that turns days into hours (days_left * 24), calls
+total_seconds() and prints a bare number, or loops over a plural date part
+(for m in months); that figure has no source.
 
 Each step a figure names is described once: its kind, a short label, the file
 it read, the web page it reached, and the SQL and HTTP requests its code shows
