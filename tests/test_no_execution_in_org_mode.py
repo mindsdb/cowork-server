@@ -1,13 +1,25 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifacts
 
 
 @pytest.fixture
 def org_mode(monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def desktop(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
     from cowork.common.settings.app_settings import get_app_settings
     get_app_settings.cache_clear()
     yield
@@ -22,7 +34,9 @@ async def test_backend_launch_refused_in_org_mode(org_mode, tmp_path, monkeypatc
 
     monkeypatch.setattr(artifacts, "_probe_port", _boom)
 
-    running, detail, port = await artifacts._ensure_backend_running(tmp_path / "slug", 8000)
+    running, detail, port = await artifacts._ensure_backend_running(
+        tmp_path / "slug", 8000, scope=LOCAL_SCOPE
+    )
 
     assert running is False
     assert port == 0
@@ -34,11 +48,18 @@ async def test_backend_launch_refused_in_org_mode(org_mode, tmp_path, monkeypatc
 async def test_backend_launch_still_works_on_desktop(monkeypatch, tmp_path):
     """Desktop keeps the launcher. Guard against the kill switch being unconditional."""
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    # The artifact sits in a registered project: the launcher resolves that
+    # first, before it probes the port.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     from cowork.common.settings.app_settings import get_app_settings
     get_app_settings.cache_clear()
     monkeypatch.setattr(artifacts, "_probe_port", lambda _p: True)
+    artifact_dir = tmp_path / "projects" / "proj" / ".anton" / "artifacts" / "slug"
+    artifact_dir.mkdir(parents=True)
 
-    running, detail, port = await artifacts._ensure_backend_running(tmp_path / "slug", 8000)
+    running, detail, port = await artifacts._ensure_backend_running(
+        artifact_dir, 8000, scope=LOCAL_SCOPE
+    )
 
     assert running is True
     assert detail == "already_running"
@@ -61,7 +82,7 @@ async def test_open_artifact_endpoint_refused_in_org_mode(org_mode):
     from cowork.api.v1.endpoints.artifacts import _PathBody, open_artifact
 
     with pytest.raises(HTTPException) as exc:
-        await open_artifact(_PathBody(path="/tmp/whatever"))
+        await open_artifact(_PathBody(path="/tmp/whatever"), scope=LOCAL_SCOPE)
     assert exc.value.status_code == 403
 
 
@@ -81,7 +102,7 @@ async def test_mount_preview_proxy_refused_in_org_mode(org_mode, tmp_path):
 
     before = dict(artifacts._PREVIEW_MOUNTS)
     with pytest.raises(ValueError, match="not available"):
-        await artifacts.mount_preview(primary)
+        await artifacts.mount_preview(primary, scope=LOCAL_SCOPE)
     assert artifacts._PREVIEW_MOUNTS == before
 
 
@@ -100,7 +121,7 @@ async def test_mount_preview_proxy_still_registers_on_desktop(monkeypatch, tmp_p
     primary = root / "index.html"
     primary.write_text("<html></html>", encoding="utf-8")
 
-    payload = await artifacts.mount_preview(primary)
+    payload = await artifacts.mount_preview(primary, scope=LOCAL_SCOPE)
 
     assert payload["kind"] == "proxy"
     assert payload["token"] in artifacts._PREVIEW_MOUNTS
@@ -117,8 +138,41 @@ async def test_export_pdf_docx_refused_in_org_mode(org_mode, fmt):
     from cowork.api.v1.endpoints.artifacts import _ExportBody, export_artifact_endpoint
 
     with pytest.raises(HTTPException) as exc:
-        await export_artifact_endpoint(_ExportBody(path="/tmp/whatever.md", format=fmt))
+        await export_artifact_endpoint(
+            _ExportBody(path="/tmp/whatever.md", format=fmt), scope=LOCAL_SCOPE
+        )
     assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["pdf", "docx"])
+async def test_export_pdf_docx_not_refused_on_desktop(desktop, tmp_path, fmt):
+    """PDF and Word export are default-on desktop paths: the gate widened to
+    `_org_mode() or scope.personal`, both false on desktop, so a desktop export
+    must reach path resolution. The 404 (not 403) proves it got past the gate;
+    it comes before any URI fetch, so nothing is executed."""
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.artifacts import _ExportBody, export_artifact_endpoint
+
+    with pytest.raises(HTTPException) as exc:
+        await export_artifact_endpoint(
+            _ExportBody(path=str(tmp_path / "missing.md"), format=fmt), scope=LOCAL_SCOPE
+        )
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_open_not_refused_on_desktop(desktop, tmp_path):
+    """Open is a default-on desktop path. The 404 proves the request reached
+    path resolution instead of the gate, and it comes before any subprocess."""
+    from fastapi import HTTPException
+
+    from cowork.api.v1.endpoints.artifacts import _PathBody, open_artifact
+
+    with pytest.raises(HTTPException) as exc:
+        await open_artifact(_PathBody(path=str(tmp_path / "missing.html")), scope=LOCAL_SCOPE)
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -133,7 +187,7 @@ async def test_export_html_not_refused_in_org_mode(org_mode, tmp_path):
 
     with pytest.raises(HTTPException) as exc:
         await export_artifact_endpoint(
-            _ExportBody(path=str(tmp_path / "missing.md"), format="html")
+            _ExportBody(path=str(tmp_path / "missing.md"), format="html"), scope=LOCAL_SCOPE
         )
     assert exc.value.status_code == 404
 
@@ -287,7 +341,7 @@ async def test_proxy_artifact_request_refused_in_org_mode(org_mode, tmp_path):
         }
         request = StarletteRequest(scope)
 
-        response = await preview_proxy.proxy_artifact_request(token, "", request)
+        response = await preview_proxy.proxy_artifact_request(token, "", request, scope=LOCAL_SCOPE)
 
         assert response.status_code == 403
     finally:
@@ -343,13 +397,15 @@ async def test_reveal_artifact_endpoint_maps_execution_refused_to_403(monkeypatc
     from cowork.services.artifacts import ExecutionRefused
 
     monkeypatch.setattr(artifacts_ep, "_resolve_reveal_path", lambda path, session: tmp_path)
+    # A desktop session: the route refuses a person's partition before this.
+    session = SimpleNamespace(scope=LOCAL_SCOPE)
 
     def _refuse(_path):
         raise ExecutionRefused("not available on this deployment")
     monkeypatch.setattr(artifacts_ep, "reveal_in_file_manager", _refuse)
 
     with pytest.raises(HTTPException) as exc:
-        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=None)
+        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=session)
     assert exc.value.status_code == 403
 
     def _boom(_path):
@@ -357,7 +413,7 @@ async def test_reveal_artifact_endpoint_maps_execution_refused_to_403(monkeypatc
     monkeypatch.setattr(artifacts_ep, "reveal_in_file_manager", _boom)
 
     with pytest.raises(HTTPException) as exc:
-        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=None)
+        await artifacts_ep.reveal_artifact(artifacts_ep._PathBody(path=str(tmp_path)), session=session)
     assert exc.value.status_code == 500
 
 

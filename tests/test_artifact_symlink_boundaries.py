@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifact_identity, artifact_roots, artifacts
 from cowork.services.artifact_identity import ensure_full_id, resolve_artifact_folder
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
@@ -41,9 +42,9 @@ def test_desktop_scan_drops_a_symlinked_artifacts_root(tmp_path, monkeypatch):
     outside.mkdir()
     linked = project / ".anton" / "artifacts"
     linked.symlink_to(outside, target_is_directory=True)
-    monkeypatch.setattr(artifact_roots, "_scan_artifact_dirs", lambda: [linked])
+    monkeypatch.setattr(artifact_roots, "_scan_artifact_dirs", lambda *, scope: [linked])
 
-    assert artifact_roots.artifacts_sources_for_scan() == []
+    assert artifact_roots.artifacts_sources_for_scan(scope=LOCAL_SCOPE) == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")

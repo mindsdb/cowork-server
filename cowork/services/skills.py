@@ -10,7 +10,10 @@ import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
+from functools import cached_property
 from pathlib import Path
+from typing import NamedTuple
 from uuid import uuid4
 
 from anton.core.tools.skill_format import (
@@ -21,6 +24,7 @@ from anton.core.tools.skill_format import (
     validate_name,
 )
 
+from cowork import shared_skills
 from cowork.common.paths import (
     dir_rename,
     dir_replace,
@@ -30,16 +34,35 @@ from cowork.common.paths import (
     safe_join,
 )
 from cowork.common.settings import get_app_settings
-from cowork.db.scoped import TenantScope, scoped_storage_root
+from cowork.creators import changer_for
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import TenantScope, scope_for_identity, scoped_storage_root
+from cowork.managed import (
+    ManagedFolder,
+    SharedSkill,
+    SharedSkills,
+    managed_folder,
+    reads_shared_registry,
+    readonly_skill_dirs,
+)
 from cowork.models.skill import (
     META_CREATED_AT,
+    META_CREATED_BY,
     META_DISPLAY_NAME,
     META_ENABLED,
     META_PROJECTS,
     META_UPDATED_AT,
     Skill,
 )
-from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
+from cowork.services.skill_links import (
+    links_apply_to,
+    reconcile_skill_links,
+    remove_skill_links,
+    sync_turn_skill_links,
+)
+# Re-exported beside the other sharing texts and errors, for the routes and the
+# operator command.
+from cowork.shared_skills import SKILL_SHARING_BUSY, SharedSkillsBusyError  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +76,34 @@ class SkillAlreadyExistsError(ValueError):
 
 
 class SkillImmutableError(PermissionError):
-    """A built-in mutation was refused, not a filesystem permission failure."""
+    """A change to a skill its reader can't change was refused: a built-in, a
+    managed or shared skill, or a shared skill's rename. Not a filesystem
+    permission failure."""
+
+
+class SkillSharingError(Exception):
+    """A share of one of the owner's skills was refused, with a reason they
+    can act on. Neither a ValueError nor a PermissionError, so no route
+    handler for those remaps it."""
+
+
+class SkillSharingUnavailableError(SkillSharingError):
+    """Sharing one skill at a time is unavailable for the owner's scope
+    (SkillService.sharing_available)."""
+
+
+# Every change to a skill its reader can't change: one someone else shares
+# with them, one of the operator's managed skills, and where skills are shared
+# across the deployment, one somebody else created (cowork.creators).
+SHARED_SKILL_REFUSAL = "This skill is shared with you and can't be changed here."
+# A shared skill's list entry names it by slug, its only identity, so a rename
+# would quietly stop sharing it. The person stops sharing it first.
+SHARED_SKILL_RENAME_REFUSAL = "Stop sharing this skill before you rename it."
+# Where sharing one skill at a time is unavailable: skills left shared, hosted
+# org tenancy, the desktop, and a scope with no person. The sentence holds in
+# each of those: it names what is unavailable and nothing about who already
+# reads the skills.
+SKILL_SHARING_UNAVAILABLE = "Sharing one skill at a time isn't available here."
 
 
 # Per-file cap (matches the skill-draft cap): filters mispackaged data blobs and
@@ -181,38 +231,41 @@ def _skill_wire_files(skill_dir: Path, root: Path) -> dict[str, str] | None:
     return files
 
 
-def build_turn_skills(
-    scope: TenantScope | None, project_path: str | None = None
-) -> dict[str, dict]:
-    """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``.
+@dataclass(frozen=True)
+class TurnSkill:
+    """One skill a turn may use: its slug and its directory in the store."""
 
-    Org-keyed through the passed `scope` (the producer binds no ambient scope).
+    slug: str
+    path: Path
+
+
+def _used_in(skill: Skill, *, project_name: str | None) -> bool:
+    """The selection rule every turn applies to a skill: enabled, and its
+    ``metadata.projects`` empty or naming this project."""
+    if not skill.enabled:
+        return False
+    return not skill.projects or (project_name is not None and project_name in skill.projects)
+
+
+def select_turn_skills(
+    *, service: SkillService, project_name: str | None
+) -> list[TurnSkill]:
+    """The skills of ``service``'s store that a turn in ``project_name`` uses.
+
     Selection mirrors skill_links: enabled skills whose ``metadata.projects`` is
-    empty or names this project's folder.
+    empty or names this project.
 
     Slug and files both come from the DIRECTORY, not frontmatter ``name`` — the
     two can drift on a hand-edited store, and resolving by frontmatter could
     ship another (e.g. disabled) skill's files. Every drop is logged.
     """
-    svc = SkillService(scope)
-    # A fresh org's store starts empty and there is no org-creation hook, so the
-    # builtins are seeded on first read. This function has no production caller
-    # today — cloud turns read skills off the shared mount directly rather than
-    # through this payload (see `_stage_remote_workspace_files`, which is the
-    # actual seed trigger for a chat-first org) — but it seeds too, so it stays
-    # correct if a future caller reappears. No-op after the first run, and in
-    # local mode.
-    svc.ensure_builtin_skills()
-
-    project_name = Path(project_path).name if project_path else None
-
-    out: dict[str, dict] = {}
-    if not svc.root.exists():
-        return out
-    root = svc.root
+    root = service.root
+    if not root.exists():
+        return []
+    selected: list[TurnSkill] = []
     for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         slug = skill_dir.name
-        if not svc.allows_skill(slug):
+        if not service.allows_skill(slug):
             continue
         if skill_dir.is_symlink():
             # is_dir() follows the link, so a symlinked dir could point into
@@ -232,20 +285,160 @@ def build_turn_skills(
         if skill is None:
             logger.warning("turn skills: dropping %r (unparseable SKILL.md)", slug)
             continue
-        if not skill.enabled:
+        if not _used_in(skill, project_name=project_name):
             continue
-        if skill.projects and (
-            project_name is None or project_name not in skill.projects
-        ):
-            continue
-        files = _skill_wire_files(skill_dir, root)
+        selected.append(TurnSkill(slug=slug, path=skill_dir))
+    return selected
+
+
+def shared_turn_skills(
+    *, service: SkillService, project_name: str | None
+) -> list[TurnSkill]:
+    """The skills others share with ``service``'s owner that a turn in
+    ``project_name`` uses, by slug.
+
+    SkillService.shared_with_owner's skills, with the selection rule the
+    owner's own get (select_turn_skills), applied to each skill's own
+    metadata: its creator's disable or project scope reaches everyone. Each
+    path is the skill's folder in its creator's own store, read live.
+    """
+    selected: list[TurnSkill] = []
+    for slug, skill_dir in sorted(service.shared_with_owner().items()):
+        skill = _skill_from_dir(skill_dir)
+        if skill is not None and _used_in(skill, project_name=project_name):
+            selected.append(TurnSkill(slug=slug, path=skill_dir))
+    return selected
+
+
+def agent_skill_names() -> frozenset[str]:
+    """The skills every person's agent already has from a read-only root
+    beside the managed folder: the harness's own (HOST_SKILLS_DIR) and
+    anton's packaged ones (anton's SkillStore.builtin_root).
+
+    anton reads the harness's root ahead of the shared skills and its
+    packaged ones after them, so a shared skill by one of these names would
+    reach nobody or replace anton's for everyone. Neither is shared
+    (SkillService._sharing, cowork.ops.skills.share_skill).
+    """
+    from anton.core.memory.skills import SkillStore
+
+    from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
+
+    return frozenset(
+        {*readonly_skill_dirs(HOST_SKILLS_DIR).reserved, *readonly_skill_dirs(SkillStore().builtin_root).reserved}
+    )
+
+
+def reads_shared_skills(scope: TenantScope | None) -> bool:
+    """Whether ``scope`` reads the skills other people share with it, from the
+    shared-skill list (cowork.shared_skills): a person's scope that keeps
+    skills personal (cowork.managed.reads_shared_registry)."""
+    return reads_shared_registry(scope, resource=PersonalResource.SKILLS)
+
+
+def build_turn_skills(
+    scope: TenantScope | None, project_path: str | None = None
+) -> dict[str, dict]:
+    """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``.
+
+    Org-keyed through the passed `scope` (the producer binds no ambient scope).
+    Selection is select_turn_skills's, by this project's folder name.
+    """
+    svc = SkillService(scope)
+    # A fresh org's store starts empty and there is no org-creation hook, so the
+    # builtins are seeded on first read. This function has no production caller
+    # today — cloud turns read skills off the shared mount directly rather than
+    # through this payload (see `_stage_remote_workspace_files`, which is the
+    # actual seed trigger for a chat-first org) — but it seeds too, so it stays
+    # correct if a future caller reappears. No-op after the first run, and in
+    # local mode.
+    svc.ensure_builtin_skills()
+
+    project_name = Path(project_path).name if project_path else None
+
+    out: dict[str, dict] = {}
+    for skill in select_turn_skills(service=svc, project_name=project_name):
+        files = _skill_wire_files(skill.path, svc.root)
         if files is None:
             logger.warning(
-                "turn skills: dropping %r (no SKILL.md within size bounds)", slug
+                "turn skills: dropping %r (no SKILL.md within size bounds)", skill.slug
             )
             continue
-        out[slug] = {"files": files}
+        out[skill.slug] = {"files": files}
     return out
+
+
+def link_turn_skills(
+    *,
+    scope: TenantScope | None,
+    project_name: str,
+    skills_dir: Path,
+    shared_skills_dir: Path | None = None,
+) -> tuple[Path, ...]:
+    """Link the skills one in-process turn uses into ``skills_dir``, from the
+    asker's own store, and the ones others share with the asker into
+    ``shared_skills_dir``. Returns the folders the links point at, own skills
+    first, which the turn's code sandbox grants read-only
+    (cowork.code_sandbox.build_cell_sandbox).
+
+    For a turn whose project receives no fanned-out links
+    (skill_links.links_apply_to). The packaged builtins are seeded into the
+    store first, read-only wherever it is partitioned, as a remote turn's
+    staging seeds them (ensure_builtin_skills), so a person's first turn
+    already has them. Selection is linked_turn_skills's.
+
+    ``shared_skills_dir`` is for a scope that reads shared skills
+    (reads_shared_skills): it takes one link per shared_turn_skills skill,
+    each into its creator's own store. The caller hands it to anton as a
+    read-only skill root after the managed one. anton writes a skill's usage
+    counters only under its own skills root (SkillStore.increment_recommended
+    finds the skill there alone), so a recall never writes the creator's
+    store, and it takes a name from the first read-only root that has one
+    (SkillStore._readonly_roots), so a shared skill never hides a host or
+    managed skill of the same name.
+    """
+    service = SkillService(scope)
+    service.ensure_builtin_skills()
+    own = {
+        skill.slug: skill.path
+        for skill in linked_turn_skills(service=service, project_name=project_name)
+    }
+    sync_turn_skill_links(skills_dir=skills_dir, wanted=own)
+    shared: dict[str, Path] = {}
+    if shared_skills_dir is not None:
+        shared = {
+            skill.slug: skill.path
+            for skill in shared_turn_skills(service=service, project_name=project_name)
+        }
+        sync_turn_skill_links(skills_dir=shared_skills_dir, wanted=shared)
+    return (*own.values(), *shared.values())
+
+
+def linked_turn_skills(
+    *, service: SkillService, project_name: str | None
+) -> list[TurnSkill]:
+    """The store's skills link_turn_skills links into a turn's skills folder.
+
+    select_turn_skills's selection, without a slug the managed folder
+    reserves, readable or not (SkillService.managed_skill_slugs): anton ranks
+    the turn's skills folder above every read-only root, so a linked
+    same-named skill would hide the operator's, and the same reserved set
+    keeps it out of every fan-out (reconcile_skill_links, reconcile_project).
+    """
+    reserved = service.managed_skill_slugs()
+    return [
+        skill
+        for skill in select_turn_skills(service=service, project_name=project_name)
+        if skill.slug not in reserved
+    ]
+
+
+def _newest_first(skills: list[Skill]) -> list[Skill]:
+    return sorted(skills, key=_creation_order, reverse=True)
+
+
+def _creation_order(skill: Skill) -> tuple[bool, datetime | None]:
+    return (skill.created_at is None, skill.created_at)
 
 
 def _skill_from_dir(
@@ -269,6 +462,47 @@ def _skill_from_dir(
     return skill
 
 
+class SkillOrigin(StrEnum):
+    """Where a skill its reader sees comes from."""
+
+    MANAGED = "managed"  # the operator's managed folder: nobody created it
+    OWN = "own"  # the reader's own store
+    SHARED = "shared"  # someone else's own store, shared with the reader
+
+
+@dataclass(frozen=True)
+class VisibleSkill:
+    """One skill as its reader lists or reads it."""
+
+    skill: Skill
+    origin: SkillOrigin
+    # In the shared-skill list: every SHARED skill, and an OWN one its
+    # reader shares.
+    shared: bool = False
+
+
+class _Sharing(NamedTuple):
+    # The store's own skills its owner shares, by slug.
+    by_owner: frozenset[str]
+    # Each skill someone else shares that the owner sees, by slug: its folder
+    # in its creator's own store.
+    with_owner: dict[str, Path]
+
+
+_NOTHING_SHARED = _Sharing(by_owner=frozenset(), with_owner={})
+
+
+def _shared_skill_dir(entry: SharedSkill, *, strict: bool = False) -> Path | None:
+    """The folder of the skill ``entry`` shares, in its creator's own store,
+    or None when that store holds no complete skill by that name. ``strict``
+    re-raises a read error other than a missing path (has_complete_skill),
+    so a transient failure never reads as "gone"."""
+    creator = SkillService(scope_for_identity(org_id=entry.partition_id, user_id=entry.user_id))
+    if not creator.allows_skill(entry.skill) or not creator.has_complete_skill(entry.skill, strict=strict):
+        return None
+    return creator._skill_dir(entry.skill)
+
+
 @dataclass(frozen=True)
 class ProjectReferenceRewrite:
     """One exact, reversible skill edit caused by a project rename."""
@@ -281,8 +515,27 @@ class ProjectReferenceRewrite:
 class SkillService:
     """File-backed skill store using the agentskills.io ``SKILL.md`` format.
 
-    Org mode keys the store per org (``<shared_root>/<org_id>/skills``); local
-    mode uses the shared root unchanged."""
+    Org mode keys the store per org (``<shared_root>/<org_id>/skills``), and a
+    personal scope that keeps skills per person keys it per partition the same
+    way; local mode uses the shared root unchanged. Wherever the store is
+    partitioned, the packaged builtins are seeded into it lazily and stay
+    immutable.
+
+    On a deployment that trusts identity headers, every skill created here
+    records its creator in ``metadata.created_by`` (META_CREATED_BY): the
+    person's sub, never a value the request or upload carries, and nobody for
+    the operator view. An edit, rename or project-rename rewrite keeps it.
+    Where skills are personal, a person shares or hides each of their own
+    skills (share, stop_sharing, or a create with ``shared``), and reads the
+    skills others share with them (shared_with_owner), live from each
+    creator's own store and read-only; the creator still changes theirs,
+    except its name while it is shared. Where skills are shared, a person
+    changes only a skill they created, and the operator view any
+    (may_change). All of it is the general store's alone: the Code store
+    records no creator and is never in the shared-skill list. With skills
+    left shared it is one store with no creator rule, which only a caller on
+    the server's own host reaches: its routes are LoopbackDesktopOnly.
+    """
 
     store_name = "skills"
     seed_builtins_in_local_mode = False
@@ -295,12 +548,22 @@ class SkillService:
         if self.store_name != "skills":
             base = base.parent / self.store_name
         self.root = scoped_storage_root(base, scope, store=self.store_name)
-        # Symlink distribution is desktop-only (skill_links resolves the unkeyed
-        # root and scans all project dirs). Keyed on deployment mode, not just
-        # scope — an unscoped service (migration, seeding) must not fan symlinks
-        # out of the unkeyed root in org mode either.
-        self._link_projects = self.store_name == "skills" and settings.tenancy_mode != "org" and (
-            scope is None or not scope.org_mode
+        # Symlink distribution resolves the unkeyed root and scans all project
+        # dirs, so it runs only where skills and projects stay unpartitioned
+        # (links_apply_to). Keyed on deployment mode too, not just scope — an
+        # unscoped service (migration, seeding) must not fan symlinks out of
+        # the unkeyed root in org mode either.
+        self._link_projects = (
+            self.store_name == "skills"
+            and settings.tenancy_mode != "org"
+            and links_apply_to(scope)
+        )
+        # Who creates and changes this store's skills, where creators are
+        # recorded (cowork.creators).
+        self._changer = (
+            changer_for(scope, resource=PersonalResource.SKILLS)
+            if self.store_name == "skills"
+            else None
         )
 
     @property
@@ -375,9 +638,354 @@ class SkillService:
 
     def _is_immutable_builtin(self, slug: str) -> bool:
         protected = self.immutable_builtins_in_local_mode or (
-            self._scope is not None and self._scope.org_mode
+            self._scope is not None
+            and self._scope.partitioned_for(PersonalResource.SKILLS)
         )
         return bool(protected and slug in self.packaged_builtin_slugs)
+
+    def _managed_for_store(self) -> ManagedFolder | None:
+        """The operator's managed folder where this store sits beside it: the
+        general catalogue, never the Code store. None without a managed folder
+        (cowork.managed)."""
+        if self.store_name != "skills":
+            return None
+        return managed_folder()
+
+    def managed_skill_dirs(self) -> dict[str, Path]:
+        """The operator's readable managed skills beside this store, by slug
+        (ManagedFolder.skill_dirs): what the listing shows."""
+        managed = self._managed_for_store()
+        return {} if managed is None else managed.skill_dirs()
+
+    def managed_skill_slugs(self) -> frozenset[str]:
+        """Every slug the managed folder beside this store reserves, readable
+        or not (ManagedFolder.skill_slugs): an unreadable managed skill keeps
+        its name, so a create under it is refused rather than clobbering the
+        operator's skill, and a same-named skill of the owner's is never
+        linked over it."""
+        managed = self._managed_for_store()
+        return frozenset() if managed is None else managed.skill_slugs()
+
+    def is_managed_skill(self, slug: str) -> bool:
+        return slug in self.managed_skill_slugs()
+
+    @cached_property
+    def _sharing(self) -> _Sharing:
+        """What this store's owner shares and is shared, read live from the
+        shared-skill list (cowork.shared_skills); nothing for a scope that
+        reads no shared skills (reads_shared_skills) or another store.
+        Read once per instance, which is one request or turn (_registry);
+        after this instance changes the list, built again from the list the
+        change left (_forget_sharing).
+
+        A skill someone else shares is skipped when its creator's store no
+        longer holds it, and hidden by a same-named skill earlier in the
+        owner's order: a packaged built-in, one the agent already has
+        (agent_skill_names), a managed skill, then any entry of the owner's
+        own store. For a name two people share, the first entry wins. A
+        malformed list shares nothing and logs a warning naming the file
+        (read_shared_skills).
+        """
+        if self.store_name != "skills" or not reads_shared_skills(self._scope):
+            return _NOTHING_SHARED
+        registry = self._registry.root
+        partition = self._scope.org_id
+        managed = managed_folder()
+        taken = {
+            *self.packaged_builtin_slugs,
+            *agent_skill_names(),
+            *(() if managed is None else managed.skill_slugs()),
+            *self._own_entry_names(),
+        }
+        with_owner: dict[str, Path] = {}
+        for entry in registry:
+            if entry.partition_id == partition or entry.skill in taken or entry.skill in with_owner:
+                continue
+            skill_dir = _shared_skill_dir(entry)
+            if skill_dir is not None:
+                with_owner[entry.skill] = skill_dir
+        return _Sharing(
+            by_owner=frozenset(entry.skill for entry in registry if entry.partition_id == partition),
+            with_owner=with_owner,
+        )
+
+    def _own_entry_names(self) -> set[str]:
+        return {entry.name for entry in self.root.iterdir()} if self.root.is_dir() else set()
+
+    @cached_property
+    def _registry(self) -> SharedSkills:
+        """The shared-skill list as this instance last saw it: read once
+        (read_shared_skills), or the list this instance's last change left."""
+        return shared_skills.read_shared_skills()
+
+    def _forget_sharing(self, *, left: SharedSkills | None = None) -> None:
+        """Drop the cached _sharing after a change to the list, so this
+        instance's next read sees the change. ``left`` is the list the change
+        left, read under the list's lock, so it holds every other writer's
+        change too, and the next read takes it rather than the file; without
+        it, the next read reads the file again."""
+        self.__dict__.pop("_sharing", None)
+        if left is None:
+            self.__dict__.pop("_registry", None)
+        else:
+            self.__dict__["_registry"] = left
+
+    def shared_with_owner(self) -> dict[str, Path]:
+        """Each skill someone else shares with this store's owner that they
+        see, by slug: its folder in its creator's own store (_sharing)."""
+        return self._sharing.with_owner
+
+    def shared_by_owner(self) -> frozenset[str]:
+        """The slugs of this store's own skills that its owner shares."""
+        return self._sharing.by_owner
+
+    def refuse_unchangeable(self, *slugs: str, creating: bool = False) -> None:
+        """Refuse a change that would write, rename into or remove any of
+        ``slugs`` when the owner can't change that name: a slug the managed
+        folder holds, in every mode and scope, or one someone else shares with
+        the owner (shared_with_owner). Both answer SHARED_SKILL_REFUSAL. Needs
+        no read of the owner's own store, which may not hold the name.
+
+        ``creating`` is for a create, upload or rename into ``slugs``, where
+        the caller is making a new skill of their own rather than changing a
+        skill someone shares: a name someone else shares then answers
+        SkillAlreadyExistsError, which names the way out, a different name. A
+        managed name keeps SHARED_SKILL_REFUSAL even on a create, since nobody
+        may hold the operator's reserved name.
+        """
+        if any(self.is_managed_skill(slug) for slug in slugs):
+            raise SkillImmutableError(SHARED_SKILL_REFUSAL)
+        shared = self.shared_with_owner()
+        taken = [slug for slug in slugs if slug in shared]
+        if taken:
+            if creating:
+                raise SkillAlreadyExistsError(
+                    f"Someone else shares a skill named '{taken[0]}'. Choose another name."
+                )
+            raise SkillImmutableError(SHARED_SKILL_REFUSAL)
+
+    def may_change(self, skill: Skill) -> bool:
+        """Whether the owner may change ``skill``, one of the store's own:
+        always, except in the deployment's base store every person reads
+        (skills left shared on a deployment that trusts identity headers),
+        where a person may change only a skill they created and the operator
+        view any (cowork.creators.Changer.may_change)."""
+        return self._changer is None or self._changer.may_change(skill.created_by)
+
+    def _refuse_unless_changeable(self, skill: Skill | None) -> None:
+        """Refuse a change the owner may not make to one of the store's own
+        skills (may_change); ``None``, a folder with no parseable SKILL.md,
+        records no creator."""
+        creator = None if skill is None else skill.created_by
+        if self._changer is not None and not self._changer.may_change(creator):
+            raise SkillImmutableError(SHARED_SKILL_REFUSAL)
+
+    def _stamp_creator(self, metadata: dict[str, str]) -> None:
+        """Record in ``metadata`` who creates the skill, where creators are
+        recorded: the changer's (cowork.creators.Changer.creator), never a
+        value the caller passed."""
+        if self._changer is None:
+            return
+        metadata.pop(META_CREATED_BY, None)
+        if self._changer.creator is not None:
+            metadata[META_CREATED_BY] = self._changer.creator
+
+    # ── sharing one skill ────────────────────────────────────────────────────
+    @property
+    def sharing_available(self) -> bool:
+        """Whether this store's owner may share their own skills one at a
+        time: a person's scope, with their sub, that keeps skills personal.
+        A personal scope already means local tenancy that trusts identity
+        headers. Never for hosted org tenancy, the desktop, the operator
+        view, skills left shared or another store."""
+        scope = self._scope
+        return (
+            self.store_name == "skills"
+            and scope is not None
+            and scope.personal
+            and scope.user_id is not None
+            and scope.partitioned_for(PersonalResource.SKILLS)
+        )
+
+    def refuse_unless_sharing_available(self) -> None:
+        """Answers SKILL_SHARING_UNAVAILABLE where sharing_available is false."""
+        if not self.sharing_available:
+            raise SkillSharingUnavailableError(SKILL_SHARING_UNAVAILABLE)
+
+    def _refuse_shared_name(self, slug: str) -> None:
+        """Refuse to share ``slug`` when everyone already has a skill by that
+        name ahead of a shared one: a packaged built-in, one the agent
+        already has (agent_skill_names), or a managed skill. A share of
+        any of them would reach nobody, or replace anton's own for
+        everyone."""
+        if is_builtin_skill(slug):
+            raise SkillSharingError(
+                f"{slug} is a built-in skill that everyone already has, so it can't be shared."
+            )
+        if slug in agent_skill_names():
+            raise SkillSharingError(
+                f"Everyone's agent already has a skill named {slug}, so sharing yours would "
+                "reach nobody. Rename your skill before you share it."
+            )
+        if self.is_managed_skill(slug):
+            raise SkillSharingError(
+                f"A built-in skill is already named {slug}, so sharing yours would reach "
+                "nobody. Rename your skill before you share it."
+            )
+
+    def _refuse_links(self, slug: str) -> None:
+        """Refuse to share a skill that holds a link: everyone would read
+        whatever it points at. Walks the folder without following one."""
+        skill_dir = self._skill_entry(slug)
+        for directory, subdirectories, files in os.walk(skill_dir):
+            for name in [*subdirectories, *files]:
+                entry = Path(directory) / name
+                if entry.is_symlink():
+                    raise SkillSharingError(
+                        f"This skill holds a link, {entry.relative_to(skill_dir).as_posix()}. "
+                        "Remove it before you share the skill."
+                    )
+
+    def share(self, slug: str) -> bool:
+        """Share the owner's own skill ``slug`` with everyone, read-only.
+
+        Refused, in this order: where sharing is unavailable
+        (SkillSharingUnavailableError), for a name everyone already has
+        (_refuse_shared_name), for a skill the store doesn't hold
+        (SkillNotFoundError), for one it can't read in full, for one holding
+        a link, and for a name someone else already shares a live skill
+        under (_add_own_entry). Returns whether it added an entry: False when
+        the skill is already shared, with nothing written.
+        """
+        self.refuse_unless_sharing_available()
+        self._refuse_shared_name(slug)
+        self.get_skill(slug)
+        if not self.has_complete_skill(slug):
+            raise SkillSharingError(f"Skill {slug} can't be read in full, so it can't be shared.")
+        self._refuse_links(slug)
+        return self._add_own_entry(slug)
+
+    def stop_sharing(self, slug: str) -> bool:
+        """Remove every entry of the owner's for ``slug`` from the list, and
+        return whether there was one. Needs no skill folder: an entry left
+        by a skill that is gone is removed too."""
+        self.refuse_unless_sharing_available()
+        partition = self._scope.org_id
+        removed = False
+
+        def without_own_entry(current: SharedSkills) -> SharedSkills:
+            nonlocal removed
+            kept = tuple(
+                entry
+                for entry in current.root
+                if not (entry.partition_id == partition and entry.skill == slug)
+            )
+            removed = len(kept) != len(current.root)
+            return SharedSkills(kept)
+
+        try:
+            left = shared_skills.change_shared_skills(change=without_own_entry)
+        except BaseException:
+            self._forget_sharing()
+            raise
+        self._forget_sharing(left=left)
+        return removed
+
+    def _add_own_entry(self, slug: str) -> bool:
+        """Add the owner's entry for ``slug`` under the list's lock, and
+        return whether it was added: False when the owner already shares it.
+        Refused when someone else already shares a live skill by that name,
+        since everyone reads the first; an entry whose skill is gone doesn't
+        count."""
+        scope = self._scope
+        added = False
+
+        def with_own_entry(current: SharedSkills) -> SharedSkills:
+            nonlocal added
+            # Scan every entry for the slug before deciding: a dead own entry
+            # listed ahead of someone else's live share must not short-circuit
+            # the live-share check, or a duplicate would slip through.
+            own_exists = False
+            for entry in current.root:
+                if entry.skill != slug:
+                    continue
+                if entry.partition_id == scope.org_id:
+                    own_exists = True
+                    continue
+                try:
+                    live = _shared_skill_dir(entry, strict=True) is not None
+                except OSError as error:
+                    raise SharedSkillsBusyError(SKILL_SHARING_BUSY) from error
+                if live:
+                    raise SkillSharingError(
+                        f"Someone else already shares a skill named {slug}. Rename your "
+                        "skill before you share it."
+                    )
+            if own_exists:
+                return current
+            added = True
+            own = SharedSkill(user_id=scope.user_id, partition_id=scope.org_id, skill=slug)
+            return SharedSkills((*current.root, own))
+
+        try:
+            left = shared_skills.change_shared_skills(change=with_own_entry)
+        except BaseException:
+            self._forget_sharing()
+            raise
+        self._forget_sharing(left=left)
+        return added
+
+    def _refuse_unless_shareable_on_create(self, slug: str) -> None:
+        """The checks a skill created shared passes before any file is
+        written: sharing is available, and its name is one a share reaches
+        (_refuse_shared_name)."""
+        self.refuse_unless_sharing_available()
+        self._refuse_shared_name(slug)
+
+    def _clear_leftover_entry(self, slug: str) -> None:
+        """Before a new skill of the owner's is written at ``slug``, which the
+        store doesn't hold, remove the owner's entry the list still has for
+        a skill of theirs by that name that is gone, so the new skill is
+        never shared unless they chose it.
+
+        Reads under the list's lock (stop_sharing), not the forgiving cached
+        _sharing: a list the filesystem can't read answers busy here, rather
+        than letting a leftover entry survive and silently share the new
+        skill once the read recovers. stop_sharing writes nothing when no
+        entry matches, unless the list is malformed, which it replaces.
+        Skipped when the list file doesn't exist, so a create where nobody
+        ever shared anything never creates the shared folder."""
+        if self.sharing_available and shared_skills.shared_skills_file().exists():
+            self.stop_sharing(slug)
+
+    def _share_new_skill(self, slug: str) -> None:
+        """Share the skill a create just wrote at ``slug``. When adding the
+        entry fails, for any reason, the new folder is removed first: no
+        skill created shared is ever left behind unshared."""
+        try:
+            self._add_own_entry(slug)
+        except Exception:
+            self._rmtree_direct_child(self.root, slug, ignore_errors=True)
+            raise
+
+    def as_own(self, skill: Skill) -> VisibleSkill:
+        """``skill``, one of the store's own, as its owner sees it."""
+        return VisibleSkill(
+            skill=skill, origin=SkillOrigin.OWN, shared=skill.name in self.shared_by_owner()
+        )
+
+    def _refuse_if_reserved(self, slug: str, *, creating: bool = False) -> None:
+        """Refuse a change that would write, rename into or remove ``slug``.
+
+        A slug the owner can't change, managed or shared with them, is refused
+        with SHARED_SKILL_REFUSAL (refuse_unchangeable); on a create, upload or
+        rename into ``slug`` (``creating``), a name someone else shares answers
+        SkillAlreadyExistsError instead. A packaged builtin slug is refused
+        wherever builtins are immutable (_is_immutable_builtin).
+        """
+        self.refuse_unchangeable(slug, creating=creating)
+        if self._is_immutable_builtin(slug):
+            raise SkillImmutableError(builtin_skill_refusal(slug))
 
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -507,8 +1115,54 @@ class SkillService:
                 skill = _skill_from_dir(entry, canonicalize_name=True)
                 if skill is not None:
                     skills.append(skill)
-        skills.sort(key=lambda s: (s.created_at is None, s.created_at), reverse=True)
-        return skills
+        return _newest_first(skills)
+
+    def _managed_skills(self) -> dict[str, Skill]:
+        managed: dict[str, Skill] = {}
+        for slug, skill_dir in self.managed_skill_dirs().items():
+            skill = _skill_from_dir(skill_dir, canonicalize_name=True)
+            if skill is not None and self.allows_skill(slug):
+                managed[slug] = skill
+        return managed
+
+    def list_visible_skills(self) -> list[VisibleSkill]:
+        """The skills this store's owner sees, newest first: the managed
+        skills, the store's own except one whose slug a managed skill holds,
+        and the ones others share with the owner (shared_with_owner).
+
+        For the skills listing only. list_skills and get_skill stay store-only,
+        so the project-rename cascade and the link reconciliation, which write
+        what they read back into the store, never reach a managed or shared
+        skill.
+        """
+        managed = self._managed_skills()
+        sharing = self._sharing
+        visible = [
+            VisibleSkill(skill=skill, origin=SkillOrigin.MANAGED) for skill in managed.values()
+        ]
+        visible.extend(
+            VisibleSkill(skill=skill, origin=SkillOrigin.OWN, shared=skill.name in sharing.by_owner)
+            for skill in self.list_skills()
+            if skill.name not in managed
+        )
+        for skill_dir in sharing.with_owner.values():
+            skill = _skill_from_dir(skill_dir)
+            if skill is not None:
+                visible.append(VisibleSkill(skill=skill, origin=SkillOrigin.SHARED, shared=True))
+        return sorted(visible, key=lambda seen: _creation_order(seen.skill), reverse=True)
+
+    def get_visible_skill(self, slug: str) -> VisibleSkill:
+        """The skill ``slug`` names for its owner: the managed one when the
+        managed folder holds it, one someone else shares with them, else the
+        store's own (get_skill)."""
+        managed = self._managed_skills().get(slug)
+        if managed is not None:
+            return VisibleSkill(skill=managed, origin=SkillOrigin.MANAGED)
+        shared_dir = self.shared_with_owner().get(slug)
+        shared = None if shared_dir is None else _skill_from_dir(shared_dir)
+        if shared is not None:
+            return VisibleSkill(skill=shared, origin=SkillOrigin.SHARED, shared=True)
+        return self.as_own(self.get_skill(slug))
 
     def get_skill(self, slug: str) -> Skill:
         if not self.allows_skill(slug):
@@ -523,7 +1177,7 @@ class SkillService:
             raise SkillNotFoundError(f"Skill {slug!r} not found.")
         return skill
 
-    def has_complete_skill(self, slug: str) -> bool:
+    def has_complete_skill(self, slug: str, *, strict: bool = False) -> bool:
         """Whether ``slug`` has a regular, parseable canonical skill file.
 
         A pending create may outlive the process that reserved it.  The directory
@@ -531,6 +1185,11 @@ class SkillService:
         creates it before replacing ``SKILL.md``.  Recovery must therefore reject
         empty directories, temporary files, symlinks, malformed frontmatter, and
         a file whose declared identity does not match its directory.
+
+        ``strict`` separates "the skill is gone" from "the filesystem couldn't
+        answer": a read error other than a missing path then raises instead of
+        reading as absent, so the locked duplicate-share check never counts a
+        live skill it merely failed to read as gone.
         """
         skill_dir = self._skill_entry(slug)
         skill_file = skill_dir / SKILL_FILE
@@ -540,7 +1199,13 @@ class SkillService:
             if skill_file.is_symlink() or not skill_file.is_file():
                 return False
             parsed = _skill_from_dir(skill_dir, canonicalize_name=False)
-        except (OSError, UnicodeError, ValueError):
+        except (UnicodeError, ValueError):
+            return False
+        except FileNotFoundError:
+            return False
+        except OSError:
+            if strict:
+                raise
             return False
         return parsed is not None and parsed.name == slug
 
@@ -586,17 +1251,31 @@ class SkillService:
         description: str | None = None,
         enabled: bool | None = None,
         projects: list[str] | None = None,
+        *,
+        shared: bool = False,
     ) -> Skill:
+        """Create a skill, shared with everyone, read-only, when ``shared``.
+
+        A shared create runs every share check that needs no file
+        (_refuse_unless_shareable_on_create) before writing anything, and
+        removes the new folder when adding its entry then fails
+        (_share_new_skill). A create that isn't shared first removes an
+        entry the owner's list still has for a gone skill by that name.
+        """
         label = self._slug_from_label(label)
-        if self._is_immutable_builtin(label):
-            raise SkillImmutableError(builtin_skill_refusal(label))
+        self._refuse_if_reserved(label, creating=True)
         if not self.allows_skill(label):
             raise ValueError(f"Skill name {label!r} is reserved for MindsHub Code.")
         if self._skill_dir(label).exists():
             raise SkillAlreadyExistsError(f"A skill named '{label}' already exists.")
+        if shared:
+            self._refuse_unless_shareable_on_create(label)
+        else:
+            self._clear_leftover_entry(label)
 
         metadata = self._build_metadata(label, name, datetime.now(UTC))
         self._apply_metadata_flags(metadata, enabled, projects)
+        self._stamp_creator(metadata)
         skill = Skill(
             name=label,
             instructions=instructions or "",
@@ -609,6 +1288,8 @@ class SkillService:
             self._write(skill, create=True)
         except FileExistsError:
             raise SkillAlreadyExistsError(f"A skill named '{label}' already exists.")
+        if shared:
+            self._share_new_skill(label)
         return self.get_skill(label)
 
     def update_skill(
@@ -621,13 +1302,12 @@ class SkillService:
         enabled: bool | None = None,
         projects: list[str] | None = None,
     ) -> Skill:
-        if self._is_immutable_builtin(skill_id):
-            raise SkillImmutableError(builtin_skill_refusal(skill_id))
+        self._refuse_if_reserved(skill_id)
         skill = self.get_skill(skill_id)
         # ``skill_id`` may be a same-root alias, so the reservation is
         # re-checked against the directory this edit would rewrite.
-        if self._is_immutable_builtin(skill.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill.name))
+        self._refuse_if_reserved(skill.name)
+        self._refuse_unless_changeable(skill)
         original_state = (
             skill.name,
             skill.display_name,
@@ -642,8 +1322,9 @@ class SkillService:
         new_slug = skill.name
         if label is not None:
             new_slug = self._slug_from_label(label)
-            if self._is_immutable_builtin(new_slug):
-                raise SkillImmutableError(builtin_skill_refusal(new_slug))
+            self._refuse_if_reserved(new_slug, creating=new_slug != skill.name)
+            if new_slug != skill.name and skill.name in self.shared_by_owner():
+                raise SkillImmutableError(SHARED_SKILL_RENAME_REFUSAL)
 
         if name is not None:
             if name and name != new_slug:
@@ -658,6 +1339,8 @@ class SkillService:
         renaming = new_slug != skill.name
         if renaming and self._skill_dir(new_slug).exists():
             raise SkillAlreadyExistsError(f"A skill named '{new_slug}' already exists.")
+        if renaming:
+            self._clear_leftover_entry(new_slug)
 
         candidate = skill.model_copy(deep=True)
         candidate.name = new_slug
@@ -713,8 +1396,10 @@ class SkillService:
         *,
         before_persist: Callable[[str], None] | None = None,
         validate_skill: Callable[[Skill], None] | None = None,
+        shared: bool = False,
     ) -> Skill:
-        """Import a skill from an uploaded file.
+        """Import a skill from an uploaded file, shared with everyone,
+        read-only, when ``shared`` (as create_skill shares one).
 
         Supported formats (by extension):
           - ``.md`` / ``.skill`` — a text ``SKILL.md``.
@@ -731,6 +1416,7 @@ class SkillService:
                 data,
                 before_persist=before_persist,
                 validate_skill=validate_skill,
+                shared=shared,
             )
         try:
             content = data.decode("utf-8")
@@ -746,6 +1432,7 @@ class SkillService:
                 copy_tree=False,
                 before_persist=before_persist,
                 validate_skill=validate_skill,
+                shared=shared,
             )
 
     def _import_zip(
@@ -754,6 +1441,7 @@ class SkillService:
         *,
         before_persist: Callable[[str], None] | None = None,
         validate_skill: Callable[[Skill], None] | None = None,
+        shared: bool = False,
     ) -> Skill:
         with tempfile.TemporaryDirectory() as tmp:
             extract_dir = Path(tmp) / "skill"
@@ -764,6 +1452,7 @@ class SkillService:
                 copy_tree=True,
                 before_persist=before_persist,
                 validate_skill=validate_skill,
+                shared=shared,
             )
 
     def _persist_imported(
@@ -773,11 +1462,14 @@ class SkillService:
         copy_tree: bool,
         before_persist: Callable[[str], None] | None = None,
         validate_skill: Callable[[Skill], None] | None = None,
+        shared: bool = False,
     ) -> Skill:
         """Validate a parsed skill folder and persist it into the canon.
 
         ``copy_tree`` copies the whole ``src_dir`` (zip: keep sibling files);
-        otherwise only ``SKILL.md`` is written by ``_write``.
+        otherwise only ``SKILL.md`` is written by ``_write``. ``shared`` runs
+        the share checks that need no file before ``before_persist``, so a
+        refused share reserves nothing, and shares the skill once written.
         """
         self._normalize_skill_dir(src_dir)
         skill = _skill_from_dir(src_dir, canonicalize_name=False)
@@ -785,20 +1477,24 @@ class SkillService:
             raise ValueError("Could not find a parseable SKILL.md in the upload.")
         if not skill.name:
             raise ValueError("Skill name is missing or invalid.")
-        if self._is_immutable_builtin(skill.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill.name))
+        self._refuse_if_reserved(skill.name, creating=True)
         if not self.allows_skill(skill.name):
             raise ValueError(
                 f"Skill name {skill.name!r} is reserved for MindsHub Code."
             )
+        if shared:
+            self._refuse_unless_shareable_on_create(skill.name)
         if before_persist is not None:
             before_persist(skill.name)
         if self._skill_dir(skill.name).exists():
             raise FileExistsError(f"A skill named '{skill.name}' already exists.")
+        if not shared:
+            self._clear_leftover_entry(skill.name)
 
         metadata = dict(skill.metadata)
         metadata.setdefault(META_CREATED_AT, datetime.now(UTC).isoformat())
         metadata.pop(META_PROJECTS, None)
+        self._stamp_creator(metadata)
         skill.metadata = metadata
         if not skill.description.strip():
             skill.description = skill.display_name or skill.name
@@ -822,6 +1518,8 @@ class SkillService:
                 raise
         else:
             self._write(skill, create=True)
+        if shared:
+            self._share_new_skill(skill.name)
         return self.get_skill(skill.name)
 
     @staticmethod
@@ -875,31 +1573,44 @@ class SkillService:
             raise ValueError("Uploaded file is not a valid zip archive.")
 
     def delete_skill(self, slug: str) -> bool:
-        if self._is_immutable_builtin(slug):
-            raise SkillImmutableError(builtin_skill_refusal(slug))
+        self._refuse_if_reserved(slug)
         skill_dir = self._skill_dir(slug)
         if not skill_dir.exists():
             return False
         # A same-root alias resolves to another slug's directory, so the
         # reservation is re-checked against the directory actually removed.
-        if self._is_immutable_builtin(skill_dir.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill_dir.name))
+        self._refuse_if_reserved(skill_dir.name)
+        self._refuse_unless_changeable(_skill_from_dir(skill_dir))
         self._rmtree_direct_child(self.root, skill_dir.name)
         if self._link_projects:
             remove_skill_links(slug)
+        if self.sharing_available and shared_skills.shared_skills_file().exists():
+            # The folder goes first. An entry left behind shares nothing:
+            # readers skip an entry whose skill is gone, and the owner's next
+            # create, upload or rename into the name removes it. Cleanup is
+            # best-effort and always attempted where sharing is available, so
+            # a list the filesystem can't read logs a possible leftover entry.
+            try:
+                self.stop_sharing(skill_dir.name)
+            except Exception:
+                logger.warning(
+                    "couldn't confirm deleted skill %s is no longer listed as shared in %s",
+                    skill_dir.name,
+                    shared_skills.shared_skills_file(),
+                    exc_info=True,
+                )
         return True
 
     def stage_delete(self, slug: str) -> Path | None:
         """Atomically hide a skill while its deletion audit is committed."""
-        if self._is_immutable_builtin(slug):
-            raise SkillImmutableError(builtin_skill_refusal(slug))
+        self._refuse_if_reserved(slug)
         skill_dir = self._skill_dir(slug)
         if not skill_dir.exists():
             return None
         # A same-root alias resolves to another slug's directory, so the
         # reservation is re-checked against the directory actually staged.
-        if self._is_immutable_builtin(skill_dir.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill_dir.name))
+        self._refuse_if_reserved(skill_dir.name)
+        self._refuse_unless_changeable(_skill_from_dir(skill_dir))
         trash = self._delete_staging_root()
         trash.mkdir(parents=True, exist_ok=True)
         staged = trash / f"{skill_dir.name}-{uuid4()}"
@@ -1138,8 +1849,10 @@ class SkillService:
     def ensure_builtin_skills(self) -> bool:
         """Seed this product-specific skill store with its packaged builtins.
 
-        Cowork seeds lazily only in org mode; desktop Cowork still seeds once at
-        boot via ``migrations.seed_builtin_skills``. Code uses a separate store and
+        Cowork seeds lazily wherever the store is partitioned (org mode, and a
+        personal scope that keeps skills per person); desktop Cowork, and a
+        shared store, still seed once at boot via
+        ``migrations.seed_builtin_skills``. Code uses a separate store and
         seeds lazily in both local and org mode so its engineering catalogue never
         depends on, or leaks into, the general Cowork catalogue.
 
@@ -1155,7 +1868,10 @@ class SkillService:
         """
         if (
             not self.seed_builtins_in_local_mode
-            and (self._scope is None or not self._scope.org_mode)
+            and (
+                self._scope is None
+                or not self._scope.partitioned_for(PersonalResource.SKILLS)
+            )
         ):
             return False
         try:

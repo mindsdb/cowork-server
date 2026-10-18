@@ -14,11 +14,13 @@ import tempfile
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlparse
 
+from fastapi import HTTPException
 from pydantic import SecretStr
 
+from cowork.code_sandbox import refuse_planted_links
 from cowork.common.paths import cowork_home, pod_local_only
 # Imported for its side effect on the module namespace as well as its use:
 # tests monkeypatch `publish.get_app_settings`, so removing it because a
@@ -26,7 +28,11 @@ from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.providers import is_mindshub_publish_url, publish_url_for_endpoint
+from cowork.services.providers import (
+    is_mindshub_publish_url,
+    normalize_publish_url,
+    publish_url_for_endpoint,
+)
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
@@ -36,8 +42,10 @@ from anton.publish_access import resolve_publish_target as _anton_resolve_publis
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
+    PUBLISHABLE_STATIC_SUFFIXES,
     _scan_artifact_dirs,
     html_artifacts,
+    is_non_content_path,
     resolve_artifact_path,
 )
 
@@ -60,6 +68,26 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
+# The upload service's 409 for a report that belongs to another account; the
+# renderer matches on the code.
+OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
+OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
+
+
+class PublishOwnedByOtherUser(HTTPException):
+    """The upload service refused the publish: another account owns this report.
+
+    An HTTPException, like ProductPermissionDenied, so any route that lets it
+    through answers 409 with the code. Nobody retries it with a fresh
+    report_id, which would publish a copy under a new URL.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            409, detail={"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE},
+        )
+
+
 def raise_publish_permission_error(exc: Exception) -> None:
     """Preserve the artifact consumer's explicit authority result through wrappers."""
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -79,7 +107,12 @@ def raise_publish_permission_error(exc: Exception) -> None:
             raise ProductPermissionDenied() from exc
 
 
-def _cowork_state_dir() -> Path:
+#: The files the publish store holds: its state, and the temporary file a
+#: save writes and moves over it.
+_STATE_FILES = ("state.json", "state.json.tmp")
+
+
+def _cowork_state_dir(*, scope: TenantScope | None) -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
         path = Path(base).expanduser()
@@ -91,16 +124,29 @@ def _cowork_state_dir() -> Path:
         # no org_id segment, so left on cowork_home() every organization
         # would read every other organization's publish history.
         path = pod_local_only(cowork_home(), "publish")
+    if get_app_settings().tenancy_mode != "org":
+        # Publish history is part of the projects resource: a person whose
+        # projects are personal reads and writes `<shared>/<partition>/publish`,
+        # and LOCAL_SCOPE keeps the path above. scoped_storage_root refuses
+        # `scope=None` on a deployment that trusts identity headers.
+        from cowork.db.scoped import scoped_storage_root
+
+        path = scoped_storage_root(path, scope, store="publish")
+    # Under the code sandbox, a link or hard-linked file that agent code left
+    # on the way to state.json, or at it, fails the read or write instead of
+    # being followed. Only the store's own files are checked: the operator
+    # view's store is cowork-home itself.
+    refuse_planted_links(path, only=_STATE_FILES)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _state_path() -> Path:
-    return _cowork_state_dir() / "state.json"
+def _state_path(*, scope: TenantScope | None) -> Path:
+    return _cowork_state_dir(scope=scope) / "state.json"
 
 
-def _load_state() -> dict[str, Any]:
-    path = _state_path()
+def _load_state(*, scope: TenantScope | None) -> dict[str, Any]:
+    path = _state_path(scope=scope)
     if not path.exists():
         return {}
     try:
@@ -110,8 +156,8 @@ def _load_state() -> dict[str, Any]:
         return {}
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    path = _state_path()
+def _save_state(state: dict[str, Any], *, scope: TenantScope | None) -> None:
+    path = _state_path(scope=scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
@@ -167,8 +213,26 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             pass
 
 
-def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
-    """(artifact, artifacts_base) for a desktop request path.
+class DesktopArtifact(NamedTuple):
+    """An artifact and the artifacts root it sits under (desktop_artifact_and_base)."""
+
+    artifact: Path
+    artifacts_base: Path
+
+
+class ResolvedReport(NamedTuple):
+    """A published artifact's state file, its key, and its report id (_resolve_report_id)."""
+
+    published_json: Path
+    published_key: str
+    report_id: str
+
+
+def desktop_artifact_and_base(
+    raw_path: str, *, scope: TenantScope | None
+) -> DesktopArtifact:
+    """(artifact, artifacts_base) for a desktop request path, resolved only
+    inside ``scope``'s artifacts roots.
 
     Split from credential resolution so callers can validate cheap, local things
     first: `update_artifact` must still answer "no published version to update"
@@ -177,15 +241,15 @@ def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
     The loop only IDENTIFIES which root the artifact sits under;
     `resolve_artifact_path` has already rejected anything outside them.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     if artifact is None:
         raise FileNotFoundError("Artifact not found")
-    for root in _scan_artifact_dirs():
+    for root in _scan_artifact_dirs(scope=scope):
         try:
             artifact.resolve().relative_to(root.resolve())
         except (ValueError, OSError):
             continue
-        return artifact, root
+        return DesktopArtifact(artifact, root)
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
@@ -197,21 +261,38 @@ def desktop_publish_credential() -> tuple[str, str]:
     return api_key, publish_url
 
 
-def desktop_publish_context(raw_path: str) -> tuple[Path, Path, str, str]:
-    """(artifact, artifacts_base, api_key, publish_url) for the desktop path.
+class PublishContext(NamedTuple):
+    """What a desktop publish needs (desktop_publish_context)."""
+
+    artifact: Path
+    artifacts_base: Path
+    api_key: str
+    publish_url: str
+
+
+def desktop_publish_context(
+    raw_path: str, *, scope: TenantScope | None
+) -> PublishContext:
+    """The artifact, its artifacts root and the credential, for the desktop path.
 
     Keeps the pre-existing behavior - path resolution against the registered
-    artifact roots, credential resolution from the active provider - in one
-    place, so the publish functions themselves stay free of both. The org path
-    supplies these four values from the DB and a minted turn key instead.
+    artifact roots of ``scope``, credential resolution from the active
+    provider - in one place, so the publish functions themselves stay free of
+    both. The org path supplies these four values from the DB and a minted turn
+    key instead.
     """
-    artifact, root = desktop_artifact_and_base(raw_path)
+    found = desktop_artifact_and_base(raw_path, scope=scope)
     api_key, publish_url = desktop_publish_credential()
-    return artifact, root, api_key, publish_url
+    return PublishContext(
+        artifact=found.artifact,
+        artifacts_base=found.artifacts_base,
+        api_key=api_key,
+        publish_url=publish_url,
+    )
 
 
 def _resolve_publish_target(
-    artifact: Path, container_dirs: list[Path] | None = None
+    artifact: Path, *, container_dirs: list[Path]
 ) -> tuple[Path, Path, str, bool]:
     """Decide what to publish + where `.published.json` lives + its key.
 
@@ -219,16 +300,13 @@ def _resolve_publish_target(
     (`anton.publish_access.resolve_publish_target`); cowork supplies its own
     container dirs so the metadata-climb is bounded to `.anton/artifacts/` roots.
 
-    `container_dirs` MUST be passed on the org path: the default
-    (`_scan_artifact_dirs()`) only sees the desktop layout, because org projects
-    live one level deeper under `<root>/<org_id>/`, and it would return nothing
-    there. Omitting it keeps the desktop behavior unchanged.
+    `container_dirs` is required: the org path passes the artifact's own root,
+    and a desktop path passes the scan of its scope
+    (`_scan_artifact_dirs(scope=...)`), which only sees the desktop layout.
 
     Returns (publish_target, published_dir, published_key, is_fullstack).
     """
-    return _anton_resolve_publish_target(
-        artifact, container_dirs if container_dirs is not None else _scan_artifact_dirs()
-    )
+    return _anton_resolve_publish_target(artifact, container_dirs)
 
 
 def _resolve_publish_endpoint(settings) -> tuple[str, str]:
@@ -245,6 +323,9 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
          SettingService, which passes DB rows as init kwargs);
       2. the ``publish_url`` setting;
       3. the host derived from the active provider endpoint.
+
+    A result on the retired 4nton.ai host becomes the prod publish host
+    (`normalize_publish_url`): a saved setting may still name it.
     """
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
@@ -253,16 +334,18 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
     env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
-    publish_url = env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    publish_url = normalize_publish_url(
+        env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    )
     return publish_url, api_key
 
 
-def list_publishable() -> dict:
+def list_publishable(*, scope: TenantScope | None) -> dict:
     settings = get_user_settings()
-    state = _load_state()
+    state = _load_state(scope=scope)
     publish_url, api_key = _resolve_publish_endpoint(settings)
     return {
-        "artifacts": html_artifacts(),
+        "artifacts": html_artifacts(scope=scope),
         "publishReady": bool(api_key),
         "publishUrl": publish_url,
         "history": state.get("publish_history", [])[:40],
@@ -273,11 +356,12 @@ def list_publishable() -> dict:
 # source of truth) and are imported at the top of this module.
 
 
-# Static artifact extensions a user can publish to a MindsHub web page.
-# `.html` is served as-is; `.md` is rendered to a styled HTML page first
-# (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
-# publish their directory regardless of the primary file's suffix.
-PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+def is_publishable_static(target: Path, artifacts_base: Path) -> bool:
+    """A non-fullstack target publishes only when it is an HTML/Markdown file
+    that is artifact content (not README, a generation input or a revision copy)."""
+    return target.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES and not is_non_content_path(
+        target, artifacts_base
+    )
 
 # What Share and the agent's publish tool report for a full-stack artifact when
 # the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
@@ -422,8 +506,8 @@ def publish_artifact(
     publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
-        raise ValueError("Only HTML and Markdown artifacts can be published")
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
+        raise ValueError("Only HTML and Markdown artifact content can be published")
     # Refuse before anything is built: `anton.publisher.publish` puts the
     # artifact's datasource credentials, in plaintext, in the body of a
     # full-stack upload, and a service that can't run the app would receive
@@ -432,7 +516,7 @@ def publish_artifact(
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
-        from anton.publisher import publish
+        from anton.publisher import ArtifactOwnedByOtherUserError, publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
@@ -496,7 +580,14 @@ def publish_artifact(
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
             vault=vault_for_scope(scope),
+            # While the password is unchanged anton re-sends the hash stored
+            # here, so a content-only re-publish keeps viewers' password grants.
+            previous_access=previous if isinstance(previous, dict) else None,
         )
+    except ArtifactOwnedByOtherUserError as exc:
+        # Not a failure to log or wrap: the upload service holds this
+        # report_id for another account.
+        raise PublishOwnedByOtherUser() from exc
     except Exception as exc:
         raise_publish_permission_error(exc)
         logger.exception("Publishing failed")
@@ -515,6 +606,9 @@ def publish_artifact(
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
 
+    # Owner-side state for the next publish, stored in the entry below and
+    # never part of the response.
+    password_hash = result.pop("password_hash", None)
     view_url = result.get("view_url", "")
     returned_report_id = result.get("report_id", "")
     if returned_report_id:
@@ -528,7 +622,9 @@ def publish_artifact(
         # Owner-side only — .published.json never enters the bundle. `owner_side`
         # carries `mode` (+ `access_password`/`pwd_version` for password, or
         # `emails`/`org_allowed`/`access_version` for restricted), and always
-        # `requires_password` for back-compat with older readers.
+        # `requires_password` for back-compat with older readers. Password mode
+        # also keeps the `password_hash` anton sent, handed back as
+        # `previous_access` on the next publish.
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
@@ -548,11 +644,13 @@ def publish_artifact(
             "published": True,
             **owner_side,
         }
+        if password_hash:
+            entry["password_hash"] = password_hash
         published_map[published_key] = entry
         _write_published_map(published_json, published_map)
-        state = _load_state()
+        state = _load_state(scope=scope)
         state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
-        _save_state(state)
+        _save_state(state, scope=scope)
 
     return {
         "status": "ok",
@@ -592,7 +690,7 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
         )
     except Exception:
         return None
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
         return None
     try:
         from anton.publisher import _zip_fullstack, _zip_html
@@ -717,7 +815,7 @@ def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
     return access_from_owner_side(entry)
 
 
-def update_artifact(raw_path: str) -> dict:
+def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
     """Re-publish an already-published artifact, preserving its URL and access.
 
     `publish_artifact` reuses the stored report_id (→ the lambda mints a new
@@ -728,7 +826,8 @@ def update_artifact(raw_path: str) -> dict:
     """
     # Path first, credential later: an artifact with nothing published must
     # report that, not "configure your API key".
-    artifact, artifacts_base = desktop_artifact_and_base(raw_path)
+    found = desktop_artifact_and_base(raw_path, scope=scope)
+    artifact, artifacts_base = found.artifact, found.artifacts_base
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
@@ -739,7 +838,7 @@ def update_artifact(raw_path: str) -> dict:
     api_key, publish_url = desktop_publish_credential()
     result = publish_artifact(
         artifact, artifacts_base=artifacts_base, api_key=api_key,
-        publish_url=publish_url, access=access,
+        publish_url=publish_url, access=access, scope=scope,
     )
 
     # Refresh the mtime snapshot so the cheap gate clears the `modified` badge.
@@ -756,13 +855,16 @@ def update_artifact(raw_path: str) -> dict:
     return result
 
 
-def _resolve_report_id(raw_path: str) -> tuple[Path, str, str]:
-    """Resolve (published_json_path, published_key, report_id) for an artifact.
+def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> ResolvedReport:
+    """Resolve (published_json_path, published_key, report_id) for an artifact
+    of ``scope``.
 
     Raises FileNotFoundError when the artifact has no live publish record.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
     published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError("Artifact has no publish record")
@@ -774,7 +876,7 @@ def _resolve_report_id(raw_path: str) -> tuple[Path, str, str]:
     report_id = entry.get("report_id") if isinstance(entry, dict) else None
     if not report_id:
         raise FileNotFoundError("Artifact is not published")
-    return published_json, published_key, report_id
+    return ResolvedReport(published_json, published_key, report_id)
 
 
 def _publisher_http_detail(exc: Exception) -> str:
@@ -787,7 +889,7 @@ def _publisher_http_detail(exc: Exception) -> str:
         return body or str(exc)
 
 
-def list_versions(raw_path: str) -> dict:
+def list_versions(raw_path: str, *, scope: TenantScope | None) -> dict:
     """List the publish history (versions) of a live artifact.
 
     Returns {reportId, currentMd5, artifactType, versions: [...]} with versions
@@ -798,7 +900,7 @@ def list_versions(raw_path: str) -> dict:
     if not api_key:
         raise ValueError("Configure your provider API key in Settings to view versions")
 
-    _published_json, _key, report_id = _resolve_report_id(raw_path)
+    report_id = _resolve_report_id(raw_path, scope=scope).report_id
 
     try:
         from anton.publisher import list_versions as _list_versions
@@ -837,7 +939,7 @@ def list_versions(raw_path: str) -> dict:
     }
 
 
-def activate_version(raw_path: str, md5: str) -> dict:
+def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> dict:
     """Roll the live URL back to an existing version (flips current_md5).
 
     On success, rewrites `.published.json` so the `modified` badge reflects the
@@ -854,7 +956,8 @@ def activate_version(raw_path: str, md5: str) -> dict:
     if not api_key:
         raise ValueError("Configure your provider API key in Settings before rolling back")
 
-    published_json, published_key, report_id = _resolve_report_id(raw_path)
+    report = _resolve_report_id(raw_path, scope=scope)
+    published_json, published_key, report_id = report.published_json, report.published_key, report.report_id
 
     try:
         from anton.publisher import activate_version as _activate_version
@@ -896,7 +999,7 @@ def activate_version(raw_path: str, md5: str) -> dict:
     }
 
 
-def published_state(raw_path: str) -> dict:
+def published_state(raw_path: str, *, scope: TenantScope | None) -> dict:
     """Owner-side publish state for an artifact path, resolved exactly the way
     `publish_artifact` resolves it (so the chat tool and the GUI never disagree
     on where `.published.json` lives).
@@ -910,12 +1013,14 @@ def published_state(raw_path: str) -> dict:
     # artifacts dir, so guard the whole resolution — the documented contract is
     # to return the blank default for any unresolvable path, never to raise.
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     except Exception:
         return dict(blank)
     if artifact is None:
         return dict(blank)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
     entry = _load_published_map(published_dir).get(published_key)
     if not isinstance(entry, dict):
         return dict(blank)
@@ -927,17 +1032,19 @@ def published_state(raw_path: str) -> dict:
     }
 
 
-def published_owner_state(raw_path: str) -> dict:
+def published_owner_state(raw_path: str, *, scope: TenantScope | None) -> dict:
     """Raw owner-side `.published.json` entry, resolved exactly like
     `publish_artifact`. Returns {} for any unresolvable/absent record. Unlike
     `published_state`, exposes the access fields (mode/access_password/emails/
     org_allowed) needed to preserve access on re-publish."""
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     except Exception:
         return {}
     if artifact is None:
         return {}
-    _t, published_dir, published_key, _fs = _resolve_publish_target(artifact)
+    _t, published_dir, published_key, _fs = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
     entry = _load_published_map(published_dir).get(published_key)
     return entry if isinstance(entry, dict) else {}

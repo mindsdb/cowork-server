@@ -33,7 +33,8 @@ import stat
 from pathlib import Path
 from uuid import UUID
 
-from cowork.db.scoped import ScopedSession
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _org_mode,
@@ -231,16 +232,19 @@ def _sources_for(
 def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts]:
     """Every artifacts root the caller can read, across their organization's
     projects. In org mode that is each project's shared base (ENG-2056) plus the
-    caller's own legacy conversation workspaces.
+    caller's own legacy conversation workspaces. In a person's partition it is
+    each of that person's projects, read from the database like org mode, so
+    every card carries its project id; the scan of the partition's projects
+    root would leave cards path-addressed.
 
     Used by the unparameterized artifacts list, which the frontend calls with no
-    project filter. In local mode this falls back to the filesystem scan so the
-    desktop list is unchanged.
+    project filter. In local mode, and for a scope that keeps projects shared,
+    this falls back to the filesystem scan so the desktop list is unchanged.
     """
-    if not _org_mode():
-        return artifacts_sources_for_scan() + _sources_outside_the_projects_root(
-            session
-        )
+    if not (_org_mode() or session.scope.partitioned_for(PersonalResource.PROJECTS)):
+        return artifacts_sources_for_scan(
+            scope=session.scope
+        ) + _sources_outside_the_projects_root(session)
 
     from cowork.services.projects import ProjectService
 
@@ -323,9 +327,10 @@ def artifacts_sources_for_project(
     )
 
 
-def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
-    """Desktop: the registered `.anton/artifacts` dirs found by scanning the
-    projects root.
+def artifacts_sources_for_scan(*, scope: TenantScope | None) -> list[ProjectArtifacts]:
+    """Desktop: the registered `.anton/artifacts` dirs found by scanning
+    ``scope``'s projects root — the unkeyed root for LOCAL_SCOPE, and a
+    person's partition root where their projects are personal.
 
     `project_id` is None here — desktop cards stay path-addressed. The directory
     name IS the project name: `create_project` builds both from one sanitized
@@ -333,10 +338,10 @@ def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
     (services/projects.py).
     """
     sources: list[ProjectArtifacts] = []
-    for base in _scan_artifact_dirs():
-        # ``_scan_artifact_dirs`` historically follows directory links in its
-        # ``is_dir`` probe.  Do not let such a root become an authorization
-        # source; ordinary desktop directories retain the exact same shape.
+    for base in _scan_artifact_dirs(scope=scope):
+        # ``_scan_artifact_dirs`` skips a linked root too; this list repeats
+        # the check because it is an authorization source, so a linked root
+        # never becomes one. Ordinary desktop directories keep the same shape.
         if not _storage_components_are_safe(base.parent.parent, may_be_absent=False):
             continue
         project_path = base.parent.parent

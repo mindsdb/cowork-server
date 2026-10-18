@@ -15,7 +15,7 @@ from cowork.schemas.connectors import DirectSaveRequest
 class TestSaveConnectionDirectReturnsUserLabel:
     def test_response_includes_user_label(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            "cowork.services.connectors.persist.ConnectorSettings",
             lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
         )
         body = DirectSaveRequest(
@@ -37,7 +37,7 @@ class TestSaveConnectionDirectReturnsUserLabel:
         # but no explicit user_label — without default_label, that fell back
         # to the generic engine id ("linear") instead of the workspace name.
         monkeypatch.setattr(
-            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            "cowork.services.connectors.persist.ConnectorSettings",
             lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
         )
         body = DirectSaveRequest(
@@ -55,7 +55,7 @@ class TestSaveConnectionDirectReturnsUserLabel:
 
     def test_second_workspace_with_distinct_account_name_gets_its_own_tile(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            "cowork.services.connectors.persist.ConnectorSettings",
             lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
         )
         first = DirectSaveRequest(
@@ -93,7 +93,7 @@ class TestSaveConnectionDirectReturnsUserLabel:
         # account ("gmail 2"). That leaks into the tile subtitle next to the
         # email. Mirrors oauth/google.py's callback() (the web flow) fix.
         monkeypatch.setattr(
-            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            "cowork.services.connectors.persist.ConnectorSettings",
             lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
         )
         body = DirectSaveRequest(

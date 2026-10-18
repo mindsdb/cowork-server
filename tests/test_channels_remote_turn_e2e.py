@@ -110,7 +110,7 @@ def test_slack_message_gets_a_reply_via_the_remote_worker(monkeypatch, org_mode_
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
-        staticmethod(lambda session, conv_id: {}),
+        staticmethod(lambda session, conv_id: None),
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
@@ -203,7 +203,7 @@ def test_a_remote_turn_failure_delivers_an_error_message_not_silence(monkeypatch
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
-        staticmethod(lambda session, conv_id: {}),
+        staticmethod(lambda session, conv_id: None),
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
@@ -334,7 +334,7 @@ def test_a_remote_allowance_stop_posts_the_allowance_message_not_out_of_credits(
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
-        staticmethod(lambda session, conv_id: {}),
+        staticmethod(lambda session, conv_id: None),
     )
 
     async def fake_llm_block(**kwargs):

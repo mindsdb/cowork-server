@@ -4,7 +4,9 @@ When COWORK_REQUIRE_AUTH is true the server validates every request (except
 OPTIONS preflight and the /health endpoint) against a shared secret token
 stored in ~/.cowork/.env as COWORK_AUTH_TOKEN.  If no token is set, one is
 auto-generated at startup and written back to that file so the desktop app
-can read it.
+can read it. With COWORK_TRUST_IDENTITY_HEADERS on, the token comes from the
+environment alone, and create_app removes any copy from that file
+(remove_auth_token).
 
 Defaults on in local/desktop tenancy (see AppSettings.require_auth) and stays
 off in org mode, where it isn't supported at all — see create_app()'s
@@ -18,6 +20,8 @@ import logging
 import os
 import re
 import secrets
+import stat
+import tempfile
 from collections.abc import Collection
 from pathlib import Path
 
@@ -53,9 +57,17 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         self._exempt_paths = exempt_paths
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        # Always let CORS preflight through — the browser sends OPTIONS before
-        # the real request and never includes an Authorization header.
-        if request.method == "OPTIONS":
+        # Let a CORS preflight through: the browser sends OPTIONS before the
+        # real request and never includes an Authorization header. Only a
+        # genuine one, carrying Origin and Access-Control-Request-Method
+        # together, as TrustedHeaderMiddleware requires: an OPTIONS without
+        # them is an ordinary request, and passing it here would let it name
+        # a person in the identity headers with no token.
+        if (
+            request.method == "OPTIONS"
+            and request.headers.get("origin")
+            and request.headers.get("access-control-request-method")
+        ):
             return await call_next(request)
 
         if request.url.path in _EXEMPT_PATHS or request.url.path in self._exempt_paths:
@@ -97,9 +109,46 @@ def sync_auth_token(env_path: Path, token: str) -> None:
         _write_token(env_path, token)
 
 
+def remove_auth_token(env_path: Path) -> bool:
+    """Remove every COWORK_AUTH_TOKEN line from env_path, keeping the other
+    lines as they are. Returns whether one was there.
+
+    For a deployment whose token must not sit in cowork-home's .env, where an
+    earlier start mirrored it (sync_auth_token). The kept lines go to a
+    temporary file beside it, with the file's mode, flushed to disk and moved
+    over it: a kill midway never leaves a torn .env, and a link or second
+    name at env_path is replaced rather than written through.
+    """
+    if not env_path.exists():
+        return False
+    existing = env_path.read_text(encoding="utf-8")
+    kept = _TOKEN_LINE_RE.sub("", existing)
+    if kept == existing:
+        return False
+    mode = stat.S_IMODE(env_path.stat().st_mode)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=env_path.parent, prefix=".env-", delete=False
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(kept)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, env_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    logger.info("auth: removed COWORK_AUTH_TOKEN from %s", env_path)
+    return True
+
+
 # ── private helpers ────────────────────────────────────────────────────────
 
 _TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN\s*=\s*(.+)$", re.MULTILINE)
+# The whole line, as python-dotenv reads it: optional indent and `export`.
+_TOKEN_LINE_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?COWORK_AUTH_TOKEN[ \t]*=.*(?:\r?\n|\Z)", re.MULTILINE)
 
 
 def _read_token(env_path: Path) -> str:

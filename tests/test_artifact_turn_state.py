@@ -257,7 +257,7 @@ def test_cards_for_slugs_builds_one_card_per_slug(tmp_path):
     _make_artifact(base, "dash", files={"index.html": "<html></html>"},
                    meta={"slug": "dash", "name": "Dash", "type": "html-app"})
 
-    cards = t.cards_for_slugs(base, ["dash"])
+    cards = t.cards_for_slugs(base, ["dash"], scope=LOCAL_SCOPE)
 
     assert [c["slug"] for c in cards] == ["dash"]
     assert cards[0]["title"] == "Dash"
@@ -269,7 +269,7 @@ def test_cards_for_slugs_skips_unreadable_metadata(tmp_path):
     folder.mkdir(parents=True)
     (folder / "metadata.json").write_text("{ not json")
 
-    assert t.cards_for_slugs(base, ["broken"]) == []
+    assert t.cards_for_slugs(base, ["broken"], scope=LOCAL_SCOPE) == []
 
 
 def test_cards_carry_project_identity_when_given(tmp_path):
@@ -280,7 +280,7 @@ def test_cards_carry_project_identity_when_given(tmp_path):
     _make_artifact(base, "dash", files={"index.html": "<html></html>"},
                    meta={"slug": "dash", "name": "Dash", "type": "html-app"})
 
-    card = t.cards_for_slugs(base, ["dash"], project_id="p-1", project_name="Alpha")[0]
+    card = t.cards_for_slugs(base, ["dash"], project_id="p-1", project_name="Alpha", scope=LOCAL_SCOPE)[0]
 
     assert card["projectId"] == "p-1"
     assert card["projectName"] == "Alpha"

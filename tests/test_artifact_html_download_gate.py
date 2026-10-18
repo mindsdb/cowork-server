@@ -69,8 +69,10 @@ def test_serve_download_is_byte_identical_to_disk(projects_root):
 
 
 def test_preview_asset_download_is_byte_identical_to_disk(projects_root):
-    artifact = projects_root / "mount-source"
-    artifact.mkdir()
+    # Inside a project's artifacts root, where /preview-mount registers mounts:
+    # the asset route serves only a mount within the caller's own roots.
+    artifact = projects_root / "proj" / ".anton" / "artifacts" / "mount-source"
+    artifact.mkdir(parents=True)
     on_disk = artifact / "index.html"
     on_disk.write_bytes(_HTML)
 

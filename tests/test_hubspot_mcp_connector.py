@@ -34,14 +34,12 @@ ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 
 def _vault(tmp_path, monkeypatch):
     fake_settings = lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})()
+    # Every save, ConnectionsService (patch_access_mode's local-mode branch) and
+    # a delete's revoke find the vault through persist.own_vault_for_scope, which
+    # reads persist's own ConnectorSettings import, so patching it alone points
+    # the whole flow at the one test vault.
     monkeypatch.setattr(
-        "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings", fake_settings,
-    )
-    # ConnectionsService (used by patch_access_mode's local-mode branch) reads
-    # its own module-level ConnectorSettings import, separate from the one
-    # above — both must point at the same test vault.
-    monkeypatch.setattr(
-        "cowork.services.connectors.connections.ConnectorSettings", fake_settings,
+        "cowork.services.connectors.persist.ConnectorSettings", fake_settings,
     )
 
 

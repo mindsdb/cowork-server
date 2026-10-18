@@ -11,6 +11,7 @@ from pathlib import Path
 from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.oauth import google as oauth_google
 from cowork.services.connectors.identity import (
@@ -437,11 +438,9 @@ class TestDisplayName:
         assert detail.display_name == "a@x.com"          # identity-only now
         assert "_label" not in detail.fields            # not rendered as a raw `_`-field row
         assert "label" not in detail.fields             # no longer echoed into fields
-        # persist_connection assigned a default user_label (the engine id) for
-        # this brand-new connection since only the legacy `label` was given,
-        # not `user_label` — the default takes precedence over the `_label`
-        # fallback because `_user_label` is present (non-empty) on the record.
-        assert detail.user_label == "gmail"
+        # No engine-id default is written, so the legacy `label` the caller
+        # gave is what titles the connection.
+        assert detail.user_label == "Support"
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # still masked
 
 
@@ -558,7 +557,7 @@ class TestOAuthCallbackDedup:
             oauth_google._USERINFO_FETCHERS, "google_drive",
             lambda access_token: {"email": email, "name": "User"},
         )
-        svc.callback("google-drive", code="authcode", state=state, error="", settings=settings)
+        svc.callback("google-drive", code="authcode", state=state, error="", settings=settings, scope=LOCAL_SCOPE)
 
     def test_repeat_connection_same_account_dedups(self, monkeypatch, tmp_path):
         self._connect(monkeypatch, tmp_path, state="state-1", access_token="tok1", email="user@gmail.com")
@@ -670,18 +669,15 @@ class TestPersistConnectionUserLabel:
         suffix = slug.split("-", 1)[1]
         assert len(suffix) == 8
 
-    def test_new_connection_gets_default_label_when_none_passed(self, tmp_path):
-        # Without this, a connection saved via cowork with no explicit
-        # `user_label` in the request (the common case for a first-time
-        # "Connect Postgres" through the GUI) would end up with NO label at
-        # all — inconsistent with anton, where the CLI prompt always has a
-        # default and can never be skipped entirely.
+    def test_new_connection_without_a_label_stores_none(self, tmp_path):
+        # `_user_label` means "someone named this". Storing the engine id made
+        # new connections read "postgres", "postgres 2" as if a user chose it.
         vault = LocalDataVault(Path(tmp_path) / "vault")
         slug = persist_connection(
             "postgres", "host-port", "", {"host": "db.example.com"}, vault=vault,
         )
         record = vault.read_record("postgres", slug)
-        assert record["fields"]["_user_label"] == "postgres"
+        assert "_user_label" not in record["fields"]
 
     def test_editing_without_a_label_does_not_assign_one(self, tmp_path):
         # The `existing is None` guard on the default-label fix above: an

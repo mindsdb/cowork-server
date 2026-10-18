@@ -55,7 +55,7 @@ def test_card_for_folder_prefers_html_entry_over_alphabetical(tmp_path):
         files={"index.html": "<html></html>", "data/prices.csv": "a,b\n1,2"},
         meta={"slug": "dash", "name": "Dash", "type": "html-app"},
     )
-    card = card_for_folder(tmp_path / "dash")
+    card = card_for_folder(tmp_path / "dash", scope=LOCAL_SCOPE)
     assert card["path"].endswith("index.html")
     assert card["ext"] == ".html"
     assert card["slug"] == "dash"
@@ -66,7 +66,7 @@ def test_card_for_folder_none_on_unreadable_metadata(tmp_path):
     folder = tmp_path / "broken"
     folder.mkdir()
     (folder / "metadata.json").write_text("{ not json")
-    assert card_for_folder(folder) is None
+    assert card_for_folder(folder, scope=LOCAL_SCOPE) is None
 
 
 # ── serve URL: addressed by the project's name, not its label ─────────────

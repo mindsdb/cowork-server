@@ -1,4 +1,5 @@
-"""Behaviour of the org-mode trusted-header principal layer.
+"""Behaviour of the trusted-header principal layer, in org mode and with
+personal partitions (local tenancy with COWORK_TRUST_IDENTITY_HEADERS on).
 
 Exercises TrustedHeaderMiddleware directly on a tiny app rather than
 create_app() so it doesn't depend on the settings singleton (same approach as
@@ -7,6 +8,7 @@ order: a browser must receive the 401, not an opaque CORS failure.
 """
 from __future__ import annotations
 
+import pytest
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
@@ -17,6 +19,7 @@ from cowork.principal import (
     TrustedHeaderMiddleware,
     get_principal,
     identity_trace_metadata,
+    personal_partition_id,
 )
 
 ORIGIN = "http://localhost:1234"
@@ -31,7 +34,7 @@ RELOAD_HEADER = "X-Cowork-Organization-Reload"
 JWT = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyIn0.signature"
 
 
-def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
+def _app(org_mode: bool = True, enforce: bool = True, personal_partitions: bool = False) -> FastAPI:
     app = FastAPI()
 
     @app.get("/api/v1/health")
@@ -53,6 +56,15 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
     async def slack_webhook():
         return {"ack": True}
 
+    # The web UI's page shell, which a browser loads with no identity.
+    @app.get("/")
+    def page_shell(principal: Principal | None = Depends(get_principal)):
+        return {"principal": None if principal is None else principal.user_id}
+
+    @app.get("/assets/{name}")
+    def page_asset(name: str):
+        return {"asset": name}
+
     # A route with its own explicit OPTIONS handler (like responses.py's
     # OpenByDesign preflight body) — CORSMiddleware only intercepts a
     # genuine preflight (Origin + Access-Control-Request-Method) before this
@@ -69,6 +81,7 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
             TrustedHeaderMiddleware,
             exempt_paths={WEBHOOK},
             enforce=enforce,
+            personal_partitions=personal_partitions,
         )
     app.add_middleware(
         CORSMiddleware,
@@ -82,6 +95,10 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
 
 def _client(org_mode: bool = True, enforce: bool = True) -> TestClient:
     return TestClient(_app(org_mode, enforce))
+
+
+def _personal_client(enforce: bool = True) -> TestClient:
+    return TestClient(_app(enforce=enforce, personal_partitions=True))
 
 
 def _browser_headers(expected_org_id: str | None = ORG_ID) -> dict[str, str]:
@@ -520,3 +537,151 @@ def test_identity_trace_metadata_does_not_mutate_base():
     base = {"harness": "anton"}
     identity_trace_metadata(principal, base)
     assert base == {"harness": "anton"}
+
+
+# ── personal partitions (local tenancy, trusted identity headers) ────────────
+
+# The shared vector: cowork-self-hosted's tests pin the same three values.
+GOLDEN_ORGANIZATION = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
+GOLDEN_USER = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+GOLDEN_PARTITION = "44e92829-e701-599b-88f9-69f5bf1165eb"
+OTHER_USER_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def test_personal_partition_id_golden_vector():
+    assert personal_partition_id(GOLDEN_ORGANIZATION, GOLDEN_USER) == GOLDEN_PARTITION
+
+
+def test_personal_partition_id_ignores_letter_case():
+    assert personal_partition_id(GOLDEN_ORGANIZATION.upper(), GOLDEN_USER.upper()) == GOLDEN_PARTITION
+    assert personal_partition_id(GOLDEN_ORGANIZATION, GOLDEN_USER.upper()) == GOLDEN_PARTITION
+
+
+def test_personal_partition_id_refuses_a_non_uuid():
+    with pytest.raises(ValueError):
+        personal_partition_id(GOLDEN_ORGANIZATION, "not-a-uuid")
+
+
+def test_personal_pair_builds_the_partition_principal():
+    res = _personal_client().get(
+        "/api/v1/whoami",
+        headers={"X-User-Id": GOLDEN_USER, "X-Organization-Id": GOLDEN_ORGANIZATION},
+    )
+    assert res.status_code == 200
+    assert res.json() == {"user_id": GOLDEN_USER, "org_id": GOLDEN_PARTITION, "email": "", "roles": []}
+
+
+def test_personal_partition_survives_header_letter_case():
+    res = _personal_client().get(
+        "/api/v1/whoami",
+        headers={"X-User-Id": GOLDEN_USER.upper(), "X-Organization-Id": GOLDEN_ORGANIZATION.upper()},
+    )
+    assert res.status_code == 200
+    assert res.json()["user_id"] == GOLDEN_USER
+    assert res.json()["org_id"] == GOLDEN_PARTITION
+
+
+def test_two_people_and_two_deployments_get_four_partitions():
+    client = _personal_client()
+    partitions = {
+        client.get("/api/v1/whoami", headers={"X-User-Id": user, "X-Organization-Id": org}).json()["org_id"]
+        for user in (USER_ID, OTHER_USER_ID)
+        for org in (ORG_ID, OTHER_ORG_ID)
+    }
+    assert len(partitions) == 4
+    assert not partitions & {ORG_ID, OTHER_ORG_ID}  # never the header's organization
+
+
+def test_personal_partitions_skip_the_organization_boundary():
+    """The browser sends its token's organization claim as the expected
+    organization, which never equals a partition id; the boundary would 409
+    every request and the web UI would reload in a loop."""
+    client = _personal_client()
+    for expected in (OTHER_ORG_ID, ORG_ID, "not-a-uuid"):
+        res = client.get("/api/v1/whoami", headers={**_browser_headers(expected), "Origin": ORIGIN})
+        assert res.status_code == 200, expected
+        assert res.json()["org_id"] == personal_partition_id(ORG_ID, USER_ID)
+    missing = client.get("/api/v1/whoami", headers={**_browser_headers(None), "Origin": ORIGIN})
+    assert missing.status_code == 200
+    assert RELOAD_HEADER.lower() not in {k.lower() for k in missing.headers}
+
+
+def test_org_mode_keeps_the_organization_boundary_and_the_raw_org():
+    # Hosted regression for the flag's two effects.
+    assert _client().get("/api/v1/whoami", headers=IDENTITY).json()["org_id"] == ORG_ID
+    res = _client().get("/api/v1/whoami", headers={**_browser_headers(OTHER_ORG_ID), "Origin": ORIGIN})
+    _assert_organization_boundary_rejection(res, 409)
+
+
+def test_personal_partitions_enforce_answers_401_without_a_pair():
+    client = _personal_client()
+    assert client.get("/api/v1/whoami").status_code == 401
+    assert client.get("/api/v1/whoami", headers={"X-User-Id": USER_ID}).status_code == 401
+    assert client.get(
+        "/api/v1/whoami", headers={"X-User-Id": "sub-not-a-uuid", "X-Organization-Id": ORG_ID}
+    ).status_code == 401
+
+
+def test_personal_partitions_audit_serves_no_person():
+    res = _personal_client(enforce=False).get("/api/v1/whoami")
+    assert res.status_code == 200
+    assert res.json() == {"principal": None}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-User-Id": USER_ID},
+        {"X-Organization-Id": ORG_ID},
+        {"X-User-Id": "f:ldap:alice", "X-Organization-Id": ORG_ID},
+        {"X-User-Id": USER_ID, "X-Organization-Id": "not-a-uuid"},
+        {"X-User-Id": "  ", "X-Organization-Id": ORG_ID},
+    ],
+)
+def test_personal_partitions_audit_refuses_a_broken_pair(headers, caplog):
+    """Audit serves a request that names nobody as the operator view. A pair
+    the proxy sent but broke is no such request: it answers 401."""
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        res = _personal_client(enforce=False).get("/api/v1/whoami", headers=headers)
+    assert res.status_code == 401
+    assert "no principal" not in caplog.text
+
+
+def test_hosted_audit_still_lets_a_broken_pair_through():
+    res = _client(enforce=False).get("/api/v1/whoami", headers={"X-User-Id": USER_ID})
+    assert res.status_code == 200
+    assert res.json() == {"principal": None}
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_personal_partitions_leave_the_page_shell_alone(enforce, caplog):
+    """The page shell names no person and logs no missing one, under either
+    mode; the API beside it behaves as before."""
+    client = _personal_client(enforce=enforce)
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        for path in ("/", "/assets/app.js"):
+            assert client.get(path).status_code == 200, path
+        shell = client.get("/", headers={"X-User-Id": USER_ID, "X-Organization-Id": ORG_ID})
+    assert shell.json() == {"principal": None}
+    assert "no principal" not in caplog.text
+
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        api = client.get("/api/v1/whoami")
+    if enforce:
+        assert api.status_code == 401
+    else:
+        assert api.json() == {"principal": None}
+        assert "no principal on GET /api/v1/whoami" in caplog.text
+
+
+def test_hosted_still_reads_identity_on_every_path():
+    assert _client().get("/").status_code == 401
+
+
+def test_underscore_spelled_identity_headers_name_no_person():
+    """A client that slips the pair past a proxy in underscore spelling names no
+    one: the middleware reads only the hyphenated names."""
+    underscored = {"X_User_Id": USER_ID, "X_Organization_Id": ORG_ID}
+    assert _personal_client().get("/api/v1/whoami", headers=underscored).status_code == 401
+    res = _personal_client(enforce=False).get("/api/v1/whoami", headers=underscored)
+    assert res.json() == {"principal": None}

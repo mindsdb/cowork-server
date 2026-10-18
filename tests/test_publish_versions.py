@@ -11,6 +11,7 @@ import pytest
 from pydantic import SecretStr
 
 import cowork.services.publish as publish_mod
+from cowork.db.scoped import LOCAL_SCOPE
 
 
 def _make_fullstack(tmp_path: Path) -> Path:
@@ -43,7 +44,7 @@ class _FakeUserSettings:
 
 
 def _patch_scan(container: Path):
-    return patch("cowork.services.artifacts._scan_artifact_dirs", lambda: [container])
+    return patch("cowork.services.artifacts._scan_artifact_dirs", lambda *, scope: [container])
 
 
 def _base_patches(container: Path):
@@ -78,7 +79,7 @@ def test_list_versions_shapes_history_newest_first(tmp_path: Path):
     }
     with _base_patches(tmp_path) as stack:
         stack.enter_context(patch("anton.publisher.list_versions", lambda *a, **k: backend_resp))
-        out = publish_mod.list_versions(str(root))
+        out = publish_mod.list_versions(str(root), scope=LOCAL_SCOPE)
 
     assert out["reportId"] == "r1"
     assert out["currentMd5"] == "m1"
@@ -101,7 +102,7 @@ def test_list_versions_forwards_report_id_and_key(tmp_path: Path):
 
     with _base_patches(tmp_path) as stack:
         stack.enter_context(patch("anton.publisher.list_versions", _spy))
-        publish_mod.list_versions(str(root))
+        publish_mod.list_versions(str(root), scope=LOCAL_SCOPE)
 
     assert seen["report_id"] == "r-xyz"
     assert seen["api_key"] == "test-key"
@@ -111,7 +112,7 @@ def test_list_versions_no_record_raises(tmp_path: Path):
     root = _make_fullstack(tmp_path)  # no .published.json
     with _base_patches(tmp_path):
         with pytest.raises(FileNotFoundError):
-            publish_mod.list_versions(str(root))
+            publish_mod.list_versions(str(root), scope=LOCAL_SCOPE)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +132,7 @@ def test_activate_rewrites_published_json_for_modified_badge(tmp_path: Path):
 
     with _base_patches(tmp_path) as stack:
         stack.enter_context(patch("anton.publisher.activate_version", _activate))
-        out = publish_mod.activate_version(str(root), "m_old")
+        out = publish_mod.activate_version(str(root), "m_old", scope=LOCAL_SCOPE)
 
     assert out["status"] == "ok"
     assert out["currentMd5"] == "m_old"
@@ -156,7 +157,7 @@ def test_activate_forwards_md5_to_publisher(tmp_path: Path):
 
     with _base_patches(tmp_path) as stack:
         stack.enter_context(patch("anton.publisher.activate_version", _activate))
-        publish_mod.activate_version(str(root), "m_target")
+        publish_mod.activate_version(str(root), "m_target", scope=LOCAL_SCOPE)
 
     assert seen == {"report_id": "r1", "md5": "m_target"}
 
@@ -166,7 +167,7 @@ def test_activate_missing_md5_raises_value_error(tmp_path: Path):
     _write_map(root, {"report_id": "r1", "url": "https://x/a/r1", "published": True})
     with _base_patches(tmp_path):
         with pytest.raises(ValueError):
-            publish_mod.activate_version(str(root), "")
+            publish_mod.activate_version(str(root), "", scope=LOCAL_SCOPE)
 
 
 def test_activate_409_fullstack_maps_to_value_error_with_message(tmp_path: Path):
@@ -179,7 +180,7 @@ def test_activate_409_fullstack_maps_to_value_error_with_message(tmp_path: Path)
     with _base_patches(tmp_path) as stack:
         stack.enter_context(patch("anton.publisher.activate_version", _activate))
         with pytest.raises(ValueError) as ei:
-            publish_mod.activate_version(str(root), "m_old")
+            publish_mod.activate_version(str(root), "m_old", scope=LOCAL_SCOPE)
     assert "fullstack" in str(ei.value)
     # .published.json must be untouched when the rollback failed upstream.
     assert "last_md5" not in _read_map(root)
@@ -195,4 +196,4 @@ def test_activate_500_maps_to_runtime_error(tmp_path: Path):
     with _base_patches(tmp_path) as stack:
         stack.enter_context(patch("anton.publisher.activate_version", _activate))
         with pytest.raises(RuntimeError):
-            publish_mod.activate_version(str(root), "m_old")
+            publish_mod.activate_version(str(root), "m_old", scope=LOCAL_SCOPE)

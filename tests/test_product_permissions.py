@@ -133,7 +133,7 @@ async def test_response_denial_precedes_router_harness_and_persistence(
 
 
 async def test_queued_reuse_denial_precedes_redis_even_with_an_existing_key(
-    monkeypatch,
+    monkeypatch, org_deployment,
 ):
     from cowork.turnqueue import producer
 

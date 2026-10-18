@@ -70,3 +70,31 @@ def test_org_mode_fails_loud_on_missing_identity(monkeypatch, org_id, created_by
     get_app_settings.cache_clear()
     with pytest.raises(MissingTenantScopeError):
         _principal_for_schedule(_schedule(org_id, created_by))
+
+
+# ── trusted identity headers (local tenancy, personal partitions) ────────────
+# ORG stands in for the stored partition id: the row's org_id is used as it is.
+
+def test_personal_schedule_runs_as_its_creator(personal_deployment):
+    principal = _principal_for_schedule(_schedule(ORG, USER))
+    assert principal is not None
+    assert (principal.org_id, principal.user_id) == (ORG, USER)
+
+
+@pytest.mark.parametrize(
+    "org_id, created_by",
+    [(None, USER), (ORG, None), (None, None)],
+    ids=["no-org", "no-creator", "neither"],
+)
+def test_personal_schedule_with_no_owner_fails_loud(personal_deployment, org_id, created_by):
+    # A row made before the update has no owner. Running it would act as no
+    # one, so it fails closed and the scheduler turns it off, as in org mode.
+    with pytest.raises(MissingTenantScopeError):
+        _principal_for_schedule(_schedule(org_id, created_by))
+
+
+def test_shared_schedules_stay_unscoped_with_trusted_identity(personal_deployment, monkeypatch):
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "memory")
+    get_app_settings.cache_clear()
+    assert _principal_for_schedule(_schedule(ORG, USER)) is None
+    assert _principal_for_schedule(_schedule(None, None)) is None

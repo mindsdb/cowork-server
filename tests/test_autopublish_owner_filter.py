@@ -18,19 +18,11 @@ from cowork.services import artifact_ownership as ownership
 from cowork.services import artifact_autopublish as ap
 from test_artifact_ownership import make_project, project_root, write_artifact
 
-pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
+pytestmark = pytest.mark.usefixtures("org_deployment", "cleanup_tmp_projects")
 
 
 def _engine():
     return get_engine(get_app_settings().database.uri)
-
-
-@pytest.fixture(autouse=True)
-def org_deployment(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    get_app_settings.cache_clear()
-    yield
-    get_app_settings.cache_clear()
 
 
 async def test_owned_slugs_splits_mine_theirs_and_unknown(tmp_path):

@@ -170,6 +170,112 @@ def cleanup_tmp_projects(tmp_path):
 
 
 @pytest.fixture
+def org_deployment(monkeypatch):
+    """Hosted org tenancy for one test, through the real AppSettings."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+def stub_landlock_kernel(monkeypatch, *, abi: int = 6) -> None:
+    """Answer the code sandbox's kernel checks without a kernel: the ABI probe
+    reports ``abi`` and the launcher's self-test passes. The one seam
+    cowork.code_sandbox leaves for tests, since neither macOS nor every CI
+    kernel has Landlock."""
+    from cowork import code_sandbox
+
+    monkeypatch.setattr(code_sandbox, "_probe_abi", lambda: abi)
+    monkeypatch.setattr(code_sandbox, "_run_self_test", lambda: None)
+
+
+@pytest.fixture
+def landlock_kernel(monkeypatch):
+    """stub_landlock_kernel for one test: a kernel at Landlock ABI 6 whose
+    self-test passes."""
+    stub_landlock_kernel(monkeypatch)
+
+
+@pytest.fixture
+def personal_deployment(monkeypatch):
+    """A local deployment that trusts identity headers, for one test.
+
+    Local tenancy with COWORK_TRUST_IDENTITY_HEADERS and COWORK_REQUIRE_AUTH
+    on, every resource personal (the setting's default), and
+    COWORK_CODE_SANDBOX=landlock, which identity headers require, with its
+    kernel checks stubbed (stub_landlock_kernel). COWORK_AUTH_TOKEN is set,
+    since identity headers take the token from the environment alone. A test
+    that leaves a resource shared sets COWORK_PERSONAL_RESOURCES and clears
+    the settings cache itself.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", "personal-deployment-test-token")
+    monkeypatch.setenv("COWORK_CODE_SANDBOX", "landlock")
+    monkeypatch.delenv("COWORK_PERSONAL_RESOURCES", raising=False)
+    stub_landlock_kernel(monkeypatch)
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def managed_dir(monkeypatch, tmp_path):
+    """An operator's managed folder (COWORK_MANAGED_DIR) for one test.
+
+    ``memory/`` holds one rule and one lesson and an empty profile, as the
+    image bakes them; ``skills/`` and ``data-vault/`` start empty. Turns read
+    it through the installed anton's Cortex and its read-only ``managed_hc``
+    layer. Yields the cowork.managed.ManagedFolder.
+    """
+    from anton.core.memory.hippocampus import Hippocampus
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.managed import ManagedFolder
+    from tests._fakes import MANAGED_LESSON, MANAGED_RULE
+
+    folder = ManagedFolder.at(tmp_path / "managed")
+    for path in (folder.memory_dir, folder.skills_dir, folder.vault_dir):
+        path.mkdir(parents=True)
+    managed_hc = Hippocampus(folder.memory_dir)
+    managed_hc.encode_rule(MANAGED_RULE, kind="always", confidence="high", source="user")
+    managed_hc.encode_lesson(MANAGED_LESSON, topic="data", source="user")
+    (folder.memory_dir / "profile.md").write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("COWORK_MANAGED_DIR", str(folder.root))
+    get_app_settings.cache_clear()
+    yield folder
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def stored_memory_enabled():
+    """Store ``memory_enabled`` for one test as the operator's Settings write
+    does (SettingService), and remove the row afterwards.
+
+    The key is operator-pinned, so the row is the deployment's global one,
+    which every scope resolves ahead of MEMORY_ENABLED. Call the yielded
+    function with ``"true"`` or ``"false"``.
+    """
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    def store(value: str) -> None:
+        with get_open_session() as db:
+            SettingService(db, LOCAL_SCOPE).upsert_setting("memory_enabled", value)
+
+    yield store
+    with get_open_session() as db:
+        SettingService(db, LOCAL_SCOPE).delete_setting("memory_enabled")
+
+
+@pytest.fixture
 def granted_product_permissions(monkeypatch):
     """Model built-in Member grants only for suites testing resource ownership.
 

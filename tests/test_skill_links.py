@@ -87,6 +87,51 @@ def test_reconcile_project_selects_its_directory_from_inventory(
     assert calls == [(discovered / "skills" / "safe-skill", canonical)]
 
 
+class _FakeManaged:
+    def __init__(self, slugs):
+        self._slugs = frozenset(slugs)
+
+    def skill_slugs(self):
+        return self._slugs
+
+
+def test_reconcile_skill_links_removes_a_managed_slugs_store_link(tmp_path: Path, monkeypatch):
+    """A store skill whose slug the managed folder holds must link into no
+    project, and an existing link from before the managed copy is removed:
+    the agent recalls the managed copy, not the store one."""
+    project = tmp_path / "projects" / "general"
+    (project / "skills").mkdir(parents=True)
+    canonical = tmp_path / "canon"
+    (canonical / "forecast-review").mkdir(parents=True)
+    link = project / "skills" / "forecast-review"
+    sl._ensure_symlink(link, canonical / "forecast-review")
+    assert sl._is_dir_link(link)
+
+    monkeypatch.setattr(sl, "_all_projects", lambda: [sl._ProjectDir(name="general", path=project)])
+    monkeypatch.setattr(sl, "_canon_root", lambda: canonical)
+    monkeypatch.setattr(sl, "managed_folder", lambda: _FakeManaged(["forecast-review"]))
+
+    sl.reconcile_skill_links(SimpleNamespace(name="forecast-review", enabled=True, projects=[]))
+
+    assert not link.exists()
+
+
+def test_reconcile_project_skips_a_managed_slug(tmp_path: Path, monkeypatch):
+    discovered = tmp_path / "projects" / "general"
+    canonical = tmp_path / "canon"
+    (canonical / "forecast-review").mkdir(parents=True)
+    discovered.mkdir(parents=True)
+    calls: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(sl, "_project_dirs", lambda: [discovered])
+    monkeypatch.setattr(sl, "_canon_root", lambda: canonical)
+    monkeypatch.setattr(sl, "managed_folder", lambda: _FakeManaged(["forecast-review"]))
+    monkeypatch.setattr(sl, "_ensure_symlink", lambda link, target: calls.append((link, target)))
+
+    sl.reconcile_project(discovered, [SimpleNamespace(name="forecast-review", enabled=True, projects=[])])
+
+    assert calls == []
+
+
 def test_reconcile_all_skips_unlinkable_skill(monkeypatch):
     """A skill whose links can't be reconciled is logged and skipped, so the
     rest still reconcile and boot proceeds — the WinError 1314 regression."""

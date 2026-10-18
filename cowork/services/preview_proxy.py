@@ -27,8 +27,17 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
+from cowork.code_sandbox import backends_off_message, code_sandbox_on
 from cowork.common.http_client import get_proxy_client
-from cowork.services.artifacts import _NO_EXEC_DETAIL, _org_mode, get_preview_mount
+from cowork.db.scoped import TenantScope
+from cowork.services.artifacts import (
+    _NO_EXEC_DETAIL,
+    _SHARED_PROJECT_BACKEND_DETAIL,
+    _backends_cross_people,
+    _org_mode,
+    backend_port_is_the_callers,
+    preview_mount_for,
+)
 from cowork.services.comments_layer import ACTIVATION_PARAM
 from cowork.services.preview_html import prepare_preview_html
 
@@ -108,13 +117,22 @@ def _build_upstream_headers(req: Request, backend_port: int) -> list[tuple[str, 
 
 
 async def proxy_artifact_request(
-    token: str, rel_path: str, request: Request
+    token: str, rel_path: str, request: Request, *, scope: TenantScope | None
 ) -> Response:
     """Forward an iframe request to the artifact's backend.
 
     `rel_path` is the path *after* `/proxy/{token}/`, e.g. an empty
     string for the index page, or `static/foo.js` for a relative asset
     the artifact's HTML loaded. It's joined onto the backend's root.
+
+    The token resolves only inside ``scope``'s own artifacts roots
+    (`preview_mount_for`), as on `/preview-asset`: a token is a stable
+    hash of the artifact's path, so presenting another person's must not
+    forward a request to their live backend, which runs with their
+    connection secrets. For the same reason, where projects are
+    partitioned the port must still be the caller's own live backend's
+    (`backend_port_is_the_callers`); otherwise the answer is 503 and the
+    client mounts the preview again.
     """
     cors = _cors_headers(request)
 
@@ -133,21 +151,33 @@ async def proxy_artifact_request(
     # proxy answers usefully in org mode.
     if _org_mode():
         return PlainTextResponse(_NO_EXEC_DETAIL, status_code=403, headers=cors)
+    # Under the code sandbox no backend can run, so there is nothing to
+    # forward to, and the same chain applies: a static preview's token plus a
+    # `port` the agent writes would reach the server's own loopback port.
+    if code_sandbox_on():
+        return PlainTextResponse(backends_off_message(), status_code=403, headers=cors)
 
     # Short-circuit preflight so artifact backends don't need to
     # implement OPTIONS themselves.
     if request.method == "OPTIONS":
         return Response(status_code=204, headers=cors)
 
-    artifact_dir = get_preview_mount(token)
+    artifact_dir = preview_mount_for(token, scope=scope)
     if artifact_dir is None:
         return PlainTextResponse(
             "Preview mount has expired or is unknown",
             status_code=404,
             headers=cors,
         )
+    # A static preview's token still reaches here, and the agent can write a
+    # `port` into the shared metadata.json. Where one backend would serve
+    # several people's connections, forward to none (as mount_preview does).
+    if _backends_cross_people():
+        return PlainTextResponse(_SHARED_PROJECT_BACKEND_DETAIL, status_code=409, headers=cors)
     backend_port = _read_backend_port(artifact_dir)
-    if backend_port is None:
+    if backend_port is None or not backend_port_is_the_callers(
+        artifact_dir, port=backend_port, scope=scope
+    ):
         return PlainTextResponse(
             "Artifact backend is not running yet",
             status_code=503,

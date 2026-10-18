@@ -15,6 +15,8 @@ import time
 import uuid
 from datetime import datetime
 
+from pydantic import BaseModel, ConfigDict
+
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import (
     RESET_AT_CODES,
@@ -23,8 +25,9 @@ from cowork.handlers.turn_errors import (
     remote_turn_error,
 )
 from cowork.services.providers import minds_chat_base_url
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import scope_for_identity
 from cowork.services import product_permissions
+from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     list_active_connections,
@@ -36,7 +39,7 @@ from cowork.turnqueue.auth_keys import (
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
-from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,20 @@ logger = logging.getLogger(__name__)
 # controller-added fields.
 _MAX_REQUEST_BYTES = 10 * 1024 * 1024
 _REQUEST_BYTES_MARGIN = 64 * 1024
+# The project a turn runs in when its conversation's project could not be
+# read: the org's default one.
+_DEFAULT_WORKSPACE_PATH = "projects/general"
+
+
+class RemoteWorkspace(BaseModel):
+    """The project a remote turn runs in: its id, which travels on the job,
+    and its path relative to the org root, which the pod joins to its own
+    mount (ResponsesHandler._remote_workspace)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    project_id: str
+    workspace_rel_path: str
 
 
 def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> dict[str, str]:
@@ -227,6 +244,21 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     }
 
 
+def _connectors_block(oauth_connections: dict | None) -> dict | None:
+    """The turn's `connectors` block: {engine: {"usage_notes": ...}} for the
+    engines of this turn's connections whose spec declares usage notes. None
+    when there is nothing to send; the key is then left out of params, like
+    `oauth`.
+
+    Built from the same, already disabled-filtered, connection list as the
+    `oauth` block: anton renders notes only for engines its vault connects,
+    and on web that vault is built from `oauth` alone.
+    """
+    connections = (oauth_connections or {}).get("connections") or []
+    notes = registry.usage_notes_for(dict.fromkeys(c.get("engine") for c in connections))
+    return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
+
+
 def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
     """Name the failed check for the operator, who otherwise sees the same
     permission_unavailable for an outage, a malformed row and a bad binding.
@@ -395,6 +427,7 @@ def step_stream_events(data: dict) -> list:
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
         ToolCall,
     )
     from anton.core.interaction.elicit import AskAnswer, AskOption, AskRequest
@@ -468,6 +501,9 @@ def step_stream_events(data: dict) -> list:
             values=tuple(v for v in data.get("values") or [] if isinstance(v, str)),
             text=str(data.get("text") or ""),
         ))]
+    if step == "turn_ended":
+        ended_by = data.get("ended_by")
+        return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
@@ -479,9 +515,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
                                 memory: dict | None = None,
-                                project_id: str | None = None,
-                                workspace_rel_path: str = "projects/general",
+                                workspace: RemoteWorkspace | None = None,
                                 correlation_id: str | None = None,
+                                run_id: str | None = None,
                                 llm: dict | None = None,
                                 turn_key_id: str | None = None,
                                 disabled: list[dict] | None = None,
@@ -498,9 +534,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
-    user (the cowork UI does; channel turns never)."""
+    user (the cowork UI does; channel turns never).
+    `workspace` is the project the turn runs in; None runs it in the org's
+    default project with no project on the job."""
     settings = TurnQueueSettings()
-    scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
+    scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
     workspace_mode = (
         "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage") else "ephemeral"
@@ -509,7 +547,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line,
     # and its cause would turn this turn's own Stop into a stall.
-    await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
+    # A registry-owned run is already cancellable. Clearing its flag here
+    # would erase a disconnect that arrived while dispatch prepared the job.
+    if run_id is None:
+        await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
     reply_stream = reply_stream_key(conversation_id)
 
     # No client-picked model → the deployment's resolved default (org mode: the
@@ -517,7 +558,6 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # a valid minds alias, independent of any harness's built-in default.
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
-        scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
         model = get_user_settings(scope).resolved_planning_model
 
     # Independent network round trips (llm's turn-key mint, oauth's active-
@@ -573,6 +613,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # second one. Org/cloud mode only: local-mode turns build in-process
     # and never reach this function at all.
     oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
+    connectors_block = _connectors_block(oauth_connections)
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
@@ -589,6 +630,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         if isinstance(project_memory, dict) and project_memory
         else None
     )
+    workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -602,6 +644,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),
+              # Agent-facing usage notes for this turn's connected engines; absent
+              # entirely when none has notes.
+              **({"connectors": connectors_block} if connectors_block else {}),
               **({"datasource": datasource_block} if datasource_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
@@ -625,7 +670,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         reply_stream=reply_stream,
         organization_id=org_id,
         user_id=user_id,
-        project_id=project_id,
+        project_id=workspace.project_id if workspace is not None else None,
         params=params,
     )
     # Read replies from after the reply stream's newest entry as it is now,
@@ -643,10 +688,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator
     # does not own the buffer; _shared_turn covers the gap between the two.
-    await record_turn(
-        conversation_id, turn_id=turn_id, correlation_id=corr,
-        org_id=org_id, user_id=user_id, client=r,
-    )
+    if run_id is None:
+        await record_turn(
+            conversation_id, turn_id=turn_id, correlation_id=corr,
+            org_id=org_id, user_id=user_id, client=r,
+        )
 
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds

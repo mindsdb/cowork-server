@@ -18,6 +18,7 @@ from cowork.common.settings.app_settings import (
     _env_file_chain,
     get_app_settings,
 )
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
 
@@ -266,6 +267,7 @@ import cowork.harnesses.memory.migration as memory_migration
 import cowork.services.publish as publish
 from cowork.coding.service import get_coding_service
 from cowork.common.paths import cowork_home
+from cowork.db.scoped import LOCAL_SCOPE
 
 paths = {
     # model_config, not _env_file_chain(): this is the value pydantic-settings
@@ -277,7 +279,7 @@ paths = {
     "migrations_env": [str(migrations._ENV_PATH)],
     "settings_endpoint_env": [str(settings_api._ENV_PATH)],
     "memory_sources": [str(p) for p, _ in memory_migration._MIGRATION_SOURCES],
-    "publish_state": [str(publish._state_path())],
+    "publish_state": [str(publish._state_path(scope=LOCAL_SCOPE))],
     "coding_root": [str(get_coding_service().root)],
     "home": [str(cowork_home())],
 }
@@ -410,6 +412,19 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
             "_probe_tmp_dir",
             "pod_local_only(cowork_home() / 'tmp', 'tmp')",
         ),
+        # The code sandbox runs only with COWORK_CODE_SANDBOX=landlock, on a
+        # self-hosted Linux stack, never on the desktop that switches
+        # organizations. Its stores are keyed per person by scoped_storage_root.
+        ("cowork/code_sandbox.py", "shared_files_dir", "cowork_home() / 'shared-files'"),
+        (
+            "cowork/code_sandbox.py",
+            "_sandbox_root",
+            "scoped_storage_root(cowork_home() / 'sandbox', scope, store='sandbox')",
+        ),
+        ("cowork/code_sandbox.py", "_forbidden_roots.roots", "cowork_home()"),
+        ("cowork/code_sandbox.py", "_trusted_roots", "cowork_home()"),
+        ("cowork/code_sandbox.py", "_run_self_test.scratch", "cowork_home() / 'tmp'"),
+        ("cowork/code_sandbox.py", "_refuse_linked_cowork_home_entries.entry", "cowork_home() / name"),
         # These are read-only sources for a one-time legacy import.
         *(
             ("cowork/harnesses/memory/migration.py", "_MIGRATION_SOURCES", f"cowork_home() / '{path}'")
@@ -621,7 +636,7 @@ def test_publish_state_dir_is_overridable_per_organization(monkeypatch, tmp_path
     monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("ANTON_COWORK_STATE_DIR", str(tmp_path / "orgs" / "org-b"))
 
-    assert publish._cowork_state_dir() == tmp_path / "orgs" / "org-b"
+    assert publish._cowork_state_dir(scope=LOCAL_SCOPE) == tmp_path / "orgs" / "org-b"
 
 
 def test_every_per_organization_override_is_a_real_knob(monkeypatch, tmp_path):
@@ -642,7 +657,7 @@ def test_every_per_organization_override_is_a_real_knob(monkeypatch, tmp_path):
         "AntonHarnessSettings.skills_root_dir": lambda: AntonHarnessSettings(
             _env_file=None
         ).skills_root_dir,
-        "_cowork_state_dir.path": publish._cowork_state_dir,
+        "_cowork_state_dir.path": lambda: publish._cowork_state_dir(scope=LOCAL_SCOPE),
     }
     owners = {
         callsite.split(":", 1)[1].split("[", 1)[0]

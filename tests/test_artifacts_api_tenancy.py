@@ -808,7 +808,7 @@ async def test_desktop_project_path_narrows_to_that_project(
 
     monkeypatch.setattr(
         ep, "artifacts_sources_for_scan",
-        lambda: [
+        lambda *, scope: [
             ep_artifacts.ProjectArtifacts(
                 base=p / ".anton" / "artifacts", project_id=None, project_name=p.name,
             )
@@ -829,7 +829,7 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
     _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="dash")
     monkeypatch.setattr(
         ep, "artifacts_sources_for_scan",
-        lambda: [
+        lambda *, scope: [
             ep_artifacts.ProjectArtifacts(
                 base=(tmp_path / "local" / "mine") / ".anton" / "artifacts",
                 project_id=None, project_name="mine",

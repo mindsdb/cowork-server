@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import JSONResponse
 
+from anton.core.interaction.elicit import AskOption, AskRequest
 from cowork.api.v1.endpoints import responses as responses_ep
 from cowork.api.v1.endpoints.responses import (
     _authorized_handle,
@@ -28,6 +29,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
+from cowork.streaming.answers import broker
 from cowork.streaming.registry import TurnLifecycle, registry
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
@@ -247,3 +249,113 @@ def test_local_mode_sees_everything(client):
     ids = {r["conversation_id"] for r in client.get("/api/v1/responses/in-flight-list").json()["in_flight"]}
     assert ids == {CID_A, CID_B}
     assert client.get("/api/v1/responses/tail", params={"conversation_id": CID_A}).status_code == 200
+
+
+# ── personal partitions (local tenancy with trusted identity headers) ──────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _personal_scope(
+    *, org_id: str | None, user_id: str | None, resources=None
+) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=org_id,
+        user_id=user_id,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def test_personal_scope_hides_and_refuses_another_persons_turn(client):
+    # Two people, each in their own partition: B cannot list, probe, tail,
+    # cancel or answer A's running answer, and A's turn keeps running.
+    handle_a = _register(CID_A, PARTITION_A, user_id="alice")
+    client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob"))
+
+    listed = client.get("/api/v1/responses/in-flight-list").json()["in_flight"]
+    assert listed == []
+    probe = client.get("/api/v1/responses/in-flight", params={"conversation_id": CID_A}).json()
+    assert probe["in_flight"] is False and probe["has_buffer"] is False
+    assert client.get("/api/v1/responses/tail", params={"conversation_id": CID_A}).status_code == 404
+    resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
+    assert resp.status_code == 404
+    answer = client.post(
+        "/api/v1/responses/answer",
+        json={"conversation_id": CID_A, "question_id": "q1", "text": "yes"},
+    )
+    assert answer.status_code == 404
+    assert handle_a.cancelled is False
+
+    client.set_scope(_personal_scope(org_id=PARTITION_A, user_id="alice"))
+    ids = {r["conversation_id"] for r in client.get("/api/v1/responses/in-flight-list").json()["in_flight"]}
+    assert ids == {CID_A}
+    resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
+    assert resp.status_code == 200 and resp.json()["cancelled"] is True
+
+
+ASKED = AskRequest(prompt="Which database?", options=(AskOption(value="pg", label="postgres"),))
+
+
+async def test_only_the_asker_answers_a_question_her_running_answer_asked(client):
+    # A real pending question: a missing one also answers 404, so B's 404
+    # proves the owner check only when A's own answer then lands.
+    _register(CID_A, PARTITION_A, user_id="alice")
+    broker.open(CID_A, "ask:1", ASKED)
+    try:
+        body = {"conversation_id": CID_A, "question_id": "ask:1", "values": ["pg"]}
+        client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob"))
+        his = client.post("/api/v1/responses/answer", json=body)
+        assert (his.status_code, his.json()) == (404, {"status": "not_found"})
+        assert not broker._pending[(CID_A, "ask:1")].future.done()
+
+        client.set_scope(_personal_scope(org_id=PARTITION_A, user_id="alice"))
+        hers = client.post("/api/v1/responses/answer", json=body)
+        assert (hers.status_code, hers.json()) == (200, {"accepted": True})
+    finally:
+        broker.reset()
+
+
+async def test_with_shared_conversations_anyone_answers_a_running_answers_question(client):
+    _register(CID_A, PARTITION_A, user_id="alice")
+    broker.open(CID_A, "ask:1", ASKED)
+    try:
+        client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob", resources=frozenset()))
+        his = client.post(
+            "/api/v1/responses/answer",
+            json={"conversation_id": CID_A, "question_id": "ask:1", "values": ["pg"]},
+        )
+        assert (his.status_code, his.json()) == (200, {"accepted": True})
+    finally:
+        broker.reset()
+
+
+def test_operator_view_sees_every_persons_turn(client):
+    # The operator view of a trusted-identity deployment is LOCAL_SCOPE: it
+    # lists and reaches every person's running answer.
+    _register(CID_A, PARTITION_A, user_id="alice")
+    _register(CID_B, PARTITION_B, user_id="bob")
+    client.set_scope(LOCAL_SCOPE)
+    ids = {r["conversation_id"] for r in client.get("/api/v1/responses/in-flight-list").json()["in_flight"]}
+    assert ids == {CID_A, CID_B}
+
+
+def test_personal_scope_with_shared_conversations_keeps_todays_behavior(client):
+    # Conversations left off the personal list stay shared: every person sees
+    # and can stop every running answer, as on today's shared stack.
+    handle_a = _register(CID_A, PARTITION_A, user_id="alice")
+    client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob", resources=frozenset()))
+    ids = {r["conversation_id"] for r in client.get("/api/v1/responses/in-flight-list").json()["in_flight"]}
+    assert ids == {CID_A}
+    resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
+    assert resp.status_code == 200 and handle_a.cancelled is True
+
+
+def test_personal_scope_without_partition_fails_closed():
+    with pytest.raises(MissingTenantScopeError):
+        _require_streaming_scope(_personal_scope(org_id=None, user_id="alice"))
+    # Shared conversations have nothing to key, so nothing to refuse.
+    _require_streaming_scope(_personal_scope(org_id=None, user_id="alice", resources=frozenset()))

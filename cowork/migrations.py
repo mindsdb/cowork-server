@@ -38,6 +38,7 @@ from cowork.common.settings.user_settings import (
     UserSettings,
     normalize_provider_value,
 )
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
@@ -255,7 +256,9 @@ def seed_builtin_skills(session: Session) -> bool:
     if current >= BUILTIN_SKILLS_VERSION:
         return False
 
-    store = SkillService()
+    # The base store, named explicitly: a deployment that trusts identity
+    # headers refuses a store with no scope.
+    store = SkillService(LOCAL_SCOPE)
     copied = store._copy_builtin_skills()
 
     if copied:
@@ -284,7 +287,8 @@ def migrate_skills_to_files(session: Session) -> bool:
     if svc._fetch_row(SKILL_MIGRATION_SENTINEL) is not None:
         return False
 
-    store = SkillService()
+    # The base store, named explicitly, as in seed_builtin_skills.
+    store = SkillService(LOCAL_SCOPE)
     rows = list(session.exec(select(SkillLegacy)).all())
 
     def _unique_slug(svc: SkillService, base: str, taken: set[str]) -> str:

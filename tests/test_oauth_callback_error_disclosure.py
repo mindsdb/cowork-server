@@ -9,6 +9,7 @@ page shown to the user stays generic.
 from typing import Any
 
 from cowork.common.settings.app_settings import OAuthSettings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.connectors.oauth.google import OAuthService
 
 
@@ -52,7 +53,7 @@ def test_callback_exception_detail_is_not_disclosed_to_the_user(monkeypatch):
 
     monkeypatch.setattr(svc, "_exchange_code", _boom)
 
-    html = svc.callback("gmail", code="auth-code", state="s-123", error="", settings=OAuthSettings())
+    html = svc.callback("gmail", code="auth-code", state="s-123", error="", settings=OAuthSettings(), scope=LOCAL_SCOPE)
 
     # The browser page is generic — no exception text.
     assert secret not in html

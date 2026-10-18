@@ -38,6 +38,9 @@ O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 # LF into CRLF. The built-in ``open()`` always sets it; raw descriptors get it
 # from ``open_fd`` (ENG-2950). 0 on POSIX, where there is no text mode.
 O_BINARY = getattr(os, "O_BINARY", 0)
+# ``O_NONBLOCK`` is POSIX-only too. An open with it never waits on a FIFO at
+# the path; Windows has no FIFOs a path can name, so 0 there loses nothing.
+O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 def cowork_home() -> Path:
@@ -374,6 +377,30 @@ def opened_subdir_nofollow(
         yield PinnedDir(fd, base.joinpath(*names))
     finally:
         os.close(fd)
+
+
+def makedirs_below_nofollow(base: Path, *, target: Path) -> None:
+    """``target.mkdir(parents=True, exist_ok=True)``, refusing a symlink below
+    *base*.
+
+    For folders the server creates inside a folder the agent's code can
+    write, such as a project's ``skills/`` and ``.anton/artifacts/``: every
+    component from *base* down to *target* is created and opened with
+    ``O_NOFOLLOW`` (``opened_subdir_nofollow``), so a planted link raises
+    ``OSError`` instead of sending the server's mkdir elsewhere. *base* itself
+    is trusted and created normally. A *target* outside *base* is created the
+    plain way.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        parts = target.relative_to(base).parts
+    except ValueError:
+        parts = ("..",)
+    if ".." in parts:
+        target.mkdir(parents=True, exist_ok=True)
+        return
+    with opened_subdir_nofollow(base, *parts, create=True):
+        pass
 
 
 def safe_join(base: Path | str, *parts: str) -> Path:

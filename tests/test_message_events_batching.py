@@ -8,18 +8,23 @@ per-message query relied on.
 The reads a turn makes at its start (the row count, the gate's tail and the
 harness's replay history) are bounded in SQL rather than in Python. The tests
 after the batching ones pin that each returns what the unbounded read did.
+The last ones pin the read of the earlier answers whose figures a turn's
+figures are checked against.
 """
 from __future__ import annotations
 
+import asyncio
 import json
-from uuid import UUID
+import logging
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import event
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.units import DatabaseBusy
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import (
     SCRATCHPAD_REPLAY_ROLES,
     extract_scratchpad_cells,
@@ -30,6 +35,8 @@ from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
 from cowork.services.conversations import ConversationService
+
+from _fakes import inline_run_db
 
 
 @pytest.fixture
@@ -473,3 +480,276 @@ def test_merged_deltas_rebuild_the_same_scratchpad_cells(session, conversation):
 
     assert extract_scratchpad_cells(history.events) == extract_scratchpad_cells(events)
     assert [c.code for c in extract_scratchpad_cells(history.events)] == ["second"]
+
+
+# --- the earlier answers a turn checks its figures against --------------------
+
+ORG_A = "11111111-1111-1111-1111-111111111111"
+ORG_B = "22222222-2222-2222-2222-222222222222"
+USER_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+# A second member of ORG_A: same tenant, different person.
+USER_A2 = "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2"
+
+
+def _figure(text: str, origin: str = "step") -> dict:
+    return {"start": 0, "end": len(text), "text": text, "origin": origin, "sources": []}
+
+
+def _figure_sources_event(*texts: str) -> dict:
+    """A response.figure_sources event as the formatter saves it."""
+    return {
+        "type": "response.figure_sources", "sequence_number": 3, "item_id": "msg-1", "project_id": None,
+        "steps": [], "figures": [_figure(text) for text in texts],
+    }
+
+
+def _save_turn(service: ConversationService, conversation, *, answer: str, events: list[dict]) -> None:
+    """A question and its answer saved as a turn is, with the answer's tool
+    rows ahead of it."""
+    service.save_user_message(conversation.id, "q")
+    service.save_assistant_turn(
+        conversation.id, answer, [_text_delta(answer, 1), *events, {"type": "response.completed"}],
+        harness="anton",
+        tool_rows=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "scratchpad", "input": {}},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "4600"}]},
+        ],
+    )
+
+
+def _texts(answers) -> list[list[str]]:
+    return [[figure.text for figure in answer.figures] for answer in answers]
+
+
+def test_earlier_answers_come_from_the_last_answers_only(session, conversation):
+    """The third answer has no figures and still takes one of the places; the
+    tool rows saved ahead of each answer take none."""
+    service = ConversationService(session)
+    _save_turn(service, conversation, answer="one", events=[_figure_sources_event("100")])
+    _save_turn(service, conversation, answer="two", events=[_figure_sources_event("200")])
+    _save_turn(service, conversation, answer="three", events=[])
+    _save_turn(service, conversation, answer="four", events=[_figure_sources_event("400")])
+
+    answers = service.get_earlier_answers(conversation.id, answers=3)
+
+    assert _texts(answers) == [["400"], ["200"]]
+
+
+def test_earlier_answers_skip_other_conversations(session, conversation):
+    other = Conversation(project_id=conversation.project_id, topic="other")
+    session.add(other)
+    session.commit()
+    session.refresh(other)
+    service = ConversationService(session)
+    _save_turn(service, other, answer="theirs", events=[_figure_sources_event("900")])
+    _save_turn(service, conversation, answer="mine", events=[_figure_sources_event("100")])
+
+    assert _texts(service.get_earlier_answers(conversation.id, answers=20)) == [["100"]]
+
+
+def test_earlier_answers_skip_a_pending_row(session, conversation):
+    _add_message(
+        session, conversation, role=Role.assistant, content="in flight", seq=0, pending=True,
+        events=[_figure_sources_event("900")],
+    )
+    _add_message(
+        session, conversation, role=Role.assistant, content="saved", seq=1, events=[_figure_sources_event("100")],
+    )
+
+    assert _texts(ConversationService(session).get_earlier_answers(conversation.id, answers=20)) == [["100"]]
+
+
+def test_a_malformed_figure_sources_event_is_skipped_not_raised(session, conversation, caplog):
+    service = ConversationService(session)
+    _save_turn(service, conversation, answer="one", events=[_figure_sources_event("100")])
+    _save_turn(
+        service, conversation, answer="two",
+        events=[{"type": "response.figure_sources", "figures": [{"text": 5, "origin": "sideways"}]}],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.conversations"):
+        answers = service.get_earlier_answers(conversation.id, answers=20)
+
+    assert _texts(answers) == [["100"]]
+    assert [r.levelname for r in caplog.records if r.name == "cowork.services.conversations"] == ["WARNING"]
+
+
+@pytest.mark.parametrize("kind", ["memory", "unknown_kind"], ids=["removed", "newer"])
+def test_an_answer_whose_step_kind_this_build_lacks_still_gives_its_figures(session, conversation, caplog, kind):
+    """A saved step can carry a kind this build no longer has (memory, which
+    earlier builds wrote) or does not have yet (a newer release's, read after
+    a rollback). The read uses only the figures, so such a step does not
+    skip the answer."""
+    service = ConversationService(session)
+    event = _figure_sources_event("4,600")
+    event["steps"] = [{"tool_use_id": "toolu_1", "kind": kind, "label": "notes.md"}]
+    event["figures"][0]["sources"] = [{"tool_use_id": "toolu_1"}]
+    _save_turn(service, conversation, answer="4,600", events=[event])
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.conversations"):
+        answers = service.get_earlier_answers(conversation.id, answers=20)
+
+    assert _texts(answers) == [["4,600"]]
+    assert [r for r in caplog.records if r.name == "cowork.services.conversations"] == []
+
+
+def test_a_text_delta_whose_whole_text_is_the_event_type_is_not_read(session, conversation):
+    """The SQL filter finds the type, quotes and all, in a text delta that
+    holds nothing else, and such a row reads as an event with no figures."""
+    _add_message(
+        session, conversation, role=Role.assistant, content="response.figure_sources", seq=0,
+        events=[{"type": "response.output_text.delta", "delta": "response.figure_sources"}],
+    )
+
+    assert ConversationService(session).get_earlier_answers(conversation.id, answers=20) == []
+
+
+def test_a_text_delta_quoting_the_event_type_is_not_read(session, conversation):
+    _add_message(
+        session, conversation, role=Role.assistant, content="x", seq=0,
+        events=[{"type": "response.output_text.delta", "delta": 'the "response.figure_sources" event'}],
+    )
+
+    assert ConversationService(session).get_earlier_answers(conversation.id, answers=20) == []
+
+
+@pytest.mark.parametrize(
+    "stray", ["response.figure_sources", ["response.figure_sources"]], ids=["string", "list"],
+)
+def test_an_event_that_is_not_an_object_is_skipped_beside_the_ones_that_read(session, conversation, stray):
+    """A stored event can be a string or a list, and its text holds the type
+    the SQL filter finds. Such a row is skipped, so it can't fail the read
+    and lose the conversation's other answers."""
+    _add_message(
+        session, conversation, role=Role.assistant, content="one", seq=0, events=[_figure_sources_event("100")],
+    )
+    _add_message(
+        session, conversation, role=Role.assistant, content="two", seq=1,
+        events=[stray, _figure_sources_event("200")],
+    )
+
+    answers = ConversationService(session).get_earlier_answers(conversation.id, answers=20)
+
+    assert _texts(answers) == [["200"], ["100"]]
+
+
+def test_earlier_answers_filter_parses_no_json_in_sql(session, conversation):
+    """The type is found in each event's stored text, for the reason
+    _replay_events gives, with the _ in it escaped so it matches only
+    itself."""
+    stmt = ConversationService(session)._earlier_answer_events(conversation.id, answers=20)
+
+    for dialect in (postgresql.dialect(), sqlite.dialect()):
+        compiled = stmt.compile(dialect=dialect)
+        sql = str(compiled)
+        assert "->" not in sql and "JSON" not in sql.upper(), sql
+        assert "CAST(message_events.event_data AS TEXT) LIKE" in sql, sql
+        assert "ESCAPE '/'" in sql, sql
+        assert '"response.figure/_sources"' in compiled.params.values(), compiled.params
+
+
+async def test_the_read_covers_the_last_20_answers(session, conversation, monkeypatch):
+    import cowork.services.conversations as conversations_mod
+
+    service = ConversationService(session)
+    for number in range(21):
+        _save_turn(service, conversation, answer=f"answer {number}", events=[_figure_sources_event(str(number))])
+    monkeypatch.setattr(conversations_mod, "run_db", inline_run_db(session))
+
+    answers = await conversations_mod.read_earlier_answers(conversation_id=conversation.id, scope=LOCAL_SCOPE)
+
+    assert conversations_mod.MAX_EARLIER_ANSWERS == 20
+    assert _texts(answers) == [[str(number)] for number in range(20, 0, -1)]
+
+
+@pytest.mark.parametrize("error", [DatabaseBusy("no connection"), ValueError("Conversation not found")])
+async def test_read_earlier_answers_gives_none_and_warns_when_the_read_fails(monkeypatch, caplog, error):
+    import cowork.services.conversations as conversations_mod
+
+    async def failing(fn, *, scope):
+        raise error
+
+    monkeypatch.setattr(conversations_mod, "run_db", failing)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.conversations"):
+        answers = await conversations_mod.read_earlier_answers(conversation_id=uuid4(), scope=LOCAL_SCOPE)
+
+    assert answers == ()
+    assert [r.levelname for r in caplog.records if r.name == "cowork.services.conversations"] == ["WARNING"]
+
+
+async def test_a_cancel_during_the_read_reaches_the_turn(monkeypatch):
+    """A failed read finds no earlier answers, but a cancel is not a failure:
+    it reaches the turn that awaits the read, so a stopped turn stops."""
+    import cowork.services.conversations as conversations_mod
+
+    async def cancelled(fn, *, scope):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(conversations_mod, "run_db", cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await conversations_mod.read_earlier_answers(conversation_id=uuid4(), scope=LOCAL_SCOPE)
+
+
+@pytest.mark.parametrize(
+    ("org_id", "owner"), [(ORG_A, USER_A2), (ORG_B, USER_A)], ids=["another-member", "another-org"],
+)
+async def test_a_conversation_the_reader_does_not_own_gives_no_earlier_answers(engine, monkeypatch, org_id, owner):
+    """In org mode a conversation is its owner's: another member of the same
+    org, or anyone in another org, reads none of its answers."""
+    import cowork.services.conversations as conversations_mod
+
+    with Session(engine) as raw:
+        writer = ScopedSession(raw, LOCAL_SCOPE)
+        project = Project(name="P", path="/tmp/p", org_id=org_id)
+        writer.add(project)
+        writer.commit()
+        writer.refresh(project)
+        theirs = Conversation(project_id=project.id, topic="theirs", org_id=org_id, created_by=owner)
+        writer.add(theirs)
+        writer.commit()
+        writer.refresh(theirs)
+        _add_message(writer, theirs, role=Role.assistant, content="a", seq=0, events=[_figure_sources_event("100")])
+        conversation_id = theirs.id
+
+    reader_scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+    with Session(engine) as raw:
+        reader = ScopedSession(raw, reader_scope)
+        with pytest.raises(ValueError):
+            ConversationService(reader).get_earlier_answers(conversation_id, answers=20)
+        monkeypatch.setattr(conversations_mod, "run_db", inline_run_db(reader))
+
+        answers = await conversations_mod.read_earlier_answers(conversation_id=conversation_id, scope=reader_scope)
+
+    assert answers == ()
+
+
+async def test_the_owner_reads_their_own_conversations_earlier_answers(engine, monkeypatch):
+    """The same org-mode read gives the owner their answers, so the refusals
+    above are the owner rule's and not a read that never works."""
+    import cowork.services.conversations as conversations_mod
+
+    reader_scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+    with Session(engine) as raw:
+        writer = ScopedSession(raw, LOCAL_SCOPE)
+        project = Project(name="P", path="/tmp/p", org_id=ORG_A)
+        writer.add(project)
+        writer.commit()
+        writer.refresh(project)
+        mine = Conversation(project_id=project.id, topic="mine", org_id=ORG_A, created_by=USER_A)
+        writer.add(mine)
+        writer.commit()
+        writer.refresh(mine)
+        _add_message(writer, mine, role=Role.assistant, content="a", seq=0, events=[_figure_sources_event("100")])
+        conversation_id = mine.id
+
+    with Session(engine) as raw:
+        reader = ScopedSession(raw, reader_scope)
+        monkeypatch.setattr(conversations_mod, "run_db", inline_run_db(reader))
+
+        answers = await conversations_mod.read_earlier_answers(conversation_id=conversation_id, scope=reader_scope)
+
+    assert _texts(answers) == [["100"]]

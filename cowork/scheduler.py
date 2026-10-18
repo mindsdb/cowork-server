@@ -166,8 +166,9 @@ def _handle_missed_runs(session) -> None:
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:
     """Service principal for a scheduled run, derived from the schedule row.
 
-    Delegates to `service_principal_for` from the scoped module, which handles
-    the org vs. local mode logic. The custom error message below wraps it with
+    Delegates to `service_principal_for` from the scoped module, which decides
+    whether schedules are partitioned (org mode, or personal schedules on a
+    trusted-identity deployment). The custom error message below wraps it with
     schedule-specific context.
     """
     from cowork.db.scoped import service_principal_for
@@ -177,7 +178,7 @@ def _principal_for_schedule(schedule: Schedule) -> Principal | None:
     except MissingTenantScopeError:
         raise MissingTenantScopeError(
             f"schedule {schedule.id} is missing org_id/created_by; "
-            "cannot resolve a service principal to run it in org mode"
+            "cannot resolve a service principal to run it as its creator"
         )
 
 

@@ -8,6 +8,7 @@ from cowork.db.scoped import ScopedSession
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
+from cowork.services.conversations import read_earlier_answers
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
@@ -36,8 +37,8 @@ async def remote_turn_events(
     """Yields the same stream format_responses_stream renders for local turns.
     Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
-    from cowork.handlers._turn_history import sanitize_turn_history_rows
-    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated
+    from cowork.handlers._turn_history import remote_turn_history
+    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
     from cowork.services.task_objects import (
         index_turn_artifacts,
         publish_and_card_turn_artifacts,
@@ -49,6 +50,16 @@ async def remote_turn_events(
     # a web turn; the seed history below is scrubbed against them.
     await register_vault_secrets(session.scope)
     seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
+    workspace = ResponsesHandler._remote_workspace(session, conv_id)
+    yield TurnContext(
+        question=input_text,
+        files=ResponsesHandler._remote_agent_files(session, conv_id, workspace=workspace),
+        history=seeded_history,
+        # In a unit of its own, never on the channel's shared session: a
+        # failed statement would abort the transaction its later reads and
+        # the answer's save run in.
+        earlier_answers=await read_earlier_answers(conversation_id=conv_id, scope=session.scope),
+    )
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
         snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
@@ -59,6 +70,10 @@ async def remote_turn_events(
     artifact_writes_allowed = False
     # Set only on turn_completed; see `turn_created_slugs(accept_unattributed=)`.
     completed_cleanly = False
+    # Whether the pod compacted or hard-truncated the turn's context: its
+    # compacted step comes for both, its compaction reply for a summary. Both
+    # arrive before the history frame.
+    compacted = False
 
     try:
         async for kind, data in stream_remote_replies(
@@ -69,7 +84,7 @@ async def remote_turn_events(
             model=model,
             turn_id=turn_id,
             history=seeded_history,
-            **ResponsesHandler._remote_workspace(session, conv_id),
+            workspace=workspace,
             started_at=ResponsesHandler._remote_started_at(session, conv_id),
             correlation_id=correlation_id,
             llm=llm,
@@ -79,13 +94,19 @@ async def remote_turn_events(
             elif kind == "turn_delta":
                 yield StreamTextDelta(text=data.get("text", ""))
             elif kind == "turn_step":
+                if data.get("step") == "compacted":
+                    compacted = True
                 for event in step_stream_events(data):
                     yield event
             elif kind == "turn_memory":
                 ResponsesHandler._persist_turn_memory(session, conv_id, data.get("entries") or [])
             elif kind == "turn_history":
-                turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
+                history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)
+                turn_rows[:] = [] if history is None else history.rows
+                if history is not None:
+                    yield history
             elif kind == "turn_compaction":
+                compacted = True
                 ResponsesHandler._persist_remote_compaction(
                     session, conv_id=conv_id, data=data, seed_info=seed_info,
                 )

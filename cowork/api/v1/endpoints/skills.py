@@ -2,11 +2,12 @@ import logging
 from contextlib import ExitStack, nullcontext
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import Authenticated, AuthenticatedInOrgMode, require
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
     ScopedSessionDep,
@@ -21,6 +22,7 @@ from cowork.schemas.skills import (
     SkillCreateRequest,
     SkillListResponse,
     SkillResponse,
+    SkillSharingRequest,
     SkillUpdateRequest,
 )
 from cowork.schemas.shared_resources import SkillCapabilities
@@ -31,7 +33,12 @@ from cowork.services.shared_resources import (
     SharedResourceAccess,
 )
 from cowork.services.skills import (
+    SharedSkillsBusyError,
+    SkillAlreadyExistsError,
+    SkillOrigin,
     SkillService,
+    SkillSharingError,
+    VisibleSkill,
     builtin_skill_refusal,
     is_builtin_skill,
 )
@@ -65,24 +72,52 @@ def _require_known_projects(scoped: ScopedSessionDep, project_names: list[str]) 
         )
 
 
-def _skill_response(skill: Skill, access: SharedResourceAccess) -> dict:
-    if access.org_mode and access.has_trusted_actor:
-        service = SkillService(access.session.scope)
-        with access.coordination_lock(SKILL_PROJECT_REFERENCES, "all"):
-            with access.coordination_lock(SKILL, skill.name):
-                access.recover_stale_claim(
-                    SKILL,
-                    skill.name,
-                    resource_exists=lambda: service.has_complete_skill(skill.name),
-                )
-    pending = access.claim_is_pending(SKILL, skill.name)
-    creator_id = access.creator_id(SKILL, skill.name)
-    builtin = is_builtin_skill(skill.name)
-    can_change = (
-        not pending
-        and not (builtin and access.org_mode)
-        and access.can_change(creator_id)
-    )
+def _builtins_immutable(scope: TenantScope) -> bool:
+    """Packaged builtins are read-only wherever the skill store is partitioned:
+    each org, or each person, gets its own seeded copy (SkillService)."""
+    return scope.partitioned_for(PersonalResource.SKILLS)
+
+
+def _skill_response(
+    visible: VisibleSkill, *, access: SharedResourceAccess, service: SkillService
+) -> dict:
+    skill = visible.skill
+    shared = visible.shared
+    if visible.origin is SkillOrigin.MANAGED:
+        # The operator's managed skill: built-in and read-only for every
+        # caller, and authored by nobody here.
+        creator_id = None
+        builtin = True
+        can_change = False
+    elif visible.origin is SkillOrigin.SHARED:
+        # Someone else's skill, shared with the caller: read-only here, and
+        # its creator is named to nobody (ResourceAttribution outside org mode).
+        creator_id = None
+        builtin = False
+        can_change = False
+    else:
+        if access.org_mode and access.has_trusted_actor:
+            with access.coordination_lock(SKILL_PROJECT_REFERENCES, "all"):
+                with access.coordination_lock(SKILL, skill.name):
+                    access.recover_stale_claim(
+                        SKILL,
+                        skill.name,
+                        resource_exists=lambda: service.has_complete_skill(skill.name),
+                    )
+        pending = access.claim_is_pending(SKILL, skill.name)
+        creator_id = access.creator_id(SKILL, skill.name)
+        builtin = is_builtin_skill(skill.name)
+        theirs = not service.may_change(skill)
+        can_change = (
+            not pending
+            and not (builtin and _builtins_immutable(access.session.scope))
+            and access.can_change(creator_id)
+            and not theirs
+        )
+        # Where skills are left shared, the base store holds everyone's
+        # skills, and one the caller didn't create is shared with them,
+        # read-only, as a skill someone shares is where skills are personal.
+        shared = shared or theirs
     return SkillResponse(
         id=skill.id,
         label=skill.label,
@@ -100,10 +135,19 @@ def _skill_response(skill: Skill, access: SharedResourceAccess) -> dict:
             fallback_modified_at=skill.updated_at,
         ),
         is_builtin=builtin,
+        shared=shared,
         capabilities=SkillCapabilities(
             can_edit=can_change,
             can_delete=can_change,
             can_disable=can_change,
+            # Only the caller's own skill, where sharing is available, and
+            # never a packaged built-in's copy. A share check may still
+            # refuse it, saying why, when the caller submits.
+            can_share=(
+                visible.origin is SkillOrigin.OWN
+                and service.sharing_available
+                and not is_builtin_skill(skill.name)
+            ),
         ),
     ).model_dump(by_alias=True)
 
@@ -207,9 +251,15 @@ def list_skills(
     # `build_turn_skills`.
     skill_service = SkillService(scoped.scope)
     skill_service.ensure_builtin_skills()
-    skills = skill_service.list_skills()
     access = SharedResourceAccess(scoped, principal)
-    return {"skills": [_skill_response(skill, access) for skill in skills]}
+    # The typed response carries can_share's "canShare" alias from the model.
+    return SkillListResponse(
+        skills=[
+            _skill_response(visible, access=access, service=skill_service)
+            for visible in skill_service.list_visible_skills()
+        ],
+        can_share=skill_service.sharing_available,
+    ).model_dump(by_alias=True)
 
 
 @router.post(
@@ -243,6 +293,15 @@ def create_skill(
                     description=body.description,
                     enabled=body.enabled,
                     projects=body.projects,
+                    shared=body.shared,
+                )
+            except SkillSharingError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+            except SharedSkillsBusyError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
                 )
             except PermissionError as e:
                 _release_new_skill_claim(access, claim, claim_token)
@@ -263,7 +322,7 @@ def create_skill(
                 claim=claim,
                 claim_token=claim_token,
             )
-    return _skill_response(skill, access)
+    return _skill_response(service.as_own(skill), access=access, service=service)
 
 
 def _upload_skill_bytes(
@@ -271,6 +330,8 @@ def _upload_skill_bytes(
     filename: str | None,
     scoped: ScopedSession,
     principal: Principal | None,
+    *,
+    shared: bool = False,
 ) -> dict:
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
@@ -291,13 +352,23 @@ def _upload_skill_bytes(
                     raw,
                     filename=filename,
                     before_persist=reserve_import if scoped.scope.org_mode else None,
+                    shared=shared,
+                )
+            # Before ValueError's 422: a refused share is a conflict.
+            except SkillSharingError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+            except SharedSkillsBusyError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
                 )
             except PermissionError as e:
                 _release_new_skill_claim(access, claim, claim_token)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail=str(e)
                 )
-            except FileExistsError as e:
+            except (FileExistsError, SkillAlreadyExistsError) as e:
                 _release_new_skill_claim(access, claim, claim_token)
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
             except ValueError as e:
@@ -317,7 +388,7 @@ def _upload_skill_bytes(
                 claim=claim,
                 claim_token=claim_token,
             )
-    return _skill_response(skill, access)
+    return _skill_response(service.as_own(skill), access=access, service=service)
 
 
 @router.post(
@@ -329,6 +400,7 @@ async def upload_skill(
     file: UploadFile,
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     principal: Principal | None = Depends(get_principal),
+    shared: Annotated[bool, Form()] = False,
 ):
     raw = await file.read()
     return await run_in_threadpool(
@@ -337,6 +409,7 @@ async def upload_skill(
         file.filename,
         scope,
         principal,
+        shared=shared,
     )
 
 
@@ -345,11 +418,13 @@ def _upload_skill_in_new_session(
     filename: str | None,
     scope: TenantScope,
     principal: Principal | None,
+    *,
+    shared: bool = False,
 ) -> dict:
     raw_session = get_open_session()
     try:
         scoped = ScopedSession(raw_session, scope)
-        return _upload_skill_bytes(raw, filename, scoped, principal)
+        return _upload_skill_bytes(raw, filename, scoped, principal, shared=shared)
     finally:
         raw_session.close()
 
@@ -360,11 +435,14 @@ def get_skill(
     scoped: ScopedSessionDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    service = SkillService(scoped.scope)
     try:
-        skill = SkillService(scoped.scope).get_skill(skill_id)
+        visible = service.get_visible_skill(skill_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return _skill_response(skill, SharedResourceAccess(scoped, principal))
+    return _skill_response(
+        visible, access=SharedResourceAccess(scoped, principal), service=service
+    )
 
 
 @router.put("/{skill_id}", response_model=SkillResponse)
@@ -379,28 +457,39 @@ def update_skill(
     with _project_reference_lock(access):
         resource_coordination = ExitStack()
         try:
+            # Before any read of the caller's own store, which may not hold a
+            # managed or shared slug, or holds one hidden behind it.
+            service.refuse_unchangeable(skill_id)
             if scoped.scope.org_mode and body.projects is not None:
                 _require_known_projects(scoped, body.projects)
             current = service.get_skill(skill_id)
+            # Every scope needs the target: the rename checks below run wherever
+            # builtins are immutable, not only where the locks are taken.
+            target_slug = (
+                service._slug_from_label(body.label)
+                if body.label is not None
+                else current.name
+            )
+            service.refuse_unchangeable(current.name)
+            if target_slug != current.name:
+                # A rename into a name someone else shares is making a new
+                # skill of the caller's own, so it answers "choose another
+                # name", not the shared-skill refusal that fits an edit.
+                service.refuse_unchangeable(target_slug, creating=True)
             if scoped.scope.org_mode:
-                target_slug = (
-                    service._slug_from_label(body.label)
-                    if body.label is not None
-                    else current.name
-                )
                 for slug in sorted({current.name, target_slug}):
                     resource_coordination.enter_context(
                         access.coordination_lock(SKILL, slug)
                     )
                 _recover_stale_skill_claim(access, service, current.name)
             creator_id = access.creator_id(SKILL, current.name)
-            if scoped.scope.org_mode and is_builtin_skill(current.name):
+            if _builtins_immutable(scoped.scope) and is_builtin_skill(current.name):
                 raise PermissionError(builtin_skill_refusal(current.name))
             access.require_change(
                 creator_id,
                 detail="Only the skill creator or an organization admin can edit this skill",
             )
-            if scoped.scope.org_mode and target_slug != current.name:
+            if _builtins_immutable(scoped.scope) and target_slug != current.name:
                 if is_builtin_skill(target_slug):
                     raise PermissionError(builtin_skill_refusal(target_slug))
                 _recover_stale_skill_claim(access, service, target_slug)
@@ -496,13 +585,62 @@ def update_skill(
                             detail=f"A skill named '{skill.name}' already exists.",
                         )
                     raise
+        except SharedSkillsBusyError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+            )
+        except SkillAlreadyExistsError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except PermissionError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
         finally:
             resource_coordination.close()
-    return _skill_response(skill, access)
+    return _skill_response(service.as_own(skill), access=access, service=service)
+
+
+@router.put("/{skill_id}/sharing", response_model=SkillResponse)
+def set_skill_sharing(
+    skill_id: str,
+    body: SkillSharingRequest,
+    scoped: ScopedSessionDep,
+    # Authenticated, beside the router's AuthenticatedInOrgMode: a person
+    # shares their own skill, so a caller with no person (the operator view,
+    # the desktop) has nothing to share and gets a 401 in either mode.
+    principal: Principal = Depends(require(Authenticated)),
+):
+    """Share one of the caller's own skills with everyone, read-only, or stop
+    sharing it. Both directions are idempotent.
+
+    401 for a caller with no person (the operator view, the desktop), from
+    the require(Authenticated) dependency before the body runs; 409 where
+    sharing is unavailable, before anything else is read; 403 for a managed
+    skill's name or one someone else shares with the caller; 404 when the
+    caller's own store holds no such skill; 409 for a share a check refuses,
+    with the reason; 503 while another change holds the list.
+    """
+    service = SkillService(scoped.scope)
+    try:
+        service.refuse_unless_sharing_available()
+        service.refuse_unchangeable(skill_id)
+        skill = service.get_skill(skill_id)
+        if body.shared:
+            service.share(skill.name)
+        else:
+            service.stop_sharing(skill.name)
+        skill = service.get_skill(skill.name)
+    except SkillSharingError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except SharedSkillsBusyError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return _skill_response(
+        service.as_own(skill), access=SharedResourceAccess(scoped, principal), service=service
+    )
 
 
 @router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -517,12 +655,13 @@ def delete_skill(
     reference_coordination.__enter__()
     resource_coordination = None
     try:
+        service.refuse_unchangeable(skill_id)
         skill = service.get_skill(skill_id)
         if scoped.scope.org_mode:
             resource_coordination = access.coordination_lock(SKILL, skill.name)
             resource_coordination.__enter__()
             _recover_stale_skill_claim(access, service, skill.name)
-        if scoped.scope.org_mode and is_builtin_skill(skill.name):
+        if _builtins_immutable(scoped.scope) and is_builtin_skill(skill.name):
             raise PermissionError(builtin_skill_refusal(skill.name))
         creator_id = access.creator_id(SKILL, skill.name)
         access.require_change(

@@ -59,7 +59,7 @@ def _reply(kind, data):
     return {"payload": json.dumps({"correlation_id": "r", "kind": kind, "data": data})}
 
 
-async def test_default_model_uses_the_verified_hosted_scope(monkeypatch):
+async def test_default_model_uses_the_verified_hosted_scope(monkeypatch, org_deployment):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
     from cowork.common.settings import user_settings
@@ -67,7 +67,6 @@ async def test_default_model_uses_the_verified_hosted_scope(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    monkeypatch.setattr(prod, "get_app_settings", lambda: SimpleNamespace(tenancy_mode="org"))
     monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
 
     def current_settings(scope):
@@ -83,6 +82,52 @@ async def test_default_model_uses_the_verified_hosted_scope(monkeypatch):
     ))
     job = json.loads(fake.added[0][1]["payload"])
     assert job["params"]["model"] == "minds-default"
+
+
+async def _scope_reaching_settings(monkeypatch, *, org_id, user_id):
+    """The scope stream_remote_replies resolves the default model under."""
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+    seen = []
+
+    def current_settings(scope):
+        seen.append(scope)
+        return SimpleNamespace(resolved_planning_model="m-default", hub_workspace_id="")
+
+    monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=org_id, user_id=user_id, input_text="hi", model=None,
+    ))
+    return seen[0]
+
+
+PARTITION = "44e92829-e701-599b-88f9-69f5bf1165eb"
+SUB = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+
+
+async def test_an_org_id_alone_is_not_org_mode_on_a_desktop(monkeypatch):
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    get_app_settings.cache_clear()
+    try:
+        scope = await _scope_reaching_settings(monkeypatch, org_id=PARTITION, user_id=SUB)
+    finally:
+        get_app_settings.cache_clear()
+    assert scope == LOCAL_SCOPE
+
+
+async def test_an_org_id_is_a_partition_with_trusted_identity(monkeypatch, personal_deployment):
+    scope = await _scope_reaching_settings(monkeypatch, org_id=PARTITION, user_id=SUB)
+    assert scope.org_mode is False
+    assert scope.partitioned is True
+    assert (scope.org_id, scope.user_id) == (PARTITION, SUB)
 
 
 async def _drain(gen, *, include_policy=False):
@@ -177,6 +222,27 @@ async def test_a_stale_cancel_cause_is_cleared_with_the_stale_flag(monkeypatch):
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
     assert "cowork:cancel:r" in fake.deleted
     assert "cowork:cancel_cause:r" in fake.deleted
+
+
+async def test_an_admitted_runs_early_cancel_survives_dispatch(monkeypatch):
+    """An early created frame makes this run cancellable before job setup starts."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    deleted = []
+
+    async def delete(*keys):
+        deleted.extend(keys)
+        return len(keys)
+
+    monkeypatch.setattr(fake, "delete", delete)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        correlation_id="r", run_id="b4bef70a-5ea4-47ae-be86-5d49ca45e154",
+    ))
+    assert "cowork:cancel:r" not in deleted
+    assert "cowork:cancel_cause:r" not in deleted
+    assert ("cowork:turns", "conv-1") not in fake.registered
+    assert json.loads(fake.added[0][1]["payload"])["correlation_id"] == "r"
 
 
 # What anton's worker sends, via scratchpad-controller, for a billing stop the
@@ -448,6 +514,41 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert "oauth" not in params
+    assert "connectors" not in params
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch):
+    from cowork.services.connectors.specs._registry import registry
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return [{"engine": "google_drive", "name": "work"}, {"engine": "gmail", "name": "me"}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    monkeypatch.setattr(
+        registry, "usage_notes_for",
+        lambda engines: {e: f"NOTE-{e}" for e in engines if e == "google_drive"},
+    )
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["connectors"] == {"google_drive": {"usage_notes": "NOTE-google_drive"}}
+
+
+def test_connectors_block_is_none_when_nothing_has_notes(monkeypatch):
+    from cowork.services.connectors.specs._registry import registry
+
+    assert prod._connectors_block(None) is None
+    assert prod._connectors_block({"connections": []}) is None
+    monkeypatch.setattr(registry, "usage_notes_for", lambda engines: {})
+    assert prod._connectors_block({"connections": [{"engine": "gmail", "name": "me"}]}) is None
 
 
 @pytest.mark.asyncio
@@ -1019,6 +1120,14 @@ def test_step_stream_events_round_end_carries_tool_call_truthiness():
 
 def test_step_stream_events_unknown_step_yields_nothing():
     assert prod.step_stream_events({"step": "mystery"}) == []
+
+
+def test_step_stream_events_turn_ended_carries_the_reason():
+    from anton.core.llm.provider import StreamTurnEnded
+
+    events = prod.step_stream_events({"step": "turn_ended", "ended_by": "round_cap"})
+    assert events == [StreamTurnEnded(ended_by="round_cap")]
+    assert prod.step_stream_events({"step": "turn_ended"}) == []
 
 
 def test_step_stream_events_ask_user_becomes_a_question():

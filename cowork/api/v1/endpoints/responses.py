@@ -2,23 +2,27 @@
 
 Streaming turns run **detached**: POST /responses starts a background
 producer (see handlers.responses + cowork.streaming) that writes to a
-per-turn buffer; the response tails that buffer. Closing the connection
-does NOT stop the run — the client reconnects via GET /responses/tail
-with a `from_seq` cursor and resumes from where it left off. Only an
-explicit POST /responses/cancel halts the producer.
+per-turn buffer; the response tails that buffer. By default, closing the
+connection does NOT stop the run — the client reconnects via GET
+/responses/tail with a `from_seq` cursor and resumes from where it left off.
+An originating POST with cancel_on_disconnect=true owns its run and cancels
+that instance on transport loss. Tail readers never own the run. Explicit
+POST /responses/cancel remains available with an optional run-instance guard.
 """
 import time
 from typing import Annotated, NamedTuple
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StringConstraints
-from starlette.responses import JSONResponse
+from starlette.requests import ClientDisconnect
+from starlette.responses import JSONResponse, Response as HTTPResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     MissingTenantScopeError,
     TenantScope,
@@ -31,13 +35,13 @@ from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import RunHandle, TurnInProgress, registry
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
+from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, request_cancel
+from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 from cowork.streaming.buffer import RedisStreamBuffer
-from cowork.streaming.turn_index import get_turn, list_turns
+from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
-    cancel_cause_key,
-    cancel_flag_key,
     get_redis,
 )
 
@@ -61,13 +65,13 @@ TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 def _require_streaming_scope(scope: TenantScope) -> None:
     """Fail closed BEFORE any registry access.
 
-    In org mode a caller with no org in scope (e.g. audit mode with no
-    identity headers) gets 401 — exactly like every ScopedSession-backed
-    endpoint. Checked up front, independent of whether the target turn
-    exists, so an empty list or an unknown conversation_id can't mask the
-    missing-identity case behind a 200/404.
+    Where conversations are partitioned (org mode, or a personal scope that
+    keeps them per person) a caller with no org in scope gets 401 — exactly
+    like every ScopedSession-backed endpoint. Checked up front, independent of
+    whether the target turn exists, so an empty list or an unknown
+    conversation_id can't mask the missing-identity case behind a 200/404.
     """
-    if scope.org_mode and scope.org_id is None:
+    if scope.partitioned_for(PersonalResource.CONVERSATIONS) and scope.org_id is None:
         raise MissingTenantScopeError("streaming access requires an org in scope")
 
 
@@ -78,27 +82,33 @@ def _authorized_handle(
 
     A conversation_id is not an authorization token — the registry is keyed by
     it and would otherwise hand any authenticated caller another org's live
-    turn. Local mode never filters (today's single-user behavior); in org mode
-    a handle owned by a different org reads as absent, never 403 (no existence
-    leak). Assumes the scope was already validated by _require_streaming_scope.
+    turn. Where conversations are shared (local mode, the operator view, or a
+    personal scope that keeps them shared) it never filters. Where they are
+    partitioned, a handle owned by a different org/partition or user reads as
+    absent, never 403 (no existence leak). Assumes the scope was already
+    validated by _require_streaming_scope.
     """
     if handle is None:
         return None
-    return handle if _owner_matches(handle.org_id, handle.user_id, scope) else None
+    owner = TurnOwner(org_id=handle.org_id, user_id=handle.user_id)
+    return handle if _owner_matches(owner, scope) else None
 
 
-def _owner_matches(org_id: str | None, user_id: str | None, scope: TenantScope) -> bool:
-    """Whether the caller may touch a turn owned by (org_id, user_id).
+def _owner_matches(owner: TurnOwner, scope: TenantScope) -> bool:
+    """Whether the caller may touch a turn ``owner`` started.
 
-    Turns are personal — a conversation belongs to its creator — so in org mode
-    BOTH the org and the owning user must match. Matching the org alone let any
-    member tail/cancel/answer a teammate's live turn and read its prompts and
-    output (staging audit P0). Local mode never filters (single user). Shared by
-    the local-handle check and the Redis turn index so the two can't disagree.
+    Turns are personal — a conversation belongs to its creator — so wherever
+    conversations are partitioned BOTH the org (or person's partition) and the
+    owning user must match. Matching the org alone let any member tail/cancel/
+    answer a teammate's live turn and read its prompts and output (staging
+    audit P0). Local mode never filters (single user), and neither does a
+    personal scope that keeps conversations shared, nor the operator view of a
+    trusted-identity deployment (LOCAL_SCOPE). Shared by the local-handle check
+    and the Redis turn index so the two can't disagree.
     """
-    if not scope.org_mode:
+    if not scope.partitioned_for(PersonalResource.CONVERSATIONS):
         return True   # today's single-user behavior
-    return org_id == scope.org_id and user_id == scope.user_id
+    return owner.org_id == scope.org_id and owner.user_id == scope.user_id
 
 
 class SharedTurn(NamedTuple):
@@ -128,13 +138,13 @@ async def _shared_turn(
     if not conversation_id or get_backend() != "redis":
         return None
     turn = await get_turn(conversation_id)
-    if turn is None or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
+    if turn is None or not _owner_matches(TurnOwner.from_index(turn), scope):
         return None
     buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
     await buf.refresh()
-    # The index entry is written when the job is enqueued; the first record only
-    # lands once the pod answers. Until the grace period is up, an empty stream
-    # means "not started yet" rather than "over".
+    # Admission publishes the index before starting the producer. Until the
+    # grace period is up, an empty stream means "not started yet" rather than
+    # "over" (a remote worker may still be starting).
     starting = buf.latest_seq == 0 and _just_started(turn)
     return SharedTurn(index=turn, buffer=buf, in_flight=(not buf.is_closed) or starting)
 
@@ -167,21 +177,10 @@ async def _request_cancel(correlation_id: str, *, stalled: bool = False) -> None
     transaction means the latest cancel decides: a failed write leaves no
     stray cause behind, and a Stop after a stall saves as a Stop.
     """
-    async with get_redis().pipeline(transaction=True) as pipe:
-        if stalled:
-            pipe.set(
-                cancel_cause_key(correlation_id), STALLED_CANCEL_REASON,
-                ex=CANCEL_FLAG_TTL_SECONDS,
-            )
-        else:
-            pipe.delete(cancel_cause_key(correlation_id))
-        pipe.set(cancel_flag_key(correlation_id), "1", ex=CANCEL_FLAG_TTL_SECONDS)
-        await pipe.execute()
+    await request_cancel(
+        correlation_id, reason=STALLED_CANCEL_REASON if stalled else None, client=get_redis(),
+    )
 
-
-# Long enough for a controller mid-turn to notice, short enough that a stale
-# flag cannot cancel a later turn that reuses the id.
-CANCEL_FLAG_TTL_SECONDS = 300
 
 # no-store (not just no-cache): a chat stream can carry secrets the model
 # echoed (e.g. a raw API key embedded in generated scratchpad code), so it
@@ -213,8 +212,8 @@ def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> 
     Runs before any database read and before the routing gate, so the refusal
     costs nothing. RunRegistry.start repeats the check under its lock for a
     request that gets past this one while the running turn is still in its
-    own gate. In org mode only the caller's own turn counts, so the refusal
-    never reveals someone else's.
+    own gate. Where conversations are partitioned only the caller's own turn
+    counts, so the refusal never reveals someone else's.
     """
     if not conversation:
         return
@@ -231,6 +230,7 @@ def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> 
 @router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def responses(
     responses_request: ResponsesRequest,
+    request: Request,
     principal: Principal | None = Depends(get_principal),
 ):
     # No request session: the handler runs its reads as short units, so no
@@ -239,6 +239,23 @@ async def responses(
         conversation=responses_request.conversation, scope=scope_from_principal(principal)
     )
     handler = ResponsesHandler(principal=principal)
+    if responses_request.cancel_on_disconnect:
+        watch = DisconnectWatch(request.receive)
+        try:
+            result = await watch.prepare(handler.handle(responses_request))
+        except ClientDisconnect:
+            await watch.close()
+            await cancel_disconnected_run(handler.last_run_handle)
+            return HTTPResponse(status_code=204)
+        except BaseException:
+            await watch.close()
+            raise
+        handle = handler.last_run_handle
+        return DisconnectStreamingResponse(
+            result, watch=watch,
+            on_disconnect=lambda: cancel_disconnected_run(handle),
+            media_type="text/event-stream", headers=_SSE_HEADERS,
+        )
     result = await handler.handle(responses_request)
     if responses_request.stream:
         # `result` is sse_from_buffer(buffer, 0); the producer is already
@@ -267,7 +284,7 @@ async def in_flight_list(scope: TenantScopeDep):
         seen = {row["conversation_id"] for row in out}
         for turn in await list_turns():
             cid = turn["conversation_id"]
-            if cid in seen or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
+            if cid in seen or not _owner_matches(TurnOwner.from_index(turn), scope):
                 continue
             buf = RedisStreamBuffer(conversation_id=cid, turn_id=int(turn["turn_id"]))
             await buf.refresh()
@@ -314,17 +331,19 @@ async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
 
 class CancelRequest(BaseModel):
     conversation_id: str
-    # Why the client is cancelling. Only "stalled" changes anything: the UI
-    # sends it when it heard nothing for its idle window, and the turn then
-    # saves as a stall rather than a Stop. Free text rather than an enum, so
-    # a newer client's reason is ignored instead of failing the cancel.
+    expected_run_id: UUID | None = None
+    # "stalled" saves the turn as a stall rather than a Stop. "client_gone"
+    # retains the disconnect cause alongside a remote cancellation request.
+    # Free text keeps newer clients compatible: unknown reasons act as Stop.
     reason: str | None = None
 
 
 @router.post("/cancel", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
-    """Halt the in-flight producer (Stop button). Fetch-abort / tab-close
-    does NOT cancel — only this does.
+    """Halt the in-flight producer (Stop button), optionally matching one run.
+
+    Fetch-abort / tab-close otherwise cancels only an originating streaming
+    POST that opted in with cancel_on_disconnect=true.
 
     404 when no turn the caller may touch is registered — same shape as /tail,
     so a foreign-org id is indistinguishable from an unknown one (no existence
@@ -340,10 +359,27 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     _require_streaming_scope(scope)
     stalled = req.reason == STALLED_CANCEL_REASON
     handle = _authorized_handle(registry.get(req.conversation_id), scope)
+    if req.expected_run_id is not None:
+        expected = str(req.expected_run_id)
+        if handle is not None and handle.run_id == expected:
+            cancelled = await cancel_run(handle, reason=req.reason)
+            return {"cancelled": cancelled, "conversation_id": req.conversation_id}
+        found = await _shared_turn(req.conversation_id, scope)
+        if found is None or found.index.get("run_id") != expected:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        if not found.in_flight or found.buffer.is_finishing:
+            return {"cancelled": False, "conversation_id": req.conversation_id}
+        await request_cancel(found.index["correlation_id"], reason=req.reason, client=get_redis())
+        return {"cancelled": True, "conversation_id": req.conversation_id}
+    if handle is not None and get_backend() == "redis":
+        turn = await get_turn(req.conversation_id)
+        if turn is not None and turn["correlation_id"] != handle.lifecycle.identity.correlation_id:
+            # RunRegistry retains finished handles for replay. A successor may
+            # run on another replica; _shared_turn below authorizes its owner.
+            handle = None
     if handle is not None:
-        turn = await get_turn(req.conversation_id) if get_backend() == "redis" else None
-        if turn is not None:
-            await _request_cancel(turn["correlation_id"], stalled=stalled)
+        if get_backend() == "redis" or handle.lifecycle.identity.remote:
+            await _request_cancel(handle.lifecycle.identity.correlation_id, stalled=stalled)
         # Before the cancel, so the producer's CancelledError handler cannot
         # miss it (see TurnLifecycle). Assigned, not only set: the latest
         # cancel decides, so a Stop after a stall cancel that the turn

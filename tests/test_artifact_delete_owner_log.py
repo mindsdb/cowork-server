@@ -10,10 +10,9 @@ from sqlalchemy.exc import OperationalError
 
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.services import artifact_ownership as ownership
-from test_artifact_permissions import (  # noqa: F401  (world, org_deployment and no_publish_side_effects are fixtures)
+from test_artifact_permissions import (  # noqa: F401  (world and no_publish_side_effects are fixtures)
     _write,
     no_publish_side_effects,
-    org_deployment,
     scoped,
     world,
 )

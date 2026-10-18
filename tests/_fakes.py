@@ -1,6 +1,13 @@
 """Shared test doubles (importing conftest directly double-loads it)."""
 
 import asyncio
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+# What the managed_dir fixture's managed memory holds.
+MANAGED_RULE = "Name Python packages by their package names only"
+MANAGED_LESSON = "The orders table is keyed by order_id"
 
 
 class FakeRequest:
@@ -127,3 +134,23 @@ class _PausedChatSession:
         await self._model.release.wait()
         self.history.append({"role": "assistant", "content": "ok"})
         yield StreamTextDelta(text="ok")
+
+
+@contextmanager
+def shared_skill_list_lock_held() -> Iterator[None]:
+    """Hold the shared-skill list's lock (cowork.shared_skills) from another
+    descriptor, as a second writer does."""
+    # Imported here: fcntl is POSIX-only, and the list's writer imports it the same way.
+    import fcntl
+
+    from cowork.shared_skills import shared_skills_file
+
+    path = shared_skills_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path.with_name(f"{path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)

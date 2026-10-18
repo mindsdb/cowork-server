@@ -376,6 +376,17 @@ class _OrgScoped:
 ORG = _OrgScoped()
 
 
+class _OperatorPinned:
+    """Annotated marker: the operator sets this for the whole deployment (the
+    model, its endpoint, memory and cost, and how the agent acts: act_first,
+    proactive_dashboards), so a personal partition reads and
+    writes it on the global row and never keeps a row of its own. SecretStr
+    credentials are pinned regardless. Read by setting_is_operator_pinned."""
+
+
+PINNED = _OperatorPinned()
+
+
 def _harness_options() -> list[str]:
     from cowork.harnesses.base import available_harness_ids
     return available_harness_ids()
@@ -548,27 +559,27 @@ class UserSettings(Settings):
         title="MindsHub API Key",
         description="API key for MindsHub. Required if using MindsHub as a provider.",
     )
-    minds_url: Annotated[str, ORG] = Field(
+    minds_url: Annotated[str, ORG, PINNED] = Field(
         default_factory=default_minds_url,
         title="MindsHub URL",
         description="Base URL for the MindsHub API.",
     )
-    planning_provider: Annotated[Provider, ORG] = Field(
+    planning_provider: Annotated[Provider, ORG, PINNED] = Field(
         default_factory=_default_provider,
         title="Planning Provider",
         description="The provider to use for the reasoning/planning model.",
     )
-    planning_model: str | None = Field(
+    planning_model: Annotated[str | None, PINNED] = Field(
         default=None,
         title="Planning Model",
         description="The reasoning model used for planning. Defaults to the recommended model for the selected provider.",
     )
-    coding_provider: Annotated[Provider, ORG] = Field(
+    coding_provider: Annotated[Provider, ORG, PINNED] = Field(
         default_factory=_default_provider,
         title="Coding Provider",
         description="The provider to use for the coding model.",
     )
-    coding_model: str | None = Field(
+    coding_model: Annotated[str | None, PINNED] = Field(
         default=None,
         title="Coding Model",
         description="The coding model. Defaults to the recommended model for the selected provider.",
@@ -578,14 +589,14 @@ class UserSettings(Settings):
         title="Coding Agent",
         description="The agent engine used by the separate Code workspace.",
     )
-    coding_agent_model: str = Field(
+    coding_agent_model: Annotated[str, PINNED] = Field(
         default="gpt",
         min_length=1,
         max_length=256,
         title="Coding Agent Model",
         description="The MindsHub Inference model used by the selected coding agent.",
     )
-    planning_reasoning_effort: str | None = Field(
+    planning_reasoning_effort: Annotated[str | None, PINNED] = Field(
         default=None,
         title="Planning Reasoning Effort",
         description=(
@@ -594,7 +605,7 @@ class UserSettings(Settings):
             "models that advertise effort levels."
         ),
     )
-    coding_reasoning_effort: str | None = Field(
+    coding_reasoning_effort: Annotated[str | None, PINNED] = Field(
         default=None,
         title="Coding Reasoning Effort",
         description=(
@@ -602,7 +613,7 @@ class UserSettings(Settings):
             "model's default. Only meaningful for models that advertise effort levels."
         ),
     )
-    router_reasoning_effort: str | None = Field(
+    router_reasoning_effort: Annotated[str | None, PINNED] = Field(
         default=None,
         title="Routing & Summarization Reasoning Effort",
         description=(
@@ -622,12 +633,12 @@ class UserSettings(Settings):
     # point routing + summarization at a cheap model independently of the
     # coding (scratchpad) model. Falls back to the coding role in anton when
     # unset, so leaving these at defaults is behavior-preserving.
-    router_provider: Annotated[Provider, ORG] = Field(
+    router_provider: Annotated[Provider, ORG, PINNED] = Field(
         default_factory=_default_provider,
         title="Routing & Summarization Provider",
         description="The provider for the routing/summarization model.",
     )
-    router_model: str | None = Field(
+    router_model: Annotated[str | None, PINNED] = Field(
         default=None,
         title="Routing & Summarization Model",
         description=(
@@ -677,6 +688,11 @@ class UserSettings(Settings):
         title="Show Counters",
         description="Show counters in the UI.",
     )
+    show_figure_sources: bool = Field(
+        default=True,
+        title="Show Figure Sources",
+        description="Mark each figure in an answer with the steps it came from, and flag figures with no source.",
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",
@@ -717,7 +733,7 @@ class UserSettings(Settings):
         title="Accent Variant",
         description="UI accent color variant.",
     )
-    memory_enabled: bool = Field(
+    memory_enabled: Annotated[bool, PINNED] = Field(
         default=True,
         title="Memory Enabled",
         description="Enable conversation memory.",
@@ -765,12 +781,12 @@ class UserSettings(Settings):
         title="Enable Claude Code in the Harness Picker",
         description="Offer Claude Code as a per-task harness choice in Coding Mode.",
     )
-    memory_mode: str = Field(
+    memory_mode: Annotated[str, PINNED] = Field(
         default="autopilot",
         title="Memory Mode",
         description="How memory is managed (autopilot or manual).",
     )
-    episodic_memory: bool = Field(
+    episodic_memory: Annotated[bool, PINNED] = Field(
         default=True,
         title="Episodic Memory",
         description="Enable episodic memory for conversations.",
@@ -780,17 +796,25 @@ class UserSettings(Settings):
         title="History Compaction",
         description="Replay anton's compacted summary + recent tail instead of full history each turn.",
     )
-    proactive_dashboards: bool = Field(
+    proactive_dashboards: Annotated[bool, PINNED] = Field(
         default=False,
         title="Proactive Dashboards",
         description="Enable proactive dashboard suggestions.",
     )
-    act_first: bool = Field(
+    act_first: Annotated[bool, PINNED] = Field(
         default=True,
         title="Act first, ask later",
         description=(
             "Act on reasonable defaults and state assumptions inline instead of "
             "stopping to ask. Turn off for a more cautious, ask-first agent."
+        ),
+    )
+    first_take_enabled: bool = Field(
+        default=True,
+        title="Instant first take",
+        description=(
+            "While the agent works, show a quick reply on the fast model saying "
+            "what it is about to do, until the agent starts writing."
         ),
     )
     # ── Advanced agent budgets ──
@@ -800,7 +824,7 @@ class UserSettings(Settings):
     # Defaults come from app settings so hosted deployments (operator-paid
     # inference, no Settings UI on web) can lower them via env without
     # touching per-user rows.
-    max_tool_rounds: Annotated[int, ORG] = Field(
+    max_tool_rounds: Annotated[int, ORG, PINNED] = Field(
         default_factory=lambda: get_app_settings().default_max_tool_rounds,
         ge=5,
         le=500,
@@ -814,7 +838,7 @@ class UserSettings(Settings):
             "variable."
         ),
     )
-    max_continuations: Annotated[int, ORG] = Field(
+    max_continuations: Annotated[int, ORG, PINNED] = Field(
         default_factory=lambda: get_app_settings().default_max_continuations,
         ge=0,
         le=25,
@@ -828,7 +852,7 @@ class UserSettings(Settings):
             "ANTON_MAX_CONTINUATIONS environment variable."
         ),
     )
-    max_turn_tokens: Annotated[int, ORG] = Field(
+    max_turn_tokens: Annotated[int, ORG, PINNED] = Field(
         default_factory=lambda: get_app_settings().default_max_turn_tokens,
         # Plain contiguous range. "No limit" in the UI is the TOP of it
         # (50_000_000), not a sentinel.
@@ -878,7 +902,7 @@ class UserSettings(Settings):
             "ANTON_MAX_TURN_TOKENS environment variable."
         ),
     )
-    publish_url: Annotated[str, ORG] = Field(
+    publish_url: Annotated[str, ORG, PINNED] = Field(
         default="",
         title="Publish URL",
         description="Base URL for publishing artifacts. When empty, derived from the MindsHub endpoint (api[.env].mindshub.ai → view[.env].mindshub.ai, else prod); set explicitly to override.",
@@ -912,37 +936,37 @@ class UserSettings(Settings):
             "deployments skip entirely; see dev_setup._migrate_env_to_db_if_local.)"
         ),
     )
-    openai_base_url: Annotated[str, ORG] = Field(
+    openai_base_url: Annotated[str, ORG, PINNED] = Field(
         default="",
         title="OpenAI Base URL",
         description="Base URL for OpenAI-compatible providers.",
     )
-    model_mode: Annotated[str, ORG] = Field(
+    model_mode: Annotated[str, ORG, PINNED] = Field(
         default="default",
         title="Model Mode",
         description="Whether to use default or custom model assignments (default or custom).",
     )
-    model_overrides: Annotated[str, ORG] = Field(
+    model_overrides: Annotated[str, ORG, PINNED] = Field(
         default="{}",
         title="Model Overrides",
         description="JSON-encoded per-role provider/model overrides when model_mode is custom.",
     )
-    providers_json: Annotated[str, ORG] = Field(
+    providers_json: Annotated[str, ORG, PINNED] = Field(
         default="[]",
         title="Providers",
         description="JSON-encoded list of configured provider entries for the settings UI.",
     )
-    provider_status: Annotated[str, ORG] = Field(
+    provider_status: Annotated[str, ORG, PINNED] = Field(
         default="{}",
         title="Provider Status",
         description="JSON-encoded map of provider type → last connectivity-test status (ok|fail). Persisted so the Settings dots survive a reload.",
     )
-    provider_status_details: Annotated[str, ORG] = Field(
+    provider_status_details: Annotated[str, ORG, PINNED] = Field(
         default="{}",
         title="Provider Status Details",
         description="JSON-encoded map of provider type → last connectivity-test detail (e.g. an HTTP code).",
     )
-    minds_model_enabled: Annotated[str, ORG] = Field(
+    minds_model_enabled: Annotated[str, ORG, PINNED] = Field(
         default="{}",
         title="MindsHub Model Availability",
         description=(
@@ -961,7 +985,7 @@ class UserSettings(Settings):
     # Only the org-mode listing writes it (`persist_org_model_availability`); a
     # desktop install has one member and keeps its restrictions in
     # `minds_model_enabled`.
-    minds_model_restricted: str = Field(
+    minds_model_restricted: Annotated[str, PINNED] = Field(
         default="[]",
         title="MindsHub Models Restricted For You",
         description=(
@@ -972,7 +996,7 @@ class UserSettings(Settings):
         ),
     )
 
-    minds_role_defaults: Annotated[str, ORG] = Field(
+    minds_role_defaults: Annotated[str, ORG, PINNED] = Field(
         default="{}",
         title="MindsHub Role Defaults",
         description=(
@@ -1386,6 +1410,22 @@ def setting_is_org_scoped(key: str) -> bool:
     if UserSettings.field_is_sensitive(key):
         return True
     return any(isinstance(m, _OrgScoped) for m in field.metadata)
+
+
+def setting_is_operator_pinned(key: str) -> bool:
+    """True for a key the operator sets for the whole deployment: the model and
+    provider choices, their endpoints and credentials, memory, the per-turn
+    budgets, and how the agent acts (act_first, proactive_dashboards).
+    SecretStr credentials are pinned structurally; other fields iff
+    tagged with the PINNED marker. A personal partition resolves these from the
+    global row, then the environment, and ignores a row of its own
+    (SettingService). Org mode routes them as setting_is_org_scoped says."""
+    field = UserSettings.model_fields.get(key)
+    if field is None:
+        return False
+    if UserSettings.field_is_sensitive(key):
+        return True
+    return any(isinstance(m, _OperatorPinned) for m in field.metadata)
 
 
 _current_scope: ContextVar["TenantScope | None"] = ContextVar("settings_scope", default=None)
