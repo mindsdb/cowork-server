@@ -24,7 +24,7 @@ from anton.core.llm.provider import (
 from anton.core.mcp.client import McpSession
 from anton.core.mcp.names import namespaced_tool_name
 from anton.core.mcp.registry import discover_tool_defs
-from anton.core.session import _discarded_tool_call_events
+from anton.core.session import ChatSession, _discarded_tool_call_events
 from anton.core.tools import tool_handlers, web_tools
 from anton.core.tools.registry import ToolOutcome
 from anton.core.utils.scratchpad import format_cell_result
@@ -127,6 +127,25 @@ class TestFigureSourcesEvent:
         final = events[-1][1]["response"]
         assert final["status"] == "incomplete"
         assert final["incomplete_details"] == {"reason": "round_cap"}
+
+    @pytest.mark.parametrize(("limit", "number"), [("round_cap", "5"), ("spend_ceiling", "1,250,000")])
+    async def test_the_number_in_antons_limit_sentence_gets_no_mark(self, limit, number):
+        # The installed anton writes the sentence, so a reword there fails
+        # here. It reads only these four fields of the session.
+        limits = SimpleNamespace(
+            _max_tool_rounds=5, _round_cap_continued_rounds=0,
+            _max_turn_tokens=1_250_000, _spend_ceiling_continued_tokens=0,
+        )
+        sentence = ChatSession._limit_reached(limits, limit)
+        assert number in sentence
+
+        events = await _run(
+            *_read_stock_cell(),
+            StreamTextDelta(text=f"{sentence}.\n\nSite S1 holds 250 units."),
+            StreamTurnEnded(ended_by=limit),
+        )
+
+        assert [(f["text"], f["origin"]) for f in events[-2][1]["figures"]] == [("250", "step")]
 
     async def test_a_turn_that_handed_back_on_antons_failure_reply_gets_no_sources(self):
         events = await _run(

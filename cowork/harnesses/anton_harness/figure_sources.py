@@ -3,8 +3,9 @@
 The formatter hands this module the final answer, the question and the tool
 calls the model saw with their results: this turn's, and those of the earlier
 turns the model is seeded with. Each figure in the answer (a number that isn't
-part of an identifier, a date, a list marker, a citation marker, a link, code
-or display math) gets one origin:
+part of an identifier, a date, a list marker, a citation marker, a link, code,
+display math or anton's sentence naming the limit that stopped the turn) gets
+one origin:
 
 - ``step``: one or more of this turn's steps' outputs hold it, at the
   precision the answer shows it, so a rounded or percent form of a step's
@@ -438,6 +439,12 @@ _ANSWER_SKIPS = (
     # Citation markers, [1] and [^1], but not a link whose text is a number.
     re.compile(r"\[\^?\d{1,3}\](?!\()"),
     re.compile(r"^[ \t]*(?:#{1,6}[ \t]+)?\d+[.)][ \t]", re.MULTILINE),
+    # The sentence anton opens a hand-back with when a turn reaches its round
+    # cap or spend ceiling ("This task reached its limit of 25 steps per
+    # request", anton core.session ChatSession._limit_reached). Its number is
+    # anton's setting, not a figure the answer reports. A step count has no
+    # thousands separators; a token count has them.
+    re.compile(r"\breached its limit of \d[\d,]*+ (?:steps|tokens) per request\b"),
 )
 
 # A line that marks a page of a document's text: a header such as
