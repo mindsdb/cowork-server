@@ -289,6 +289,19 @@ class TestSourcedFigures:
 
         assert _figure(sources, figure).sources == [FigureSource(tool_use_id="toolu_q")]
 
+    @pytest.mark.parametrize(("answer", "figure", "stdout"), [
+        ("We run 3 D printers.", "3", "{'printers': 3, 'uptime_hours': 20}\n"),
+        ("Stock 22 H-beams.", "22", "{'h_beams': 22, 'lead_time_days': 5}\n"),
+    ], ids=["d", "h"])
+    def test_a_single_letter_after_a_figure_is_not_its_time_unit(self, answer: str, figure: str, stdout: str):
+        """A lone D or H after a space starts a word, so the figure keeps its
+        source in a step that names another time unit."""
+        step = _cell("toolu_q", code="print(fetch_row())", stdout=stdout)
+
+        sources = find_figure_sources(answer=answer, question="", steps=[step])
+
+        assert _figure(sources, figure).sources == [FigureSource(tool_use_id="toolu_q")]
+
 
 class TestTheStepsList:
     def test_each_named_step_is_listed_once_in_step_order(self):

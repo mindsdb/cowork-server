@@ -377,8 +377,10 @@ _STEP_TIME_WORDS = frozenset({
     "secs", "seconds", "mins", "minutes", "hrs", "hours", "days", "wks", "weeks", "months", "yrs", "years",
 })
 # The word just after a figure in prose, past emphasis and one space or
-# hyphen: "22 hours", "**22** hours", "13.08-day".
-_WORD_AFTER = re.compile(r"[*_]{0,2}[ \u00a0-]?[*_]{0,2}(?P<word>[A-Za-z]+)")
+# hyphen: "22 hours", "**22** hours", "13.08-day". A single letter there
+# names no unit ("3 D printers", "22 H-beams"); a glued one (22h) is read as
+# the number's own unit.
+_WORD_AFTER = re.compile(r"[*_]{0,2}[ \u00a0-]?[*_]{0,2}(?P<word>[A-Za-z]{2,})")
 # A word of a step's text, with identifiers split at underscores, digits and
 # case changes, so lead_time_days, leadTimeDays and LEAD_TIME_DAYS each end
 # in the word days.
