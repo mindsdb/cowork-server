@@ -70,6 +70,19 @@ def stack(personal_deployment, monkeypatch, tmp_path):
         raw.commit()
 
 
+@pytest.fixture
+def launches_backends(monkeypatch):
+    """The live-backend paths' own per-person checks. Identity headers need
+    the code sandbox, under which the preview mount, _ensure_backend_running
+    and the preview proxy refuse every backend before these checks run
+    (tests/test_code_sandbox.py), so a test of the checks behind those
+    refusals opens them."""
+    from cowork.services import artifacts, preview_proxy
+
+    monkeypatch.setattr(artifacts, "code_sandbox_on", lambda: False)
+    monkeypatch.setattr(preview_proxy, "code_sandbox_on", lambda: False)
+
+
 def _general(scope: TenantScope) -> Path:
     """The person's own `general` project directory, provisioned as a request would."""
     with Session(get_engine(get_app_settings().database.uri)) as raw:
@@ -234,7 +247,7 @@ class _Upstream:
         pass
 
 
-def test_a_backend_preview_token_forwards_only_for_the_owner(two_people, monkeypatch):
+def test_a_backend_preview_token_forwards_only_for_the_owner(two_people, monkeypatch, launches_backends):
     """The proxy token is a hash of A's artifact root, as stable as the asset
     one, and A's backend runs with A's connection secrets: holding the token
     must not forward B's request to it."""
@@ -274,7 +287,7 @@ def test_a_backend_preview_token_forwards_only_for_the_owner(two_people, monkeyp
     assert forwarded == ["http://127.0.0.1:4242/data"]
 
 
-def test_the_proxy_forwards_only_to_the_callers_live_backend(stack, monkeypatch):
+def test_the_proxy_forwards_only_to_the_callers_live_backend(stack, monkeypatch, launches_backends):
     """B's iframe keeps its token after B's backend exits, and A's next launch
     can take the freed port, which B's metadata.json still names. The proxy
     then forwards B's requests to no backend but one launched for B: 503, so
@@ -567,7 +580,7 @@ def test_the_operator_view_lists_no_persons_project_by_id(two_people):
 # ── live backends ───────────────────────────────────────────────────────────
 
 
-async def test_two_peoples_same_slug_backends_keep_running(stack, monkeypatch):
+async def test_two_peoples_same_slug_backends_keep_running(stack, monkeypatch, launches_backends):
     """anton's launcher keys the dict it is handed by slug and reaps the entry
     it finds there, so one dict for the whole server would stop A's backend the
     moment B previews an artifact with the same slug."""
@@ -629,7 +642,9 @@ def fake_pads(monkeypatch):
     return scratchpad_runtime
 
 
-async def test_two_peoples_same_slug_backends_get_their_own_venvs(stack, monkeypatch, fake_pads):
+async def test_two_peoples_same_slug_backends_get_their_own_venvs(
+    stack, monkeypatch, fake_pads, launches_backends
+):
     """anton's launcher asks the pool for the slug's venv, then installs the
     artifact's requirements into that slug's pad. A pool keyed by slug alone
     would hand B's backend A's pad, inside A's project."""
@@ -675,7 +690,7 @@ class _LiveProc:
     returncode = None
 
 
-async def test_another_persons_backend_on_the_port_is_not_the_callers(stack, monkeypatch):
+async def test_another_persons_backend_on_the_port_is_not_the_callers(stack, monkeypatch, launches_backends):
     """Ports are reused: by the time B previews, the port in B's metadata.json
     can belong to A's backend. Only a backend this server launched for B's
     project and slug, on that port, counts as B's running backend."""
@@ -734,7 +749,9 @@ async def test_desktop_counts_any_listener_as_the_artifacts_backend(monkeypatch,
 
 
 @pytest.mark.parametrize("listening", [False, True])
-async def test_a_backend_launches_only_inside_the_callers_projects(stack, monkeypatch, listening):
+async def test_a_backend_launches_only_inside_the_callers_projects(
+    stack, monkeypatch, listening, launches_backends
+):
     """Refused before the port is probed: a live port is no reason to report
     another person's artifact as running."""
     from cowork.services import artifacts
@@ -784,7 +801,9 @@ def test_shared_projects_keep_todays_shared_artifacts(stack):
     ],
     ids=["connections-personal", "connections-shared"],
 )
-def test_shared_projects_with_personal_connections_refuse_a_live_backend(stack, monkeypatch, personal, status_code):
+def test_shared_projects_with_personal_connections_refuse_a_live_backend(
+    stack, monkeypatch, personal, status_code, launches_backends
+):
     """With projects shared, A and B open the one artifact folder: one preview
     token, and one metadata.json port the proxy follows, while a backend runs
     with the connections of whoever launched it. Where connections are
@@ -822,6 +841,32 @@ def test_shared_projects_with_personal_connections_refuse_a_live_backend(stack, 
         assert forwarded.text == artifacts._SHARED_PROJECT_BACKEND_DETAIL
     else:
         assert mounted.json()["kind"] == "proxy"
+
+
+def test_the_sandboxed_stack_previews_no_live_backend(stack, monkeypatch):
+    """The stack as it runs (identity headers need the code sandbox): a live
+    backend preview is refused before any token or launch, an HTML preview
+    still mounts, and its token forwards nothing whatever port the agent
+    writes into its metadata.json."""
+    from anton.core.backends.sandbox import BACKENDS_OFF_MESSAGE
+    from cowork.services import artifacts, preview_proxy
+
+    project = _general(ALICE)
+    app = _with_port(_artifact(project, "app", title="A app"), 5000)
+    dash = _artifact(project, "dash", title="A dash")
+    monkeypatch.setattr(artifacts, "_ensure_backend_running", lambda *_a, **_kw: pytest.fail("no launch here"))
+    monkeypatch.setattr(preview_proxy, "get_proxy_client", lambda: pytest.fail("nothing forwards here"))
+    monkeypatch.setattr(artifacts, "_PREVIEW_MOUNTS", {})
+    client = _client()
+
+    mounted = client.post("/api/v1/artifacts/preview-mount", json={"path": str(app / "index.html")}, headers=A)
+    assert (mounted.status_code, mounted.json()["detail"]) == (409, BACKENDS_OFF_MESSAGE)
+    assert app.resolve() not in {path.resolve() for path in artifacts._PREVIEW_MOUNTS.values()}
+    static = client.post("/api/v1/artifacts/preview-mount", json={"path": str(dash / "index.html")}, headers=A)
+    assert (static.status_code, static.json()["kind"]) == (200, "static")
+    (dash / "metadata.json").write_text(json.dumps({"title": "A dash", "port": 26866}))
+    forwarded = client.get(f"/api/v1/artifacts/proxy/{static.json()['token']}/api/v1/memory/", headers=A)
+    assert (forwarded.status_code, forwarded.text) == (403, BACKENDS_OFF_MESSAGE)
 
 
 def test_desktop_previews_the_unkeyed_projects_root(monkeypatch, tmp_path):

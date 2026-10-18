@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from urllib.parse import quote
 
+from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -108,7 +109,8 @@ _SHARED_PROJECT_BACKEND_DETAIL = (
 class BackendPreviewRefused(RuntimeError):
     """Raised by `mount_preview` instead of previewing an artifact's live
     backend where one backend would serve several people's connections
-    (`_backends_cross_people`). The /artifacts/preview-mount route answers
+    (`_backends_cross_people`), and under the code sandbox, which runs no
+    backend (`code_sandbox_on`). The /artifacts/preview-mount route answers
     it with 409 and its message."""
 
 
@@ -1710,6 +1712,11 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         # pod and use the mount as an SSRF pivot, backend running or not.
         if _org_mode():
             raise ValueError(_NO_EXEC_DETAIL)
+        # Under the code sandbox no backend can run, so no proxy token is
+        # minted either: the proxy would forward to whatever loopback port
+        # the agent writes into metadata.json.
+        if code_sandbox_on():
+            raise BackendPreviewRefused(backends_off_message())
         if _backends_cross_people():
             raise BackendPreviewRefused(_SHARED_PROJECT_BACKEND_DETAIL)
         # Register the artifact root (where metadata.json and the live port
@@ -2018,7 +2025,10 @@ def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> P
     registered = _registered_project_dirs(scope=scope)
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
-            return parent
+            # The registered entry, equal to the ancestor: the caller hands it
+            # to the code sandbox, so it is a path this module listed rather
+            # than one built from the request's artifact path.
+            return next(root for root in registered if root == parent)
     return None
 
 
@@ -2033,9 +2043,13 @@ async def _ensure_backend_running(
 
     In org mode this always refuses; see `_org_mode`. The no-exec check is
     deployment-wide, so a personal partition launches like the desktop does.
+    Under the code sandbox it refuses too, before the scratchpad pool is
+    touched: the pool's venv check and install would run the venv's Python.
     """
     if _org_mode():
         return BackendStatus(running=False, detail=_NO_EXEC_DETAIL, port=0)
+    if code_sandbox_on():
+        return BackendStatus(running=False, detail=backends_off_message(), port=0)
 
     slug = artifact_dir.name
     # The project root first, so nothing about the port is reported for an
@@ -2075,7 +2089,12 @@ async def _launch_backend_locked(
     from cowork.services.scratchpad_runtime import WorkspaceScopedPool
 
     slug = artifact_dir.name
-    pool = WorkspaceScopedPool(str(project_root))
+    # anton refuses a backend whose pool carries a policy, so a launch that
+    # got past the refusal in _ensure_backend_running still runs nothing.
+    pool = WorkspaceScopedPool(
+        str(project_root),
+        cell_sandbox=build_cell_sandbox(scope=scope, project_dir=project_root),
+    )
 
     # Inject the secrets of datasources the artifact declared in metadata.json
     # into the backend subprocess only — NOT the cowork server's global

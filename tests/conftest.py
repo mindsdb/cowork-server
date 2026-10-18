@@ -180,21 +180,45 @@ def org_deployment(monkeypatch):
     get_app_settings.cache_clear()
 
 
+def stub_landlock_kernel(monkeypatch, *, abi: int = 6) -> None:
+    """Answer the code sandbox's kernel checks without a kernel: the ABI probe
+    reports ``abi`` and the launcher's self-test passes. The one seam
+    cowork.code_sandbox leaves for tests, since neither macOS nor every CI
+    kernel has Landlock."""
+    from cowork import code_sandbox
+
+    monkeypatch.setattr(code_sandbox, "_probe_abi", lambda: abi)
+    monkeypatch.setattr(code_sandbox, "_run_self_test", lambda: None)
+
+
+@pytest.fixture
+def landlock_kernel(monkeypatch):
+    """stub_landlock_kernel for one test: a kernel at Landlock ABI 6 whose
+    self-test passes."""
+    stub_landlock_kernel(monkeypatch)
+
+
 @pytest.fixture
 def personal_deployment(monkeypatch):
     """A local deployment that trusts identity headers, for one test.
 
     Local tenancy with COWORK_TRUST_IDENTITY_HEADERS and COWORK_REQUIRE_AUTH
-    on, and every resource personal (the setting's default). A test that
-    leaves a resource shared sets COWORK_PERSONAL_RESOURCES and clears the
-    settings cache itself.
+    on, every resource personal (the setting's default), and
+    COWORK_CODE_SANDBOX=landlock, which identity headers require, with its
+    kernel checks stubbed (stub_landlock_kernel). COWORK_AUTH_TOKEN is set,
+    since identity headers take the token from the environment alone. A test
+    that leaves a resource shared sets COWORK_PERSONAL_RESOURCES and clears
+    the settings cache itself.
     """
     from cowork.common.settings.app_settings import get_app_settings
 
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
     monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
     monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", "personal-deployment-test-token")
+    monkeypatch.setenv("COWORK_CODE_SANDBOX", "landlock")
     monkeypatch.delenv("COWORK_PERSONAL_RESOURCES", raising=False)
+    stub_landlock_kernel(monkeypatch)
     get_app_settings.cache_clear()
     yield
     get_app_settings.cache_clear()

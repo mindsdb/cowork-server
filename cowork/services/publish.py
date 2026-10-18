@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from fastapi import HTTPException
 from pydantic import SecretStr
 
+from cowork.code_sandbox import refuse_planted_links
 from cowork.common.paths import cowork_home, pod_local_only
 # Imported for its side effect on the module namespace as well as its use:
 # tests monkeypatch `publish.get_app_settings`, so removing it because a
@@ -106,6 +107,11 @@ def raise_publish_permission_error(exc: Exception) -> None:
             raise ProductPermissionDenied() from exc
 
 
+#: The files the publish store holds: its state, and the temporary file a
+#: save writes and moves over it.
+_STATE_FILES = ("state.json", "state.json.tmp")
+
+
 def _cowork_state_dir(*, scope: TenantScope | None) -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
@@ -126,6 +132,11 @@ def _cowork_state_dir(*, scope: TenantScope | None) -> Path:
         from cowork.db.scoped import scoped_storage_root
 
         path = scoped_storage_root(path, scope, store="publish")
+    # Under the code sandbox, a link or hard-linked file that agent code left
+    # on the way to state.json, or at it, fails the read or write instead of
+    # being followed. Only the store's own files are checked: the operator
+    # view's store is cowork-home itself.
+    refuse_planted_links(path, only=_STATE_FILES)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

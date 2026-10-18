@@ -12,6 +12,9 @@ reads it live from its creator's vault, marked ``managed`` (they can't change
 it) and ``shared``, and every change they try answers 403 with the shared
 sentence, a delete before its OAuth revoke. Its creator sees it shared and
 changes, reconnects and deletes it as before, and everyone sees each change.
+Under the code sandbox, a link left in a sharer's vault before the sandbox
+fails only that person's own reads: everyone else goes on without what they
+share.
 
 With connections shared, everyone reads the one base vault. A person
 changes only an entry they created, the operator view changes any, and a
@@ -35,6 +38,7 @@ from sqlalchemy import delete
 
 import cowork.server as cowork_server
 from cowork.api.v1.endpoints.connectors import connections as connections_ep
+from cowork.code_sandbox import PlantedLinkError
 from cowork.api.v1.endpoints.connectors import submissions as submissions_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import use_settings_scope
@@ -661,6 +665,33 @@ def test_a_malformed_registry_shares_nothing_and_says_so(sharing, caplog, owned_
         if record.name == "cowork.services.connectors.persist" and record.levelno == logging.ERROR
     ]
     assert errors and str(sharing.shared_connections_file) in errors[0]
+
+
+def test_a_link_left_in_a_sharers_vault_fails_only_their_own_reads(sharing, stores, caplog, owned_logger):
+    """Under the code sandbox (personal_deployment), a hard link that agent
+    code left in Alice's vault before the sandbox fails her own vault reads.
+    Bob's reads and turns go on without the connections she shares, and an
+    error names her vault and each connection left out."""
+    persist_connection("postgres", None, "mine", {**ERP, "host": "bob.example"}, scope=BOB)
+    elsewhere = stores / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "target").write_text("someone else's\n", encoding="utf-8")
+    os.link(elsewhere / "target", own_vault_root(ALICE) / "planted")
+    owned_logger("cowork.services.connectors.persist", level=logging.ERROR)
+
+    assert _names(vault_for_scope(BOB)) == {("postgres", "mine")}
+    assert _names(turn_vault_for_scope(BOB)) == {("postgres", "mine")}
+    with pytest.raises(PlantedLinkError):
+        vault_for_scope(ALICE)
+    with pytest.raises(PlantedLinkError):
+        turn_vault_for_scope(ALICE)
+
+    errors = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.services.connectors.persist" and record.levelno == logging.ERROR
+    ]
+    assert errors and str(own_vault_root(ALICE)) in errors[0] and "postgres/erp" in errors[0]
 
 
 def test_only_a_scope_with_personal_connections_reads_the_registry(sharing):

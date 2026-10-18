@@ -24,9 +24,10 @@ deployment) never filters — today's behavior.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, Request
 from sqlalchemy import event, inspect
@@ -195,8 +196,9 @@ def service_principal_for(org_id: str | None, user_id: str | None) -> Principal 
 
 def _partitions_store(scope: TenantScope, store: str) -> bool:
     resource = STORE_RESOURCE.get(store)
-    # Unmapped: partitioned wherever anything is, so a new store is never
-    # shared by omission. tests/test_personal_resources.py keeps the map whole.
+    # Mapped to None (the sandbox store), or unmapped: partitioned wherever
+    # anything is, so a new store is never shared by omission.
+    # tests/test_personal_resources.py keeps the map whole.
     return scope.partitioned if resource is None else scope.partitioned_for(resource)
 
 
@@ -206,14 +208,32 @@ def _partitions_model(scope: TenantScope, model: type) -> bool:
     return scope.partitioned if resource is None else scope.partitioned_for(resource)
 
 
+def storage_segment(value: str, *, what: Literal["partition", "store", "user"]) -> str:
+    """``value`` as one folder name below a storage root: returned as it is,
+    or ValueError naming ``what`` (the partition, store or user).
+
+    A segment must be its own base name. "" is dropped by pathlib, so the
+    path collapses onto the folder above; "." and ".." name a folder that is
+    not below; a separator names a folder further down, maybe in another
+    partition, and an absolute value replaces the root. A backslash is refused
+    too, so a value never means one thing here and another on a host that
+    reads it as a separator."""
+    segment = os.path.basename(value)
+    if segment != value or segment in ("", ".", "..") or "\\" in segment:
+        raise ValueError(f"invalid storage {what} segment: {value!r}")
+    return segment
+
+
 def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
     """``base`` where the scope leaves ``store`` shared, ``<shared_root>/<org_id>/<store>``
     where it partitions it (org mode, or a personal scope whose resources include
     the store's, see STORE_RESOURCE), fail-closed without an org. Org-first so
     each org or partition is one mountable/GC-able subtree. org_id is a
-    normalized UUID (TrustedHeaderMiddleware, personal_partition_id), so it's
-    path-safe. ``store`` is required — deriving it from ``base`` would let a
-    *_DIR env override silently rename an org's store.
+    normalized UUID (TrustedHeaderMiddleware, personal_partition_id), and
+    storage_segment refuses one that would leave its folder all the same, so
+    the partition never rests on the middleware alone. ``store`` is required:
+    deriving it from ``base`` would let a *_DIR env override silently rename an
+    org's store.
 
     ``scope=None`` fail-closes on a partitioned deployment (tenant_scope_required).
     It cannot mean "no tenancy" there: ``base`` is the shared root every
@@ -235,12 +255,10 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
         raise MissingTenantScopeError(
             "filesystem store requires an organization in scope"
         )
-    # "" is silently dropped by pathlib (store collapses onto the org root);
-    # "."/".."/separators would escape it.
-    if not store or store in (".", "..") or "/" in store or "\\" in store:
-        raise ValueError(f"invalid storage store segment: {store!r}")
+    partition = storage_segment(scope.org_id, what="partition")
+    store = storage_segment(store, what="store")
     shared = Path(get_app_settings().storage.shared_root)
-    return shared / scope.org_id / store
+    return shared / partition / store
 
 
 # The segment under a store's partition that holds the per-person tiers.
@@ -290,10 +308,13 @@ def scoped_user_storage_root(
         raise MissingTenantScopeError(
             "per-user filesystem store requires a user in scope"
         )
-    # scoped_storage_root checks the org and the store segment.
+    user_id = storage_segment(scope.user_id, what="user")
+    # scoped_storage_root checks the org and the store segment. The path below
+    # joins only the values storage_segment returned, never the raw ids.
     scoped_storage_root(base, scope, store=store)
+    partition = storage_segment(scope.org_id, what="partition")
     return Path(get_app_settings().storage.shared_root).joinpath(
-        *user_store_segments(scope.org_id, scope.user_id, store=store)
+        *user_store_segments(partition, user_id, store=store)
     )
 
 

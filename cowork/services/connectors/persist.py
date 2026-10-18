@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from anton.utils.datasources import ensure_unique_user_label
 
+from cowork.code_sandbox import PlantedLinkError, refuse_planted_links
 from cowork.common.settings.app_settings import ConnectorSettings, get_app_settings
 from cowork.creators import Changer, changer_for, turn_changer_for
 from cowork.managed import (
@@ -58,10 +59,19 @@ def own_vault_root(scope: "TenantScope | None" = None) -> Path:
 
 
 def own_vault_for_scope(scope: "TenantScope | None" = None) -> LocalDataVault:
-    """The vault ``scope`` saves into, without the operator's managed entries."""
+    """The vault ``scope`` saves into, without the operator's managed entries.
+
+    Every read and save of a person's vault, their own or a connection they
+    share, starts here, so under the code sandbox a link or hard-linked record
+    left in it by agent code before the sandbox fails the read or save here
+    (refuse_planted_links) instead of the server following it. Someone else
+    reading what they share goes on without it (_shared_sources).
+    """
     from anton.core.datasources.data_vault import LocalDataVault
 
-    return LocalDataVault(own_vault_root(scope))
+    root = own_vault_root(scope)
+    refuse_planted_links(root)
+    return LocalDataVault(root)
 
 
 def _registry_for(scope: "TenantScope | None", managed: ManagedFolder | None) -> SharedConnections:
@@ -75,12 +85,45 @@ def _registry_for(scope: "TenantScope | None", managed: ManagedFolder | None) ->
     return SharedConnections.read_live(managed.shared_connections_file, logger=logger)
 
 
-def _shared_from(entry: SharedConnection) -> SharedFrom:
-    """A registry entry with its creator's own vault, never their layered one."""
+def _shared_sources(
+    registry: tuple[SharedConnection, ...], *, own_partition: str | None
+) -> tuple[SharedFrom, ...]:
+    """The registry's entries other people share, in its order, each with its
+    creator's own vault, never their layered one. Each creator's vault is
+    opened once, for all of their entries.
+
+    A creator's vault that refuse_planted_links refuses shares nothing: an
+    error names the vault and each connection left out, and the reader's
+    vault is built without them. So a link left in one person's vault fails
+    only that person's own reads, not everyone's who reads what they share.
+    """
     from cowork.db.scoped import scope_for_identity
 
-    creator = scope_for_identity(org_id=entry.partition_id, user_id=entry.user_id)
-    return SharedFrom(entry=entry, vault=own_vault_for_scope(creator))
+    vaults: dict[tuple[str, str], LocalDataVault | None] = {}
+    shared: list[SharedFrom] = []
+    for entry in registry:
+        if entry.partition_id == own_partition:
+            continue
+        key = (entry.partition_id, entry.user_id)
+        if key not in vaults:
+            creator = scope_for_identity(org_id=entry.partition_id, user_id=entry.user_id)
+            try:
+                vaults[key] = own_vault_for_scope(creator)
+            except PlantedLinkError as error:
+                vaults[key] = None
+                left_out = ", ".join(
+                    f"{other.engine}/{other.name}"
+                    for other in registry
+                    if (other.partition_id, other.user_id) == key
+                )
+                logger.error(
+                    "the shared connections %s are left out until the vault %s is fixed: %s",
+                    left_out, own_vault_root(creator), error,
+                )
+        vault = vaults[key]
+        if vault is not None:
+            shared.append(SharedFrom(entry=entry, vault=vault))
+    return tuple(shared)
 
 
 def vault_for_scope(scope: "TenantScope | None" = None) -> LocalDataVault | LayeredDataVault:
@@ -119,9 +162,7 @@ def _vault_changed_by(
     return LayeredDataVault(
         own=own,
         managed=None if managed is None else LocalDataVault(managed.vault_dir),
-        shared=tuple(
-            _shared_from(entry) for entry in registry if entry.partition_id != own_partition
-        ),
+        shared=_shared_sources(registry, own_partition=own_partition),
         shared_by_own=frozenset(
             (entry.engine, entry.name) for entry in registry if entry.partition_id == own_partition
         ),

@@ -24,6 +24,7 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
     TenantScope,
+    storage_segment,
     user_store_segments,
     user_store_tiers_segments,
 )
@@ -570,28 +571,36 @@ def remove_project_memory_tiers(*, scope: TenantScope, project_id: UUID) -> int:
     id goes. Everywhere else project memory sits in the project's own folder
     and goes with it.
 
-    The deployment's tier goes first, and an error there is raised. A person's
-    tier that can't be removed, such as one behind a link planted in their
-    chain, is logged and skipped, so it never keeps another person's tier.
+    The scope's ids are checked before anything is removed. The deployment's
+    tier goes first, and an error there is raised. A person's tier that can't
+    be removed, such as one behind a link planted in their chain, is logged
+    and skipped, so it never keeps another person's tier.
     """
     settings = get_app_settings()
     if not settings.trust_identity_headers:
         return 0
     name = str(UUID(str(project_id)))
-    removed = 0
-    if _remove_tier(base=deployment_memory_root(), parents=(PROJECT_TIERS_DIRNAME,), name=name):
-        removed += 1
     shared = Path(settings.storage.shared_root)
     # <shared>/<partition>/memory/users/<sub>, the layout scoped_user_storage_root
     # gives a person's global tier (user_store_segments).
     if scope.partitioned_for(PersonalResource.PROJECTS):
-        people = [PersonTier(scope.org_id, scope.user_id)] if scope.org_id and scope.user_id else []
+        # The scope's ids come from the request, so each must be one folder
+        # name, refused here before any tier goes; the walk below takes names
+        # that are already folders.
+        people = (
+            [PersonTier(storage_segment(scope.org_id, what="partition"), storage_segment(scope.user_id, what="user"))]
+            if scope.org_id and scope.user_id
+            else []
+        )
     else:
         people = [
             PersonTier(partition, sub)
             for partition in _real_child_dirs(shared)
             for sub in _real_child_dirs(shared.joinpath(*user_store_tiers_segments(partition, store=MEMORY_STORE)))
         ]
+    removed = 0
+    if _remove_tier(base=deployment_memory_root(), parents=(PROJECT_TIERS_DIRNAME,), name=name):
+        removed += 1
     for tier in people:
         parents = (
             *user_store_segments(tier.partition, tier.sub, store=MEMORY_STORE),

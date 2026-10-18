@@ -12,10 +12,17 @@ from uuid import UUID
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
+from cowork.code_sandbox import (
+    build_cell_sandbox,
+    code_sandbox_on,
+    refuse_a_linked_project,
+    refuse_planted_links,
+    shared_files_dir,
+)
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
-from cowork.common.paths import cowork_home, pod_local_only
+from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.personal_resources import PersonalResource
@@ -256,12 +263,58 @@ def _apply_overlay_fallback(workspace, overlay: dict[str, str], overlay_kwargs: 
     Returns whether it applied. Extracted so the fallback is testable without
     constructing a full ChatSession, like the org-mode guard above. Gated on a
     non-empty overlay, which org mode never produces, so the untrusted shared
-    .env is not reachable from here.
+    .env is not reachable from here. Refused under the code sandbox: the
+    project's .env is the agent's to write, and loading it into this
+    process's own environment would hand the agent's lines to the server.
     """
     if not (overlay and not overlay_kwargs):
         return False
+    if code_sandbox_on():
+        raise RuntimeError(
+            "The installed anton can't carry the project's .env to its scratchpad, "
+            "and loading it into the server's own environment is refused under "
+            "COWORK_CODE_SANDBOX=landlock."
+        )
     workspace.apply_env_to_process()
     return True
+
+
+def _make_project_folder(base: Path, folder: Path, *, sandboxed: bool) -> None:
+    """Create ``folder``, one of the server's own folders in the project at
+    ``base`` (its ``skills/`` and ``.anton/*``).
+
+    Under the code sandbox the project is the agent's to write and this
+    process isn't locked, so a link planted below ``base`` raises OSError
+    instead of being followed (makedirs_below_nofollow). Off, the folder is
+    made the plain way, as on the desktop, where a project may link these
+    folders on purpose.
+    """
+    if sandboxed:
+        makedirs_below_nofollow(base, target=folder)
+    else:
+        folder.mkdir(parents=True, exist_ok=True)
+
+
+def _inside_project(base: Path, *, folder: Path) -> Path:
+    """``folder``, the agent's context folder (anton's context_dir, which
+    ANTON_CONTEXT_DIR sets), written below the project at ``base`` so
+    _make_project_folder makes it without following links. anton resolves
+    the folder against the resolved project, so a folder below ``base``
+    resolved counts as inside too.
+
+    The harness calls it under the code sandbox, where the server makes no
+    folder of its own outside the project: a folder outside it raises
+    RuntimeError naming the setting.
+    """
+    folder = Path(os.path.abspath(folder))
+    for root in (Path(os.path.abspath(base)), Path(os.path.realpath(base))):
+        if folder.is_relative_to(root):
+            return base / folder.relative_to(root)
+    raise RuntimeError(
+        f"The agent's context folder {folder} is outside the project {base}, and under "
+        "COWORK_CODE_SANDBOX=landlock the server makes its folders only inside the "
+        "project. Unset ANTON_CONTEXT_DIR, or set it to a folder inside the project."
+    )
 
 
 settings = AntonHarnessSettings()
@@ -506,6 +559,57 @@ _ATTACHMENT_AFFORDANCE = (
     "files that are neither in the project nor attached."
 )
 
+# The same rule under the code sandbox, where the shared folder every person's
+# agent reads and changes (cowork.code_sandbox.shared_files_dir) is a third
+# way in.
+_SANDBOXED_ATTACHMENT_AFFORDANCE = (
+    " Files reach you in exactly three ways: they are already in the project "
+    "directory above, the user attaches them to this conversation, or they are "
+    "in the shared folder at `{shared}`. If the user refers to a file you cannot "
+    "find in any of these places, ask them to attach it to the conversation, "
+    "which is how they grant you access. Do not ask them to type or paste a "
+    "filesystem path; you are not permitted to read files that are not in the "
+    "project, attached, or in the shared folder."
+)
+
+
+def _attachment_affordance() -> str:
+    """How a file the agent cannot reach gets to it: _ATTACHMENT_AFFORDANCE,
+    or under the code sandbox _SANDBOXED_ATTACHMENT_AFFORDANCE."""
+    if not code_sandbox_on():
+        return _ATTACHMENT_AFFORDANCE
+    return _SANDBOXED_ATTACHMENT_AFFORDANCE.format(shared=shared_files_dir())
+
+
+# What the agent may reach beside the project, in the project context.
+_OTHER_FILES_RULE = (
+    "The only other files that you are allowed to access are any items that are attached to the conversation. "
+    "Access to any files not attached to the conversation or located outside the project is strictly forbidden. "
+)
+
+
+def _other_files_rule(*, sandboxed: bool) -> str:
+    """_OTHER_FILES_RULE, or under the code sandbox the same rule with the
+    shared folder allowed, named, and said to be every person's agent's."""
+    if not sandboxed:
+        return _OTHER_FILES_RULE
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation, "
+        f"and the files in the shared folder at `{shared_files_dir()}`. "
+        "Every person's agent on this deployment can read and change the shared folder: use it to hand files "
+        "to other people, never put anything private there, and read and write it in the scratchpad. "
+        "Access to any other files outside the project is strictly forbidden. "
+    )
+
+
+# What the agent hears about long-running services under the code sandbox, in
+# place of the full-stack artifact and `launch_backend`, which anton refuses
+# there.
+_SANDBOXED_BACKENDS_RULE = (
+    "App backends are off on this deployment because your code runs in a sandbox, so never "
+    "build a full-stack artifact or call `launch_backend`; build static artifacts instead."
+)
+
 
 def _units_scope() -> TenantScope:
     """The scope a turn's own database units run under: the one its settings
@@ -603,7 +707,7 @@ async def _conversation_attachment_context(conversation, *, scope: TenantScope |
     files were uploaded (the Cyberdeck bug). Handing it the exact paths lets
     it read them on demand on any turn — not just the turn they arrived on.
 
-    Never returns "": every turn carries ``_ATTACHMENT_AFFORDANCE`` so the
+    Never returns "": every turn carries ``_attachment_affordance()`` so the
     agent always knows attaching is the route to a file it cannot reach
     (ENG-1357). Two distinct outcomes, and the distinction is load-bearing:
 
@@ -616,9 +720,16 @@ async def _conversation_attachment_context(conversation, *, scope: TenantScope |
       direction: the user attached a file and the agent flatly denies it
       exists.
     """
-    rows = await _read_attachments(conversation, scope=scope)
+    return _attachment_context_for(
+        await _read_attachments(conversation, scope=scope), conversation=conversation,
+    )
+
+
+def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -> str:
+    """``_conversation_attachment_context`` for rows already read: None is a
+    listing that could not be read."""
     if rows is None:
-        return _ATTACHMENT_AFFORDANCE
+        return _attachment_affordance()
     # Only list files that still exist on disk — a row whose file was
     # deleted would otherwise hand the agent a dead path to chase.
     # Resolve one row at a time: a single bad row (e.g. a path the OS
@@ -638,7 +749,7 @@ async def _conversation_attachment_context(conversation, *, scope: TenantScope |
     if not attached:
         return (
             " No files are currently attached to this conversation."
-            + _ATTACHMENT_AFFORDANCE
+            + _attachment_affordance()
         )
     return (
         " The user has attached the following files to THIS conversation. "
@@ -1130,9 +1241,16 @@ class AntonHarness:
         anton_settings = AntonSettings()
         anton_settings.resolve_workspace(str(base))
 
+        # Under the code sandbox, a project reached through a link is refused
+        # before the server writes into it, and the server's own folders in
+        # it never follow a link (_make_project_folder).
+        sandboxed = code_sandbox_on()
+        if sandboxed:
+            refuse_a_linked_project(base)
+
         # Per-project skills
         project_skills_dir = base / "skills"
-        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        _make_project_folder(base, project_skills_dir, sandboxed=sandboxed)
         anton_settings.skills_root = project_skills_dir
 
         # Host skills: read-only, they back
@@ -1177,7 +1295,13 @@ class AntonHarness:
             anton_settings.router_model = router_model
 
         workspace = Workspace(base)
-        workspace.initialize()
+        if sandboxed:
+            # .anton, .anton/memory, anton.md and .env never follow a link.
+            # Passed directly, never through supported_kwargs: create_app
+            # refuses the sandbox on an anton without it (_anton_sandbox_gap).
+            workspace.initialize(refuse_links=True)
+        else:
+            workspace.initialize()
         workspace_env_overlay = _load_workspace_env_if_safe(workspace)
 
         overlay_kwargs = supported_kwargs(
@@ -1201,12 +1325,14 @@ class AntonHarness:
         # rather than auto-saved.
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
+        if sandboxed:
+            context_dir = _inside_project(base, folder=context_dir)
         episodes_dir = anton_dir / "episodes"
         # On a deployment that trusts identity headers the project's
         # .anton/memory is never this turn's project tier (person_turn_memory);
         # anton's Workspace above still creates it, empty.
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir):
-            directory.mkdir(parents=True, exist_ok=True)
+            _make_project_folder(base, directory, sandboxed=sandboxed)
 
         llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
         _apply_client_models(anton_settings, llm_client)
@@ -1228,9 +1354,10 @@ class AntonHarness:
         # (.cowork/files/<uuid>/<name>), OUTSIDE the project directory — so
         # the agent must be told their exact paths or it scans only the
         # project root and wrongly reports "no files uploaded" (Cyberdeck bug).
-        attachment_context = await _conversation_attachment_context(
-            conversation, scope=current_settings_scope(),
-        )
+        # Read once: the prompt lists them, and the code sandbox grants their
+        # folders read-only.
+        attachment_rows = await _read_attachments(conversation, scope=current_settings_scope())
+        attachment_context = _attachment_context_for(attachment_rows, conversation=conversation)
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
         # scramble a turn's tool_use/tool_result block-rows. The same unit
@@ -1241,6 +1368,8 @@ class AntonHarness:
         )
         ordered_messages = history.messages
 
+        # App backends are refused under the code sandbox (`sandboxed`), so
+        # the agent is never told to build one.
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
@@ -1251,15 +1380,18 @@ class AntonHarness:
             "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
-            + "The only other files that you are allowed to access are any items that are attached to the conversation. "
-            "Access to any files not attached to the conversation or located outside the project is strictly forbidden. "
-            "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
+            + _other_files_rule(sandboxed=sandboxed)
+            + "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
-            "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+            + (
+                _SANDBOXED_BACKENDS_RULE
+                if sandboxed
+                else "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+            )
             + attachment_context
         )
         output_context = (
@@ -1270,7 +1402,7 @@ class AntonHarness:
             # (which conversation, which turns) is tracked server-side
             # and stamped into each folder's metadata.json + README.md
             # automatically.
-            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, fullstack apps, etc.) live under `{str(artifacts_dir)}/`. "
+            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
@@ -1413,6 +1545,14 @@ class AntonHarness:
                 if turn_scratch_dir is None:
                     turn_scratch_dir = _new_turn_scratch_dir()
                 memory_layout = empty_turn_memory(turn_scratch_dir / "memory")
+            if not memory_off:
+                # anton's Hippocampus writes the tiers by path, so under the code
+                # sandbox a link or hard-linked file that agent code left in one,
+                # the person's own or the shared store, fails the turn instead of
+                # being written through. With memory off the turn has only the
+                # empty tiers in its scratch folder and uses no stored tier.
+                for tier in (memory_layout.global_dir, memory_layout.project_dir):
+                    refuse_planted_links(tier)
             memory_layout.global_dir.mkdir(parents=True, exist_ok=True)
             memory_layout.project_dir.mkdir(parents=True, exist_ok=True)
             cortex = _turn_cortex(
@@ -1437,11 +1577,13 @@ class AntonHarness:
             # (linked_turn_skills), and neither do the fan-outs into projects
             # (reconcile_skill_links, reconcile_project).
             managed = managed_folder()
+            managed_skill_dirs: dict[str, Path] = {}
             if managed is not None:
                 if turn_scratch_dir is None:
                     turn_scratch_dir = _new_turn_scratch_dir()
                 managed_skills_dir = turn_scratch_dir / "managed-skills"
-                sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed.skill_dirs())
+                managed_skill_dirs = managed.skill_dirs()
+                sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed_skill_dirs)
                 anton_settings.skills_extra_roots = [
                     *anton_settings.skills_extra_roots,
                     managed_skills_dir,
@@ -1456,7 +1598,15 @@ class AntonHarness:
             # linked into the scratch folder too, which anton reads as its last
             # host root: read-only, after the managed skills.
             turn_scope = current_settings_scope()
-            if not links_apply_to(turn_scope):
+            # The folders a sandboxed cell reads beside its project: every
+            # read-only skill root, each linked skill's own folder (the
+            # managed ones included, since Landlock checks where a link
+            # resolves), and each attachment's folder.
+            read_only_dirs: list[Path] = list(managed_skill_dirs.values())
+            if links_apply_to(turn_scope):
+                # The project's skills/ holds links into the one shared store.
+                read_only_dirs.append(Path(get_app_settings().skill.root_dir))
+            else:
                 if turn_scope is not None and turn_scope.partitioned_for(
                     PersonalResource.PROJECTS
                 ):
@@ -1474,13 +1624,21 @@ class AntonHarness:
                         *anton_settings.skills_extra_roots,
                         shared_skills_dir,
                     ]
-                link_turn_skills(
+                read_only_dirs += link_turn_skills(
                     scope=turn_scope,
                     project_name=conversation.project.name,
                     skills_dir=turn_skills_dir,
                     shared_skills_dir=shared_skills_dir,
                 )
+                if turn_skills_dir != project_skills_dir:
+                    read_only_dirs.append(turn_skills_dir)
                 anton_settings.skills_root = turn_skills_dir
+            read_only_dirs += anton_settings.skills_extra_roots
+            read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
+            # None with the sandbox off, and then not passed at all.
+            cell_sandbox = build_cell_sandbox(
+                scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
+            )
 
             config = ChatSessionConfig(
                 llm_client=llm_client,
@@ -1562,6 +1720,10 @@ class AntonHarness:
                 # also rejects this kwarg — passing it there is a TypeError
                 # that takes down every turn.
                 **({"mcp_sessions": mcp_sessions} if mcp_wiring is not None else {}),
+                # Passed directly, never through supported_kwargs: create_app
+                # refuses the sandbox on an anton without the field, and a
+                # dropped policy would run every cell unlocked.
+                **({"cell_sandbox": cell_sandbox} if cell_sandbox is not None else {}),
                 cells=cells
             )
             # Not `ChatSession(config)` directly: every construction of anton's

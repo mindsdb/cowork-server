@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
+from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.coding.connector_capabilities import (
     ConnectorCapability,
@@ -121,8 +122,11 @@ from cowork.services.skills import CodeSkillService
 # whole credential this surface has. Declared on the router rather than per
 # route because it REFUSES — the 106 routes below inherit a check, so a new
 # one added here is closed until someone opens it, which is the opposite of
-# what inheriting OpenByDesign did.
-router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly))])
+# what inheriting OpenByDesign did. Under the code sandbox the whole surface
+# answers 403 (refuse_code_mode_in_sandbox).
+router = APIRouter(
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(refuse_code_mode_in_sandbox)]
+)
 logger = logging.getLogger(__name__)
 
 
