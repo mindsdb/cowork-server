@@ -46,6 +46,15 @@ class WorkspaceMode(str, Enum):
     worktree = "worktree"
 
 
+class WorkspaceModeOptions(BaseModel):
+    """The modes a new task could run in, and the one it gets if it asks for none."""
+
+    supported: list[WorkspaceMode]
+    default: WorkspaceMode
+    # Why working in the original folder is not offered, when it is not.
+    in_place_unavailable_reason: str | None = None
+
+
 class PermissionMode(str, Enum):
     read_only = "read_only"
     supervised = "supervised"

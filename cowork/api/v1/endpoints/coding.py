@@ -44,6 +44,7 @@ from cowork.coding.contracts import (
     TurnRequest,
     GitIdentity,
     GitIdentityRequest,
+    WorkspaceModeOptions,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
@@ -227,6 +228,16 @@ def _require_inference_client(request: Request) -> None:
 @router.get("/engines")
 def engines():
     return _service().capabilities()
+
+
+@router.get("/workspace-modes", response_model=WorkspaceModeOptions)
+def workspace_modes(
+    project_id: str | None = Query(default=None, min_length=1, max_length=128),
+    computer_id: str | None = Query(default=None, min_length=1, max_length=128),
+    path: str | None = Query(default=None, min_length=1, max_length=32_768),
+):
+    """Which workspace modes the composer may offer for a new task, optionally for one folder."""
+    return _call(_service().workspace_mode_options, project_id, computer_id, path)
 
 
 @router.get("/models")

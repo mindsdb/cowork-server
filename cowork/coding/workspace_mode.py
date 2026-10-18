@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-from cowork.coding.contracts import WorkspaceMode
+from cowork.coding.contracts import WorkspaceMode, WorkspaceModeOptions
 
 # An in-place task relies on Codex's sandbox to keep writes inside the user's
 # folder: Seatbelt on macOS and Landlock on Linux. Its Windows sandbox has not
@@ -66,6 +66,41 @@ def resolve_workspace_mode(
     if project_default is not None and project_default in supported:
         return project_default
     return _LOCAL_DEFAULT if runs_locally and not org_mode else _RUNTIME_DEFAULT
+
+
+def workspace_mode_options(
+    project_default: WorkspaceMode | None,
+    *,
+    runs_locally: bool,
+    org_mode: bool,
+    project_task: bool = False,
+    platform: str | None = None,
+) -> WorkspaceModeOptions:
+    """What a client may offer for a new task, resolved the way creation resolves it."""
+    context = {"runs_locally": runs_locally, "org_mode": org_mode, "project_task": project_task, "platform": platform}
+    supported = supported_workspace_modes(**context)
+    return WorkspaceModeOptions(
+        supported=list(supported),
+        default=resolve_workspace_mode(None, project_default, **context),
+        in_place_unavailable_reason=(
+            None
+            if WorkspaceMode.in_place in supported
+            else _unsupported_message(
+                WorkspaceMode.in_place, runs_locally=runs_locally, org_mode=org_mode, project_task=project_task,
+            )
+        ),
+    )
+
+
+def without_in_place(options: WorkspaceModeOptions, reason: str) -> WorkspaceModeOptions:
+    """``options`` for a folder that cannot be worked in directly."""
+    if WorkspaceMode.in_place not in options.supported:
+        return options
+    return WorkspaceModeOptions(
+        supported=[mode for mode in options.supported if mode != WorkspaceMode.in_place],
+        default=WorkspaceMode.worktree if options.default == WorkspaceMode.in_place else options.default,
+        in_place_unavailable_reason=reason,
+    )
 
 
 def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool, project_task: bool) -> str:
