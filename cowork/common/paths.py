@@ -379,6 +379,30 @@ def opened_subdir_nofollow(
         os.close(fd)
 
 
+def makedirs_below_nofollow(base: Path, *, target: Path) -> None:
+    """``target.mkdir(parents=True, exist_ok=True)``, refusing a symlink below
+    *base*.
+
+    For folders the server creates inside a folder the agent's code can
+    write, such as a project's ``skills/`` and ``.anton/artifacts/``: every
+    component from *base* down to *target* is created and opened with
+    ``O_NOFOLLOW`` (``opened_subdir_nofollow``), so a planted link raises
+    ``OSError`` instead of sending the server's mkdir elsewhere. *base* itself
+    is trusted and created normally. A *target* outside *base* is created the
+    plain way.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        parts = target.relative_to(base).parts
+    except ValueError:
+        parts = ("..",)
+    if ".." in parts:
+        target.mkdir(parents=True, exist_ok=True)
+        return
+    with opened_subdir_nofollow(base, *parts, create=True):
+        pass
+
+
 def safe_join(base: Path | str, *parts: str) -> Path:
     """Join user-controlled *parts* onto *base*, guaranteeing containment.
 

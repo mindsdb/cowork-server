@@ -832,7 +832,10 @@ class AppSettings(Settings):
             "cowork.principal.personal_partition_id. Only for a deployment "
             "behind a proxy that verifies each person and strips client copies "
             "of those headers. create_app refuses it in org tenancy, when "
-            "COWORK_REQUIRE_AUTH is off, and with COWORK_TURN_BACKEND=remote. "
+            "COWORK_REQUIRE_AUTH is off, with COWORK_TURN_BACKEND=remote, with "
+            "COWORK_CODE_SANDBOX off, and without COWORK_AUTH_TOKEN in the "
+            "environment; with it on, the token is never copied into "
+            "cowork-home's .env. "
             "COWORK_IDENTITY_ENFORCE applies: 'enforce' answers 401 without a "
             "valid pair, and 'audit' serves a request carrying no pair as the "
             "operator view, with no person; a pair that is present but broken "
@@ -895,6 +898,25 @@ class AppSettings(Settings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    code_sandbox: Literal["off", "landlock"] = Field(
+        default="off",
+        validation_alias=AliasChoices("COWORK_CODE_SANDBOX"),
+        description=(
+            "How the agent's code runs (cowork.code_sandbox). 'off' (default): "
+            "every cell, install and check starts as today, with the server's "
+            "environment and files. 'landlock': each one starts through anton's "
+            "launcher, which locks it with Landlock to the conversation's "
+            "project, the asker's own HOME and TMPDIR, the skills and "
+            "attachments of the turn, the shared folder and the system's "
+            "read-only files, with an allowlisted environment. create_app "
+            "refuses COWORK_TRUST_IDENTITY_HEADERS with it off, and refuses "
+            "'landlock' in org tenancy, with COWORK_TURN_BACKEND=remote, on an "
+            "anton without the launcher, below Landlock ABI 3 (Linux 6.2), and "
+            "when its startup self-test can't confirm a denied path is denied. "
+            "Under 'landlock', app backends and Code mode are refused."
+        ),
+    )
 
     organization_switch_enabled: bool = Field(
         default=False,

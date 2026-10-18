@@ -92,7 +92,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "settings": PersonalResource.SETTINGS,
 }
 
-STORE_RESOURCE: dict[str, PersonalResource] = {
+# None keeps a store in each person's partition in every personal scope,
+# whatever COWORK_PERSONAL_RESOURCES lists.
+STORE_RESOURCE: dict[str, PersonalResource | None] = {
     "projects": PersonalResource.PROJECTS,
     # Publish history (cowork.services.publish), part of an artifact's
     # publish state.
@@ -102,4 +104,11 @@ STORE_RESOURCE: dict[str, PersonalResource] = {
     "code-skills": PersonalResource.SKILLS,
     "data-vault": PersonalResource.CONNECTIONS,
     "memory": PersonalResource.MEMORY,
+    # The HOME and TMPDIR each person's agent code runs with, and the
+    # folders of their credential probes (cowork.code_sandbox). Every
+    # person's own whenever identity headers are on, whatever the list leaves
+    # shared, memory included: one person's pip cache, temporary files or
+    # candidate credentials never reach another person's cells. The operator
+    # view keeps the base store.
+    "sandbox": None,
 }

@@ -326,6 +326,21 @@ def test_bob_lists_and_reads_alices_shared_skill_read_only(sharing, scoped):
     assert not (SkillService(BOB).root / SHARED).exists()
 
 
+def test_a_turn_learns_the_folders_its_links_point_at(sharing, stores):
+    """The turn's code sandbox grants exactly these folders read-only: Bob's
+    own skills and the one Alice shares, in her own store."""
+    skills_dir = stores / "bob-turn" / "skills"
+    shared_dir = stores / "bob-turn" / "shared-skills"
+
+    targets = link_turn_skills(
+        scope=BOB, project_name="general", skills_dir=skills_dir, shared_skills_dir=shared_dir
+    )
+
+    linked = [*_links(skills_dir).values(), *_links(shared_dir).values()]
+    assert sorted(target.resolve() for target in targets) == sorted(linked)
+    assert (SkillService(ALICE).root / SHARED).resolve() in linked
+
+
 def test_every_change_bob_tries_is_refused(sharing, scoped):
     before = (SkillService(ALICE).root / SHARED / "SKILL.md").read_bytes()
 

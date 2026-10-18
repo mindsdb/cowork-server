@@ -27,6 +27,7 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
+from cowork.code_sandbox import backends_off_message, code_sandbox_on
 from cowork.common.http_client import get_proxy_client
 from cowork.db.scoped import TenantScope
 from cowork.services.artifacts import (
@@ -150,6 +151,11 @@ async def proxy_artifact_request(
     # proxy answers usefully in org mode.
     if _org_mode():
         return PlainTextResponse(_NO_EXEC_DETAIL, status_code=403, headers=cors)
+    # Under the code sandbox no backend can run, so there is nothing to
+    # forward to, and the same chain applies: a static preview's token plus a
+    # `port` the agent writes would reach the server's own loopback port.
+    if code_sandbox_on():
+        return PlainTextResponse(backends_off_message(), status_code=403, headers=cors)
 
     # Short-circuit preflight so artifact backends don't need to
     # implement OPTIONS themselves.

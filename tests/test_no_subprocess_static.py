@@ -67,11 +67,29 @@ caller's `_org_mode()` check. That indirection makes it a hole in the
 mechanism rather than a live one: a new, closer caller added later would
 spawn it unguarded with this test still green, which is exactly what listing
 it here as a named site prevents.
+
+The same sites matter on a self-hosted deployment, where every person's agent
+code runs beside this server. There COWORK_CODE_SANDBOX=landlock starts each
+of anton's spawns through its Landlock launcher, under the policy
+cowork.code_sandbox.build_cell_sandbox builds, and a construction that drops
+that policy runs the agent's code unlocked. So every construction that leads
+to an anton spawn (ChatSessionConfig, anton's ScratchpadManager and its
+default runtime factory, LocalScratchpadRuntime, the backend pool and its
+registry, and the credential probe) must pass ``cell_sandbox`` too:
+test_every_agent_code_construction_passes_the_policy reads each one, through
+the file's import aliases. At runtime, build_chat_session and the pool's
+_make_runtime and get_or_create also refuse a missing policy under the
+sandbox (cowork.code_sandbox.refuse_a_missing_policy). The launcher's startup
+self-test is a spawn of its own, listed below; Code mode's git,
+project-command and Codex sites are refused under the sandbox
+(refuse_code_mode_in_sandbox), and app backends too (_ensure_backend_running).
 """
 
 import ast
 from collections import Counter
 from pathlib import Path
+
+import pytest
 
 COWORK_ROOT = Path(__file__).resolve().parent.parent / "cowork"
 
@@ -114,13 +132,32 @@ BANNED_ATTRS = {
     "posix_spawnp",
     "fork",
     "forkpty",
+    "execlpe",
+    "spawnle",
+    "spawnlpe",
+    "spawnvp",
+    "spawnvpe",
+    "startfile",
 }
+#: An event loop's own spawns, on whatever receiver: `loop.subprocess_exec`,
+#: `asyncio.get_running_loop().subprocess_shell(...)`.
+LOOP_SPAWN_ATTRS = {"subprocess_exec", "subprocess_shell"}
 BANNED_NAMES = {"eval", "exec", "compile", "__import__"}
 #: Dangerous callables named by their canonical dotted path, so the module's
 #: SAFE helpers are not swept up: `importlib.import_module` is banned but
 #: `importlib.metadata.version` is not; `yaml.load` is banned but
 #: `yaml.safe_load` is not.
-BANNED_CALLS = {"importlib.import_module", "yaml.load", "yaml.unsafe_load"}
+BANNED_CALLS = {
+    "importlib.import_module",
+    "yaml.load",
+    "yaml.unsafe_load",
+    # Spawns anton's Landlock launcher in a child process.
+    "anton.core.backends.sandbox.self_test",
+    "anyio.open_process",
+    "anyio.run_process",
+    # Forks this process into workers.
+    "concurrent.futures.ProcessPoolExecutor",
+}
 BANNED_CONSTRUCTORS = {"ChatSession", "LocalScratchpadRuntime"}
 BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 
@@ -234,6 +271,14 @@ ALLOWLIST = (
         "single-entry site rather than an unlisted local import",
     ),
     (
+        "code_sandbox.py",
+        "_run_self_test",
+        "anton.core.backends.sandbox.self_test",
+        "the code sandbox's startup self-test: runs anton's launcher once, in a "
+        "child process, against a folder it creates, and only with "
+        "COWORK_CODE_SANDBOX=landlock",
+    ),
+    (
         "channels/registry.py",
         "load_first_party_plugins",
         "importlib.import_module",
@@ -249,6 +294,13 @@ ALLOWLIST = (
     ),
     (
         "services/artifact_export.py",
+        "_to_pdf",
+        "xhtml2pdf.CreatePDF",
+        "PDF export render call (`pisa.CreatePDF`); same endpoint org-mode "
+        "refusal as the import",
+    ),
+    (
+        "services/artifact_export.py",
         "_to_docx",
         "htmldocx",
         "DOCX export renderer import; the export endpoint refuses docx in org "
@@ -260,6 +312,41 @@ ALLOWLIST = (
         "htmldocx.HtmlToDocx",
         "DOCX export render call; same endpoint org-mode refusal as the import",
     ),
+)
+
+
+#: Constructions that lead to an anton spawn of agent code, and so must carry
+#: the code sandbox's policy: the session config of a turn and of the probe,
+#: anton's pad manager and its default runtime factory, the backend pool's
+#: runtime, the pool and its registry, and the probe itself. Matched by the
+#: callable's own name through the file's import aliases; a dotted entry
+#: matches only through its module, since `get_or_create` alone names many
+#: methods.
+POLICY_CARRIERS = {
+    "ChatSessionConfig",
+    "ScratchpadManager",
+    "local_scratchpad_runtime_factory",
+    "LocalScratchpadRuntime",
+    "WorkspaceScopedPool",
+    "CredentialProbe",
+    "_make_runtime",
+    "scratchpad_runtime.get_or_create",
+}
+
+#: Where each carrier is constructed today, so the scan below is known to see
+#: them: (relative path, enclosing function, carrier).
+POLICY_CARRIER_SITES = (
+    ("harnesses/anton_harness/harness.py", "AntonHarness._build_chat_session", "ChatSessionConfig"),
+    ("services/connectors/probe.py", "CredentialProbe.run", "ChatSessionConfig"),
+    ("handlers/probe.py", "ProbeHandler.run", "CredentialProbe"),
+    ("services/scratchpad_runtime.py", "_make_runtime", "LocalScratchpadRuntime"),
+    ("services/scratchpad_runtime.py", "get_or_create", "_make_runtime"),
+    (
+        "services/scratchpad_runtime.py",
+        "WorkspaceScopedPool._pad",
+        "scratchpad_runtime.get_or_create",
+    ),
+    ("services/artifacts.py", "_launch_backend_locked", "WorkspaceScopedPool"),
 )
 
 
@@ -284,7 +371,8 @@ def _collect_aliases(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
     callable, mapped to the canonical dotted name it was imported from.
 
     Returns `(modules, callables)`: `import subprocess as _sp` puts
-    `_sp -> subprocess` in the first; `from subprocess import run as _r` puts
+    `_sp -> subprocess` in the first, and `import concurrent.futures as cf`
+    puts `cf -> concurrent.futures`; `from subprocess import run as _r` puts
     `_r -> subprocess.run` in the second. Without this, a banned call hides
     behind any local rename.
 
@@ -300,14 +388,30 @@ def _collect_aliases(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root = alias.name.split(".")[0]
-                modules[alias.asname or root] = root
+                if alias.asname:
+                    modules[alias.asname] = alias.name
+                else:
+                    root = alias.name.split(".")[0]
+                    modules[root] = root
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             for alias in node.names:
                 local = alias.asname or alias.name
                 callables[local] = f"{mod}.{alias.name}" if mod else alias.name
     return modules, callables
+
+
+def _owner(node: ast.expr, *, modules: dict[str, str], callables: dict[str, str]) -> str:
+    """The dotted name an attribute's owner refers to, through the file's
+    import aliases (`cf` -> `concurrent.futures`, `futures.x` ->
+    `concurrent.futures.x`), or "" when it is neither a name nor a chain of
+    attributes on one."""
+    if isinstance(node, ast.Name):
+        return modules.get(node.id) or callables.get(node.id) or node.id
+    if isinstance(node, ast.Attribute):
+        owner = _owner(node.value, modules=modules, callables=callables)
+        return f"{owner}.{node.attr}" if owner else ""
+    return ""
 
 
 def _banned_label(
@@ -321,14 +425,16 @@ def _banned_label(
     know a local rename.
     """
     if isinstance(fn, ast.Attribute):
-        raw_owner = fn.value.id if isinstance(fn.value, ast.Name) else ""
-        owner = modules.get(raw_owner, raw_owner)
-        if fn.attr in BANNED_ATTRS and owner == "os":
+        owner = _owner(fn.value, modules=modules, callables=callables)
+        root = owner.split(".")[0]
+        if fn.attr in LOOP_SPAWN_ATTRS:
+            return f"loop.{fn.attr}"
+        if fn.attr in BANNED_ATTRS and root == "os":
             return f"os.{fn.attr}"
         if fn.attr.startswith("create_subprocess_"):
             return f"asyncio.{fn.attr}"
-        if owner in BANNED_MODULES:
-            return f"{owner}.{fn.attr}"
+        if root in BANNED_MODULES:
+            return f"{root}.{fn.attr}"
         if f"{owner}.{fn.attr}" in BANNED_CALLS:
             return f"{owner}.{fn.attr}"
         if fn.attr in BANNED_CONSTRUCTORS:
@@ -463,12 +569,14 @@ class _SiteVisitor(ast.NodeVisitor):
         ):
             return None
         attr = attr_node.value
-        raw_owner = owner_node.id if isinstance(owner_node, ast.Name) else ""
-        owner = self._modules.get(raw_owner, raw_owner)
-        if owner == "os" and attr in BANNED_ATTRS:
+        owner = _owner(owner_node, modules=self._modules, callables=self._callables)
+        root = owner.split(".")[0]
+        if attr in LOOP_SPAWN_ATTRS:
+            return f"loop.{attr}"
+        if root == "os" and attr in BANNED_ATTRS:
             return f"os.{attr}"
-        if owner in BANNED_MODULES:
-            return f"{owner}.{attr}"
+        if root in BANNED_MODULES:
+            return f"{root}.{attr}"
         if f"{owner}.{attr}" in BANNED_CALLS:
             return f"{owner}.{attr}"
         return None
@@ -501,6 +609,170 @@ def _render(counts: Counter[tuple[str, str, str]]) -> str:
         f"  {rel}: {enclosing}: {label}" + (f" (x{n})" if n > 1 else "")
         for (rel, enclosing, label), n in sorted(counts.items())
     )
+
+
+def _carrier(
+    fn: ast.expr, *, module: str, modules: dict[str, str], callables: dict[str, str]
+) -> str | None:
+    """The POLICY_CARRIERS entry a call's callable names, or None.
+
+    A bare name resolves through the file's imports, or else to the file's
+    own ``module``: `Cfg` imported `as` an alias of ChatSessionConfig is
+    ChatSessionConfig, and `get_or_create` inside scratchpad_runtime.py is
+    `scratchpad_runtime.get_or_create`. An attribute's owner resolves the
+    same way (_owner)."""
+    if isinstance(fn, ast.Attribute):
+        owner = _owner(fn.value, modules=modules, callables=callables)
+        dotted = f"{owner}.{fn.attr}" if owner else fn.attr
+    elif isinstance(fn, ast.Name):
+        dotted = callables.get(fn.id) or f"{module}.{fn.id}"
+    else:
+        return None
+    parts = dotted.split(".")
+    for candidate in (".".join(parts[-2:]), parts[-1]):
+        if candidate in POLICY_CARRIERS:
+            return candidate
+    return None
+
+
+class _CarrierVisitor(ast.NodeVisitor):
+    """Each construction of a POLICY_CARRIERS entry in one file, labeled by
+    where it lives, and whether it passes ``cell_sandbox``: as a keyword, or
+    inside a ``**`` mapping that names it. ``module`` is the file's dotted
+    module name, and ``modules`` and ``callables`` its import aliases
+    (_collect_aliases)."""
+
+    def __init__(
+        self, rel: str, *, module: str, modules: dict[str, str], callables: dict[str, str]
+    ) -> None:
+        self.rel = rel
+        self._module = module
+        self._modules = modules
+        self._callables = callables
+        self._stack: list[str] = []
+        self.found: list[tuple[str, str, str, bool]] = []
+
+    def _push(self, name: str, node: ast.AST) -> None:
+        self._stack.append(name)
+        self.generic_visit(node)
+        self._stack.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._push(node.name, node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._push(node.name, node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._push(node.name, node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = _carrier(
+            node.func, module=self._module, modules=self._modules, callables=self._callables
+        )
+        if name is not None:
+            passes = any(
+                keyword.arg == "cell_sandbox"
+                or (keyword.arg is None and "cell_sandbox" in ast.unparse(keyword.value))
+                for keyword in node.keywords
+            )
+            enclosing = ".".join(self._stack) if self._stack else "<module>"
+            self.found.append((self.rel, enclosing, name, passes))
+        self.generic_visit(node)
+
+
+def _carrier_visitor(rel: str, *, tree: ast.AST) -> _CarrierVisitor:
+    """The carrier scan of one file at ``rel`` below cowork/, run."""
+    modules, callables = _collect_aliases(tree)
+    module = ".".join(("cowork", *Path(rel).with_suffix("").parts))
+    visitor = _CarrierVisitor(rel, module=module, modules=modules, callables=callables)
+    visitor.visit(tree)
+    return visitor
+
+
+def _carrier_sites() -> list[tuple[str, str, str, bool]]:
+    found: list[tuple[str, str, str, bool]] = []
+    for path in sorted(COWORK_ROOT.rglob("*.py")):
+        rel = str(path.relative_to(COWORK_ROOT))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found.extend(_carrier_visitor(rel, tree=tree).found)
+    return found
+
+
+def test_every_agent_code_construction_passes_the_policy():
+    """A construction that leads to an anton spawn and passes no
+    ``cell_sandbox`` runs the agent's code unlocked under the sandbox."""
+    found = _carrier_sites()
+    assert {site[:3] for site in found} >= set(POLICY_CARRIER_SITES), (
+        "the scan no longer sees a known construction; update POLICY_CARRIER_SITES"
+    )
+    dropping = [site[:3] for site in found if not site[3]]
+    assert dropping == [], (
+        "construction(s) that pass no cell_sandbox, so the agent's code they "
+        "lead to would run outside the code sandbox:\n"
+        + "\n".join(f"  {rel}: {enclosing}: {name}" for rel, enclosing, name in dropping)
+    )
+
+
+def test_a_construction_without_the_policy_is_caught():
+    visitor = _carrier_visitor("snippet.py", tree=ast.parse(
+        "def build():\n"
+        "    ChatSessionConfig(llm_client=c)\n"
+        "    ChatSessionConfig(llm_client=c, **({'cell_sandbox': p} if p else {}))\n"
+        "    WorkspaceScopedPool(root, cell_sandbox=p)\n"
+    ))
+    assert [passes for *_, passes in visitor.found] == [False, True, True]
+
+
+@pytest.mark.parametrize(
+    ("source", "carrier"),
+    [
+        (
+            "from anton.core.session import ChatSessionConfig as Cfg\n"
+            "Cfg(llm_client=None)\n",
+            "ChatSessionConfig",
+        ),
+        (
+            "import anton.core.session as session_module\n"
+            "session_module.ChatSessionConfig(llm_client=None)\n",
+            "ChatSessionConfig",
+        ),
+        (
+            "from anton.core.backends.manager import ScratchpadManager\n"
+            "ScratchpadManager(runtime_factory=f).get_or_create('x')\n",
+            "ScratchpadManager",
+        ),
+        (
+            "from anton.core.backends.local import local_scratchpad_runtime_factory as factory\n"
+            "factory(name='x')\n",
+            "local_scratchpad_runtime_factory",
+        ),
+        (
+            "from cowork.services import scratchpad_runtime\n"
+            "scratchpad_runtime.get_or_create('x', workspace_path=p)\n",
+            "scratchpad_runtime.get_or_create",
+        ),
+        (
+            "from cowork.services.scratchpad_runtime import get_or_create as pad\n"
+            "pad('x', workspace_path=p)\n",
+            "scratchpad_runtime.get_or_create",
+        ),
+    ],
+)
+def test_a_construction_under_another_name_is_caught(source, carrier):
+    """The carrier scan resolves import aliases and reaches anton's own pad
+    manager, its runtime factory, and the backend pool's registry."""
+    visitor = _carrier_visitor("snippet.py", tree=ast.parse(source))
+    assert [(name, passes) for _rel, _enclosing, name, passes in visitor.found] == [
+        (carrier, False)
+    ]
+
+
+def test_another_objects_get_or_create_is_no_carrier():
+    visitor = _carrier_visitor("snippet.py", tree=ast.parse(
+        "pool.get_or_create('app')\nself._scratchpads.get_or_create('main')\n"
+    ))
+    assert visitor.found == []
 
 
 def test_execution_sites_match_the_allowlist():
@@ -584,3 +856,54 @@ def test_dunder_import_is_caught():
         label.startswith("__import__")
         for label in _snippet_labels("__import__('os')\n")
     )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import asyncio\nasyncio.get_running_loop().subprocess_exec(Protocol, 'py')\n",
+        "loop.subprocess_shell(Protocol, 'py -c 1')\n",
+        "fn = getattr(loop, 'subprocess_exec')\n",
+    ],
+)
+def test_an_event_loops_spawn_is_caught_on_any_receiver(source):
+    assert any(label.startswith("loop.subprocess_") for label in _snippet_labels(source))
+
+
+@pytest.mark.parametrize("name", ["execlpe", "spawnle", "spawnlpe", "spawnvp", "spawnvpe", "startfile"])
+def test_every_os_spawn_is_caught(name):
+    assert f"os.{name}" in _snippet_labels(f"import os\nos.{name}(py)\n")
+    assert f"os.{name}" in _snippet_labels(f"from os import {name}\n{name}(py)\n")
+
+
+@pytest.mark.parametrize(
+    ("source", "label"),
+    [
+        ("import anyio\nanyio.run_process(command)\n", "anyio.run_process"),
+        ("from anyio import open_process\nopen_process(command)\n", "anyio.open_process"),
+        (
+            "import concurrent.futures\nconcurrent.futures.ProcessPoolExecutor()\n",
+            "concurrent.futures.ProcessPoolExecutor",
+        ),
+        (
+            "import concurrent.futures as cf\ncf.ProcessPoolExecutor()\n",
+            "concurrent.futures.ProcessPoolExecutor",
+        ),
+        (
+            "from concurrent import futures\nfutures.ProcessPoolExecutor()\n",
+            "concurrent.futures.ProcessPoolExecutor",
+        ),
+        (
+            "from concurrent.futures import ProcessPoolExecutor\nProcessPoolExecutor()\n",
+            "concurrent.futures.ProcessPoolExecutor",
+        ),
+    ],
+)
+def test_anyio_spawns_and_a_process_pool_are_caught(source, label):
+    assert label in _snippet_labels(source)
+
+
+def test_a_thread_pool_is_not_a_spawn():
+    assert _snippet_labels(
+        "from concurrent.futures import ThreadPoolExecutor\nThreadPoolExecutor()\n"
+    ) == []

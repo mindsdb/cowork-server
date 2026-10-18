@@ -19,7 +19,13 @@ from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclar
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
-from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.auth_middleware import (
+    BearerTokenMiddleware,
+    ensure_auth_token,
+    remove_auth_token,
+    sync_auth_token,
+)
+from cowork.code_sandbox import check_startup as check_code_sandbox_startup
 from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
@@ -536,6 +542,10 @@ def create_app() -> FastAPI:
             "COWORK_TURN_BACKEND unset to run turns in this process."
         )
 
+    # Identity headers need the code sandbox, and the sandbox needs a kernel
+    # and an anton that hold it (cowork.code_sandbox.check_startup).
+    check_code_sandbox_startup(settings, remote_turns=TurnQueueSettings().is_remote)
+
     # Org mode, or local tenancy that trusts identity headers: build a
     # per-request Principal from the identity headers. Added first so it sits
     # inner of the bearer/CORS layers: in local tenancy it reads the headers
@@ -587,8 +597,24 @@ def create_app() -> FastAPI:
                 "Org deployments authenticate at the ingress instead."
             )
         env_path = cowork_home() / ".env"
-        token = settings.auth_token or ensure_auth_token(env_path)
-        sync_auth_token(env_path, token)
+        if settings.trust_identity_headers:
+            # With identity headers on, the token acts as any person, and the
+            # desktop app, which reads the copy in cowork-home's .env, never
+            # runs here. The token comes from the process environment alone,
+            # never settings.auth_token, which cowork-home's .env also fills,
+            # and a copy an earlier start wrote there is removed.
+            token = os.environ.get("COWORK_AUTH_TOKEN", "")
+            if not token:
+                raise RuntimeError(
+                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's "
+                    "environment: with identity headers on, the token acts as any person, "
+                    "so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
+                    "Set COWORK_AUTH_TOKEN where the server starts."
+                )
+            remove_auth_token(env_path)
+        else:
+            token = settings.auth_token or ensure_auth_token(env_path)
+            sync_auth_token(env_path, token)
         # Codex has a separate, process-local inference credential, not the
         # desktop's API token. These exact routes retain their own constant-time
         # credential check and LoopbackDesktopOnly guard. Do not exempt the
