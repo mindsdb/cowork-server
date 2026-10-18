@@ -77,6 +77,18 @@ states no number either, so a record's value equal to its hour, minutes or
 seconds is still read. A figure the model works out in its own text, without
 a step printing it, has no source.
 
+A figure written in a time unit, glued to its digits (12h) or as the word
+after it (22 hours, a 13.08-day lead time), is not held by a step that names
+time units but never the figure's: the 22 in a lead_time_days column is not
+the "22 hours" the model worked out. A step names a unit by its plural, in
+its output, input or label and inside identifiers too, since a singular is
+more often a rate's (cost_per_day) or a date part's (GROUP BY month). A step
+that names no time unit may hold the figure. A rate ("$42 per hour", "10
+units/day") has no time unit: the word after its figure names none. The rule
+misses a step that prints the figure's value while it names only another
+unit, such as a cell that turns days into hours (days_left * 24) or calls
+total_seconds() and prints a bare number; that figure has no source.
+
 Each step a figure names is described once: its kind, a short label, the file
 it read, the web page it reached, and the SQL and HTTP requests its code shows
 (``cell_queries``) or, for a connector tool, the statement its call ran. Its
@@ -343,6 +355,31 @@ _HEDGE = re.compile(
     r"(?:\b(?:about|around|roughly|approximately|approx\.?|nearly|almost|some|circa)|[~≈])[ \t]*\Z",
     re.IGNORECASE,
 )
+
+# The time units a figure can be written in, by the words and short forms
+# that name each one: glued to its digits (12h) or the word after it.
+_TIME_UNITS = {
+    "sec": "second", "secs": "second", "second": "second", "seconds": "second",
+    "min": "minute", "mins": "minute", "minute": "minute", "minutes": "minute",
+    "h": "hour", "hr": "hour", "hrs": "hour", "hour": "hour", "hours": "hour",
+    "d": "day", "day": "day", "days": "day",
+    "wk": "week", "wks": "week", "week": "week", "weeks": "week",
+    "month": "month", "months": "month",
+    "yr": "year", "yrs": "year", "year": "year", "years": "year",
+}
+# The words that name a time unit in a step's text: the plurals a duration's
+# name takes (lead_time_days, hours=21.98). A singular is more often a rate's
+# (holding_cost_per_day) or a date part's (GROUP BY month).
+_STEP_TIME_WORDS = frozenset({
+    "secs", "seconds", "mins", "minutes", "hrs", "hours", "days", "wks", "weeks", "months", "yrs", "years",
+})
+# The word just after a figure in prose, past emphasis and one space or
+# hyphen: "22 hours", "**22** hours", "13.08-day".
+_WORD_AFTER = re.compile(r"[*_]{0,2}[ \u00a0-]?[*_]{0,2}(?P<word>[A-Za-z]+)")
+# A word of a step's text, with identifiers split at underscores, digits and
+# case changes, so lead_time_days, leadTimeDays and LEAD_TIME_DAYS each end
+# in the word days.
+_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])")
 
 # A month name, spelled out or cut short, so "Maybe" and "decreased" are not
 # months. May counts only capitalized: "12 may arrive" is not a date.
@@ -717,7 +754,7 @@ def find_figure_sources(
     named: set[int] = set()
     figures: list[Figure] = []
     for number in numbers:
-        held = _holders(described, outputs=outputs, figure=number)
+        held = _holders(described, outputs=outputs, figure=number, time_unit=_time_unit(answer, figure=number))
         holders = _named_holders(described, outputs=outputs, figure=number, holders=held)
         readers = _readers(described, holders=holders, index_of=index_of)
         named.update(holders, readers)
@@ -818,6 +855,9 @@ class _DescribedStep:
     output_numbers: tuple[_Number, ...]
     input_values: frozenset[Decimal]
     document_has_pages: bool
+    # The time units its output, input and label name (``_time_units_named``);
+    # none for an earlier turn's step.
+    time_units: frozenset[str]
     # The cells, by tool_use_id, that read the data this cell's code draws on
     # through names earlier cells bound.
     drawn_from: frozenset[str] = frozenset()
@@ -1177,12 +1217,14 @@ def _described(
 ) -> _DescribedStep:
     # An output value equal to a number the step's input states only echoes
     # it, so it is not read, not even for a figure that rounds to it. An
-    # earlier turn's step holds no figure, so neither is read for it.
+    # earlier turn's step holds no figure, so neither is read for it, nor the
+    # time units it names.
     if step.earlier_turn:
-        input_values, output_numbers = frozenset(), ()
+        input_values, output_numbers, time_units = frozenset(), (), frozenset()
     else:
         input_values = frozenset(n.value for n in _numbers(_DIGIT_UNDERSCORE.sub("", literals)))
         output_numbers = tuple(n for n in _output_numbers(output) if n.value not in input_values)
+        time_units = _time_units_named(f"{output}\n{literals}\n{label}")
     return _DescribedStep(
         tool_use_id=step.tool_use_id,
         kind=kind,
@@ -1196,6 +1238,7 @@ def _described(
         input_values=input_values,
         # With several documents a figure's page could be any one's.
         document_has_pages=kind is SourceKind.file and len(documents) == 1 and documents[0].lower().endswith(".pdf"),
+        time_units=time_units,
         drawn_from=drawn_from,
     )
 
@@ -1580,12 +1623,36 @@ def _output_values(numbers: Sequence[_Number]) -> _OutputValues:
     )
 
 
-def _holders(steps: Sequence[_DescribedStep], *, outputs: Sequence[_OutputValues], figure: _Number) -> list[int]:
-    """The steps whose output holds the figure, in step order."""
+def _holders(
+    steps: Sequence[_DescribedStep], *, outputs: Sequence[_OutputValues], figure: _Number, time_unit: str,
+) -> list[int]:
+    """The steps whose output holds the figure, in step order. With the
+    figure's ``time_unit``, a step that names time units, none of them that
+    one, holds none: the 22 of its lead_time_days is not "22 hours"."""
     return [
         index for index, step in enumerate(steps)
         if _holds(step, values=outputs[index], figure=figure, tolerance=figure.tolerance)
+        and (not time_unit or not step.time_units or time_unit in step.time_units)
     ]
+
+
+def _time_unit(answer: str, *, figure: _Number) -> str:
+    """The time unit the figure is written in, glued to its digits (12h) or
+    the word after it (22 hours, a 13.08-day lead time), or "" for none. A
+    rate ("$42 per hour", "10 units/day") has none, and nor does a figure
+    with another unit glued to it (40kg)."""
+    if figure.unit:
+        return _TIME_UNITS.get(figure.unit, "")
+    after = _WORD_AFTER.match(answer, figure.end)
+    return _TIME_UNITS.get(after["word"].lower(), "") if after else ""
+
+
+def _time_units_named(text: str) -> frozenset[str]:
+    """The time units a step's text names by their plurals
+    (``_STEP_TIME_WORDS``), as words and inside identifiers."""
+    return frozenset(
+        _TIME_UNITS[word] for match in _WORD.finditer(text) if (word := match.group().lower()) in _STEP_TIME_WORDS
+    )
 
 
 def _named_holders(

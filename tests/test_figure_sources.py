@@ -183,6 +183,54 @@ class TestSourcedFigures:
             requests=["GET {DS_ERP_URL}/inventory"],
         )
 
+    def test_a_figure_in_hours_matches_a_step_that_names_hours_among_other_units(self):
+        convert = _cell(
+            "toolu_hours",
+            code="days = stockout_days()\nprint(f'days={days:.4f} hours={days * 24:.2f}')",
+            stdout="days=0.9158 hours=21.98\n",
+            description="Convert the earliest stockout time to hours",
+        )
+
+        sources = find_figure_sources(answer="SKU-0127 runs out in about 22 hours.", question="", steps=[convert])
+
+        assert _figure(sources, "22").origin is FigureOrigin.step
+        assert _figure(sources, "22").sources == [FigureSource(tool_use_id="toolu_hours")]
+
+    def test_a_figure_in_hours_matches_a_step_that_names_no_time_unit(self):
+        step = _cell("toolu_q", code="print(round(stock / rate, 2))", stdout="21.98\n")
+
+        sources = find_figure_sources(answer="SKU-0127 runs out in about 22 hours.", question="", steps=[step])
+
+        assert _figure(sources, "22").sources == [FigureSource(tool_use_id="toolu_q")]
+
+    def test_a_figure_in_days_matches_a_step_that_names_a_unit_only_as_a_date_part(self):
+        """A singular unit names a date part here, not the unit of the
+        values printed beside it."""
+        step = _cell(
+            "toolu_q",
+            code="cur.execute('SELECT month, AVG(lead_time) FROM orders GROUP BY month')\nprint(cur.fetchall())",
+            stdout="[('March', 12.4)]\n",
+        )
+
+        sources = find_figure_sources(answer="Lead time averaged 12.4 days in March.", question="", steps=[step])
+
+        assert _figure(sources, "12.4").sources == [FigureSource(tool_use_id="toolu_q")]
+
+    @pytest.mark.parametrize(("answer", "figure", "stdout"), [
+        ("Line 7 overtime costs $42 per hour.", "$42", "{'line': 7, 'overtime_rate': 42, 'shift_days': 5}\n"),
+        ("SKU-0127 sells 10 units/day.", "10", "{'sku': 'SKU-0127', 'daily_units': 10, 'lead_time_hours': 6}\n"),
+    ], ids=["per-hour", "slash-day"])
+    def test_a_rate_keeps_its_source_in_a_step_that_names_another_time_unit(
+        self, answer: str, figure: str, stdout: str,
+    ):
+        """A rate's time unit follows another word or a slash, so its figure
+        is written in no time unit and any step that prints it holds it."""
+        step = _cell("toolu_q", code="print(fetch_row())", stdout=stdout)
+
+        sources = find_figure_sources(answer=answer, question="", steps=[step])
+
+        assert _figure(sources, figure).sources == [FigureSource(tool_use_id="toolu_q")]
+
 
 class TestTheStepsList:
     def test_each_named_step_is_listed_once_in_step_order(self):
@@ -2649,6 +2697,40 @@ class TestFiguresWithoutASource:
         sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=[echo])
 
         assert _figure(sources, "$30").origin is FigureOrigin.none
+
+    @pytest.mark.parametrize(("hours", "figure"), [
+        ("about **22 hours**", "22"), ("a 22-hour wait", "22"), ("about 22h", "22h"), ("about 22 hrs", "22"),
+    ], ids=["word", "hyphen", "glued", "short-form"])
+    def test_a_figure_in_hours_is_not_held_by_a_days_column_that_prints_its_number(self, hours: str, figure: str):
+        """The model worked out 22 hours from 0.92 days; the 22 the sample
+        rows print is another item's lead_time_days."""
+        sample = _cell(
+            "toolu_sample",
+            code=(
+                "cur.execute('SELECT * FROM inventory LIMIT 3')\n"
+                "print([d.name for d in cur.description])\n"
+                "for row in cur.fetchall():\n    print(row)"
+            ),
+            stdout="['sku', 'count_in_stock', 'lead_time_days']\n('SKU-0027', 46, 25)\n('SKU-0028', 313, 22)\n",
+            description="Inspect the inventory table's sample records",
+        )
+        stockout = _cell(
+            "toolu_stockout",
+            code=(
+                "cur.execute('SELECT sku, projected_out_of_stock_days FROM inventory ORDER BY 2')\n"
+                "print(cur.fetchone())"
+            ),
+            stdout="('SKU-0127', 0.9157509)\n",
+        )
+
+        sources = find_figure_sources(
+            answer=f"SKU-0127 runs out in **0.92 days**, {hours}.", question="", steps=[sample, stockout],
+        )
+
+        assert _figure(sources, figure).origin is FigureOrigin.none
+        assert _figure(sources, figure).sources == []
+        assert _figure(sources, "0.92").sources == [FigureSource(tool_use_id="toolu_stockout")]
+        assert [step.tool_use_id for step in sources.steps] == ["toolu_stockout"]
 
     def test_a_memorize_call_is_not_a_source(self):
         memorize = _tool("toolu_mem", "memorize", {"text": "Overtime costs 30 dollars"}, "Saved: Overtime costs 30 dollars")
