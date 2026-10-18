@@ -302,6 +302,34 @@ class TestSourcedFigures:
 
         assert _figure(sources, figure).sources == [FigureSource(tool_use_id="toolu_q")]
 
+    @pytest.mark.parametrize(("code", "description", "stdout", "answer", "figure"), [
+        (
+            "cur.execute(\"SELECT AVG(lead_time) FROM orders WHERE order_date > now() - interval '12 months'\")\n"
+            "print(cur.fetchone())",
+            "", "(22.3,)\n", "Average lead time was 22.3 days.", "22.3",
+        ),
+        (
+            "cur.execute(\"SELECT AVG(EXTRACT(EPOCH FROM closed_at - opened_at) / 3600) FROM tickets"
+            " WHERE opened_at > now() - interval '30 days'\")\nprint(cur.fetchone())",
+            "", "(4.2,)\n", "Tickets took 4.2 hours on average.", "4.2",
+        ),
+        (
+            "print(average_lead_time())", "Average lead time over the last 12 months", "22.3\n",
+            "Lead time was 22.3 days.", "22.3",
+        ),
+    ], ids=["sql-months", "sql-days", "label-months"])
+    def test_a_figure_keeps_a_step_whose_code_or_label_names_another_time_unit_as_its_window(
+        self, code: str, description: str, stdout: str, answer: str, figure: str,
+    ):
+        """A window the step filters on names its period, not its output's
+        unit, so only the output's units rule a step out."""
+        step = _cell("toolu_q", code=code, stdout=stdout, description=description)
+
+        sources = find_figure_sources(answer=answer, question="", steps=[step])
+
+        assert _figure(sources, figure).origin is FigureOrigin.step
+        assert _figure(sources, figure).sources == [FigureSource(tool_use_id="toolu_q")]
+
 
 class TestTheStepsList:
     def test_each_named_step_is_listed_once_in_step_order(self):
@@ -2771,7 +2799,8 @@ class TestFiguresWithoutASource:
 
     @pytest.mark.parametrize(("hours", "figure"), [
         ("about **22 hours**", "22"), ("a 22-hour wait", "22"), ("about 22h", "22h"), ("about 22 hrs", "22"),
-    ], ids=["word", "hyphen", "glued", "short-form"])
+        ("about 22 working hours", "22"), ("about 22-25 hours", "22"), ("22 to 25 hours", "22"),
+    ], ids=["word", "hyphen", "glued", "short-form", "qualified", "range-hyphen", "range-to"])
     def test_a_figure_in_hours_is_not_held_by_a_days_column_that_prints_its_number(self, hours: str, figure: str):
         """The model worked out 22 hours from 0.92 days; the 22 the sample
         rows print is another item's lead_time_days."""
