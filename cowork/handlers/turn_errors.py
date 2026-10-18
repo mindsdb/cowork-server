@@ -31,6 +31,11 @@ from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 from urllib.parse import urlparse
 
+from anton.core.llm.provider import (
+    AllowanceExhaustedError,
+    FreeServingPausedError,
+    WalletEmptyError,
+)
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.app_settings import default_minds_url
@@ -87,9 +92,8 @@ CONTENT_REPAIR_CODES: frozenset[str] = frozenset(
     {CONTENT_RECOVERY_CODE, CONTENT_TOO_LARGE_CODE}
 )
 
-# Curated copy for the out-of-credits case. In the wallet billing model this
-# fires when either the org's wallet is empty (gateway 402 `wallet_empty`) or
-# the free allowance is spent (gateway 429 `included_allowance_exhausted`).
+# Curated copy for an empty wallet or a legacy TokenLimitExceeded failure.
+# Known allowance and free-serving-pause refusals have their own codes below.
 # Without this the turn would die mid-stream
 # with no completion event and no error frame — the SSE connection just closes
 # and the renderer's spinner stops, which reads as "Anton is dead" rather than
@@ -931,9 +935,8 @@ def _configured_minds_host() -> str | None:
 def _from_minds_gateway(host: str | None) -> bool:
     """Whether the failing request went to the configured MindsHub gateway.
 
-    Gates the bare-status billing fallbacks: only the gateway's 402/429/503
-    are billing decisions. The same statuses from a BYOK provider mean
-    something else entirely (an OpenAI rate limit, an Anthropic overload) and
+    Gates body-code reads and the bare-status 402/503 billing fallbacks.
+    The same statuses from a BYOK provider mean something else entirely and
     must not surface billing copy. An unknown origin (no URL on the failure)
     is treated as not-the-gateway, so ambiguous failures stay generic.
     """
@@ -1241,9 +1244,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
 
     A velocity ``rate_limited`` is NOT out of credits and must never share that
     card: the ceiling is per-minute tokens, so buying credits cannot lift it and
-    the remedy is to wait (ENG-1537). It is listed here rather than left to the
-    bare-status 429 rule below precisely because that rule cannot tell the two
-    429s apart — and the gateway already did.
+    the remedy is to wait. The gateway's explicit reason distinguishes it from
+    other 429s; the status alone cannot.
     """
     if reason == _REASON_RATE_LIMITED:
         return RATE_LIMITED_CODE, RATE_LIMITED_USER_MESSAGE
@@ -1359,8 +1361,7 @@ def friendly_turn_error(
             # model 'deepseek-v4-flash' isn't available: …"), while the header
             # only says *that* a model was rejected. Returning the header copy
             # here threw the model id away and left the user with nothing to act
-            # on — ENG-1358. The billing reasons have no such typed counterpart,
-            # so they still short-circuit.
+            # on. Billing types use the same curated copy as the header.
             if mapped[0] == MODEL_NOT_FOUND_CODE:
                 if model_info is _UNSET:
                     model_info = model_unavailable_info(exc)
@@ -1371,9 +1372,8 @@ def friendly_turn_error(
     # Same decision from the body's `code` when the header didn't survive the
     # trip (ENG-1363's Anthropic lane strips it). The gateway sets both fields
     # to the same value, so this is the identical decision from a second
-    # carrier — NOT a heuristic. It must stay above the bare-status rule below:
-    # that rule cannot tell the velocity 429 from the allowance 429, and
-    # guessing "out of credits" for a rate limit is the ENG-1537 defect.
+    # carrier, not a heuristic. It must stay above the legacy token-limit
+    # detector so a recognized reason keeps its specific classification.
     body_denial = _gateway_body_denial(exc=exc)
     # NOTE: strict here (provably-gateway), unlike the header above. The header
     # needs the looser three-valued check because an existing test requires an
@@ -1400,18 +1400,13 @@ def friendly_turn_error(
             return MODEL_RESTRICTED_CODE, str(exc)
         return MODEL_RESTRICTED_CODE, MODEL_RESTRICTED_USER_MESSAGE
 
-    # anton exhausted its rate-limit wait budget and re-raised with the code
-    # (ENG-1537). Checked here, above the bare-status rule, because that
-    # exception still carries the original 429 in its cause chain — so without
-    # this the honest "waiting didn't clear it" failure is relabelled
-    # out-of-credits, which is exactly what the wait was added to stop.
+    # Anton exhausted its rate-limit wait budget and re-raised with the code.
+    # Preserve that verdict before the legacy text classifiers below.
     # Read the code attribute DIRECTLY rather than via provider_overloaded_info:
     # that helper's version-skew duck-type only accepts
     # ``code == provider_overloaded``, so under the exact skew its own docstring
     # exists for (anton's type not importable), an exhausted rate-limit wait
-    # would fall through to the bare-status rule and be relabelled
-    # out-of-credits — the outcome this hoist exists to prevent (ENG-1537
-    # review).
+    # would otherwise lose its specific verdict.
     # `not hasattr(exc, "response")` is load-bearing, not defensive noise.
     # `openai.APIStatusError` populates `.code` FROM THE RESPONSE BODY, and on a
     # BYOK OPENAI_COMPATIBLE provider that body is third-party-controlled — so
@@ -1428,6 +1423,18 @@ def friendly_turn_error(
     if getattr(exc, "code", None) == RATE_LIMITED_CODE and not hasattr(exc, "response"):
         return RATE_LIMITED_CODE, str(exc) or RATE_LIMITED_USER_MESSAGE
 
+    # Anton's mindshub_billing_stop checks the response origin before creating
+    # these types. Self-hosted can deliberately set minds_url to a nonresolving
+    # host while model calls go to MindsHub, so its configured-host checks above
+    # need not match. Preserve the trusted type before its broader parent wins;
+    # arbitrary reason attributes and class-name lookalikes have no authority.
+    if isinstance(exc, WalletEmptyError):
+        return _map_gateway_reason(_REASON_WALLET_EMPTY)
+    if isinstance(exc, AllowanceExhaustedError):
+        return _map_gateway_reason(_REASON_ALLOWANCE_EXHAUSTED)
+    if isinstance(exc, FreeServingPausedError):
+        return _map_gateway_reason(_REASON_FREE_AIR_FUSE)
+
     # Precedence per ENG-673: token_limit / the billing-status fallback /
     # provider_auth / the ENG-598 model gate all WIN over provider_overloaded
     # (ranked below, after auth). These exception types are disjoint in practice
@@ -1443,12 +1450,11 @@ def friendly_turn_error(
 
     # Bare-status fallback for a gateway that omits the reason header (older
     # versions). Gated on the failing request having gone to the configured
-    # MindsHub gateway: a BYOK provider's own 402/429/503 (an OpenAI rate
-    # limit, an Anthropic overload) is not a billing decision, so it falls
-    # through — usually to the generic redacted message. 402/429 both mean
-    # out-of-credits; 503 is a transient policy outage, retryable and never
-    # the out-of-credits card.
-    if status in (402, 429, 503) and _from_minds_gateway(host):
+    # MindsHub gateway: a BYOK provider's own 402/503 is not a billing decision,
+    # so it falls through, usually to the generic redacted message. A gateway
+    # 429 alone does not identify which limit fired and must stay unclassified.
+    # 402 means out-of-credits; 503 is a transient policy outage.
+    if status in (402, 503) and _from_minds_gateway(host):
         if status == 503:
             return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE

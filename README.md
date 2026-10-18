@@ -341,6 +341,28 @@ A step's label, web page, SQL and requests pass through a best-effort credential
 
 A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. The poll and each run's reads and writes are database units, so a full pool refuses them after `POOL_TIMEOUT` rather than stalling the server. A run whose first write is refused does not start, and a cron slot then stays due for the next poll. A run's last two writes, its outcome and its finish, try again while the pool stays full, for up to 10 minutes, so a busy moment never leaves a run at `running` or its slot due. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
 
+### Turn failure reasons
+
+`response.failed` and its saved event identify known MindsHub billing refusals:
+`wallet_empty` produces `token_limit`, `included_allowance_exhausted` keeps its
+code, and `free_air_daily_spend_fuse_exceeded` produces `free_serving_paused`.
+In-process turns preserve Anton's actual billing exception types, matching
+remote turns even when a self-hosted installation deliberately sets `MINDS_URL`
+to `https://minds.invalid`. Raw response headers and body codes still require
+the existing origin checks; arbitrary reason attributes and class names do not
+select a billing failure.
+
+A gateway 429 with no recognized classifier stays generic (`anton_error`).
+Its status alone cannot distinguish an exhausted allowance from another limit.
+Recognized body codes still recover a missing reason header, and the existing
+gateway-only 402 and 503 fallbacks remain. When the SDK cause chain carries
+`X-MindsHub-Reset-At`, allowance and free-serving-pause failures retain it on
+their streamed and saved events. Wallet failures do not add a reset time.
+
+These events record the resulting classification, not whether the upstream
+reason header was present. Counts of `token_limit` cannot establish a historical
+header-stripping rate.
+
 ## Data Layer
 
 Data lives in two places: a **SQLite database** for structured records and the **filesystem** for project files and agent workspaces. Understanding both is essential.

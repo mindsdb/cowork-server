@@ -1215,10 +1215,10 @@ def _fuse_via_header():
     return exc
 
 
-# anton's REAL parent type, as for ContentTooLargeError above. The pinned anton
-# predates MindsHubBillingStop, but production's stop IS a TokenLimitExceeded,
-# and that is what sends it to the out-of-credits rung when the body code goes
-# unread. A stand-in without the parent would pass for the wrong reason.
+# A legacy parent-type fixture for the raw body-code origin checks. It is not
+# one of Anton's trusted billing subclasses; those are tested with the real
+# mindshub_billing_stop factory below. Keeping the parent exercises the broader
+# token-limit rung when the body code goes unread.
 from anton.core.llm.provider import TokenLimitExceeded as _AntonTokenLimitExceeded
 
 
@@ -1234,7 +1234,7 @@ class MindsHubBillingStop(_AntonTokenLimitExceeded):
 
 
 def _typed_stop_via_body_code(reason, *, url=None):
-    """The billing stop anton raises today, on a lane that lost X-MindsHub-Reason.
+    """A legacy parent-type stop on a lane that lost X-MindsHub-Reason.
 
     The SDK error it is raised from still holds the response, the body `code`
     and the reset header. ``url`` defaults to the configured gateway.
@@ -1256,8 +1256,7 @@ def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
 
 
 def test_fuse_body_code_maps_when_the_header_is_lost():
-    # Without the body carrier this lane falls to the bare-status 429 rule and
-    # renders as out-of-credits.
+    # The body supplies the reason even when the header did not survive.
     code, message = te.friendly_turn_error(_fuse_via_body_code())
     assert code == te.FREE_SERVING_PAUSED_CODE
     assert message == te.FREE_SERVING_PAUSED_USER_MESSAGE
@@ -1507,8 +1506,8 @@ def test_velocity_rate_limit_is_not_out_of_credits():
 def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
     # ENG-1363: the Anthropic /v1/messages lane strips X-MindsHub-* headers.
     # The gateway sets `code` and `reason` to the same value, so the body is a
-    # second carrier for the identical decision — without it, that lane would
-    # fall to the bare-status rule and show the credits card again.
+    # second carrier for the identical decision; without it this lane would
+    # lose the specific rate-limit verdict.
     exc = ConnectionError("Server returned 429")
     exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
     inner.body = {"error": {"code": "rate_limited", "message": "Rate limit exceeded"}}
@@ -1633,13 +1632,82 @@ def test_retry_after_rides_the_failed_payload_only_when_present():
     assert "retry_after" not in te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
 
 
-def test_reasonless_gateway_429_still_cards_as_credits():
-    # A gateway old enough to omit the header only ever meant "allowance" by a
-    # 429, so the legacy assumption is preserved for a 429 carrying neither a
-    # reason nor a body code. Narrowing this instead would have stripped the
-    # credits card from a real allowance exhaustion.
-    code, _ = te.friendly_turn_error(_gateway_failure(429))
-    assert code == te.TOKEN_LIMIT_CODE
+def test_reasonless_gateway_429_stays_generic():
+    # The status alone cannot distinguish allowance exhaustion from a velocity
+    # limit or another refusal. A missing discriminator must not invent one.
+    assert te.friendly_turn_error(_gateway_failure(429)) is None
+
+
+@pytest.mark.parametrize("reason", ["future_billing_limit", "unknown_limit"])
+def test_unrecognized_gateway_429_reason_stays_generic(reason):
+    assert te.friendly_turn_error(_gateway_failure(429, reason=reason)) is None
+
+
+@pytest.mark.parametrize("carrier", ["header", "body", "neither"])
+@pytest.mark.parametrize(
+    ("reason", "status", "expected_type", "expected_code"),
+    [
+        ("wallet_empty", 402, "WalletEmptyError", te.TOKEN_LIMIT_CODE),
+        (
+            "included_allowance_exhausted", 429,
+            "AllowanceExhaustedError", te.ALLOWANCE_EXHAUSTED_CODE,
+        ),
+        (
+            "free_air_daily_spend_fuse_exceeded", 429,
+            "FreeServingPausedError", te.FREE_SERVING_PAUSED_CODE,
+        ),
+    ],
+)
+def test_real_billing_subclass_survives_a_nonresolving_configured_host(
+    monkeypatch, carrier, reason, status, expected_type, expected_code,
+):
+    import httpx
+    import openai
+    from anton.core.llm.provider import mindshub_billing_stop
+    from types import SimpleNamespace
+
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda: SimpleNamespace(minds_url="https://minds.invalid"),
+    )
+    headers = {"X-MindsHub-Reset-At": _FUSE_RESET_AT}
+    body = {"code": reason}
+    if carrier == "header":
+        headers["X-MindsHub-Reason"] = reason
+        body = {}
+    response = httpx.Response(
+        status, headers=headers,
+        request=httpx.Request("POST", "https://api.mindshub.ai/v1/chat/completions"),
+    )
+    sdk_error = openai.APIStatusError("Request refused", response=response, body=body)
+    stop = mindshub_billing_stop(exc=sdk_error, body=body, status_code=status)
+    assert type(stop).__name__ == expected_type
+    stop.__cause__ = sdk_error
+    if carrier == "neither":
+        # Once Anton has classified the response, its actual exception type
+        # remains authoritative even without either raw-response carrier.
+        sdk_error.body = {}
+
+    assert te.friendly_turn_error(stop) == te.remote_turn_error(
+        f"{expected_type}: {stop}"
+    )
+    assert te.friendly_turn_error(stop)[0] == expected_code
+
+
+def test_billing_class_name_and_reason_attributes_are_not_authoritative(monkeypatch):
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda: SimpleNamespace(minds_url="https://minds.invalid"),
+    )
+    lookalike = type("AllowanceExhaustedError", (Exception,), {})("Request refused")
+    lookalike.reason = "included_allowance_exhausted"
+    lookalike.status_code = 429
+    assert te.friendly_turn_error(lookalike) is None
 
 
 def test_reason_header_policy_unavailable_is_transient_not_out_of_credits():
@@ -1708,9 +1776,10 @@ def test_bare_402_status_maps_to_out_of_credits_without_header():
     assert code == te.TOKEN_LIMIT_CODE
 
 
-def test_bare_429_status_maps_to_out_of_credits_without_header():
-    code, _ = te.friendly_turn_error(_gateway_failure(429))
-    assert code == te.TOKEN_LIMIT_CODE
+def test_gateway_429_with_unrecognized_body_code_stays_generic():
+    exc = _gateway_failure(429)
+    exc.__cause__.body = {"error": {"code": "future_billing_limit"}}
+    assert te.friendly_turn_error(exc) is None
 
 
 def test_bare_503_status_maps_to_transient_without_header():
