@@ -283,6 +283,10 @@ class CodingService(
             return session
         if run.status != RunStatus.preparing:
             return session
+        try:
+            self.workspaces.discard_unrecorded(session.id)
+        except Exception:
+            logger.warning("Could not remove what task %s's interrupted preparation left", session.id, exc_info=True)
         message = "The app stopped before the task workspace was ready. Start the task again."
         self.store.append_event(
             session.id,

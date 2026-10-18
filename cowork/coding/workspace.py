@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import logging
 import os
 import shutil
 import stat
@@ -19,10 +20,13 @@ from cowork.coding.contracts import (
     WorkspaceKind,
 )
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
-from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
+from cowork.coding.local_copy import LocalCopyError, LocalCopyManager, PreparedLocalCopy, _force_remove
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class WorkspaceError(RuntimeError):
@@ -59,6 +63,27 @@ SNAPSHOT_TRUNCATED_MARKER = (
     "Snapshot truncated because this task has a large combined patch. Open the worktree to recover the rest.\n"
 )
 _TASK_ROOT_METADATA = (".DS_Store", "Thumbs.db", "desktop.ini")
+# A task copy of a folder that holds several repositories checks each one out
+# as a worktree. These are rebuilt by a project's own tooling, so the levels
+# of the folder that are walked (rather than copied whole) leave them out.
+_DEPENDENCY_DIRS = frozenset({
+    "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".tox", ".next", ".turbo",
+})
+_REPOSITORY_SEARCH_DEPTH = 3
+
+
+# Left-out folders worth telling the user about; caches rebuild on their own.
+_INSTALLED_DEPENDENCY_DIRS = frozenset({"node_modules", ".venv", "venv"})
+
+
+def _omitted_warning(omitted: tuple[str, ...]) -> str | None:
+    omitted = tuple(path for path in omitted if PurePosixPath(path).name in _INSTALLED_DEPENDENCY_DIRS)
+    if not omitted:
+        return None
+    shown = ", ".join(omitted[:3])
+    more = f" and {len(omitted) - 3} more" if len(omitted) > 3 else ""
+    return f"Dependency folders were left out of this task's copy and need rebuilding: {shown}{more}."
 
 
 def _org_mode() -> bool:
@@ -341,7 +366,10 @@ class WorkspaceManager:
 
             if kind == WorkspaceKind.local_copy:
                 try:
-                    prepared = self.local_copies.fork(session_id, source, current)
+                    if self._inner_repositories(source):
+                        prepared = self._fork_repository_folder(session_id, source, current)
+                    else:
+                        prepared = self.local_copies.fork(session_id, source, current)
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
                 return PreparedWorkspace(
@@ -722,9 +750,15 @@ class WorkspaceManager:
         base_revision: str | None,
     ) -> None:
         with self._mutation_lock:
+            if not workspace_path:
+                # Preparation never recorded a workspace, but may have left one.
+                self.discard_unrecorded(session_id)
+                return
             if kind == WorkspaceKind.local_copy:
                 try:
-                    self.local_copies.cleanup(session_id, Path(workspace_path))
+                    self.local_copies.cleanup(
+                        session_id, Path(workspace_path), before_remove=self._remove_inner_worktrees,
+                    )
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
                 return
@@ -752,6 +786,67 @@ class WorkspaceManager:
                     shutil.rmtree(actual)
             if source.is_dir():
                 self.git.run(source, "worktree", "prune")
+
+    def discard_unrecorded(self, key: str) -> None:
+        """Remove what an interrupted preparation left behind for ``key``.
+
+        A task whose preparation stopped part-way, for example because the app
+        quit, has no recorded workspace. It may still have a partly built
+        folder under the managed roots, and worktrees registered for it in the
+        user's repositories. Only worktrees inside this task's own folders are
+        unregistered.
+        """
+        relative = managed_key(key)
+        with self._mutation_lock:
+            for root in (self.worktrees_root, self.legacy_worktrees_root, self.local_copies.legacy_copies_root):
+                target = root / relative
+                if target.is_symlink() or not target.is_dir():
+                    continue
+                self._unregister_worktrees_under(target)
+                _force_remove(target)
+            _force_remove(self.local_copies.baselines_root / relative)
+
+    def _unregister_worktrees_under(self, root: Path) -> None:
+        links = [root / ".git"] if (root / ".git").is_file() else []
+        pending = [(root, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name in _DEPENDENCY_DIRS or entry.name == ".git" or not entry.is_dir(follow_symlinks=False):
+                    continue
+                link = Path(entry.path) / ".git"
+                if link.is_file():
+                    links.append(link)
+                elif depth + 1 < _REPOSITORY_SEARCH_DEPTH + 2:
+                    pending.append((Path(entry.path), depth + 1))
+        for link in links:
+            self._unregister_worktree(link)
+
+    def _unregister_worktree(self, link: Path) -> None:
+        """Forget one worktree checkout, even one Git left half-made."""
+        checkout = link.parent
+        try:
+            common = self.git.run(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+            removed = self.git.run(Path(common).parent, "worktree", "remove", "--force", str(checkout), check=False)
+            if removed.returncode == 0:
+                return
+        except WorkspaceError as exc:
+            logger.info("Could not unregister the worktree %s through Git: %s", checkout, exc)
+        # Git could not read the checkout. Its registration is a folder in the
+        # repository's worktrees directory that points back here; remove only
+        # that one, as `git worktree prune` would.
+        try:
+            admin = Path(link.read_text(encoding="utf-8").removeprefix("gitdir:").strip())
+            if admin.parent.name == "worktrees" and Path(
+                (admin / "gitdir").read_text(encoding="utf-8").strip()
+            ).parent.resolve() == checkout.resolve():
+                shutil.rmtree(admin, ignore_errors=True)
+        except OSError:
+            pass
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""
@@ -874,7 +969,7 @@ class WorkspaceManager:
 
     def _prepare_local_copy(self, session_id: str, source: Path) -> PreparedWorkspace:
         try:
-            prepared = self.local_copies.prepare(session_id, source)
+            prepared = self._prepare_folder_copy(session_id, source)
         except LocalCopyError as exc:
             raise WorkspaceError(str(exc)) from exc
         return PreparedWorkspace(
@@ -884,8 +979,225 @@ class WorkspaceManager:
             repository_root=None,
             base_revision=None,
             source_dirty=False,
-            warning=None,
+            warning=_omitted_warning(prepared.omitted),
         )
+
+    def _prepare_folder_copy(self, key: str, source: Path) -> PreparedLocalCopy:
+        """Copy a non-Git folder, checking out any repositories inside it as worktrees.
+
+        Copying a folder of repositories duplicated every checkout with its
+        dependencies. A worktree shares the repository's objects and leaves
+        ignored files out, and the folder copy around it keeps review and
+        handoff exactly as they are for any other folder. Dependency folders
+        are left out and named in ``omitted``; every other ignored file, such
+        as a ``.env``, is copied.
+        """
+        repositories = self._inner_repositories(source)
+        if not repositories:
+            return self.local_copies.prepare(key, source)
+        relative = managed_key(key)
+        workspace = self.local_copies.copies_root / relative
+        baseline = self.local_copies.baselines_root / relative
+        if workspace.exists() or baseline.exists():
+            raise LocalCopyError("A managed copy already exists for this task folder")
+        workspace.parent.mkdir(parents=True, exist_ok=True)
+        baseline.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            omitted = self._materialize_repository_folder(source, workspace, repositories)
+            self._baseline_from(workspace, baseline, source, repositories)
+        except GitUnavailableError:
+            self._discard_repository_folder(source, workspace, baseline)
+            return self.local_copies.prepare(key, source)
+        except Exception:
+            self._discard_repository_folder(source, workspace, baseline)
+            raise
+        return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline, omitted=tuple(omitted))
+
+    def _fork_repository_folder(self, key: str, source: Path, current: Path) -> PreparedLocalCopy:
+        """Fork a folder-of-repositories copy without sharing the parent's worktrees."""
+        parent_baseline = self.local_copies._baseline_for(current)
+        relative = managed_key(key)
+        workspace = self.local_copies.copies_root / relative
+        baseline = self.local_copies.baselines_root / relative
+        if workspace.exists() or baseline.exists():
+            raise LocalCopyError("A managed copy already exists for this task folder")
+        workspace.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._materialize_repository_folder(source, workspace, self._inner_repositories(source))
+            # The fork inherits the parent's content and comparison point, not
+            # whatever the source holds now.
+            self.local_copies.match(workspace, current)
+            self.local_copies._copy_tree(parent_baseline, baseline)
+        except Exception:
+            self._discard_repository_folder(source, workspace, baseline)
+            raise
+        return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
+
+    def _inner_repositories(self, folder: Path) -> list[Path]:
+        """Repository roots inside a folder that is not itself a repository."""
+        if (folder / ".git").exists():
+            return []
+        found: list[Path] = []
+        pending = [(folder, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name == ".git" or entry.name in _DEPENDENCY_DIRS or not entry.is_dir(follow_symlinks=False):
+                    continue
+                path = Path(entry.path)
+                if (path / ".git").exists():
+                    found.append(path)
+                elif depth + 1 < _REPOSITORY_SEARCH_DEPTH:
+                    pending.append((path, depth + 1))
+        return sorted(found)
+
+    def _materialize_repository_folder(self, source: Path, target: Path, repositories: list[Path]) -> list[str]:
+        """Build the task folder, returning the dependency folders it left out."""
+        repository_paths = {repository.relative_to(source) for repository in repositories}
+        ancestors = {parent for path in repository_paths for parent in path.parents if parent != Path(".")}
+        omitted: list[str] = []
+
+        def build(relative: Path) -> None:
+            (target / relative).mkdir(parents=True, exist_ok=True)
+            for entry in sorted(os.scandir(source / relative), key=lambda item: item.name):
+                child = relative / entry.name
+                destination = target / child
+                if entry.name == ".git":
+                    continue
+                if entry.is_symlink():
+                    destination.symlink_to(os.readlink(entry.path))
+                elif entry.is_dir(follow_symlinks=False):
+                    if child in repository_paths:
+                        omitted.extend(
+                            f"{child.as_posix()}/{path}" for path in self._check_out_repository(source / child, destination)
+                        )
+                    elif entry.name in _DEPENDENCY_DIRS:
+                        omitted.append(child.as_posix())
+                    elif child in ancestors:
+                        build(child)
+                    else:
+                        self.local_copies._copy_tree(Path(entry.path), destination)
+                elif entry.is_file(follow_symlinks=False):
+                    shutil.copy2(entry.path, destination)
+                # Sockets, pipes and devices cannot be copied; review ignores them too.
+
+        build(Path("."))
+        return sorted(omitted)
+
+    def _check_out_repository(self, repository: Path, target: Path) -> list[str]:
+        """Check out one inner repository as a worktree with its local and ignored files.
+
+        Returns the ignored dependency folders it left out, relative to the repository.
+        """
+        head = self._head_revision(repository)
+        if head is not None:
+            self.git.run(repository, "worktree", "add", "--detach", str(target), head)
+            try:
+                if self._status_lines(repository):
+                    from cowork.coding.source_changes import copy_source_changes
+
+                    copy_source_changes(self, repository, target, head)
+                return self._copy_ignored(repository, target)
+            except WorkspaceError as exc:
+                # Changes too large or unusual to carry over as a patch: copy
+                # this repository as before rather than start without them.
+                logger.info("Copying %s instead of checking it out: %s", repository, exc)
+                self.git.run(repository, "worktree", "remove", "--force", str(target), check=False)
+                self.git.run(repository, "worktree", "prune", check=False)
+                _force_remove(target)
+        self.local_copies._copy_tree(repository, target)
+        return []
+
+    def _copy_ignored(self, repository: Path, target: Path) -> list[str]:
+        """Copy a repository's ignored files into its worktree, except dependency folders.
+
+        A worktree holds only what Git tracks. Ignored files such as ``.env``
+        or local configuration are part of how the folder works, so they are
+        carried over; dependency folders are rebuilt by setup instead.
+        """
+        listed = self.git.run(
+            repository, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
+        ).stdout
+        omitted: list[str] = []
+        for raw in filter(None, listed.split("\0")):
+            relative = Path(raw.rstrip("/"))
+            if any(part in _DEPENDENCY_DIRS for part in relative.parts):
+                omitted.append(relative.as_posix())
+                continue
+            source_entry = repository / relative
+            destination = target / relative
+            if destination.exists() or destination.is_symlink():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if source_entry.is_symlink():
+                    destination.symlink_to(os.readlink(source_entry))
+                elif source_entry.is_dir():
+                    self.local_copies._copy_tree(source_entry, destination)
+                elif source_entry.is_file():
+                    shutil.copy2(source_entry, destination)
+            except OSError as exc:
+                raise WorkspaceError(f"Could not copy the ignored file {relative.as_posix()}: {exc}") from exc
+        return omitted
+
+    def _baseline_from(self, workspace: Path, baseline: Path, source: Path, repositories: list[Path]) -> None:
+        """Snapshot a freshly built copy as its baseline, without worktree links.
+
+        Copying the built workspace makes the two start identical. The baseline
+        is only ever compared against, so it must not point Git at the
+        workspace's worktree metadata.
+        """
+        self.local_copies._copy_tree(workspace, baseline)
+        for repository in repositories:
+            link = baseline / repository.relative_to(source) / ".git"
+            if link.is_file():
+                link.unlink()
+
+    def _discard_repository_folder(self, source: Path, workspace: Path, baseline: Path) -> None:
+        if workspace.exists():
+            self._remove_inner_worktrees(workspace)
+        _force_remove(workspace)
+        _force_remove(baseline)
+
+    def _remove_inner_worktrees(self, workspace: Path) -> None:
+        """Unregister the worktrees checked out inside a task copy before it is deleted.
+
+        Only this copy's own worktrees are removed, so other worktrees in the
+        user's repositories, including stale ones, are left as they are.
+        """
+        for link in self._worktree_links(workspace):
+            checkout = link.parent
+            try:
+                common = self.git.run(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+                repository = Path(common).parent
+                self.git.run(repository, "worktree", "remove", "--force", str(checkout), check=False)
+            except WorkspaceError as exc:
+                logger.info("Could not unregister the task worktree %s: %s", checkout, exc)
+
+    @staticmethod
+    def _worktree_links(workspace: Path) -> list[Path]:
+        """``.git`` files marking the worktree checkouts inside a task copy."""
+        links: list[Path] = []
+        pending = [(workspace, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name in _DEPENDENCY_DIRS or entry.name == ".git" or not entry.is_dir(follow_symlinks=False):
+                    continue
+                link = Path(entry.path) / ".git"
+                if link.is_file():
+                    links.append(link)
+                elif depth + 1 < _REPOSITORY_SEARCH_DEPTH:
+                    pending.append((Path(entry.path), depth + 1))
+        return links
 
     @staticmethod
     def _resolve_existing(raw_path: str) -> Path | None:
