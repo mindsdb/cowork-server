@@ -397,8 +397,9 @@ async def test_two_people_in_one_shared_project_keep_their_own_memory(monkeypatc
         assert learned not in context
 
 
+@pytest.mark.parametrize("self_hosted", [False, True])
 async def test_a_persons_scheduled_run_gets_its_creators_tiers(
-    monkeypatch, trusted, granted_product_permissions
+    monkeypatch, trusted, granted_product_permissions, self_hosted
 ):
     """A personal schedule runs as its creator: the scheduler builds the
     principal from the row, ResponsesHandler._produce binds its scope around
@@ -407,9 +408,18 @@ async def test_a_persons_scheduled_run_gets_its_creators_tiers(
     whole chain shows."""
     import cowork.handlers.responses as responses_mod
     from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
+    from cowork.deployment_identity import initialize_deployment_identity
     from cowork.scheduler import execute_schedule
     from cowork.services.schedules import ScheduleService
     from tests._turns import close_turn, stub_turn_settings
+
+    if self_hosted:
+        pack = trusted / "pack.json"
+        pack.write_text('{"name":"Scheduled Workbench"}', encoding="utf-8")
+        monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+        monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(pack))
+        get_app_settings.cache_clear()
+        initialize_deployment_identity(get_app_settings(), remote_turns=False)
 
     stub_turn_settings(monkeypatch)
     seen: dict[str, object] = {}
@@ -432,6 +442,8 @@ async def test_a_persons_scheduled_run_gets_its_creators_tiers(
                 try:
                     seen["tiers"] = _tiers(config)
                     seen["mode"] = config.cortex.mode
+                    seen["identity"] = getattr(config, "deployment_identity", None)
+                    seen["memory_scope"] = getattr(config, "learned_memory_scope", None)
                 finally:
                     await close_turn(config, scratch)
 
@@ -465,6 +477,12 @@ async def test_a_persons_scheduled_run_gets_its_creators_tiers(
         assert global_dir == expected_global
         assert project_dir == expected_global / "projects" / str(project_id)
         assert seen["mode"] == "autopilot"
+        if self_hosted:
+            assert seen["identity"].product_name == "Scheduled Workbench"
+            assert seen["memory_scope"] == "personal"
+        else:
+            assert seen["identity"] is None
+            assert seen["memory_scope"] is None
     finally:
         with get_open_session() as db:
             ScheduleService(ScopedSession(db, SYSTEM_SCOPE)).delete_schedule(schedule_id)

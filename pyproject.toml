@@ -209,7 +209,9 @@ packages = ["cowork"]
 # capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
 # predate the `anton-agent` floor above, which no longer admits a release that
 # needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "81f39146a77255e728cb4d29e238d7ab4d5ebf37" }
+# Explicit self-hosted deployments also require DeploymentIdentity and scoped
+# learned-memory context. Default hosts retain the existing PyPI floor.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "3d0c0552108206731438fd0e5566d2d8dcf2e639" }
 
 [dependency-groups]
 dev = [

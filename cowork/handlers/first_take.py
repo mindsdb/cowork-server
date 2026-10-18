@@ -39,6 +39,7 @@ from cowork.handlers.response_routing import (
     denies_our_product,
     names_foreign_product,
     names_gate_tool,
+    with_deployment_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -260,7 +261,7 @@ class FirstTake:
 
         events = self._binding.provider.stream(
             model=self._binding.model,
-            system=_SYSTEM_PROMPT,
+            system=with_deployment_identity(_SYSTEM_PROMPT),
             messages=self._messages,
             max_tokens=_MAX_TOKENS,
         )
