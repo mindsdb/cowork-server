@@ -18,6 +18,7 @@ from cowork.coding.contracts import (
     SourceContext,
     TaskWorkspace,
     WorkspaceKind,
+    WorkspaceMode,
 )
 from cowork.coding.control_models import RunStatus, TaskControlSnapshot, TaskResourceScope
 from cowork.coding.control_service import ControlPlaneService
@@ -32,7 +33,8 @@ from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
 from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
-from cowork.coding.workspace import WorkspaceManager
+from cowork.coding.workspace import WorkspaceManager, _org_mode
+from cowork.coding.workspace_mode import resolve_workspace_mode
 from cowork.services.skills import CodeSkillService
 
 EventEmitter = Callable[[str, CodingEvent], CodingEvent]
@@ -65,6 +67,7 @@ class PendingLocalSession:
     adapter_version: str
     model: str
     reasoning_effort: str | None
+    workspace_mode: WorkspaceMode
     control_snapshot: TaskControlSnapshot
     code_skills: CodeSkillService | None
 
@@ -240,7 +243,19 @@ class CodingSessionFactory:
             repository_setup=request.repository_setup,
             standalone_computer_id=self.control.local_computer.id if project is None else None,
         )
-        if control_snapshot.computer.id != self.control.local_computer.id:
+        runs_locally = control_snapshot.computer.id == self.control.local_computer.id
+        try:
+            workspace_mode = resolve_workspace_mode(
+                request.workspace_mode,
+                project.default_workspace_mode if project else None,
+                runs_locally=runs_locally,
+                org_mode=_org_mode(),
+            )
+        except ValueError:
+            with suppress(KeyError, ValueError):
+                self.control.set_run_status(control_snapshot.run.id, RunStatus.failed)
+            raise
+        if not runs_locally:
             return self._create_remote_session(
                 session_id,
                 request,
@@ -251,12 +266,13 @@ class CodingSessionFactory:
                 control_snapshot,
                 code_skills,
                 reasoning_effort,
+                workspace_mode,
             )
         try:
             # Preparation runs in the background, so reject a folder it would
             # refuse now, while the composer can still show the error.
             if project is None:
-                self.workspaces.check_source(request.path or "", request.allow_direct_folder)
+                self.workspaces.check_source(request.path or "", request.allow_folder_copy)
             validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):
@@ -271,6 +287,7 @@ class CodingSessionFactory:
             adapter_version=capabilities.adapter_version,
             model=model,
             reasoning_effort=reasoning_effort,
+            workspace_mode=workspace_mode,
             control_snapshot=control_snapshot,
             code_skills=code_skills,
         )
@@ -323,6 +340,7 @@ class CodingSessionFactory:
                 skill_resolution=skill_resolution,
                 contexts=contexts,
                 reasoning_effort=pending.reasoning_effort,
+                workspace_mode=pending.workspace_mode,
             )
             # The placeholder has been visible and editable since ``begin``:
             # queued follow-ups, title, pin and config changes stay, and only
@@ -389,6 +407,7 @@ class CodingSessionFactory:
             # a local task without one.
             workspace_path="",
             workspace_kind=WorkspaceKind.local_copy,
+            workspace_mode=pending.workspace_mode,
             status=SessionStatus.running,
             source_contexts=list(request.source_contexts),
         )
@@ -440,7 +459,7 @@ class CodingSessionFactory:
     ) -> LocalSessionPreparation:
         requested_dirs = validate_directories(request.additional_dirs)
         if project is None:
-            prepared = self.workspaces.prepare(session_id, request.path or "", request.allow_direct_folder)
+            prepared = self.workspaces.prepare(session_id, request.path or "", request.allow_folder_copy)
             workspace = TaskWorkspace(
                 folder_id="folder",
                 folder_name=Path(prepared.source_path).name,
@@ -519,6 +538,7 @@ class CodingSessionFactory:
         skill_resolution: SkillResolution,
         contexts: list[SourceContext],
         reasoning_effort: str | None,
+        workspace_mode: WorkspaceMode,
     ) -> CodingSession:
         project = preparation.project
         instructions = project_instructions(
@@ -555,6 +575,7 @@ class CodingSessionFactory:
             source_path=primary.source_path,
             workspace_path=primary.workspace_path,
             workspace_kind=primary.workspace_kind,
+            workspace_mode=workspace_mode,
             workspaces=list(preparation.task_workspaces),
             repository_root=primary.repository_root,
             base_revision=primary.base_revision,
@@ -583,6 +604,7 @@ class CodingSessionFactory:
         control_snapshot: TaskControlSnapshot,
         code_skills: CodeSkillService | None,
         reasoning_effort: str | None,
+        workspace_mode: WorkspaceMode,
     ) -> CodingSession:
         if project is None:
             raise RuntimeError("A folder on this computer cannot run on another computer")
@@ -632,6 +654,7 @@ class CodingSessionFactory:
             source_path=source_path,
             workspace_path="",
             workspace_kind=WorkspaceKind.local_copy,
+            workspace_mode=workspace_mode,
             workspace_warning=f"Waiting for {control_snapshot.computer.name}",
             guidance_summary=" · ".join(
                 part for part in (playbook_summary, skill_resolution.summary) if part
