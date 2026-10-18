@@ -22,3 +22,49 @@ class AntonHarnessSettings(Settings):
         description="The root directory where the Anton harness will store skill-related files",
         validation_alias="ANTON_SKILLS_ROOT_DIR",
     )  # ANTON_SKILLS_ROOT_DIR
+    # anton reads this one itself, from this process's environment, through
+    # AntonSettings; it's read here only so check_write_approval_startup knows
+    # the deployment asked for it.
+    write_approval: bool = Field(
+        default=False,
+        description=(
+            "Hold an agent cell that changes connected data, or deletes, renames or moves "
+            "an existing file, until the person who asked approves it"
+        ),
+        validation_alias="ANTON_WRITE_APPROVAL",
+    )  # ANTON_WRITE_APPROVAL
+
+
+def check_write_approval_startup(
+    settings: AntonHarnessSettings, *, ask_user_enabled: bool, remote_turns: bool
+) -> None:
+    """Refuse to start where ANTON_WRITE_APPROVAL=true would hold nothing.
+
+    The deployment would say every change waits for approval while every
+    cell ran unheld, or was refused with no card. Raises RuntimeError naming
+    the fix: for remote turns, whose workers don't read this process's
+    environment; for COWORK_ASK_USER_ENABLED=false, which leaves no way to
+    ask; and for an anton without the setting, which ignores it.
+    """
+    if not settings.write_approval:
+        return
+    if remote_turns:
+        raise RuntimeError(
+            "ANTON_WRITE_APPROVAL=true is not supported with COWORK_TURN_BACKEND=remote: "
+            "remote workers don't read this server's environment, so their cells would run "
+            "without approval. Leave COWORK_TURN_BACKEND unset to run turns in this process."
+        )
+    if not ask_user_enabled:
+        raise RuntimeError(
+            "ANTON_WRITE_APPROVAL=true needs COWORK_ASK_USER_ENABLED: with questions off, "
+            "there is no way to ask for approval, so every cell that changes data or files "
+            "would be refused. Remove COWORK_ASK_USER_ENABLED=false."
+        )
+    from anton.core.settings import CoreSettings
+
+    if "write_approval" not in CoreSettings.model_fields:
+        raise RuntimeError(
+            "ANTON_WRITE_APPROVAL=true needs an anton that holds writes for approval. The "
+            "installed anton has no write_approval setting, so it would ignore this one and "
+            "run every cell without asking. Install the anton this cowork-server pins."
+        )
