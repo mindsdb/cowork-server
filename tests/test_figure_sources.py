@@ -196,6 +196,32 @@ class TestSourcedFigures:
         assert _figure(sources, "22").origin is FigureOrigin.step
         assert _figure(sources, "22").sources == [FigureSource(tool_use_id="toolu_hours")]
 
+    def test_a_figure_in_hours_names_only_the_step_that_names_hours_when_a_days_column_also_prints_it(self):
+        """The days column drops out on its own: the step that names hours
+        still holds the figure, so it keeps its source."""
+        sample = _cell(
+            "toolu_sample",
+            code=(
+                "cur.execute('SELECT * FROM inventory LIMIT 3')\n"
+                "print([d.name for d in cur.description])\n"
+                "for row in cur.fetchall():\n    print(row)"
+            ),
+            stdout="['sku', 'count_in_stock', 'lead_time_days']\n('SKU-0028', 313, 22)\n",
+        )
+        convert = _cell(
+            "toolu_hours",
+            code="days = stockout_days()\nprint(f'days={days:.4f} hours={days * 24:.2f}')",
+            stdout="days=0.9158 hours=21.98\n",
+        )
+
+        sources = find_figure_sources(
+            answer="SKU-0127 runs out in about 22 hours.", question="", steps=[sample, convert],
+        )
+
+        assert _figure(sources, "22").origin is FigureOrigin.step
+        assert _figure(sources, "22").sources == [FigureSource(tool_use_id="toolu_hours")]
+        assert [step.tool_use_id for step in sources.steps] == ["toolu_hours"]
+
     def test_a_figure_in_hours_matches_a_step_that_names_no_time_unit(self):
         step = _cell("toolu_q", code="print(round(stock / rate, 2))", stdout="21.98\n")
 
