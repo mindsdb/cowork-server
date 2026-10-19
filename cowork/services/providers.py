@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
+from cowork.build_info import surface
+from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
@@ -44,6 +46,25 @@ MINDS_PROBE_MODEL = "mindshub_air"
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
 MINDS_REQUEST_KIND_PROBE = "probe"
+
+# Langfuse tag on every MindsHub connectivity probe. The gateway files a call
+# with no Langfuse headers as direct-API use, so without it a user who only
+# opened Settings is counted as an API user. Tags alone make the gateway treat
+# the call as first-party; no `harness` is claimed because no agent runs here,
+# and no session or turn because a ping belongs to no conversation.
+PROBE_TRACE_TAG = "provider-ping"
+
+
+def _minds_probe_headers() -> dict[str, str]:
+    """The probe marker plus the probe's Langfuse identity, for a MindsHub host only."""
+    resolved_surface = surface()
+    tags = [PROBE_TRACE_TAG]
+    headers = {MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE}
+    if resolved_surface:
+        tags.append(f"{SURFACE_TAG_PREFIX}{resolved_surface}")
+        headers["Langfuse-Metadata"] = json.dumps({"surface": resolved_surface}, separators=(",", ":"))
+    headers["Langfuse-Tags"] = ",".join(tags)
+    return headers
 
 
 def minds_chat_base_url(minds_url: str) -> str:
@@ -102,10 +123,26 @@ def is_minds_host(url: str | None) -> bool:
     return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
 
 
-# Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
-# publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
-# can't map to a non-prod MindsHub env, falls back here.
-PUBLISH_FAILSAFE_URL = "https://4nton.ai"
+# Prod publish host. The view host serves the publishing API (/upload, /list,
+# /delete/{id}, /versions, /activate); prod's api host (api.mindshub.ai) does
+# not. So prod, plus anything we can't map to a non-prod MindsHub env, falls
+# back here.
+PUBLISH_FAILSAFE_URL = "https://view.mindshub.ai"
+
+# The former prod publish host. It serves the same API but is being retired
+# for publishing, while saved settings may still name it.
+LEGACY_PUBLISH_HOST = "4nton.ai"
+
+
+def normalize_publish_url(publish_url: str | None) -> str | None:
+    """`publish_url` with the retired 4nton.ai host replaced by the prod
+    publish host; any other URL is returned unchanged."""
+    try:
+        host = (urlparse(publish_url or "").hostname or "").lower().rstrip(".")
+    except ValueError:
+        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
+        return publish_url
+    return PUBLISH_FAILSAFE_URL if host == LEGACY_PUBLISH_HOST else publish_url
 
 
 def publish_url_for_endpoint(endpoint_url: str | None) -> str:
@@ -115,9 +152,9 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
     served on the *non-prod* MindsHub api hosts, so a provider pointed at
     ``api.<env>.mindshub.ai`` (dev/staging) publishes to that same host. Prod
     (``api.mindshub.ai``) has no publish routes, and anything unrecognised
-    (mdb.ai, a custom endpoint, empty) falls back to the legacy ``4nton.ai``
-    host. anton appends the route path; an explicit `publish_url` /
-    `ANTON_PUBLISH_URL` overrides this.
+    (mdb.ai, a custom endpoint, empty) falls back to the prod publish host,
+    ``view.mindshub.ai``. anton appends the route path; an explicit
+    `publish_url` / `ANTON_PUBLISH_URL` overrides this.
     """
     host = (urlparse(endpoint_url or "").hostname or "").lower()
     if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
@@ -131,17 +168,11 @@ def is_mindshub_publish_url(publish_url: str | None) -> bool:
     Only MindsHub's service can run a full-stack artifact. A service an operator
     points `ANTON_PUBLISH_URL` or the `publish_url` setting at, such as one a
     customer built from the publishing specification, stores static bundles
-    only. Matches the hosts `publish_url_for_endpoint` can return: the MindsHub
-    api hosts (via `is_minds_host`) and the legacy `4nton.ai` host.
+    only. Matches the hosts `publish_url_for_endpoint` can return (MindsHub
+    hosts, via `is_minds_host`); a retired `4nton.ai` URL counts as the prod
+    publish host it maps to.
     """
-    if is_minds_host(publish_url):
-        return True
-    try:
-        host = (urlparse(publish_url or "").hostname or "").lower()
-    except ValueError:
-        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
-        return False
-    return host == urlparse(PUBLISH_FAILSAFE_URL).hostname
+    return is_minds_host(normalize_publish_url(publish_url))
 
 
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
@@ -1276,7 +1307,7 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
                 {
                     "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 MINDS_PROBE_MODEL,
             )
@@ -1347,7 +1378,7 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
@@ -1395,7 +1426,7 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
         # meaningless to an arbitrary endpoint, and only MindsHub reads it to hide
         # the probe from the Traces list.
         if is_minds_host(normalized):
-            headers[MINDS_REQUEST_KIND_HEADER] = MINDS_REQUEST_KIND_PROBE
+            headers.update(_minds_probe_headers())
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(chat_url, headers=headers, json=payload)
             if r.status_code in (200, 201):

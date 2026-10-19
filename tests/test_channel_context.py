@@ -1,6 +1,6 @@
 """ENG-591: channel turns get support-mode prompt guidance.
 
-The desktop suffix lead must stay byte-identical (it participates in anton's
+The UI suffix lead must stay byte-identical (it participates in anton's
 cache-stable prompt prefix); channel turns swap in chat/support guidance plus
 optional per-binding operator instructions.
 """
@@ -14,8 +14,8 @@ import cowork.services.task_objects as task_objects
 from cowork.harnesses.anton_harness.harness import AntonHarness, _turn_style_context
 from cowork.harnesses.base import ChannelContext
 
-DESKTOP_LEAD = (
-    "The Anton CoWork desktop UI displays progress, tool usage, and actions "
+UI_LEAD = (
+    "The Cowork UI displays progress, tool usage, and actions "
     "as separate structured activity rows, so do not narrate each step "
     "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
     "open your reply with one short sentence telling the user what you are "
@@ -36,8 +36,8 @@ DESKTOP_LEAD = (
 )
 
 
-def test_desktop_lead_is_byte_stable():
-    assert _turn_style_context(None) == DESKTOP_LEAD
+def test_ui_lead_is_byte_stable():
+    assert _turn_style_context(None) == UI_LEAD
 
 
 def test_desktop_lead_asks_for_an_opening_sentence_not_step_narration():

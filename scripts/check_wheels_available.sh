@@ -96,7 +96,8 @@ case "$TARGET" in
 esac
 echo
 
-failed=0
+unresolved=0
+no_wheel=0
 for plat in "${PLATFORMS[@]}"; do
   for pyver in "${PYTHON_VERSIONS[@]}"; do
     printf '%-28s py%s  ' "$plat" "$pyver"
@@ -110,7 +111,7 @@ for plat in "${PLATFORMS[@]}"; do
                  --quiet --output-file "$pinned" 2>&1); then
       echo "FAILED (could not resolve at all)"
       echo "$out" | sed 's/^/    /'
-      failed=1
+      unresolved=1
       continue
     fi
 
@@ -125,12 +126,28 @@ for plat in "${PLATFORMS[@]}"; do
     else
       echo "FAILED (resolves to a version with no wheel)"
       echo "$out" | sed 's/^/    /'
-      failed=1
+      no_wheel=1
     fi
   done
 done
 
-if [ "$failed" -ne 0 ]; then
+# Two footers, because the two failures need opposite fixes. A requirement
+# that does not resolve at all never reached the wheel question, and the wheel
+# advice below sends whoever reads it after a cap that is not needed.
+if [ "$unresolved" -ne 0 ]; then
+  cat <<'MSG'
+
+---
+A requirement could not be resolved at all, so no wheel was checked for it.
+The uv error above names the requirement.
+
+An exact pin to a version uploaded minutes ago fails this way until PyPI's
+Simple index serves it, even though PyPI's JSON API and web page already list
+it. Re-run once the index catches up.
+MSG
+fi
+
+if [ "$no_wheel" -ne 0 ]; then
   cat <<'MSG'
 
 ---
@@ -150,6 +167,9 @@ marker so the other platforms stay current, e.g.
 
 Then run `uv lock` and commit the lockfile.
 MSG
+fi
+
+if [ "$unresolved" -ne 0 ] || [ "$no_wheel" -ne 0 ]; then
   exit 1
 fi
 

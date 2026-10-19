@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import publish
-from cowork.services.publish import PublisherUnavailable
+from cowork.services.publish import PublisherUnavailable, PublishOwnedByOtherUser
 
 
 def _client() -> TestClient:
@@ -39,7 +39,7 @@ def _patch_context():
     exception-mapping tests below must get past that step to reach `_publish`."""
     return patch.object(
         publish_ep, "_desktop_context",
-        lambda raw: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
+        lambda raw, *, scope: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
     )
 
 
@@ -67,6 +67,22 @@ def test_upstream_runtime_error_always_maps_to_502(exc):
     assert res.json()["detail"] == str(exc)
 
 
+@pytest.mark.parametrize("route, target", [
+    ("/api/v1/publish/", "_publish"),
+    ("/api/v1/publish/update", "_update"),
+])
+def test_a_report_owned_by_another_account_is_409_with_its_code(route, target):
+    """An HTTPException passes the RuntimeError -> 502 ladder untouched, so the
+    client gets the code it matches on instead of a 502."""
+    with _patch_context(), patch.object(publish_ep, target, side_effect=PublishOwnedByOtherUser()):
+        res = _client().post(route, json={"path": "/some/art"})
+    assert res.status_code == 409
+    assert res.json()["detail"] == {
+        "code": "artifact_owned_by_other_user",
+        "message": "This artifact was published by another owner.",
+    }
+
+
 def test_publisher_unavailable_maps_to_503():
     """The local "a publish dependency didn't import" case is still a 503,
     now via the exception type instead of message sniffing."""
@@ -91,9 +107,13 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, publish_side
     )
     monkeypatch.setattr(
         publish, "get_app_settings",
-        lambda: SimpleNamespace(connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))),
+        lambda: SimpleNamespace(
+            tenancy_mode="local", connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))
+        ),
     )
-    monkeypatch.setattr(publish, "resolve_artifact_path", lambda raw, allow_dir=True: target)
+    monkeypatch.setattr(
+        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True: target
+    )
     monkeypatch.setattr(
         publish, "_resolve_publish_target",
         lambda a, container_dirs=None: (target, target.parent, key, False),
