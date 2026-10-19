@@ -116,16 +116,48 @@ jobs:
       # pre-release markers only in direct requirements) — no resolution-wide
       # prerelease flag is ever used.
       - name: Pin anton-agent to its latest staging rc
+        id: pin
         run: |
           set -euo pipefail
           LATEST=$(curl -fsSL --retry 3 https://pypi.org/pypi/anton-agent/json | jq -r '[.releases | to_entries[] | select(.key | test("^[0-9]+(\\.[0-9]+)*(rc[0-9]+)?$")) | select((.value | length) > 0) | select(any(.value[]; .yanked != true)) | {v: .key, t: ([.value[].upload_time_iso_8601] | max)}] | sort_by(.t) | last | .v')
           if [[ "$LATEST" == *rc* ]]; then
             sed -i 's/"anton-agent>=[^"]*"/"anton-agent=='"$LATEST"'"/' pyproject.toml
             grep -q '"anton-agent=='"$LATEST"'"' pyproject.toml
+            echo "rc=$LATEST" >> "$GITHUB_OUTPUT"
             echo "Pinned anton-agent==$LATEST"
           else
             echo "Latest anton-agent is a stable release ($LATEST); keeping the loose constraint"
           fi
+
+      # The JSON API the pin step reads lists an upload as soon as PyPI accepts
+      # it. uv resolves from the Simple index instead, which can trail the
+      # upload by minutes. Until it catches up, every later step fails with
+      # "there is no version of anton-agent==<rc>", and the wheel check blames
+      # a wheel that is not missing. So wait until uv itself resolves the pin.
+      # `--refresh-package` skips the uv cache setup-uv restored, which can
+      # hold an index page from before the upload; the refreshed page is what
+      # the steps below then read.
+      - name: Wait until uv resolves the pinned anton-agent rc
+        if: steps.pin.outputs.rc != ''
+        env:
+          ANTON_RC: ${{ steps.pin.outputs.rc }}
+        run: |
+          set -uo pipefail
+          attempts=30
+          for attempt in $(seq 1 "$attempts"); do
+            if out=$(uv pip compile - --no-config --no-deps --quiet \
+                       --refresh-package anton-agent <<<"anton-agent==$ANTON_RC" 2>&1); then
+              echo "uv resolves anton-agent==$ANTON_RC"
+              exit 0
+            fi
+            echo "uv cannot resolve anton-agent==$ANTON_RC yet (attempt $attempt/$attempts)"
+            if [ "$attempt" -lt "$attempts" ]; then
+              sleep 30
+            fi
+          done
+          echo "$out" >&2
+          echo "PyPI's Simple index still does not serve anton-agent==$ANTON_RC after $attempts attempts, 30s apart" >&2
+          exit 1
 
       - name: Build package
         env:
