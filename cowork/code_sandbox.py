@@ -379,35 +379,73 @@ def probe_workspaces_dir(scope: TenantScope | None) -> Path:
     return _private_dir(_sandbox_root(scope), name="probes")
 
 
-def _partition_roots(shared_root: Path) -> list[Path]:
-    """Every person's partition folder: the children of the shared root named
-    by a partition id (cowork.principal.personal_partition_id, a UUID)."""
+class _Partition(NamedTuple):
+    """One person's partition folder: its name in the shared root, and the
+    folder it resolves to (``_real``)."""
+
+    name: str
+    real: Path
+
+
+def _resolved_entry(entry: os.DirEntry[str], *, real_root: Path) -> Path:
+    """What ``entry`` in the shared root resolves to, given the root resolved.
+    os.path.realpath resolves the parent first and then follows the last name
+    only when it is a link, so an entry that isn't one resolves to the
+    resolved root joined with its name. A link, or an entry whose type can't
+    be read, is resolved on its own."""
     try:
-        entries = list(shared_root.iterdir())
+        linked = entry.is_symlink()
+    except OSError:
+        linked = True
+    if linked:
+        return _real(Path(entry.path))
+    return real_root / entry.name
+
+
+def _partition_roots(shared_root: Path) -> list[_Partition]:
+    """Every person's partition folder: the children of the shared root named
+    by a partition id (cowork.principal.personal_partition_id, a UUID), each
+    resolved once. The shared root is resolved once for all of them, and only
+    a partition that is a link is resolved on its own (``_resolved_entry``)."""
+    real_root = _real(shared_root)
+    try:
+        with os.scandir(real_root) as scanned:
+            entries = list(scanned)
     except FileNotFoundError:
         return []
-    roots: list[Path] = []
+    partitions: list[_Partition] = []
     for entry in entries:
         try:
-            if str(UUID(entry.name)) == entry.name:
-                roots.append(entry)
+            if str(UUID(entry.name)) != entry.name:
+                continue
         except ValueError:
             continue
-    return roots
+        partitions.append(_Partition(entry.name, _resolved_entry(entry, real_root=real_root)))
+    return partitions
 
 
-def _forbidden_roots(settings: AppSettings, *, partitions: list[Path]) -> tuple[Path, ...]:
+def _forbidden_roots(settings: AppSettings, *, partitions: list[_Partition]) -> tuple[Path, ...]:
+    """The folders no grant may equal or contain, each resolved and named
+    once: cowork-home, the shared root, its ``shared/`` folder, every
+    partition (resolved by _partition_roots), and the managed folder."""
     shared_root = Path(settings.storage.shared_root)
-    roots = [cowork_home(), shared_root, shared_root / "shared", *partitions]
+    roots = [_real(root) for root in (cowork_home(), shared_root, shared_root / "shared")]
+    roots += [partition.real for partition in partitions]
     if settings.managed_dir is not None:
-        roots.append(settings.managed_dir)
-    return tuple(dict.fromkeys(_real(root) for root in roots))
+        roots.append(_real(settings.managed_dir))
+    return tuple(dict.fromkeys(roots))
 
 
-def _other_partitions(scope: TenantScope | None, *, partitions: list[Path]) -> tuple[Path, ...]:
-    """Every partition but the asker's own: all of them for the operator view."""
+def _other_partitions(
+    scope: TenantScope | None, *, partitions: list[_Partition]
+) -> tuple[Path, ...]:
+    """Every partition but the asker's own: all of them for the operator view.
+    The asker's own is the one named by their partition id in the shared
+    root, whatever it resolves to."""
     own = scope.org_id if scope is not None and scope.personal else None
-    return tuple(dict.fromkeys(_real(root) for root in partitions if root.name != own))
+    return tuple(
+        dict.fromkeys(partition.real for partition in partitions if partition.name != own)
+    )
 
 
 def _cell_sandbox(

@@ -23,22 +23,21 @@
 # pinned set wheel-only (step 2). Exact `==` pins leave nothing to backtrack
 # to, so a missing wheel has to fail.
 #
-# `--no-config` for the same reason as `--no-sources`. Without it uv applies
-# this project's `[tool.uv] override-dependencies` (currently `openai>=3.0`,
-# `pillow>=12.3.0`) while resolving — and those overrides are NOT part of the
-# published wheel, so a user's `uv tool install` never sees them. Measured: with
-# config, a requirement of `openai<3` still resolves to 3.16.1; with
-# `--no-config` it resolves to 2.54.0, which is what a user actually gets. The
-# two agree for today's dependency set, so this closes a latent divergence
-# rather than a live break — but a gate that resolves under constraints users do
-# not have is the same defect class this file exists to catch.
+# `--no-config` for the same reason as `--no-sources`. Without it uv reads the
+# nearest uv.toml or pyproject.toml `[tool.uv]` table at or above the working
+# directory, plus the user's and the system's uv.toml, while resolving, and
+# settings there such as `override-dependencies` are NOT part of the published
+# wheel, so a user's `uv tool install` never sees them. This project sets none
+# today. A gate
+# that resolves under constraints users do not have is the same defect class
+# this file exists to catch.
 #
-# `--no-sources` on both steps, for a related reason. `[tool.uv.sources]` points
-# anton-agent and hermes-agent at git, which is a source build by definition and
-# has no wheel to find — without the flag this gate fails on every platform for a
-# reason no user will ever hit. More importantly, those sources do not appear in
-# the published wheel's metadata at all: users resolve `anton-agent>=...,<3` from
-# PyPI. Checking the dev tree would be checking something we do not ship.
+# `--no-sources` on both steps, for a related reason. A `[tool.uv.sources]`
+# entry (git, URL or local path) does not appear in the published wheel's
+# metadata at all: users resolve `anton-agent>=...,<3` from PyPI. pyproject.toml
+# has none today. The flag keeps one added later from making this gate check a
+# dev tree we do not ship, and a git source, which has no wheel to find, from
+# failing it on every platform for a reason no user will ever hit.
 #
 # `aarch64-pc-windows-msvc` is deliberately absent: it is unsatisfiable
 # regardless of this check, because psycopg-binary publishes no win_arm64

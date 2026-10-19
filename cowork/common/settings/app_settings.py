@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
@@ -754,6 +754,14 @@ class AppSettings(Settings):
         description=(
             "Bearer token clients must send as 'Authorization: Bearer <token>'. "
             "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
+        ),
+    )
+    publish_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUBLISH_TOKEN"),
+        description=(
+            "Bearer sent to the publish service (ANTON_PUBLISH_URL) in place of the "
+            "provider's key, on every provider. Blank means unset."
         ),
     )
     tenancy_mode: Literal["local", "org"] = Field(

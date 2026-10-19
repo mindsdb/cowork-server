@@ -1603,11 +1603,13 @@ def build_llm_client(
         else settings.resolved_router_model
     )
 
-    # The published package still permits Anton releases from before ENG-2116.
-    # Inspect the constructor once per client build so those versions keep
-    # working without pretending they can refresh a credential per request.
-    # A signature we cannot inspect is treated as unsupported: omitting a new
-    # kwarg is safer than raising TypeError on every MindsHub turn.
+    # Inspect OpenAIProvider's constructor once per client build for
+    # api_key_provider (ENG-2116). Every anton this server can start with has
+    # it: it predates the anton.core.artifacts.internal_files constants the
+    # server imports at startup. So the check serves only an anton too old to
+    # start this server. A signature we cannot inspect is treated as
+    # unsupported: omitting a new kwarg is safer than raising TypeError on
+    # every MindsHub turn.
     try:
         openai_provider_params = inspect.signature(OpenAIProvider).parameters
     except (TypeError, ValueError):
@@ -1655,10 +1657,11 @@ def build_llm_client(
             # this callback unset and keep their existing lifetime.
             #
             # The live supplier is available only when Anton advertises the
-            # constructor kwarg. Older versions allowed by the package metadata
-            # keep the construction-time credential and log that they cannot
-            # adopt desktop refreshes; passing the unsupported kwarg would
-            # TypeError on every signed-in MindsHub turn.
+            # constructor kwarg. An anton without it (none can start this
+            # server; see supports_api_key_provider above) keeps the
+            # construction-time credential and logs that it cannot adopt
+            # desktop refreshes; passing the unsupported kwarg would TypeError
+            # on every signed-in MindsHub turn.
             #
             # This refreshes the MAIN-PROCESS provider only. anton snapshots
             # export_connection_info().api_key once per ChatSession and hands
