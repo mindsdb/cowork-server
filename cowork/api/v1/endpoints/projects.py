@@ -19,6 +19,7 @@ from cowork.schemas.shared_resources import ProjectCapabilities
 from cowork.api.v1.endpoints.guards import ensure_loopback_socket
 from cowork.services.projects import (
     GENERAL_PROJECT,
+    ProjectInUseError,
     ProjectNameLockBusyError,
     ProjectNotFoundError,
     ProjectPathNotAllowedError,
@@ -838,6 +839,8 @@ def delete_project(
     # children, which then answered "not found" for a project that exists.
     except ProjectNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ProjectInUseError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     finally:
         for row, token in pending_guards:
             try:

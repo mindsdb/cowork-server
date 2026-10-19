@@ -68,13 +68,10 @@ def _drop_sentinel():
 
 
 @pytest.fixture(autouse=True)
-def org_deployment(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    get_app_settings.cache_clear()
+def _backfill_sentinel_cleared(org_deployment):
     _drop_sentinel()
     yield
     _drop_sentinel()
-    get_app_settings.cache_clear()
 
 
 pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")

@@ -262,6 +262,54 @@ async def test_harness_works_in_local_mode(units_read_engine, monkeypatch):
     assert "doc.txt" in await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
 
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _person(*, partition: str, user: str, resources) -> TenantScope:
+    return TenantScope(personal=True, org_id=partition, user_id=user, personal_resources=resources)
+
+
+async def test_harness_refuses_another_persons_conversation(units_read_engine, personal_deployment, caplog):
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    alice = _person(partition=PARTITION_A, user="alice", resources=ALL_PERSONAL_RESOURCES)
+    bob = _person(partition=PARTITION_B, user="bob", resources=ALL_PERSONAL_RESOURCES)
+    _raw, conv = _conversation_with_file(units_read_engine, alice)
+
+    assert "doc.txt" in await _conversation_attachment_context(conv, scope=alice)
+    with caplog.at_level("WARNING"):
+        ctx = await _conversation_attachment_context(conv, scope=bob)
+    assert "doc.txt" not in ctx
+    assert "No files are currently attached" not in ctx
+    assert any("does not match scope org" in message for message in _logged(caplog))
+
+
+async def test_harness_lists_own_attachments_on_a_shared_conversation(units_read_engine, personal_deployment):
+    """Files per person, conversations shared: the conversation row carries no
+    org, so the guard must key on conversations, not files. Each person's
+    listing still holds only their own uploads."""
+    from cowork.db.personal_resources import PersonalResource
+
+    files_only = frozenset({PersonalResource.FILES})
+    alice = _person(partition=PARTITION_A, user="alice", resources=files_only)
+    bob = _person(partition=PARTITION_B, user="bob", resources=files_only)
+    _raw, conv = _conversation_with_file(units_read_engine, alice)
+    assert conv.org_id is None
+
+    assert "doc.txt" in await _conversation_attachment_context(conv, scope=alice)
+    bob_ctx = await _conversation_attachment_context(conv, scope=bob)
+    assert "doc.txt" not in bob_ctx
+    assert "No files are currently attached" in bob_ctx
+
+
+async def test_harness_with_every_resource_shared_keeps_todays_listing(units_read_engine, personal_deployment):
+    alice = _person(partition=PARTITION_A, user="alice", resources=frozenset())
+    bob = _person(partition=PARTITION_B, user="bob", resources=frozenset())
+    _raw, conv = _conversation_with_file(units_read_engine, alice)
+    assert "doc.txt" in await _conversation_attachment_context(conv, scope=bob)
+
+
 # ── upload safety: untrusted filename + size cap (not tenancy, but this is the
 # FileService test home and reuses `engine`/`_svc`) ──────────────────────────
 

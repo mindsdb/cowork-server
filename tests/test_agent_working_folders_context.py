@@ -70,17 +70,15 @@ def _folder(tmp_path: Path, name: str) -> Path:
 
 
 def test_without_folders_the_access_rules_are_todays_text():
-    assert _file_access_rules([]) == (
-        "The only other files that you are allowed to access are any items that are attached to the conversation."
-        "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
-    )
+    assert _file_access_rules([], sandboxed=False) == harness._OTHER_FILES_RULE
+    assert _file_access_rules([], sandboxed=True) == harness._other_files_rule(sandboxed=True)
     assert _working_folders_context([]) == ""
 
 
 def test_with_folders_the_rules_allow_them_and_the_context_lists_them():
     paths = ["/Users/x/docs", "/Users/x/reports"]
 
-    rules = _file_access_rules(paths)
+    rules = _file_access_rules(paths, sandboxed=False)
     context = _working_folders_context(paths)
 
     assert "the working folders" in rules
@@ -204,3 +202,19 @@ async def test_a_channel_turn_prompt_carries_no_folders(local_mode, monkeypatch,
 
     assert str(docs) not in suffix
     assert "working folder" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_a_sandboxed_turn_prompt_carries_no_folders(local_mode, monkeypatch, tmp_path):
+    """Landlock grants agent code no working folder, so naming one would send
+    the agent to files it cannot open."""
+    docs = _folder(tmp_path, "docs")
+    chat = _chat_in_general(tmp_path, [docs])
+    monkeypatch.setenv("COWORK_CODE_SANDBOX", "landlock")
+    get_app_settings.cache_clear()
+
+    suffix = await _suffix(monkeypatch, chat)
+
+    assert str(docs) not in suffix
+    assert "working folder" not in suffix
+    assert harness._other_files_rule(sandboxed=True) in suffix

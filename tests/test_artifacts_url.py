@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cowork.api.v1.router import api_router
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.artifacts import _project_artifacts_base, serve_url_for
 
 
@@ -44,7 +46,7 @@ def test_serve_url_prefix_matches_router():
             "cowork.services.artifacts._registered_project_dirs",
             return_value=[project_dir],
         ):
-            url = serve_url_for(str(test_file))
+            url = serve_url_for(str(test_file), scope=LOCAL_SCOPE)
 
         assert url, "serve_url_for returned empty string"
         assert url.startswith(expected_prefix), (
@@ -59,11 +61,16 @@ def test_project_base_accepts_registered_path_through_symlink(tmp_path):
     alias_root = tmp_path / "projects-alias"
     alias_root.symlink_to(real_root, target_is_directory=True)
 
+    # A desktop session; no project here is an adopted folder.
+    session = SimpleNamespace(scope=LOCAL_SCOPE)
     with patch(
         "cowork.services.artifacts._registered_project_dirs",
         return_value=[alias_root / "proj"],
     ), patch(
         "cowork.services.artifacts._projects_root",
         return_value=alias_root,
+    ), patch(
+        "cowork.services.artifacts._external_project_artifacts_base",
+        return_value=None,
     ):
-        assert _project_artifacts_base("proj") == artifacts.resolve()
+        assert _project_artifacts_base("proj", session) == artifacts.resolve()
