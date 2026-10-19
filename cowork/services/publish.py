@@ -317,11 +317,12 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     authenticates with that provider's own key — so pointing the provider at
     dev/staging publishes there too. api key is "" when the chosen provider has none.
 
-    A non-blank ``COWORK_PUBLISH_TOKEN`` (AppSettings.publish_token) replaces that key on every
-    provider. A self-hosted publisher then never takes the model key, which the
-    agent's code holds as its own OPENAI_API_KEY on a MindsHub endpoint. anton's
-    sandbox passes no COWORK_* name to the agent's code
-    (`anton.core.backends.sandbox`), so the token stays out of it.
+    A non-blank ``COWORK_PUBLISH_TOKEN`` (AppSettings.publish_token) replaces
+    that key on every provider. A self-hosted publisher then never takes the
+    model key, which the agent's code holds as its own OPENAI_API_KEY on a
+    MindsHub endpoint. Under COWORK_CODE_SANDBOX=landlock, anton's launcher
+    passes no COWORK_* name to the agent's code (`anton.core.backends.sandbox`),
+    so the token stays out of it too.
 
     Resolution order for the publish base URL (first non-empty wins):
       1. ``ANTON_PUBLISH_URL`` env var — an operator/dev override that trumps
