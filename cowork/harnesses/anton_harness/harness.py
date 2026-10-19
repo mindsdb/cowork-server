@@ -176,8 +176,8 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
 
     Returns the attrs actually applied, so a caller or test can assert on it.
 
-    **The skew guard is the load-bearing part.** anton is pinned as a git dep on
-    ``branch = "main"`` (see ``[tool.uv.sources]``), so cowork-server can ship a
+    **The skew guard is the load-bearing part.** anton is pinned to a release
+    (the floor in ``pyproject.toml``), so cowork-server can ship a
     setting whose field has only reached anton's ``staging`` — it arrives on
     main at the weekly release, not when the anton PR merges. pydantic raises
     ``ValueError: "AntonSettings" object has no field "x"`` on setattr of an

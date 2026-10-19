@@ -25,12 +25,15 @@ dependencies = [
     # lockfile. Releases before 2.26.10.4.1 also write DS_* scrub state into
     # this process's environment, shared by every org on the server.
     # 2.26.10.14.1 is the first with `StreamTurnEnded`, which the formatter and
-    # producer import unguarded. The agent prompt in
-    # `harnesses/anton_harness/harness.py` names `read_text_file`, which
-    # mindsdb/anton#545 adds and no release up to 2.26.10.14.1 registers, so a
-    # PyPI-channel desktop install on this floor is told to call a tool its
-    # anton lacks.
-    "anton-agent>=2.26.10.14.1,<3",
+    # producer import unguarded.
+    # 2.26.10.19.1 is the first stable release with the agent-code sandbox, the
+    # deployment identity and the managed memory layer, which create_app
+    # requires on a self-hosted stack, and with the write-approval gate, which
+    # it requires when ANTON_WRITE_APPROVAL is on. It is also the first that
+    # registers `read_text_file` (mindsdb/anton#545), which the agent prompt in
+    # `harnesses/anton_harness/harness.py` names, and the first with the file
+    # tools' read boundary (mindsdb/anton#598).
+    "anton-agent>=2.26.10.19.1,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
@@ -172,50 +175,6 @@ fallback-version = "0.0.0-dev"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
-
-[tool.uv.sources]
-# cowork-server imports the artifact-identity derivation
-# (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`) from Anton
-# and persists what Anton only derives in memory, so the two must agree on the
-# value or one artifact ends up with two identities. Anton `main` defines all
-# three, and since mindsdb/anton#429 it also carries the typed provider-auth
-# error and the per-request API-key supplier that refresh desktop credentials
-# without rebuilding an active session (ENG-2116).
-# Pin the tested revision so frozen image builds use the role-aware provider
-# and cached turn setup. It also carries the anton change that adds the
-# agent-code sandbox (`anton.core.backends.sandbox`, `ChatSessionConfig.cell_sandbox`
-# and `Workspace.initialize(refuse_links=)`), which create_app requires whenever
-# COWORK_CODE_SANDBOX is landlock (cowork.code_sandbox.check_startup). This is
-# anton staging at bee1826e, which includes the squash of mindsdb/anton#588,
-# plus the head of mindsdb/anton#592, which adds DeploymentIdentity and the
-# scoped learned-memory context that create_app requires whenever
-# COWORK_DEPLOYMENT_KIND is self-hosted
-# (cowork.deployment_identity.initialize_deployment_identity); default hosts
-# keep the PyPI floor above. Staging also includes the squash of
-# mindsdb/anton#572 that adds Cortex's read-only managed memory layer
-# (`managed_hc`), which create_app requires whenever COWORK_MANAGED_DIR is set
-# (cowork.managed.cortex_takes_managed_layer). It also carries
-# mindsdb/anton#585, which adds `ChatSession.turn_messages()`,
-# the `history` frame `anton.cloud_turn` sends after a compaction,
-# `anton.core.mcp.access.returns_records` and
-# `anton.core.mcp.names.parse_namespaced_tool_name`; the turn-end stream event
-# and the token filter; staging's unreleased changes such as
-# `ChatSessionConfig.tool_messages` and mindsdb/anton#545, which replaces
-# `open_artifact` with `read_text_file`; and what the floor above requires. It
-# moves to the squash commit of mindsdb/anton#592, or the first anton staging
-# tag that holds it, once anton lands #592.
-# tests/test_agent_prompt_tools.py checks that each tool name of two or more
-# words the agent prompt's project, output and skill-output sections put in
-# backticks is one the locked anton defines in tool_defs or cowork adds.
-# Cloud pods run the anton in their `minds-anton-scratchpad` image, bumped
-# independently of this pin, so the pod's history frame reaches a hosted turn
-# only once that image carries #585.
-#
-# The version-skew fallbacks in `services/providers.py` (the live supplier's
-# capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
-# predate the `anton-agent` floor above, which no longer admits a release that
-# needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "e5f74c31f8fce8b001c39ab164a848d84d13e30b" }
 
 [dependency-groups]
 dev = [
