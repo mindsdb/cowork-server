@@ -10,14 +10,16 @@ to open the right buffer, its correlation_id, to cancel it, and its org, to
 authorize the caller.
 
 Keys:
-    cowork:turn:{conversation_id}   HASH turn_id, correlation_id, org_id, user_id, started_at
+    cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at
     cowork:turns                    SET of conversation ids with a recorded turn
 """
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 
+from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
 
@@ -36,6 +38,25 @@ def _turn_key(conversation_id: str) -> str:
     return f"cowork:turn:{conversation_id}"
 
 
+class TurnOwner(BaseModel):
+    """Who started a recorded turn: its org (a person's partition on a
+    trusted-identity deployment) and its user, None where the turn had none.
+
+    Built from a turn's hash in one place (``from_index``), so the owner check
+    never reads the hash's keys itself.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    org_id: str | None
+    user_id: str | None
+
+    @classmethod
+    def from_index(cls, turn: Mapping[str, str]) -> TurnOwner:
+        # record_turn writes "" for a missing id.
+        return cls(org_id=turn.get("org_id") or None, user_id=turn.get("user_id") or None)
+
+
 async def record_turn(
     conversation_id: str,
     *,
@@ -43,6 +64,7 @@ async def record_turn(
     correlation_id: str,
     org_id: str | None,
     user_id: str | None,
+    run_id: str | None = None,
     client=None,
 ) -> None:
     """Note this turn as the conversation's current one, replacing any previous.
@@ -62,6 +84,7 @@ async def record_turn(
             "org_id": org_id or "",
             "user_id": user_id or "",
             "started_at": str(time.time()),
+            **({"run_id": run_id} if run_id is not None else {}),
         })
         pipe.expire(key, TURN_INDEX_TTL_SECONDS)
         pipe.sadd(_TURNS_SET, conversation_id)
@@ -77,6 +100,23 @@ async def forget_turn(conversation_id: str) -> None:
     r = get_redis()
     await r.delete(_turn_key(conversation_id))
     await r.srem(_TURNS_SET, conversation_id)
+
+
+async def forget_run(conversation_id: str, run_id: str) -> None:
+    """Remove abandoned admission without deleting a successor's index entry."""
+    r = get_redis()
+    key = _turn_key(conversation_id)
+    try:
+        async with r.pipeline(transaction=True) as pipe:
+            await pipe.watch(key)
+            if await pipe.hget(key, "run_id") != run_id:
+                return
+            pipe.multi()
+            pipe.delete(key)
+            pipe.srem(_TURNS_SET, conversation_id)
+            await pipe.execute()
+    except WatchError:
+        return  # replaced while cleanup was pending; that entry belongs to its successor
 
 
 def forget_turn_sync(conversation_id: str) -> None:

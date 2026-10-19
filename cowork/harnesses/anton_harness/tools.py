@@ -13,9 +13,9 @@ makes sense for a server process: no console.print, no Live spinner,
 no webbrowser.open. Status flows back to the desktop UI through the
 normal SSE event stream and the response string the LLM renders.
 
-Right now we only override PUBLISH_TOOL — the only one users have hit.
-Add more here as needed (CONNECT_DATASOURCE_TOOL is the next likely
-candidate; same pattern).
+PUBLISH_TOOL is overridden here, and CONNECT_DATASOURCE_TOOL keeps anton's
+handler with a vault that matches only the asker's own connections. Add more
+here as needed; same pattern.
 """
 
 from __future__ import annotations
@@ -29,7 +29,9 @@ import uuid
 
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import MissingTenantScopeError
+from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 
@@ -38,9 +40,15 @@ logger = logging.getLogger(__name__)
 
 def _published_state(raw_path: str) -> dict:
     """Delegate to the publish service so the tool and GUI agree on where
-    `.published.json` lives. Imported lazily to avoid a startup import cycle."""
+    `.published.json` lives. Imported lazily to avoid a startup import cycle.
+
+    Every helper here resolves paths in the turn's own scope, the one the
+    producer binds (use_settings_scope): a person's partition where projects
+    are personal. Unbound, the scan refuses on a partitioned deployment.
+    """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_state
-    return published_state(raw_path)
+    return published_state(raw_path, scope=current_settings_scope())
 
 
 def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
@@ -49,12 +57,16 @@ def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
     Resolves the artifact, its root and the credential the same way the HTTP
     endpoints do — `publish_artifact` takes all three explicitly now.
     """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import desktop_publish_context, publish_artifact
 
-    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(raw_path)
+    scope = current_settings_scope()
+    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
+        raw_path, scope=scope
+    )
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
-        api_key=api_key, publish_url=publish_url, access=access,
+        api_key=api_key, publish_url=publish_url, access=access, scope=scope,
     )
 
 
@@ -62,8 +74,9 @@ def _published_owner_state(raw_path: str) -> dict:
     """Raw owner-side `.published.json` entry (mode/access_password/…) so the
     tool can preserve prior access on re-publish. Lazily imported to avoid a
     startup import cycle."""
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_owner_state
-    return published_owner_state(raw_path)
+    return published_owner_state(raw_path, scope=current_settings_scope())
 
 
 def _access_from_state(entry: dict) -> dict:
@@ -75,29 +88,32 @@ def _access_from_state(entry: dict) -> dict:
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
-# The CLI-flavoured copies inside anton-core's `tools.py` mention the
-# legacy `.anton/output/` artifacts dir and reference a `/publish`
-# slash command that doesn't exist in antontron — both confuse the
-# LLM in the desktop context, so we override them in `build_cowork_publish_tool`.
-COWORK_PUBLISH_DESCRIPTION = (
-    "Preview, check, or publish an HTML dashboard / report. Files live "
-    "under the project's `artifacts/<artifact-id>/<name>.html`. Actions: "
+# The CLI-flavoured copies inside anton-core's `tools.py` describe the
+# interactive CLI flow ('ask' prompts the user, 'preview' opens a
+# browser), which doesn't exist in the desktop process and confuses the
+# LLM there, so we override them in `build_cowork_publish_tool`.
+# Default hosts fill the placeholders with the desktop app and MindsHub
+# publishing. A self-hosted deployment runs in the browser and publishes to
+# its own publisher, so its text names neither.
+_PUBLISH_DESCRIPTION = (
+    "Preview, check, or publish an HTML dashboard / report. Pass as "
+    "`file_path` the artifact's slug or the absolute path that "
+    "`create_artifact` or `generate_artifact` returned. Actions: "
     "'ask' (default) and 'preview' check whether the file is already "
     "published and return the public URL if so — they DON'T publish; "
     "use them when generating a new file to confirm state. 'publish' "
     "actually publishes (or re-publishes if a report_id already exists) "
-    "and returns the public URL. In the desktop app the user can also "
-    "publish via the Live Artifacts panel — but you should call "
+    "and returns the public URL. {panel} — but you should call "
     "action='publish' directly whenever the user asks to publish, "
     "share, deploy, or make-public any artifact you generated. No "
     "slash command, no extra confirmation."
 )
-COWORK_PUBLISH_PROMPT = (
-    "CONTENT SHARING POLICY (desktop chat):\n"
+_PUBLISH_PROMPT = (
+    "{heading}\n"
     "- Publishing dashboards or reports to the web is done ONLY via the `publish_or_preview` tool.\n"
     "- When the user asks to publish / share / deploy / make-public a generated artifact, call this\n"
     "  tool with `action: 'publish'` directly. Don't ask the user to use a slash command or a UI\n"
-    "  panel — publishing works straight from chat when MindsHub is configured.\n"
+    "  panel — {from_chat}.\n"
     "- To check whether something is already published (e.g. the user asks 'is it live?'), call with\n"
     "  `action: 'ask'` or `action: 'preview'` — both return the public URL if one exists, without\n"
     "  publishing or re-publishing.\n"
@@ -127,6 +143,54 @@ COWORK_PUBLISH_PROMPT = (
     "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
     "  ask again)."
 )
+COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
+    panel="In the desktop app the user can also publish via the Live Artifacts panel",
+)
+COWORK_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
+    heading="CONTENT SHARING POLICY (desktop chat):",
+    from_chat="publishing works straight from chat when MindsHub is configured",
+)
+SELF_HOSTED_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
+    panel="The user can also publish from the Live Artifacts panel",
+)
+SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
+    heading="CONTENT SHARING POLICY:",
+    from_chat="publishing works straight from chat",
+)
+
+
+def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
+    """The existing path `raw_path` names, or None when nothing matches.
+
+    A relative path is looked up in the session project's artifacts folder
+    first (`<slug>`, `<slug>/<file>`, `artifacts/<slug>/...`), then under the
+    project folder, where `.anton/artifacts/<slug>` resolves. `..` in a
+    relative path is refused: resolving collapses it even through a missing
+    folder, so `artifacts/../.anton/memory` would otherwise land in
+    `.anton/memory`.
+    """
+    from cowork.services.artifacts import _candidate_relative_artifacts
+
+    try:
+        path = Path(raw_path).expanduser()
+        workspace = getattr(session, "_workspace", None)
+        base = getattr(workspace, "base", None)
+        if not path.is_absolute() and base:
+            if ".." in path.parts:
+                return None
+            # `as_posix()` drops the `.` segments and doubled slashes that
+            # the helper would otherwise reject (`artifacts//<slug>`).
+            matches = _candidate_relative_artifacts(
+                path.as_posix(), [Path(workspace.artifacts_dir)]
+            )
+            if matches:
+                return matches[0]
+            path = Path(base) / path
+        path = path.resolve()
+        return path if path.exists() else None
+    except (OSError, RuntimeError, ValueError):
+        # NUL bytes, over-long names and unknown `~user` raise here.
+        return None
 
 
 async def _cowork_publish_or_preview(session: Any, tc_input: dict):
@@ -146,18 +210,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if not raw_path:
         return "publish_or_preview: missing file_path"
 
-    file_path = Path(raw_path).expanduser()
-    if not file_path.is_absolute():
-        # Anton's session carries the active workspace base.
-        workspace = getattr(session, "_workspace", None)
-        if workspace is not None:
-            base = getattr(workspace, "base", None)
-            if base:
-                file_path = Path(base) / raw_path
-    file_path = file_path.resolve()
-
-    if not file_path.exists():
-        return f"File not found: {file_path}"
+    file_path = _resolve_publish_path(session, raw_path)
+    if file_path is None:
+        # Echo only what the agent passed: the joined path could name a folder
+        # outside the artifacts (e.g. `.anton/memory`).
+        shown = raw_path if len(raw_path) <= 200 else raw_path[:200] + "…"
+        return (
+            f"Artifact not found: {shown!r}. Pass the artifact's slug "
+            "(list_artifacts shows it) or the absolute path that "
+            "create_artifact or generate_artifact returned."
+        )
 
     abs_path = str(file_path)
 
@@ -180,12 +242,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 f"If the user asks to re-publish, call this tool again with "
                 f"action='publish' — the same report_id is reused so the URL stays stable."
             )
+        from_chat = (
+            "MindsHub publishing works directly from chat in the desktop app"
+            if identity_for_turn() is None
+            else "publishing works directly from chat"
+        )
         return (
             f"{title} is at {file_path} and visible in the Live Artifacts "
             f"panel. It has NOT been published to the public web yet. If the "
             f"user asks to publish / share / make it public, call this tool "
-            f"again with action='publish' — MindsHub publishing works directly "
-            f"from chat in the desktop app, no slash command needed."
+            f"again with action='publish' — {from_chat}, no slash command needed."
         )
 
     if action != "publish":
@@ -314,21 +380,23 @@ def build_cowork_publish_tool():
     can build the session config without paying the import cost twice.
 
     The description and prompt are replaced with cowork-flavoured copy
-    that names the right artifacts path (`artifacts/<id>/<file>.html`,
-    not the legacy `.anton/output/`) and tells the LLM publishing
+    that says what to pass as `file_path` and tells the LLM publishing
     works directly from chat — no slash command, no UI dance. Without
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
+    On a self-hosted deployment the copy names neither the desktop app
+    nor MindsHub publishing.
     """
     from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
 
+    self_hosted = identity_for_turn() is not None
     return ToolDef(
         name=PUBLISH_TOOL.name,
-        description=COWORK_PUBLISH_DESCRIPTION,
+        description=SELF_HOSTED_PUBLISH_DESCRIPTION if self_hosted else COWORK_PUBLISH_DESCRIPTION,
         input_schema=PUBLISH_TOOL.input_schema,
         handler=_cowork_publish_or_preview,
-        prompt=COWORK_PUBLISH_PROMPT,
+        prompt=SELF_HOSTED_PUBLISH_PROMPT if self_hosted else COWORK_PUBLISH_PROMPT,
     )
 
 
@@ -559,18 +627,34 @@ def build_cowork_lookup_connector_tool():
 # After the lookup_connector tool surfaces the canonical form spec, the agent calls
 # `request_credentials` to render the form for the user.
 
-def _saved_connection_exists(engine: str, name: str) -> bool:
-    """Whether this turn's vault holds connection ``engine``/``name``.
+def _extends_refusal(engine: str, name: str) -> str | None:
+    """Why a later step can't add fields to connection ``engine``/``name``, or
+    None when it can: this turn's vault must hold it, and the asker must be
+    able to change it (ConnectionsService.can_change), as submit_form checks.
+    A connection someone shares with the asker reads like their own, so
+    without the second check the form would render and its submission answer
+    403.
 
-    Returns True when there is no tenant scope to read the vault with, so the
-    form still renders and submit_form makes the same check.
+    None when there is no tenant scope to read the vault with, so the form
+    still renders and submit_form makes the same checks.
     """
+    scope = current_settings_scope()
     try:
-        vault = vault_for_scope(current_settings_scope())
+        vault = vault_for_scope(scope)
     except MissingTenantScopeError:
         logger.warning("request_credentials: no tenant scope to check extends_connection against")
-        return True
-    return vault.read_record(engine, name) is not None
+        return None
+    if vault.read_record(engine, name) is None:
+        return (
+            f"request_credentials: there is no {engine} connection named "
+            f"{name!r} to extend. Use the name the first save reported."
+        )
+    if not ConnectionsService(scope).can_change(engine, name):
+        return (
+            f"request_credentials: the {engine} connection {name!r} is shared with the "
+            "user and can't be changed here, so no step can add fields to it."
+        )
+    return None
 
 
 def _ensure_form_id(spec: dict) -> dict:
@@ -667,11 +751,9 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
                 "request_credentials: `extends_connection` applies only to handcrafted "
                 "forms; a built-in connector's form saves its connection in one step."
             )
-        if not _saved_connection_exists(connector_id, extends_name.strip()):
-            return (
-                f"request_credentials: there is no {connector_id} connection named "
-                f"{extends_name.strip()!r} to extend. Use the name the first save reported."
-            )
+        refusal = _extends_refusal(connector_id, extends_name.strip())
+        if refusal is not None:
+            return refusal
         # The renderer submits `_existing_name` as the record name; the server
         # reads `_extends_connection` to merge instead of creating a sibling.
         spec["_extends_connection"] = extends_name.strip()
@@ -899,10 +981,22 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     label = str(tc_input.get("label", "")).strip()
     if not engine or not name or not label:
         return "label_connection: `engine`, `name`, and `label` are all required."
-    try:
-        from cowork.services.connectors.persist import set_connection_label
+    from cowork.services.connectors.layered_vault import SharedConnectionError
 
-        stored = set_connection_label(engine, name, label)
+    try:
+        from cowork.common.settings.user_settings import current_settings_scope
+        from cowork.services.connectors.persist import set_connection_label, turn_vault_for_scope
+
+        # The turn's own vault: the label lands on the asker's connection, an
+        # unbound turn on a partitioned deployment is refused, and a turn with
+        # no person changes no connection already saved.
+        scope = current_settings_scope()
+        stored = set_connection_label(
+            engine, name, label, vault=turn_vault_for_scope(scope), scope=scope
+        )
+    except SharedConnectionError as exc:
+        # A connection the asker can't change, such as one shared with them.
+        return f"label_connection: {exc}"
     except Exception as exc:
         logger.exception("Cowork label_connection failed")
         return f"label_connection: could not set label ({exc})"
@@ -927,6 +1021,51 @@ def build_cowork_label_connection_tool():
         # `connect-datasource` SKILL.md (see lookup_connector above).
         unlock_skill="connect-datasource",
     )
+
+
+#########################
+# Connect Datasource Tool
+#########################
+
+
+async def _cowork_connect_datasource(session: Any, tc_input: dict) -> str:
+    """Tool handler for `connect_new_datasource`: anton's own
+    (anton.tools.handle_connect_datasource), matched only against the
+    connections the asker can change.
+
+    anton's handler updates the saved connection whose identity fields match
+    the new one's. The turn's vault also lists connections the asker can't
+    change, so it runs against that vault's ConnectingDataVault, where those
+    match nothing and a new connection is saved as the asker's own. A turn
+    with connections turned off reads a FilteredDataVault over it, whose
+    connecting view lists them by label alone, so a paste never matches or
+    relabels one.
+    """
+    from anton.tools import handle_connect_datasource
+
+    from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
+
+    vault = session._data_vault
+    if not isinstance(vault, (LayeredDataVault, FilteredDataVault)):
+        return await handle_connect_datasource(session, tc_input)
+    # anton's handler reads the vault off the session, and a session runs its
+    # tool calls one at a time, so the swap holds for this call alone.
+    session._data_vault = vault.for_connecting()
+    try:
+        return await handle_connect_datasource(session, tc_input)
+    finally:
+        session._data_vault = vault
+
+
+def build_cowork_connect_datasource_tool():
+    """anton's console-less connect_new_datasource, the one its ChatSession
+    swaps in where there is no console, as cowork's turns have none, with
+    _cowork_connect_datasource as its handler."""
+    import dataclasses
+
+    from anton.tools import CONNECT_DATASOURCE_TOOL_NO_CONSOLE
+
+    return dataclasses.replace(CONNECT_DATASOURCE_TOOL_NO_CONSOLE, handler=_cowork_connect_datasource)
 
 
 ##################

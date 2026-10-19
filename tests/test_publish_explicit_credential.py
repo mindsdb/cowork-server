@@ -288,7 +288,7 @@ def test_agent_publish_tool_wrapper_still_works(artifact, monkeypatch):
     )
     monkeypatch.setattr(
         p, "desktop_publish_context",
-        lambda raw: (folder, base, "desktop-key", "https://api.staging.mindshub.ai"),
+        lambda raw, *, scope: (folder, base, "desktop-key", "https://api.staging.mindshub.ai"),
     )
 
     out = htools._publish_artifact(str(folder), access={"mode": "public"})

@@ -84,13 +84,16 @@ def resolve_comments_route(user_dir: str, report_id: str, *, session=None) -> tu
         artifact_id = UUID(report_id).hex
     except (ValueError, TypeError, AttributeError):
         return None
+    # The caller's own artifacts roots only: another person's artifact id is
+    # unresolvable here and falls back to the local journal's 404.
+    tenant_scope = session.scope if session is not None else None
     try:
         _source, folder, _metadata = resolve_artifact_folder(
-            artifacts_sources_for_scan(), artifact_id
+            artifacts_sources_for_scan(scope=tenant_scope), artifact_id
         )
     except Exception:
         return None
-    scope = cloud_comments_scope(published_owner_state(str(folder)))
+    scope = cloud_comments_scope(published_owner_state(str(folder), scope=tenant_scope))
     if not scope:
         return None
     upstream_user_dir, _, upstream_report_id = scope.partition("/")
@@ -128,7 +131,7 @@ async def comments_stream(user_dir: str, report_id: str, request: Request, sessi
         # ``route is None`` is possible only in desktop's canonical namespace,
         # where the boundary helper always returns a UUID.
         assert local_report_id is not None
-        return local_comments_stream(local_report_id)
+        return local_comments_stream(local_report_id, scope=session.scope)
     return await forward_comments_stream(request, route[0], route[1])
 
 
@@ -142,5 +145,7 @@ async def comments_rest(user_dir: str, report_id: str, subpath: str, request: Re
     route = await run_in_threadpool(resolve_comments_route, user_dir, report_id, session=session)
     if route is None:
         assert local_report_id is not None
-        return await handle_local_comments(request, local_report_id, subpath)
+        return await handle_local_comments(
+            request, local_report_id, subpath, scope=session.scope
+        )
     return await forward_comments_rest(request, route[0], route[1], subpath)

@@ -1,15 +1,21 @@
+from __future__ import annotations
+
 import os
 import re
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+
+if TYPE_CHECKING:
+    from anton.core.llm.identity import DeploymentIdentity
 
 
 # ── Global model catalog ───────────────────────────────────────────────
@@ -378,13 +384,19 @@ class CodingSettings(Settings):
 
 
 class StorageSettings(Settings):
-    # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
-    # mountable subtree per org). Local mode never reads this; in org mode the
-    # per-store *_DIR overrides are inert.
+    # Org mode and personal partitions: stores live under
+    # <shared_root>/<org_id>/<store>/ (one mountable subtree per org or
+    # person). The desktop never reads this; in org mode the per-store *_DIR
+    # overrides are inert.
     shared_root: str = Field(
         default_factory=lambda: str(cowork_home()),
         validation_alias=AliasChoices("COWORK_SHARED_DIR", "STORAGE_SHARED_ROOT"),
-        description="Root of the org-keyed shared storage tree (org mode only)",
+        description=(
+            "Root of the org-keyed shared storage tree (org mode and personal "
+            "partitions). Where skills are personal, it also holds "
+            "shared/skills.json, the skills people share, which Cowork writes "
+            "(cowork.shared_skills)."
+        ),
     )
 
 
@@ -567,6 +579,15 @@ class TurnQueueSettings(Settings):
             "both together."
         ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    pod_shared_mount_root: str = Field(
+        default="/mnt/cowork-shared",
+        description=(
+            "Where a cloud pod mounts its organization's shared tree, as "
+            "scratchpad-controller's SHARED_MOUNT_ROOT sets it. With a persistent "
+            "workspace the pod's scratchpad runs in "
+            "<root>/<project path in the organization>/conversations/<conversation id>."
+        ),
+    )  # COWORK_TURN_POD_SHARED_MOUNT_ROOT
     minds_base_url: str = Field(
         default="",
         description=(
@@ -629,6 +650,25 @@ OpenAICompatibleAPI = Literal["chat_completions", "responses"]
 
 
 class AppSettings(Settings):
+    # Loaded by create_app before accepting turns. A private snapshot cannot
+    # become a member-editable setting or change when a mounted pack changes.
+    _deployment_identity: DeploymentIdentity | None = PrivateAttr(default=None)
+    _deployment_identity_initialized: bool = PrivateAttr(default=False)
+
+    deployment_kind: Literal["self-hosted"] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_DEPLOYMENT_KIND"),
+        description="Explicit self-hosted agent identity. Unset keeps the desktop and hosted defaults.",
+    )
+    deployment_brand_file: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_DEPLOYMENT_BRAND_FILE"),
+        description=(
+            "Absolute path to the operator's read-only branding pack.json. Its name is the "
+            "agent's product name when COWORK_DEPLOYMENT_KIND=self-hosted. Read once at startup."
+        ),
+    )
+
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
     port: int = Field(
@@ -716,6 +756,14 @@ class AppSettings(Settings):
             "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
         ),
     )
+    publish_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUBLISH_TOKEN"),
+        description=(
+            "Bearer sent to the publish service (ANTON_PUBLISH_URL) in place of the "
+            "provider's key, on every provider. Blank means unset."
+        ),
+    )
     tenancy_mode: Literal["local", "org"] = Field(
         default="local",
         validation_alias=AliasChoices("COWORK_TENANCY_MODE"),
@@ -795,14 +843,113 @@ class AppSettings(Settings):
         default="enforce",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
-            "Org-mode identity enforcement. 'enforce' (default): a request "
+            "Identity enforcement in org mode, and in local tenancy with "
+            "COWORK_TRUST_IDENTITY_HEADERS on. 'enforce' (default): a request "
             "without identity headers is rejected with 401. 'audit': it is "
             "logged and allowed through, which is the rollout mode the org "
-            "cutover needed and now has to be asked for. Dropping the env var "
-            "must not reopen the no-principal path, so the default is the "
+            "cutover needed and now has to be asked for; with trusted "
+            "identity headers it is served as the operator view, and a pair "
+            "that is present but broken is still rejected. Dropping the env "
+            "var must not reopen the no-principal path, so the default is the "
             "closed one."
         ),
     )
+    trust_identity_headers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_TRUST_IDENTITY_HEADERS"),
+        description=(
+            "Local tenancy only. Read X-User-Id and X-Organization-Id on a "
+            "request that passed the bearer token, and give each (organization, "
+            "user) pair its own partition, keyed by "
+            "cowork.principal.personal_partition_id. Only for a deployment "
+            "behind a proxy that verifies each person and strips client copies "
+            "of those headers. create_app refuses it in org tenancy, when "
+            "COWORK_REQUIRE_AUTH is off, with COWORK_TURN_BACKEND=remote, with "
+            "COWORK_CODE_SANDBOX off, and without COWORK_AUTH_TOKEN in the "
+            "environment; with it on, the token is never copied into "
+            "cowork-home's .env. "
+            "COWORK_IDENTITY_ENFORCE applies: 'enforce' answers 401 without a "
+            "valid pair, and 'audit' serves a request carrying no pair as the "
+            "operator view, with no person; a pair that is present but broken "
+            "answers 401 under either."
+        ),
+    )
+    personal_resources: Annotated[frozenset[PersonalResource], NoDecode] = Field(
+        default=ALL_PERSONAL_RESOURCES,
+        validation_alias=AliasChoices("COWORK_PERSONAL_RESOURCES"),
+        description=(
+            "Comma-separated resources each person keeps in their own "
+            "partition while COWORK_TRUST_IDENTITY_HEADERS is on: "
+            "conversations, projects, files, skills, connections, schedules, "
+            "pins, memory, settings. Default: all of them. Blank: none. A "
+            "resource left off stays shared across the deployment, as with the "
+            "setting off. An unknown name fails settings load. Memory left "
+            "off is one store every person's turns read and learn into, "
+            "profile included: its global tier is COWORK_MEMORY_DIR, and each "
+            "project's tier sits under it at projects/<project id>/, never in "
+            "the project's .anton/memory. Each turn reads only its current "
+            "project's tier. The server logs a warning at start that memory is "
+            "shared (MemoryPolicy.start_warning in "
+            "cowork.harnesses.memory.policy). create_app refuses a list that "
+            "breaks a dependency: projects requires conversations, and "
+            "conversations requires files, pins and schedules. Ignored while "
+            "COWORK_TRUST_IDENTITY_HEADERS is off."
+        ),
+    )
+
+    @field_validator("personal_resources", mode="before")
+    @classmethod
+    def _split_personal_resources(cls, value: object) -> object:
+        if isinstance(value, str):
+            return frozenset(name.strip() for name in value.split(",") if name.strip())
+        return value
+
+    managed_dir: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_MANAGED_DIR"),
+        description=(
+            "The operator's managed folder (cowork.managed.ManagedFolder): "
+            "memory/ with rules and lessons every turn reads, skills/ with the "
+            "operator's own skills every person sees as built-in, data-vault/ "
+            "with the operator's own connections every turn can use, and an "
+            "optional shared/connections.json listing the connections people "
+            "share. Cowork never writes it. Blank or unset: none. create_app "
+            "refuses it in org tenancy, with COWORK_TURN_BACKEND=remote, when "
+            "the folder or any of memory/, skills/ and data-vault/ is missing, "
+            "when the server's user can't read and search memory/, when "
+            "shared/connections.json is malformed, and when the installed "
+            "anton's Cortex takes no managed_hc."
+        ),
+    )
+
+    @field_validator("managed_dir", mode="before")
+    @classmethod
+    def _blank_managed_dir_is_none(cls, value: object) -> object:
+        # A blank value read as a Path is ".", the working directory, which
+        # exists: the missing-folder refusal would then pass on a typo.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    code_sandbox: Literal["off", "landlock"] = Field(
+        default="off",
+        validation_alias=AliasChoices("COWORK_CODE_SANDBOX"),
+        description=(
+            "How the agent's code runs (cowork.code_sandbox). 'off' (default): "
+            "every cell, install and check starts as today, with the server's "
+            "environment and files. 'landlock': each one starts through anton's "
+            "launcher, which locks it with Landlock to the conversation's "
+            "project, the asker's own HOME and TMPDIR, the skills and "
+            "attachments of the turn, the shared folder and the system's "
+            "read-only files, with an allowlisted environment. create_app "
+            "refuses COWORK_TRUST_IDENTITY_HEADERS with it off, and refuses "
+            "'landlock' in org tenancy, with COWORK_TURN_BACKEND=remote, on an "
+            "anton without the launcher, below Landlock ABI 3 (Linux 6.2), and "
+            "when its startup self-test can't confirm a denied path is denied. "
+            "Under 'landlock', app backends and Code mode are refused."
+        ),
+    )
+
     organization_switch_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
