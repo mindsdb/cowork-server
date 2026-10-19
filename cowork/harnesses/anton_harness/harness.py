@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import partial
@@ -1637,9 +1638,13 @@ class AntonHarness:
                 anton_settings.skills_root = turn_skills_dir
             read_only_dirs += anton_settings.skills_extra_roots
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
-            # None with the sandbox off, and then not passed at all.
-            cell_sandbox = build_cell_sandbox(
-                scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
+            # None with the sandbox off, and then not passed at all. Built in a
+            # worker thread: it lists every person's partition and opens the
+            # session's folders, file work that would otherwise hold the event
+            # loop and every request on it. to_thread copies the context, so
+            # the settings scope still applies there.
+            cell_sandbox = await asyncio.to_thread(
+                build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
             )
 
             deployment = identity_for_turn()

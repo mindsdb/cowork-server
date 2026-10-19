@@ -16,12 +16,14 @@ launcher, and the one real-kernel test here runs it where Landlock is.
 """
 from __future__ import annotations
 
+import asyncio
 import getpass
 import json
 import logging
 import os
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +39,7 @@ from cowork.auth_middleware import remove_auth_token
 from cowork.code_sandbox import NO_CODE_MODE_DETAIL, PlantedLinkError, build_cell_sandbox
 from cowork.common.paths import makedirs_below_nofollow
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, TenantScope
 from cowork.harnesses.anton_harness import harness
@@ -46,8 +49,10 @@ from tests._turns import built_turn
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 SUB_A = "11111111-1111-4111-8111-111111111111"
 SUB_B = "22222222-2222-4222-8222-222222222222"
+SUB_C = "33333333-3333-4333-8333-333333333333"
 PARTITION_A = personal_partition_id(DEPLOYMENT, SUB_A)
 PARTITION_B = personal_partition_id(DEPLOYMENT, SUB_B)
+PARTITION_C = personal_partition_id(DEPLOYMENT, SUB_C)
 TOKEN = "code-sandbox-test-token"
 SHARED_PROJECTS = "conversations,files,skills,connections,schedules,pins,memory,settings"
 SHARED_MEMORY = "conversations,projects,files,skills,connections,schedules,pins,settings"
@@ -516,6 +521,106 @@ def test_a_persons_policy_names_every_other_partition(stack, tmp_path):
     assert set(operator.other_partitions) == {real / PARTITION_A, real / PARTITION_B}
 
 
+def _realpath(path: Path) -> Path:
+    return Path(os.path.realpath(path))
+
+
+def _shared_root(tmp_path: Path, *, reached: str) -> Path:
+    """The test's shared root, ``tmp_path/home``, as configured or through a
+    link to it. pytest resolves tmp_path, so without the link no platform
+    reaches the shared root through one."""
+    home = _project(tmp_path, "home")
+    if reached == "as configured":
+        return home
+    linked = tmp_path / "linked-home"
+    linked.symlink_to(home, target_is_directory=True)
+    return linked
+
+
+@pytest.mark.parametrize("reached", ["as configured", "through a link"])
+def test_each_partition_resolves_where_realpath_resolves_it(tmp_path, reached):
+    """The partitions are listed with each one resolved once, to what
+    os.path.realpath gives its entry: Alice's folder, and Bob's, which is a
+    link to a folder elsewhere. The shared root is resolved once for all of
+    them, through its link too. A name that isn't a partition id in its
+    canonical form is no partition."""
+    shared_root = _shared_root(tmp_path, reached=reached)
+    _project(shared_root, PARTITION_A)
+    bobs = _project(tmp_path, "elsewhere", "bobs")
+    (shared_root / PARTITION_B).symlink_to(bobs, target_is_directory=True)
+    _project(shared_root, "shared")
+    _project(shared_root, PARTITION_C.upper())
+
+    partitions = code_sandbox._partition_roots(shared_root)
+
+    assert sorted(partitions) == sorted(
+        code_sandbox._Partition(name, _realpath(shared_root / name))
+        for name in (PARTITION_A, PARTITION_B)
+    )
+    assert {partition.name: partition.real for partition in partitions}[PARTITION_B] == bobs.resolve()
+
+
+@pytest.mark.parametrize("asker", ["a person", "the operator view"])
+@pytest.mark.parametrize("reached", ["as configured", "through a link"])
+def test_the_policy_names_each_partition_as_realpath_resolves_it(
+    stack, tmp_path, managed_dir, reached, asker
+):
+    """forbidden_roots and other_partitions, in order and each once, as
+    resolving every root and partition entry with os.path.realpath names
+    them. Bob's partition is a link to a folder that bears Alice's id, so
+    his resolves to her name: Alice's own partition is still the one her id
+    names on disk, in her forbidden_roots and not her other_partitions."""
+    shared_root = _shared_root(tmp_path, reached=reached)
+    stack.setenv("COWORK_HOME", str(shared_root))
+    stack.setenv("COWORK_SHARED_DIR", str(shared_root))
+    get_app_settings.cache_clear()
+    bobs = _project(tmp_path, "elsewhere", PARTITION_A)
+    (shared_root / PARTITION_B).symlink_to(bobs, target_is_directory=True)
+    _project(shared_root, "shared")
+    if asker == "a person":
+        scope, own = ALICE, PARTITION_A
+        project = _project(shared_root, PARTITION_A, "projects", "p")
+    else:
+        scope, own = LOCAL_SCOPE, None
+        _project(shared_root, PARTITION_A)
+        project = _project(shared_root, "projects", "general")
+    entries = [
+        shared_root / name
+        for name in os.listdir(shared_root)
+        if name in (PARTITION_A, PARTITION_B)
+    ]
+
+    policy = build_cell_sandbox(scope=scope, project_dir=project)
+
+    roots = [shared_root, shared_root, shared_root / "shared", *entries, managed_dir.root]
+    assert policy.forbidden_roots == tuple(dict.fromkeys(_realpath(root) for root in roots))
+    assert policy.other_partitions == tuple(
+        dict.fromkeys(_realpath(entry) for entry in entries if entry.name != own)
+    )
+    alices = _realpath(shared_root / PARTITION_A)
+    assert alices in policy.forbidden_roots
+    assert bobs.resolve() in policy.other_partitions
+    assert (alices in policy.other_partitions) is (asker == "the operator view")
+
+
+def test_a_partition_made_after_a_build_is_denied_on_the_next(stack, tmp_path):
+    """Nothing keeps the partitions from one build to the next: a person
+    whose partition appears after Alice's turn is in her next policy's
+    forbidden_roots and other_partitions."""
+    home = tmp_path / "home"
+    real = home.resolve()
+    _project(home, PARTITION_B)
+    project = _project(home, PARTITION_A, "projects", "p")
+    first = build_cell_sandbox(scope=ALICE, project_dir=project)
+    assert real / PARTITION_C not in first.forbidden_roots
+
+    _project(home, PARTITION_C)
+    second = build_cell_sandbox(scope=ALICE, project_dir=project)
+
+    assert real / PARTITION_C in second.forbidden_roots
+    assert real / PARTITION_C in second.other_partitions
+
+
 def test_two_people_never_share_a_home(stack, tmp_path):
     home = tmp_path / "home"
     alice = build_cell_sandbox(scope=ALICE, project_dir=_project(home, PARTITION_A, "projects", "p"))
@@ -942,6 +1047,54 @@ async def test_a_turn_off_passes_what_it_passed_before(monkeypatch, tmp_path):
     assert harness._OTHER_FILES_RULE not in on_suffix
     assert harness._ATTACHMENT_AFFORDANCE not in on_suffix
     assert "strictly forbidden" in on_suffix and "exactly two ways" not in on_suffix
+
+
+@dataclass(frozen=True)
+class _PolicyBuild:
+    """One build_cell_sandbox call a turn made, and where it ran."""
+
+    on_an_event_loop: bool
+    on_the_main_thread: bool
+    settings_scope: TenantScope | None
+    policy: object
+
+
+async def test_a_turn_builds_its_policy_off_the_event_loop(stack, monkeypatch, tmp_path):
+    """The policy lists every person's partition and opens the session's
+    folders, so the turn builds it in a worker thread rather than on the
+    event loop every other request shares. The thread carries the turn's
+    settings scope, and the policy it builds is the one the session gets."""
+    builds: list[_PolicyBuild] = []
+    build = harness.build_cell_sandbox
+
+    def recording(**kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_an_event_loop = False
+        else:
+            on_an_event_loop = True
+        policy = build(**kwargs)
+        builds.append(
+            _PolicyBuild(
+                on_an_event_loop=on_an_event_loop,
+                on_the_main_thread=threading.current_thread() is threading.main_thread(),
+                settings_scope=current_settings_scope(),
+                policy=policy,
+            )
+        )
+        return policy
+
+    monkeypatch.setattr(harness, "build_cell_sandbox", recording)
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=ALICE) as turn:
+        policy = turn.config.cell_sandbox
+
+    (made,) = builds
+    assert made.on_an_event_loop is False
+    assert made.on_the_main_thread is False
+    assert made.settings_scope == ALICE
+    assert policy is not None
+    assert made.policy is policy
 
 
 async def test_a_persons_turn_grants_its_skills_and_attachments(personal_deployment, monkeypatch, tmp_path):
