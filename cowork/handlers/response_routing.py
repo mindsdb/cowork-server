@@ -162,6 +162,13 @@ _FOREIGN_PRODUCT_RE = re.compile(
 )
 
 
+def _configured_name(name: str) -> str:
+    """The deployment's configured product name as a pattern, bounded as
+    _FOREIGN_PRODUCT_RE bounds its names, so a short name such as "AI" matches
+    neither inside "explain" nor inside "OpenAI"."""
+    return rf"(?<![A-Za-z0-9_-]){re.escape(name)}(?![A-Za-z0-9_-])"
+
+
 # The second shape the gate must never ship: an answer that names no competitor
 # and instead denies that our own product can be identified or exists — the
 # prospect evaluating Cowork who was told "I can't reliably identify a current
@@ -265,6 +272,12 @@ def names_foreign_product(text: str) -> str | None:
     Exported so the regression suite asserts against the same matcher the gate
     uses, rather than a copy that can drift away from it.
     """
+    identity = identity_for_turn()
+    if identity is not None:
+        # The configured name is our own product even when it holds a listed
+        # name ("Acme Copilot"). Only the whole name is removed, so a listed
+        # name elsewhere in the text still matches.
+        text = re.sub(_configured_name(identity.product_name), "", text or "", flags=re.IGNORECASE)
     match = _FOREIGN_PRODUCT_RE.search(text or "")
     return match.group(0) if match else None
 
@@ -276,7 +289,7 @@ def denies_our_product(text: str) -> str | None:
     """
     identity = identity_for_turn()
     pattern = _DENIES_PRODUCT_RE if identity is None else _product_denial_regex(
-        rf"(?:{_OUR_PRODUCTS}|{re.escape(identity.product_name)})"
+        rf"(?:{_OUR_PRODUCTS}|{_configured_name(identity.product_name)})"
     )
     match = pattern.search(text or "")
     return " ".join(match.group(0).split())[:120] if match else None

@@ -1,5 +1,6 @@
 """Harness publish tool forwards access + preserves previous (ENG-322 follow-up)."""
 
+import hashlib
 import json
 from pathlib import Path
 from unittest import mock
@@ -271,3 +272,23 @@ def test_publish_description_says_what_to_pass_not_where_artifacts_live():
     assert "`create_artifact`" in description
     assert "`generate_artifact`" in description
     assert "open_artifact" not in description
+
+
+# The publish tool's description and prompt at staging 8b1ecf4, before
+# deployment identity support. Hosts without COWORK_DEPLOYMENT_KIND keep them.
+DEFAULT_DESCRIPTION_SHA256 = "5bae1e84c433d3e09c5b572e6b1e60221143a30086a8e71b4898e2239149a6b1"
+DEFAULT_PROMPT_SHA256 = "5e040dfeaca047ee2307d953989e2282106f6972c8d7aaf4655301e50ec1e73a"
+
+
+@pytest.mark.asyncio
+async def test_default_hosts_keep_the_publish_tool_text(project):
+    base, artifact, _ = project
+    publish = htools.build_cowork_publish_tool()
+    assert hashlib.sha256(publish.description.encode()).hexdigest() == DEFAULT_DESCRIPTION_SHA256
+    assert hashlib.sha256(publish.prompt.encode()).hexdigest() == DEFAULT_PROMPT_SHA256
+    assert await _ask(base, SLUG) == (
+        f"Dashboard is at {artifact} and visible in the Live Artifacts panel. It has NOT been "
+        "published to the public web yet. If the user asks to publish / share / make it public, "
+        "call this tool again with action='publish' — MindsHub publishing works directly from "
+        "chat in the desktop app, no slash command needed."
+    )

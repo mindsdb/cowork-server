@@ -29,6 +29,7 @@ import uuid
 
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import MissingTenantScopeError
+from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.persist import vault_for_scope
@@ -91,7 +92,10 @@ def _access_from_state(entry: dict) -> dict:
 # interactive CLI flow ('ask' prompts the user, 'preview' opens a
 # browser), which doesn't exist in the desktop process and confuses the
 # LLM there, so we override them in `build_cowork_publish_tool`.
-COWORK_PUBLISH_DESCRIPTION = (
+# Default hosts fill the placeholders with the desktop app and MindsHub
+# publishing. A self-hosted deployment runs in the browser and publishes to
+# its own publisher, so its text names neither.
+_PUBLISH_DESCRIPTION = (
     "Preview, check, or publish an HTML dashboard / report. Pass as "
     "`file_path` the artifact's slug or the absolute path that "
     "`create_artifact` or `generate_artifact` returned. Actions: "
@@ -99,18 +103,17 @@ COWORK_PUBLISH_DESCRIPTION = (
     "published and return the public URL if so — they DON'T publish; "
     "use them when generating a new file to confirm state. 'publish' "
     "actually publishes (or re-publishes if a report_id already exists) "
-    "and returns the public URL. In the desktop app the user can also "
-    "publish via the Live Artifacts panel — but you should call "
+    "and returns the public URL. {panel} — but you should call "
     "action='publish' directly whenever the user asks to publish, "
     "share, deploy, or make-public any artifact you generated. No "
     "slash command, no extra confirmation."
 )
-COWORK_PUBLISH_PROMPT = (
-    "CONTENT SHARING POLICY (desktop chat):\n"
+_PUBLISH_PROMPT = (
+    "{heading}\n"
     "- Publishing dashboards or reports to the web is done ONLY via the `publish_or_preview` tool.\n"
     "- When the user asks to publish / share / deploy / make-public a generated artifact, call this\n"
     "  tool with `action: 'publish'` directly. Don't ask the user to use a slash command or a UI\n"
-    "  panel — publishing works straight from chat when MindsHub is configured.\n"
+    "  panel — {from_chat}.\n"
     "- To check whether something is already published (e.g. the user asks 'is it live?'), call with\n"
     "  `action: 'ask'` or `action: 'preview'` — both return the public URL if one exists, without\n"
     "  publishing or re-publishing.\n"
@@ -139,6 +142,20 @@ COWORK_PUBLISH_PROMPT = (
     "- Exception: when re-publishing an artifact that already has access on record and the user\n"
     "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
     "  ask again)."
+)
+COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
+    panel="In the desktop app the user can also publish via the Live Artifacts panel",
+)
+COWORK_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
+    heading="CONTENT SHARING POLICY (desktop chat):",
+    from_chat="publishing works straight from chat when MindsHub is configured",
+)
+SELF_HOSTED_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
+    panel="The user can also publish from the Live Artifacts panel",
+)
+SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
+    heading="CONTENT SHARING POLICY:",
+    from_chat="publishing works straight from chat",
 )
 
 
@@ -225,12 +242,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 f"If the user asks to re-publish, call this tool again with "
                 f"action='publish' — the same report_id is reused so the URL stays stable."
             )
+        from_chat = (
+            "MindsHub publishing works directly from chat in the desktop app"
+            if identity_for_turn() is None
+            else "publishing works directly from chat"
+        )
         return (
             f"{title} is at {file_path} and visible in the Live Artifacts "
             f"panel. It has NOT been published to the public web yet. If the "
             f"user asks to publish / share / make it public, call this tool "
-            f"again with action='publish' — MindsHub publishing works directly "
-            f"from chat in the desktop app, no slash command needed."
+            f"again with action='publish' — {from_chat}, no slash command needed."
         )
 
     if action != "publish":
@@ -363,16 +384,19 @@ def build_cowork_publish_tool():
     works directly from chat — no slash command, no UI dance. Without
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
+    On a self-hosted deployment the copy names neither the desktop app
+    nor MindsHub publishing.
     """
     from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
 
+    self_hosted = identity_for_turn() is not None
     return ToolDef(
         name=PUBLISH_TOOL.name,
-        description=COWORK_PUBLISH_DESCRIPTION,
+        description=SELF_HOSTED_PUBLISH_DESCRIPTION if self_hosted else COWORK_PUBLISH_DESCRIPTION,
         input_schema=PUBLISH_TOOL.input_schema,
         handler=_cowork_publish_or_preview,
-        prompt=COWORK_PUBLISH_PROMPT,
+        prompt=SELF_HOSTED_PUBLISH_PROMPT if self_hosted else COWORK_PUBLISH_PROMPT,
     )
 
 

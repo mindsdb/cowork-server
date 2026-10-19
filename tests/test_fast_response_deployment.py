@@ -152,7 +152,7 @@ async def test_real_routing_starts_a_first_take_with_the_same_startup_identity(
         handler.first_take.cancel()
 
 
-@pytest.mark.parametrize("name", ["Acme Workbench", PRODUCT, "O'Brien's [R&D]+ (v2)$ #tools"])
+@pytest.mark.parametrize("name", ["Acme Workbench", PRODUCT, "O'Brien's [R&D]+ (v2)$ #tools", "AI"])
 @pytest.mark.parametrize("answer", [
     "I'm not familiar with a product called {name}.",
     "{name} does not appear to exist.",
@@ -180,7 +180,7 @@ async def test_configured_product_denials_delegate_and_withdraw_first_takes(monk
     assert take._queue.empty()
 
 
-@pytest.mark.parametrize("name", ["Acme Workbench", PRODUCT, "O'Brien's [R&D]+ (v2)$ #tools"])
+@pytest.mark.parametrize("name", ["Acme Workbench", PRODUCT, "O'Brien's [R&D]+ (v2)$ #tools", "AI"])
 def test_configured_product_guard_keeps_the_existing_narrow_policy(monkeypatch, tmp_path, name):
     _initialize(monkeypatch, tmp_path, branded=True, name=name)
     for text in (
@@ -190,9 +190,28 @@ def test_configured_product_guard_keeps_the_existing_narrow_policy(monkeypatch, 
         f"I cannot verify the checksum of the {name} download you pasted.",
         "I'm not familiar with a product called Changed after startup.",
         "I'm not familiar with a product called O'Brien's R&D v2 tools.",
+        # A short name matches only as a whole word, not inside "explain".
+        "I'm not familiar with that library, but I can explain the general approach.",
     ):
         assert response_routing.denies_our_product(text) is None, text
         assert first_take._shippable(text), text
+
+
+@pytest.mark.parametrize("answer,route,reason", [
+    ("Hi, I am Acme Copilot, made by MindsHub.", response_routing.DIRECT_CONTEXT, "router_direct_response"),
+    ("I am Copilot.", response_routing.DELEGATED_AGENTIC, "router_answer_named_foreign_product"),
+])
+async def test_a_configured_name_holding_a_foreign_product_is_still_ours(
+    monkeypatch, tmp_path, answer, route, reason
+):
+    _initialize(monkeypatch, tmp_path, branded=True, name="Acme Copilot")
+    decision = await response_routing.decide_route(
+        history=[{"role": "user", "content": "Who are you?"}], has_non_text_input=False,
+        has_attachments=False, has_disabled_connections=False, binding=_binding(_Provider(answer)),
+    )
+
+    assert (decision.route, decision.reason) == (route, reason)
+    assert first_take._shippable(answer) is (route == response_routing.DIRECT_CONTEXT)
 
 
 def test_without_opt_in_the_denial_guard_needs_no_startup_or_new_anton_api(monkeypatch, tmp_path):

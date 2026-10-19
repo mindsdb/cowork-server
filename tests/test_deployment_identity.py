@@ -5,6 +5,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -308,6 +309,10 @@ async def test_real_harness_passes_only_the_operator_identity_and_actual_memory_
         assert "self-hosted deployment accessed in the browser" in prompt
         assert "The operator installs, updates and removes this deployment" in prompt
         assert "This conversation is running in the Cowork desktop app" not in prompt
+        assert "desktop UI" not in prompt
+        assert "desktop chat" not in prompt
+        (publish,) = [tool for tool in turn.config.tools if tool.name == "publish_or_preview"]
+        assert "desktop app" not in publish.description
         assert "Member override" not in prompt
         notices = {
             "personal": "No personal memories are saved",
@@ -317,3 +322,22 @@ async def test_real_harness_passes_only_the_operator_identity_and_actual_memory_
         }
         assert notices[expected] in prompt
         assert "not remembered user preferences" in prompt
+
+
+async def test_self_hosted_publish_tool_names_neither_the_desktop_app_nor_mindshub(monkeypatch, tmp_path):
+    from cowork.harnesses.anton_harness import tools
+
+    _enable(monkeypatch, _pack(tmp_path))
+    cowork_server.create_app()
+    report = tmp_path / "report.html"
+    report.write_text("<h1>report</h1>", encoding="utf-8")
+    monkeypatch.setattr(tools, "_published_state", lambda raw_path: {})
+    publish = tools.build_cowork_publish_tool()
+
+    answer = await publish.handler(SimpleNamespace(), {"file_path": str(report), "action": "ask"})
+
+    assert "NOT been published" in answer
+    assert "publishing works directly from chat, no slash command needed" in answer
+    for text in (publish.description, publish.prompt, answer):
+        assert "desktop" not in text
+        assert "MindsHub" not in text

@@ -11,7 +11,7 @@ import inspect
 import json
 import os
 import stat
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError
 
@@ -20,8 +20,7 @@ from cowork.common.settings.app_settings import AppSettings, get_app_settings
 
 if TYPE_CHECKING:
     from anton.core.llm.identity import DeploymentIdentity
-
-LearnedMemoryScope = Literal["personal", "shared", "off", "unavailable"]
+    from anton.core.memory.base import LearnedMemoryScope
 
 
 class _BrandPack(BaseModel):
