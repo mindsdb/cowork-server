@@ -389,6 +389,10 @@ def create_app() -> FastAPI:
 
     settings = get_app_settings()
 
+    from cowork.deployment_identity import initialize_deployment_identity
+
+    initialize_deployment_identity(settings, remote_turns=TurnQueueSettings().is_remote)
+
     # Create FastAPI app
     app = FastAPI(
         title="Cowork API",

@@ -1,16 +1,21 @@
+from __future__ import annotations
+
 import os
 import re
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+
+if TYPE_CHECKING:
+    from anton.core.llm.identity import DeploymentIdentity
 
 
 # ── Global model catalog ───────────────────────────────────────────────
@@ -645,6 +650,25 @@ OpenAICompatibleAPI = Literal["chat_completions", "responses"]
 
 
 class AppSettings(Settings):
+    # Loaded by create_app before accepting turns. A private snapshot cannot
+    # become a member-editable setting or change when a mounted pack changes.
+    _deployment_identity: DeploymentIdentity | None = PrivateAttr(default=None)
+    _deployment_identity_initialized: bool = PrivateAttr(default=False)
+
+    deployment_kind: Literal["self-hosted"] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_DEPLOYMENT_KIND"),
+        description="Explicit self-hosted agent identity. Unset keeps the desktop and hosted defaults.",
+    )
+    deployment_brand_file: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_DEPLOYMENT_BRAND_FILE"),
+        description=(
+            "Absolute path to the operator's read-only branding pack.json. Its name is the "
+            "agent's product name when COWORK_DEPLOYMENT_KIND=self-hosted. Read once at startup."
+        ),
+    )
+
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
     port: int = Field(

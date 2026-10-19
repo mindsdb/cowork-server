@@ -25,6 +25,7 @@ from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
+from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_to_completion, unit_session
@@ -454,16 +455,16 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     support-chat guidance for channel turns.
 
     Both branches name how a finished file reaches the user: the channel branch
-    says "I'm sending the file", the desktop branch points at the Live Artifacts
-    panel. Without the desktop half, anton pasted the artifact's local path as a
+    says "I'm sending the file", the UI branch points at the Live Artifacts
+    panel. Without the UI half, anton pasted the artifact's local path as a
     markdown link — inert in chat (ENG-1636).
 
-    The desktop branch is asserted byte-for-byte by test_channel_context.py
+    The UI branch is asserted byte-for-byte by test_channel_context.py
     (cache-stable prompt prefix) — change both together.
     """
     if channel is None:
         return (
-            "The Anton CoWork desktop UI displays progress, tool usage, and actions "
+            "The Cowork UI displays progress, tool usage, and actions "
             "as separate structured activity rows, so do not narrate each step "
             "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
             "open your reply with one short sentence telling the user what you are "
@@ -1527,7 +1528,8 @@ class AntonHarness:
             # empty tiers in its scratch folder, memory off and no background
             # passes, so it reads and writes nobody's memory. The layout is
             # picked before any real tier's folder is made or read.
-            memory_off = memory_policy(memory_enabled=anton_settings.memory_enabled).off
+            memory_state = memory_policy(memory_enabled=anton_settings.memory_enabled)
+            memory_off = memory_state.off
             memory_layout: TurnMemoryLayout | None = None
             if not memory_off:
                 memory_layout = person_turn_memory(
@@ -1640,8 +1642,19 @@ class AntonHarness:
                 scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
             )
 
+            deployment = identity_for_turn()
+            deployment_kwargs = {} if deployment is None else {
+                "deployment_identity": deployment,
+                "learned_memory_scope": learned_memory_scope(
+                    off=memory_state.off,
+                    learns=memory_layout.learns,
+                    shared=memory_state.shared,
+                ),
+            }
+
             config = ChatSessionConfig(
                 llm_client=llm_client,
+                **deployment_kwargs,
                 settings=anton_settings,
                 self_awareness=self_awareness,
                 cortex=cortex,
