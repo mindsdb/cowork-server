@@ -35,6 +35,22 @@ class AntonHarnessSettings(Settings):
     )  # ANTON_WRITE_APPROVAL
 
 
+# Appended to a refusal when only anton's own settings read the value as on.
+_ONLY_ANTON_READS_IT = (
+    " This server's settings read ANTON_WRITE_APPROVAL as off, but anton's own settings "
+    "read it as on, from a .env file anton reads: .env or .anton/.env in the working "
+    "folder, ~/.anton/.env or ~/.cowork/.env. Remove it there to leave the setting off."
+)
+
+
+def _anton_reads_write_approval() -> bool:
+    """Whether anton's AntonSettings, the settings every session gets, read
+    ANTON_WRITE_APPROVAL as on. False for an anton without the setting."""
+    from anton.config.settings import AntonSettings
+
+    return getattr(AntonSettings(), "write_approval", False) is True
+
+
 def check_write_approval_startup(
     *, settings: AntonHarnessSettings, ask_user_enabled: bool, remote_turns: bool
 ) -> None:
@@ -48,20 +64,35 @@ def check_write_approval_startup(
     anton's own settings don't read, such as one only in <COWORK_HOME>/.env
     with COWORK_HOME set to a folder other than ~/.cowork. The last two read
     anton's AntonSettings, the settings every session gets.
+
+    The first two also hold when only anton reads the value as on, such as
+    one only in ~/.cowork/.env with COWORK_HOME set elsewhere: sessions get
+    it from AntonSettings either way. anton is read for that only when remote
+    turns or questions off would refuse, so the default deployment, turns in
+    this process with questions on, builds no AntonSettings here while the
+    value is off.
     """
-    if not settings.write_approval:
+    only_anton = (
+        not settings.write_approval
+        and (remote_turns or not ask_user_enabled)
+        and _anton_reads_write_approval()
+    )
+    if not (settings.write_approval or only_anton):
         return
+    where = _ONLY_ANTON_READS_IT if only_anton else ""
     if remote_turns:
         raise RuntimeError(
             "ANTON_WRITE_APPROVAL=true is not supported with COWORK_TURN_BACKEND=remote: "
             "remote workers don't read this server's environment, so their cells would run "
             "without approval. Leave COWORK_TURN_BACKEND unset to run turns in this process."
+            + where
         )
     if not ask_user_enabled:
         raise RuntimeError(
             "ANTON_WRITE_APPROVAL=true needs COWORK_ASK_USER_ENABLED: with questions off, "
             "there is no way to ask for approval, so every cell that changes data or files "
             "would be refused. Remove COWORK_ASK_USER_ENABLED=false."
+            + where
         )
     from anton.config.settings import AntonSettings
 
@@ -72,7 +103,7 @@ def check_write_approval_startup(
             "run every cell without asking. Install an anton release that has the "
             "write_approval setting, and leave ANTON_WRITE_APPROVAL off until then."
         )
-    if AntonSettings().write_approval is not True:
+    if not _anton_reads_write_approval():
         raise RuntimeError(
             "ANTON_WRITE_APPROVAL=true is set where anton doesn't read it: anton's own "
             "settings read it as off, so every cell would run without asking. Set "
