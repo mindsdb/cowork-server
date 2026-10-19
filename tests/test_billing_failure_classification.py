@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from uuid import UUID
 
 import httpx
@@ -18,7 +17,6 @@ from anton.core.llm.provider import (
 )
 from openai import APIStatusError
 
-from cowork.common.settings import user_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.units import unit_session
 from cowork.handlers import responses, turn_errors
@@ -30,13 +28,6 @@ from tests.test_turn_errors import _handler_with_raising_formatter
 
 RESET_AT = "2026-10-19T00:00:00Z"
 GATEWAY_URL = "https://api.mindshub.ai/v1/chat/completions"
-
-
-@pytest.fixture
-def configured_minds_url(monkeypatch):
-    settings = SimpleNamespace(minds_url="https://minds.invalid")
-    monkeypatch.setattr(user_settings, "get_user_settings", lambda: settings)
-    return settings
 
 
 @pytest.fixture
@@ -117,7 +108,7 @@ def _saved_and_streamed_failure(monkeypatch, conversation_id: UUID, error: Excep
     ],
 )
 def test_real_billing_stop_keeps_its_card_and_reset_on_reload(
-    monkeypatch, configured_minds_url, conversation_id, status, reason, error_type, code, message, has_reset,
+    monkeypatch, self_hosted_minds_url, conversation_id, status, reason, error_type, code, message, has_reset,
 ):
     error = _billing_stop(status=status, reason=reason)
     assert type(error) is error_type
@@ -133,12 +124,17 @@ def test_real_billing_stop_keeps_its_card_and_reset_on_reload(
         assert "reset_at" not in failed
 
 
+@pytest.mark.parametrize("carrier", ["no_reason", "unknown_header", "unknown_body_code"])
 @pytest.mark.parametrize("minds_url", ["https://minds.invalid", "https://api.mindshub.ai"])
 def test_unclassified_gateway_429_stays_generic_on_reload(
-    monkeypatch, configured_minds_url, conversation_id, minds_url,
+    monkeypatch, self_hosted_minds_url, conversation_id, minds_url, carrier,
 ):
-    configured_minds_url.minds_url = minds_url
-    error = _sdk_error(status=429, reason=None)
+    self_hosted_minds_url.minds_url = minds_url
+    error = _sdk_error(
+        status=429, reason="future_billing_limit" if carrier == "unknown_body_code" else None,
+    )
+    if carrier == "unknown_header":
+        error.response.headers["X-MindsHub-Reason"] = "future_billing_limit"
 
     failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
 
@@ -148,7 +144,7 @@ def test_unclassified_gateway_429_stays_generic_on_reload(
 
 
 def test_third_party_billing_carriers_cannot_persist_a_billing_card(
-    monkeypatch, configured_minds_url, conversation_id,
+    monkeypatch, self_hosted_minds_url, conversation_id,
 ):
     error = _sdk_error(
         status=429, reason="included_allowance_exhausted", url="https://openrouter.ai/api/v1/x",
@@ -164,7 +160,7 @@ def test_third_party_billing_carriers_cannot_persist_a_billing_card(
 
 
 def test_model_deadline_over_a_billing_stop_keeps_its_own_saved_failure(
-    monkeypatch, configured_minds_url, conversation_id,
+    monkeypatch, self_hosted_minds_url, conversation_id,
 ):
     error = ModelCallTimeoutError(idle_timeout_s=60)
     error.__context__ = _billing_stop(status=429, reason="included_allowance_exhausted")

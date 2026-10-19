@@ -225,6 +225,23 @@ def personal_deployment(monkeypatch):
 
 
 @pytest.fixture
+def self_hosted_minds_url(monkeypatch):
+    """User settings whose minds_url is self-hosted's https://minds.invalid.
+
+    The stack sets MINDS_URL to a host that never resolves while its model
+    calls go to MindsHub. Returns the settings object, so a test can point
+    minds_url elsewhere.
+    """
+    from types import SimpleNamespace
+
+    from cowork.common.settings import user_settings
+
+    settings = SimpleNamespace(minds_url="https://minds.invalid")
+    monkeypatch.setattr(user_settings, "get_user_settings", lambda: settings)
+    return settings
+
+
+@pytest.fixture
 def managed_dir(monkeypatch, tmp_path):
     """An operator's managed folder (COWORK_MANAGED_DIR) for one test.
 

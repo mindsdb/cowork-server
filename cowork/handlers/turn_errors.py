@@ -109,11 +109,9 @@ CONTENT_REPAIR_CODES: frozenset[str] = frozenset(
 # pay-as-you-go. So editing this message alone changes nothing a desktop user
 # sees; the client must change too. It still reaches non-desktop consumers and
 # is the fallback for a client that doesn't hardcode.
-# This copy is now the EMPTY-WALLET half only. The spent-free-allowance case was
-# split off into ALLOWANCE_EXHAUSTED_CODE below (ENG-1537 step 8, in scope from
-# the start) — an earlier revision of this comment argued for deferring it and
-# is superseded. Because the split introduces a code an older renderer has no
-# branch for, the delivery order matters: the cowork card must reach users
+# A spent free allowance has its own ALLOWANCE_EXHAUSTED_CODE below. Because
+# that code is one an older renderer has no branch for, the delivery order
+# matters: the cowork card must reach users
 # BEFORE this server change, or a user who has just spent their free grant
 # falls through to a buttonless alert at the paid-conversion moment. That is a
 # release-ordering constraint, not a merge-ordering one.
@@ -122,8 +120,8 @@ TOKEN_LIMIT_USER_MESSAGE = (
 )
 
 # Wire-level code for the out-of-credits case. Named `token_limit` for wire
-# back-compat with clients already branching on it; it now covers both the
-# empty-wallet and spent-allowance reasons above.
+# back-compat with clients already branching on it. It covers an empty wallet,
+# a gateway 402 with no reason, and a plain anton `TokenLimitExceeded`.
 TOKEN_LIMIT_CODE = "token_limit"
 
 # Curated copy + wire code for a spent or absent FREE allowance (gateway 429
@@ -178,12 +176,13 @@ RESET_AT_CODES: frozenset[str] = frozenset(
 
 # Curated copy + wire code for a VELOCITY rate-limit (gateway 429
 # `rate_limited`) — the org exceeded requests/tokens per minute, NOT its credit
-# balance. ENG-1537: this was the fifth and only unmapped gateway reason, so it
-# fell through to the bare-status 429 rule below and rendered as out-of-credits
-# — telling the user to buy something that cannot raise a per-minute ceiling.
-# The gateway is explicit that the two are different (`rate_limited()` in
-# minds/inference/errors.py: "the caller should slow down and retry after
-# retry_after seconds, not wait for an allowance reset or add credits").
+# balance. A 429's status cannot tell it apart from an allowance stop, so only
+# the reason header or the body code selects it. It must never render as
+# out-of-credits, which tells the user to buy something that cannot raise a
+# per-minute ceiling. The gateway is explicit that the two are different
+# (`rate_limited()` in minds/inference/errors.py: "the caller should slow down
+# and retry after retry_after seconds, not wait for an allowance reset or add
+# credits").
 # Copy names the remedy (wait) and rules out the one the user would otherwise
 # assume, because they have just been shown a credits card for this.
 RATE_LIMITED_CODE = "rate_limited"
@@ -648,11 +647,12 @@ def is_content_validation_error(exc: Exception) -> bool:
 
 
 def is_token_limit_error(exc: Exception) -> bool:
-    """Detect a spent allowance — anton's ``TokenLimitExceeded`` (429 token
-    limit) OR an exhausted credit balance (the gateway may instead report a
-    402 / "insufficient credits"). Both mean "out of credits", so we map them
-    to the same ``token_limit`` code and let the client show the curated
-    out-of-credits card instead of a generic crash.
+    """Detect an out-of-credits failure: anton's ``TokenLimitExceeded`` or an
+    exhausted credit balance (a 402 / "insufficient credits" message). Both map
+    to the ``token_limit`` code so the client shows the curated out-of-credits
+    card instead of a generic crash. ``friendly_turn_error`` maps anton's
+    allowance and free-serving-pause subclasses to their own codes before
+    this runs.
     """
     try:
         from anton.core.llm.provider import TokenLimitExceeded
@@ -766,12 +766,10 @@ def is_auth_error(exc: Exception) -> bool:
     Anton's typed exception proves the failed credential belongs to the active
     LLM provider and may select the reconnect/update-key card.
 
-    Imported lazily like every other anton type in this module
-    (``ContentValidationError``, ``TokenLimitExceeded``, ``ModelUnavailableError``,
-    ``ProviderOverloadedError``). A module-scope import would turn an anton
-    without this symbol — staging and main today, and the ``branch = "main"``
-    pin this repo's pyproject documents — into a failed app import rather than
-    one missing error card.
+    Imported lazily, so an anton without this symbol loses one error card rather
+    than failing the app import. The billing subclasses at the top of this
+    module import eagerly because the anton-agent floor in pyproject.toml ships
+    them.
     """
     try:
         from anton.core.llm.provider import ProviderAuthError
@@ -861,9 +859,9 @@ def _http_error_context(
     matching. When the header is found, the status and host are taken from that
     SAME exception so the trio always describes one response; otherwise they
     come from the first exception in the chain with a ``status_code``. The host
-    lets callers tell a gateway billing status from a BYOK provider's own
-    402/429/503. Returns ``(None, None, None)`` for a plain exception with no
-    HTTP context.
+    lets callers tell a gateway billing decision from a BYOK provider's own
+    status. Returns ``(None, None, None)`` for a plain exception with no HTTP
+    context.
 
     anton's typed billing stops and its ``TransientProviderError`` carry a
     ``status_code`` but no response, so for them the host is None. The
@@ -935,10 +933,14 @@ def _configured_minds_host() -> str | None:
 def _from_minds_gateway(host: str | None) -> bool:
     """Whether the failing request went to the configured MindsHub gateway.
 
-    Gates body-code reads and the bare-status 402/503 billing fallbacks.
-    The same statuses from a BYOK provider mean something else entirely and
-    must not surface billing copy. An unknown origin (no URL on the failure)
-    is treated as not-the-gateway, so ambiguous failures stay generic.
+    Gates body-code reads, the body deny detail, the bare-status 402/503
+    billing fallbacks and, through ``_origin_is_known_third_party``, the reason
+    header. A self-hosted ``minds_url`` that never resolves makes this False
+    for the real gateway; the typed billing rung in ``friendly_turn_error``
+    covers that case. The same statuses from a BYOK provider mean something
+    else entirely and must not surface billing copy. An unknown origin (no URL
+    on the failure) is treated as not-the-gateway, so ambiguous failures stay
+    generic.
     """
     if not host:
         return False
@@ -1400,8 +1402,8 @@ def friendly_turn_error(
             return MODEL_RESTRICTED_CODE, str(exc)
         return MODEL_RESTRICTED_CODE, MODEL_RESTRICTED_USER_MESSAGE
 
-    # Anton exhausted its rate-limit wait budget and re-raised with the code.
-    # Preserve that verdict before the legacy text classifiers below.
+    # Anton exhausted its rate-limit wait budget and re-raised with the code;
+    # keep that verdict.
     # Read the code attribute DIRECTLY rather than via provider_overloaded_info:
     # that helper's version-skew duck-type only accepts
     # ``code == provider_overloaded``, so under the exact skew its own docstring
@@ -1423,11 +1425,16 @@ def friendly_turn_error(
     if getattr(exc, "code", None) == RATE_LIMITED_CODE and not hasattr(exc, "response"):
         return RATE_LIMITED_CODE, str(exc) or RATE_LIMITED_USER_MESSAGE
 
-    # Anton's mindshub_billing_stop checks the response origin before creating
-    # these types. Self-hosted can deliberately set minds_url to a nonresolving
-    # host while model calls go to MindsHub, so its configured-host checks above
-    # need not match. Preserve the trusted type before its broader parent wins;
-    # arbitrary reason attributes and class-name lookalikes have no authority.
+    # Anton's mindshub_billing_stop builds these types only for a response that
+    # is not provably from a third party, so the type is the verdict.
+    # Self-hosted sets minds_url to a nonresolving host while model calls go to
+    # MindsHub, so this module's _origin_is_known_third_party and
+    # _from_minds_gateway treat the real gateway as foreign and skip its header
+    # and body code. Checked before is_token_limit_error, which matches every
+    # TokenLimitExceeded. Only the imported types count: a reason attribute or a
+    # class with the same name does not. The wallet line returns what
+    # is_token_limit_error would; it mirrors _REMOTE_TYPE_MAPPINGS and holds if
+    # anton ever reparents the type.
     if isinstance(exc, WalletEmptyError):
         return _map_gateway_reason(_REASON_WALLET_EMPTY)
     if isinstance(exc, AllowanceExhaustedError):
