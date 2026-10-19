@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import random
+from dataclasses import asdict
 
 import pytest
 from anton.core.backends.base import Cell
@@ -78,6 +79,59 @@ def test_malformed_content_is_ignored():
     ])
 
     assert [c.code for c in cells] == ["kept"]
+
+
+@pytest.mark.asyncio
+async def test_a_result_the_store_cut_still_replays_its_code():
+    """The stream formatter stores at most 65,536 characters of a cell's
+    result. A cell whose logs pass that (1,000 HTTP calls log about 83,000
+    characters) still replays its code, so the next turn's write check sees
+    the statement it bound."""
+    from anton.core.llm.provider import (
+        StreamToolResult,
+        StreamToolUseDelta,
+        StreamToolUseEnd,
+        StreamToolUseStart,
+    )
+
+    from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+    code = "fix_sql = \"UPDATE suppliers SET lead_time_days = 21 WHERE region = 'EU'\""
+    ran = Cell(
+        code=code,
+        stdout="1000 lookups\n",
+        stderr="",
+        error=None,
+        logs="INFO HTTP Request: GET https://api.example.com/x \"HTTP/1.1 200 OK\"\n" * 1200,
+    )
+    result = json.dumps(asdict(ran))
+    assert len(result) > 65_536
+
+    async def turn():
+        yield StreamToolUseStart(id="t1", name="scratchpad")
+        yield StreamToolUseDelta(id="t1", json_delta=json.dumps({"action": "exec", "code": code}))
+        yield StreamToolUseEnd(id="t1")
+        yield StreamToolResult(name="scratchpad", action="exec", content=result, id="t1")
+
+    stored: list[dict] = []
+    async for _ in format_responses_stream(
+        turn(), model="claude-sonnet-4-6", event_sink=lambda _type, data: stored.append(data)
+    ):
+        pass
+
+    [stored_result] = [e for e in stored if e.get("thought_role") == "thought.scratchpad.result"]
+    assert len(stored_result["content"]) == 65_536
+    assert extract_scratchpad_cells(stored) == [
+        Cell(code=code, stdout="1000 lookups\n", stderr="", error=None),
+    ]
+
+
+def test_a_result_cut_inside_its_code_makes_no_cell():
+    """Only a code field the cut left whole replays: half a statement is
+    never handed on as the code a cell ran."""
+    cut = {**_result("x = 1"), "content": json.dumps({"code": "y = " + "1" * 100})[:40]}
+
+    assert extract_scratchpad_cells([_end("exec"), cut]) == []
 
 
 def test_events_that_are_not_objects_are_skipped():

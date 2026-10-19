@@ -22,9 +22,9 @@ class AntonHarnessSettings(Settings):
         description="The root directory where the Anton harness will store skill-related files",
         validation_alias="ANTON_SKILLS_ROOT_DIR",
     )  # ANTON_SKILLS_ROOT_DIR
-    # anton reads this one itself, from this process's environment, through
-    # AntonSettings; it's read here only so check_write_approval_startup knows
-    # the deployment asked for it.
+    # anton reads this one itself, through AntonSettings and its own .env
+    # files; it's read here only so check_write_approval_startup knows the
+    # deployment asked for it.
     write_approval: bool = Field(
         default=False,
         description=(
@@ -36,7 +36,7 @@ class AntonHarnessSettings(Settings):
 
 
 def check_write_approval_startup(
-    settings: AntonHarnessSettings, *, ask_user_enabled: bool, remote_turns: bool
+    *, settings: AntonHarnessSettings, ask_user_enabled: bool, remote_turns: bool
 ) -> None:
     """Refuse to start where ANTON_WRITE_APPROVAL=true would hold nothing.
 
@@ -44,7 +44,10 @@ def check_write_approval_startup(
     cell ran unheld, or was refused with no card. Raises RuntimeError naming
     the fix: for remote turns, whose workers don't read this process's
     environment; for COWORK_ASK_USER_ENABLED=false, which leaves no way to
-    ask; and for an anton without the setting, which ignores it.
+    ask; for an anton without the setting, which ignores it; and for a value
+    anton's own settings don't read, such as one only in <COWORK_HOME>/.env
+    with COWORK_HOME set to a folder other than ~/.cowork. The last two read
+    anton's AntonSettings, the settings every session gets.
     """
     if not settings.write_approval:
         return
@@ -60,11 +63,18 @@ def check_write_approval_startup(
             "there is no way to ask for approval, so every cell that changes data or files "
             "would be refused. Remove COWORK_ASK_USER_ENABLED=false."
         )
-    from anton.core.settings import CoreSettings
+    from anton.config.settings import AntonSettings
 
-    if "write_approval" not in CoreSettings.model_fields:
+    if "write_approval" not in AntonSettings.model_fields:
         raise RuntimeError(
             "ANTON_WRITE_APPROVAL=true needs an anton that holds writes for approval. The "
             "installed anton has no write_approval setting, so it would ignore this one and "
-            "run every cell without asking. Install the anton this cowork-server pins."
+            "run every cell without asking. Install an anton release that has the "
+            "write_approval setting, and leave ANTON_WRITE_APPROVAL off until then."
+        )
+    if AntonSettings().write_approval is not True:
+        raise RuntimeError(
+            "ANTON_WRITE_APPROVAL=true is set where anton doesn't read it: anton's own "
+            "settings read it as off, so every cell would run without asking. Set "
+            "ANTON_WRITE_APPROVAL=true in the server's process environment."
         )

@@ -549,7 +549,7 @@ def create_app() -> FastAPI:
     # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
     # turns in this process (check_write_approval_startup).
     check_write_approval_startup(
-        AntonHarnessSettings(),
+        settings=AntonHarnessSettings(),
         ask_user_enabled=settings.ask_user_enabled,
         remote_turns=TurnQueueSettings().is_remote,
     )
