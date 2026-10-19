@@ -253,12 +253,20 @@ PHASE_LABELS = {
 
 PROGRESS_THROTTLE = 0.25  # seconds
 
+# How anton's result opens for a cell it never ran, such as a write the user
+# didn't approve (anton.core.utils.scratchpad._refusal). Plain text, not a
+# cell's JSON.
+_NOT_RUN_PREFIX = "Not run: "
+
 
 def classify_cell_status(content: str) -> str:
     """Classify a scratchpad tool-result as ok / timeout / error.
 
     The renderer uses this to show a killed cell as distinctly dead rather
-    than indistinguishable from a slow-but-running one.
+    than indistinguishable from a slow-but-running one. A cell anton never
+    ran reads as "error": Cowork marks only "timeout" and "error"
+    (deriveCellStatus in its responseStreamAdapter.js), and shows a plain-text
+    result with any other status as a clean run.
 
     An exec result arrives as ``json.dumps(asdict(cell))`` (see
     ``ChatSession.turn_stream`` → ``StreamToolResult``), so we inspect the
@@ -285,6 +293,8 @@ def classify_cell_status(content: str) -> str:
             return "timeout"
         return "error"
     # Fallback for non-JSON results (dump notebook, non-scratchpad tools).
+    if content.startswith(_NOT_RUN_PREFIX):
+        return "error"
     low = content.lower()
     if "cell timed out" in low or "of inactivity" in low or "cell killed" in low:
         return "timeout"

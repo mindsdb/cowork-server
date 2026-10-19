@@ -31,6 +31,7 @@ from cowork.db.personal_resources import PersonalResource, check_personal_resour
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
+from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
 from cowork.harnesses.memory.store import deployment_memory_root
 from cowork.managed import (
@@ -549,6 +550,13 @@ def create_app() -> FastAPI:
     # Identity headers need the code sandbox, and the sandbox needs a kernel
     # and an anton that hold it (cowork.code_sandbox.check_startup).
     check_code_sandbox_startup(settings, remote_turns=TurnQueueSettings().is_remote)
+    # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
+    # turns in this process (check_write_approval_startup).
+    check_write_approval_startup(
+        settings=AntonHarnessSettings(),
+        ask_user_enabled=settings.ask_user_enabled,
+        remote_turns=TurnQueueSettings().is_remote,
+    )
 
     # Org mode, or local tenancy that trusts identity headers: build a
     # per-request Principal from the identity headers. Added first so it sits
