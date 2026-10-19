@@ -1038,6 +1038,7 @@ Environment variables fall into these groups:
 | `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint. Pointed anywhere but MindsHub's service, it takes HTML and Markdown only: sharing a full-stack app is refused before anything is uploaded, because that upload carries the app's connection credentials |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
+| `ANTON_WRITE_APPROVAL` | Anton | Off by default. On, anton holds an agent cell that changes connected data, or deletes, renames or moves an existing file, until the person who asked approves it. anton reads it through its own settings, so set it in the server's process environment. The server refuses to start with it on and remote turns (`COWORK_TURN_BACKEND=remote`), questions off (`COWORK_ASK_USER_ENABLED=false`), an anton without the `write_approval` setting, or a value anton's own settings read as off, such as one only in a `.env` file anton doesn't read. It refuses remote turns and questions off also when only anton's own settings read it as on, from a `.env` file anton reads that this server doesn't, such as `~/.cowork/.env` with `COWORK_HOME` set elsewhere |
 
 **By field name** (local tenancy only): every `UserSettings` field also reads the environment variable named after it, and a stored row wins over the variable. The router's reasoning effort is set this way, beside `PLANNING_REASONING_EFFORT` and `CODING_REASONING_EFFORT`:
 

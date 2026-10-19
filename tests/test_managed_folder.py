@@ -225,7 +225,7 @@ def test_the_installed_anton_takes_the_managed_memory_layer():
     pin that loses it must fail here first."""
     assert cortex_takes_managed_layer(), (
         "the pinned anton-agent's Cortex takes no managed_hc: move the anton pin "
-        "(the pyproject.toml floor, its [tool.uv.sources] rev and uv.lock) to a "
+        "(the pyproject.toml floor and uv.lock) to a "
         "release that has it"
     )
 
