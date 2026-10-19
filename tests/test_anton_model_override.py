@@ -35,9 +35,10 @@ def test_older_client_without_router_keeps_existing_router_setting():
 
 
 def test_skew_guard_skips_fields_the_pinned_anton_does_not_have():
-    """Version skew must degrade, never crash — anton is a git dep pinned to
-    branch="main" (see _overlay_user_settings's docstring for why); pydantic
-    raises ValueError on setattr of an unknown field."""
+    """Version skew must degrade, never crash — the installed anton can
+    predate a setting cowork-server ships (see _overlay_user_settings's
+    docstring for why); pydantic raises ValueError on setattr of an unknown
+    field."""
     from pydantic_settings import BaseSettings
 
     class PinnedAnton(BaseSettings):

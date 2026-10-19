@@ -8,10 +8,10 @@ turn that compacted ran near or over the context window, and rows this
 process captures have no size cap, so its rows reach the formatter
 (TurnHistory.read) and none are stored: the next turn replays it as text only.
 
-An anton without `turn_messages` (PyPI-channel desktop installs resolve
-anton from the floor in pyproject.toml) gets the slice of `history` past the
-seed, and nothing after a compaction, where that slice could drop rows or
-keep a tool_result whose tool_use was folded away.
+An anton without `turn_messages` (a local editable anton older than
+mindsdb/anton#585) gets the slice of `history` past the seed, and nothing
+after a compaction, where that slice could drop rows or keep a tool_result
+whose tool_use was folded away.
 
 The real-session turns run a tool round AFTER the compaction: a turn that
 compacts on its final round appends only text afterwards, which

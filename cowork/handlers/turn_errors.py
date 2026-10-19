@@ -530,14 +530,12 @@ def is_image_format_error(exc: Exception) -> bool:
 
 
 # ENG-2689's discriminator, deliberately NOT an isinstance check against
-# `anton.core.llm.provider.ContentTooLargeError`. cowork-server pins anton from
-# a git branch, so importing a type this repo can be deployed ahead of would
-# turn a version skew into an ImportError on the error path — the worst place
-# to have one. The class NAME is also the only thing that survives the remote
-# hop (`anton.cloud_turn.__main__._scrub` emits "<Type>: <message>"), so keying
-# on it here keeps both transports on one rule. `code` is checked too because
-# it is the attribute anton actually declares, and a future rename of the class
-# should not silently downgrade this to the wrong card.
+# `anton.core.llm.provider.ContentTooLargeError`. The class NAME is the only
+# thing that survives the remote hop (`anton.cloud_turn.__main__._scrub` emits
+# "<Type>: <message>"), so keying on it here keeps both transports on one rule.
+# `code` is checked too because it is the attribute anton actually declares,
+# and a future rename of the class should not silently downgrade this to the
+# wrong card.
 CONTENT_TOO_LARGE_TYPE_NAME = "ContentTooLargeError"
 
 
