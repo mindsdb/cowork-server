@@ -193,6 +193,8 @@ class _FakeUserSettings:
 
 
 class _FakeAppSettings:
+    publish_token = None
+
     class connector:  # noqa: N801
         vault_dir = "/tmp/does-not-matter"
 
