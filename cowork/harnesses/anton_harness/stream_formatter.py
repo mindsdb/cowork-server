@@ -205,8 +205,8 @@ class TurnEvidence:
     # mid-way (the stream carried a StreamContextCompacted) and no tool rows
     # arrived for it (no TurnHistory): their results never reached the
     # formatter. A producer whose anton predates ChatSession.turn_messages
-    # (an older cloud pod, or a PyPI-channel desktop install on the anton
-    # floor) sends no rows after a compaction. Empty otherwise.
+    # (a cloud pod or a local editable anton older than mindsdb/anton#585)
+    # sends no rows after a compaction. Empty otherwise.
     calls_without_rows: tuple[EvidenceCall, ...] = ()
     # The figures the conversation's last answers list (TurnContext
     # .earlier_answers), which a figure no step holds may repeat.
@@ -304,10 +304,11 @@ def classify_cell_status(content: str) -> str:
 
 
 # anton's reply when every attempt at the turn failed: its error, not an answer
-# (the fallback reply in anton core.session's turn loop). Final anton releases
-# through 2.26.10.14.1 (the anton-agent floor in pyproject.toml) and older pod
-# images still send it; from mindsdb/anton#569 on, the turn raises instead. The
-# check can go once the floor and the pod image both carry #569.
+# (the fallback reply in anton core.session's turn loop). A pod image or a
+# local editable anton older than mindsdb/anton#569 still sends it; from #569
+# on, which the anton-agent floor in pyproject.toml carries, the turn raises
+# instead. The check can go once the pod image carries #569 and no local
+# editable anton older than #569 is in use.
 _ANTON_FAILURE_REPLY = "An unexpected error occurred: "
 
 # The header over each block the client appends, for the agent only, to the
@@ -513,8 +514,9 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
         # rows that do arrive hold every call that ran, through a compaction
         # too; a call missing there never ran, as in a round anton threw away
         # and retried. This can go once production pods run an anton with
-        # ChatSession.turn_messages, which sends the rows after a compaction,
-        # and the anton-agent floor in pyproject.toml requires one.
+        # ChatSession.turn_messages (mindsdb/anton#585), which sends the rows
+        # after a compaction, and no local editable anton older than #585 is
+        # in use.
         return sources.model_copy(update={
             "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
         })
@@ -575,17 +577,16 @@ async def format_responses_stream(
         StreamTurnEnded,
     )
 
-    # StreamReasoningDelta is newer than the rest — it arrived with the
-    # reasoning-subtype channel (ENG-1109) and does not exist in anton-agent
-    # builds before it. Desktop staging installs resolve anton from PyPI, which
-    # lags the staging branch (staging cowork-server can be paired with an
-    # older published anton until anton is promoted), so importing it in the
-    # same unconditional block would make THIS formatter — run on every single
-    # turn — raise ImportError, which the responses route can only redact to a
-    # generic "An unexpected error occurred", breaking all chat (ENG-1167).
-    # Guard it: an older anton simply never emits reasoning deltas, so falling
-    # back to a sentinel class no event can be an instance of leaves the branch
-    # below dead and the turn degrades gracefully instead of failing.
+    # StreamReasoningDelta arrived with the reasoning-subtype channel
+    # (ENG-1109). It predates the anton.core.artifacts.internal_files
+    # constants the server imports at startup, so every anton this server can
+    # start with has it, and the fallback below serves only an anton too old
+    # to start this server. The import is guarded because THIS formatter runs
+    # on every single turn: an ImportError here reaches the responses route,
+    # which can only redact it to a generic "An unexpected error occurred",
+    # breaking all chat (ENG-1167). An anton without the class never emits
+    # reasoning deltas, so a sentinel class no event can be an instance of
+    # leaves the branch below dead and the turn degrades instead of failing.
     try:
         from anton.core.llm.provider import StreamReasoningDelta
     except ImportError:
@@ -660,11 +661,12 @@ async def format_responses_stream(
     successful_tool_calls: set[str] = set()
     compacted = False
     # Whether the turn's last text is anton's failure reply, which carries no
-    # figures. Final anton releases through 2.26.10.14.1 (the anton-agent
-    # floor) and older pod images stream that reply as one delta and end the
-    # turn on it, so each delta with visible text sets or clears this. From
-    # mindsdb/anton#569 on, the turn raises instead, so this can go once the
-    # floor and the pod image both carry #569.
+    # figures. A pod image or a local editable anton older than
+    # mindsdb/anton#569 streams that reply as one delta and ends the turn on
+    # it, so each delta with visible text sets or clears this. From #569 on,
+    # which the anton-agent floor carries, the turn raises instead, so this
+    # can go once the pod image carries #569 and no local editable anton
+    # older than #569 is in use.
     failure_reply = False
 
     resp = Response(id=resp_id, model=model, status=ResponseStatus.created)

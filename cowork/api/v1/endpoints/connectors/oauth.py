@@ -180,11 +180,12 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     table rather than a second MCP implementation here)."""
     if engine not in _MCP_IDENTITY_ENGINES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No MCP identity resolution for {engine!r}.")
-    # Capability-gated like the harness's own discovery call: this repo's
-    # published anton floor still resolves builds without anton.core.mcp
-    # (ENG-1816 reaches anton's main on its own cadence). A bare ImportError
-    # here would surface to Electron as an opaque 500; 501 says what is
-    # actually true — this build cannot do MCP identity resolution at all.
+    # Capability-gated like the harness's own discovery call. Every anton this
+    # server can start with has anton.core.mcp (ENG-1816): it predates the
+    # anton.core.artifacts.internal_files constants the server imports at
+    # startup. So the 501 serves only an anton too old to start this server,
+    # and says what is true there: this build cannot do MCP identity
+    # resolution at all.
     try:
         from anton.core.mcp.wiring import call_mcp_tool
     except ImportError as exc:

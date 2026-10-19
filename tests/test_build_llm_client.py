@@ -136,8 +136,8 @@ def test_direct_openai_uses_the_responses_transport(build):
 def test_direct_openai_stays_generic_on_an_anton_without_a_ready_transport(
     build, monkeypatch
 ):
-    # cowork-server pins anton to a branch; an older build's Responses path
-    # drops truncation, tool_result images and trace headers.
+    # An older anton's Responses path drops truncation, tool_result images and
+    # trace headers.
     import anton.core.llm.openai as anton_openai
 
     monkeypatch.setattr(anton_openai.OpenAIProvider, "RESPONSES_TRANSPORT_READY", False)
