@@ -900,10 +900,9 @@ class TestConnectorTools:
         assert sources.steps == []
 
     def test_an_anton_that_cannot_classify_connector_tools_counts_none(self, tmp_path: Path):
-        """A PyPI-channel desktop install resolves anton from the anton-agent
-        floor, whose anton.core.mcp has no returns_records and no names
-        module. The module still imports there, and only the tools anton runs
-        itself are evidence."""
+        """An anton older than mindsdb/anton#585 has an anton.core.mcp with no
+        returns_records and no names module. The module still imports there,
+        and only the tools anton runs itself are evidence."""
         program = textwrap.dedent(f"""
             import sys
             import anton.core.mcp.access

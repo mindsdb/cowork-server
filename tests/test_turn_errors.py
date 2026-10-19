@@ -66,11 +66,9 @@ def test_returns_none_for_unmapped_error():
 # ── content-shaped rejections (ENG-1992) ──────────────────────────────
 
 def test_detects_content_validation_via_anton_type():
-    provider = pytest.importorskip("anton.core.llm.provider")
-    error_cls = getattr(provider, "ContentValidationError", None)
-    if error_cls is None:
-        pytest.skip("installed anton predates ContentValidationError (ENG-1992)")
-    assert te.is_content_validation_error(error_cls("boom")) is True
+    from anton.core.llm.provider import ContentValidationError
+
+    assert te.is_content_validation_error(ContentValidationError("boom")) is True
 
 
 def test_detects_openai_responses_dialect():
@@ -139,21 +137,13 @@ def test_remote_content_validation_error_maps_to_curated_copy():
 # ── ENG-2689: too-large is its own card, and still repairs the conversation ──
 
 
-# anton's REAL parent type, deliberately. cowork-server pins anton from a git
-# branch, so `ContentTooLargeError` is not installed here yet — but production's
-# object is a real subclass of a real `ContentValidationError`, and that is the
-# whole point: BOTH detectors match it, so only their ORDER decides the card.
-# A hand-rolled stand-in would satisfy neither detector's isinstance check and
-# these tests would pass without the ordering ever being exercised.
+# anton's REAL types, deliberately. Production's object is anton's
+# `ContentTooLargeError`, a subclass of `ContentValidationError`, and that is
+# the whole point: BOTH detectors match it, so only their ORDER decides the
+# card. A hand-rolled stand-in would satisfy neither detector's isinstance
+# check and these tests would pass without the ordering ever being exercised.
+from anton.core.llm.provider import ContentTooLargeError
 from anton.core.llm.provider import ContentValidationError as _AntonContentValidationError
-
-
-class ContentTooLargeError(_AntonContentValidationError):
-    """Named to match anton's class exactly — the name is the discriminator on
-    both transports (the remote wire carries only "<Type>: <message>")."""
-
-    def __init__(self, message, code="content_too_large"):
-        super().__init__(message, code=code)
 
 
 _RESIZE_COPY = (
@@ -2989,8 +2979,9 @@ def test_remote_error_unmapped_type_still_falls_through_to_generic():
 # with a 403 whose reason stays `permission_denied`, so an older client keeps
 # reading a plain 403, and names the rule on X-MindsHub-Deny-Detail and in the
 # body's `error.deny_detail`. Unmapped, the turn read as a generic error (or,
-# with the pinned anton, as "try again in a moment"), which tells the member
-# nothing about why the model is refused or what would work instead.
+# on an anton without ModelRestrictedError, as "try again in a moment"), which
+# tells the member nothing about why the model is refused or what would work
+# instead.
 
 _RESTRICTED_COPY = (
     "An admin in your organization restricted the model 'sonnet'. "
@@ -3114,9 +3105,9 @@ async def test_stream_names_the_restricted_model_on_the_failure_frame():
 
 
 async def test_stream_maps_the_restricted_403_from_an_untyped_anton():
-    # The pinned anton raises a bare ConnectionError for this 403. The header
-    # still decides the code; with no typed error there is no model to name,
-    # so the card falls back to its unnamed copy.
+    # An anton without ModelRestrictedError raises a bare ConnectionError for
+    # this 403. The header still decides the code; with no typed error there
+    # is no model to name, so the card falls back to its unnamed copy.
     exc = _restricted_failure(url=_minds_gateway_url())
     frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
     payload = json.loads(

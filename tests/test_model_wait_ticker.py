@@ -22,6 +22,7 @@ from uuid import uuid4
 
 import fakeredis.aioredis
 import pytest
+from anton.core.llm import liveness as anton_liveness
 from anton.core.llm.provider import StreamTextDelta
 
 import cowork.handlers.responses as responses_mod
@@ -427,20 +428,11 @@ async def test_the_anton_harness_attaches_its_session_for_the_turn_only(monkeypa
 # ── The contract with the real anton ─────────────────────────────────
 # Everything above uses stand-ins, and cowork-server reads anton's tracker and
 # error by attribute and by class name. These run against the installed
-# anton, so they skip until uv.lock moves to an anton release that has the
-# tracker, then catch a rename the stand-ins would hide.
-
-
-def _real_anton_liveness():
-    liveness_mod = pytest.importorskip("anton.core.llm.liveness")
-    if getattr(liveness_mod, "ModelCallTracker", None) is None:
-        pytest.skip("installed anton predates the model-call tracker (ENG-3281)")
-    return liveness_mod
+# anton and catch a rename the stand-ins would hide.
 
 
 async def test_a_real_anton_tracker_drives_the_ticker():
-    real = _real_anton_liveness()
-    tracker = real.ModelCallTracker()
+    tracker = anton_liveness.ModelCallTracker()
     tracker.open(role="planning", idle_timeout_s=600.0).awaiting = True
     buffer = _Buffer()
     ticker = liveness.ModelWaitTicker()
@@ -456,7 +448,6 @@ async def test_a_real_anton_tracker_drives_the_ticker():
 
 
 def test_a_real_anton_deadline_maps_to_model_timeout_in_process_and_remote():
-    _real_anton_liveness()
     from anton.core.llm.provider import ModelCallTimeoutError
 
     from cowork.handlers.turn_errors import MODEL_TIMEOUT_CODE, friendly_turn_error, remote_turn_error

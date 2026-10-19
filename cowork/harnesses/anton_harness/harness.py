@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import partial
@@ -69,17 +70,12 @@ logger = get_logger(__name__)
 def _anton_mcp_wiring():
     """anton's MCP wiring module, or ``None`` when the installed anton predates it.
 
-    cowork-server pins anton from a git branch, but its *published* floor
-    (``anton-agent>=2.26.8.23.1``) still resolves builds with no
-    ``anton.core.mcp`` package — the MCP client (ENG-1816) reaches anton's
-    ``main`` on its own release cadence, so there is a real window where a
-    perfectly valid dependency lacks it.
-
-    Importing it unconditionally turns that window into an ImportError on the
-    session-construction path, i.e. every turn fails, not just the MCP ones.
-    Same reasoning and same shape as ``services/providers.py``'s
-    ``router_provider`` gate and ``handlers/turn_errors.py``'s deliberate
-    refusal to import a type this repo can be deployed ahead of.
+    Every anton this server can start with has the ``anton.core.mcp`` package
+    (the MCP client, ENG-1816): it predates the
+    ``anton.core.artifacts.internal_files`` constants the server imports at
+    startup. So the ``None`` branch serves only an anton too old to start this
+    server. Same shape as ``services/providers.py``'s ``router_provider`` gate:
+    a missing capability degrades the feature instead of raising.
     """
     try:
         from anton.core.mcp import wiring
@@ -176,10 +172,11 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
 
     Returns the attrs actually applied, so a caller or test can assert on it.
 
-    **The skew guard is the load-bearing part.** anton is pinned as a git dep on
-    ``branch = "main"`` (see ``[tool.uv.sources]``), so cowork-server can ship a
-    setting whose field has only reached anton's ``staging`` — it arrives on
-    main at the weekly release, not when the anton PR merges. pydantic raises
+    **The skew guard is the load-bearing part.** uv.lock pins anton to a
+    release, and a PyPI-channel install takes any release at or above the
+    floor in ``pyproject.toml``, so cowork-server can ship a setting whose
+    field has only reached anton's ``staging`` — it arrives on main at the
+    weekly release, not when the anton PR merges. pydantic raises
     ``ValueError: "AntonSettings" object has no field "x"`` on setattr of an
     unknown field, and this runs on EVERY session build, so an unguarded overlay
     turns a one-week ordering gap into a total agent outage rather than a
@@ -245,8 +242,11 @@ def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
     """
     if get_app_settings().tenancy_mode == "org":
         return {}
-    # This server pins anton to a moving rev, so degrade rather than raise:
-    # an absent overlay costs the project's .env, raising costs every turn.
+    # Workspace.load_env predates the anton.core.artifacts.internal_files
+    # constants the server imports at startup, so every anton this server can
+    # start with has it, and this guard serves only an anton too old to start
+    # this server. It degrades rather than raises: an absent overlay costs the
+    # project's .env, raising costs every turn.
     loader = getattr(workspace, "load_env", None)
     if loader is None:
         logger.warning("installed anton has no Workspace.load_env; no project .env overlay")
@@ -259,7 +259,7 @@ def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
 
 
 def _apply_overlay_fallback(workspace, overlay: dict[str, str], overlay_kwargs: dict) -> bool:
-    """Load the project .env the old way when the pinned anton cannot carry it.
+    """Load the project .env the old way when the installed anton cannot carry it.
 
     Returns whether it applied. Extracted so the fallback is testable without
     constructing a full ChatSession, like the org-mode guard above. Gated on a
@@ -381,11 +381,11 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     figures in them, and the next turn replays this one as text only. A turn
     that did not compact stores its rows.
 
-    An anton without `turn_messages` (PyPI-channel desktop installs resolve
-    anton from the floor in pyproject.toml) gets the slice of
-    `session.history` past `seed_len`, and no rows after a compaction: the
-    compaction replaced the list, so the slice could drop rows or keep a
-    tool_result whose tool_use was folded away. A session with neither
+    An anton without `turn_messages` (a local editable anton older than
+    mindsdb/anton#585) gets the slice of `session.history` past `seed_len`,
+    and no rows after a compaction: the compaction replaced the list, so the
+    slice could drop rows or keep a tool_result whose tool_use was folded
+    away. A session with neither
     `turn_messages` nor `history` has no rows.
     """
     if hasattr(session, "turn_messages"):
@@ -932,10 +932,10 @@ class AntonHarness:
             seed_len = len(session.history) if hasattr(session, "history") else None
             compacted = False  # set if anton compacts or hard-truncates history mid-turn
             # Forward trace annotations only if the installed anton's
-            # turn_stream accepts them. Deployed cowork-server resolves anton
-            # from PyPI/main, which may predate the trace-tags kwargs (anton
-            # #218); gating keeps those builds working — tags simply don't flow
-            # until the anton floor is bumped — instead of raising TypeError.
+            # turn_stream accepts them. Every anton this server can start with
+            # does (anton #218 predates the anton.core.artifacts.internal_files
+            # constants the server imports at startup), so the gate serves only
+            # an anton too old to start this server.
             turn_kwargs: dict = {}
             _turn_params = inspect.signature(session.turn_stream).parameters
             if "trace_tags" in _turn_params:
@@ -1472,11 +1472,11 @@ class AntonHarness:
         # unfiltered connection list for every other connector.
         #
         # Capability-gated on the installed anton, the same way
-        # services/providers.py gates ENG-648's router kwargs: this repo's
-        # published floor (anton-agent>=2.26.8.23.1) still resolves builds
-        # that predate the MCP client, and promoting it to anton's `main` is
-        # a separate release step (ENG-1816). An unguarded import would turn
-        # that window into a failure on EVERY turn, not just MCP ones.
+        # services/providers.py gates ENG-648's router kwargs. Every anton
+        # this server can start with ships the MCP client (ENG-1816): it
+        # predates the anton.core.artifacts.internal_files constants the
+        # server imports at startup. So the gate serves only an anton too old
+        # to start this server.
         # This turn's connections, listed once for MCP discovery and the usage notes.
         vault_connections = data_vault.list_connections() if data_vault is not None else []
         mcp_tool_defs: list = []
@@ -1637,9 +1637,13 @@ class AntonHarness:
                 anton_settings.skills_root = turn_skills_dir
             read_only_dirs += anton_settings.skills_extra_roots
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
-            # None with the sandbox off, and then not passed at all.
-            cell_sandbox = build_cell_sandbox(
-                scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
+            # None with the sandbox off, and then not passed at all. Built in a
+            # worker thread: it lists every person's partition and opens the
+            # session's folders, file work that would otherwise hold the event
+            # loop and every request on it. to_thread copies the context, so
+            # the settings scope still applies there.
+            cell_sandbox = await asyncio.to_thread(
+                build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
             )
 
             deployment = identity_for_turn()
@@ -1695,8 +1699,8 @@ class AntonHarness:
                 **surface_kwarg(ChatSessionConfig),
                 # WHO the user is, so anton keys `turn_completed` on the account
                 # rather than the machine (ENG-2121). Opaque ids from the held
-                # MindsHub JWT only; {} when there is none or the pinned anton
-                # predates the fields.
+                # MindsHub JWT only; {} when there is none or the installed
+                # anton predates the fields.
                 **account_kwargs(ChatSessionConfig),
                 # This harness rebuilds the session every message, so the verifier
                 # latch has to outlive it or a persistent failure diagnoses each time.
