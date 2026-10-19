@@ -485,7 +485,7 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
 
 
 def test_load_workspace_env_degrades_when_anton_has_no_load_env(monkeypatch):
-    """This server pins anton to a moving rev. A Workspace without load_env
+    """A Workspace without load_env (an anton that predates Workspace.load_env)
     must cost the overlay, not every in-process turn."""
     from unittest.mock import Mock
 

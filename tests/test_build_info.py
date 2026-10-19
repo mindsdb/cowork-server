@@ -346,8 +346,8 @@ class TestTheWebSurfaceIsNotReachableYet:
 
 
 class TestSupportedKwargs:
-    """This server pins anton to a rev, so a config field it knows about can be
-    missing from the installed copy. Passing it anyway raises on every turn."""
+    """The installed anton can predate a config field this server knows about.
+    Passing it anyway raises on every turn."""
 
     def test_a_declared_field_is_passed_through(self):
         from dataclasses import dataclass

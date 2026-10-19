@@ -154,8 +154,7 @@ try:
     from anton.core.mcp.access import returns_records
     from anton.core.mcp.names import parse_namespaced_tool_name
 except ImportError:
-    # A PyPI-channel desktop install resolves anton from the anton-agent
-    # floor in pyproject.toml, whose anton cannot say which connector tools
+    # An anton older than mindsdb/anton#585 cannot say which connector tools
     # return the customer's records. There no connector tool is evidence
     # (_records_tool).
     returns_records = None

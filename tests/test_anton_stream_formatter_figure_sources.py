@@ -1216,11 +1216,12 @@ class TestAnswersWithoutSources:
         ([], [StreamTextDelta(text="\n")]),
     ], ids=["whole-answer", "after-a-tool-round", "after-partial-text", "followed-by-a-blank-delta"])
     async def test_antons_failure_reply_gets_no_sources(self, before: list, after: list):
-        """Final anton releases through 2.26.10.14.1 (the anton-agent floor)
-        and older pod images stream their failure reply as one delta and end
-        the turn on it, after whatever the turn streamed first. From
-        mindsdb/anton#569 on, the turn raises instead, so this check can go
-        once the floor and the pod image both carry #569."""
+        """A pod image or a local editable anton older than mindsdb/anton#569
+        streams its failure reply as one delta and ends the turn on it, after
+        whatever the turn streamed first. From #569 on, which the anton-agent
+        floor carries, the turn raises instead, so this check can go once the
+        pod image carries #569 and no local editable anton older than #569 is
+        in use."""
         events = await _run_turn(
             TurnContext(question="How many?"),
             *before,
