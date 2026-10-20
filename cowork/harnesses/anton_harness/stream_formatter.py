@@ -7,6 +7,7 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.memory_read        (whether the turn read learned memory, and how many entries)
     response.figure_sources     (each figure in the answer and the steps it came from)
     response.completed          (final response object)
     response.failed             (error)
@@ -66,17 +67,29 @@ class ArtifactCreated:
     artifact: dict
 
 
-@dataclass
+@dataclass(frozen=True)
 class TurnMemoryRead:
-    """Synthetic post-turn event: whether the turn read learned memory, the
-    person's own or the shared store, and how many entries it put in front
-    of the model (anton's ChatSession.memory_read: rules, lessons, profile
-    lines and scratchpad wisdom, never the operator's managed layer). Mapped
-    to a `response.memory_read` SSE event below, which the answer's saved
-    events keep."""
+    """Synthetic event: whether the turn read learned memory, the person's
+    own or the shared store, and how many entries it put in front of the
+    model (anton's ChatSession.memory_read: rules, lessons, profile lines and
+    scratchpad wisdom, never the operator's managed layer). The harness sends
+    it once anton has built the turn's prompt. Mapped to a
+    `response.memory_read` SSE event below, which the answer's saved events
+    keep."""
 
     read: bool
     entries: int
+
+    def payload(self, *, sequence_number: int | None = None) -> dict[str, Any]:
+        """The `response.memory_read` event body, the one shape every answer
+        sends and saves: an agent turn's, here, and a direct answer's
+        (cowork.handlers.responses). A streamed frame carries its
+        ``sequence_number``; the saved events of a non-streaming answer
+        don't."""
+        body: dict[str, Any] = {"type": "response.memory_read", "read": self.read, "entries": self.entries}
+        if sequence_number is not None:
+            body["sequence_number"] = sequence_number
+        return body
 
 
 @dataclass
@@ -1103,12 +1116,7 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnMemoryRead):
             seq += 1
-            yield _event("response.memory_read", {
-                "type": "response.memory_read",
-                "sequence_number": seq,
-                "read": event.read,
-                "entries": event.entries,
-            })
+            yield _event("response.memory_read", event.payload(sequence_number=seq))
 
         elif isinstance(event, StreamComplete):
             # One LLM round is over. anton's agent loop streams the next

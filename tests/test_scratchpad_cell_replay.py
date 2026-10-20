@@ -444,7 +444,7 @@ async def test_the_harness_hands_the_session_the_cells_a_conversation_stored(mon
             _result("z = y + 1", tool_use_id="t2"),
         ])
 
-        config, _, _ = await harness.AntonHarness()._build_chat_session(conversation)
+        config = (await harness.AntonHarness()._build_chat_session(conversation)).session
 
     assert config.cells == [
         Cell(code="x = 1", stdout="1\n", stderr="", error=None),
