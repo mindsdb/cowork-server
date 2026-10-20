@@ -307,6 +307,18 @@ field takes `"on"` (the default) or `"off"`. A deployment that doesn't trust ide
 such as the desktop app, still reads stored memory with memory off, so it refuses the question
 with 501.
 
+Each answer also gets one `response.memory_read` event before `response.completed`. `read` says
+whether the turn read learned memory, the person's own or the shared store, and `entries` counts
+the rules, lessons, profile lines and scratchpad tips anton put in front of the model
+(`ChatSession.memory_read`). The operator's managed rules aren't counted. A question with
+`"memory": "off"`, and a direct answer from the routing gate, which runs no agent, get
+`"read": false` and `"entries": 0`. `read` is anton's: a turn with memory off reads two empty
+tiers, which anton reports as not read when the server passes it the turn's memory scope, as it
+does on a self-hosted deployment (`COWORK_DEPLOYMENT_KIND=self-hosted`); elsewhere such a turn
+reports `"read": true` with no entries. The event is saved with the answer's events. A turn the user
+stops, a failed turn, a turn on the remote worker and a turn on an anton without
+`ChatSession.memory_read` get none.
+
 The root of `response.created` carries a `run_id` UUID for that execution. An API client or proxy
 can send `{"conversation_id": "...", "expected_run_id": "...", "reason": "client_gone"}` to
 `POST /api/v1/responses/cancel`. The guard must match the authorized run; a stale or foreign ID

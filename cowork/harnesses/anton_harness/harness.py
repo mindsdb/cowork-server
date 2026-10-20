@@ -43,6 +43,7 @@ from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
     TurnContext,
     TurnHistory,
+    TurnMemoryRead,
     format_responses_stream,
 )
 from cowork.managed import managed_folder
@@ -861,6 +862,7 @@ class AntonHarness:
         touched_slugs: set[str] = set()
         turn_scope = None
         turn_history: TurnHistory | None = None
+        memory_read: TurnMemoryRead | None = None
         session = None
         seed_info: dict | None = None
 
@@ -968,6 +970,12 @@ class AntonHarness:
             # sealing keeps its in-memory history valid. A turn that compacted
             # hands its rows to the formatter and stores none.
             turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
+            # What the turn's prompt held from learned memory, for its record.
+            # Guarded like `history` above: an anton build (or test double)
+            # without ChatSession.memory_read records nothing.
+            read = getattr(session, "memory_read", None)
+            if read is not None:
+                memory_read = TurnMemoryRead(read=read.learned, entries=read.entries)
         finally:
             if model_wait is not None:
                 model_wait.detach()
@@ -998,6 +1006,8 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
+        if memory_read is not None:
+            yield memory_read
         if turn_history is not None:
             yield turn_history
 

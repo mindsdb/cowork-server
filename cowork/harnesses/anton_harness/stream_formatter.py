@@ -67,6 +67,19 @@ class ArtifactCreated:
 
 
 @dataclass
+class TurnMemoryRead:
+    """Synthetic post-turn event: whether the turn read learned memory, the
+    person's own or the shared store, and how many entries it put in front
+    of the model (anton's ChatSession.memory_read: rules, lessons, profile
+    lines and scratchpad wisdom, never the operator's managed layer). Mapped
+    to a `response.memory_read` SSE event below, which the answer's saved
+    events keep."""
+
+    read: bool
+    entries: int
+
+
+@dataclass
 class TurnHistory:
     """Synthetic post-turn event carrying the turn's tool block-rows
     (assistant `tool_use` / user `tool_result`) so the responses route can
@@ -1079,6 +1092,15 @@ async def format_responses_stream(
                 "type": "response.skill_created",
                 "sequence_number": seq,
                 "skill": event.skill,
+            })
+
+        elif isinstance(event, TurnMemoryRead):
+            seq += 1
+            yield _event("response.memory_read", {
+                "type": "response.memory_read",
+                "sequence_number": seq,
+                "read": event.read,
+                "entries": event.entries,
             })
 
         elif isinstance(event, StreamComplete):

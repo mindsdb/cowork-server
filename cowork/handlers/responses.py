@@ -174,6 +174,11 @@ class _RemoteTurnFailed(Exception):
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
 
+#: A direct answer from the routing gate runs no agent, so it reads no learned
+#: memory. Its saved events carry the record an agent turn's do
+#: (stream_formatter.TurnMemoryRead).
+_DIRECT_MEMORY_READ = {"type": "response.memory_read", "read": False, "entries": 0}
+
 #: Budget for a pod-reported history summary. Well above what the summarizer's
 #: own output cap can produce, and the summary is sticky: it is replayed on
 #: every later turn, so an oversized one wedges the conversation for good.
@@ -1188,7 +1193,7 @@ class ResponsesHandler:
             }, *([] if sources is None else [{
                 "type": "response.figure_sources",
                 **sources.model_dump(mode="json"),
-            }]), {"type": "response.completed"}]
+            }]), {**_DIRECT_MEMORY_READ}, {"type": "response.completed"}]
 
             def save_turn(session: ScopedSession) -> UUID:
                 service = ConversationService(session)
@@ -1299,7 +1304,10 @@ class ResponsesHandler:
                 "item_id": item_id,
                 **sources.model_dump(mode="json"),
             }
-            saved_events = [delta, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"}]
+            memory_frame = {**_DIRECT_MEMORY_READ, "sequence_number": 3 if sources_frame is None else 4}
+            saved_events = [
+                delta, *([] if sources_frame is None else [sources_frame]), memory_frame, {"type": "response.completed"},
+            ]
             async with conversation_writes(conv_id):
                 saved = await run_db(
                     partial(save_turn, events=saved_events), scope=scope_from_principal(self.principal),
@@ -1325,6 +1333,7 @@ class ResponsesHandler:
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
             if sources_frame is not None:
                 await buffer.append("sse", {"sse": sse_frame("response.figure_sources", sources_frame)})
+            await buffer.append("sse", {"sse": sse_frame("response.memory_read", memory_frame)})
             completed_response = Response(
                 id=response.id,
                 created_at=response.created_at,
@@ -1334,7 +1343,7 @@ class ResponsesHandler:
             ).model_dump()
             completed_frame = {
                 "type": "response.completed",
-                "sequence_number": 3 if sources_frame is None else 4,
+                "sequence_number": memory_frame["sequence_number"] + 1,
                 "response": completed_response,
             }
             # The persisted row's real id, at the frame root (not
