@@ -299,13 +299,7 @@ still reconnects to the detached answer. Closing a `/responses/tail` observer ne
 If a client leaves during routing or setup, that request's cleanup prevents it from leaving a
 live producer behind. Completion and server shutdown retain their existing outcomes.
 
-A question can set `"memory": "off"` to read no learned memory and learn nothing, while other
-questions keep memory, for example a scored evaluation run on a deployment whose testers have it
-on. The turn runs as every turn does with `MEMORY_ENABLED=false`: two empty memory tiers in its
-scratch folder, no background memory passes, and the operator's managed rules still read. The
-field takes `"on"` (the default) or `"off"`. A deployment that doesn't trust identity headers,
-such as the desktop app, still reads stored memory with memory off, so it refuses the question
-with 501.
+A question can set `"memory": "off"` to read no learned memory and learn nothing, while other questions keep memory, for example a scored evaluation run on a deployment whose testers have it on. The turn runs as every turn does with `MEMORY_ENABLED=false`: two empty memory tiers in its scratch folder, no background memory passes, and the operator's managed rules still read. A later turn sent without the key in the same conversation learns from the whole conversation, its earlier memory-off turns included, so send the key on every turn of the conversation. The field takes `"on"` (the default) or `"off"`. A deployment that doesn't trust identity headers, such as the desktop app, still reads stored memory with memory off, so it refuses the question with 501.
 
 The root of `response.created` carries a `run_id` UUID for that execution. An API client or proxy
 can send `{"conversation_id": "...", "expected_run_id": "...", "reason": "client_gone"}` to

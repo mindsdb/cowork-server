@@ -211,7 +211,11 @@ class ResponsesRequest(BaseModel):
     # memory.
     memory: Literal["on", "off"] = Field(
         default="on",
-        description='"off" keeps this question from reading or learning memory; other questions keep it.',
+        description=(
+            '"off" keeps this question from reading learned memory or learning any; '
+            "the operator's managed rules still apply. "
+            '"on", the default, follows the deployment\'s memory setting and never turns memory on.'
+        ),
     )
 
     @model_validator(mode="after")

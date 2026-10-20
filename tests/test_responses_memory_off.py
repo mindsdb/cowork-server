@@ -132,12 +132,27 @@ async def test_questions_without_memory_off_keep_memory(trusted, monkeypatch):
     ]
 
 
-async def test_the_desktop_refuses_a_question_with_memory_off(monkeypatch):
-    """Without trusted identity headers, memory off still reads the base
-    tiers, so the question is refused before anything runs."""
+async def test_no_question_turns_memory_on_where_the_operator_turned_it_off(trusted, monkeypatch):
+    """With MEMORY_ENABLED false, a question without the key and one that
+    says "on" run with memory off too: the key only ever turns memory off."""
+    monkeypatch.setenv("MEMORY_ENABLED", "false")
     harness = _SeesMemory()
 
-    answered = await _ask(monkeypatch, harness, headers={}, memory="off")
+    for body in ({}, {"memory": "on"}, {"memory": "off"}):
+        answered = await _ask(monkeypatch, harness, headers=PERSON, **body)
+        assert answered.status_code == 200, answered.text
+
+    assert harness.seen == [TurnMemory(enabled=False, off=True)] * 3
+
+
+async def test_the_desktop_refuses_a_question_with_memory_off(monkeypatch):
+    """Without trusted identity headers, memory off still reads the base
+    tiers, so the question is refused before anything runs: no conversation
+    is saved for it."""
+    harness = _SeesMemory()
+    conversation = uuid4()
+
+    answered = await _ask(monkeypatch, harness, headers={}, memory="off", conversation=str(conversation))
 
     assert answered.status_code == 501, answered.text
     assert answered.json()["detail"] == (
@@ -145,6 +160,18 @@ async def test_the_desktop_refuses_a_question_with_memory_off(monkeypatch):
         'Retry the request without "memory": "off".'
     )
     assert harness.started == 0
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        assert raw.get(Conversation, conversation) is None
+
+
+async def test_the_desktop_answers_a_question_with_memory_on(monkeypatch):
+    """Only "off" is refused there: "on" keeps the desktop's own memory."""
+    harness = _SeesMemory()
+
+    answered = await _ask(monkeypatch, harness, headers={}, memory="on")
+
+    assert answered.status_code == 200 and "response.completed" in answered.text, answered.text
+    assert harness.seen == [TurnMemory(enabled=True, off=False)]
 
 
 @pytest.mark.parametrize("value", ["OFF", "none", "", False, None])
