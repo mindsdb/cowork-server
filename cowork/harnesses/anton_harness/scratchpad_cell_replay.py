@@ -146,13 +146,15 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
     and a `content` key carrying the JSON payload for scratchpad events. A
     result pairs with the end event of its own `tool_use_id`: when the model
     sends several calls at once, every end event comes before the first
-    result. A result stored without one pairs with the end event just before
-    it. A result makes a cell only when its call ran an exec (_ran_action).
+    result. A result stored without one pairs with an end event stored
+    without one just before it (the connector probe's). A result makes a cell
+    only when its call ran an exec (_ran_action).
     """
     cells: list[Cell] = []
     # The calls whose result hasn't come yet, by tool_use_id.
     sent: dict[str, _SentCall] = {}
-    # The last call, for a result stored without a tool_use_id.
+    # The last call stored without a tool_use_id, for a result stored
+    # without one.
     last: _SentCall | None = None
 
     for data in events:
@@ -171,10 +173,11 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
                 cells.clear()
                 sent.clear()
                 last = None
+            elif tool_use_id:
+                sent[tool_use_id] = call
+                last = None
             else:
                 last = call
-                if tool_use_id:
-                    sent[tool_use_id] = call
 
         elif role == _SCRATCHPAD_RESULT:
             call = sent.pop(tool_use_id, None) if tool_use_id else last

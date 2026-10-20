@@ -91,6 +91,10 @@ def _scratchpad_action(tc_input: Mapping[str, Any]) -> str:
     export. Tools go to the model without strict schemas, so a call can leave
     out `action`, and anton runs one that carries `code` as an exec. One with
     neither gets "", which no action matches.
+
+    Replace with `from anton.core.utils.scratchpad import scratchpad_action`
+    in the change that raises the anton-agent floor in pyproject.toml to the
+    release that carries it.
     """
     action = tc_input.get("action")
     if not action and tc_input.get("code"):
