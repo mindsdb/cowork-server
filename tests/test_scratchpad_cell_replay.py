@@ -189,11 +189,14 @@ async def test_interleaved_long_calls_keep_their_own_code_and_status_after_stora
 
 
 @pytest.mark.parametrize("status", [None, "ok", "error", "timeout", "unrecognized", ["ok"]])
-@pytest.mark.parametrize("cut_in_code", [False, True], ids=["code-whole", "code-cut"])
-def test_a_missing_error_uses_only_an_explicit_success_status(status, cut_in_code):
+@pytest.mark.parametrize("cut", ["code", "stdout", "stderr", "error"], ids=lambda field: f"{field}-cut")
+def test_a_missing_error_uses_only_an_explicit_success_status(status, cut):
+    """A result cut inside any field before its error is whole counts as a
+    failure unless its status says ok, and says how it ended where it knows."""
     code = "open('report.md', 'w').write('draft')"
-    content = json.dumps({"code": code, "stdout": "long output"})
-    content = content[:12] if cut_in_code else content[:-5]
+    whole = json.dumps({"code": code, "stdout": "long output", "stderr": "a warning",
+                        "error": "ZeroDivisionError: division by zero"})
+    content = whole[:whole.index(f'"{cut}": ') + len(cut) + 8]
     result = {**_result(code), "content": content}
     if status is not None:
         result["cell_status"] = status
@@ -202,8 +205,10 @@ def test_a_missing_error_uses_only_an_explicit_success_status(status, cut_in_cod
 
     assert cell.code == code
     assert (cell.error is None) is (status == "ok")
-    if status != "ok":
-        assert isinstance(cell.error, str) and cell.error
+    expected = {"error": "The cell failed", "timeout": "The cell timed out", "ok": None}.get(
+        status if isinstance(status, str) else None, "whether it succeeded is unknown"
+    )
+    assert cell.error is None if expected is None else expected in cell.error
 
 
 @pytest.mark.parametrize("status", [None, "ok", "error", "timeout", "unrecognized"])
@@ -231,6 +236,10 @@ async def test_only_scratchpad_call_inputs_lose_the_length_cap():
         yield StreamToolUseEnd(id="other")
         yield StreamToolResult(name="recall", action="message", content=content, id="other")
         yield StreamToolResult(name="recall", action="read", content=content, id="other")
+        # An MCP tool named like the scratchpad keeps the cap on its input.
+        yield StreamToolUseStart(id="notes", name="notes__scratchpad_append")
+        yield StreamToolUseDelta(id="notes", json_delta=content)
+        yield StreamToolUseEnd(id="notes")
 
     stored: list[dict] = []
     async for _ in format_responses_stream(
@@ -239,9 +248,44 @@ async def test_only_scratchpad_call_inputs_lose_the_length_cap():
         pass
 
     contents = [e["content"] for e in stored if e.get("thought_role") in {
-        "thought.recall.end", "thought.tool_call.message", "thought.scratchpad.result",
+        "thought.recall.end", "thought.tool_call.message", "thought.scratchpad.result", "thought.scratchpad.end",
     }]
-    assert contents == [content[:65_536]] * 3
+    assert contents == [content[:65_536]] * 4
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="anton-agent 2.26.10.19.3 drops a compacted cell's error flag; the floor moves to the release that keeps it",
+)
+@pytest.mark.parametrize("code_size", [1000, 70_000], ids=["error-cut", "code-and-error-cut"])
+async def test_a_replayed_failure_folded_by_compaction_grants_no_file_ownership(tmp_path, monkeypatch, code_size):
+    """A replayed cell that failed while writing the user's report still
+    makes no file the agent's own after compaction folds it."""
+    from anton.core.backends.local import LocalScratchpadRuntime
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "report.md").write_text("user's report")
+    code = f"report = {'x' * code_size!r}\nx = 1 / 0\nopen('report.md', 'w').write('draft')"
+    result = json.dumps(asdict(Cell(code=code, stdout="x" * 70_000, stderr="", error="ZeroDivisionError")))
+    cells = _persisted_cells(await _stored_events(calls=[(code, result)]))
+    assert len(cells) == 1 and cells[0].error
+    pad = LocalScratchpadRuntime(
+        name="main", coding_provider="anthropic", coding_model="", coding_api_key="", coding_base_url="",
+        cells=cells, workspace_path=tmp_path, _venvs_base=tmp_path / "venvs",
+    )
+    pad.cells += [Cell(code=f"total_{n} = {n}", stdout="", stderr="", error=None) for n in range(6)]
+    assert pad._compact_cells()
+    assert all(cell.code != code for cell in pad.cells)
+    elicitor = _CancelWrites()
+    emitter = TurnEmitter()
+    session = SimpleNamespace(
+        _write_gate=WriteGate(snapshots=(snapshot_project_files(root=tmp_path, label="project", taken_at=10**10),)),
+        elicitor=elicitor, emitter=emitter, emit=emitter.emit, answer_wait_s=0.0,
+    )
+
+    outcome = await hold_unapproved_write(session, pad=pad, code="open('report.md', 'w').write('replacement')")
+
+    assert outcome is not None and len(elicitor.requests) == 1
 
 
 def test_an_exec_end_and_its_result_make_a_cell():
