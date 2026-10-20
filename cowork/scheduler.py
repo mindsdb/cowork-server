@@ -48,6 +48,11 @@ _MAX_RUN_DURATION_SECONDS = 600
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 _scheduler_task: asyncio.Task | None = None
+# The runs the poll loop started and nothing awaits. A shutdown waits for them
+# (wait_for_scheduled_runs) so each run's last writes land before the process
+# exits. A manual run belongs to its request instead, which Uvicorn's drain
+# waits for.
+_scheduled_runs: set[asyncio.Task] = set()
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
 
@@ -550,7 +555,9 @@ async def _scheduler_loop() -> None:
             due = []
 
         for schedule_id in due:
-            asyncio.create_task(execute_schedule(schedule_id, is_manual=False))
+            run = asyncio.create_task(execute_schedule(schedule_id, is_manual=False))
+            _scheduled_runs.add(run)
+            run.add_done_callback(_scheduled_runs.discard)
 
 
 def start_scheduler() -> None:
@@ -559,3 +566,35 @@ def start_scheduler() -> None:
         return
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     logger.info("Scheduler background task created")
+
+
+async def stop_scheduler(*, timeout_seconds: float) -> None:
+    """Stop the poll loop, so it starts no more runs. Calling it again does nothing.
+
+    Waits at most ``timeout_seconds`` for a poll that is reading the database.
+    The cancel lands either way: run_db re-raises it once that read ends, so
+    the loop never reaches the line that starts a run.
+    """
+    global _scheduler_task
+    task, _scheduler_task = _scheduler_task, None
+    if task is None or task.done():
+        return
+    task.cancel()
+    await asyncio.wait([task], timeout=timeout_seconds)
+    logger.info("Scheduler stopped")
+
+
+async def wait_for_scheduled_runs(*, timeout_seconds: float) -> int:
+    """Wait up to ``timeout_seconds`` for the runs the poll loop started.
+
+    For a shutdown, after the server has ended their turns: each run then
+    records the turn's outcome and finishes its run row. A row left at
+    `running` stops its schedule firing until a boot reaps it
+    (ScheduleRunService.reap_orphaned_runs). Returns how many runs were still
+    going when the wait ended; they go on until the process exits.
+    """
+    runs = [run for run in _scheduled_runs if not run.done()]
+    if not runs:
+        return 0
+    _, pending = await asyncio.wait(runs, timeout=timeout_seconds)
+    return len(pending)
