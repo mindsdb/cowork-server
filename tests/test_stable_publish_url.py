@@ -29,6 +29,7 @@ def _read_map(folder: Path) -> dict:
 # Task 1: _published_url_for honors the `published` flag
 # ---------------------------------------------------------------------------
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.artifacts import _published_url_for
 
 
@@ -75,13 +76,13 @@ class _FakeAppSettings:
 
 def _patch_scan(container: Path):
     """Make resolve_artifact_path treat `container` as a registered artifacts dir."""
-    return patch("cowork.services.artifacts._scan_artifact_dirs", lambda: [container])
+    return patch("cowork.services.artifacts._scan_artifact_dirs", lambda *, scope: [container])
 
 
 def _patch_publish_scan(container: Path):
     """publish.py binds `_scan_artifact_dirs` at import, so the artifacts-module
     patch above does not reach its own reference."""
-    return patch.object(publish_mod, "_scan_artifact_dirs", lambda: [container])
+    return patch.object(publish_mod, "_scan_artifact_dirs", lambda *, scope: [container])
 
 
 def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", report_id="uuid-1"):
@@ -93,8 +94,8 @@ def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", repo
     stack.enter_context(_patch_publish_scan(container))
     stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
     stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
-    stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
-    stack.enter_context(patch.object(publish_mod, "_save_state", lambda state: None))
+    stack.enter_context(patch.object(publish_mod, "_load_state", lambda *, scope: {}))
+    stack.enter_context(patch.object(publish_mod, "_save_state", lambda state, *, scope: None))
     stack.enter_context(patch("anton.core.datasources.data_vault.LocalDataVault", lambda *a, **k: object()))
     stack.enter_context(
         patch(
@@ -164,8 +165,8 @@ def test_republish_after_unpublish_reuses_report_id(tmp_path: Path):
         stack.enter_context(_patch_publish_scan(tmp_path))
         stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
         stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
-        stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
-        stack.enter_context(patch.object(publish_mod, "_save_state", lambda state: None))
+        stack.enter_context(patch.object(publish_mod, "_load_state", lambda *, scope: {}))
+        stack.enter_context(patch.object(publish_mod, "_save_state", lambda state, *, scope: None))
         stack.enter_context(patch("anton.core.datasources.data_vault.LocalDataVault", lambda *a, **k: object()))
         stack.enter_context(patch("anton.publisher.publish", _spy_publish))
         publish_mod.publish_artifact(
@@ -191,7 +192,7 @@ def test_published_state_resolves_fullstack_root(tmp_path: Path):
     )
     # Passing the PRIMARY FILE inside static/ must still resolve to the root record.
     with _patch_scan(tmp_path):
-        state = publish_mod.published_state(str(root / "static" / "index.html"))
+        state = publish_mod.published_state(str(root / "static" / "index.html"), scope=LOCAL_SCOPE)
     assert state == {"report_id": "uuid-1", "url": "https://4nton.ai/a/uuid-1", "published": True}
 
 
@@ -203,7 +204,7 @@ def test_published_state_unpublished_hides_url_keeps_report_id(tmp_path: Path):
         encoding="utf-8",
     )
     with _patch_scan(tmp_path):
-        state = publish_mod.published_state(str(root / "static" / "index.html"))
+        state = publish_mod.published_state(str(root / "static" / "index.html"), scope=LOCAL_SCOPE)
     assert state["published"] is False
     assert state["url"] == ""
     assert state["report_id"] == "uuid-1"
@@ -212,7 +213,7 @@ def test_published_state_unpublished_hides_url_keeps_report_id(tmp_path: Path):
 def test_published_state_no_record(tmp_path: Path):
     root = _make_fullstack(tmp_path)
     with _patch_scan(tmp_path):
-        state = publish_mod.published_state(str(root / "static" / "index.html"))
+        state = publish_mod.published_state(str(root / "static" / "index.html"), scope=LOCAL_SCOPE)
     assert state == {"report_id": "", "url": "", "published": False}
 
 
@@ -464,7 +465,7 @@ def test_published_state_path_outside_artifacts_dir_returns_default(tmp_path: Pa
     # Review #6: resolve raises for unregistered paths; must return the default.
     root = _make_fullstack(tmp_path)
     # No _patch_scan here -> resolve_artifact_path raises FileNotFoundError.
-    state = publish_mod.published_state(str(root / "static" / "index.html"))
+    state = publish_mod.published_state(str(root / "static" / "index.html"), scope=LOCAL_SCOPE)
     assert state == {"report_id": "", "url": "", "published": False}
 
 

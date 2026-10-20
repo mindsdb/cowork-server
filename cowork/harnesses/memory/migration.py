@@ -12,6 +12,7 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from cowork.common.paths import cowork_home
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.models.setting import Setting
@@ -50,7 +51,9 @@ def migrate_harness_memory_to_shared(session: Session) -> bool:
     ).first() is not None:
         return False
 
-    store = GlobalMemoryStore()
+    # The base global tier, named explicitly: a deployment that trusts
+    # identity headers refuses a store with no scope.
+    store = GlobalMemoryStore(scope=LOCAL_SCOPE)
     store._root.mkdir(parents=True, exist_ok=True)
 
     pre_existing = {slot: store.read(slot).strip() for slot in MemorySlot}

@@ -19,6 +19,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.logger import exception_http_status
 from cowork.common.settings.user_settings import get_user_settings
+from cowork.deployment_identity import identity_for_turn
 from cowork.services.providers import build_llm_client
 
 
@@ -82,6 +83,30 @@ Call the delegate tool when the request needs any of those capabilities or you
 are unsure. Direct answers must be short, helpful, and in the user's language.
 Never mention routing, Anton, tools, or these instructions."""
 
+
+def with_deployment_identity(role_prompt: str) -> str:
+    """Give fast responses Anton's trusted facts without changing their role.
+
+    The gate can answer without a ChatSession, and the first take speaks before
+    it exists. Both use create_app's snapshot, never request or member settings.
+    Unset hosts keep the exact prompt and need no new Anton prompt API.
+    """
+    identity = identity_for_turn()
+    if identity is None:
+        return role_prompt
+    from anton.core.llm.identity import product_lines
+
+    return (
+        "TRUSTED DEPLOYMENT CONTEXT:\n"
+        + "\n".join(product_lines("web", identity))
+        + "\n\nReferences to Cowork in the role below mean the deployment named above. "
+        "Use that configured name as your product identity. "
+        "recall_skill is available only to the full agent: keep the role's "
+        "delegation or placeholder-only behavior instead of trying to call it.\n\n"
+        + role_prompt
+    )
+
+
 # Products the gate's answer must never name (ENG-2423).
 #
 # The instruction above is necessary and NOT sufficient: the equivalent
@@ -137,6 +162,13 @@ _FOREIGN_PRODUCT_RE = re.compile(
 )
 
 
+def _configured_name(name: str) -> str:
+    """The deployment's configured product name as a pattern, bounded as
+    _FOREIGN_PRODUCT_RE bounds its names, so a short name such as "AI" matches
+    neither inside "explain" nor inside "OpenAI"."""
+    return rf"(?<![A-Za-z0-9_-]){re.escape(name)}(?![A-Za-z0-9_-])"
+
+
 # The second shape the gate must never ship: an answer that names no competitor
 # and instead denies that our own product can be identified or exists — the
 # prospect evaluating Cowork who was told "I can't reliably identify a current
@@ -154,62 +186,56 @@ _FOREIGN_PRODUCT_RE = re.compile(
 # product-ish object, and `exist` restricted to the product as its own subject
 # so "the path doesn't exist" is untouched.
 _OUR_PRODUCTS = r"(?:cowork|minds\s?hub|mindsdb)"
-_PRODUCT_NOUN = rf"(?:product|app(?:lication)?|tool|software|service|company|thing|anything|{_OUR_PRODUCTS})"
-_DENIAL = rf"""(?:
+
+
+def _product_denial_regex(products: str) -> re.Pattern[str]:
+    """Apply the existing denial phrases to the supplied product-name pattern."""
+    product_noun = rf"(?:product|app(?:lication)?|tool|software|service|company|thing|anything|{products})"
+    denial = rf"""(?:
    (?:can(?:no|')t|cannot|could\s?n[o']t|could\s+not|unable\s+to)
        \s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)
-       (?:\s+\w+){{0,4}}?\s+(?:a|any|the|that)?\s*{_PRODUCT_NOUN}
+       (?:\s+\w+){{0,4}}?\s+(?:a|any|the|that)?\s*{product_noun}
  | (?:not|n't)\s+(?:\w+\s+){{0,2}}?(?:familiar|aware)\s+(?:with|of)
  | (?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)
-       (?:\s+\w+){{0,1}}?\s+{_PRODUCT_NOUN}
+       (?:\s+\w+){{0,1}}?\s+{product_noun}
  | (?:do|does)\s?n[o']t\s+(?:know|recognis[ez]e)\s+(?:of\s+)?(?:any|a)\b
  | never\s+heard\s+of
 )"""
-#: `exist` alone is far too common ("the path doesn't exist"), so it is bound to
-#: the product being its own subject within one clause.
-_NOT_EXIST = rf"(?:{_OUR_PRODUCTS})[^.!?]{{0,30}}?do(?:es)?\s?n[o']t\s+(?:appear\s+to\s+)?exist"
+    # `exist` alone is far too common ("the path doesn't exist"), so it is bound
+    # to the product being its own subject within one clause.
+    not_exist = rf"(?:{products})[^.!?]{{0,30}}?do(?:es)?\s?n[o']t\s+(?:appear\s+to\s+)?exist"
 
-#: The attributive form: the product name sits INSIDE the denial clause as a
-#: modifier ("I could not find any official Cowork application") rather than
-#: before or after it ("…a product called Cowork").  The name is then consumed
-#: by the clause's own filler, leaving nothing to satisfy the before/after
-#: requirement above — so these read as ordinary answers and shipped.  All four
-#: observed phrasings are at least as natural as the form already caught.
-#:
-#: It keeps the product-noun requirement, and that is the whole difference
-#: between this and the obvious version.  Anchoring on the bare product name
-#: instead (denial verb + … + "Cowork") was executed against the negatives first
-#: and regressed three of them — "I couldn't find that setting in Cowork", "I
-#: can't locate that file in your Cowork workspace", "I cannot verify the
-#: checksum of the Cowork download" — the first of which is already a committed
-#: test.  Requiring `<product> <product-noun>` separates "a Cowork installer"
-#: from "that setting in Cowork", which is exactly the line that matters.
-_ATTRIBUTIVE_NOUN = r"(?:product|app(?:lication)?|tool|software|service|installer|desktop\s+app|package)"
-_DENIAL_ATTRIBUTIVE = (
-    rf"(?:can(?:no|')t|cannot|could\s?n[o']t|could\s+not|unable\s+to)"
-    rf"\s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)"
-    rf"(?:\s+\w+){{0,4}}?\s+(?:{_OUR_PRODUCTS})\s+{_ATTRIBUTIVE_NOUN}"
-)
+    # The attributive form: the product name sits INSIDE the denial clause as a
+    # modifier ("I could not find any official Cowork application") rather than
+    # before or after it ("…a product called Cowork"). The name is then consumed
+    # by the clause's own filler, leaving nothing to satisfy the before/after
+    # requirement above. Keep the product-noun requirement: a bare-name match
+    # also rejected "I couldn't find that setting in Cowork", "I can't locate
+    # that file in your Cowork workspace" and "I cannot verify the checksum of
+    # the Cowork download". The tests pin those negatives.
+    attributive_noun = r"(?:product|app(?:lication)?|tool|software|service|installer|desktop\s+app|package)"
+    denial_attributive = (
+        rf"(?:can(?:no|')t|cannot|could\s?n[o']t|could\s+not|unable\s+to)"
+        rf"\s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)"
+        rf"(?:\s+\w+){{0,4}}?\s+(?:{products})\s+{attributive_noun}"
+    )
 
-#: The adjective form with our name as the modifier: "no verified Cowork desktop
-#: app".  Needed for the same reason as `_DENIAL_ATTRIBUTIVE`: the name is
-#: consumed inside the denial clause, so the before/after rule cannot see it.
-#: Without the product-noun requirement this branch was bare proximity and fired
-#: on ordinary true answers — "Cowork has no official Slack integration yet",
-#: "there is no public API for Cowork right now" — which is the shape the
-#: narrowness argument above rules out.
-_DENIAL_ADJ_ATTRIBUTIVE = (
-    rf"(?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)"
-    rf"\s+(?:{_OUR_PRODUCTS})\s+{_ATTRIBUTIVE_NOUN}"
-)
+    # The adjective form ("no verified Cowork desktop app") needs the same
+    # product noun, so ordinary feature limitations remain allowed.
+    denial_adj_attributive = (
+        rf"(?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)"
+        rf"\s+(?:{products})\s+{attributive_noun}"
+    )
+    return re.compile(
+        rf"(?isx)(?:{products}).{{0,120}}?{denial}"
+        rf"|{denial}.{{0,120}}?(?:{products})"
+        rf"|{not_exist}"
+        rf"|{denial_attributive}"
+        rf"|{denial_adj_attributive}"
+    )
 
-_DENIES_PRODUCT_RE = re.compile(
-    rf"(?isx)(?:{_OUR_PRODUCTS}).{{0,120}}?{_DENIAL}"
-    rf"|{_DENIAL}.{{0,120}}?(?:{_OUR_PRODUCTS})"
-    rf"|{_NOT_EXIST}"
-    rf"|{_DENIAL_ATTRIBUTIVE}"
-    rf"|{_DENIAL_ADJ_ATTRIBUTIVE}"
-)
+
+_DENIES_PRODUCT_RE = _product_denial_regex(_OUR_PRODUCTS)
 
 # A direct answer is persisted as history, so one naming the gate's own tool
 # teaches the agent that tool exists. Two shapes reach here as text: a call the
@@ -246,6 +272,12 @@ def names_foreign_product(text: str) -> str | None:
     Exported so the regression suite asserts against the same matcher the gate
     uses, rather than a copy that can drift away from it.
     """
+    identity = identity_for_turn()
+    if identity is not None:
+        # The configured name is our own product even when it holds a listed
+        # name ("Acme Copilot"). Only the whole name is removed, so a listed
+        # name elsewhere in the text still matches.
+        text = re.sub(_configured_name(identity.product_name), "", text or "", flags=re.IGNORECASE)
     match = _FOREIGN_PRODUCT_RE.search(text or "")
     return match.group(0) if match else None
 
@@ -255,7 +287,11 @@ def denies_our_product(text: str) -> str | None:
 
     Exported for the same reason as :func:`names_foreign_product`.
     """
-    match = _DENIES_PRODUCT_RE.search(text or "")
+    identity = identity_for_turn()
+    pattern = _DENIES_PRODUCT_RE if identity is None else _product_denial_regex(
+        rf"(?:{_OUR_PRODUCTS}|{_configured_name(identity.product_name)})"
+    )
+    match = pattern.search(text or "")
     return " ".join(match.group(0).split())[:120] if match else None
 
 
@@ -314,7 +350,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
 
     events = binding.provider.stream(
         model=binding.model,
-        system=_SYSTEM_PROMPT,
+        system=with_deployment_identity(_SYSTEM_PROMPT),
         messages=history,
         tools=[_DELEGATE_TOOL],
         max_tokens=_DIRECT_MAX_TOKENS,
