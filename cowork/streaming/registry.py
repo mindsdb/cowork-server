@@ -275,6 +275,17 @@ async def _stop_controller_turns(handles: list[RunHandle], *, timeout_seconds: f
     await asyncio.wait(writes, timeout=timeout_seconds)
 
 
+async def _forget_unstarted_run(conversation_id: str, run_id: str) -> None:
+    """Remove a run start() published to the turn index but never started."""
+    from cowork.streaming.turn_index import forget_run
+
+    try:
+        async with asyncio.timeout(5):
+            await forget_run(conversation_id, run_id)
+    except Exception:
+        logger.exception("Could not remove unstarted run %s", run_id)
+
+
 class RunRegistry:
     """Process-wide map of in-flight turns. Single-threaded (asyncio loop)."""
 
@@ -288,9 +299,20 @@ class RunRegistry:
         """Refuse every later start() with ServerShuttingDown.
 
         cowork.server calls it before it ends the turns in flight for a
-        shutdown, so none starts behind that. Calling it again does nothing.
+        shutdown, so none starts behind that. A start() already waiting on
+        its buffer or the earlier turn when this runs is refused too, at its
+        last check before it registers the turn. Calling it again does
+        nothing.
         """
         self._closed = True
+
+    @staticmethod
+    def _shutdown_refusal(conversation_id: str) -> ServerShuttingDown:
+        logger.info(
+            "Refused a turn for conversation %s; the server is shutting down.",
+            conversation_id,
+        )
+        return ServerShuttingDown()
 
     async def start(
         self,
@@ -322,11 +344,17 @@ class RunRegistry:
         its question's position in the history, which this question does not
         hold. A start after a turn that saved nothing keeps the number.
 
-        Raises ServerShuttingDown once close() has run.
+        Raises ServerShuttingDown once close() has run, whether close() ran
+        before this start or while it waited on the earlier turn, its buffer
+        or the turn index. The last check runs with no await between it and
+        the turn's registration, so shutdown() sees every turn that starts.
 
-        A refused start creates no buffer and no producer coroutine. An
-        accepted one opens its buffer clear of the records of an earlier turn
-        at the same number (backend.new_buffer).
+        A start refused before it opens its buffer creates no buffer and no
+        producer coroutine. One refused by that last check has opened an
+        empty buffer, which the next start at that number opens clean again,
+        and removes the run it published to the turn index. An accepted start
+        opens its buffer clear of the records of an earlier turn at the same
+        number (backend.new_buffer).
         """
         loop = asyncio.get_running_loop()
         lock = self._start_locks.get(conversation_id)
@@ -335,11 +363,7 @@ class RunRegistry:
             self._start_locks[conversation_id] = lock
         async with lock:
             if self._closed:
-                logger.info(
-                    "Refused a turn for conversation %s; the server is shutting down.",
-                    conversation_id,
-                )
-                raise ServerShuttingDown()
+                raise self._shutdown_refusal(conversation_id)
             existing = self._by_cid.get(conversation_id)
             if existing is not None and existing.is_answering:
                 logger.info(
@@ -366,9 +390,10 @@ class RunRegistry:
             buffer = await open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             from cowork.streaming.backend import get_backend
-            if get_backend() == "redis":
+            published = get_backend() == "redis"
+            if published:
                 from cowork.db.units import run_to_completion
-                from cowork.streaming.turn_index import forget_run, record_turn
+                from cowork.streaming.turn_index import record_turn
                 # Publish immutable identity before either the producer or its
                 # first reader can request cancellation. Dispatch never replaces it.
                 async def publish() -> None:
@@ -385,12 +410,15 @@ class RunRegistry:
                 except BaseException:
                     # Setup can be cancelled while Redis has committed but not
                     # replied. Settle that write, then remove only this instance.
-                    try:
-                        async with asyncio.timeout(5):
-                            await forget_run(conversation_id, lifecycle.identity.run_id)
-                    except Exception:
-                        logger.exception("Could not remove unstarted run %s", lifecycle.identity.run_id)
+                    await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
                     raise
+            # close() may have run during any await above. No await from this
+            # check to the registration below, so a shutdown that closed the
+            # registry either refuses this turn here or finds it in _by_cid.
+            if self._closed:
+                if published:
+                    await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
+                raise self._shutdown_refusal(conversation_id)
             task = asyncio.create_task(
                 self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),
                 name=f"turn[{conversation_id}/{turn_id}]",

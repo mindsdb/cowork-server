@@ -552,3 +552,52 @@ async def test_a_closed_registry_refuses_a_new_turn_before_opening_anything():
 
     assert opened == [] and produced == []
     assert registry.get(CID) is None
+
+
+@pytest.mark.parametrize("backend", ["file", "redis"])
+async def test_a_start_the_shutdown_overtakes_is_refused_before_it_registers(monkeypatch, backend):
+    """close() and shutdown() run while a start() that passed the first closed
+    check waits on its buffer. shutdown() cannot see that turn, so start()
+    must refuse it at its last check rather than register a turn nothing
+    ends. On Redis it also removes the run it published to the turn index."""
+    from cowork.streaming import turn_index
+
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", backend)
+    index = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(turn_index, "get_redis", lambda: index)
+    published: list[str] = []
+    real_record_turn = turn_index.record_turn
+
+    async def record_turn(conversation_id, **kwargs):
+        published.append(kwargs["run_id"])
+        await real_record_turn(conversation_id, **kwargs)
+
+    monkeypatch.setattr(turn_index, "record_turn", record_turn)
+    opening = asyncio.Event()
+    release = asyncio.Event()
+    produced: list[str] = []
+
+    async def open_buffer():
+        opening.set()
+        await release.wait()
+        return _FakeBuffer()
+
+    def produce(buffer):
+        produced.append("producer")
+
+    lifecycle = TurnLifecycle(identity=RunIdentity(remote=True))
+    start = asyncio.create_task(registry.start(
+        conversation_id=CID, turn_id=0, open_buffer=open_buffer, produce=produce, lifecycle=lifecycle,
+    ))
+    await asyncio.wait_for(opening.wait(), timeout=2)
+
+    registry.close()
+    assert await registry.shutdown(timeout_seconds=1) == 0
+    release.set()
+
+    with pytest.raises(ServerShuttingDown):
+        await asyncio.wait_for(start, timeout=2)
+    assert produced == []
+    assert registry.get(CID) is None and registry.in_flight() == []
+    assert published == ([lifecycle.identity.run_id] if backend == "redis" else [])
+    assert await index.keys("*") == []
