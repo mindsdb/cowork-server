@@ -157,8 +157,11 @@ deployment:
   #           remaining answer as interrupted on its open stream
   #           (TURN_SHUTDOWN_GRACE_SECONDS).
   #   2 s     uvicorn's own drain (--timeout-graceful-shutdown in the image).
-  #   about 13 s  the lifespan teardown's bounded waits.
-  # About 35 s in all, so 60 s leaves room for the unbounded closes at the end
+  #   about 18 s  the lifespan teardown's bounded waits: another pass over
+  #           turns (5 s), channel tasks (3 s, then up to 5 s more while each
+  #           one cancelled writes its sandbox turn's cancel flag) and
+  #           scratchpad closes (5 s).
+  # About 40 s in all, so 60 s leaves room for the unbounded closes at the end
   # of teardown before the kubelet's SIGKILL.
   terminationGracePeriodSeconds: 60
 
