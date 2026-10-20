@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -118,6 +118,21 @@ def _new_turn_scratch_dir() -> Path:
     base = _vault_scratch_dir()
     base.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="cowork-turn-", dir=base))
+
+
+class BuiltChatSession(NamedTuple):
+    """One in-process turn, as ``_build_chat_session`` builds it."""
+
+    session: "ChatSession"
+    # The turn's scratch folder (_new_turn_scratch_dir), which stream_response
+    # removes when the turn ends, or None when the turn made none.
+    turn_scratch_dir: Path | None
+    # What _persist_history_compaction needs to map this turn's compaction
+    # onto the saved messages (_seed_history); None with history compaction off.
+    seed_info: dict | None
+    # The turn's TurnMemoryLayout.learns: False when its tiers are two empty
+    # scratch folders, so it reads and writes nobody's learned memory.
+    learns: bool
 
 
 def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
@@ -406,6 +421,21 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     if not rows:
         return None
     return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
+
+
+def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead | None:
+    """What the turn's prompt held from learned memory, or None before anton
+    has built the prompt (ChatSession.memory_read stays None until then) and
+    on an anton build, or a test double, without ChatSession.memory_read.
+
+    ``learns`` is the turn's memory layout's (BuiltChatSession.learns). A
+    layout that may not learn hands anton two empty scratch tiers, so the turn
+    read nobody's learned memory, whatever anton reports for them.
+    """
+    read = getattr(session, "memory_read", None)
+    if read is None:
+        return None
+    return TurnMemoryRead(read=read.learned and learns, entries=read.entries)
 
 
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
@@ -914,7 +944,7 @@ class AntonHarness:
             skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
 
         try:
-            session, turn_scratch_dir, seed_info = await self._build_chat_session(
+            built = await self._build_chat_session(
                 conversation,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -922,6 +952,7 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
             )
+            session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
                 model_wait.attach(session=session)
             # Length of the seeded history, for an anton without
@@ -957,25 +988,45 @@ class AntonHarness:
                 # what anton seeds the model with, not the figures' events.
                 earlier_answers=await read_earlier_answers(conversation_id=conv_id, scope=_units_scope()),
             )
-            async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
-                # Under context pressure anton summarizes or hard-truncates
-                # history mid-turn, replacing session.history, and says so
-                # with this event.
-                if type(event).__name__ == "StreamContextCompacted":
-                    compacted = True
-                yield event
+            # The turn's record of the learned memory it read goes out once,
+            # with the first event after anton builds the prompt, which it does
+            # before its first model call. A turn that fails or is stopped after
+            # anton builds its prompt carries it too.
+            try:
+                async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
+                    # Under context pressure anton summarizes or hard-truncates
+                    # history mid-turn, replacing session.history, and says so
+                    # with this event.
+                    if type(event).__name__ == "StreamContextCompacted":
+                        compacted = True
+                    yield event
+                    if memory_read is None:
+                        memory_read = _turn_memory_read(session=session, learns=built.learns)
+                        if memory_read is not None:
+                            yield memory_read
+            except (Exception, asyncio.CancelledError):
+                # A turn that fails or is stopped after anton builds its prompt,
+                # before any event after it: the stop usually lands on the first
+                # model call. The yield doesn't absorb the cancel, since the
+                # bare raise sends it on once the consumer asks for the next
+                # event. GeneratorExit isn't caught: a yield during aclose()
+                # raises RuntimeError.
+                if memory_read is None:
+                    memory_read = _turn_memory_read(session=session, learns=built.learns)
+                    if memory_read is not None:
+                        yield memory_read
+                raise
+            # A turn that built its prompt and sent no event after it.
+            if memory_read is None:
+                memory_read = _turn_memory_read(session=session, learns=built.learns)
+                if memory_read is not None:
+                    yield memory_read
             # Turn completed cleanly: capture its tool block-rows. Skipped on
             # cancel/error (this line never runs), so a partial turn falls
             # back to text-only replay and anton's own dangling-tool_use
             # sealing keeps its in-memory history valid. A turn that compacted
             # hands its rows to the formatter and stores none.
             turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
-            # What the turn's prompt held from learned memory, for its record.
-            # Guarded like `history` above: an anton build (or test double)
-            # without ChatSession.memory_read records nothing.
-            read = getattr(session, "memory_read", None)
-            if read is not None:
-                memory_read = TurnMemoryRead(read=read.learned, entries=read.entries)
         finally:
             if model_wait is not None:
                 model_wait.detach()
@@ -1006,8 +1057,6 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
-        if memory_read is not None:
-            yield memory_read
         if turn_history is not None:
             yield turn_history
 
@@ -1204,7 +1253,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
-    ):
+    ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
@@ -1761,7 +1810,12 @@ class AntonHarness:
             # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
             # call under cowork/ as a new, unreviewed execution site.
             session = build_chat_session(config)
-            return session, turn_scratch_dir, seed_info
+            return BuiltChatSession(
+                session=session,
+                turn_scratch_dir=turn_scratch_dir,
+                seed_info=seed_info,
+                learns=memory_layout.learns,
+            )
         except Exception:
             # The turn never starts, so nothing else removes its scratch folder.
             if turn_scratch_dir is not None:
