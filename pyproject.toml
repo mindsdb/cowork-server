@@ -136,6 +136,9 @@ dependencies = [
     "google-re2>=1.1",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
+    # Imported directly by the artifact stats client for the OS trust store;
+    # anton-agent already pulls it in, so the floor matches the locked version.
+    "truststore>=0.10.4",
     "tzlocal>=5.0",
     "uvicorn>=0.47.0",
     # Document export (md/html → pdf/docx). All pure-Python, no native
