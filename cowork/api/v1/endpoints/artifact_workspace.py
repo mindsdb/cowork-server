@@ -71,6 +71,9 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
+# The stats tracking toggle waits only briefly for an in-flight publish:
+# the full publish wait would freeze the switch for a minute.
+_STATS_TRACKING_LOCK_TIMEOUT_S = 5.0
 # Matched against the first path component of a draft request.
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
@@ -567,11 +570,13 @@ async def _sync_live_artifact(
             await key.revoke()
 
 
-async def _acquire_live_publish_lock(folder: Path) -> bool:
+async def _acquire_live_publish_lock(folder: Path, *, timeout_s: float | None = None) -> bool:
     from cowork.services.artifact_locks import acquire
 
+    if timeout_s is None:
+        timeout_s = _LIVE_PUBLISH_TIMEOUT_S
     loop = asyncio.get_running_loop()
-    lock_deadline = loop.time() + _LIVE_PUBLISH_TIMEOUT_S
+    lock_deadline = loop.time() + timeout_s
     while not await run_in_threadpool(
         acquire,
         folder.parent,
