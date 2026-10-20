@@ -19,6 +19,11 @@ from cowork.common.logger import log_context
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.responses import Role
+from cowork.services.connectors.databricks_genie import (
+    GenieConnectionError,
+    is_genie_method,
+    save_genie_connection,
+)
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
@@ -306,6 +311,45 @@ class ProbeHandler:
                     "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
                 })
                 yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
+                return
+
+            # Genie's check is fixed and needs no model, so it runs before the
+            # workspace and LLM client are built.
+            if is_genie_method(connector_id, method):
+                yield _patch_delta({
+                    "form_id": form_id,
+                    "_is_probing": True,
+                    "status_text": "Checking Databricks Genie…",
+                    "form_error": None,
+                })
+                try:
+                    saved = await save_genie_connection(
+                        self.scope, credentials, name,
+                        label=connection_label, user_label=connection_user_label,
+                    )
+                except GenieConnectionError as exc:
+                    yield _delta(f"{exc.message}\n")
+                    yield _patch_delta({
+                        "form_id": form_id,
+                        "status_text": None,
+                        "_is_probing": False,
+                        "form_error": exc.message,
+                        "_is_success": False,
+                    })
+                    yield await _completed(db_conversation_id, {"status": "retry"})
+                    return
+                summary = f"Connected to Databricks Genie on {saved.host}."
+                yield _delta(f"{summary}\n")
+                yield _patch_delta({
+                    "form_id": form_id,
+                    "title": f"Connected — {saved.slug}",
+                    "subtitle": summary,
+                    "status_text": None,
+                    "form_error": None,
+                    "_is_probing": False,
+                    "_is_success": True,
+                })
+                yield await _completed(db_conversation_id, {"status": "success", "user_label": saved.user_label})
                 return
 
             # Probe path: build workspace + LLM client

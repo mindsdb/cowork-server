@@ -46,7 +46,8 @@ USAGE_NOTES_MAX_CHARS = 1600
 #                   connection panel read the TOP-LEVEL `logo_url`, which
 #                   survives. Tidying it would be a no-op, not a fix.
 #   form.engine     (3 specs)
-#   method.name_from (2 specs)
+#   method.name_from (3 specs): read from the raw JSON by identity._spec_name_from,
+#                   so it names the connection even though validation drops it.
 #
 # Do not add to this list to make a new spec pass. It exists to bound
 # pre-existing debt, and a new entry means a key that will be silently ignored.
@@ -74,9 +75,10 @@ KNOWN_KEYS = {
 #
 # `form.logo_url` is deliberately NOT here. It is inert but it is also what 169
 # of 213 specs do, so it is the convention; failing a new connector for
-# following it would be backwards. The other two have no known consumer, so a
-# fourth `form.engine` is almost certainly a mistake worth catching.
-DEAD_KEY_BASELINE = {"form.engine": 3, "method.name_from": 2}
+# following it would be backwards. `form.engine` has no known consumer, so a
+# fourth is almost certainly a mistake worth catching; a new `method.name_from`
+# should be a deliberate choice of the connection's identity fields.
+DEAD_KEY_BASELINE = {"form.engine": 3, "method.name_from": 3}
 
 
 def _count_dead_keys() -> dict[str, int]:

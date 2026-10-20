@@ -15,6 +15,7 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.handlers.probe import ProbeHandler
 from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.databricks_genie import ORG_MODE_REFUSAL, is_genie_method
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
@@ -102,6 +103,11 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Unknown method: {method!r}",
                 )
+
+        if scope.org_mode and is_genie_method(connector_id, method):
+            # The workspace host is checked by suffix only, with no public-address
+            # check, so the shared hosted server does not send requests to it.
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ORG_MODE_REFUSAL)
 
         fields = _resolve_fields(spec, method)
     else:
