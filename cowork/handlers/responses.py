@@ -686,7 +686,8 @@ class ResponsesHandler:
                 **({"response_router_model": route.model} if route.model else {}),
                 **({"response_route_fallback": "true"} if route.fallback else {}),
             }
-            logger.info(
+            logger.log(
+                logging.WARNING if route.fallback else logging.INFO,
                 "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
                 route.route, route.reason, route.fallback, route.provider, route.model,
                 start.conversation_id,
