@@ -136,12 +136,14 @@ async def _cancel_and_wait(task: asyncio.Task | None) -> None:
 async def _end_remote_turns() -> None:
     """End this replica's turns for a shutdown, where turns run remotely.
 
-    Refuses new turns, stops the scheduler's poll loop, then ends every turn
-    in flight: RunRegistry.shutdown writes each remote turn's controller
+    Refuses new turns and cancels the scheduler's poll loop, then ends every
+    turn in flight: RunRegistry.shutdown writes each remote turn's controller
     cancel flag, and the turn's relay saves it as interrupted and writes
-    response.failed to its stream. Then waits for the scheduled runs those
-    turns belonged to, so each run's record lands. TURN_SHUTDOWN_GRACE_SECONDS
-    bounds all of it. Each step does nothing for what an earlier call ended.
+    response.failed to its stream. Only then does it wait for the poll loop,
+    which finishes a database read it was in before it stops, and for the
+    scheduled runs those turns belonged to, so each run's record lands.
+    TURN_SHUTDOWN_GRACE_SECONDS bounds all of it. Each step does nothing for
+    what an earlier call ended.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + TURN_SHUTDOWN_GRACE_SECONDS
@@ -150,10 +152,12 @@ async def _end_remote_turns() -> None:
         return max(0.0, deadline - loop.time())
 
     registry.close()
-    await stop_scheduler(timeout_seconds=remaining())
+    poll_loop = stop_scheduler()
     cancelled = await registry.shutdown(timeout_seconds=remaining())
     if cancelled:
         logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+    if poll_loop is not None:
+        await asyncio.wait([poll_loop], timeout=remaining())
     unfinished = await wait_for_scheduled_runs(timeout_seconds=remaining())
     if unfinished:
         logger.warning("%d scheduled run(s) still recording their outcome at shutdown", unfinished)

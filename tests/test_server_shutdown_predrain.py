@@ -11,6 +11,7 @@ whole sequence in a real process.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 import threading
@@ -225,6 +226,75 @@ async def test_ending_remote_turns_refuses_new_ones_and_lets_their_scheduled_run
         await registry.start(
             conversation_id="d", turn_id=0, open_buffer=None, produce=None,
         )
+
+
+async def test_a_poll_reading_the_database_does_not_hold_up_ending_the_turns(
+    monkeypatch, controller_flags,
+):
+    """SIGTERM lands while the scheduler's poll is reading the database. Its
+    cancel waits for that read (run_db), but the cancel alone already stops it
+    starting a run, so the turns' flags and cancels go first and the read is
+    waited for after."""
+    order: list[str] = []
+    turn_cancelled = asyncio.Event()
+    lifecycle = TurnLifecycle(identity=RunIdentity(remote=True))
+    flag = cancel_flag_key(lifecycle.identity.correlation_id)
+
+    async def poll_loop():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # run_db: the read in its worker thread ends before the cancel
+            # propagates. It ends here once the turn is cancelled, or after
+            # 1 s if the turn waits behind it.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.shield(asyncio.wait_for(turn_cancelled.wait(), timeout=1))
+            order.append("poll read ended")
+            raise
+
+    async def relay():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            order.append(f"turn cancelled, flag set: {bool(await controller_flags.exists(flag))}")
+            turn_cancelled.set()
+            raise
+
+    loop_task = asyncio.create_task(poll_loop())
+    turn = asyncio.create_task(relay())
+    await asyncio.sleep(0)
+    monkeypatch.setattr(scheduler, "_scheduler_task", loop_task)
+    registry._by_cid["c"] = RunHandle(
+        conversation_id="c", turn_id=0, buffer=SimpleNamespace(is_closed=False), task=turn,
+        lifecycle=lifecycle,
+    )
+
+    await server._end_remote_turns()
+
+    assert order == ["turn cancelled, flag set: True", "poll read ended"]
+    assert loop_task.cancelled() and turn.cancelled()
+
+
+async def test_a_remote_shutdown_that_skipped_sigterm_still_ends_its_turns(
+    monkeypatch, quiet_lifespan, controller_flags,
+):
+    """SIGINT, or a SIGTERM handler the server could not chain onto: the
+    lifespan's teardown ends the remote turns itself, flag first."""
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    signal.signal(signal.SIGTERM, lambda signum, frame: None)
+    lifecycle = TurnLifecycle(identity=RunIdentity(remote=True))
+
+    async with server.lifespan(FastAPI()):
+        turn = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+        registry._by_cid["c"] = RunHandle(
+            conversation_id="c", turn_id=0, buffer=SimpleNamespace(is_closed=False), task=turn,
+            lifecycle=lifecycle,
+        )
+
+    assert turn.cancelled()
+    assert lifecycle.shutting_down
+    assert await controller_flags.exists(cancel_flag_key(lifecycle.identity.correlation_id))
 
 
 def test_a_turn_refused_for_shutdown_is_answered_as_a_busy_server():

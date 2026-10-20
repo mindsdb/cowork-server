@@ -568,20 +568,22 @@ def start_scheduler() -> None:
     logger.info("Scheduler background task created")
 
 
-async def stop_scheduler(*, timeout_seconds: float) -> None:
-    """Stop the poll loop, so it starts no more runs. Calling it again does nothing.
+def stop_scheduler() -> asyncio.Task | None:
+    """Cancel the poll loop, so it starts no more runs, without waiting for it.
 
-    Waits at most ``timeout_seconds`` for a poll that is reading the database.
-    The cancel lands either way: run_db re-raises it once that read ends, so
-    the loop never reaches the line that starts a run.
+    A poll reading the database finishes that read first: run_db re-raises
+    the cancel once the read ends, so the loop never reaches the line that
+    starts a run. Returns the cancelled loop for the caller to wait on once
+    it has done what must not wait behind that read, or None when no loop
+    was running, as on a second call.
     """
     global _scheduler_task
     task, _scheduler_task = _scheduler_task, None
     if task is None or task.done():
-        return
+        return None
     task.cancel()
-    await asyncio.wait([task], timeout=timeout_seconds)
     logger.info("Scheduler stopped")
+    return task
 
 
 async def wait_for_scheduled_runs(*, timeout_seconds: float) -> int:

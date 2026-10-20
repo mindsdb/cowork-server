@@ -1,9 +1,9 @@
 """Stopping the scheduler for a shutdown.
 
-With remote turns the server stops the poll loop before it ends the turns in
-flight, so no run starts behind that, and then waits for the runs the loop
-already started, so each one records its turn's outcome and finishes its run
-row before the process exits.
+With remote turns the server cancels the poll loop before it ends the turns
+in flight, so no run starts behind that, and then waits for the loop and for
+the runs it already started, so each one records its turn's outcome and
+finishes its run row before the process exits.
 """
 from __future__ import annotations
 
@@ -56,10 +56,11 @@ async def test_stopping_twice_is_safe_and_the_runs_it_started_are_awaited(one_du
     loop_task = scheduler._scheduler_task
     await _until(lambda: scheduler._scheduled_runs)
 
-    await scheduler.stop_scheduler(timeout_seconds=1)
-    await scheduler.stop_scheduler(timeout_seconds=1)
+    assert scheduler.stop_scheduler() is loop_task
+    assert scheduler.stop_scheduler() is None
+    await asyncio.wait_for(asyncio.gather(loop_task, return_exceptions=True), timeout=2)
 
-    assert loop_task.done() and scheduler._scheduler_task is None
+    assert loop_task.cancelled() and scheduler._scheduler_task is None
     polled = len(polls)
     await asyncio.sleep(0.05)
     assert len(polls) == polled, "the loop polled after it was stopped"
@@ -74,5 +75,5 @@ async def test_stopping_twice_is_safe_and_the_runs_it_started_are_awaited(one_du
 
 async def test_stopping_a_scheduler_that_never_started_does_nothing():
     assert scheduler._scheduler_task is None
-    await scheduler.stop_scheduler(timeout_seconds=1)
+    assert scheduler.stop_scheduler() is None
     assert await scheduler.wait_for_scheduled_runs(timeout_seconds=1) == 0
