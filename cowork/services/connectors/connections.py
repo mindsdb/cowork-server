@@ -115,11 +115,12 @@ class ConnectionsService:
         fields: dict = dict(record.get("fields") or {})
         # Mask secrets. Prefer the record's explicit secure_keys; fall back to the
         # name heuristic so records saved before secure_keys was persisted don't
-        # leak their secret values through this endpoint.
+        # leak their secret values through this endpoint. A `_` name hides a
+        # field from the agent's environment, not from this mask.
         secure_keys = record.get("secure_keys")
         masked_keys: list[str] = []
         for key in list(fields):
-            if not key.startswith("_") and is_secret_key(key, secure_keys):
+            if is_secret_key(key, secure_keys):
                 fields[key] = _SENTINEL
                 masked_keys.append(key)
 
@@ -130,8 +131,8 @@ class ConnectionsService:
         # the old code echoed `_label`. `fields` is echoed back to the
         # frontend as the raw credential-field map (masked secrets aside);
         # `_user_label`/`_label` are bookkeeping, not credentials, and the
-        # mask loop above skips `_`-prefixed keys entirely (only
-        # `_connector_id`/`_method` are popped today) — leaving them in would
+        # mask loop above leaves them unmasked (only `_connector_id`/`_method`
+        # are popped today) — leaving them in would
         # ship two internal keys to the client as if they were unknown form
         # fields, and if the edit form ever echoed them back unchanged on
         # save, `persist_connection` would pop `user_label` from `credentials`
