@@ -120,10 +120,8 @@ def fake_redis():
             super().setup()
             self.writer = Resp2Writer(self.client_address, self.wfile, self)
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    server = TcpFakeServer(("127.0.0.1", port), server_type="redis")
+    server = TcpFakeServer(("127.0.0.1", 0), server_type="redis")
+    port = server.server_address[1]
     server.RequestHandlerClass = Resp2Handler
     # A connection the exited server left in a blocking XREAD holds its
     # handler thread until the block times out; don't wait for it.
@@ -246,6 +244,9 @@ def test_sigterm_ends_an_open_remote_answer_on_its_stream_and_stops_its_controll
     replies with the partial answer, then nothing) and the auth service's
     turn key and connection list. The registry, relay, Redis job, reply and
     turn streams, save and lifespan are the real ones, on a fakeredis server.
+    It runs in local tenancy with no principal, where hosted runs org
+    tenancy; the relay, its cancel branch and the save are the same code in
+    both.
     """
     from cowork.turnqueue.redis_client import cancel_flag_key
 
