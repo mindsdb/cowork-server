@@ -108,6 +108,18 @@ def test_tls_verification_follows_the_anton_setting(monkeypatch):
     assert isinstance(stats._tls_verify(), ssl.SSLContext)
 
 
+@pytest.mark.parametrize("value", ["", "  ", "TRUE", "1", "yes", "maybe"])
+def test_tls_verification_stays_on_unless_explicitly_off(monkeypatch, value):
+    monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", value)
+    assert isinstance(stats._tls_verify(), ssl.SSLContext)
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no", "off", " OFF "])
+def test_tls_verification_turns_off_only_for_off_values(monkeypatch, value):
+    monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", value)
+    assert stats._tls_verify() is False
+
+
 # -- response mapping ---------------------------------------------------------
 
 

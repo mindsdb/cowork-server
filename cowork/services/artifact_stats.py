@@ -71,8 +71,13 @@ class StatsTemporarilyUnavailable(StatsError):
 STATS_ROUTE_ERRORS = (StatsError, FileNotFoundError, ValueError, RuntimeError)
 
 
+_TLS_OFF_VALUES = frozenset({"false", "0", "no", "off"})
+
+
 def _tls_verify() -> ssl.SSLContext | bool:
-    if os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() != "true":
+    # Only an explicit "off" value disables verification: an empty or unknown
+    # value must not drop TLS checks on a request that carries the publish key.
+    if os.environ.get("ANTON_MINDS_SSL_VERIFY", "").strip().lower() in _TLS_OFF_VALUES:
         return False
     # The OS trust store, as anton's publisher uses: a TLS-inspecting proxy's
     # root CA is trusted there and not in certifi.
