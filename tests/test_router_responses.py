@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from unittest.mock import AsyncMock
 
 import httpx
 import openai
@@ -300,3 +301,170 @@ async def test_history_summary_uses_the_router_responses_transport_without_tools
 
     endpoint.request_body(tools=False, streaming=False)
     assert response.content == "Earlier discussion."
+
+
+class _ChatStream(_Stream):
+    async def __aiter__(self):
+        for event in self.events:
+            yield f"data: {json.dumps(event)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+
+def _probe_output(api, *, delegate=False):
+    if api == "chat_completions":
+        delta = {"content": "Hello!"}
+        if delegate:
+            delta = {"tool_calls": [{
+                "index": 0, "id": "call_probe", "type": "function",
+                "function": {"name": "delegate", "arguments": '{"reason":"Needs tools"}'},
+            }]}
+        return _ChatStream({
+            "id": "chat_probe", "object": "chat.completion.chunk", "created": 0,
+            "model": MODEL, "choices": [{
+                "index": 0, "delta": delta, "finish_reason": "tool_calls" if delegate else "stop",
+            }],
+        })
+    if not delegate:
+        return _Stream(_text("Hello!"), _done())
+    return _Stream(
+        {
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_probe", "call_id": "call_probe",
+                     "name": "delegate", "arguments": "", "status": "in_progress"},
+        },
+        {
+            "type": "response.function_call_arguments.done", "output_index": 0,
+            "item_id": "fc_probe", "arguments": '{"reason":"Needs tools"}',
+        },
+        _done(),
+    )
+
+
+def _configure_startup_probe(endpoint, monkeypatch, *, effort):
+    from cowork.services import router_probe
+
+    endpoint.configure(effort)
+    monkeypatch.setattr(router_probe, "run_db", AsyncMock(return_value=routing.get_user_settings()))
+    return router_probe
+
+
+@pytest.mark.parametrize("api,effort,delegate", [
+    ("responses", "low", False), ("responses", None, True),
+    ("chat_completions", "none", False), ("chat_completions", "low", True),
+])
+async def test_startup_probe_uses_real_configured_router(
+    endpoint, monkeypatch, openai_compatible_api, caplog, api, effort, delegate,
+):
+    probe = _configure_startup_probe(endpoint, monkeypatch, effort=effort)
+    openai_compatible_api(api)
+    endpoint.stream = _probe_output(api, delegate=delegate)
+    with caplog.at_level(logging.INFO, logger=probe.__name__):
+        await probe.run_router_startup_probe()
+
+    (request,) = endpoint.requests
+    body = json.loads(request.content)
+    assert body["model"] == MODEL
+    assert body["stream"] is True
+    assert "tool_choice" not in body
+    assert "store" not in body  # The probe retains the adapter's existing retention policy.
+    if api == "responses":
+        endpoint.request_body(effort)
+        assert body["instructions"] == routing.with_deployment_identity(routing._SYSTEM_PROMPT)
+        assert body["input"] == [{"role": "user", "content": "Hello", "type": "message"}]
+        assert body["max_output_tokens"] == routing._DIRECT_MAX_TOKENS
+    else:
+        assert request.url.path == "/v1/chat/completions"
+        assert body.get("reasoning_effort") == effort
+        assert body["messages"] == [
+            {"role": "system", "content": routing.with_deployment_identity(routing._SYSTEM_PROMPT)},
+            {"role": "user", "content": "Hello"},
+        ]
+        assert body["tools"][0]["function"]["name"] == "delegate"
+        assert body["max_completion_tokens"] == routing._DIRECT_MAX_TOKENS
+    assert any(
+        r.name == probe.__name__ and r.levelno == logging.INFO and "outcome=passed" in r.getMessage()
+        for r in caplog.records
+    )
+    assert endpoint.stream.closed
+    assert all(client.is_closed for client in endpoint.clients)
+
+
+@pytest.mark.parametrize("api", ["responses", "chat_completions"])
+async def test_startup_refused_effort_does_not_substitute(endpoint, monkeypatch, openai_compatible_api, caplog, api):
+    probe = _configure_startup_probe(endpoint, monkeypatch, effort="none")
+    openai_compatible_api(api)
+    private = "private-provider-refusal"
+    endpoint.status = 400
+    endpoint.json_body = {"error": {
+        "message": private, "type": "invalid_request_error",
+        "param": "reasoning.effort" if api == "responses" else "reasoning_effort",
+        "code": "unsupported_value",
+    }}
+    await probe.run_router_startup_probe()
+
+    (request,) = endpoint.requests
+    body = json.loads(request.content)
+    assert (body["reasoning"]["effort"] if api == "responses" else body["reasoning_effort"]) == "none"
+    records = [r for r in caplog.records if r.name == probe.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "outcome=unverified reason=provider_refused" in records[0].getMessage()
+    assert private not in repr([r.__dict__ for r in caplog.records])
+    assert all(client.is_closed for client in endpoint.clients)
+
+
+@pytest.mark.parametrize("kind", ["incomplete", "failed", "missing_terminal", "empty", "malformed_tool"])
+async def test_startup_responses_does_not_pass_an_unfinished_or_invalid_response(endpoint, monkeypatch, caplog, kind):
+    probe = _configure_startup_probe(endpoint, monkeypatch, effort="low")
+    if kind == "incomplete":
+        endpoint.stream = _Stream(_text("Partial"), {
+            "type": "response.incomplete",
+            "response": _response("incomplete", incomplete_details={"reason": "max_output_tokens"}),
+        })
+    elif kind == "failed":
+        endpoint.stream = _Stream(_text("Partial"), {
+            "type": "response.failed",
+            "response": _response("failed", error={"code": "server_error", "message": "private-failure"}),
+        })
+    elif kind == "missing_terminal":
+        endpoint.stream = _Stream(_text("Partial"))
+    elif kind == "empty":
+        endpoint.stream = _Stream(_done())
+    else:
+        endpoint.stream = _probe_output("responses", delegate=True)
+        endpoint.stream.events[1]["arguments"] = '{"reason":"cut'
+    await probe.run_router_startup_probe()
+
+    records = [r for r in caplog.records if r.name == probe.__name__]
+    assert len(records) == 1
+    assert "outcome=unverified" in records[0].getMessage()
+    assert records[0].levelno == logging.WARNING
+    assert "private-failure" not in repr([r.__dict__ for r in caplog.records])
+    assert endpoint.stream.closed
+    assert all(client.is_closed for client in endpoint.clients)
+
+
+async def test_startup_does_not_probe_coding_when_router_construction_fails(endpoint, monkeypatch, caplog):
+    from cowork.services import router_probe
+
+    settings = UserSettings(
+        _env_file=None,
+        planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+        router_provider=Provider.OPENAI_COMPATIBLE,
+        planning_model=MODEL, coding_model=MODEL, router_model=MODEL,
+        openai_api_key=SecretStr("test-direct-key"),
+        openai_compatible_api_key=SecretStr("test-router-key"),
+        openai_base_url="",
+    )
+    assert settings.resolved_router_provider is Provider.OPENAI_COMPATIBLE
+    monkeypatch.setattr(router_probe, "run_db", AsyncMock(return_value=settings))
+    with caplog.at_level(logging.INFO, logger=router_probe.__name__):
+        await router_probe.run_router_startup_probe()
+
+    assert endpoint.requests == []
+    assert endpoint.clients  # Planning and coding clients still need cleanup.
+    assert all(client.is_closed for client in endpoint.clients)
+    records = [r for r in caplog.records if r.name == router_probe.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "outcome=unverified reason=configuration_unavailable" in records[0].getMessage()

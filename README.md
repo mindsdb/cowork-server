@@ -1026,6 +1026,10 @@ Environment variables fall into these groups:
 
 A failed router check delegates to the agent and logs `[responses] route=delegated_agentic reason=... fallback=True` at WARNING. The line includes the provider, model and conversation when available, without a prompt or provider response body. It also covers failures before the check starts, such as a missing model or unavailable history. Intentional delegation logs `fallback=False` at INFO. The gate keeps its two-second first-event, five-second idle and ten-second total budgets; selecting Responses does not make a slow model meet them. Provider failures also log the exception class and HTTP status when available, without the provider's text.
 
+With `COWORK_DEPLOYMENT_KIND=self-hosted`, local tenancy and local turns, each server process also starts one background router probe after loading its configuration. It sends a synthetic greeting with the gate's function tool through the effective router model, API and effort, with a 30-second response deadline and separate two-second cleanup waits (up to eight seconds in all). It executes no tool and creates no Cowork conversation. The call can consume provider tokens; the normal transport's retries and provider retention settings still apply.
+
+Look for `[router-startup-probe]` in the server log. A pass is INFO; an unverified configuration is WARNING with a reason and HTTP status when available, without provider bodies, credentials or exception text. A refused request, timeout, empty response or incomplete stream never prevents startup. A pass confirms only this synthetic request, not the gate's latency budget or model quality, and the result may arrive after the first user request. Restart after changing the router configuration to recheck it. Desktop and organization tenancy do not run this probe, and health checks do not call a model.
+
 **Database pool**: these read their bare names, with no `DATABASE_` prefix. A SQLite engine is built without them and waits SQLAlchemy's 30 s for a connection outside a database unit; its database units run one at a time, and `POOL_TIMEOUT` still bounds a unit's waits.
 
 | Variable | Default | Description |
