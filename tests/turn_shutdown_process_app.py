@@ -10,10 +10,12 @@ import asyncio
 import importlib
 import os
 import pkgutil
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.responses import StreamingResponse
+from fastapi import Request
 from sqlmodel import SQLModel
 
 import cowork.handlers.responses as responses
@@ -26,6 +28,8 @@ from cowork.models.project import Project
 from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming.cancellation import cancel_disconnected_run
+from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 
 
 def _seed_schema() -> None:
@@ -82,7 +86,7 @@ async def ready():
 
 
 @app.get("/__shutdown_test/start")
-async def start():
+async def start(request: Request, cancel_on_disconnect: bool = False):
     session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
     try:
         conversation = ConversationService(session).create_conversation(
@@ -91,14 +95,14 @@ async def start():
         conversation_id = conversation.id
     finally:
         session.close()
-    buffer = new_buffer(str(conversation_id), 0)
     lifecycle = TurnLifecycle()
     handler = object.__new__(responses.ResponsesHandler)
     handler.principal = None  # local, single-process deployment
-    await registry.start(
-        conversation_id=str(conversation_id), turn_id=0, buffer=buffer,
+    handle = await registry.start(
+        conversation_id=str(conversation_id), turn_id=0,
+        open_buffer=partial(new_buffer, str(conversation_id), 0),
         lifecycle=lifecycle,
-        producer_coro=handler._run_turn(
+        produce=lambda buffer: handler._run_turn(
             conv_id=conversation_id, harness_input=[], original_content="hello",
             model="anton", disabled=None, harness_name="anton", harness_id="anton",
             buffer=buffer, lifecycle=lifecycle,
@@ -106,11 +110,17 @@ async def start():
     )
 
     async def tail():
-        async for record in buffer.tail():
+        async for record in handle.buffer.tail():
             if record.type == "sse":
                 yield record.data["sse"]
 
-    return StreamingResponse(
+    response_type = DisconnectStreamingResponse if cancel_on_disconnect else StreamingResponse
+    kwargs = {
+        "watch": DisconnectWatch(request.receive),
+        "on_disconnect": lambda: cancel_disconnected_run(handle),
+    } if cancel_on_disconnect else {}
+    return response_type(
         tail(), media_type="text/event-stream",
+        **kwargs,
         headers={"X-Test-Conversation-Id": str(conversation_id)},
     )

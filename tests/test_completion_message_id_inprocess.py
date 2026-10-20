@@ -30,7 +30,7 @@ def _handler_with_formatter(turn_formatter) -> ResponsesHandler:
 
     async def _stream_response(*, conversation, input, model=None, reasoning_effort=None,
                                 disabled_connections=None, trace_tags=None, trace_metadata=None,
-                                tool_messages=False):
+                                tool_messages=False, model_wait=None):
         if False:
             yield
 
@@ -58,7 +58,6 @@ async def _run(handler, *, assistant_message_id, user_message_id=None) -> _Buffe
     buffer = _Buffer()
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -150,7 +149,6 @@ async def test_run_turn_ignores_a_delta_frame_whose_text_quotes_a_frame_type_nam
     buffer = _Buffer()
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -199,7 +197,6 @@ async def _run_direct(*, assistant_message_id, route_text="ok", user_message_id=
     route = RouteDecision(route="direct_context", text=route_text, model="anton", reason="test")
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
     ):
         conv_svc.return_value.save_user_message.return_value = SimpleNamespace(
@@ -212,6 +209,7 @@ async def _run_direct(*, assistant_message_id, route_text="ok", user_message_id=
             lifecycle=TurnLifecycle(),
             conv_id=uuid4(),
             original_content="hi",
+            question="hi",
             route=route,
             buffer=buffer,
         )
@@ -245,6 +243,7 @@ async def test_produce_direct_completed_frame_omits_the_id_when_nothing_persiste
 # building the full probe harness.
 
 async def _run_probe_expired_submission(*, conversation_id, assistant_message_id):
+    from cowork.db.scoped import LOCAL_SCOPE
     from cowork.handlers.probe import ProbeHandler
 
     with (
@@ -258,7 +257,7 @@ async def _run_probe_expired_submission(*, conversation_id, assistant_message_id
         conv_svc.return_value.save_assistant_turn.return_value = (
             SimpleNamespace(id=assistant_message_id) if assistant_message_id else None
         )
-        handler = ProbeHandler(session=MagicMock())
+        handler = ProbeHandler(scope=LOCAL_SCOPE)
         frames = [chunk async for chunk in handler.run(
             submission_id="sub-1", connector_id="postgres", method=None,
             name="my-db", conversation_id=str(conversation_id),
@@ -359,3 +358,59 @@ def test_turn_anchor_falls_back_to_the_user_row_when_nothing_was_persisted():
 
     user_id = uuid4()
     assert _turn_anchor_id(SimpleNamespace(id=user_id), None) == user_id
+
+
+async def _collect_answer(*items):
+    """`_collect` over a turn whose stream yields `items`, through the real
+    formatter, with the conversation's saves faked."""
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+    handler = _handler_with_formatter(format_responses_stream)
+    handler.scope = LOCAL_SCOPE
+
+    async def stream():
+        for item in items:
+            yield item
+
+    with patch("cowork.handlers.responses.ConversationService") as conv_svc:
+        conv_svc.return_value.save_user_message.return_value = SimpleNamespace(id=uuid4())
+        conv_svc.return_value.save_assistant_turn.return_value = SimpleNamespace(id=uuid4())
+        return await handler._collect(stream(), uuid4(), "anton", "How many at S1?")
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_answer_returns_its_figure_sources():
+    from anton.core.llm.provider import StreamTextDelta, StreamToolResult, StreamToolUseDelta, StreamToolUseEnd, StreamToolUseStart
+
+    from cowork.harnesses.anton_harness.stream_formatter import TurnContext
+
+    code = "print(open('stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    response = await _collect_answer(
+        TurnContext(question="How many at S1?"),
+        StreamToolUseStart(id="t1", name="scratchpad"),
+        StreamToolUseDelta(id="t1", json_delta=json.dumps({"action": "exec", "code": code})),
+        StreamToolUseEnd(id="t1"),
+        StreamToolResult(name="scratchpad", content=json.dumps(cell), action="exec", id="t1"),
+        StreamTextDelta(text="S1 holds 250 units."),
+    )
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert [(f["text"], f["sources"]) for f in output["figure_sources"]["figures"]] == [
+        ("250", [{"tool_use_id": "t1", "page": None}]),
+    ]
+    assert [step["label"] for step in output["figure_sources"]["steps"]] == ["stock.csv"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_answer_without_figures_has_no_figure_sources_field():
+    from anton.core.llm.provider import StreamTextDelta
+
+    from cowork.harnesses.anton_harness.stream_formatter import TurnContext
+
+    response = await _collect_answer(TurnContext(question="Hello"), StreamTextDelta(text="Hi there."))
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert "figure_sources" not in output

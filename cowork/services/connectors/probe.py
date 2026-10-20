@@ -14,16 +14,19 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
-from anton.core.datasources.data_vault import LocalDataVault
+from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
 
 if TYPE_CHECKING:
+    from anton.core.backends.sandbox import CellSandbox
+
     from cowork.services.providers import WebToolKwargs
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,81 @@ PROBE_HARNESS = "anton"
 PROBE_TRACE_TAG = "connector-probe"
 
 
+#: The connection name the candidate credentials carry in a sandboxed probe's
+#: vault (CandidateCredentialsVault).
+PROBE_CONNECTION_NAME = "probe"
+
+
+def _credential_env(credentials: Mapping[str, Any]) -> dict[str, str]:
+    """The candidate credentials as the pad's ``DS_<KEY>`` variables."""
+    return {
+        f"DS_{str(key).upper()}": str(value)
+        for key, value in (credentials or {}).items()
+        if key
+    }
+
+
+@dataclass(frozen=True)
+class CandidateCredentialsVault:
+    """The data vault of a probe under the code sandbox: the candidate
+    credentials as its one connection, held in memory.
+
+    anton's ScratchpadManager derives the pad's DS_* from ``env_for`` and
+    hands them to the launcher's environment, so no plaintext file is written
+    for them. It stores nothing, so nothing on disk can add a connection to it.
+
+    Two prompts name those variables. The probe's own names the flat
+    ``DS_<KEY>`` ones (_credential_env). anton's datasource listing in the
+    system prompt names the namespaced ``DS_<ENGINE>_PROBE__<KEY>`` ones it
+    derives from ``read_record``'s fields, and says credentials are
+    namespaced. So the pad gets both, and ``read_record`` gives the field
+    names with empty values: every name either prompt gives is set in the
+    pad, and no value reaches a prompt. ``load`` answers None.
+    """
+
+    engine: str
+    credentials: Mapping[str, Any]
+
+    def _is_candidate(self, engine: str, name: str) -> bool:
+        return (engine, name) == (self.engine, PROBE_CONNECTION_NAME)
+
+    def list_connections(self) -> list[dict[str, str]]:
+        return [{"engine": self.engine, "name": PROBE_CONNECTION_NAME, "created_at": ""}]
+
+    def env_for(self, engine: str, name: str, *, flat: bool = False) -> dict[str, str] | None:
+        if not self._is_candidate(engine, name):
+            return None
+        env = _credential_env(self.credentials)
+        if flat:
+            return env
+        prefix = _slug_env_prefix(engine, name)
+        return {
+            **env,
+            **{f"{prefix}__{str(key).upper()}": str(value) for key, value in self.credentials.items() if key},
+        }
+
+    def load(self, engine: str, name: str) -> dict[str, str] | None:
+        return None
+
+    def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
+        if not self._is_candidate(engine, name):
+            return None
+        keys = [str(key) for key in self.credentials if key]
+        return {"fields": dict.fromkeys(keys, ""), "secure_keys": keys}
+
+    def save(self, engine: str, name: str, credentials: dict[str, str], *, secure_keys: list[str] | None = None) -> object:
+        raise NotImplementedError("a probe's candidate credentials are never saved from the probe")
+
+    def delete(self, engine: str, name: str) -> bool:
+        return False
+
+    def inject_env(self, engine: str, name: str, *, flat: bool = False) -> list[str] | None:
+        raise NotImplementedError("a probe's candidate credentials never enter the server's environment")
+
+    def clear_ds_env(self) -> None:
+        """Nothing to clear: this vault never writes the server's environment."""
+
+
 @dataclass
 class ProbeOutcome:
     status: str = "unresolved"   # success | failure | needs_input | unresolved
@@ -89,7 +167,9 @@ class CredentialProbe:
         form_spec: dict | None = None,
         skipped: list[str] | None = None,
         timeout_seconds: float = 90.0,
+        usage_notes: str | None = None,
         web_tool_kwargs: WebToolKwargs | None = None,
+        cell_sandbox: CellSandbox | None = None,
     ) -> None:
         self.engine = engine
         self.credentials = credentials
@@ -98,9 +178,16 @@ class CredentialProbe:
         self.form_spec = form_spec or {}
         self.skipped = list(skipped or [])
         self.timeout_seconds = timeout_seconds
+        # The prober makes the first real API call, so it needs the same API
+        # traps the chat agent is told about.
+        self.usage_notes = (usage_notes or "").strip()
         # The caller captures this alongside llm_client. Never re-read settings
         # here: the provider may have changed since the client was constructed.
         self.web_tool_kwargs: WebToolKwargs = {**(web_tool_kwargs or {})}
+        # The policy its cells run under (cowork.code_sandbox), None with the
+        # sandbox off. Set, the credentials reach the cell as its DS_* through
+        # CandidateCredentialsVault instead of a plaintext file.
+        self.cell_sandbox = cell_sandbox
         self._outcome = ProbeOutcome()
         self._pending: list[tuple[str, Any]] = []
 
@@ -212,15 +299,12 @@ class CredentialProbe:
         return self._summarize_field_list(fields, filled_names, skipped_set)
 
     def _write_credentials_env(self) -> tuple[str, list[str]]:
-        var_names: list[str] = []
+        env = _credential_env(self.credentials)
+        var_names = list(env)
         lines: list[str] = []
-        for key, value in (self.credentials or {}).items():
-            if not key:
-                continue
-            var = f"DS_{str(key).upper()}"
-            var_names.append(var)
+        for var, value in env.items():
             escaped = (
-                str(value)
+                value
                 .replace("\\", "\\\\")
                 .replace('"', '\\"')
                 .replace("\n", "\\n")
@@ -240,7 +324,22 @@ class CredentialProbe:
         os.chmod(path, 0o600)
         return str(path), var_names
 
-    def _build_prompt(self, env_path: str, var_names: list[str]) -> str:
+    @staticmethod
+    def _remove_credentials_env(env_path: str | None) -> None:
+        """Delete the plaintext credentials file, when the probe wrote one."""
+        if env_path is None:
+            return
+        try:
+            os.unlink(env_path)
+        except Exception:
+            # Silently swallowing this would leave a plaintext credentials
+            # file sitting on disk with nothing in the logs to explain why
+            # cleanup never ran. Warn (not debug) so an operator sees it.
+            logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
+
+    def _build_prompt(self, env_path: str | None, var_names: list[str]) -> str:
+        """The probe's prompt. ``env_path`` is the credentials file the cell
+        parses, or None when they are already in the cell's environment."""
         filled_names = {v.replace("DS_", "", 1).lower() for v in var_names}
         field_names_lower = set()
         for f in (self.form_spec or {}).get("fields") or []:
@@ -266,12 +365,15 @@ class CredentialProbe:
             "if there's no usable info, request_extra_field with the "
             "minimum needed.\n"
         )
+        quirks = (
+            f"——— KNOWN API QUIRKS ———\n{self.usage_notes}\n\n"
+            if self.usage_notes else ""
+        )
         return (
             f"You are a connection prober for `{self.engine}`. Your only job is "
             f"to determine if the credentials we just collected actually "
             f"work, and report back via your tools.\n\n"
-            f"The user-submitted credentials are in a temporary `.env` file:\n"
-            f"  Path: `{env_path}`\n"
+            f"{self._credentials_location(env_path)}"
             f"  Variable names: {', '.join(var_names) or '(none)'}\n"
             f"{method_hint}\n"
             f"——— CURRENT FORM ROSTER ———\n"
@@ -283,9 +385,10 @@ class CredentialProbe:
             f"remove_field, request_extra_field) take a `method_id` "
             f"parameter — pass the method whose fields you're touching.\n\n"
             f"{roster}\n\n"
+            f"{quirks}"
             f"——— STEPS (follow in order) ———\n"
             f"1. Call `set_status` with a short message like \"Loading credentials…\".\n"
-            f"2. In the scratchpad, parse the .env file (e.g. `dotenv_values('{env_path}')`). "
+            f"2. {self._credentials_step(env_path)} "
             f"NEVER print the values. NEVER echo them back in any tool input.\n"
             f"3. Call `set_status` with \"Installing <pkg>…\" if you need a client library, "
             f"then install it via the scratchpad's `packages` array.\n"
@@ -314,6 +417,21 @@ class CredentialProbe:
             f"• Don't ask follow-up questions in prose — use `request_extra_field`.\n"
         )
 
+    @staticmethod
+    def _credentials_location(env_path: str | None) -> str:
+        if env_path is None:
+            return "The user-submitted credentials are in the scratchpad's environment:\n"
+        return (
+            f"The user-submitted credentials are in a temporary `.env` file:\n"
+            f"  Path: `{env_path}`\n"
+        )
+
+    @staticmethod
+    def _credentials_step(env_path: str | None) -> str:
+        if env_path is None:
+            return "In the scratchpad, read them from `os.environ` by the variable names above."
+        return f"In the scratchpad, parse the .env file (e.g. `dotenv_values('{env_path}')`)."
+
     # ── Main entry point ─────────────────────────────────────────────
 
     async def run(self) -> AsyncIterator[tuple[str, Any]]:
@@ -324,7 +442,21 @@ class CredentialProbe:
         )
         from anton.core.tools.tool_defs import ToolDef
 
-        env_path, var_names = self._write_credentials_env()
+        if self.cell_sandbox is None:
+            env_path, var_names = self._write_credentials_env()
+            # An empty vault, so the manager derives an empty DS_* set and the
+            # runtime strips the inherited ones: the probe tests the candidate
+            # credentials it writes to its own env file, and must not be able
+            # to read a saved connection's.
+            data_vault = LocalDataVault(_probe_tmp_dir() / "empty-vault")
+        else:
+            # The candidate credentials are the pad's only DS_*, and the
+            # launcher's environment carries them: no file in cowork-home's
+            # tmp/, which the sandbox denies, and no shared folder a stray
+            # connection file could join.
+            env_path = None
+            var_names = list(_credential_env(self.credentials))
+            data_vault = CandidateCredentialsVault(engine=self.engine, credentials=self.credentials)
 
         SET_STATUS_TOOL = ToolDef(
             name="set_status",
@@ -446,11 +578,7 @@ class CredentialProbe:
 
         config = ChatSessionConfig(
             llm_client=self.llm_client,
-            # An empty vault, so the manager derives an empty DS_* set and the
-            # runtime strips the inherited ones: the probe tests the candidate
-            # credentials it writes to its own env file, and must not be able
-            # to read a saved connection's.
-            data_vault=LocalDataVault(_probe_tmp_dir() / "empty-vault"),
+            data_vault=data_vault,
             # WHICH agent ran: anton, same as a UI turn — the probe is anton
             # doing a job, not a different agent (ENG-1694's definition of
             # `harness` as agent identity). Without this the probe's traces
@@ -488,6 +616,9 @@ class CredentialProbe:
             # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning
             # on the Responses API.
             **self.web_tool_kwargs,
+            # Passed directly, as the turn passes it: a dropped policy would
+            # run the probe's cells unlocked.
+            **({"cell_sandbox": self.cell_sandbox} if self.cell_sandbox is not None else {}),
         )
 
         try:
@@ -504,13 +635,7 @@ class CredentialProbe:
             logger.exception("Could not build probe session")
             self._outcome.status = "failure"
             self._outcome.error = f"Could not start probe: {exc}"
-            try:
-                os.unlink(env_path)
-            except Exception:
-                # Silently swallowing this would leave a plaintext credentials
-                # file sitting on disk with nothing in the logs to explain why
-                # cleanup never ran. Warn (not debug) so an operator sees it.
-                logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
+            self._remove_credentials_env(env_path)
             yield ("verdict", self._outcome)
             return
 
@@ -597,13 +722,7 @@ class CredentialProbe:
             self._outcome.status = "failure"
             self._outcome.error = f"Probe crashed: {exc}"
         finally:
-            try:
-                os.unlink(env_path)
-            except Exception:
-                # Same reasoning as the other unlink above: a leftover
-                # plaintext credentials file is worth an operator's attention,
-                # not a debug line nobody has turned on.
-                logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
+            self._remove_credentials_env(env_path)
             # The cells the prompt asks for run in a scratchpad process, and
             # no later turn reuses it.
             close_session_scratchpads(probe_session, owner="connector probe")
