@@ -3,7 +3,6 @@ but built separately, since sharing it would move ~20 tests' patch targets."""
 from __future__ import annotations
 
 import asyncio
-import logging
 from uuid import UUID
 
 from cowork.db.scoped import ScopedSession
@@ -11,11 +10,9 @@ from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import read_earlier_answers
-from cowork.streaming.cancellation import request_cancel
+from cowork.streaming.cancellation import stop_controller_turn
 from cowork.turnqueue import producer
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
-
-logger = logging.getLogger(__name__)
 
 
 class RemoteTurnFailed(Exception):
@@ -141,7 +138,7 @@ async def remote_turn_events(
     except (asyncio.CancelledError, GeneratorExit):
         # Both terminals leave this block (break, raise), so the controller is
         # still running the turn here.
-        await _stop_controller_turn(correlation_id)
+        await stop_controller_turn(correlation_id, turn_label=f"channel turn {correlation_id}")
         raise
     finally:
         if artifacts is not None and artifact_writes_allowed:
@@ -162,15 +159,3 @@ async def remote_turn_events(
             project_name=artifacts[3],
         ):
             yield ArtifactCreated(card)
-
-
-async def _stop_controller_turn(correlation_id: str) -> None:
-    """Write the controller's cancel flag. A failure is logged, never raised:
-    the caller is already unwinding."""
-    try:
-        await request_cancel(correlation_id)
-    except Exception:
-        logger.warning(
-            "Could not ask scratchpad-controller to stop channel turn %s; the sandbox turn "
-            "may run on.", correlation_id, exc_info=True,
-        )

@@ -60,6 +60,23 @@ async def cancel_disconnected_run(handle: RunHandle | None) -> None:
         logger.exception("Could not cancel disconnected run %s", handle.run_id)
 
 
+async def stop_controller_turn(correlation_id: str, *, turn_label: str) -> None:
+    """Write scratchpad-controller's cancel flag for a turn this server is
+    ending without its user's Stop, so the sandbox turn stops too.
+
+    A failure is logged as a WARNING naming ``turn_label``, never raised: the
+    caller is already ending the turn, and the cancel it is unwinding must
+    not turn into a Redis error.
+    """
+    try:
+        await request_cancel(correlation_id)
+    except Exception:
+        logger.warning(
+            "Could not ask scratchpad-controller to stop %s; the sandbox turn may run on.",
+            turn_label, exc_info=True,
+        )
+
+
 async def watch_cancel(task: asyncio.Task, buffer: StreamBuffer, lifecycle: TurnLifecycle) -> None:
     """Let any replica cancel a direct/in-process producer using the worker flag protocol.
 

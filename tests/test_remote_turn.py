@@ -560,3 +560,44 @@ async def test_a_channel_turn_that_reached_its_terminal_writes_no_cancel_flag(
     ))
 
     assert await controller_flags.keys("*") == []
+
+
+async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_written(monkeypatch, caplog):
+    """Redis down at shutdown: the controller cannot be told, which is logged,
+    and the channel task still ends cancelled rather than with the Redis
+    error, which drain_background_tasks would get in place of the cancel."""
+    import logging
+
+    from cowork.streaming import cancellation
+
+    def unreachable():
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(cancellation, "get_redis", unreachable)
+    # The migration tests' alembic env calls fileConfig, which disables every
+    # logger that existed before it for the rest of the session.
+    monkeypatch.setattr(cancellation.logger, "disabled", False)
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, started = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    turn = asyncio.create_task(_drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    )))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    with caplog.at_level(logging.WARNING, logger=cancellation.logger.name):
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    records = [
+        r for r in caplog.records
+        if r.name == cancellation.logger.name and r.levelno == logging.WARNING
+    ]
+    assert [r.getMessage() for r in records] == [
+        f"Could not ask scratchpad-controller to stop channel turn {sent[0]['correlation_id']}; "
+        "the sandbox turn may run on."
+    ]
+    assert isinstance(records[0].exc_info[1], ConnectionError)

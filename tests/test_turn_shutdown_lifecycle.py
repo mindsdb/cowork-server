@@ -337,19 +337,22 @@ async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, ca
         assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
 
 
-@pytest.fixture
-def registry_log(monkeypatch, caplog):
-    """The registry's WARNING records. Its logger is turned back on first:
-    the migration tests' alembic env calls fileConfig, which disables every
-    logger that existed before it for the rest of the session."""
-    monkeypatch.setattr(logging.getLogger("cowork.streaming.registry"), "disabled", False)
-    caplog.set_level(logging.WARNING, logger="cowork.streaming.registry")
+REGISTRY_LOGGER = "cowork.streaming.registry"
+CANCELLATION_LOGGER = "cowork.streaming.cancellation"
 
-    def records() -> list[logging.LogRecord]:
-        return [
-            r for r in caplog.records
-            if r.name == "cowork.streaming.registry" and r.levelno == logging.WARNING
-        ]
+
+@pytest.fixture
+def warnings_from(monkeypatch, caplog):
+    """The WARNING records of the registry's or the cancellation module's
+    logger. Both are turned back on first: the migration tests' alembic env
+    calls fileConfig, which disables every logger that existed before it for
+    the rest of the session."""
+    for name in (REGISTRY_LOGGER, CANCELLATION_LOGGER):
+        monkeypatch.setattr(logging.getLogger(name), "disabled", False)
+        caplog.set_level(logging.WARNING, logger=name)
+
+    def records(name: str) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.name == name and r.levelno == logging.WARNING]
 
     return records
 
@@ -479,7 +482,7 @@ async def test_a_second_shutdown_leaves_the_turns_the_first_ended_alone(controll
     await asyncio.wait_for(task, timeout=2)  # it unwinds once, from the first cancel
 
 
-async def test_a_failed_flag_write_still_ends_the_turn(monkeypatch, registry_log):
+async def test_a_failed_flag_write_still_ends_the_turn(monkeypatch, warnings_from):
     """Redis down at shutdown: the controller cannot be told, which is logged,
     and the turn is still cancelled so it saves as interrupted."""
     def unreachable():
@@ -491,7 +494,7 @@ async def test_a_failed_flag_write_still_ends_the_turn(monkeypatch, registry_log
     assert await registry.shutdown(timeout_seconds=1) == 1
 
     assert handle.task.cancelled()
-    records = registry_log()
+    records = warnings_from(CANCELLATION_LOGGER)
     assert [r.getMessage() for r in records] == [
         f"Could not ask scratchpad-controller to stop turn {handle.run_id} for shutdown; "
         "the sandbox turn may run on."
@@ -501,7 +504,7 @@ async def test_a_failed_flag_write_still_ends_the_turn(monkeypatch, registry_log
 
 @pytest.mark.parametrize("backend", ["file", "redis"])
 async def test_a_turn_unwinding_past_the_budget_is_reported_with_what_becomes_of_it(
-    monkeypatch, registry_log, backend,
+    monkeypatch, warnings_from, backend,
 ):
     """Boot recovery seals only file buffers, so the warning says what happens
     to an unfinished turn on the backend this server runs."""
@@ -526,7 +529,7 @@ async def test_a_turn_unwinding_past_the_budget_is_reported_with_what_becomes_of
         "pending, and its stream stays open until a reader's idle cut ends it"
         if backend == "redis" else "one that never finishes is sealed by the next boot's recovery"
     )
-    assert [r.getMessage() for r in registry_log()] == [
+    assert [r.getMessage() for r in warnings_from(REGISTRY_LOGGER)] == [
         "1 turn(s) still unwinding past the 0.05s shutdown budget; each saves if it finishes "
         f"before the process exits, and {fate}."
     ]

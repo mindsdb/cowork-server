@@ -260,18 +260,15 @@ async def _stop_controller_turns(handles: list[RunHandle], *, timeout_seconds: f
     on its own, within request_cancel's own bound. A failed write is logged
     and never holds up the turn's interrupted save.
     """
-    from cowork.streaming.cancellation import request_cancel
+    from cowork.streaming.cancellation import stop_controller_turn
 
-    async def stop(handle: RunHandle) -> None:
-        try:
-            await request_cancel(handle.lifecycle.identity.correlation_id)
-        except Exception:
-            logger.warning(
-                "Could not ask scratchpad-controller to stop turn %s for shutdown; "
-                "the sandbox turn may run on.", handle.run_id, exc_info=True,
-            )
-
-    writes = [asyncio.create_task(stop(handle)) for handle in handles]
+    writes = [
+        asyncio.create_task(stop_controller_turn(
+            handle.lifecycle.identity.correlation_id,
+            turn_label=f"turn {handle.run_id} for shutdown",
+        ))
+        for handle in handles
+    ]
     await asyncio.wait(writes, timeout=timeout_seconds)
 
 
