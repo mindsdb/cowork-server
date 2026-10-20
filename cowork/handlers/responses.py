@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -549,7 +549,11 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
-def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
+def _first_take_binding(
+    minted: RouterBinding | None,
+    *,
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
+) -> RouterBinding | None:
     """The gate's own binding: the take only helps if it lands within a second
     or two, which a chat model is routinely too slow for. `minted` is the
     gate's per-turn MindsHub binding on hosted orgs. None when there is no
@@ -557,7 +561,7 @@ def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
     if minted is not None:
         return minted
     try:
-        return _settings_binding()
+        return (binding_factory or _settings_binding)()
     except Exception:
         return None
 
@@ -576,6 +580,7 @@ def _start_first_take(
     conversation_id: UUID,
     harness: str | None,
     metadata: dict[str, str],
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
 ) -> FirstTake | None:
     """Start the turn's first take on the gate's model, or None when it is
     switched off or there is no model to run it on.
@@ -585,7 +590,7 @@ def _start_first_take(
     """
     if not _first_take_enabled():
         return None
-    binding = _first_take_binding(minted)
+    binding = _first_take_binding(minted, binding_factory=binding_factory)
     if binding is None:
         return None
     from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
@@ -1020,10 +1025,19 @@ class ResponsesHandler:
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
+
+                    @cache
+                    def binding_for_turn() -> RouterBinding | None:
+                        # Share successful resolution (including no model) only
+                        # in this request. Exceptions remain retryable by the gate,
+                        # which must still propagate a database pool timeout.
+                        return binding if binding is not None else _settings_binding()
+
                     correlation_id = (turn_llm or {}).get("correlation_id")
                     if first_take:
                         self.first_take = _start_first_take(
                             binding,
+                            binding_factory=binding_for_turn,
                             history=history,
                             conversation_id=conversation_id,
                             harness=self.harness_name,
@@ -1050,6 +1064,7 @@ class ResponsesHandler:
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
+                        binding_factory=binding_for_turn,
                     )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to

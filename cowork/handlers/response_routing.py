@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
@@ -444,7 +445,7 @@ def _settings_binding() -> RouterBinding | None:
     model = settings.resolved_gate_model
     if not model:
         return None
-    client = build_llm_client()
+    client = build_llm_client(settings=settings)
     return RouterBinding(
         provider=client.router_provider,
         model=model,
@@ -589,11 +590,13 @@ async def decide_route(
     has_attachments: bool,
     has_disabled_connections: bool,
     binding: RouterBinding | None = None,
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation on the gate's own model.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
-    per-turn key); when None the binding comes from stored settings.
+    per-turn key); when None the binding comes from stored settings or the
+    request's lazy `binding_factory`. Resolve only after the eligibility checks.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
     A database pool that freed no connection in time is not a gate failure: it
@@ -620,7 +623,7 @@ async def decide_route(
 
     try:
         if binding is None:
-            binding = _settings_binding()
+            binding = (binding_factory or _settings_binding)()
         if binding is None:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
