@@ -1,18 +1,20 @@
-"""The publishing service's stats client, on httpx.MockTransport."""
+"""The publishing service's stats client, on anton's transport."""
 from __future__ import annotations
 
 import json
-import ssl
+import socket
+import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifact_stats as stats
 from cowork.services.product_permissions import ProductPermissionDenied
 from cowork.services.publish import PublisherUnavailable
+from tests._fakes import StatsUpstream
 
 PUBLISH_URL = "https://view.example/"
 STATS_BODY = {
@@ -27,91 +29,80 @@ STATS_BODY = {
 }
 
 
-def _client(handler) -> httpx.Client:
-    return httpx.Client(transport=httpx.MockTransport(handler))
-
-
-def _respond(status: int, body=None):
-    def handler(request: httpx.Request) -> httpx.Response:
-        if body is None:
-            return httpx.Response(status)
-        return httpx.Response(status, json=body)
-
-    return handler
-
-
-def _call(kind: str, client: httpx.Client):
+def _call(kind: str):
     if kind == "fetch":
-        return stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", client=client)
-    return stats.set_tracking(
-        publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", enabled=True, client=client,
-    )
+        return stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1")
+    return stats.set_tracking(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", enabled=True)
 
 
 # -- requests -----------------------------------------------------------------
 
 
-def test_fetch_sends_the_publish_credential_and_returns_the_body_unchanged():
-    seen = {}
+def test_fetch_sends_the_publish_credential_and_returns_the_body_unchanged(monkeypatch):
+    upstream = StatsUpstream(200, STATS_BODY).install(monkeypatch)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["request"] = request
-        return httpx.Response(200, json=STATS_BODY)
+    out = stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1")
 
-    out = stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", client=_client(handler))
-
-    request = seen["request"]
+    (call,) = upstream.calls
     assert out == STATS_BODY
-    assert request.method == "GET"
-    assert str(request.url) == "https://view.example/stats/rid-1"
-    assert request.headers["Authorization"] == "Bearer k-1"
-    assert "Anton/1.0" in request.headers["User-Agent"]
+    assert call.method == "GET"
+    assert call.url == "https://view.example/stats/rid-1"
+    assert call.api_key == "k-1"
+    assert call.payload is None
+    assert call.timeout == 15
 
 
-def test_set_tracking_puts_the_flag_and_returns_the_stored_value():
-    seen = {}
+def test_set_tracking_puts_the_flag_and_returns_the_stored_value(monkeypatch):
+    upstream = StatsUpstream(200, {"tracking": False}).install(monkeypatch)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["request"] = request
-        return httpx.Response(200, json={"tracking": False})
+    out = stats.set_tracking(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", enabled=False)
 
-    out = stats.set_tracking(
-        publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", enabled=False, client=_client(handler),
-    )
-
-    request = seen["request"]
+    (call,) = upstream.calls
     assert out is False
-    assert request.method == "PUT"
-    assert str(request.url) == "https://view.example/stats/rid-1/tracking"
-    assert request.headers["Authorization"] == "Bearer k-1"
-    assert json.loads(request.content) == {"enabled": False}
+    assert call.method == "PUT"
+    assert call.url == "https://view.example/stats/rid-1/tracking"
+    assert call.api_key == "k-1"
+    assert isinstance(call.payload, bytes)
+    assert json.loads(call.payload) == {"enabled": False}
 
 
-def test_report_id_is_escaped_into_one_path_segment():
-    seen = {}
+def test_report_id_is_escaped_into_one_path_segment(monkeypatch):
+    upstream = StatsUpstream(200, STATS_BODY).install(monkeypatch)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        return httpx.Response(200, json=STATS_BODY)
+    stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="a/b")
 
-    stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="a/b", client=_client(handler))
+    assert upstream.calls[0].url == "https://view.example/stats/a%2Fb"
 
-    assert seen["url"] == "https://view.example/stats/a%2Fb"
+
+def test_requests_pass_the_tls_setting_to_the_transport(monkeypatch):
+    upstream = StatsUpstream(200, STATS_BODY).install(monkeypatch)
+    monkeypatch.delenv("ANTON_MINDS_SSL_VERIFY", raising=False)
+    _call("fetch")
+    monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", "off")
+    _call("fetch")
+
+    assert [c.verify for c in upstream.calls] == [True, False]
+
+
+def test_missing_anton_transport_is_publisher_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "anton.minds_client", None)
+    with pytest.raises(PublisherUnavailable):
+        _call("fetch")
 
 
 def test_tls_verification_follows_the_anton_setting(monkeypatch):
     monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", "false")
     assert stats._tls_verify() is False
     monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", "true")
-    assert isinstance(stats._tls_verify(), ssl.SSLContext)
+    assert stats._tls_verify() is True
     monkeypatch.delenv("ANTON_MINDS_SSL_VERIFY")
-    assert isinstance(stats._tls_verify(), ssl.SSLContext)
+    assert stats._tls_verify() is True
 
 
 @pytest.mark.parametrize("value", ["", "  ", "TRUE", "1", "yes", "maybe"])
 def test_tls_verification_stays_on_unless_explicitly_off(monkeypatch, value):
     monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", value)
-    assert isinstance(stats._tls_verify(), ssl.SSLContext)
+    assert stats._tls_verify() is True
 
 
 @pytest.mark.parametrize("value", ["false", "False", "0", "no", "off", " OFF "])
@@ -149,64 +140,76 @@ def test_typed_errors_stay_out_of_the_generic_route_branches():
         (502, None, RuntimeError),
     ],
 )
-def test_service_statuses_map_to_typed_errors(kind, status, body, error):
+def test_service_statuses_map_to_typed_errors(monkeypatch, kind, status, body, error):
+    StatsUpstream(status, body).install(monkeypatch)
     with pytest.raises(error):
-        _call(kind, _client(_respond(status, body)))
+        _call(kind)
 
 
-def test_forbidden_keeps_the_service_code_and_message():
+def test_forbidden_keeps_the_service_code_and_message(monkeypatch):
     body = {"code": "organization_inactive", "error": "This organization is archived."}
+    StatsUpstream(403, body).install(monkeypatch)
     with pytest.raises(stats.StatsForbidden) as excinfo:
-        _call("fetch", _client(_respond(403, body)))
+        _call("fetch")
     assert excinfo.value.code == "organization_inactive"
     assert excinfo.value.message == "This organization is archived."
 
 
-def test_forbidden_without_a_code_gets_a_generic_one():
+def test_forbidden_without_a_code_gets_a_generic_one(monkeypatch):
+    StatsUpstream(403, None).install(monkeypatch)
     with pytest.raises(stats.StatsForbidden) as excinfo:
-        _call("fetch", _client(_respond(403, None)))
+        _call("fetch")
     assert excinfo.value.code == "forbidden"
     assert excinfo.value.message == "Access to stats was refused."
 
 
-def test_upgrade_required_carries_the_service_body():
+def test_upgrade_required_carries_the_service_body(monkeypatch):
     body = {"code": "upgrade_required", "error": "Upgrade required", "required_product": "mindsdb-pro-hub"}
+    StatsUpstream(402, body).install(monkeypatch)
     with pytest.raises(stats.StatsUpgradeRequired) as excinfo:
-        _call("fetch", _client(_respond(402, body)))
+        _call("fetch")
     assert excinfo.value.body == body
 
 
-def test_bad_request_carries_the_service_message():
+def test_bad_request_carries_the_service_message(monkeypatch):
+    StatsUpstream(400, {"error": "enabled must be a boolean"}).install(monkeypatch)
     with pytest.raises(ValueError, match="enabled must be a boolean"):
-        _call("set", _client(_respond(400, {"error": "enabled must be a boolean"})))
+        _call("set")
 
 
 @pytest.mark.parametrize("kind", ["fetch", "set"])
-def test_network_failure_is_a_runtime_error(kind):
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
-
-    with pytest.raises(RuntimeError):
-        _call(kind, _client(handler))
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.URLError("connection refused"),
+        socket.timeout("timed out"),
+        ConnectionResetError("reset"),
+        ValueError("unknown url type"),
+    ],
+)
+def test_network_failure_is_a_runtime_error(monkeypatch, kind, error):
+    StatsUpstream(error=error).install(monkeypatch)
+    with pytest.raises(RuntimeError, match="Could not reach the stats service"):
+        _call(kind)
 
 
 @pytest.mark.parametrize("kind", ["fetch", "set"])
-def test_an_unreadable_success_body_is_a_runtime_error_not_a_bad_request(kind):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"<html>gateway</html>")
-
+def test_an_unreadable_success_body_is_a_runtime_error_not_a_bad_request(monkeypatch, kind):
+    StatsUpstream(200, raw=b"<html>gateway</html>").install(monkeypatch)
     with pytest.raises(RuntimeError):
-        _call(kind, _client(handler))
+        _call(kind)
 
 
-def test_tracking_reply_without_a_boolean_is_a_runtime_error():
+def test_tracking_reply_without_a_boolean_is_a_runtime_error(monkeypatch):
+    StatsUpstream(200, {"tracking": "yes"}).install(monkeypatch)
     with pytest.raises(RuntimeError):
-        _call("set", _client(_respond(200, {"tracking": "yes"})))
+        _call("set")
 
 
-def test_fetch_reply_that_is_not_an_object_is_a_runtime_error():
+def test_fetch_reply_that_is_not_an_object_is_a_runtime_error(monkeypatch):
+    StatsUpstream(200, [1, 2, 3]).install(monkeypatch)
     with pytest.raises(RuntimeError):
-        _call("fetch", _client(_respond(200, [1, 2, 3])))
+        _call("fetch")
 
 
 # -- route mapping ------------------------------------------------------------

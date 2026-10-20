@@ -13,7 +13,6 @@ import time
 from types import SimpleNamespace
 
 import anyio
-import httpx
 import pytest
 from fastapi import HTTPException
 
@@ -21,6 +20,7 @@ from cowork.api.v1.endpoints import artifact_workspace as aw
 from cowork.db.scoped import TenantScope
 from cowork.services import artifact_locks, artifact_stats
 from cowork.services.product_permissions import ProductPermissionDenied
+from tests._fakes import StatsUpstream
 
 ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 ARTIFACT_ID = "11111111-1111-1111-1111-111111111111"
@@ -137,11 +137,11 @@ def keys(monkeypatch):
 def stats_calls(monkeypatch):
     calls = []
 
-    def fake_fetch(*, publish_url, key, report_id, client=None):
+    def fake_fetch(*, publish_url, key, report_id):
         calls.append(("fetch", publish_url, key, report_id))
         return dict(STATS_BODY)
 
-    def fake_set(*, publish_url, key, report_id, enabled, client=None):
+    def fake_set(*, publish_url, key, report_id, enabled):
         calls.append(("set", publish_url, key, report_id, enabled))
         return enabled
 
@@ -150,10 +150,8 @@ def stats_calls(monkeypatch):
     return calls
 
 
-def _upstream(monkeypatch, handler):
-    monkeypatch.setattr(
-        artifact_stats, "_new_client", lambda: httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+def _upstream(monkeypatch, status, body=None):
+    return StatsUpstream(status, body).install(monkeypatch)
 
 
 async def _read():
@@ -242,7 +240,7 @@ async def test_no_publish_key_is_503(as_owner, keys, stats_calls, call):
 
 
 async def test_key_is_revoked_when_the_stats_service_fails(as_owner, keys, monkeypatch):
-    _upstream(monkeypatch, lambda request: httpx.Response(503, json={"error": "DynamoDB unavailable"}))
+    _upstream(monkeypatch, 503, {"error": "DynamoDB unavailable"})
 
     with pytest.raises(HTTPException) as excinfo:
         await _read()
@@ -302,7 +300,7 @@ async def test_anyio_cancellation_still_revokes_the_key_and_releases_the_lock(
 ):
     started = []
 
-    def slow_set(*, publish_url, key, report_id, enabled, client=None):
+    def slow_set(*, publish_url, key, report_id, enabled):
         started.append(report_id)
         time.sleep(0.5)
         return enabled
@@ -331,7 +329,7 @@ async def test_reading_stats_takes_no_publish_lock(as_owner, keys, stats_calls, 
 
 @pytest.mark.parametrize("call", [_read, _toggle])
 async def test_upstream_401_is_502_without_the_desktop_code(as_owner, keys, monkeypatch, caplog, call):
-    _upstream(monkeypatch, lambda request: httpx.Response(401, json={"error": "Invalid token"}))
+    _upstream(monkeypatch, 401, {"error": "Invalid token"})
 
     with caplog.at_level(logging.WARNING, logger=aw.logger.name):
         with pytest.raises(HTTPException) as excinfo:
@@ -344,7 +342,7 @@ async def test_upstream_401_is_502_without_the_desktop_code(as_owner, keys, monk
 
 
 async def test_report_owned_by_another_account_is_409(as_owner, keys, monkeypatch):
-    _upstream(monkeypatch, lambda request: httpx.Response(404, json={"code": "artifact_not_found"}))
+    _upstream(monkeypatch, 404, {"code": "artifact_not_found"})
 
     with pytest.raises(HTTPException) as excinfo:
         await _read()

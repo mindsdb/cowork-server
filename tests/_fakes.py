@@ -1,9 +1,13 @@
 """Shared test doubles (importing conftest directly double-loads it)."""
 
 import asyncio
+import io
+import json
 import os
+import urllib.error
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 # What the managed_dir fixture's managed memory holds.
 MANAGED_RULE = "Name Python packages by their package names only"
@@ -154,3 +158,43 @@ def shared_skill_list_lock_held() -> Iterator[None]:
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+class StatsUpstream:
+    """Stands in for ``anton.minds_client.minds_request`` on the stats routes.
+
+    Records every call; replies with ``body`` as JSON (or ``raw`` bytes) for a
+    2xx ``status``, raises ``HTTPError`` for any other status, and raises
+    ``error`` instead of replying when one is given.
+    """
+
+    def __init__(
+        self,
+        status: int = 200,
+        body=None,
+        *,
+        raw: bytes | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self.status = status
+        self.body = body
+        self.raw = raw
+        self.error = error
+        self.calls: list[SimpleNamespace] = []
+
+    def install(self, monkeypatch) -> "StatsUpstream":
+        monkeypatch.setattr("anton.minds_client.minds_request", self)
+        return self
+
+    def __call__(self, url, api_key, *, method="GET", payload=None, verify=True, timeout=30):
+        self.calls.append(SimpleNamespace(
+            url=url, api_key=api_key, method=method, payload=payload, verify=verify, timeout=timeout,
+        ))
+        if self.error is not None:
+            raise self.error
+        encoded = self.raw if self.raw is not None else (
+            b"" if self.body is None else json.dumps(self.body).encode()
+        )
+        if 200 <= self.status < 300:
+            return encoded
+        raise urllib.error.HTTPError(url, self.status, "error", {}, io.BytesIO(encoded))

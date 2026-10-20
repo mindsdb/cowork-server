@@ -6,16 +6,15 @@ mode. The report id comes from the artifact's `.published.json` record.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
-import ssl
+import urllib.error
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-import httpx
-import truststore
 from fastapi import HTTPException
 
 from cowork.services import artifacts as _artifacts
@@ -30,9 +29,7 @@ PUBLISH_CREDENTIAL_MISSING_CODE = "publish_credential_missing"
 PUBLISH_CREDENTIAL_REJECTED_CODE = "publish_credential_rejected"
 
 _REPORT_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
-_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
-# anton's publisher sends this string; the view host's bot detection lets it through.
-_USER_AGENT = "Mozilla/5.0 (compatible; Anton/1.0; +https://github.com/mindsdb/anton)"
+_TIMEOUT_SECONDS = 15
 
 
 class StatsError(Exception):
@@ -74,64 +71,48 @@ STATS_ROUTE_ERRORS = (StatsError, FileNotFoundError, ValueError, RuntimeError)
 _TLS_OFF_VALUES = frozenset({"false", "0", "no", "off"})
 
 
-def _tls_verify() -> ssl.SSLContext | bool:
+def _tls_verify() -> bool:
     # Only an explicit "off" value disables verification: an empty or unknown
     # value must not drop TLS checks on a request that carries the publish key.
-    if os.environ.get("ANTON_MINDS_SSL_VERIFY", "").strip().lower() in _TLS_OFF_VALUES:
-        return False
-    # The OS trust store, as anton's publisher uses: a TLS-inspecting proxy's
-    # root CA is trusted there and not in certifi.
-    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-
-
-def _new_client() -> httpx.Client:
-    return httpx.Client(timeout=_TIMEOUT, verify=_tls_verify(), follow_redirects=False)
+    return os.environ.get("ANTON_MINDS_SSL_VERIFY", "").strip().lower() not in _TLS_OFF_VALUES
 
 
 def _stats_url(publish_url: str, report_id: str) -> str:
     return f"{publish_url.rstrip('/')}/stats/{quote(report_id, safe='')}"
 
 
-def _json_body(response: httpx.Response) -> Any:
+def _json_body(raw: bytes) -> Any:
     try:
-        return response.json()
+        return json.loads(raw)
     except ValueError:
         return None
 
 
-def _request(
-    method: str,
-    url: str,
-    *,
-    key: str,
-    json_body: dict | None = None,
-    client: httpx.Client | None = None,
-) -> httpx.Response:
-    owns_client = client is None
-    client = client or _new_client()
+def _request(method: str, url: str, *, key: str, json_body: dict | None = None) -> Any:
+    """The parsed JSON body of a successful reply, or None if it is not JSON."""
     try:
-        return client.request(
-            method,
-            url,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Accept": "application/json",
-                "User-Agent": _USER_AGENT,
-            },
-            json=json_body,
+        from anton.minds_client import minds_request
+    except ImportError as exc:
+        raise PublisherUnavailable("Anton publisher is unavailable") from exc
+
+    payload = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+    try:
+        raw = minds_request(
+            url, key, method=method, payload=payload, verify=_tls_verify(), timeout=_TIMEOUT_SECONDS,
         )
-    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+    except urllib.error.HTTPError as exc:
+        try:
+            error_body = exc.read(65_536)
+        except OSError:
+            error_body = b""
+        _raise_for_status(exc.code, _json_body(error_body))
+        raise RuntimeError(f"Stats request failed (HTTP {exc.code})") from exc
+    except (OSError, ValueError, http.client.HTTPException) as exc:
         raise RuntimeError("Could not reach the stats service") from exc
-    finally:
-        if owns_client:
-            client.close()
+    return _json_body(raw)
 
 
-def _raise_for_status(response: httpx.Response) -> None:
-    status = response.status_code
-    if 200 <= status < 300:
-        return
-    body = _json_body(response)
+def _raise_for_status(status: int, body: Any) -> None:
     code = body.get("code") if isinstance(body, dict) else None
     error = body.get("error") if isinstance(body, dict) else None
     message = error if isinstance(error, str) else ""
@@ -157,32 +138,22 @@ def _raise_for_status(response: httpx.Response) -> None:
     raise RuntimeError(f"Stats request failed (HTTP {status})")
 
 
-def fetch_stats(
-    *, publish_url: str, key: str, report_id: str, client: httpx.Client | None = None,
-) -> dict:
+def fetch_stats(*, publish_url: str, key: str, report_id: str) -> dict:
     """The service's stats JSON for one report, unchanged."""
-    response = _request("GET", _stats_url(publish_url, report_id), key=key, client=client)
-    _raise_for_status(response)
-    body = _json_body(response)
+    body = _request("GET", _stats_url(publish_url, report_id), key=key)
     if not isinstance(body, dict):
         raise RuntimeError("The stats service returned an unreadable response")
     return body
 
 
-def set_tracking(
-    *, publish_url: str, key: str, report_id: str, enabled: bool,
-    client: httpx.Client | None = None,
-) -> bool:
+def set_tracking(*, publish_url: str, key: str, report_id: str, enabled: bool) -> bool:
     """Turn view recording on or off; returns the flag the service stored."""
-    response = _request(
+    body = _request(
         "PUT",
         f"{_stats_url(publish_url, report_id)}/tracking",
         key=key,
         json_body={"enabled": enabled},
-        client=client,
     )
-    _raise_for_status(response)
-    body = _json_body(response)
     tracking = body.get("tracking") if isinstance(body, dict) else None
     if not isinstance(tracking, bool):
         raise RuntimeError("The stats service returned an unreadable response")

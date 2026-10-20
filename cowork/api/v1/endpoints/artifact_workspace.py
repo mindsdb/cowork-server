@@ -9,6 +9,7 @@ import os
 import stat
 from collections.abc import Callable
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
@@ -943,7 +944,6 @@ async def set_artifact_stats_tracking(
     rewriting the same file in between would drop the change.
     """
     await require_product_permission(session.scope, "artifact.manage")
-    from functools import partial
 
     from cowork.services import artifact_stats as stats
     from cowork.services.artifact_locks import release

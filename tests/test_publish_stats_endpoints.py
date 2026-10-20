@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import json
 
-import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import artifact_stats
+from tests._fakes import StatsUpstream
 
 STATS_BODY = {
     "tracking": True,
@@ -54,42 +54,33 @@ def published(monkeypatch):
     return seen
 
 
-def _upstream(monkeypatch, handler):
-    requests = []
-
-    def record(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return handler(request)
-
-    monkeypatch.setattr(
-        artifact_stats, "_new_client", lambda: httpx.Client(transport=httpx.MockTransport(record)),
-    )
-    return requests
+def _upstream(monkeypatch, status, body=None):
+    return StatsUpstream(status, body).install(monkeypatch)
 
 
 def test_get_returns_the_service_json_unchanged(monkeypatch, credential, published):
-    requests = _upstream(monkeypatch, lambda request: httpx.Response(200, json=STATS_BODY))
+    upstream = _upstream(monkeypatch, 200, STATS_BODY)
 
     res = _get()
 
     assert res.status_code == 200, res.text
     assert res.json() == STATS_BODY
     assert published == ["/art/rep/report.html"]
-    assert str(requests[0].url) == "https://view.example/stats/rid-1"
-    assert requests[0].headers["Authorization"] == "Bearer desk-key"
+    assert upstream.calls[0].url == "https://view.example/stats/rid-1"
+    assert upstream.calls[0].api_key == "desk-key"
 
 
 def test_put_sets_tracking_and_returns_the_flag(monkeypatch, credential, published):
-    requests = _upstream(monkeypatch, lambda request: httpx.Response(200, json={"tracking": False}))
+    upstream = _upstream(monkeypatch, 200, {"tracking": False})
 
     res = _put(enabled=False)
 
     assert res.status_code == 200, res.text
     assert res.json() == {"tracking": False}
     assert published == ["/art/rep/report.html"]
-    assert requests[0].method == "PUT"
-    assert str(requests[0].url) == "https://view.example/stats/rid-1/tracking"
-    assert json.loads(requests[0].content) == {"enabled": False}
+    assert upstream.calls[0].method == "PUT"
+    assert upstream.calls[0].url == "https://view.example/stats/rid-1/tracking"
+    assert json.loads(upstream.calls[0].payload) == {"enabled": False}
 
 
 def test_put_rejects_a_non_boolean_flag(credential, published):
@@ -125,7 +116,7 @@ def test_an_invalid_path_is_a_plain_400_without_the_credential_code(credential, 
 
 @pytest.mark.parametrize("call", [_get, _put])
 def test_rejected_publish_key_is_502_with_the_reconnect_code(monkeypatch, credential, published, call):
-    _upstream(monkeypatch, lambda request: httpx.Response(401, json={"error": "Invalid token"}))
+    _upstream(monkeypatch, 401, {"error": "Invalid token"})
 
     res = call()
 
@@ -170,10 +161,7 @@ def test_unpublished_artifact_is_404(monkeypatch, credential):
 def test_service_errors_reach_the_client_with_the_shared_mapping(
     monkeypatch, credential, published, status, body, expected_status, expected_detail,
 ):
-    _upstream(
-        monkeypatch,
-        lambda request: httpx.Response(status) if body is None else httpx.Response(status, json=body),
-    )
+    _upstream(monkeypatch, status, body)
 
     res = _get()
 
