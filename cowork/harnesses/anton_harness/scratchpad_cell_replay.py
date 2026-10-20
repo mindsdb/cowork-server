@@ -20,7 +20,7 @@ _SCRATCHPAD_RESULT = "thought.scratchpad.result"
 SCRATCHPAD_REPLAY_ROLES = (_SCRATCHPAD_END, _SCRATCHPAD_RESULT)
 
 # Cell's outputs that have no default, for a result cut before them.
-_NO_OUTPUT = {"stdout": "", "stderr": "", "error": None}
+_NO_OUTPUT = {"stdout": "", "stderr": ""}
 
 # JSON's whitespace between tokens.
 _SPACE = re.compile(r"[ \t\n\r]*")
@@ -53,7 +53,7 @@ def _parse_json(raw: Any) -> dict[str, Any] | None:
 def _whole_fields(*, text: str) -> dict[str, Any]:
     """The fields of a JSON object cut short that the cut left whole.
 
-    The stream formatter stores at most 65,536 characters of each event, so a
+    The stream formatter stores at most 65,536 characters of each result, so a
     cell with long output, most often its logs, is stored as JSON that no
     longer parses. json.dumps(asdict(cell)) writes ``code`` first and ``logs``
     last, so ``code`` and the fields after it up to the cut still read whole.
@@ -93,16 +93,15 @@ def _sent_call(*, content: Any) -> _SentCall | None:
     return _SentCall(action=action, code=code if isinstance(code, str) else None)
 
 
-def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
+def _ran_cell(*, content: Any, sent_code: str | None, cell_status: Any) -> Cell | None:
     """The cell an exec result reports, or None for a result that is no cell.
 
     Plain text is none: anton closes a cell it never ran, such as a write the
     user didn't approve, with its "Not run: ..." reason as plain text. A
     result cut before its code ends (see _whole_fields) makes a cell from the
     code the model sent, `sent_code`, with no outputs, when the call's end
-    event kept that code whole. It often does: json.dumps escapes each
-    non-ASCII character to six, while the end event keeps the model's tool
-    input as written.
+    event kept that code whole. New end events keep the full input; older
+    stored events may have cut it too.
     """
     payload = _parse_json(content)
     if payload is None:
@@ -110,6 +109,10 @@ def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
         if not (cut_in_code and sent_code is not None):
             return None
         payload = {"code": sent_code}
+    if "error" not in payload:
+        # The formatter classifies the whole result before cutting it. Only
+        # confirmed success lets an earlier write establish file ownership.
+        payload["error"] = None if cell_status == "ok" else "The stored result does not confirm successful execution."
     # A result cut before its outputs still makes a cell, so the write check
     # sees the code it ran.
     with contextlib.suppress(TypeError, ValueError):
@@ -159,7 +162,7 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
             call = sent.pop(tool_use_id, None) if tool_use_id else last
             last = None
             if call is not None and call.action == "exec":
-                cell = _ran_cell(content=data.get("content"), sent_code=call.code)
+                cell = _ran_cell(content=data.get("content"), sent_code=call.code, cell_status=data.get("cell_status"))
                 if cell is not None:
                     cells.append(cell)
 

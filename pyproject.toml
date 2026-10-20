@@ -37,7 +37,9 @@ dependencies = [
     # `api_key_provider` capability gate) or `handlers/turn_errors.py`
     # (`is_auth_error`'s untyped 401): what they stand in for predates the
     # `anton.core.artifacts.internal_files` constants it imports at startup.
-    "anton-agent>=2.26.10.19.1,<3",
+    # 2.26.10.19.3 preserves earlier cells' error flags in the write check,
+    # so replayed failures cannot grant ownership of an existing file.
+    "anton-agent>=2.26.10.19.3,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
