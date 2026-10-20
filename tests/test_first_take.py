@@ -312,7 +312,9 @@ def test_what_takes_its_place():
     def frame(kind, **data):
         return f"event: {kind}\ndata: {json.dumps({'type': kind, **data})}\n\n"
 
-    assert ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="Here"))
+    # Anton's text is narration until the renderer says otherwise: it no longer
+    # ends the take here, so the take finishes its sentence (ENG-3554).
+    assert not ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="Let me check."))
     assert not ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="\n\n"))
     for kind in ("response.ask_user", "response.completed", "response.failed"):
         assert ft.clears_take(kind, frame(kind))
@@ -502,9 +504,11 @@ def test_the_setting_defaults_on():
 
 
 @pytest.mark.asyncio
-async def test_the_turn_clears_it_right_before_anton_speaks():
+async def test_anton_speaking_does_not_clear_it_the_turns_end_does():
     """In-process producer, end to end: created, then the take's words, then
-    its clear, then Anton's first words. Nothing of it reaches the saved turn."""
+    Anton's words (narration or answer: the renderer decides), then the take's
+    clear right before the turn ends (ENG-3554). Nothing of it reaches the
+    saved turn."""
     from unittest.mock import MagicMock, patch
     from types import SimpleNamespace
     from uuid import uuid4
@@ -540,7 +544,8 @@ async def test_the_turn_clears_it_right_before_anton_speaks():
 
     kinds = [frame.split("\n", 1)[0].removeprefix("event: ") for frame in buffer.frames]
     assert kinds[0] == "response.created"
-    assert kinds.index(ft.DELTA) < kinds.index(ft.CLEARED) < kinds.index("response.output_text.delta")
+    assert kinds.index(ft.DELTA) < kinds.index("response.output_text.delta") < kinds.index(ft.CLEARED)
+    assert kinds.index(ft.CLEARED) < kinds.index("response.completed")
     assert kinds.count(ft.CLEARED) == 1
     assert all(k not in kinds[kinds.index(ft.CLEARED) + 1:] for k in (ft.DELTA, ft.DONE))
     saved_text = json.dumps([str(c) for c in conv_svc.return_value.save_assistant_turn.call_args_list])
