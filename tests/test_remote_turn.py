@@ -2,6 +2,7 @@
 ResponsesHandler is replaced wholesale per test; its helpers have coverage elsewhere."""
 from __future__ import annotations
 
+import asyncio
 import json
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
 from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import RemoteWorkspace
+from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 
@@ -467,3 +469,94 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
     ))
     assert index.call_args.kwargs["attribute_by_provenance"] is True
     assert index.call_args.kwargs["completed_cleanly"] is (not failed)
+
+
+@pytest.fixture
+def controller_flags(monkeypatch):
+    """The Redis the controller's cancel flags are written to."""
+    import fakeredis.aioredis
+
+    from cowork.streaming import cancellation
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(cancellation, "get_redis", lambda: client)
+    return client
+
+
+def _replies_that_wait(sent: list[dict]):
+    """A controller that answers with one delta, then runs on with no terminal."""
+    started = asyncio.Event()
+
+    async def replies(**kwargs):
+        sent.append(kwargs)
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "partial"}
+        started.set()
+        await asyncio.Event().wait()
+
+    return replies, started
+
+
+@pytest.mark.parametrize("correlation_id", [None, "corr-given"], ids=["minted", "given"])
+async def test_a_cancelled_channel_turn_stops_its_controller_turn(monkeypatch, controller_flags, correlation_id):
+    """Shutdown's drain of channel tasks cancels a channel turn still running.
+    No registry handle covers it, so the turn itself writes the controller's
+    cancel flag, under the correlation id the job went out with."""
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, started = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    turn = asyncio.create_task(_drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[], correlation_id=correlation_id,
+    )))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    sent_id = sent[0]["correlation_id"]
+    assert sent_id, "the job went out with no correlation id"
+    if correlation_id is not None:
+        assert sent_id == correlation_id
+    assert await controller_flags.keys("*") == [cancel_flag_key(sent_id)]
+
+
+async def test_a_channel_turn_its_reader_abandons_stops_its_controller_turn(monkeypatch, controller_flags):
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, _ = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    events = remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    )
+    async for event in events:
+        if getattr(event, "text", None) == "partial":
+            break
+    await events.aclose()
+
+    assert await controller_flags.keys("*") == [cancel_flag_key(sent[0]["correlation_id"])]
+
+
+@pytest.mark.parametrize("terminal", ["turn_completed", "turn_failed"])
+async def test_a_channel_turn_that_reached_its_terminal_writes_no_cancel_flag(
+    monkeypatch, controller_flags, terminal,
+):
+    _fake_handler(monkeypatch)
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "done"}
+        yield terminal, {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert await controller_flags.keys("*") == []

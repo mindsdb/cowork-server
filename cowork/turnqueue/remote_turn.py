@@ -2,6 +2,8 @@
 but built separately, since sharing it would move ~20 tests' patch targets."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from uuid import UUID
 
 from cowork.db.scoped import ScopedSession
@@ -9,7 +11,11 @@ from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import read_earlier_answers
+from cowork.streaming.cancellation import request_cancel
+from cowork.turnqueue import producer
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+
+logger = logging.getLogger(__name__)
 
 
 class RemoteTurnFailed(Exception):
@@ -35,7 +41,12 @@ async def remote_turn_events(
     llm: dict | None = None,
 ):
     """Yields the same stream format_responses_stream renders for local turns.
-    Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure."""
+    Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure.
+
+    Cancelled, or closed by its reader, before the turn's terminal reply, it
+    writes the controller's cancel flag, so the sandbox turn stops too. At
+    shutdown that is the drain of channel tasks (drain_background_tasks)
+    cancelling it; no registry handle covers a channel turn."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import remote_turn_history
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
@@ -46,6 +57,9 @@ async def remote_turn_events(
         snapshot_artifact_state,
     )
 
+    # Minted here rather than inside stream_remote_replies, so a cancel below
+    # can name the turn to the controller.
+    correlation_id = correlation_id or producer._new_correlation_id()
     # A channel turn never goes through handle(), which registers these for
     # a web turn; the seed history below is scrubbed against them.
     await register_vault_secrets(session.scope)
@@ -124,6 +138,11 @@ async def remote_turn_events(
                 message = data.get("message") or GENERIC_TURN_ERROR_MESSAGE
                 code = data.get("code") or GENERIC_TURN_ERROR_CODE
                 raise RemoteTurnFailed(code, message)
+    except (asyncio.CancelledError, GeneratorExit):
+        # Both terminals leave this block (break, raise), so the controller is
+        # still running the turn here.
+        await _stop_controller_turn(correlation_id)
+        raise
     finally:
         if artifacts is not None and artifact_writes_allowed:
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
@@ -143,3 +162,15 @@ async def remote_turn_events(
             project_name=artifacts[3],
         ):
             yield ArtifactCreated(card)
+
+
+async def _stop_controller_turn(correlation_id: str) -> None:
+    """Write the controller's cancel flag. A failure is logged, never raised:
+    the caller is already unwinding."""
+    try:
+        await request_cancel(correlation_id)
+    except Exception:
+        logger.warning(
+            "Could not ask scratchpad-controller to stop channel turn %s; the sandbox turn "
+            "may run on.", correlation_id, exc_info=True,
+        )
