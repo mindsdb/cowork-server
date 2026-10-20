@@ -73,8 +73,9 @@ async def _stored_events(*, calls: list[tuple[str, str]], action: str | None = "
             # anton's inline exec path (ChatSession) names "exec" on the
             # result of every call it runs as one, a call that left `action`
             # out but carries `code` among them (anton's scratchpad_action).
-            # The anton this repo's floor installs never runs such a call, so
-            # its result is written here as anton writes it.
+            # anton-agent 2.26.10.19.1, the version uv.lock pins, has no
+            # scratchpad_action and never runs such a call, so its result is
+            # written here as that path writes it.
             yield StreamToolResult(name="scratchpad", action="exec", content=result, id=f"t{n}")
 
     stored: list[dict] = []
@@ -247,10 +248,12 @@ def test_the_action_a_call_named_decides_over_its_results():
 
 
 class _ProbeSession:
-    """A connector probe's session whose turn runs one scratchpad cell."""
+    """A connector probe's session whose turn runs one scratchpad cell. A
+    None ``action`` leaves it out of the call, as a model can."""
 
-    def __init__(self, *, code: str) -> None:
+    def __init__(self, *, code: str, action: str | None) -> None:
         self.code = code
+        self.action = action
 
     async def turn_stream(self, prompt: str, *, trace_tags: list[str]):
         from anton.core.llm.provider import (
@@ -261,26 +264,27 @@ class _ProbeSession:
         )
 
         ran = Cell(code=self.code, stdout="connected\n", stderr="", error=None)
-        tool_input = json.dumps({"action": "exec", "name": "main", "code": self.code})
+        call = {"name": "main", "code": self.code}
+        if self.action is not None:
+            call = {"action": self.action, **call}
         yield StreamToolUseStart(id="p1", name="scratchpad")
-        yield StreamToolUseDelta(id="p1", json_delta=tool_input)
+        yield StreamToolUseDelta(id="p1", json_delta=json.dumps(call))
         yield StreamToolUseEnd(id="p1")
+        # Written as anton's inline exec path writes it (see _stored_events).
         yield StreamToolResult(name="scratchpad", action="exec", content=json.dumps(asdict(ran)), id="p1")
 
 
-@pytest.mark.asyncio
-async def test_a_connector_probes_cells_stay_out_of_the_replay(monkeypatch):
-    """The connector probe saves its narrative in the conversation, its cells
-    among it, and their end events carry the code with no action. Those
-    cells ran in the probe's own scratchpad, which no later turn reuses, so
-    no turn's session starts with them."""
+async def _probe_stored_events(monkeypatch, *, code: str, action: str | None) -> list[dict]:
+    """The events the real ProbeHandler.run saves for a connector probe whose
+    turn runs one scratchpad cell, through the real CredentialProbe."""
     from cowork.db.scoped import LOCAL_SCOPE
     from cowork.handlers import probe as probe_handler
     from cowork.services.connectors import probe as probe_service
     from cowork.services.connectors.submissions import SubmissionStore
 
-    code = "import psycopg2\nconn = psycopg2.connect(**creds)\nprint('connected')"
-    monkeypatch.setattr(probe_service, "build_chat_session", lambda _config: _ProbeSession(code=code))
+    monkeypatch.setattr(
+        probe_service, "build_chat_session", lambda _config: _ProbeSession(code=code, action=action),
+    )
     monkeypatch.setattr(probe_service, "close_session_scratchpads", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()),
@@ -304,13 +308,41 @@ async def test_a_connector_probes_cells_stay_out_of_the_replay(monkeypatch):
     ]
 
     # ProbeHandler.run's _push saves each frame's data as one of the turn's events.
-    stored = [
+    return [
         json.loads(line[len("data: "):])
         for frame in frames for line in frame.splitlines() if line.startswith("data: ")
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_connector_probes_cells_stay_out_of_the_replay(monkeypatch):
+    """The connector probe saves its narrative in the conversation, its cells
+    among it, and their end events carry the code with no action. Those
+    cells ran in the probe's own scratchpad, which no later turn reuses, so
+    no turn's session starts with them."""
+    code = "import psycopg2\nconn = psycopg2.connect(**creds)\nprint('connected')"
+
+    stored = await _probe_stored_events(monkeypatch, code=code, action="exec")
+
     [end] = [e for e in stored if e.get("thought_role") == "thought.scratchpad.end"]
     assert json.loads(end["content"])["code"] == code
     assert "action" not in json.loads(end["content"])
+    assert extract_scratchpad_cells(stored) == []
+
+
+@pytest.mark.asyncio
+async def test_a_connector_probe_call_that_left_out_its_action_keeps_its_code(monkeypatch):
+    """anton runs a probe's call that carries `code` and no `action` as an
+    exec, so the probe saves that cell with its code, as it saves a call that
+    named exec, and the cell still stays out of the replay."""
+    code = "import psycopg2\nconn = psycopg2.connect(**creds)\nprint('connected')"
+
+    stored = await _probe_stored_events(monkeypatch, code=code, action=None)
+
+    ends = [json.loads(e["content"]) for e in stored if e.get("thought_role") == "thought.scratchpad.end"]
+    results = [json.loads(e["content"]) for e in stored if e.get("thought_role") == "thought.scratchpad.result"]
+    assert [end["code"] for end in ends] == [code]
+    assert [result["code"] for result in results] == [code]
     assert extract_scratchpad_cells(stored) == []
 
 

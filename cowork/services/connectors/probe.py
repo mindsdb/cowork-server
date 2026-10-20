@@ -83,6 +83,21 @@ def _credential_env(credentials: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _scratchpad_action(tc_input: Mapping[str, Any]) -> str:
+    """The action anton runs a scratchpad call as.
+
+    A copy of anton.core.utils.scratchpad.scratchpad_action, which owns the
+    rule: anton-agent 2.26.10.19.1, the version uv.lock pins, has no such
+    export. Tools go to the model without strict schemas, so a call can leave
+    out `action`, and anton runs one that carries `code` as an exec. One with
+    neither gets "", which no action matches.
+    """
+    action = tc_input.get("action")
+    if not action and tc_input.get("code"):
+        return "exec"
+    return action if isinstance(action, str) else ""
+
+
 @dataclass(frozen=True)
 class CandidateCredentialsVault:
     """The data vault of a probe under the code sandbox: the candidate
@@ -678,7 +693,7 @@ class CredentialProbe:
                                 parsed = _json.loads(raw or "{}")
                             except Exception:
                                 parsed = {}
-                            if (parsed.get("action") or "") == "exec":
+                            if _scratchpad_action(parsed) == "exec":
                                 yield ("scratchpad", {
                                     "action": "end",
                                     "name": parsed.get("name", ""),

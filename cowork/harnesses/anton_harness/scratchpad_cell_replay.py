@@ -97,9 +97,9 @@ def _sent_call(*, content: Any) -> _SentCall | None:
     )
 
 
-def _ran_action(*, call: _SentCall, result: dict[str, Any]) -> str | None:
+def _ran_action(*, call: _SentCall, result_action: Any) -> str | None:
     """The action a call ran: the one the model sent, or, for a call that
-    sent none, the one anton reports on its result.
+    sent none, `result_action`, the one anton reports on its result.
 
     The end event stores the model's tool input as it streamed, so a call
     that left out `action` has none there. anton runs such a call as an
@@ -111,8 +111,7 @@ def _ran_action(*, call: _SentCall, result: dict[str, Any]) -> str | None:
     """
     if call.action is not None:
         return call.action
-    ran = result.get("tool_action")
-    return ran if isinstance(ran, str) else None
+    return result_action if isinstance(result_action, str) else None
 
 
 def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
@@ -180,7 +179,7 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
         elif role == _SCRATCHPAD_RESULT:
             call = sent.pop(tool_use_id, None) if tool_use_id else last
             last = None
-            if call is not None and _ran_action(call=call, result=data) == "exec":
+            if call is not None and _ran_action(call=call, result_action=data.get("tool_action")) == "exec":
                 cell = _ran_cell(content=data.get("content"), sent_code=call.code)
                 if cell is not None:
                     cells.append(cell)
