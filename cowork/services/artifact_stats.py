@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,7 @@ NOT_PUBLISHED_MESSAGE = "Artifact is not published"
 PUBLISH_CREDENTIAL_MISSING_CODE = "publish_credential_missing"
 PUBLISH_CREDENTIAL_REJECTED_CODE = "publish_credential_rejected"
 
+_REPORT_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 # anton's publisher sends this string; the view host's bot detection lets it through.
 _USER_AGENT = "Mozilla/5.0 (compatible; Anton/1.0; +https://github.com/mindsdb/anton)"
@@ -195,6 +197,9 @@ def _report_id_from_record(published_dir: Path, published_key: str) -> str:
         raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
     report_id = str(entry.get("report_id") or "").strip()
     if report_id:
+        # A dot-only id would be normalized out of the URL path by the HTTP client.
+        if _REPORT_ID_RE.fullmatch(report_id) is None:
+            raise FileNotFoundError(NOT_PUBLISHED_MESSAGE)
         return report_id
     # A publish whose upload reply carried no report id: unpublish still finds
     # it by md5, but the service files no stats under an md5.
@@ -245,7 +250,9 @@ def stats_http_exception(exc: Exception, *, desktop: bool) -> HTTPException:
         # The service puts its text in "error"; the renderer reads "message".
         body = dict(exc.body) if isinstance(exc.body, dict) else {}
         body.setdefault("code", "upgrade_required")
-        body.setdefault("message", body.get("error") or "Upgrade required")
+        message, error = body.get("message"), body.get("error")
+        if not (isinstance(message, str) and message):
+            body["message"] = error if isinstance(error, str) and error else "Upgrade required"
         return HTTPException(402, detail=body)
     if isinstance(exc, StatsTemporarilyUnavailable):
         return HTTPException(503, detail={

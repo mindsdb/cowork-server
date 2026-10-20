@@ -211,6 +211,16 @@ def test_fetch_reply_that_is_not_an_object_is_a_runtime_error():
          {"code": "organization_inactive", "message": "Archived."}),
         (stats.StatsUpgradeRequired({"code": "upgrade_required", "error": "Upgrade required"}), True, 402,
          {"code": "upgrade_required", "error": "Upgrade required", "message": "Upgrade required"}),
+        (stats.StatsUpgradeRequired({"error": {"detail": "x"}}), True, 402,
+         {"error": {"detail": "x"}, "code": "upgrade_required", "message": "Upgrade required"}),
+        (stats.StatsUpgradeRequired({"error": ["x"], "message": None}), True, 402,
+         {"error": ["x"], "message": "Upgrade required", "code": "upgrade_required"}),
+        (stats.StatsUpgradeRequired({"error": "Plan limit", "message": None}), True, 402,
+         {"error": "Plan limit", "message": "Plan limit", "code": "upgrade_required"}),
+        (stats.StatsUpgradeRequired({"error": "Plan limit", "message": ""}), True, 402,
+         {"error": "Plan limit", "message": "Plan limit", "code": "upgrade_required"}),
+        (stats.StatsUpgradeRequired({"error": "Plan limit", "message": "Upgrade now"}), True, 402,
+         {"error": "Plan limit", "message": "Upgrade now", "code": "upgrade_required"}),
         (stats.StatsUpgradeRequired(None), True, 402,
          {"code": "upgrade_required", "message": "Upgrade required"}),
         (stats.StatsTemporarilyUnavailable(), False, 503,
@@ -269,6 +279,19 @@ def test_folder_without_a_live_record_is_not_published(tmp_path, entry):
     folder = _artifact(tmp_path, entry)
     with pytest.raises(FileNotFoundError, match="Artifact is not published"):
         stats.report_id_for_folder(folder)
+
+
+@pytest.mark.parametrize("report_id", ["..", ".", "a/b", "%2e%2e", "a b", "../x", "id.1"])
+def test_folder_record_with_an_unsafe_report_id_is_not_published(tmp_path, report_id):
+    folder = _artifact(tmp_path, {"report_id": report_id, "url": "u", "published": True})
+    with pytest.raises(FileNotFoundError, match="Artifact is not published"):
+        stats.report_id_for_folder(folder)
+
+
+@pytest.mark.parametrize("report_id", ["abc123", "A_b-9", "0123456789abcdef0123456789abcdef"])
+def test_folder_record_accepts_service_style_report_ids(tmp_path, report_id):
+    folder = _artifact(tmp_path, {"report_id": report_id, "url": "u", "published": True})
+    assert stats.report_id_for_folder(folder) == report_id
 
 
 def test_folder_record_for_another_file_is_not_published(tmp_path):
