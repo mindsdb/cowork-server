@@ -25,7 +25,7 @@ from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import ScheduleRunService, ScheduleService
-from cowork.streaming.registry import registry
+from cowork.streaming.registry import ServerShuttingDown, registry
 
 if TYPE_CHECKING:
     from cowork.principal import Principal
@@ -48,6 +48,9 @@ _MAX_RUN_DURATION_SECONDS = 600
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 _scheduler_task: asyncio.Task | None = None
+# A run's error when its turn was refused because the server was shutting
+# down. The run never started, so the schedule's own last_error is left alone.
+_SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
 # The runs the poll loop started and nothing awaits. A shutdown waits for them
 # (wait_for_scheduled_runs) so each run's last writes land before the process
 # exits. A manual run belongs to its request instead, which Uvicorn's drain
@@ -258,6 +261,20 @@ def _link_conversation(
     return conversation_id
 
 
+def _delete_unstarted_conversation(
+    session: ScopedSession, *, scheduled: _ScheduledTurn, conversation_id: UUID,
+) -> None:
+    """Delete the conversation _link_conversation made for a run whose turn
+    never started, so it is not left empty in its owner's list. Under the
+    schedule's own scope, as it was created."""
+    from cowork.services.conversations import ConversationService
+
+    conv_session = ScopedSession(
+        unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
+    )
+    ConversationService(conv_session).delete_conversation(conversation_id)
+
+
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
 ) -> _RunOutcome:
@@ -370,6 +387,7 @@ async def execute_schedule(
 
     error: str | None = None
     final_status: RunStatus | None = None
+    created_conversation = conversation_id is None
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -414,6 +432,34 @@ async def execute_schedule(
             raise RuntimeError(
                 f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
             ) from exc
+        except ServerShuttingDown:
+            # This replica is ending its turns for a shutdown and refused the
+            # run's turn before it started. Nothing ran, so the schedule keeps
+            # its last_error, and _record_turn_outcome never consumes the cron
+            # slot: it stays due for the next poll, on a replica still
+            # serving. The finally below finishes the run row.
+            error = _SHUTDOWN_RUN_ERROR
+            logger.info(
+                "Schedule run did not start; the server is shutting down",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
+            if created_conversation:
+                try:
+                    await run_db(
+                        partial(
+                            _delete_unstarted_conversation,
+                            scheduled=scheduled, conversation_id=conversation_id,
+                        ),
+                        scope=SYSTEM_SCOPE,
+                    )
+                    conversation_id = None
+                except Exception:
+                    logger.warning(
+                        "Could not delete the empty conversation of a run that did not start",
+                        exc_info=True,
+                        extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+                    )
+            return
 
         # A cancel or a producer failure closes the stream normally from the
         # consumer's side (the producer runs detached and even swallows its
