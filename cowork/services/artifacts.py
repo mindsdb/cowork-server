@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import quote
 
 from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
+from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -972,7 +973,7 @@ def _unpublish_identifier(
 
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    ssl_verify = minds_ssl_verify()
     try:
         unpublish(
             identifier,

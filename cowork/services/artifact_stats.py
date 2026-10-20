@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import re
 import urllib.error
 from pathlib import Path
@@ -17,6 +16,7 @@ from urllib.parse import quote
 
 from fastapi import HTTPException
 
+from cowork.common.minds_tls import minds_ssl_verify
 from cowork.services import artifacts as _artifacts
 from cowork.services.product_permissions import ProductPermissionDenied
 from cowork.services.publish import PublisherUnavailable, _resolve_publish_target
@@ -68,15 +68,6 @@ class StatsTemporarilyUnavailable(StatsError):
 STATS_ROUTE_ERRORS = (StatsError, FileNotFoundError, ValueError, RuntimeError)
 
 
-_TLS_OFF_VALUES = frozenset({"false", "0", "no", "off"})
-
-
-def _tls_verify() -> bool:
-    # Only an explicit "off" value disables verification: an empty or unknown
-    # value must not drop TLS checks on a request that carries the publish key.
-    return os.environ.get("ANTON_MINDS_SSL_VERIFY", "").strip().lower() not in _TLS_OFF_VALUES
-
-
 def _stats_url(publish_url: str, report_id: str) -> str:
     return f"{publish_url.rstrip('/')}/stats/{quote(report_id, safe='')}"
 
@@ -98,7 +89,7 @@ def _request(method: str, url: str, *, key: str, json_body: dict | None = None) 
     payload = json.dumps(json_body).encode("utf-8") if json_body is not None else None
     try:
         raw = minds_request(
-            url, key, method=method, payload=payload, verify=_tls_verify(), timeout=_TIMEOUT_SECONDS,
+            url, key, method=method, payload=payload, verify=minds_ssl_verify(), timeout=_TIMEOUT_SECONDS,
         )
     except urllib.error.HTTPError as exc:
         try:

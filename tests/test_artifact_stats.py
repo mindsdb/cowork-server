@@ -90,27 +90,6 @@ def test_missing_anton_transport_is_publisher_unavailable(monkeypatch):
         _call("fetch")
 
 
-def test_tls_verification_follows_the_anton_setting(monkeypatch):
-    monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", "false")
-    assert stats._tls_verify() is False
-    monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", "true")
-    assert stats._tls_verify() is True
-    monkeypatch.delenv("ANTON_MINDS_SSL_VERIFY")
-    assert stats._tls_verify() is True
-
-
-@pytest.mark.parametrize("value", ["", "  ", "TRUE", "1", "yes", "maybe"])
-def test_tls_verification_stays_on_unless_explicitly_off(monkeypatch, value):
-    monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", value)
-    assert stats._tls_verify() is True
-
-
-@pytest.mark.parametrize("value", ["false", "False", "0", "no", "off", " OFF "])
-def test_tls_verification_turns_off_only_for_off_values(monkeypatch, value):
-    monkeypatch.setenv("ANTON_MINDS_SSL_VERIFY", value)
-    assert stats._tls_verify() is False
-
-
 # -- response mapping ---------------------------------------------------------
 
 
