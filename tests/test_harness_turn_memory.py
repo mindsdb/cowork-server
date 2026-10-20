@@ -149,6 +149,7 @@ async def test_a_person_reads_and_writes_their_own_tiers(monkeypatch, trusted):
         assert global_dir.is_dir() and project_dir.is_dir()
         assert config.cortex.mode == "autopilot"
         assert config.background_memory is True
+        assert turn.learns is True
         # The turn's scratch folder holds only the read-only root of the
         # skills others share with the person: none of its memory.
         assert scratch is not None and {path.name for path in scratch.iterdir()} == {"shared-skills"}
@@ -264,6 +265,8 @@ async def test_memory_off_reads_and_writes_no_learned_memory(
                 assert global_dir.parent.parent == scratch and project_dir.parent.parent == scratch
                 assert config.cortex.mode == "off"
                 assert config.background_memory is False
+                # So its memory record says it read nothing (_turn_memory_read).
+                assert turn.learns is False
                 context = await _everything_the_turn_reads(config)
                 assert list(global_dir.iterdir()) == [] and list(project_dir.iterdir()) == []
                 after = _snapshot(personal_tier, shared, project_memory)
@@ -305,6 +308,7 @@ async def test_a_turn_with_no_person_learns_nothing(monkeypatch, trusted, caplog
             assert list(global_dir.iterdir()) == [] and list(project_dir.iterdir()) == []
             assert config.cortex.mode == "off"
             assert config.background_memory is False
+            assert turn.learns is False
 
             context = await config.cortex.build_memory_context("how many?")
             assert PLANTED_PROJECT_RULE not in context
@@ -349,6 +353,8 @@ async def test_the_desktop_with_memory_disabled_still_reads_the_base_tiers(monke
         assert project_dir == Path(project.path) / ".anton" / "memory"
         assert config.cortex.mode == "off"
         assert config.background_memory is True
+        # It reads the base tiers, so its memory record keeps anton's `learned`.
+        assert turn.learns is True
         assert scratch is None
         context = await config.cortex.build_memory_context("how many?")
         assert PLANTED_PROJECT_RULE in context
@@ -438,7 +444,8 @@ async def test_a_persons_scheduled_run_gets_its_creators_tiers(
         async def _run_turn(self, *, conversation_id: UUID) -> None:
             with get_open_session() as db:
                 conversation = db.get(Conversation, conversation_id)
-                config, scratch, _ = await harness.AntonHarness()._build_chat_session(conversation)
+                built = await harness.AntonHarness()._build_chat_session(conversation)
+                config, scratch = built.session, built.turn_scratch_dir
                 try:
                     seen["tiers"] = _tiers(config)
                     seen["mode"] = config.cortex.mode

@@ -19,7 +19,7 @@ from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
-from cowork.harnesses.anton_harness.harness import AntonHarness
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
 from cowork.services import task_objects as t
 from cowork.services.artifacts import card_for_folder
@@ -97,7 +97,7 @@ def _turn_cards(monkeypatch, conversation) -> list[dict]:
             yield
 
     async def _fake_build(self, conversation, **_kwargs):
-        return _Session(), None, None
+        return BuiltChatSession(session=_Session(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     async def _drain():
         return [

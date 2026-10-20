@@ -42,7 +42,7 @@ from anton.core.tools.registry import ToolOutcome
 
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
-from cowork.harnesses.anton_harness.harness import AntonHarness
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession
 from cowork.harnesses.anton_harness import harness as harness_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, Attachment
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory, format_responses_stream
@@ -225,7 +225,7 @@ def _stream(monkeypatch, session, *, question: str = "hi", read_earlier_answers=
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
         tool_messages=False,
     ):
-        return session, None, None
+        return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
 

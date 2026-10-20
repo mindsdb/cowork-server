@@ -1316,17 +1316,18 @@ async def test_a_direct_answer_carries_its_figure_sources_live_and_saved(monkeyp
 
     events = buffer.events()
     assert [e["type"] for e in events] == [
-        "response.created", "response.output_text.delta", "response.figure_sources", "response.completed",
+        "response.created", "response.output_text.delta", "response.memory_read", "response.figure_sources",
+        "response.completed",
     ]
-    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4]
-    sources = events[2]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4, 5]
+    sources = events[3]
     assert sources["item_id"] == events[1]["item_id"]
     assert sources["steps"] == []
     assert {f["text"]: f["origin"] for f in sources["figures"]} == {"$30": "none", "$60": "none", "2": "question"}
     assert [e["type"] for e in saved["events"]] == [
-        "response.output_text.delta", "response.figure_sources", "response.completed",
+        "response.output_text.delta", "response.memory_read", "response.figure_sources", "response.completed",
     ]
-    assert saved["events"][1] == sources
+    assert saved["events"][2] == sources
     assert buffer.closed == "completed"
 
 
@@ -1337,9 +1338,15 @@ async def test_a_direct_answer_without_figures_streams_as_before(monkeypatch):
     buffer = await _produce_direct_answer(monkeypatch, text="Hi.", saved=saved)
 
     events = buffer.events()
-    assert [e["type"] for e in events] == ["response.created", "response.output_text.delta", "response.completed"]
-    assert events[-1]["sequence_number"] == 3
-    assert [e["type"] for e in saved["events"]] == ["response.output_text.delta", "response.completed"]
+    assert [e["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4]
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    # It runs no agent, so it reads no learned memory.
+    assert events[2] == {"type": "response.memory_read", "sequence_number": 3, "read": False, "entries": 0}
 
 
 @pytest.mark.asyncio
@@ -1356,7 +1363,7 @@ async def test_a_matcher_failure_leaves_the_direct_answer_whole(monkeypatch, cap
     buffer = await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved=saved)
 
     assert [e["type"] for e in buffer.events()] == [
-        "response.created", "response.output_text.delta", "response.completed",
+        "response.created", "response.output_text.delta", "response.memory_read", "response.completed",
     ]
     assert buffer.closed == "completed"
     assert [r for r in caplog.records if r.name == formatter.logger.name and r.levelname == "ERROR"]
@@ -1386,6 +1393,13 @@ async def test_a_non_streaming_direct_answer_returns_and_saves_its_figure_source
     }
     [saved_sources] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
     assert saved_sources["figures"] == output["figure_sources"]["figures"]
+    # The order a streamed direct answer sends them in.
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.figure_sources", "response.completed",
+    ]
+    assert [e for e in saved["events"] if e["type"] == "response.memory_read"] == [
+        {"type": "response.memory_read", "read": False, "entries": 0}
+    ]
 
 
 def _overtime_earlier_answer():
