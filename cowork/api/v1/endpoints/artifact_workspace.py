@@ -7,16 +7,18 @@ import mimetypes
 import ntpath
 import os
 import stat
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
@@ -874,6 +876,94 @@ async def set_artifact_access(
     finally:
         if not publish_abandoned:
             await run_in_threadpool(release, folder.parent, folder.name)
+
+
+async def _call_stats_service(session, folder: Path, call: Callable[..., Any]) -> Any:
+    """Run one stats request with a publish key minted for it, then revoke the key."""
+    from cowork.services import artifact_stats as stats
+
+    key = None
+    try:
+        report_id = await run_in_threadpool(stats.report_id_for_folder, folder)
+        _artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+        api_key = await key.get()
+        if not api_key:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Publishing is unavailable right now. Try again in a moment.",
+            )
+        return await run_in_threadpool(
+            call, publish_url=publish_url, key=api_key, report_id=report_id,
+        )
+    except stats.STATS_ROUTE_ERRORS as exc:
+        if isinstance(exc, stats.PublishCredentialRejected):
+            logger.warning("artifact_stats_upstream_unauthorized artifact=%s", folder.name)
+        raise stats.stats_http_exception(exc, desktop=False) from exc
+    finally:
+        if key is not None:
+            # Under a cancelled anyio scope this await would be cancelled too,
+            # leaving the key live until its TTL.
+            with anyio.CancelScope(shield=True):
+                await key.revoke()
+
+
+class _StatsTrackingBody(BaseModel):
+    enabled: StrictBool
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/stats")
+async def read_artifact_stats(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    session: ScopedSessionDep,
+):
+    """View statistics of this published artifact, as the publishing service returns them.
+
+    Owner-only. artifact.manage is checked here too: auth mints the publish
+    key only with it, and a refusal at the mint would read as a key failure.
+    """
+    await require_product_permission(session.scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    return await _call_stats_service(session, folder, stats.fetch_stats)
+
+
+@router.put("/workspace/{project_ref}/{artifact_id}/stats/tracking")
+async def set_artifact_stats_tracking(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: _StatsTrackingBody,
+    session: ScopedSessionDep,
+):
+    """Turn view recording on or off for this published artifact. Owner-only.
+
+    The publishing service rewrites the artifact's metadata file to store the
+    flag, so the request holds the publish lock: a live sync or autopublish
+    rewriting the same file in between would drop the change.
+    """
+    await require_product_permission(session.scope, "artifact.manage")
+    from functools import partial
+
+    from cowork.services import artifact_stats as stats
+    from cowork.services.artifact_locks import release
+
+    _source, folder, _metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    if not await _acquire_live_publish_lock(folder, timeout_s=_STATS_TRACKING_LOCK_TIMEOUT_S):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Publishing is busy right now. Try again in a moment.",
+        )
+    try:
+        tracking = await _call_stats_service(
+            session, folder, partial(stats.set_tracking, enabled=body.enabled),
+        )
+    finally:
+        # Shielded for the same reason: an unreleased lock blocks publishing
+        # of this artifact until its TTL.
+        with anyio.CancelScope(shield=True):
+            await run_in_threadpool(release, folder.parent, folder.name)
+    return {"tracking": tracking}
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
