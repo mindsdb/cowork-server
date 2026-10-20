@@ -105,7 +105,7 @@ _controllers: set[asyncio.Task] = set()
 
 
 async def _controller_that_never_finishes(conversation_id: str) -> None:
-    """Stands in for scratchpad-controller: takes the turn's job from its
+    """Stands in for the sandbox controller: takes the turn's job from its
     Redis stream, replies with the partial answer, and never sends a terminal."""
     r = get_redis()
     jobs = f"{TurnQueueSettings().jobs_stream}:{conversation_id}"

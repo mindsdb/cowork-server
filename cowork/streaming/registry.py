@@ -571,7 +571,7 @@ class RunRegistry:
         same ordering rule as ``discard``.
 
         Cancelling a remote turn's relay stops only this server's side of it;
-        scratchpad-controller would run the sandbox turn on with nobody
+        the sandbox controller would run the sandbox turn on with nobody
         reading its replies. So each remote turn still answering first gets
         the controller's cancel flag, written as ``/cancel`` writes it
         (cancellation.request_cancel). ``cancel_run`` is not the way in: it

@@ -61,7 +61,7 @@ async def cancel_disconnected_run(handle: RunHandle | None) -> None:
 
 
 async def stop_controller_turn(correlation_id: str, *, turn_label: str) -> None:
-    """Write scratchpad-controller's cancel flag for a turn this server is
+    """Write the sandbox controller's cancel flag for a turn this server is
     ending without its user's Stop, so the sandbox turn stops too.
 
     A failure is logged as a WARNING naming ``turn_label``, never raised: the
@@ -72,7 +72,7 @@ async def stop_controller_turn(correlation_id: str, *, turn_label: str) -> None:
         await request_cancel(correlation_id)
     except Exception:
         logger.warning(
-            "Could not ask scratchpad-controller to stop %s; the sandbox turn may run on.",
+            "Could not ask the sandbox controller to stop %s; the sandbox turn may run on.",
             turn_label, exc_info=True,
         )
 

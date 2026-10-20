@@ -597,7 +597,7 @@ async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_
         if r.name == cancellation.logger.name and r.levelno == logging.WARNING
     ]
     assert [r.getMessage() for r in records] == [
-        f"Could not ask scratchpad-controller to stop channel turn {sent[0]['correlation_id']}; "
+        f"Could not ask the sandbox controller to stop channel turn {sent[0]['correlation_id']}; "
         "the sandbox turn may run on."
     ]
     assert isinstance(records[0].exc_info[1], ConnectionError)

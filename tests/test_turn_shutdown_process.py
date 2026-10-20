@@ -240,7 +240,7 @@ def test_sigterm_ends_an_open_remote_answer_on_its_stream_and_stops_its_controll
     the process exits. Without the SIGTERM pre-drain the bound cuts the stream
     at about 2 s with no terminal frame, which reads below as IncompleteRead.
 
-    Stubbed: scratchpad-controller (the harness's stand-in takes the job and
+    Stubbed: the sandbox controller (the harness's stand-in takes the job and
     replies with the partial answer, then nothing) and the auth service's
     turn key and connection list. The registry, relay, Redis job, reply and
     turn streams, save and lifespan are the real ones, on a fakeredis server.

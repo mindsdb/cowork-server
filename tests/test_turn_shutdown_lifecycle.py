@@ -392,7 +392,7 @@ async def _idle_turn(*, remote: bool, seen_at_cancel: list | None = None, flags=
 async def test_shutdown_stops_a_remote_turn_on_its_controller_and_saves_it_interrupted(
     monkeypatch, tmp_path, controller_flags, remote,
 ):
-    """A remote turn runs on scratchpad-controller; cancelling its relay alone
+    """A remote turn runs on the sandbox controller; cancelling its relay alone
     would leave the sandbox turn running with nobody reading its replies. So
     shutdown writes the controller's cancel flag first, keyed by the turn's
     own correlation id, and the relay's cancel branch still saves the turn as
@@ -496,7 +496,7 @@ async def test_a_failed_flag_write_still_ends_the_turn(monkeypatch, warnings_fro
     assert handle.task.cancelled()
     records = warnings_from(CANCELLATION_LOGGER)
     assert [r.getMessage() for r in records] == [
-        f"Could not ask scratchpad-controller to stop turn {handle.run_id} for shutdown; "
+        f"Could not ask the sandbox controller to stop turn {handle.run_id} for shutdown; "
         "the sandbox turn may run on."
     ]
     assert isinstance(records[0].exc_info[1], ConnectionError)
