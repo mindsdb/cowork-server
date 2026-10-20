@@ -45,6 +45,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import has_figures
+from cowork.harnesses.memory.policy import memory_policy
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
@@ -631,6 +632,18 @@ class ResponsesHandler:
 
         await require_product_permission(self.scope, "product.execute")
 
+        # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
+        # deployment where that still reads stored memory (memory_policy: the
+        # desktop), the question is refused rather than answered from memory.
+        if request.memory == "off" and not memory_policy(memory_enabled=False).off:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "This deployment can't keep one question from reading memory. "
+                    'Retry the request without "memory": "off".'
+                ),
+            )
+
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
         # metric be attributed to a release instead of to a date on which
@@ -659,8 +672,15 @@ class ResponsesHandler:
 
         # Every settings read for this turn, in the gate and in the producer
         # task created below (create_task copies this context), is served from
-        # the snapshot the unit loaded.
-        with use_turn_settings(self.scope, start.settings):
+        # the snapshot the unit loaded. A question with "memory": "off" gets a
+        # copy with memory off, so AntonHarness._build_chat_session gives it
+        # two empty tiers in its scratch folder and no background passes.
+        turn_settings = (
+            start.settings.model_copy(update={"memory_enabled": False})
+            if request.memory == "off"
+            else start.settings
+        )
+        with use_turn_settings(self.scope, turn_settings):
             try:
                 route, turn_llm = await self._route_request(
                     conversation_id=start.conversation_id,
