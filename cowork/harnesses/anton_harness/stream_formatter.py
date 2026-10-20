@@ -817,7 +817,11 @@ async def format_responses_stream(
         elif (
             isinstance(event, StreamToolResult)
             and getattr(event, "action", None) == "message"
-            # A scratchpad result carries the model's own `action`.
+            # A scratchpad result stays a cell's result. Its action is the one
+            # anton resolved for the call, not the model's raw input:
+            # ChatSession's inline exec path and dump branch name theirs, and
+            # _known_scratchpad_action keeps a discarded call's only when the
+            # scratchpad schema allows it.
             and getattr(event, "name", "") != "scratchpad"
         ):
             # A tool's message to the user (generate_artifact's brief when the
@@ -851,6 +855,9 @@ async def format_responses_stream(
                 "thought_role": Role.thought_scratchpad_result.value,
                 "content": event.content[:65536],
                 "tool_name": getattr(event, "name", "") or "",
+                # anton's action, not the model's: the cell replay takes it as
+                # the action of a call that named none
+                # (scratchpad_cell_replay._ran_action).
                 "tool_action": getattr(event, "action", "") or "",
                 "tool_use_id": getattr(event, "id", None) or "",
                 # ok / timeout / error — lets the renderer show a killed cell
