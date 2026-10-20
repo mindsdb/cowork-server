@@ -87,7 +87,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
 
     decision = await decide_route(
@@ -121,7 +121,7 @@ async def test_ineligible_request_shapes_delegate_without_router_call(
 ):
     import cowork.handlers.response_routing as routing
 
-    monkeypatch.setattr(routing, "build_llm_client", lambda: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: (_ for _ in ()).throw(AssertionError()))
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -159,7 +159,7 @@ async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch)
             resolved_gate_model="mindshub_air",
         ),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
 
     decision = await decide_route(
@@ -183,7 +183,7 @@ async def test_router_decline_delegates(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(
         routing,
         "_gate",
@@ -210,7 +210,7 @@ async def test_router_error_fails_open_to_anton(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -236,7 +236,7 @@ async def test_slow_gate_times_out_and_fails_open(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
     monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.02)
 
     decision = await decide_route(
@@ -871,7 +871,7 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
     )
     monkeypatch.setattr(
         routing, "build_llm_client",
-        lambda: (_ for _ in ()).throw(AssertionError("client must not build")),
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("client must not build")),
     )
     provider = _Client(_response(content="Hi there."))
 
@@ -1615,7 +1615,7 @@ async def test_router_unavailable_keeps_model_attribution(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="opus"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: _Boom())
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: _Boom())
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -2017,7 +2017,7 @@ async def test_a_preamble_before_a_tool_call_delegates_and_says_nothing(monkeypa
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
@@ -2055,7 +2055,7 @@ async def test_no_delegated_route_ever_carries_text(monkeypatch, events, first_d
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     provider = _StreamProvider(events, first_delay=first_delay)
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
@@ -2075,7 +2075,7 @@ async def test_a_direct_decision_carries_the_whole_answer(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
