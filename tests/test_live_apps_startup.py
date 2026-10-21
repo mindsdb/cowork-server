@@ -4,6 +4,7 @@ without what keeps each app to its launcher, and with every live-app route
 
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
@@ -185,3 +186,56 @@ def test_health_says_live_apps_are_on(stack):
     client = TestClient(cowork_server.create_app())
 
     assert client.get("/api/v1/health/").json()["live_apps"] is True
+
+
+# ── on: the preview route and the in-server backend stay refused ─────────────
+
+
+def _never(*_args, **_kwargs):
+    raise AssertionError("live apps never reach the in-server backend paths")
+
+
+async def test_the_preview_proxy_still_forwards_nothing(stack, tmp_path):
+    from anton.core.backends import sandbox
+    from starlette.requests import Request
+
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services import preview_proxy
+
+    turn_on_live_apps(stack)
+    folder = tmp_path / "proj" / ".anton" / "artifacts" / "app"
+    folder.mkdir(parents=True)
+    (folder / "metadata.json").write_text(json.dumps({"port": 26866}), encoding="utf-8")
+    stack.setattr(preview_proxy, "preview_mount_for", lambda token, *, scope: folder)
+    stack.setattr(preview_proxy, "get_proxy_client", _never)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/x", "query_string": b"", "headers": []},
+        receive=receive,
+    )
+    response = await preview_proxy.proxy_artifact_request("token", "api/items", request, scope=LOCAL_SCOPE)
+
+    assert response.status_code == 403
+    assert response.body.decode() == sandbox.BACKENDS_OFF_MESSAGE
+
+
+async def test_no_backend_starts_in_this_server(stack, tmp_path):
+    from anton.core.backends import sandbox
+
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services import artifacts, scratchpad_runtime
+
+    turn_on_live_apps(stack)
+    stack.setattr(scratchpad_runtime, "WorkspaceScopedPool", _never)
+    stack.setattr(artifacts, "_probe_port", _never)
+    stack.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
+    folder = tmp_path / "projects" / "proj" / ".anton" / "artifacts" / "app"
+    folder.mkdir(parents=True)
+
+    status = await artifacts._ensure_backend_running(folder, 8000, scope=LOCAL_SCOPE)
+
+    assert status == (False, sandbox.BACKENDS_OFF_MESSAGE, 0)
+    assert artifacts._LAUNCHED_BACKENDS == {}
