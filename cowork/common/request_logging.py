@@ -6,6 +6,7 @@ from http import HTTPMethod, HTTPStatus
 from time import monotonic
 from uuid import uuid4
 
+from fastapi import FastAPI
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from structlog.contextvars import bind_contextvars, reset_contextvars
 
@@ -13,6 +14,20 @@ logger = logging.getLogger(__name__)
 _REQUEST_ID = re.compile(
     r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
 )
+_REFUSAL_REASONS = frozenset(
+    {
+        "expected_organization_missing",
+        "expected_organization_invalid",
+        "organization_mismatch",
+    }
+)
+
+
+class RequestLoggingApp(FastAPI):
+    def build_middleware_stack(self) -> ASGIApp:
+        # Include ServerErrorMiddleware so generated 500 responses carry the
+        # same correlation header and access-log context as handled responses.
+        return RequestLoggingMiddleware(super().build_middleware_stack())
 
 
 class RequestLoggingMiddleware:
@@ -77,6 +92,8 @@ class RequestLoggingMiddleware:
             raise
         finally:
             if not escaped and status >= 400:
+                candidate = scope.get("state", {}).get("_request_log_reason")
+                reason = candidate if candidate in _REFUSAL_REASONS else None
                 fallback = (
                     HTTPStatus(status).name.lower()
                     if status in HTTPStatus
@@ -90,7 +107,7 @@ class RequestLoggingMiddleware:
                         "event": "request_refused"
                         if status < 500
                         else "request_failed",
-                        "reason": fallback,
+                        "reason": reason or fallback,
                     },
                 )
             reset_contextvars(**tokens)

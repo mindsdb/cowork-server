@@ -45,7 +45,7 @@ from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
-from cowork.common.request_logging import RequestLoggingMiddleware
+from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
@@ -396,7 +396,7 @@ def create_app() -> FastAPI:
     initialize_deployment_identity(settings, remote_turns=TurnQueueSettings().is_remote)
 
     # Create FastAPI app
-    app = FastAPI(
+    app = RequestLoggingApp(
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
@@ -667,8 +667,6 @@ def create_app() -> FastAPI:
             "/api/v1/capabilities",
         ),
     )
-
-    app.add_middleware(RequestLoggingMiddleware)
 
     # Include v1 API routes
     app.include_router(v1_router)

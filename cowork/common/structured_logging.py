@@ -275,5 +275,4 @@ def console_handler(access: bool = False):
         handler.addFilter(AccessLogFilter())
     else:
         handler.setLevel(os.environ.get("LOG_LEVEL", "WARNING").upper())
-        handler.addFilter(ServerDiagnosticFilter())
     return handler

@@ -261,7 +261,7 @@ def test_setup_logging_adds_each_uvicorn_filter_once_in_either_configuration_ord
     )
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout.splitlines()[-1])
-    expected = ["DatabaseErrorFilter", "ProviderErrorFilter"]
+    expected = ["ServerDiagnosticFilter", "DatabaseErrorFilter", "ProviderErrorFilter"]
     assert report["logger_filters"] == {
         "uvicorn": expected, "uvicorn.error": expected, "uvicorn.access": [*expected, "AccessQueryFilter"],
         "uvicorn.asgi": expected,
@@ -270,13 +270,13 @@ def test_setup_logging_adds_each_uvicorn_filter_once_in_either_configuration_ord
     if order == "dict_config_first":
         # The handlers Uvicorn installed before setup_logging ran carry the
         # filters too, so a record from a child logger is replaced.
-        assert report["handler_filters"] == {"uvicorn": [[*expected, "ServerDiagnosticFilter"]], "uvicorn.access": [[*expected, "ServerDiagnosticFilter", "AccessLogFilter"]]}
+        assert report["handler_filters"] == {"uvicorn": [expected], "uvicorn.access": [[*expected, "AccessLogFilter"]]}
         assert "Database operation failed: error_type=IntegrityError" in report["child_output"]
         assert not any(secret in report["child_output"] for secret in SECRETS)
     else:
         # dictConfig replaces the handlers; Uvicorn logs only on the loggers
         # that carry the filters themselves.
-        assert report["handler_filters"] == {"uvicorn": [[*expected, "ServerDiagnosticFilter"]], "uvicorn.access": [[*expected, "AccessLogFilter"]]}
+        assert report["handler_filters"] == {"uvicorn": [expected], "uvicorn.access": [[*expected, "AccessLogFilter"]]}
 
 
 async def _start_and_stop(*, app) -> bool:

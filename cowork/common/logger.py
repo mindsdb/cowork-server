@@ -235,14 +235,15 @@ class ProviderErrorFilter(logging.Filter):
             record._diagnostic_safe_template = True
             record.error_type = type(exc).__name__
             record.provider_error = type(provider_error).__name__
-            record.status_code = _own_http_status(error=provider_error)
+            if not hasattr(record, "status_code"):
+                record.status_code = _own_http_status(error=provider_error)
             break
         return True
 
 
 def _add_privacy_filters(*, target: logging.Filterer) -> None:
-    """Attach the database and provider filters to a handler or logger, once each."""
-    for filter_type in (DatabaseErrorFilter, ProviderErrorFilter):
+    """Deduplicate before privacy filters clear the exception's diagnostic marker."""
+    for filter_type in (ServerDiagnosticFilter, DatabaseErrorFilter, ProviderErrorFilter):
         if not any(isinstance(existing, filter_type) for existing in target.filters):
             target.addFilter(filter_type())
 
@@ -449,7 +450,6 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
 
     for handler in handlers:
         handler.setFormatter(make_formatter())
-        handler.addFilter(ServerDiagnosticFilter())
     return handlers
 
 
@@ -458,7 +458,6 @@ def setup_console_handler():
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(make_formatter())
     _add_privacy_filters(target=handler)
-    handler.addFilter(ServerDiagnosticFilter())
     return handler
 
 
