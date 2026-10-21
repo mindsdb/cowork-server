@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed, and its database
 units run inline on fakes (inline_run_db) unless a test needs the real ones.
 """
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import asyncio
 import json
@@ -1030,7 +1031,7 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
     assert record.exc_info is None
     assert "POOL_TIMEOUT" not in repr(record.__dict__)
     [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
-    assert f"[Project:{project.id}][Conversation:{conversation_id}][Artifacts:{slug!r}]" in line
+    assert_log_fields(line, project_id=str(project.id), conversation_id=str(conversation_id), artifact_slugs=[slug])
     assert "POOL_TIMEOUT" not in logged.output()
     assert not [
         r for r in caplog.records
@@ -2631,7 +2632,7 @@ async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_
     assert record.exc_info is None
     assert busy_text not in repr(record.__dict__)
     [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
-    assert f"[Project:{project_id}][Conversation:{conv_id}][Artifacts:'sales-report']" in line
+    assert_log_fields(line, project_id=str(project_id), conversation_id=str(conv_id), artifact_slugs=["sales-report"])
     assert busy_text not in logged.output()
 
 

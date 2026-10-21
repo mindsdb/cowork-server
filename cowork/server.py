@@ -45,6 +45,7 @@ from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
+from cowork.common.request_logging import RequestLoggingMiddleware
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
@@ -230,7 +231,7 @@ async def lifespan(app: FastAPI):
         try:
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
             if reaped:
-                logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
+                logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:
             recovery_session.close()
     except Exception:
@@ -666,6 +667,8 @@ def create_app() -> FastAPI:
             "/api/v1/capabilities",
         ),
     )
+
+    app.add_middleware(RequestLoggingMiddleware)
 
     # Include v1 API routes
     app.include_router(v1_router)
