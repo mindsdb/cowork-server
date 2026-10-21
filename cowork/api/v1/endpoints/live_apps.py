@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import logging
 
+from collections.abc import Callable, Coroutine
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse
+from fastapi.routing import APIRoute
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.code_sandbox import live_apps_on
@@ -33,7 +37,24 @@ from cowork.services.live_apps import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+
+class LiveAppRoute(APIRoute):
+    """A live-app route: 404 with live apps off, before FastAPI reads the
+    request, so a malformed one, a body that isn't JSON included, answers
+    404 too, not 422."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def route_handler(request: Request) -> Response:
+            if not live_apps_on():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+            return await handler(request)
+
+        return route_handler
+
+
+router = APIRouter(route_class=LiveAppRoute)
 
 _UNAVAILABLE = "The live app's access can't be checked right now."
 
@@ -43,18 +64,15 @@ def _require_slot(slot: int) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
 
-# AuthenticatedInOrgMode, declared explicitly; the handler itself refuses a
-# caller with no verified email, after the 404 a deployment without live apps
-# answers.
+# AuthenticatedInOrgMode, declared explicitly. A caller with no verified email
+# has launched nothing, so the list is empty.
 @router.get("/mine", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def my_live_apps(principal: Principal | None = Depends(get_principal)) -> list[dict]:
+async def my_live_apps(principal: Principal | None = Depends(get_principal)) -> list[LiveAppStateResponse]:
     """The latest launch of each of the caller's apps, newest first, for the
     state line on its card."""
-    if not live_apps_on():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     person = live_app_person(principal)
     if person is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        return []
     return [
         LiveAppStateResponse(
             project_id=app.project_id,
@@ -64,9 +82,10 @@ async def my_live_apps(principal: Principal | None = Depends(get_principal)) -> 
             address=app.address,
             started_at=app.started_at,
             stopped_at=app.stopped_at,
-            stop_reason=app.stop_reason,
-            stop_reason_text=app.stop_text,
-        ).model_dump(by_alias=True, mode="json")
+            # A relaunch keeps the app, so it is no stop to show.
+            stop_reason=None if app.stop_reason == "relaunched" else app.stop_reason,
+            stop_reason_text=None if app.stop_reason == "relaunched" else app.stop_text,
+        )
         for app in await person_apps(person)
     ]
 

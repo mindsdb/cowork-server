@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,6 +36,7 @@ from tests._live_apps import (
     clear_live_app_rows,
     general_project,
     headers_for,
+    person,
     person_scope,
     turn_on_live_apps,
 )
@@ -133,6 +135,19 @@ def _shared_with(client: TestClient, headers):
     return client.get("/api/v1/artifacts/shared-live-apps", headers=headers)
 
 
+def _shares_of(client: TestClient, project_id, *, slug: str = SLUG, headers=A):
+    return client.get(
+        "/api/v1/artifacts/live-app-shares", params={"projectId": str(project_id), "slug": slug}, headers=headers
+    )
+
+
+def _withdraw(client: TestClient, share_id: str, *, headers=A):
+    return client.delete(f"/api/v1/artifacts/live-app-share/{share_id}", headers=headers)
+
+
+NO_EMAIL = "Live apps need an email address on your account. Ask the operator to add one."
+
+
 def _files(folder: Path) -> set[str]:
     return {str(path.relative_to(folder)) for path in folder.rglob("*") if path.is_file()}
 
@@ -166,6 +181,7 @@ def test_a_share_with_everyone_is_one_per_app(people):
 @pytest.mark.parametrize(
     ("body", "detail"),
     [
+        ({"email": "b" * 250 + "@example.com"}, "Enter a valid email address."),
         ({"email": "bob@example.com", "everyone": True}, "Choose one address, or everyone on this stack."),
         ({}, "Choose one address, or everyone on this stack."),
         ({"email": "not-an-address"}, "Enter a valid email address."),
@@ -199,10 +215,24 @@ def test_a_share_of_a_missing_app_or_someone_elses_project_is_404(people):
     assert (theirs.status_code, theirs.json()["detail"]) == (404, "No project by that id.")
 
 
-def test_sharing_needs_a_verified_email(people):
-    response = _share(_client(), people["a_project"], headers=headers_for(SUB_A, None), everyone=True)
+def test_without_a_verified_email_sharing_says_why_and_lists_are_empty(people):
+    client = _client()
+    no_email = headers_for(SUB_A, None)
+    share = _share(client, people["a_project"], everyone=True).json()
 
-    assert response.status_code == 401
+    response = _share(client, people["a_project"], headers=no_email, everyone=True)
+    duplicate = _duplicate(client, share["shareId"], people["b_project"], headers=headers_for(SUB_B, None))
+    withdraw = client.delete(f"/api/v1/artifacts/live-app-share/{share['shareId']}", headers=no_email)
+
+    for refused in (response, duplicate, withdraw):
+        assert (refused.status_code, refused.json()["detail"]) == (403, NO_EMAIL)
+    assert _shared_with(client, headers_for(SUB_B, None)).json() == []
+    assert _shares_of(client, people["a_project"], headers=no_email).json() == []
+
+
+@pytest.mark.parametrize("body", [{"everyone": "yes"}, {"everyone": 1}])
+def test_everyone_takes_json_true_only(people, body):
+    assert _share(_client(), people["a_project"], **body).status_code == 422
 
 
 # ── "Shared with you" ────────────────────────────────────────────────────────
@@ -280,7 +310,9 @@ def test_the_copy_takes_only_the_fixed_list_and_is_the_recipients(people):
     assert metadata["type"] == "fullstack-stateless-app"
     assert metadata["name"] == "Orders dashboard"
     assert metadata["datasources"] == [{"engine": "postgres", "name": "demo"}]
-    assert metadata.get("port") is None
+    # anton's store writes every field of its model: the owner's port and
+    # provenance never come along, and the copy's are empty.
+    assert ("port", metadata["port"]) == ("port", None)
     assert metadata["provenance"] == []
     assert metadata["id"] != original["id"]
 
@@ -360,18 +392,29 @@ def test_a_share_with_someone_else_or_into_their_project_is_404(people):
     assert (into_a.status_code, into_a.json()["detail"]) == (404, "No project by that id.")
 
 
+def _replace_with_link(app: Path, name: str, target: Path) -> None:
+    (app / name).unlink()
+    os.symlink(target, app / name)
+
+
 @pytest.mark.parametrize(
     ("plant", "path"),
     [
-        (lambda app: os.symlink("/etc/passwd", app / "static" / "leak.txt"), "static/leak.txt is a link"),
-        (lambda app: os.link(app / "requirements.txt", app / "static" / "twin.txt"), "has a second name"),
-        (lambda app: (app / "backend.py").unlink(), "backend.py is missing"),
+        (lambda app, outside: os.symlink(outside, app / "static" / "leak.txt"), "static/leak.txt is a link"),
+        # Only the open's no-follow flag guards the top-level names.
+        (lambda app, outside: _replace_with_link(app, "backend.py", outside), "backend.py is a link"),
+        (lambda app, outside: _replace_with_link(app, "prd.md", outside), "prd.md is a link"),
+        (lambda app, outside: os.link(outside, app / "static" / "twin.txt"), "static/twin.txt has a second name"),
+        (lambda app, outside: (app / "backend.py").unlink(), "backend.py is missing"),
     ],
+    ids=["static-link", "backend-link", "prd-link", "static-hard-link", "no-backend"],
 )
-def test_the_copy_refuses_a_link_a_hard_link_and_a_missing_backend(people, plant, path):
+def test_the_copy_refuses_a_link_a_hard_link_and_a_missing_backend(people, tmp_path, plant, path):
     client = _client()
     share = _share(client, people["a_project"], email="bob@example.com").json()
-    plant(people["app"])
+    outside = tmp_path / "outside.txt"
+    outside.write_text("COWORK_SECRET=x\n", encoding="utf-8")
+    plant(people["app"], outside)
 
     response = _duplicate(client, share["shareId"], people["b_project"])
 
@@ -404,6 +447,23 @@ def test_the_copy_refuses_an_app_over_antons_launch_caps(stack, people, cap, val
     assert not artifacts.exists() or not any(artifacts.iterdir())
 
 
+def _launch_sizes() -> tuple[int, int, int]:
+    """The fixture app's launch files: their count, their total and the
+    largest one, in bytes."""
+    launched = {name: text.encode() for name, text in APP_FILES.items() if name not in ("prd.md", "spec.md")}
+    return len(launched), sum(map(len, launched.values())), max(map(len, launched.values()))
+
+
+@pytest.mark.parametrize("cap", ["MAX_LAUNCH_FILES", "MAX_LAUNCH_TOTAL_BYTES", "MAX_LAUNCH_FILE_BYTES"])
+def test_an_app_exactly_at_antons_launch_caps_is_copied(stack, people, cap):
+    files, total, largest = _launch_sizes()
+    client = _client()
+    share = _share(client, people["a_project"], email="bob@example.com").json()
+    stack.setattr(sys.modules[MODULE], cap, {"MAX_LAUNCH_FILES": files, "MAX_LAUNCH_TOTAL_BYTES": total, "MAX_LAUNCH_FILE_BYTES": largest}[cap])
+
+    assert _duplicate(client, share["shareId"], people["b_project"]).status_code == 200
+
+
 def test_the_copy_refuses_an_app_folder_reached_through_a_link(people, tmp_path):
     client = _client()
     share = _share(client, people["a_project"], email="bob@example.com").json()
@@ -415,3 +475,270 @@ def test_the_copy_refuses_an_app_folder_reached_through_a_link(people, tmp_path)
 
     assert response.status_code == 422
     assert "reached through a link" in response.json()["detail"]
+
+
+def test_a_share_refuses_a_linked_metadata_file(people, tmp_path):
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"type": "fullstack-stateless-app"}), encoding="utf-8")
+    _replace_with_link(people["app"], "metadata.json", outside)
+
+    response = _share(_client(), people["a_project"], everyone=True)
+
+    assert response.status_code == 422
+    assert "metadata.json is a link" in response.json()["detail"]
+
+
+def test_the_copy_refuses_an_owner_project_folder_reached_through_a_link(people, tmp_path):
+    """A link at the owner's project folder itself, which a no-follow open
+    below it can't see."""
+    client = _client()
+    share = _share(client, people["a_project"], email="bob@example.com").json()
+    project = people["app"].parents[2]
+    elsewhere = tmp_path / "elsewhere-project"
+    project.rename(elsewhere)
+    os.symlink(elsewhere, project)
+
+    response = _duplicate(client, share["shareId"], people["b_project"])
+
+    assert response.status_code == 422
+    assert "reached through a link" in response.json()["detail"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a folder whatever its mode")
+def test_an_unreadable_app_folder_drops_out_of_the_list_and_refuses_a_copy(people):
+    """One app folder the server can't read never fails anyone's whole list."""
+    client = _client()
+    a_path = people["app"].parents[2]
+    _app(str(a_path), "other-9f8e7d6c")
+    unreadable = _share(client, people["a_project"], everyone=True).json()
+    readable = _share(client, people["a_project"], slug="other-9f8e7d6c", everyone=True).json()
+    people["app"].chmod(0)
+    try:
+        listed = _shared_with(client, B)
+        duplicate = _duplicate(client, unreadable["shareId"], people["b_project"])
+    finally:
+        people["app"].chmod(0o755)
+
+    assert listed.status_code == 200
+    assert [entry["shareId"] for entry in listed.json()] == [readable["shareId"]]
+    assert duplicate.status_code == 422
+    assert "can't be read" in duplicate.json()["detail"]
+
+
+def test_confirmed_takes_json_true_only(people):
+    client = _client()
+    share = _share(client, people["a_project"], email="bob@example.com").json()
+
+    response = client.post(
+        "/api/v1/artifacts/live-app-duplicate",
+        json={"shareId": share["shareId"], "projectId": str(people["b_project"]), "confirmed": "yes"},
+        headers=B,
+    )
+
+    assert response.status_code == 422
+
+
+def test_a_failed_received_mark_leaves_no_copy(people, monkeypatch):
+    """A copy without its received mark would reach the agent as the person's
+    own code, so a database failure after the files are written removes it."""
+    from cowork.services import live_apps
+
+    client = TestClient(cowork_server.create_app(), raise_server_exceptions=False)
+    share = _share(client, people["a_project"], email="bob@example.com").json()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(live_apps, "record_copy", fail)
+
+    response = _duplicate(client, share["shareId"], people["b_project"])
+
+    assert response.status_code == 500
+    artifacts = people["b_path"] / ".anton" / "artifacts"
+    assert not artifacts.exists() or not any(artifacts.iterdir())
+
+
+# ── stopping a share ─────────────────────────────────────────────────────────
+
+
+def test_the_owner_lists_their_shares_of_an_app_newest_first(people):
+    from sqlmodel import Session
+
+    from cowork.db.session import get_engine
+    from cowork.models.live_app import LiveAppShare
+
+    client = _client()
+    by_email = _share(client, people["a_project"], email="bob@example.com").json()
+    everyone = _share(client, people["a_project"], everyone=True).json()
+    # The server's own clock stamps both within one second; set them apart.
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        for share_id, minutes in ((by_email["shareId"], 2), (everyone["shareId"], 1)):
+            row = raw.get(LiveAppShare, UUID(share_id))
+            row.created_at = datetime(2026, 10, 21, 12, minutes, tzinfo=timezone.utc)
+            raw.add(row)
+        raw.commit()
+
+    listed = _shares_of(client, people["a_project"]).json()
+
+    assert [entry["shareId"] for entry in listed] == [by_email["shareId"], everyone["shareId"]]
+    assert [(entry["email"], entry["everyone"]) for entry in listed] == [("bob@example.com", False), (None, True)]
+    # Someone else's view of A's project lists nothing of A's.
+    assert _shares_of(client, people["a_project"], headers=B).json()["detail"] == "No project by that id."
+
+
+def test_the_share_list_refuses_as_sharing_does(people):
+    client = _client()
+    _app(str(people["app"].parents[2]), "page-9z8y7x6w", type_="html-app")
+
+    missing = _shares_of(client, people["a_project"], slug="nothing-here")
+    page = _shares_of(client, people["a_project"], slug="page-9z8y7x6w")
+
+    assert (missing.status_code, missing.json()["detail"]) == (404, "No artifact by that name in this project.")
+    assert (page.status_code, page.json()["detail"]) == (400, "Only full-stack apps can be shared this way.")
+
+
+def test_stopping_a_share_ends_it_for_the_recipients_and_keeps_their_copies(people):
+    client = _client()
+    c_project, _ = general_project(person_scope(PARTITION_C, SUB_C))
+    everyone = _share(client, people["a_project"], everyone=True).json()
+    by_email = _share(client, people["a_project"], email="bob@example.com").json()
+    copy = _duplicate(client, everyone["shareId"], c_project, headers=C).json()
+
+    assert _withdraw(client, everyone["shareId"]).status_code == 204
+
+    assert _shared_with(client, C).json() == []
+    # B's own email share of the same app stays.
+    assert [entry["shareId"] for entry in _shared_with(client, B).json()] == [by_email["shareId"]]
+    again = _duplicate(client, everyone["shareId"], c_project, headers=C)
+    assert (again.status_code, again.json()["detail"]) == (404, "This app is no longer shared with you.")
+    cards = client.get("/api/v1/artifacts/", params={"project_id": str(c_project)}, headers=C).json()
+    assert {Path(card["folder"]).name: card["receivedFrom"] for card in cards}[Path(copy["folder"]).name] == {
+        "email": EMAIL_A
+    }
+    assert [entry["shareId"] for entry in _shares_of(client, people["a_project"]).json()] == [by_email["shareId"]]
+
+
+def test_only_the_owner_stops_a_share(people):
+    client = _client()
+    share = _share(client, people["a_project"], email="bob@example.com").json()
+
+    for headers in (B, C):
+        refused = _withdraw(client, share["shareId"], headers=headers)
+        assert (refused.status_code, refused.json()["detail"]) == (404, "This share no longer exists.")
+    assert _withdraw(client, share["shareId"]).status_code == 204
+    gone = _withdraw(client, share["shareId"])
+    assert (gone.status_code, gone.json()["detail"]) == (404, "This share no longer exists.")
+
+
+# ── moving a conversation ────────────────────────────────────────────────────
+
+
+def test_a_moved_conversation_takes_its_apps_shares_and_launches_along(people, tmp_path, monkeypatch):
+    """Moving a conversation to another project moves its app's folder; its
+    share, the received mark and the launch records follow, so recipients
+    still list it and its card keeps its state."""
+    from sqlmodel import Session, select
+
+    from cowork.db.scoped import ScopedSession
+    from cowork.db.session import get_engine
+    from cowork.models.conversation import Conversation
+    from cowork.models.live_app import LiveAppCopy, LiveAppLaunchRecord, LiveAppShare
+    from cowork.models.project import Project
+    from cowork.models.task_object import TaskObject
+    from cowork.services import live_apps
+    from cowork.services.live_apps import CoworkLiveAppHost
+    from cowork.services.task_objects import KIND_ARTIFACT, TaskObjectService
+
+    async def no_slot(*_args, **_kwargs):
+        return None
+
+    # No slot answers here: the launch below only needs its record.
+    monkeypatch.setattr(live_apps, "_slot_boot_time", no_slot)
+
+    client = _client()
+    share = _share(client, people["a_project"], everyone=True).json()
+    engine = get_engine(get_app_settings().database.uri)
+    dest_path = tmp_path / "shared" / PARTITION_A / "projects" / "moved"
+    dest_path.mkdir(parents=True)
+    conversation_id = uuid4()
+    with Session(engine) as raw:
+        dest = Project(name="moved", path=str(dest_path), org_id=PARTITION_A, created_by=SUB_A)
+        raw.add(dest)
+        raw.add(
+            Conversation(
+                id=conversation_id, topic="task", project_id=people["a_project"], org_id=PARTITION_A, created_by=SUB_A
+            )
+        )
+        raw.add(TaskObject(conversation_id=conversation_id, project_id=people["a_project"], kind=KIND_ARTIFACT, ref=SLUG))
+        # A's app was itself a copy someone shared with A.
+        raw.add(LiveAppCopy(partition_id=PARTITION_A, project_id=people["a_project"], slug=SLUG, owner_email="c@example.com", share_id=uuid4()))
+        raw.commit()
+        dest_id = dest.id
+    launch = sys.modules[MODULE].LiveAppLaunch(
+        slot=1, slug=SLUG, artifact_dir=str(people["app"]), address="http://app1.view.localhost:8080/", boot_id="1" * 32
+    )
+    import asyncio
+
+    asyncio.run(
+        CoworkLiveAppHost(person(PARTITION_A, SUB_A, EMAIL_A), project_id=people["a_project"], launch_token="t").launched(
+            launch
+        )
+    )
+
+    with Session(engine) as raw:
+        session = ScopedSession(raw, person_scope(PARTITION_A, SUB_A))
+        TaskObjectService(session).relocate_to_project(
+            session.get(Conversation, conversation_id),
+            session.get(Project, people["a_project"]),
+            session.get(Project, dest_id),
+        )
+
+    assert (dest_path / ".anton" / "artifacts" / SLUG / "backend.py").is_file()
+    (listed,) = _shared_with(client, C).json()
+    assert listed["shareId"] == share["shareId"]
+    with Session(engine) as raw:
+        assert raw.exec(select(LiveAppShare.project_id)).all() == [dest_id]
+        assert raw.exec(select(LiveAppLaunchRecord.project_id)).all() == [dest_id]
+        assert raw.exec(select(LiveAppCopy.project_id)).all() == [dest_id]
+
+
+def test_a_failed_owner_record_removes_the_copy_and_its_received_mark(people, monkeypatch):
+    from sqlmodel import Session, select
+
+    from cowork.db.session import get_engine
+    from cowork.models.live_app import LiveAppCopy
+    from cowork.services import artifact_ownership
+
+    client = TestClient(cowork_server.create_app(), raise_server_exceptions=False)
+    share = _share(client, people["a_project"], email="bob@example.com").json()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("the owner row failed")
+
+    monkeypatch.setattr(artifact_ownership, "record_artifact_owner", fail)
+
+    assert _duplicate(client, share["shareId"], people["b_project"]).status_code == 500
+    artifacts = people["b_path"] / ".anton" / "artifacts"
+    assert not artifacts.exists() or not any(artifacts.iterdir())
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        assert raw.exec(select(LiveAppCopy)).all() == []
+
+
+def test_shared_with_you_lists_newest_first(people):
+    from sqlmodel import Session
+
+    from cowork.db.session import get_engine
+    from cowork.models.live_app import LiveAppShare
+
+    client = _client()
+    _app(str(people["app"].parents[2]), "other-9f8e7d6c")
+    older = _share(client, people["a_project"], email="bob@example.com").json()
+    newer = _share(client, people["a_project"], slug="other-9f8e7d6c", email="bob@example.com").json()
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        for share_id, minutes in ((older["shareId"], 1), (newer["shareId"], 2)):
+            row = raw.get(LiveAppShare, UUID(share_id))
+            row.created_at = datetime(2026, 10, 21, 12, minutes, tzinfo=timezone.utc)
+            raw.add(row)
+        raw.commit()
+
+    assert [entry["shareId"] for entry in _shared_with(client, B).json()] == [newer["shareId"], older["shareId"]]

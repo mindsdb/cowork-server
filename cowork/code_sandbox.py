@@ -45,8 +45,12 @@ store. ``refuse_planted_links`` refuses a link, or a hard-linked file, that
 agent code before the sandbox left there, before the server follows it into
 another person's space.
 
+``live_apps_on`` asks anton whether live apps run full-stack apps in app
+slots outside this server.
+
 ``check_startup`` runs in create_app. It refuses identity headers with the
-sandbox off, and ``landlock`` where it can't hold. ``_probe_abi`` and
+sandbox off, live apps without what keeps each app to its launcher
+(``_check_live_apps_startup``), and ``landlock`` where it can't hold. ``_probe_abi`` and
 ``_run_self_test`` are the one seam tests stub, since neither a macOS machine
 nor every CI kernel has Landlock.
 """
@@ -62,6 +66,7 @@ from collections.abc import Iterable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from cowork.common.logger import get_logger
@@ -118,6 +123,7 @@ _LIVE_APP_SLOTS_API = (
     "MAX_LAUNCH_FILES",
     "MAX_LAUNCH_FILE_BYTES",
     "MAX_LAUNCH_TOTAL_BYTES",
+    "MAX_REPLY_BYTES",
 )
 
 
@@ -324,6 +330,14 @@ def refuse_a_linked_project(project_dir: Path) -> None:
     link into another person's space before the policy refused it.
     """
     _required_dir(project_dir, create=True)
+
+
+def refuse_a_linked_folder(folder: Path) -> None:
+    """Raise OSError when a folder on the way to ``folder`` below the server's
+    roots is a link or not a folder (``_required_dir``), and FileNotFoundError
+    when ``folder`` is gone. Unlike refuse_a_linked_project it makes nothing,
+    so it fits a read of someone else's folder."""
+    _required_dir(folder, create=False)
 
 
 class PlantedLinkError(OSError):
@@ -658,8 +672,12 @@ def _live_apps_gap() -> str | None:
 
 def _check_live_apps_startup(settings: AppSettings) -> None:
     """Raise RuntimeError, naming what to change, where ANTON_LIVE_APP_SLOTS
-    is set and live apps can't keep each app to the person who launched it."""
-    if not os.environ.get(LIVE_APP_SLOTS_VARIABLE, "").strip():
+    is set and live apps can't keep each app to the person who launched it.
+
+    It runs when either the variable is set or anton reads live apps as on,
+    since every runtime decision (live_apps_on) asks anton, and the slot
+    paths skip the bearer only behind these refusals."""
+    if not (os.environ.get(LIVE_APP_SLOTS_VARIABLE, "").strip() or live_apps_on()):
         return
     if settings.code_sandbox != "landlock":
         raise RuntimeError(
@@ -688,22 +706,43 @@ def _check_live_apps_startup(settings: AppSettings) -> None:
     from anton.core.artifacts.live_app_slots import live_app_slot_addresses
 
     try:
-        live_app_slot_addresses()
+        addresses = live_app_slot_addresses()
     except ValueError as error:
         raise RuntimeError(f"{LIVE_APP_SLOTS_VARIABLE} doesn't parse: {error}") from error
-    if not settings.live_apps_viewer_login_url.strip():
+    if not addresses:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} lists no slot address. Set it to the slots' "
+            "http://<host>:<port> addresses, comma-separated, or leave it unset."
+        )
+    viewer_login_url = settings.live_apps_viewer_login_url
+    if viewer_login_url != viewer_login_url.strip() or not _is_viewer_login_url(viewer_login_url):
         raise RuntimeError(
             f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_VIEWER_LOGIN_URL, the viewer "
-            "sign-in that tells this server who opens an app, for example "
-            "http://viewer-login:4180."
+            "sign-in's http:// or https:// address that tells this server who opens an app, "
+            "for example http://viewer-login:4180."
         )
     token = settings.live_apps_launch_token.get_secret_value()
-    if len(token) < MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH:
+    if (
+        len(token) < MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH
+        or token != token.strip()
+        or not token.isascii()
+        or not token.isprintable()
+    ):
         raise RuntimeError(
             f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_LAUNCH_TOKEN of at least "
-            f"{MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH} characters, the token every app slot "
-            "checks before it takes a launch."
+            f"{MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH} printable ASCII characters with no space "
+            "around them, the token every app slot checks before it takes a launch."
         )
+
+
+def _is_viewer_login_url(value: str) -> bool:
+    """Whether ``value`` is an http or https address with a host and no query
+    or fragment, which the access check can join /oauth2/userinfo to."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and not parts.query and not parts.fragment
 
 
 #: cowork-home's own files and folders the server reads and writes at fixed

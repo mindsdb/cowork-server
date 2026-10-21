@@ -16,15 +16,23 @@ from sqlmodel import Field
 
 from cowork.models.base import BaseSQLModel
 
-# The longest address RFC 3696 allows: a 64-character local part, "@", and a
-# 255-character domain.
-EMAIL_MAX_LENGTH = 320
+# The longest address SMTP carries (RFC 5321's 256-octet path less its angle
+# brackets, RFC 3696's erratum 1690), and the longest anton's LiveAppLauncher
+# takes.
+EMAIL_MAX_LENGTH = 254
 
 
 #: Why a launch stopped: the slot's report (idle, max_time, app_exited,
-#: terminated), anton's claim of the slot (replaced, relaunched), or a slot
+#: terminated), anton's claim of the slot (replaced, relaunched, or
+#: launch_failed when the launch that claimed it didn't finish), or a slot
 #: found no longer running it with no report (lost).
-StopReason = Literal["idle", "max_time", "app_exited", "terminated", "replaced", "relaunched", "lost"]
+StopReason = Literal[
+    "idle", "max_time", "app_exited", "terminated", "replaced", "relaunched", "launch_failed", "lost"
+]
+
+#: The stop reasons a person is shown: a relaunch keeps the app, so it is
+#: never shown as a stop.
+ShownStopReason = Literal["idle", "max_time", "app_exited", "terminated", "replaced", "launch_failed", "lost"]
 
 
 class LiveAppLaunchRecord(BaseSQLModel, table=True):
@@ -54,7 +62,7 @@ class LiveAppLaunchRecord(BaseSQLModel, table=True):
     launcher_user_id: str = Field(max_length=36)
     launcher_partition_id: str = Field(max_length=36)
     launcher_email: str = Field(max_length=EMAIL_MAX_LENGTH)
-    project_id: UUID | None = None
+    project_id: UUID
     slug: str = Field(max_length=255)
     artifact_dir: str = Field(max_length=4096)
     address: str = Field(max_length=512)

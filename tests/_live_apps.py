@@ -4,23 +4,25 @@ answering over HTTP, and the people who use them.
 anton's ``anton.core.artifacts.live_app_slots`` (owner: anton,
 ``anton/core/artifacts/live_app_slots.py``) isn't in the anton this server
 pins yet. Where the installed anton lacks it, install_live_app_slots puts a
-stand-in written from that module's published names in its place: the switch,
-the slot addresses, the launch list and its caps, and the models this server
-reads. Where the installed anton has it, the real module is used.
+stand-in written from that module's published names and limits in its place:
+the switch, the slot addresses, the launch list and its caps, the reply cap,
+and the models this server reads. Where the installed anton has it, the real
+module is used, and an error importing it fails the test.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import json
+import importlib.util
 import os
+import re
 import sys
 import types
 from dataclasses import dataclass, field
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import personal_partition_id
@@ -49,8 +51,8 @@ PARTITION_C = personal_partition_id(DEPLOYMENT, SUB_C)
 class _LiveAppLauncher(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    subject: str
-    email: str
+    subject: str = Field(min_length=1, max_length=255)
+    email: str = Field(min_length=3, max_length=254)
 
 
 class _LiveAppLaunch(BaseModel):
@@ -85,10 +87,13 @@ class _SlotApp(_Wire):
 
 class _SlotStatus(_Wire):
     version: Literal[1]
-    boot_id: str
+    boot_id: str = Field(min_length=1)
     booted_at: str
     state: Literal["empty", "running", "exited"]
     app: _SlotApp | None = None
+
+
+_SLOT_ADDRESS = re.compile(r"^http://[A-Za-z0-9.-]+:(?P<port>\d{1,5})$")
 
 
 def _live_apps_enabled() -> bool:
@@ -98,8 +103,8 @@ def _live_apps_enabled() -> bool:
 def _live_app_slot_addresses() -> tuple[str, ...]:
     entries = tuple(entry.strip() for entry in os.environ.get(SLOTS_VARIABLE, "").split(",") if entry.strip())
     for entry in entries:
-        url = httpx.URL(entry)
-        if url.scheme != "http" or not url.host or url.path not in ("", "/"):
+        match = _SLOT_ADDRESS.match(entry)
+        if match is None or not 1 <= int(match["port"]) <= 65535:
             raise ValueError(f"{SLOTS_VARIABLE} entry {entry!r} isn't http://<host>:<port>")
     return entries
 
@@ -116,21 +121,24 @@ def _stand_in() -> types.ModuleType:
     module.MAX_LAUNCH_FILES = 500
     module.MAX_LAUNCH_FILE_BYTES = 8 * 1024 * 1024
     module.MAX_LAUNCH_TOTAL_BYTES = 64 * 1024 * 1024
+    module.MAX_REPLY_BYTES = 1024 * 1024
     return module
 
 
 def install_live_app_slots(monkeypatch) -> types.ModuleType:
     """anton's live-app slots, real or stood in, and a ChatSessionConfig that
-    takes ``live_app_host``."""
+    takes ``live_app_host``. The stand-in goes in only where the installed
+    anton has no such module, so a real module that fails to import fails
+    the test instead of passing on the stand-in."""
     import anton.core.artifacts as artifacts_package
     import anton.core.session as session_module
 
-    try:
-        import anton.core.artifacts.live_app_slots as module
-    except ImportError:
+    if sys.modules.get(MODULE) is None and importlib.util.find_spec(MODULE) is None:
         module = _stand_in()
         monkeypatch.setitem(sys.modules, MODULE, module)
         monkeypatch.setattr(artifacts_package, "live_app_slots", module, raising=False)
+    else:
+        import anton.core.artifacts.live_app_slots as module
     config = session_module.ChatSessionConfig
     if "live_app_host" not in {item.name for item in dataclasses.fields(config)}:
 
@@ -158,28 +166,46 @@ def turn_on_live_apps(monkeypatch) -> types.ModuleType:
 @dataclass
 class FakeSlot:
     boot_id: str = "0" * 32
+    booted_at: str = "2026-10-21T04:40:00Z"
     state: Literal["empty", "running", "exited"] = "empty"
     artifact: str = ""
+    launcher_subject: str = ""
     launcher_email: str = ""
     # Answer status with this code instead, or None.
     fails_with: int | None = None
 
 
 @dataclass
+class ViewerUser:
+    """A viewer-login session: the ID token's ``sub`` and email."""
+
+    sub: str
+    email: str
+
+
+@dataclass
 class FakeServices:
     """viewer-login's /oauth2/userinfo and each slot's GET /status.
 
-    ``sessions`` maps a viewer cookie's value to the signed-in email. Every
-    request each service gets is kept in ``requests``.
+    ``sessions`` maps a viewer cookie's value to the person signed in with
+    it. ``viewer_replies`` maps a cookie's value to a raw reply viewer-login
+    gives instead (a body oauth2-proxy can send, a redirect, an exception the
+    transport raises). ``refresh_cookies`` adds the Set-Cookie headers
+    oauth2-proxy sends when it refreshes a session. Every request each
+    service gets is kept in ``requests``.
     """
 
-    sessions: dict[str, str] = field(default_factory=dict)
+    sessions: dict[str, ViewerUser] = field(default_factory=dict)
     slots: dict[int, FakeSlot] = field(default_factory=lambda: {n: FakeSlot() for n in (1, 2, 3)})
     viewer_fails_with: int | None = None
+    viewer_replies: dict[str, httpx.Response | Exception] = field(default_factory=dict)
+    refresh_cookies: tuple[str, ...] = ()
     requests: list[httpx.Request] = field(default_factory=list)
 
-    def run(self, slot: int, *, boot_id: str, artifact: str, email: str) -> None:
-        self.slots[slot] = FakeSlot(boot_id=boot_id, state="running", artifact=artifact, launcher_email=email)
+    def run(self, slot: int, *, boot_id: str, artifact: str, subject: str, email: str) -> None:
+        self.slots[slot] = FakeSlot(
+            boot_id=boot_id, state="running", artifact=artifact, launcher_subject=subject, launcher_email=email
+        )
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -197,11 +223,17 @@ class FakeServices:
         if self.viewer_fails_with is not None:
             return httpx.Response(self.viewer_fails_with)
         cookie = request.headers.get("cookie", "")
-        value = cookie.removeprefix("_oauth2_proxy=")
-        email = self.sessions.get(value)
-        if email is None:
+        value = cookie.split(";")[0].removeprefix("_oauth2_proxy=")
+        reply = self.viewer_replies.get(value)
+        if isinstance(reply, Exception):
+            raise reply
+        if reply is not None:
+            return reply
+        user = self.sessions.get(value)
+        if user is None:
             return httpx.Response(401)
-        return httpx.Response(200, json={"user": email, "email": email})
+        headers = [("set-cookie", cookie) for cookie in self.refresh_cookies]
+        return httpx.Response(200, json={"user": user.sub, "email": user.email}, headers=headers)
 
     def _status(self, n: int, request: httpx.Request) -> httpx.Response:
         if request.url.path != "/status":
@@ -212,15 +244,18 @@ class FakeServices:
         if slot.fails_with is not None:
             return httpx.Response(slot.fails_with)
         app = None
-        if slot.state == "running":
+        # The slot program keeps its app in the status after the app exits.
+        if slot.state in ("running", "exited"):
             app = {
                 "artifact": slot.artifact,
-                "launcher": {"subject": "sub", "email": slot.launcher_email},
+                "app_id": "0" * 64,
+                "launcher": {"subject": slot.launcher_subject, "email": slot.launcher_email},
                 "started_at": "2026-10-21T04:40:00Z",
                 "expires_at": "2026-10-21T12:40:00Z",
-                "hashes": {"backend": "0" * 64, "requirements": "0" * 64, "connections": "0" * 64},
+                "stop_reason": None,
+                "hashes": {"backend": "0" * 64, "requirements": "0" * 64, "connections": "0" * 64, "files": "0" * 64},
             }
-        body = {"version": 1, "boot_id": slot.boot_id, "booted_at": "2026-10-21T04:40:00Z", "state": slot.state, "app": app}
+        body = {"version": 1, "boot_id": slot.boot_id, "booted_at": slot.booted_at, "state": slot.state, "app": app}
         # Built through the installed anton's own model, so a reply this
         # server's code can't read fails here rather than passing a test.
         status = sys.modules[MODULE].SlotStatus.model_validate(body)
@@ -232,7 +267,9 @@ def answer_over_http(monkeypatch, services: FakeServices) -> None:
     from cowork.services import live_apps
 
     def client() -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(services.handle), follow_redirects=False)
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(services.handle), follow_redirects=False, trust_env=False
+        )
 
     monkeypatch.setattr(live_apps, "_http_client", client)
 
@@ -274,6 +311,8 @@ def person(partition: str, sub: str, email: str):
 
 ALICE = person(PARTITION_A, SUB_A, EMAIL_A)
 BOB = person(PARTITION_B, SUB_B, EMAIL_B)
+VIEWER_A = ViewerUser(SUB_A, EMAIL_A)
+VIEWER_B = ViewerUser(SUB_B, EMAIL_B)
 
 
 def clear_live_app_rows() -> None:

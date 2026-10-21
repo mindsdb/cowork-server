@@ -53,7 +53,8 @@ from anton.core.artifacts.models import DatasourceRef
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import IntegrityError
 
-from cowork.code_sandbox import live_apps_on, refuse_a_linked_project
+from cowork.code_sandbox import live_apps_on, refuse_a_linked_folder, refuse_a_linked_project
+from cowork.common.datetime_utils import ensure_utc
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -68,8 +69,14 @@ from cowork.common.paths import (
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
-from cowork.db.units import run_db
-from cowork.models.live_app import LiveAppCopy, LiveAppLaunchRecord, LiveAppShare, StopReason
+from cowork.db.units import run_db, run_to_completion
+from cowork.models.live_app import (
+    EMAIL_MAX_LENGTH,
+    LiveAppCopy,
+    LiveAppLaunchRecord,
+    LiveAppShare,
+    StopReason,
+)
 from cowork.principal import Principal
 from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH, project_artifacts_base
 
@@ -97,7 +104,14 @@ COPY_DOCS = (PRD_FILENAME, TECH_SPEC_FILENAME)
 #: The longest name or description "Shared with you" shows.
 SHARED_TEXT_MAX_LENGTH = 200
 
+#: The shortest email anton's LiveAppLauncher takes.
+EMAIL_MIN_LENGTH = 3
+
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+# An address a turn's prompt may show as is: no backtick, space or other
+# character that could end its code span or read as an instruction.
+_PROMPT_SAFE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
 
 
 def normalized_email(value: str) -> str:
@@ -106,7 +120,16 @@ def normalized_email(value: str) -> str:
 
 
 def is_email(value: str) -> bool:
-    return _EMAIL.fullmatch(value) is not None
+    return len(value) <= EMAIL_MAX_LENGTH and _EMAIL.fullmatch(value) is not None
+
+
+def prompt_email(value: str) -> str:
+    """Another person's address as a turn's prompt names it: in backticks
+    when it holds only plain address characters, else a generic phrase,
+    since the address comes from that person's account."""
+    if _PROMPT_SAFE_EMAIL.fullmatch(value):
+        return f"`{value}`"
+    return "another person on this stack"
 
 
 # ── who launches ─────────────────────────────────────────────────────────────
@@ -125,11 +148,13 @@ class LiveAppPerson:
 def live_app_person(principal: Principal | None) -> LiveAppPerson | None:
     """The person ``principal`` names, or None for a principal with no email:
     live apps open, share and copy by email, so such a principal can do none
-    of it."""
+    of it. An email anton's LiveAppLauncher wouldn't take (under 3 or over
+    254 characters) counts as none, so its turn runs without a host instead of
+    failing."""
     if principal is None or not principal.user_id or not principal.org_id:
         return None
     email = normalized_email(principal.email)
-    if not email:
+    if not EMAIL_MIN_LENGTH <= len(email) <= EMAIL_MAX_LENGTH:
         return None
     return LiveAppPerson(user_id=principal.user_id, partition_id=principal.org_id, email=email)
 
@@ -160,11 +185,13 @@ class CoworkLiveAppHost:
     anton calls ``claim`` when a launch replaces an app the slot runs, before
     it resets the slot, and ``claim`` stops that app's running record; a
     launch that then fails leaves no running record, so nobody opens the slot
-    until a later launch succeeds. ``launched`` starts the new record once the
-    slot has accepted, ending any record still running there (_start_record).
+    until a later launch succeeds, and anton calls ``launch_failed``, which
+    makes that stop one the person hears of. ``launched`` starts the new
+    record once the slot has accepted, ending any record still running there
+    (_start_record).
     """
 
-    def __init__(self, launcher: LiveAppPerson, *, project_id: UUID | None, launch_token: str) -> None:
+    def __init__(self, launcher: LiveAppPerson, *, project_id: UUID, launch_token: str) -> None:
         from anton.core.artifacts.live_app_slots import LiveAppLauncher
 
         self.launcher = LiveAppLauncher(subject=launcher.user_id, email=launcher.email)
@@ -176,13 +203,17 @@ class CoworkLiveAppHost:
         self._claimed: dict[int, UUID] = {}
 
     async def claim(self, slot: int) -> None:
-        stopped = await run_db(partial(_stop_for_claim, slot=slot, claimer=self._person), scope=SYSTEM_SCOPE)
+        lost_at = await _slot_boot_time(slot)
+        stopped = await run_db(
+            partial(_stop_for_claim, slot=slot, claimer=self._person, lost_at=lost_at), scope=SYSTEM_SCOPE
+        )
         if stopped is None:
             self._claimed.pop(slot, None)
         else:
             self._claimed[slot] = stopped
 
     async def launched(self, launch: LiveAppLaunch) -> None:
+        lost_at = await _slot_boot_time(launch.slot, boot_id=launch.boot_id)
         await run_db(
             partial(
                 _start_record,
@@ -190,12 +221,26 @@ class CoworkLiveAppHost:
                 launcher=self._person,
                 project_id=self._project_id,
                 claimed=self._claimed.pop(launch.slot, None),
+                lost_at=lost_at,
             ),
             scope=SYSTEM_SCOPE,
         )
 
+    async def launch_failed(self, slot: int) -> None:
+        """A launch that claimed ``slot`` didn't finish: anton reset the slot,
+        so the app claim stopped is gone and nothing runs there. Its stop
+        becomes ``launch_failed``, which the card, the stopped page and the
+        next turn tell. Never raises into anton's launch."""
+        claimed = self._claimed.pop(slot, None)
+        if claimed is None:
+            return
+        try:
+            await run_db(partial(_launch_failed, record_id=claimed), scope=SYSTEM_SCOPE)
+        except Exception:
+            logger.warning("live app %d: the failed launch can't be recorded", slot, exc_info=True)
 
-def live_app_host_for_turn(*, project_id: UUID | None) -> CoworkLiveAppHost | None:
+
+def live_app_host_for_turn(*, project_id: UUID) -> CoworkLiveAppHost | None:
     """The live-app host for the turn running in this context, in project
     ``project_id``: None where live apps are off, or where the turn names
     nobody (use_live_app_launcher)."""
@@ -225,9 +270,12 @@ def _stop(
     reason: StopReason,
     limit_hours: float | None = None,
     noticed: bool = False,
+    stopped_at: datetime | None = None,
 ) -> None:
+    """Stop ``record``, at ``stopped_at`` when the stop happened earlier than
+    now (a slot's report, a slot found restarted), else now."""
     record.state = "stopped"
-    record.stopped_at = _utc_now()
+    record.stopped_at = _when_stopped(record, stopped_at)
     record.stop_reason = reason
     record.limit_hours = limit_hours
     record.stop_noticed = noticed
@@ -237,13 +285,25 @@ def _stop(
     session.flush()
 
 
+def _when_stopped(record: LiveAppLaunchRecord, at: datetime | None) -> datetime:
+    """``at`` held between the record's start and now, since a slot's report
+    and a slot's boot time come from outside this server; now for None."""
+    now = _utc_now()
+    if at is None:
+        return now
+    return min(max(ensure_utc(at), ensure_utc(record.started_at)), now)
+
+
 def _same_person(record: LiveAppLaunchRecord, person: LiveAppPerson) -> bool:
     return record.launcher_partition_id == person.partition_id and record.launcher_user_id == person.user_id
 
 
-def _stop_for_claim(session: ScopedSession, *, slot: int, claimer: LiveAppPerson) -> UUID | None:
+def _stop_for_claim(
+    session: ScopedSession, *, slot: int, claimer: LiveAppPerson, lost_at: datetime | None
+) -> UUID | None:
     """Stop slot ``slot``'s running record before ``claimer``'s launch, and
-    return its id."""
+    return its id. Another person's record ends ``lost`` at ``lost_at``, the
+    slot's current boot (_slot_boot_time)."""
     record = _running_record(session, slot=slot)
     if record is None:
         return None
@@ -252,11 +312,25 @@ def _stop_for_claim(session: ScopedSession, *, slot: int, claimer: LiveAppPerson
         # repeats it.
         _stop(session, record, reason="replaced", noticed=True)
     else:
-        # anton claims a slot that ran another person's app only once that
-        # slot is empty (its slot choice never replaces anyone else's app), so
-        # their app had already gone without a report.
-        _stop(session, record, reason="lost")
+        # anton claims only a slot whose status runs the claimer's own app
+        # (its slot choice never replaces anyone else's), so another person's
+        # running record here is one the slot no longer shows: their app had
+        # already gone without a report.
+        _stop(session, record, reason="lost", stopped_at=lost_at)
     return record.id
+
+
+def _launch_failed(session: ScopedSession, *, record_id: UUID) -> None:
+    """Make the stop claim recorded for ``record_id`` a failed launch the
+    person hasn't heard of."""
+    record = session.get(LiveAppLaunchRecord, record_id)
+    # Only the person's own app the claim replaced: another person's record
+    # a claim ended was already gone (lost), and stays theirs as it is.
+    if record is None or record.state != "stopped" or record.stop_reason != "replaced":
+        return
+    record.stop_reason = "launch_failed"
+    record.stop_noticed = False
+    session.add(record)
 
 
 def _start_record(
@@ -264,8 +338,9 @@ def _start_record(
     *,
     launch: LiveAppLaunch,
     launcher: LiveAppPerson,
-    project_id: UUID | None,
+    project_id: UUID,
     claimed: UUID | None,
+    lost_at: datetime | None,
 ) -> None:
     if claimed is not None:
         previous = session.get(LiveAppLaunchRecord, claimed)
@@ -286,7 +361,7 @@ def _start_record(
         if _same_person(stale, launcher) and stale.slug == launch.slug and stale.project_id == project_id:
             _stop(session, stale, reason="relaunched", noticed=True)
         else:
-            _stop(session, stale, reason="lost")
+            _stop(session, stale, reason="lost", stopped_at=lost_at)
     session.add(
         LiveAppLaunchRecord(
             slot=launch.slot,
@@ -337,13 +412,23 @@ def live_app_slot_paths() -> frozenset[str]:
 
 
 class ViewerSession(BaseModel):
-    """viewer-login's /oauth2/userinfo answer (oauth2-proxy's UserInfo). It
-    answers 200 with ``{}`` when it finds no session and no error, so an empty
-    email is a visitor who isn't signed in."""
+    """viewer-login's /oauth2/userinfo answer (oauth2-proxy's UserInfo).
+    ``user`` is the ID token's ``sub`` (oauth2-proxy's user claim), the id the
+    recording proxy sends this server as X-User-Id. It answers 200 with ``{}``
+    when it finds no session and no error, so an empty email is a visitor who
+    isn't signed in."""
 
     model_config = ConfigDict(extra="ignore")
 
+    user: str = ""
     email: str = ""
+
+
+class ViewerIdentity(NamedTuple):
+    """The signed-in visitor: their ``sub`` and their email, normalized."""
+
+    user_id: str
+    email: str
 
 
 class LiveAppAccessUnavailable(RuntimeError):
@@ -354,17 +439,55 @@ AccessOutcome = Literal["allowed", "signed_out", "refused"]
 
 
 class _LaunchedBy(NamedTuple):
+    user_id: str
     email: str
     boot_id: str
 
 
 def _launched_by(session: ScopedSession, *, slot: int) -> _LaunchedBy | None:
     record = _running_record(session, slot=slot)
-    return None if record is None else _LaunchedBy(email=record.launcher_email, boot_id=record.boot_id)
+    if record is None:
+        return None
+    return _LaunchedBy(user_id=record.launcher_user_id, email=record.launcher_email, boot_id=record.boot_id)
 
 
 def _http_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=ACCESS_TIMEOUT_SECONDS, follow_redirects=False)
+    # trust_env=False: viewer-login and the slots are sibling containers on
+    # internal networks, never behind a proxy a deployment may set, which
+    # would otherwise get the visitor's cookie and the launch token. A client
+    # per check keeps no viewer-login cookie from one visitor to the next.
+    # trust_env=False also stops httpx reading SSL_CERT_FILE and SSL_CERT_DIR,
+    # so the context reads them itself, for a viewer-login on a private CA.
+    return httpx.AsyncClient(
+        timeout=ACCESS_TIMEOUT_SECONDS,
+        follow_redirects=False,
+        trust_env=False,
+        verify=httpx.create_ssl_context(trust_env=True),
+    )
+
+
+class _Reply(NamedTuple):
+    status_code: int
+    content: bytes
+
+
+class _ReplyTooLarge(Exception):
+    pass
+
+
+async def _get(client: httpx.AsyncClient, url: str, *, headers: dict[str, str | bytes]) -> _Reply:
+    """GET ``url``: its status and body, read no further than anton reads a
+    slot's reply (MAX_REPLY_BYTES). Raises httpx.HTTPError as httpx does, and
+    _ReplyTooLarge past the cap."""
+    from anton.core.artifacts.live_app_slots import MAX_REPLY_BYTES
+
+    async with client.stream("GET", url, headers=headers) as response:
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body += chunk
+            if len(body) > MAX_REPLY_BYTES:
+                raise _ReplyTooLarge
+        return _Reply(response.status_code, bytes(body))
 
 
 async def check_access(slot: int, *, cookie: str) -> AccessOutcome:
@@ -372,16 +495,19 @@ async def check_access(slot: int, *, cookie: str) -> AccessOutcome:
     the app slot ``slot`` runs now.
 
     The launcher comes from the slot's running record and from the slot's own
-    status, never from the request: both must name the visitor, and the slot
-    must still run the launch the record names (its boot id). Raises
-    LiveAppAccessUnavailable when viewer-login or the slot can't answer.
+    status, never from the request: both must name the visitor, by ``sub``
+    and by email, and the slot must still run the launch the record names
+    (its boot id). Raises LiveAppAccessUnavailable when viewer-login or the
+    slot can't answer.
     """
+    if not cookie:
+        return "signed_out"
     async with _http_client() as client:
-        email = await viewer_email(client, cookie)
-        if not email:
+        visitor = await viewer_identity(client, cookie)
+        if visitor is None:
             return "signed_out"
         launched_by = await run_db(partial(_launched_by, slot=slot), scope=SYSTEM_SCOPE)
-        if launched_by is None or launched_by.email != email:
+        if launched_by is None or (launched_by.user_id, launched_by.email) != visitor:
             return "refused"
         slot_status = await _slot_status(client, slot)
     app = slot_status.app
@@ -389,33 +515,51 @@ async def check_access(slot: int, *, cookie: str) -> AccessOutcome:
         slot_status.state != "running"
         or app is None
         or slot_status.boot_id != launched_by.boot_id
-        or normalized_email(app.launcher.email) != email
+        or app.launcher.subject != visitor.user_id
+        or normalized_email(app.launcher.email) != visitor.email
     ):
         return "refused"
     return "allowed"
 
 
-async def viewer_email(client: httpx.AsyncClient, cookie: str) -> str:
-    """The email of the visitor signed in with ``cookie``, normalized, or ""
-    for nobody. Raises LiveAppAccessUnavailable when viewer-login can't say."""
+async def viewer_identity(client: httpx.AsyncClient, cookie: str) -> ViewerIdentity | None:
+    """The visitor signed in with ``cookie``, or None for nobody. Raises
+    LiveAppAccessUnavailable when viewer-login can't say."""
     if not cookie:
-        return ""
-    url = get_app_settings().live_apps_viewer_login_url.rstrip("/") + "/oauth2/userinfo"
+        return None
+    url = get_app_settings().live_apps_viewer_login_url.strip().rstrip("/") + "/oauth2/userinfo"
     try:
-        response = await client.get(url, headers={"Cookie": cookie})
-    except httpx.HTTPError as error:
+        # The header's own bytes: Starlette decoded them as latin-1, and a
+        # cookie the app's page set may hold any byte, which httpx can't
+        # encode back from a str.
+        reply = await _get(client, url, headers={"Cookie": cookie.encode("latin-1")})
+    except (httpx.HTTPError, UnicodeError) as error:
         raise LiveAppAccessUnavailable(
             f"viewer-login didn't answer ({type(error).__name__})"
         ) from error
-    if response.status_code == 401:
-        return ""
-    if response.status_code != 200:
-        raise LiveAppAccessUnavailable(f"viewer-login answered {response.status_code}")
+    except _ReplyTooLarge:
+        raise LiveAppAccessUnavailable("viewer-login's answer is too large") from None
+    if reply.status_code == 401:
+        return None
+    if reply.status_code != 200:
+        raise LiveAppAccessUnavailable(f"viewer-login answered {reply.status_code}")
     try:
-        session = ViewerSession.model_validate_json(response.content)
+        session = ViewerSession.model_validate_json(reply.content)
     except ValidationError as error:
         raise LiveAppAccessUnavailable("viewer-login's answer doesn't parse") from error
-    return normalized_email(session.email)
+    email = normalized_email(session.email)
+    if not email:
+        return None
+    return ViewerIdentity(user_id=_canonical_sub(session.user), email=email)
+
+
+def _canonical_sub(sub: str) -> str:
+    """``sub`` in the form the identity middleware gives X-User-Id (a UUID's
+    lowercase, hyphenated text), so the two compare; as it is otherwise."""
+    try:
+        return str(UUID(sub.strip()))
+    except ValueError:
+        return sub
 
 
 async def _slot_status(client: httpx.AsyncClient, slot: int) -> SlotStatus:
@@ -424,15 +568,17 @@ async def _slot_status(client: httpx.AsyncClient, slot: int) -> SlotStatus:
     address = live_app_slot_addresses()[slot - 1]
     token = get_app_settings().live_apps_launch_token.get_secret_value()
     try:
-        response = await client.get(f"{address}/status", headers={"Authorization": f"Bearer {token}"})
+        reply = await _get(client, f"{address}/status", headers={"Authorization": f"Bearer {token}"})
     except httpx.HTTPError as error:
         raise LiveAppAccessUnavailable(
             f"live-app slot {slot} didn't answer ({type(error).__name__})"
         ) from error
-    if response.status_code != 200:
-        raise LiveAppAccessUnavailable(f"live-app slot {slot} answered {response.status_code}")
+    except _ReplyTooLarge:
+        raise LiveAppAccessUnavailable(f"live-app slot {slot}'s status is too large") from None
+    if reply.status_code != 200:
+        raise LiveAppAccessUnavailable(f"live-app slot {slot} answered {reply.status_code}")
     try:
-        return SlotStatus.model_validate_json(response.content)
+        return SlotStatus.model_validate_json(reply.content)
     except ValidationError as error:
         raise LiveAppAccessUnavailable(f"live-app slot {slot}'s status doesn't parse") from error
 
@@ -443,7 +589,8 @@ async def _slot_status(client: httpx.AsyncClient, slot: int) -> SlotStatus:
 class SlotStopReport(BaseModel):
     """A slot program's report that it ended its app (POST
     /api/v1/live-apps/<n>/stopped). ``limit_hours`` is the idle or maximum time
-    for an ``idle`` or ``max_time`` stop."""
+    for an ``idle`` or ``max_time`` stop; ``stopped_at`` is when the slot ended
+    it, which the record keeps within the launch's own lifetime."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -451,6 +598,7 @@ class SlotStopReport(BaseModel):
     artifact: str = Field(default="", max_length=255)
     reason: Literal["idle", "max_time", "app_exited", "reset", "terminated"]
     limit_hours: float | None = Field(default=None, ge=0, le=100_000)
+    stopped_at: datetime | None = None
 
 
 class SlotReportRefused(PermissionError):
@@ -481,9 +629,10 @@ async def record_slot_stop(
 
     Believed only from the slot's own address, with no forwarding header, and
     only for the boot id of the slot's running record, which only anton and
-    the slot know. A ``reset`` changes nothing: anton resets a slot only
-    after its claim stopped the record. Raises SlotReportRefused for any other
-    address.
+    the slot know. A ``reset`` changes nothing: after a claim the record is
+    already stopped, and otherwise (anton resets an exited slot, or one after
+    a launch that didn't finish) the slot's next boot marks a record it still
+    runs lost. Raises SlotReportRefused for any other address.
     """
     if peer is None or any(name.lower() in _FORWARDING_HEADERS for name in headers):
         raise SlotReportRefused(f"a stop report for live-app slot {slot} came through a proxy")
@@ -499,23 +648,44 @@ def _stop_reported(session: ScopedSession, *, slot: int, report: SlotStopReport)
     if record is None or record.boot_id != report.boot_id:
         return False
     limit_hours = report.limit_hours if report.reason in ("idle", "max_time") else None
-    _stop(session, record, reason=report.reason, limit_hours=limit_hours)
+    _stop(session, record, reason=report.reason, limit_hours=limit_hours, stopped_at=report.stopped_at)
     return True
+
+
+def _limit_text(limit_hours: float) -> str:
+    """An idle or maximum time as a stop's sentence shows it: whole minutes
+    under an hour ("2 min"), else hours ("2 h", "1.5 h")."""
+    if limit_hours < 1:
+        return f"{max(1, round(limit_hours * 60))} min"
+    return f"{limit_hours:g} h"
 
 
 def stop_reason_text(reason: StopReason | None, *, limit_hours: float | None) -> str | None:
     """The sentence the card, the stopped page and the turn show for a stop."""
-    hours = "" if limit_hours is None else f"{limit_hours:g}"
+    limit = "" if limit_hours is None else _limit_text(limit_hours)
     texts: dict[str, str] = {
-        "idle": f"no requests for {hours} h" if hours else "no requests for a while",
-        "max_time": f"it reached its {hours} h limit" if hours else "it reached its time limit",
+        "idle": f"no requests for {limit}" if limit else "no requests for a while",
+        "max_time": f"it reached its {limit} limit" if limit else "it reached its time limit",
         "app_exited": "its backend stopped by itself",
         "terminated": "the operator or a stack restart stopped it",
-        "replaced": "you launched another app in its slot",
+        # True both for another app of theirs and for a relaunch of this one
+        # that didn't start, since claim stops the record before either.
+        "replaced": "a launch of yours took its slot",
         "relaunched": "you relaunched it",
+        "launch_failed": "a launch of yours into its slot didn't start",
         "lost": "its app slot restarted",
     }
     return None if reason is None else texts[reason]
+
+
+def stop_time_text(at: datetime, *, now: datetime | None = None) -> str:
+    """When a stop happened, as the stopped page and the turn show it: "12:04
+    UTC" for a stop today (UTC), "19 Oct 12:04 UTC" for an older one."""
+    when = ensure_utc(at).astimezone(timezone.utc)
+    today = ensure_utc(now or _utc_now()).astimezone(timezone.utc).date()
+    if when.date() == today:
+        return when.strftime("%H:%M UTC")
+    return f"{when.day} {when.strftime('%b %H:%M')} UTC"
 
 
 # ── the person's apps ────────────────────────────────────────────────────────
@@ -525,7 +695,7 @@ class PersonApp(NamedTuple):
     """The latest launch of one of a person's apps."""
 
     record_id: UUID
-    project_id: UUID | None
+    project_id: UUID
     slug: str
     slot: int
     address: str
@@ -569,51 +739,80 @@ def _latest_apps(session: ScopedSession, *, person: LiveAppPerson) -> list[Perso
         )
         .order_by(LiveAppLaunchRecord.started_at.desc())
     ).all()
-    latest: dict[tuple[UUID | None, str], PersonApp] = {}
+    latest: dict[tuple[UUID, str], PersonApp] = {}
     for record in records:
         latest.setdefault((record.project_id, record.slug), _as_person_app(record))
     return list(latest.values())
 
 
-def _mark_lost(session: ScopedSession, *, record_ids: Iterable[UUID]) -> None:
-    for record_id in record_ids:
+def _mark_lost(session: ScopedSession, *, lost: dict[UUID, datetime | None]) -> dict[UUID, PersonApp]:
+    """Stop each record in ``lost`` still running as ``lost``, at the time
+    given for it (now for None), and return each record as it now stands,
+    one a report stopped meanwhile included."""
+    now_standing: dict[UUID, PersonApp] = {}
+    for record_id, at in lost.items():
         record = session.get(LiveAppLaunchRecord, record_id)
-        if record is not None and record.state == "running":
-            _stop(session, record, reason="lost")
+        if record is None:
+            continue
+        if record.state == "running":
+            _stop(session, record, reason="lost", stopped_at=at)
+        now_standing[record_id] = _as_person_app(record)
+    return now_standing
+
+
+async def _slot_boot_time(slot: int, *, boot_id: str | None = None) -> datetime | None:
+    """When slot ``slot``'s current boot began (only when it is ``boot_id``,
+    if given): the latest an app the slot ran before can have ended. None
+    when the slot can't say. Never raises, since anton fails a launch whose
+    host call raises."""
+    try:
+        async with _http_client() as client:
+            status = await _slot_status(client, slot)
+    except Exception:
+        return None
+    if boot_id is not None and status.boot_id != boot_id:
+        return None
+    return _booted_at(status)
+
+
+def _booted_at(status: SlotStatus) -> datetime | None:
+    """When the slot's current boot began, the latest its earlier app can
+    have ended, or None when the slot's time doesn't parse."""
+    try:
+        return datetime.fromisoformat(status.booted_at.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
 
 
 async def reconcile_running(apps: list[PersonApp]) -> list[PersonApp]:
     """``apps`` with every running one its slot no longer runs marked
-    stopped, ``lost``, in the database too. A slot that can't answer leaves
-    its app as recorded."""
+    stopped, ``lost``, in the database too: a slot on a later boot, or a slot
+    the slot list no longer has. A slot that still shows the record's boot,
+    running or exited, keeps it running: an exited slot's report of why is
+    on its way. A slot that can't answer leaves its app as recorded."""
     running = [app for app in apps if app.running]
     if not running:
         return apps
+    count = len(live_app_slot_addresses())
+    # A slot past the list (the operator lowered the slot count) has no
+    # address to ask and no route for its report.
+    lost: dict[UUID, datetime | None] = {app.record_id: None for app in running if not 1 <= app.slot <= count}
+    asked = [app for app in running if 1 <= app.slot <= count]
     async with _http_client() as client:
         statuses = await asyncio.gather(
-            *(_slot_status(client, app.slot) for app in running), return_exceptions=True
+            *(_slot_status(client, app.slot) for app in asked), return_exceptions=True
         )
-    lost = {
-        app.record_id
-        for app, status in zip(running, statuses)
-        if not isinstance(status, BaseException)
-        and (status.state != "running" or status.boot_id != app.boot_id)
-    }
-    for app, status in zip(running, statuses):
+    for app, status in zip(asked, statuses):
         if isinstance(status, LiveAppAccessUnavailable):
             logger.warning("live app %d: its status can't be read: %s", app.slot, status)
         elif isinstance(status, BaseException):
             raise status
+        elif status.boot_id != app.boot_id:
+            lost[app.record_id] = _booted_at(status)
     if not lost:
         return apps
-    await run_db(partial(_mark_lost, record_ids=lost), scope=SYSTEM_SCOPE)
-    now = _utc_now()
-    return [
-        app._replace(running=False, stopped_at=now, stop_reason="lost", stop_noticed=False)
-        if app.record_id in lost
-        else app
-        for app in apps
-    ]
+    now_standing = await run_db(partial(_mark_lost, lost=lost), scope=SYSTEM_SCOPE)
+    return [now_standing.get(app.record_id, app) for app in apps]
 
 
 async def person_apps(person: LiveAppPerson) -> list[PersonApp]:
@@ -644,34 +843,93 @@ def _page(body: str) -> str:
     )
 
 
-def _slot_history(session: ScopedSession, *, slot: int, email: str) -> tuple[PersonApp | None, bool]:
-    """``email``'s latest launch on slot ``slot``, and whether someone else's
-    app runs there now."""
+class _SlotHistory(NamedTuple):
+    """The visitor's latest launch on a slot (``mine``), with the space it
+    lives in; the same app running on another slot now (``elsewhere``); and
+    whether someone else's app runs on the slot now."""
+
+    mine: PersonApp | None
+    partition_id: str | None
+    elsewhere: PersonApp | None
+    other_running: bool
+
+
+def _slot_history(session: ScopedSession, *, slot: int, user_id: str) -> _SlotHistory:
+    """The launches on slot ``slot`` of the person whose ``sub`` is
+    ``user_id``, as _SlotHistory tells them."""
     mine = session.exec(
         session.select(LiveAppLaunchRecord)
-        .where(LiveAppLaunchRecord.slot == slot, LiveAppLaunchRecord.launcher_email == email)
+        .where(LiveAppLaunchRecord.slot == slot, LiveAppLaunchRecord.launcher_user_id == user_id)
         .order_by(LiveAppLaunchRecord.started_at.desc())
     ).first()
     running = _running_record(session, slot=slot)
-    other_running = running is not None and running.launcher_email != email
-    return (None if mine is None else _as_person_app(mine)), other_running
+    other_running = running is not None and running.launcher_user_id != user_id
+    if mine is None:
+        return _SlotHistory(None, None, None, other_running)
+    elsewhere = session.exec(
+        session.select(LiveAppLaunchRecord).where(
+            LiveAppLaunchRecord.launcher_partition_id == mine.launcher_partition_id,
+            LiveAppLaunchRecord.launcher_user_id == user_id,
+            LiveAppLaunchRecord.project_id == mine.project_id,
+            LiveAppLaunchRecord.slug == mine.slug,
+            LiveAppLaunchRecord.slot != slot,
+            LiveAppLaunchRecord.state == "running",
+        )
+    ).first()
+    return _SlotHistory(
+        _as_person_app(mine),
+        mine.launcher_partition_id,
+        None if elsewhere is None else _as_person_app(elsewhere),
+        other_running,
+    )
+
+
+async def _app_name(*, partition_id: str, user_id: str, project_id: UUID, slug: str) -> str:
+    """The name the person's app ``slug`` has in its metadata.json, as their
+    card shows it, or the slug when it can't be read."""
+    from cowork.db.scoped import scope_for_identity
+    from cowork.services.projects import ProjectNotFoundError, ProjectService
+
+    def project_path(session: ScopedSession) -> Path | None:
+        try:
+            return Path(ProjectService(session).get_project(project_id).path)
+        except ProjectNotFoundError:
+            return None
+
+    project_dir = await run_db(project_path, scope=scope_for_identity(org_id=partition_id, user_id=user_id))
+    if project_dir is None:
+        return slug
+    try:
+        metadata = await asyncio.to_thread(read_app_metadata, project_dir, slug)
+    except (LiveAppGone, LiveAppCopyRefused):
+        return slug
+    return shared_text(metadata.name) or slug
 
 
 async def stopped_page(slot: int, *, cookie: str) -> StoppedPage:
     """The page the edge shows at slot ``slot``'s address instead of a bare
-    403, 502 or 503: why the visitor's app there stopped, for a visitor who
-    launched one there, and a plain refusal for anyone else."""
-    async with _http_client() as client:
-        email = await viewer_email(client, cookie)
+    403, 502 or 503: why the visitor's app there stopped, or where it runs
+    now, for a visitor who launched one there, and a plain refusal for anyone
+    else."""
     refusal = StoppedPage(403, _page(f"<p>{_NO_ACCESS}</p>"))
-    if not email:
+    if not cookie:
         return refusal
-    app, other_running = await run_db(partial(_slot_history, slot=slot, email=email), scope=SYSTEM_SCOPE)
-    if app is None:
+    async with _http_client() as client:
+        visitor = await viewer_identity(client, cookie)
+    if visitor is None or not visitor.user_id:
+        return refusal
+    history = await run_db(partial(_slot_history, slot=slot, user_id=visitor.user_id), scope=SYSTEM_SCOPE)
+    app = history.mine
+    if app is None or history.partition_id is None:
         return refusal
     if app.running:
         (app,) = await reconcile_running([app])
-    name = html.escape(app.slug)
+    elsewhere = history.elsewhere
+    if elsewhere is not None and not app.running:
+        (elsewhere,) = await reconcile_running([elsewhere])
+    name = html.escape(
+        await _app_name(partition_id=history.partition_id, user_id=visitor.user_id, project_id=app.project_id, slug=app.slug)
+    )
     if app.running:
         return StoppedPage(
             200,
@@ -680,10 +938,15 @@ async def stopped_page(slot: int, *, cookie: str) -> StoppedPage:
                 "<p>Ask your agent to relaunch it.</p>"
             ),
         )
-    stopped_at = (app.stopped_at or _utc_now()).astimezone(timezone.utc).strftime("%H:%M")
+    if elsewhere is not None and elsewhere.running:
+        address = html.escape(elsewhere.address)
+        return StoppedPage(
+            200, _page(f"<p>Your app <code>{name}</code> now runs at <a href=\"{address}\">{address}</a>.</p>")
+        )
+    stopped_at = stop_time_text(app.stopped_at or _utc_now())
     reason = html.escape(app.stop_text or "")
-    body = f"<p>Your app <code>{name}</code> stopped at {stopped_at} UTC: {reason}.</p><p>Ask your agent to relaunch it.</p>"
-    if other_running:
+    body = f"<p>Your app <code>{name}</code> stopped at {stopped_at}: {reason}.</p><p>Ask your agent to relaunch it.</p>"
+    if history.other_running:
         body += (
             "<p>This address now serves another person's app, so a relaunch gets a new one, "
             "which its card in Cowork shows.</p>"
@@ -812,8 +1075,9 @@ def read_shared_app(project_dir: Path, slug: str) -> SharedApp:
     says of the app.
 
     Raises LiveAppGone when the folder or its metadata is gone, and
-    LiveAppCopyRefused for a link, a hard-linked file, a name the copy
-    refuses, a file over its cap, or an app that isn't full-stack.
+    LiveAppCopyRefused for a link (at the owner's project folder too), a
+    hard-linked file, a name the copy refuses, a file over its cap, a folder
+    that can't be read, or an app that isn't full-stack.
     """
     from anton.core.artifacts.live_app_slots import (
         LAUNCH_DIRS,
@@ -829,6 +1093,9 @@ def read_shared_app(project_dir: Path, slug: str) -> SharedApp:
     )
     _check_name(slug, path=PurePosixPath(slug))
     try:
+        # opened_subdir_nofollow trusts its base, so the owner's project
+        # folder itself is checked from the server's roots first.
+        refuse_a_linked_folder(project_dir)
         with opened_subdir_nofollow(project_dir, *_ARTIFACTS_SUBPATH, slug) as folder:
             metadata = _read_metadata(folder)
             launched: list[AppFile] = []
@@ -854,12 +1121,8 @@ def read_shared_app(project_dir: Path, slug: str) -> SharedApp:
                 content = _read_regular(folder, name, path=root / name, limit=COPY_DOC_MAX_BYTES)
                 if content is not None:
                     docs.append(AppFile(root / name, content))
-    except FileNotFoundError:
-        raise LiveAppGone(slug) from None
     except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise LiveAppCopyRefused(f"the folder of {slug} is reached through a link") from None
-        raise
+        raise _folder_refusal(error, slug=slug) from None
     if not any(file.path == root / "backend.py" for file in launched):
         raise LiveAppCopyRefused("backend.py is missing")
     return SharedApp(
@@ -893,14 +1156,23 @@ def read_app_metadata(project_dir: Path, slug: str) -> AppMetadata:
     LiveAppCopyRefused as read_shared_app does."""
     _check_name(slug, path=PurePosixPath(slug))
     try:
+        refuse_a_linked_folder(project_dir)
         with opened_subdir_nofollow(project_dir, *_ARTIFACTS_SUBPATH, slug) as folder:
             return _read_metadata(folder)
-    except FileNotFoundError:
-        raise LiveAppGone(slug) from None
     except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise LiveAppCopyRefused(f"the folder of {slug} is reached through a link") from None
-        raise
+        raise _folder_refusal(error, slug=slug) from None
+
+
+def _folder_refusal(error: OSError, *, slug: str) -> LiveAppGone | LiveAppCopyRefused:
+    """What reading the owner's app ``slug`` raises for ``error``: gone for a
+    missing folder, a refusal naming the folder for a link on the way or one
+    the server can't read (a permission, say), so one bad folder never fails
+    a list of other people's apps."""
+    if isinstance(error, FileNotFoundError):
+        return LiveAppGone(slug)
+    if error.errno in (errno.ELOOP, errno.ENOTDIR):
+        return LiveAppCopyRefused(f"the folder of {slug} is reached through a link")
+    return LiveAppCopyRefused(f"the folder of {slug} can't be read")
 
 
 def write_app_copy(project_dir: Path, app: SharedApp) -> str:
@@ -926,10 +1198,16 @@ def write_app_copy(project_dir: Path, app: SharedApp) -> str:
             for file in app.files:
                 _write_file(folder, file)
     except BaseException:
-        with opened_subdir_nofollow(project_dir, *_ARTIFACTS_SUBPATH) as artifacts:
-            dir_rmtree(artifacts, created.slug)
+        remove_app_copy(project_dir, created.slug)
         raise
     return created.slug
+
+
+def remove_app_copy(project_dir: Path, slug: str) -> None:
+    """Remove the copy ``slug`` write_app_copy made in ``project_dir``,
+    without following links."""
+    with opened_subdir_nofollow(project_dir, *_ARTIFACTS_SUBPATH) as artifacts:
+        dir_rmtree(artifacts, slug)
 
 
 def _write_file(folder: PinnedDir, file: AppFile) -> None:
@@ -1035,6 +1313,34 @@ def record_share(
     return _as_share_record(share)
 
 
+def _owned_by(owner: LiveAppPerson):
+    """Shares ``owner`` made: their space and their ``sub``."""
+    return sa.and_(
+        LiveAppShare.owner_partition_id == owner.partition_id, LiveAppShare.owner_user_id == owner.user_id
+    )
+
+
+def shares_of_app(session: ScopedSession, *, owner: LiveAppPerson, project_id: UUID, slug: str) -> list[ShareRecord]:
+    """Every share ``owner`` made of their app ``slug`` in project
+    ``project_id``, newest first."""
+    rows = session.exec(
+        session.select(LiveAppShare)
+        .where(_owned_by(owner), LiveAppShare.project_id == project_id, LiveAppShare.slug == slug)
+        .order_by(LiveAppShare.created_at.desc())
+    ).all()
+    return [_as_share_record(row) for row in rows]
+
+
+def delete_share(session: ScopedSession, *, owner: LiveAppPerson, share_id: UUID) -> bool:
+    """Withdraw share ``share_id`` when ``owner`` made it, and say whether it
+    did. Copies already made keep their own rows, so their "received from"."""
+    row = session.exec(session.select(LiveAppShare).where(LiveAppShare.id == share_id, _owned_by(owner))).first()
+    if row is None:
+        return False
+    session.delete(row)
+    return True
+
+
 class ShareForRecipient(NamedTuple):
     """A share someone made with the recipient, and where its app lives."""
 
@@ -1117,6 +1423,20 @@ def record_copy(
     )
 
 
+def forget_copy(session: ScopedSession, *, recipient: LiveAppPerson, project_id: UUID, slug: str) -> None:
+    """Remove the received mark of ``recipient``'s copy ``slug``, for a copy
+    whose folder the duplicate removed again."""
+    row = session.exec(
+        session.select(LiveAppCopy).where(
+            LiveAppCopy.partition_id == recipient.partition_id,
+            LiveAppCopy.project_id == project_id,
+            LiveAppCopy.slug == slug,
+        )
+    ).first()
+    if row is not None:
+        session.delete(row)
+
+
 def received_from(session: ScopedSession, *, partition_id: str) -> dict[tuple[UUID, str], str]:
     """Whom each copy in ``partition_id``'s projects came from: the owner's
     email by (project id, slug)."""
@@ -1132,51 +1452,150 @@ class ReceivedApp(NamedTuple):
 
 
 def received_in_project(session: ScopedSession, *, person: LiveAppPerson, project_id: UUID) -> list[ReceivedApp]:
-    """The copies ``person`` duplicated into project ``project_id``, by slug."""
+    """The copies ``person`` duplicated into project ``project_id`` and never
+    launched, by slug: the ones whose ``backend.py`` the agent reads first."""
+    launched = (
+        session.select(LiveAppLaunchRecord)
+        .where(
+            LiveAppLaunchRecord.launcher_partition_id == person.partition_id,
+            LiveAppLaunchRecord.project_id == project_id,
+        )
+    )
+    launched_slugs = {record.slug for record in session.exec(launched).all()}
     rows = session.exec(
         session.select(LiveAppCopy)
         .where(LiveAppCopy.partition_id == person.partition_id, LiveAppCopy.project_id == project_id)
         .order_by(LiveAppCopy.slug)
     ).all()
-    return [ReceivedApp(row.slug, row.owner_email) for row in rows]
+    return [ReceivedApp(row.slug, row.owner_email) for row in rows if row.slug not in launched_slugs]
 
 
-def _mark_noticed(session: ScopedSession, *, record_ids: Iterable[UUID]) -> None:
+def _still_there(artifacts_dir: Path, slug: str) -> bool:
+    """Whether the copy ``slug`` still has its folder, which a delete from the
+    card or from a cell removes without touching its row. A folder that can't
+    be checked counts as there, so the agent still hears the copy is someone
+    else's."""
+    try:
+        return stat.S_ISDIR(os.lstat(artifacts_dir / slug).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as error:
+        logger.warning("live app copy %s: its folder can't be checked (%s)", slug, error.strerror)
+        return True
+
+
+def _claim_notices(session: ScopedSession, *, record_ids: Iterable[UUID]) -> list[UUID]:
+    """Mark the stops ``record_ids`` heard, and return the ones this call
+    marked: a stop another turn marked first is that turn's to tell."""
+    ids = list(record_ids)
+    # FOR UPDATE: on Postgres a second turn's claim waits for the first's
+    # commit, then reads stop_noticed again and skips what it marked.
+    rows = session.exec(
+        session.select(LiveAppLaunchRecord)
+        .where(LiveAppLaunchRecord.id.in_(ids), LiveAppLaunchRecord.stop_noticed.is_(False))
+        .with_for_update()
+    ).all()
+    for record in rows:
+        record.stop_noticed = True
+        session.add(record)
+    return [record.id for record in rows]
+
+
+def _unmark_notices(session: ScopedSession, *, record_ids: Iterable[UUID]) -> None:
     for record_id in record_ids:
         record = session.get(LiveAppLaunchRecord, record_id)
         if record is not None:
-            record.stop_noticed = True
+            record.stop_noticed = False
             session.add(record)
 
 
+async def release_stop_notices(record_ids: Iterable[UUID]) -> None:
+    """Hand back the stops a turn claimed (turn_live_apps) and didn't get to
+    tell, because it failed or was stopped, so the person's next turn does."""
+    ids = list(record_ids)
+    if ids:
+        await run_db(partial(_unmark_notices, record_ids=ids), scope=SYSTEM_SCOPE)
+
+
 class TurnLiveApps(NamedTuple):
-    """What a turn's live-app rule names: the copies in its project, the
-    person's running apps, and the stops they haven't heard of yet."""
+    """What a turn's live-app rule names: the copies in its project not yet
+    launched, the person's running apps, and the stops they haven't heard of."""
 
     received: tuple[ReceivedApp, ...]
     running: tuple[PersonApp, ...]
     stopped: tuple[PersonApp, ...]
 
 
-async def turn_live_apps(person: LiveAppPerson, *, project_id: UUID) -> TurnLiveApps:
-    """The live apps a turn of ``person``'s in ``project_id`` hears of. A stop
-    it names counts as heard, so the next turn doesn't repeat it."""
+async def turn_live_apps(
+    person: LiveAppPerson, *, project_id: UUID, artifacts_dir: Path, claimed_into: list[UUID]
+) -> TurnLiveApps:
+    """The live apps a turn of ``person``'s in ``project_id`` hears of, with
+    ``artifacts_dir`` the project's artifacts folder. The turn claims each
+    stop it names, so two turns at once never both tell it, into
+    ``claimed_into``, which a Stop can't leave empty once the claim commits;
+    the turn hands back what it didn't get to tell (release_stop_notices)."""
     received = await run_db(
         partial(received_in_project, person=person, project_id=project_id), scope=SYSTEM_SCOPE
     )
+    received = [copy for copy in received if await asyncio.to_thread(_still_there, artifacts_dir, copy.slug)]
     apps = await person_apps(person)
-    stopped = tuple(
+    unheard = [
         app for app in apps if not app.running and not app.stop_noticed and app.stop_reason != "relaunched"
-    )
-    if stopped:
-        await run_db(
-            partial(_mark_noticed, record_ids=[app.record_id for app in stopped]), scope=SYSTEM_SCOPE
-        )
+    ]
+    if unheard:
+
+        async def claim() -> None:
+            claimed_into.extend(
+                await run_db(
+                    partial(_claim_notices, record_ids=[app.record_id for app in unheard]), scope=SYSTEM_SCOPE
+                )
+            )
+
+        await run_to_completion(claim())
+    claimed = set(claimed_into)
     return TurnLiveApps(
         received=tuple(received),
         running=tuple(app for app in apps if app.running),
-        stopped=stopped,
+        stopped=tuple(app for app in unheard if app.record_id in claimed),
     )
+
+
+def follow_moved_app(
+    session: ScopedSession,
+    *,
+    partition_id: str,
+    source_project_id: UUID,
+    old_slug: str,
+    dest_project_id: UUID,
+    new_slug: str,
+) -> None:
+    """Retarget the live-app rows of app ``old_slug`` in ``partition_id``'s
+    project ``source_project_id`` to its new home after a conversation move
+    took its folder there: its shares, its received mark and its launches,
+    so recipients still list it and its card keeps its state. Rows already
+    at the new address belong to a folder that is gone there, so they go."""
+    keyed = (
+        (LiveAppShare, LiveAppShare.owner_partition_id),
+        (LiveAppCopy, LiveAppCopy.partition_id),
+        (LiveAppLaunchRecord, LiveAppLaunchRecord.launcher_partition_id),
+    )
+    for model, partition in keyed:
+        for stale in session.exec(
+            session.select(model).where(
+                partition == partition_id, model.project_id == dest_project_id, model.slug == new_slug
+            )
+        ).all():
+            session.delete(stale)
+    session.flush()
+    for model, partition in keyed:
+        for row in session.exec(
+            session.select(model).where(
+                partition == partition_id, model.project_id == source_project_id, model.slug == old_slug
+            )
+        ).all():
+            row.project_id = dest_project_id
+            row.slug = new_slug
+            session.add(row)
 
 
 def shared_text(value: str) -> str:

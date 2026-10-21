@@ -1,7 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import timezone
 from functools import partial
 import inspect
 import os
@@ -60,6 +59,9 @@ from cowork.services.live_apps import (
     TurnLiveApps,
     current_live_app_launcher,
     live_app_host_for_turn,
+    prompt_email,
+    release_stop_notices,
+    stop_time_text,
     turn_live_apps,
 )
 from cowork.services.projects import display_label
@@ -141,6 +143,9 @@ class BuiltChatSession(NamedTuple):
     # The turn's TurnMemoryLayout.learns: False when its tiers are two empty
     # scratch folders, so it reads and writes nobody's learned memory.
     learns: bool
+    # The launch records whose stop the turn's prompt tells, which the turn
+    # claimed (turn_live_apps) and hands back unless it finishes.
+    live_app_notices: tuple[UUID, ...] = ()
 
 
 def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
@@ -655,9 +660,11 @@ _SANDBOXED_BACKENDS_RULE = (
 # in an app slot outside this server, which anton launches.
 _LIVE_APPS_RULE = (
     "Live apps are on: a full-stack artifact runs as a live app in an app slot outside this server, "
-    "at its own address, and only the person who launched it can open it. Build the full-stack "
-    "artifact and start it with `launch_backend`; the person approves its first launch, and each "
-    "relaunch after its backend, its requirements or its connections change. Give the address from "
+    "at its own address, and only the person who launched it can open it. Build a full-stack app "
+    "with `generate_artifact`, which launches it; start one you built by hand with `launch_backend`, "
+    "and call it again to relaunch a stopped app. A cell that changes a running app's files "
+    "relaunches it by itself. The person approves an app's first launch, and each relaunch after "
+    "its backend, its requirements or its connections change. Give the address from "
     "the launch result as visible text in backticks, never a `127.0.0.1` or `localhost:<port>` "
     "address. When a launch names a connection that is missing or not approved, ask the person to "
     "add it or rename theirs to match, or their operator to approve it. When a launch is refused "
@@ -676,14 +683,14 @@ def _live_apps_rule(apps: TurnLiveApps | None) -> str:
     if apps is None:
         return rule
     if apps.received:
-        copies = "; ".join(f"`{app.slug}`, from {app.owner_email}" for app in apps.received)
-        rule += f"Apps someone shared with the person, copied into this project: {copies}. "
+        copies = "; ".join(f"`{app.slug}`, from {prompt_email(app.owner_email)}" for app in apps.received)
+        rule += f"Apps someone shared with the person, copied into this project and not launched yet: {copies}. "
     for app in apps.running:
         rule += f"The person's live app `{app.slug}` is running at `{app.address}`. "
     for app in apps.stopped:
-        stopped_at = (app.stopped_at or app.started_at).astimezone(timezone.utc).strftime("%H:%M")
+        stopped_at = stop_time_text(app.stopped_at or app.started_at)
         rule += (
-            f"The person's live app `{app.slug}` stopped at {stopped_at} UTC since their last "
+            f"The person's live app `{app.slug}` stopped at {stopped_at} since their last "
             f"message: {app.stop_text}. Tell them once, and offer to relaunch it. "
         )
     return rule
@@ -941,9 +948,21 @@ class AntonHarness:
         memory_read: TurnMemoryRead | None = None
         session = None
         seed_info: dict | None = None
+        # The live-app stops this turn's prompt tells (built.live_app_notices)
+        # go back unless the turn finishes, so the person's next turn tells them.
+        built: BuiltChatSession | None = None
+        turn_finished = False
 
         async def record_turn_cleanup():
             nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            # The live-app stops the turn's prompt told go back unless the
+            # turn finished, so the person's next turn tells them. Here, so
+            # the same shield covers it and its failure skips nothing.
+            if built is not None and built.live_app_notices and not turn_finished:
+                try:
+                    await release_stop_notices(built.live_app_notices)
+                except Exception:
+                    logger.warning("Could not hand back this turn's live-app stop notices", exc_info=True)
             if session is not None and seed_info is not None and getattr(session, "last_compaction", None) is not None:
                 # Best-effort: a missing compaction does not lose the answer.
                 try:
@@ -1073,6 +1092,7 @@ class AntonHarness:
             # sealing keeps its in-memory history valid. A turn that compacted
             # hands its rows to the formatter and stores none.
             turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
+            turn_finished = True
         finally:
             if model_wait is not None:
                 model_wait.detach()
@@ -1300,7 +1320,43 @@ class AntonHarness:
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
     ) -> BuiltChatSession:
-        """Build the same core runtime the Anton CLI uses, scoped to one project."""
+        """Build the same core runtime the Anton CLI uses, scoped to one project
+        (_build_turn_session). The live-app stops its prompt tells ride on the
+        result; a build that fails hands them back (release_stop_notices)."""
+        notices: list[UUID] = []
+        try:
+            built = await self._build_turn_session(
+                conversation,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                disabled_connections=disabled_connections,
+                channel_context=channel_context,
+                tool_messages=tool_messages,
+                live_app_notices=notices,
+            )
+        except BaseException:
+            if notices:
+                try:
+                    await run_to_completion(release_stop_notices(notices))
+                except Exception:
+                    logger.warning("Could not hand back this turn's live-app stop notices", exc_info=True)
+            raise
+        return built._replace(live_app_notices=tuple(notices))
+
+    async def _build_turn_session(
+        self,
+        conversation: Conversation,
+        *,
+        model: str | None,
+        reasoning_effort: str | None,
+        disabled_connections: list[dict] | None,
+        channel_context: ChannelContext | None,
+        tool_messages: bool,
+        live_app_notices: list[UUID],
+    ) -> BuiltChatSession:
+        """_build_chat_session's work. ``live_app_notices`` gets the launch
+        records whose stop the turn's prompt tells, which the turn claimed
+        (turn_live_apps)."""
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
@@ -1476,15 +1532,18 @@ class AntonHarness:
 
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
-        # app slots outside this server.
-        live_apps = live_apps_on()
-        launcher = current_live_app_launcher() if live_apps else None
+        # app slots outside this server for a turn with a launcher, the only
+        # turn that gets a host (live_app_host_for_turn).
+        launcher = current_live_app_launcher() if live_apps_on() else None
+        offers_live_apps = launcher is not None
         turn_apps = (
-            await turn_live_apps(launcher, project_id=conversation.project.id)
+            await turn_live_apps(
+                launcher, project_id=conversation.project.id, artifacts_dir=artifacts_dir, claimed_into=live_app_notices
+            )
             if launcher is not None
             else None
         )
-        if live_apps:
+        if offers_live_apps:
             backends_rule = _live_apps_rule(turn_apps)
         elif sandboxed:
             backends_rule = _SANDBOXED_BACKENDS_RULE
@@ -1518,7 +1577,7 @@ class AntonHarness:
             # (which conversation, which turns) is tracked server-side
             # and stamped into each folder's metadata.json + README.md
             # automatically.
-            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed and not live_apps else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
+            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed and not offers_live_apps else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"

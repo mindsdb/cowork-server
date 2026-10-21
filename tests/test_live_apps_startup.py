@@ -114,14 +114,36 @@ def test_live_apps_on_an_anton_without_the_slots_are_refused(stack):
 
 
 def test_live_apps_on_an_anton_whose_session_takes_no_host_are_refused(stack):
+    """Whatever anton is installed: a ChatSessionConfig with no live_app_host."""
+    import dataclasses
+
     import anton.core.session as session_module
 
-    real = session_module.ChatSessionConfig
+    @dataclasses.dataclass
+    class NoHost:
+        pass
+
     turn_on_live_apps(stack)
-    stack.setattr(session_module, "ChatSessionConfig", real)
-    if "live_app_host" in real.__dataclass_fields__:
-        pytest.skip("the installed anton's ChatSessionConfig takes live_app_host")
+    stack.setattr(session_module, "ChatSessionConfig", NoHost)
     assert "has a ChatSessionConfig that takes no live_app_host" in _refusal()
+
+
+def test_live_apps_on_an_anton_whose_slots_lack_a_name_are_refused(stack):
+    module = turn_on_live_apps(stack)
+    stack.delattr(module, "SlotStatus")
+    assert "has a live_app_slots without SlotStatus" in _refusal()
+
+
+def test_live_apps_anton_reads_as_on_are_checked_without_the_variable(stack):
+    """Every runtime decision asks anton, so the checks run when anton reads
+    live apps as on even with the variable unset."""
+    import cowork.code_sandbox as code_sandbox
+
+    install_live_app_slots(stack)
+    stack.setattr(code_sandbox, "live_apps_on", lambda: True)
+    stack.setenv("COWORK_CODE_SANDBOX", "off")
+    stack.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    assert "ANTON_LIVE_APP_SLOTS needs COWORK_CODE_SANDBOX=landlock" in _refusal()
 
 
 def test_a_slot_list_that_doesnt_parse_is_refused(stack):
@@ -130,16 +152,38 @@ def test_a_slot_list_that_doesnt_parse_is_refused(stack):
     assert "ANTON_LIVE_APP_SLOTS doesn't parse" in _refusal()
 
 
-def test_live_apps_without_the_viewer_login_are_refused(stack):
+@pytest.mark.parametrize("value", [",", " , "])
+def test_a_slot_list_with_no_address_is_refused(stack, value):
     turn_on_live_apps(stack)
-    stack.setenv("COWORK_LIVE_APPS_VIEWER_LOGIN_URL", " ")
+    stack.setenv(SLOTS_VARIABLE, value)
+    assert "ANTON_LIVE_APP_SLOTS lists no slot address" in _refusal()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [" ", "viewer-login:4180", "ftp://viewer-login:4180", "http://viewer-login:4180/?next=x", " http://viewer-login:4180"],
+)
+def test_live_apps_without_a_viewer_login_address_are_refused(stack, value):
+    turn_on_live_apps(stack)
+    stack.setenv("COWORK_LIVE_APPS_VIEWER_LOGIN_URL", value)
     assert "needs COWORK_LIVE_APPS_VIEWER_LOGIN_URL" in _refusal()
 
 
-def test_live_apps_with_a_short_launch_token_are_refused(stack):
+@pytest.mark.parametrize("value", ["http://viewer-login:4180", "https://login.example.com/viewer/"])
+def test_a_viewer_login_address_with_a_path_starts(stack, value):
     turn_on_live_apps(stack)
-    stack.setenv("COWORK_LIVE_APPS_LAUNCH_TOKEN", "x" * 31)
-    assert "needs COWORK_LIVE_APPS_LAUNCH_TOKEN of at least 32 characters" in _refusal()
+    stack.setenv("COWORK_LIVE_APPS_VIEWER_LOGIN_URL", value)
+    get_app_settings.cache_clear()
+    cowork_server.create_app()
+
+
+@pytest.mark.parametrize("token", ["x" * 31, " " + "x" * 32, "x" * 32 + " ", "é" * 32, "x" * 31 + "\x07"])
+def test_live_apps_with_a_launch_token_a_header_cant_carry_are_refused(stack, token):
+    turn_on_live_apps(stack)
+    stack.setenv("COWORK_LIVE_APPS_LAUNCH_TOKEN", token)
+    message = _refusal()
+    assert "needs COWORK_LIVE_APPS_LAUNCH_TOKEN of at least 32 printable ASCII characters" in message
+    assert token.strip() not in message
 
 
 # ── off: every route 404, the flag false ─────────────────────────────────────
@@ -152,7 +196,29 @@ _ROUTES = [
     ("POST", "/api/v1/artifacts/live-app-share", {"projectId": "00000000-0000-4000-8000-000000000001", "slug": "app", "everyone": True}),
     ("GET", "/api/v1/artifacts/shared-live-apps", None),
     ("POST", "/api/v1/artifacts/live-app-duplicate", {"shareId": "00000000-0000-4000-8000-000000000001", "projectId": "00000000-0000-4000-8000-000000000002", "confirmed": True}),
+    ("GET", "/api/v1/artifacts/live-app-shares?projectId=00000000-0000-4000-8000-000000000001&slug=app", None),
+    ("DELETE", "/api/v1/artifacts/live-app-share/00000000-0000-4000-8000-000000000001", None),
+    # Requests no live-app route would take: they are 404 too, never 422.
+    ("POST", "/api/v1/artifacts/live-app-share", {}),
+    ("POST", "/api/v1/artifacts/live-app-duplicate", {}),
+    ("POST", "/api/v1/live-apps/1/stopped", {}),
+    ("GET", "/api/v1/artifacts/live-app-shares", None),
+    ("DELETE", "/api/v1/artifacts/live-app-share/not-a-uuid", None),
+    ("GET", "/api/v1/live-apps/x/access", None),
 ]
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/v1/artifacts/live-app-share", "/api/v1/artifacts/live-app-duplicate", "/api/v1/live-apps/1/stopped"]
+)
+def test_a_body_that_isnt_json_is_404_with_live_apps_off(stack, path):
+    install_live_app_slots(stack)
+    get_app_settings.cache_clear()
+    client = TestClient(cowork_server.create_app())
+
+    response = client.post(path, content=b"{not json", headers={**A, "Content-Type": "application/json"})
+
+    assert response.status_code == 404
 
 
 @pytest.mark.parametrize(("method", "path", "body"), _ROUTES)
