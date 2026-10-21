@@ -29,6 +29,35 @@ unusable_bodies:
   - name: a PDF header and nothing after it
     body: '{"pdf_base64": "JVBERi0xLjcK", "refused": []}'
 
+# Page trees a render service never makes, against the 500-page limit. Each
+# costs a walk of at most 2 * 500 + 2 nodes. shape names the builder in
+# tests/test_render_pdf_client.py; size is its page, node or entry count.
+hostile_page_trees:
+  - {name: one page listed 501 times, shape: one_page_listed, size: 501, answer: 413}
+  - {name: a count of 1 over 501 pages, shape: count_that_lies, size: 501, answer: 413}
+  - {name: a page tree that loops, shape: looping_tree, size: 2, answer: 502}
+  - {name: a chain past the node limit, shape: long_chain, size: 1100, answer: 502}
+  - {name: indirect types over 501 pages, shape: indirect_types, size: 501, answer: 413}
+  - {name: an unknown type with kids, shape: unknown_type_with_kids, size: 501, answer: 502}
+
+# Settings a PDF client refuses to start with: it needs the render engine
+# and a render URL.
+no_client_settings:
+  - {name: engine and URL unset, settings: {engine: null, render_url: null}}
+  - {name: engine unset, settings: {engine: null, render_url: "http://render.test:9000"}}
+  - {name: URL unset, settings: {engine: render, render_url: null}}
+
+# Whether the render service runs the page's scripts, by source file.
+scripts_by_source:
+  - {source_name: page.html, scripts: true}
+  - {source_name: page.htm, scripts: true}
+  - {source_name: PAGE.HTML, scripts: true}
+  - {source_name: sub/page.html, scripts: true}
+  - {source_name: report.md, scripts: false}
+  - {source_name: report.markdown, scripts: false}
+  - {source_name: notes.txt, scripts: false}
+  - {source_name: page.html.md, scripts: false}
+
 # Render URLs the server refuses to start with while the engine is "render".
 refused_render_urls:
   - ftp://render.internal/

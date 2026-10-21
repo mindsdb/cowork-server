@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from pathlib import PurePosixPath
 from types import FrameType
 from typing import Literal
 
@@ -71,6 +72,9 @@ PAGE_COUNT_SECONDS = 10.0
 
 PDF_MAGIC = b"%PDF-"
 
+# Source files whose PDF runs the page's own scripts.
+_SCRIPTED_SOURCES = frozenset({".html", ".htm"})
+
 _MALFORMED_PAGE_TREE = "the render service's PDF has a malformed page tree"
 _NO_PDF_IN_TIME = "no PDF arrived within the time budget"
 
@@ -94,6 +98,16 @@ class RenderPdfFailed(Exception):
     def __init__(self, *, status: RenderPdfFailureStatus, reason: str) -> None:
         super().__init__(reason)
         self.status = status
+
+
+def pdf_request(*, source_name: str, html: str) -> RenderPdfRequest:
+    """The render request for ``html``, the inlined document of ``source_name``.
+
+    An HTML page may draw its charts with scripts, so the render service runs
+    them. Markdown and text become HTML that needs none, so it runs none.
+    """
+    suffix = PurePosixPath(source_name).suffix.lower()
+    return RenderPdfRequest(html=html, scripts=suffix in _SCRIPTED_SOURCES)
 
 
 class RenderServicePdf:
@@ -262,16 +276,22 @@ def _count_pages(*, pdf: bytes, max_pages: int, deadline: float) -> int:
     stop_at = min(deadline, time.monotonic() + PAGE_COUNT_SECONDS)
     previous = sys.getprofile()
     sys.setprofile(_stop_after(stop_at=stop_at))
+    # The hook also sees the call that removes it, so a stop can come from the
+    # finally after the count is done. The outer try catches that stop too.
+    # Python turns off a hook that raises, and a stop raised at that call
+    # skips the restore, so the handler restores the previous hook.
     try:
-        return _walk_page_tree(pdf=pdf, max_pages=max_pages, stop_at=stop_at)
+        try:
+            return _walk_page_tree(pdf=pdf, max_pages=max_pages, stop_at=stop_at)
+        finally:
+            sys.setprofile(previous)
     except _PageCountStopped:
+        sys.setprofile(previous)
         if stop_at >= deadline:
             raise RenderPdfFailed(status=504, reason=_NO_PDF_IN_TIME) from None
         raise RenderPdfFailed(
             status=502, reason=f"counting the render service's PDF pages took over {PAGE_COUNT_SECONDS} s"
         ) from None
-    finally:
-        sys.setprofile(previous)
 
 
 def _walk_page_tree(*, pdf: bytes, max_pages: int, stop_at: float) -> int:

@@ -10,6 +10,7 @@ from pathlib import Path
 import dotenv
 import pytest
 import yaml
+from pydantic import BaseModel
 
 from cowork import cli
 from cowork.common.settings.app_settings import (
@@ -23,7 +24,17 @@ from cowork.common.settings.app_settings import (
 from cowork.schemas.artifact_export import ExportPdfSettings
 from cowork.server import create_app
 
-CASES = yaml.safe_load((Path(__file__).parent / "fixtures" / "render_pdf_cases.yaml").read_text(encoding="utf-8"))
+
+class RenderUrlCases(BaseModel, frozen=True):
+    """The tables of render_pdf_cases.yaml this file reads."""
+
+    refused_render_urls: list[str]
+    accepted_render_urls: list[str]
+
+
+CASES = RenderUrlCases.model_validate(
+    yaml.safe_load((Path(__file__).parent / "fixtures" / "render_pdf_cases.yaml").read_text(encoding="utf-8"))
+)
 
 PDF_LINES = f"{EXPORT_PDF_ENGINE_VAR}=render\n{EXPORT_RENDER_URL_VAR}=http://127.0.0.1:9000\n"
 
@@ -53,7 +64,7 @@ def test_a_render_url_without_the_engine_offers_no_pdf():
     assert settings.render_url is None
 
 
-@pytest.mark.parametrize("url", CASES["accepted_render_urls"])
+@pytest.mark.parametrize("url", CASES.accepted_render_urls)
 def test_render_with_an_http_url_turns_pdf_on(url):
     settings = load_export_pdf_settings(environ={EXPORT_PDF_ENGINE_VAR: "render", EXPORT_RENDER_URL_VAR: url})
 
@@ -76,7 +87,7 @@ def test_render_without_a_url_refuses_startup(monkeypatch):
         create_app()
 
 
-@pytest.mark.parametrize("url", CASES["refused_render_urls"])
+@pytest.mark.parametrize("url", CASES.refused_render_urls)
 def test_a_render_url_that_isnt_an_http_base_address_refuses_startup(monkeypatch, url):
     monkeypatch.setenv(EXPORT_PDF_ENGINE_VAR, "render")
     monkeypatch.setenv(EXPORT_RENDER_URL_VAR, url)

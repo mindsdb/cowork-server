@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -19,25 +20,79 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
+from types import FrameType
+from typing import Literal
 
 import httpx
 import pytest
 import yaml
 from pypdf import PdfWriter
 
+from pydantic import BaseModel
+
 from cowork.schemas.artifact_export import ExportPdfSettings, RenderPdfRequest, RenderPdfResult
 from cowork.services import render_pdf_client
-from cowork.services.render_pdf_client import FULL_JOB_SECONDS, RenderPdfFailed, RenderServicePdf
+from cowork.services.render_pdf_client import FULL_JOB_SECONDS, RenderPdfFailed, RenderServicePdf, pdf_request
 from _no_fetch import recording_server
 
+HostileShape = Literal[
+    "one_page_listed",
+    "count_that_lies",
+    "looping_tree",
+    "long_chain",
+    "indirect_types",
+    "unknown_type_with_kids",
+]
+
+
+class UpstreamStatusCase(BaseModel, frozen=True, extra="forbid"):
+    upstream: int
+    answer: int
+
+
+class UnusableBody(BaseModel, frozen=True, extra="forbid"):
+    name: str
+    body: str
+
+
+class HostilePageTree(BaseModel, frozen=True, extra="forbid"):
+    name: str
+    shape: HostileShape
+    size: int
+    answer: int
+
+
+class NoClientSettings(BaseModel, frozen=True, extra="forbid"):
+    name: str
+    settings: ExportPdfSettings
+
+
+class ScriptsBySource(BaseModel, frozen=True, extra="forbid"):
+    source_name: str
+    scripts: bool
+
+
+class RenderPdfClientCases(BaseModel, frozen=True):
+    """The tables of render_pdf_cases.yaml this file reads."""
+
+    upstream_statuses: list[UpstreamStatusCase]
+    unusable_bodies: list[UnusableBody]
+    hostile_page_trees: list[HostilePageTree]
+    no_client_settings: list[NoClientSettings]
+    scripts_by_source: list[ScriptsBySource]
+    proxy_variables: list[str]
+
+
 FIXTURES = Path(__file__).parent / "fixtures"
-CASES = yaml.safe_load((FIXTURES / "render_pdf_cases.yaml").read_text(encoding="utf-8"))
+CASES = RenderPdfClientCases.model_validate(
+    yaml.safe_load((FIXTURES / "render_pdf_cases.yaml").read_text(encoding="utf-8"))
+)
 REQUEST_JSON = (FIXTURES / "render_pdf" / "request.json").read_bytes()
 RESPONSE_JSON = (FIXTURES / "render_pdf" / "response.json").read_bytes()
 REQUEST = RenderPdfRequest.model_validate_json(REQUEST_JSON)
 FIXTURE_PDF = base64.b64decode(RenderPdfResult.model_validate_json(RESPONSE_JSON).pdf_base64, validate=True)
 
-REDIRECT_STATUSES = [case["upstream"] for case in CASES["upstream_statuses"] if 300 <= case["upstream"] < 400]
+REDIRECT_STATUSES = [case.upstream for case in CASES.upstream_statuses if 300 <= case.upstream < 400]
 
 MIB = 1024 * 1024
 
@@ -261,20 +316,20 @@ def _closed_port_url() -> str:
 # Settings.
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        pytest.param(ExportPdfSettings(engine=None, render_url=None), id="engine-and-url-unset"),
-        pytest.param(ExportPdfSettings(engine=None, render_url="http://render.test:9000"), id="engine-unset"),
-        pytest.param(ExportPdfSettings(engine="render", render_url=None), id="url-unset"),
-    ],
-)
-def test_no_client_without_the_render_engine_and_a_url(settings):
+@pytest.mark.parametrize("case", CASES.no_client_settings, ids=lambda case: case.name)
+def test_no_client_without_the_render_engine_and_a_url(case):
     with pytest.raises(ValueError):
-        RenderServicePdf(settings=settings, transport=httpx.MockTransport(_ok))
+        RenderServicePdf(settings=case.settings, transport=httpx.MockTransport(_ok))
 
 
 # The wire.
+
+
+@pytest.mark.parametrize("case", CASES.scripts_by_source, ids=lambda case: case.source_name)
+def test_scripts_run_only_for_an_html_source(case):
+    request = pdf_request(source_name=case.source_name, html="<p>Report</p>")
+
+    assert request == RenderPdfRequest(html="<p>Report</p>", scripts=case.scripts)
 
 
 async def test_render_posts_the_request_to_v1_pdf_and_returns_the_pdf():
@@ -337,16 +392,16 @@ async def test_the_render_url_keeps_its_path_prefix():
 
 
 @pytest.mark.parametrize(
-    "case", CASES["upstream_statuses"], ids=lambda case: f"{case['upstream']}-answers-{case['answer']}"
+    "case", CASES.upstream_statuses, ids=lambda case: f"{case.upstream}-answers-{case.answer}"
 )
 async def test_each_status_maps_to_the_routes_answer_with_no_retry(case):
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(case["upstream"], headers={"Location": "http://elsewhere.test/v1/pdf"})
+        return httpx.Response(case.upstream, headers={"Location": "http://elsewhere.test/v1/pdf"})
 
-    assert await _status(client=_client(handler=handler)) == case["answer"]
+    assert await _status(client=_client(handler=handler)) == case.answer
     assert len(seen) == 1
 
 
@@ -361,10 +416,10 @@ async def test_a_redirect_answers_502_and_its_target_sees_nothing(status):
         assert target.hits() == []
 
 
-@pytest.mark.parametrize("case", CASES["unusable_bodies"], ids=lambda case: case["name"])
+@pytest.mark.parametrize("case", CASES.unusable_bodies, ids=lambda case: case.name)
 async def test_a_200_without_a_usable_pdf_answers_502(case):
     def handler(_request: httpx.Request) -> httpx.Response:
-        return _streamed_200(body=case["body"].encode())
+        return _streamed_200(body=case.body.encode())
 
     assert await _status(client=_client(handler=handler)) == 502
 
@@ -577,6 +632,43 @@ async def test_a_page_count_over_its_own_time_answers_502(monkeypatch):
     assert time.monotonic() - started < 3
 
 
+def _stop_as_the_hook_comes_off(*, stop_at: float) -> Callable[[FrameType, str, object], None]:
+    """A profile hook that raises only at the call that removes it.
+
+    It stands in for the clock passing the stop time just after the count
+    returned: the next event the hook sees is that call.
+    """
+
+    def profile(_frame: FrameType, event: str, arg: object) -> None:
+        if event == "c_call" and getattr(arg, "__name__", "") == "setprofile":
+            raise render_pdf_client._PageCountStopped
+
+    return profile
+
+
+async def test_a_stop_as_the_page_count_hook_comes_off_answers_502(monkeypatch):
+    monkeypatch.setattr(render_pdf_client, "_stop_after", _stop_as_the_hook_comes_off)
+
+    assert await _status(client=_client(handler=_ok)) == 502
+
+
+def test_a_stop_as_the_page_count_hook_comes_off_restores_the_previous_profile(monkeypatch):
+    monkeypatch.setattr(render_pdf_client, "_stop_after", _stop_as_the_hook_comes_off)
+
+    def previous(_frame: FrameType, _event: str, _arg: object) -> None:
+        pass
+
+    outer = sys.getprofile()
+    sys.setprofile(previous)
+    try:
+        with pytest.raises(RenderPdfFailed):
+            render_pdf_client._count_pages(pdf=FIXTURE_PDF, max_pages=500, deadline=time.monotonic() + 60)
+        restored = sys.getprofile()
+    finally:
+        sys.setprofile(outer)
+    assert restored is previous
+
+
 async def test_a_page_count_left_running_holds_off_the_next_export(monkeypatch):
     release = threading.Event()
     counted: list[int] = []
@@ -639,12 +731,10 @@ def _count_that_lies(*, pages: int) -> bytes:
     return _pdf(CATALOG, f"<< /Type /Pages /Kids [{kids}] /Count 1 >>", *[PAGE] * pages)
 
 
-def _looping_tree() -> bytes:
-    return _pdf(
-        CATALOG,
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        "<< /Type /Pages /Parent 2 0 R /Kids [2 0 R] /Count 1 >>",
-    )
+def _looping_tree(*, nodes: int) -> bytes:
+    """``nodes`` page-tree nodes, each the only kid of the one before, the last one's kid the first."""
+    kids = [*range(3, nodes + 2), 2]
+    return _pdf(CATALOG, *[f"<< /Type /Pages /Kids [{kid} 0 R] /Count 1 >>" for kid in kids])
 
 
 def _long_chain(*, depth: int) -> bytes:
@@ -664,19 +754,21 @@ def _unknown_type_with_kids(*, pages: int) -> bytes:
     return _pdf(CATALOG, f"<< /Type /Foo /Kids [{kids}] /Count {pages} >>", *[PAGE] * pages)
 
 
-@pytest.mark.parametrize(
-    ("pdf", "answer"),
-    [
-        pytest.param(_one_page_listed(times=501), 413, id="one-page-listed-501-times"),
-        pytest.param(_count_that_lies(pages=501), 413, id="count-of-1-over-501-pages"),
-        pytest.param(_looping_tree(), 502, id="page-tree-that-loops"),
-        pytest.param(_long_chain(depth=1100), 502, id="chain-past-the-node-limit"),
-        pytest.param(_indirect_types(pages=501), 413, id="indirect-types-over-501-pages"),
-        pytest.param(_unknown_type_with_kids(pages=501), 502, id="unknown-type-with-kids"),
-    ],
-)
-async def test_a_hostile_page_tree_costs_a_bounded_walk(pdf, answer):
-    assert await _status(client=_client(handler=_answering(pdf=pdf))) == answer
+HOSTILE_PAGE_TREES: dict[HostileShape, Callable[[int], bytes]] = {
+    "one_page_listed": lambda size: _one_page_listed(times=size),
+    "count_that_lies": lambda size: _count_that_lies(pages=size),
+    "looping_tree": lambda size: _looping_tree(nodes=size),
+    "long_chain": lambda size: _long_chain(depth=size),
+    "indirect_types": lambda size: _indirect_types(pages=size),
+    "unknown_type_with_kids": lambda size: _unknown_type_with_kids(pages=size),
+}
+
+
+@pytest.mark.parametrize("case", CASES.hostile_page_trees, ids=lambda case: case.name)
+async def test_a_hostile_page_tree_costs_a_bounded_walk(case):
+    pdf = HOSTILE_PAGE_TREES[case.shape](case.size)
+
+    assert await _status(client=_client(handler=_answering(pdf=pdf))) == case.answer
 
 
 async def test_a_short_chain_is_counted():
@@ -739,7 +831,7 @@ async def test_certificate_variables_are_ignored(monkeypatch, tmp_path):
 
 async def test_proxy_settings_never_reroute_the_request(monkeypatch):
     with recording_server() as proxy:
-        for name in CASES["proxy_variables"]:
+        for name in CASES.proxy_variables:
             monkeypatch.setenv(name, proxy.url)
         for name in ("NO_PROXY", "no_proxy"):
             monkeypatch.delenv(name, raising=False)
