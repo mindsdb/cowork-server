@@ -126,17 +126,8 @@ class ConnectionsService:
 
         display_name = connection_display_name(fields, engine)
         user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
-        # Pop both out of `fields` (still needed — see below), just without
-        # re-adding either as `fields["label"]`/`fields["user_label"]` the way
-        # the old code echoed `_label`. `fields` is echoed back to the
-        # frontend as the raw credential-field map (masked secrets aside);
-        # `_user_label`/`_label` are bookkeeping, not credentials, and the
-        # mask loop above leaves them unmasked (only `_connector_id`/`_method`
-        # are popped today) — leaving them in would
-        # ship two internal keys to the client as if they were unknown form
-        # fields, and if the edit form ever echoed them back unchanged on
-        # save, `persist_connection` would pop `user_label` from `credentials`
-        # again and treat it as an explicit value, closing an unintended loop.
+        # `_user_label` and `_label` are bookkeeping, not credentials, so they
+        # leave `fields` and never reach the client as unknown form fields.
         fields.pop("_user_label", None)
         fields.pop("_label", None)
         # Who created it is the vault's bookkeeping, not a credential field.

@@ -135,6 +135,24 @@ async def test_request_entry_registers_a_hidden_secret_without_adding_it_to_the_
     assert not any("CLIENT_SECRET" in key for key in env)
 
 
+async def test_request_entry_registers_a_hidden_secret_for_a_reader_of_a_shared_connection(
+    monkeypatch, personal_deployment, managed_dir, stores, scrub_scope
+):
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    get_app_settings.cache_clear()
+    own_vault_for_scope(ALICE).save("databricks", "genie", dict(GENIE_FIELDS), secure_keys=GENIE_SECURE_KEYS)
+    managed_dir.shared_dir.mkdir(exist_ok=True)
+    managed_dir.shared_connections_file.write_text(json.dumps([
+        {"user_id": SUB_A, "partition_id": PARTITION_A, "engine": "databricks", "name": "genie"},
+    ]))
+    assert isinstance(vault_for_scope(BOB), LayeredDataVault)
+
+    await register_vault_secrets(BOB)
+
+    assert SECRET not in scrub_credentials(f"the secret is {SECRET}")
+    assert SECRET not in scrub_output(f"the secret is {SECRET}")
+
+
 async def test_hidden_fields_not_marked_secure_stay_readable(stores, scrub_scope):
     """Bookkeeping such as `_method` is not a secret, so text naming it is
     left as it was, which keeps connect input and published code intact."""

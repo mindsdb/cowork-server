@@ -31,7 +31,10 @@ def _hidden_secret_values(vault: DataVault, engine: str, name: str) -> dict[str,
     rebuild would otherwise never see. The label only names the scrub marker;
     it follows anton's ``DS_<ENGINE>_<NAME>__<FIELD>`` env naming.
     """
-    record = vault.read_record(engine, name) if hasattr(vault, "read_record") else None
+    if not hasattr(vault, "read_record"):
+        logger.debug("Vault has no read_record; hidden secrets not registered for %s/%s", engine, name)
+        return {}
+    record = vault.read_record(engine, name)
     if not record:
         return {}
     secure_keys = record.get("secure_keys")
@@ -53,9 +56,11 @@ class _ScrubRegistrationVault:
     """
 
     def __init__(self, vault: DataVault) -> None:
+        """Wrap the real vault whose records the scrub registration reads."""
         self._vault = vault
 
     def __getattr__(self, attr: str) -> Any:
+        """Delegate every other vault attribute to the wrapped vault."""
         return getattr(self._vault, attr)
 
     def env_for(self, engine: str, name: str, *, flat: bool = False) -> dict[str, str] | None:
