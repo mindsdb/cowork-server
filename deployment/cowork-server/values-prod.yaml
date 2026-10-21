@@ -81,3 +81,5 @@ deployment:
     #   value: "250"
     # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
     #   value: "10"
+    # - name: COWORK_DEFAULT_MAX_TURN_TOKENS
+    #   value: "25000000"
