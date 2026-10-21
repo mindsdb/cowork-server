@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from cowork.schemas.artifact_export import ExportFormat, ExportPdfSettings
+
 logger = logging.getLogger(__name__)
 
 # Target formats we can produce, and the source extensions we accept.
@@ -130,3 +132,10 @@ def export_artifact(source_path: Path, fmt: str) -> Path:
         raise ExportError(f"Could not convert document to {fmt.upper()}") from exc
 
     return dest
+
+
+def export_formats(
+    *, source_name: str, is_backend: bool, can_edit: bool, pdf: ExportPdfSettings
+) -> list[ExportFormat]:
+    """The formats an artifact's Export offers this caller, in the order html, docx, pdf."""
+    raise NotImplementedError
