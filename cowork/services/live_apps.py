@@ -157,10 +157,11 @@ class CoworkLiveAppHost:
     """The host anton calls around each launch into a slot (anton's
     LiveAppHost protocol).
 
-    ``claim`` stops the slot's running record before anton resets the slot or
-    launches into it, and ``launched`` starts the new record once the slot has
-    accepted. A launch that fails between the two leaves no running record, so
-    nobody opens the slot until a later launch succeeds.
+    anton calls ``claim`` when a launch replaces an app the slot runs, before
+    it resets the slot, and ``claim`` stops that app's running record; a
+    launch that then fails leaves no running record, so nobody opens the slot
+    until a later launch succeeds. ``launched`` starts the new record once the
+    slot has accepted, ending any record still running there (_start_record).
     """
 
     def __init__(self, launcher: LiveAppPerson, *, project_id: UUID | None, launch_token: str) -> None:
@@ -276,11 +277,16 @@ def _start_record(
         ):
             previous.stop_reason = "relaunched"
             session.add(previous)
-    # Recorded by another process since the claim: that launch can't be
-    # running any more, since this one now holds the slot.
+    # A record still running on the slot belongs to an app that already
+    # ended there with no report (anton claims only a slot that runs an app),
+    # or to another process's launch since the claim: either way this launch
+    # now holds the slot. The person's own same app is a relaunch.
     stale = _running_record(session, slot=launch.slot)
     if stale is not None:
-        _stop(session, stale, reason="lost")
+        if _same_person(stale, launcher) and stale.slug == launch.slug and stale.project_id == project_id:
+            _stop(session, stale, reason="relaunched", noticed=True)
+        else:
+            _stop(session, stale, reason="lost")
     session.add(
         LiveAppLaunchRecord(
             slot=launch.slot,

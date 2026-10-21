@@ -234,6 +234,33 @@ def test_replacing_ones_own_app_records_it(services):
     assert (second.slug, second.state) == ("report", "running")
 
 
+def _launch_into_a_free_slot(services: FakeServices, slot: int, who: LiveAppPerson, *, slug: str, boot_id: str, project_id=None) -> None:
+    """anton's launch into an empty or exited slot: no claim, only launched."""
+    asyncio.run(_host(who, project_id).launched(_launch_model(slot, slug, boot_id)))
+    services.run(slot, boot_id=boot_id, artifact=slug, email=who.email)
+
+
+def test_relaunching_an_app_that_ended_unreported_is_no_stop(services):
+    project = uuid4()
+    _launch(services, 1, ALICE, slug="dash", boot_id=BOOT_1, project_id=project)
+    services.slots[1].state = "exited"
+    _launch_into_a_free_slot(services, 1, ALICE, slug="dash", boot_id=BOOT_2, project_id=project)
+
+    first, second = _records(1)
+    assert (first.stop_reason, first.stop_noticed) == ("relaunched", True)
+    assert (second.state, second.boot_id) == ("running", BOOT_2)
+
+
+def test_a_free_slot_ends_another_persons_unreported_record(services):
+    _launch(services, 1, ALICE, slug="dash", boot_id=BOOT_1)
+    services.slots[1].state = "empty"
+    _launch_into_a_free_slot(services, 1, BOB, slug="board", boot_id=BOOT_2)
+
+    alice, bob = _records(1)
+    assert (alice.stop_reason, alice.stop_noticed) == ("lost", False)
+    assert bob.state == "running"
+
+
 def test_a_slot_taken_from_another_person_was_already_lost(services):
     """anton takes a slot that ran someone else's app only once it is empty."""
     _launch(services, 1, ALICE, slug="dash", boot_id=BOOT_1)
