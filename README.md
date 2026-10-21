@@ -1077,3 +1077,8 @@ On a deployment that trusts identity headers, an operator with a shell where cow
 ## License
 
 See [LICENSE](LICENSE).
+
+## Diagnostics
+
+See [structured logging](docs/structured-logging.md) for defaults, troubleshooting
+overrides, retained evidence streams and rollout requirements.

@@ -45,6 +45,7 @@ from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
+from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
@@ -230,7 +231,7 @@ async def lifespan(app: FastAPI):
         try:
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
             if reaped:
-                logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
+                logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:
             recovery_session.close()
     except Exception:
@@ -395,7 +396,7 @@ def create_app() -> FastAPI:
     initialize_deployment_identity(settings, remote_turns=TurnQueueSettings().is_remote)
 
     # Create FastAPI app
-    app = FastAPI(
+    app = RequestLoggingApp(
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
