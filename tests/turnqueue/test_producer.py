@@ -1065,11 +1065,11 @@ async def test_replies_refresh_the_idle_deadline(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_controllers_liveness_replies_keep_a_quiet_turn_alive_and_show_nothing(monkeypatch):
+async def test_the_controllers_liveness_replies_keep_a_quiet_turn_alive_and_reach_the_caller(monkeypatch):
     """scratchpad-controller relays a busy pod's heartbeat as a `worker_alive`
     progress reply, so a single step longer than the idle bound doesn't fail a
-    live turn. It must count as activity and never reach the caller as
-    content."""
+    live turn. Each one reaches the caller too, which turns it into the frame
+    that keeps the UI's and the registry's idle bounds open."""
 
     class QuietStepRedis(SilentRedis):
         """A long tool step: nothing but liveness replies, then the answer.
@@ -1111,6 +1111,7 @@ async def test_the_controllers_liveness_replies_keep_a_quiet_turn_alive_and_show
 
     assert items == [
         ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}),
+        *[("progress", {"phase": "worker_alive"})] * 12,
         ("turn_completed", {}),
     ]
 
