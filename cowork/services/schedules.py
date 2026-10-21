@@ -3,17 +3,23 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from datetime import timezone as timezone_
 from enum import Enum
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
+from cowork.common.logger import get_logger
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
-from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun
-from cowork.schemas.schedules import AttemptOutcome, OccurrenceStatus, RunStatus
+from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun, ScheduleSkippedPeriod
+from cowork.schedule_timing import normalize_next_run
+from cowork.schemas.schedules import AttemptOutcome, Cadence, OccurrenceStatus, RunStatus
+
+
+logger = get_logger(__name__)
 
 
 class ScheduleService:
@@ -74,11 +80,12 @@ class ScheduleService:
             title=title,
             prompt=prompt,
             cadence=cadence,
-            next_run_at=next_run_at,
+            next_run_at=normalize_next_run(cadence, next_run_at, timezone),
             model=model,
             timezone=timezone,
             project_id=target_project_id,
             enabled=enabled,
+            paused_at=None if enabled else datetime.now(timezone_.utc),
         )
         self.session.add(schedule)
         self.session.commit()
@@ -86,17 +93,44 @@ class ScheduleService:
         return schedule
 
     def update_schedule(self, schedule_id: UUID, **kwargs) -> Schedule:
+        """Apply an edit. ``enabled`` pauses or resumes, as those actions do;
+        the editor sends the current value with every save, which changes
+        nothing."""
         schedule = self.get_schedule(schedule_id)
         new_project_id = kwargs.get("project_id")
         if new_project_id is not None and self.session.get(Project, new_project_id) is None:
             raise ValueError("Project not found")
-        for field, value in kwargs.items():
-            if value is not None and hasattr(schedule, field):
-                setattr(schedule, field, value)
+        enabled = kwargs.pop("enabled", None)
+        # Compared with the state before the edit: a reschedule below can
+        # turn a missed one-off back on, and the stale `enabled` the editor
+        # sent must not pause it again.
+        was_on = self._runs_on_its_own(schedule)
+        given = {k for k, v in kwargs.items() if v is not None}
+        for field in given:
+            if hasattr(schedule, field):
+                setattr(schedule, field, kwargs[field])
+        if {"cadence", "timezone", "next_run_at"} & given:
+            # The slot follows the edit at once, rather than firing on the old
+            # cadence or reading a start already in the past as a missed run.
+            schedule.next_run_at = normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone)
+            if (
+                schedule.cadence == Cadence.once
+                and schedule.missed_at is not None
+                and _utc(schedule.next_run_at) > datetime.now(timezone_.utc)
+            ):
+                # A missed one-off given a new time is scheduled again.
+                schedule.missed_at = None
+                schedule.enabled = schedule.paused_at is None and schedule.auto_paused_at is None
         self.session.add(schedule)
+        if enabled is not None and enabled != was_on:
+            return self._pause(schedule) if not enabled else self._resume(schedule)
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
+
+    @staticmethod
+    def _runs_on_its_own(schedule: Schedule) -> bool:
+        return schedule.paused_at is None and schedule.auto_paused_at is None and schedule.enabled
 
     def delete_schedule(self, schedule_id: UUID) -> bool:
         schedule = self._owned(schedule_id)
@@ -149,20 +183,62 @@ class ScheduleService:
         )
 
     def pause_schedule(self, schedule_id: UUID) -> Schedule:
-        schedule = self.get_schedule(schedule_id)
+        return self._pause(self.get_schedule(schedule_id))
+
+    def _pause(self, schedule: Schedule) -> Schedule:
+        """Stop everything that would start on its own: future slots, a retry
+        waiting to run, and a slot claimed but not yet started. An attempt
+        already running finishes; nothing follows it."""
+        now = datetime.now(timezone_.utc)
         schedule.enabled = False
+        if schedule.paused_at is None:
+            schedule.paused_at = now
         self.session.add(schedule)
+        self.session.flush()
+        ScheduleOccurrenceService(self.session).cancel_pending(schedule.id, error="Paused before it ran.")
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
 
     def resume_schedule(self, schedule_id: UUID) -> Schedule:
-        schedule = self.get_schedule(schedule_id)
+        return self._resume(self.get_schedule(schedule_id))
+
+    def _resume(self, schedule: Schedule) -> Schedule:
+        """Turn the schedule back on, clearing a pause, an auto-pause and its
+        failure streak. The run history stays. Nothing runs at once: a
+        recurring schedule waits for its next slot. A one-off whose time has
+        passed cannot wait for anything; run it now or give it a new time."""
+        now = datetime.now(timezone_.utc)
+        if schedule.cadence == Cadence.once and _utc(schedule.next_run_at) <= now:
+            raise ScheduleConflict(
+                "This one-time task's time has passed. Run it now, or edit it to give it a new time."
+            )
         schedule.enabled = True
+        schedule.paused_at = None
+        schedule.auto_paused_at = None
+        schedule.missed_at = None
+        schedule.consecutive_failures = 0
+        schedule.next_run_at = normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone, now=now)
         self.session.add(schedule)
+        self.session.flush()
+        # A retry that was being scheduled as the pause landed never starts
+        # while paused (start_attempt checks); drop it, so the next slot can.
+        ScheduleOccurrenceService(self.session).cancel_pending(schedule.id, error="Paused before it ran.")
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
+
+    def last_skipped(self, schedule_id: UUID) -> ScheduleSkippedPeriod | None:
+        return self.session.exec(
+            self.session.select(ScheduleSkippedPeriod)
+            .where(ScheduleSkippedPeriod.schedule_id == schedule_id)
+            .order_by(ScheduleSkippedPeriod.created_at.desc())  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+
+
+class ScheduleConflict(Exception):
+    """An action the schedule's state does not allow; the message says why."""
 
 
 class ScheduleRunService:
@@ -214,15 +290,20 @@ class ScheduleRunService:
         ).first()
         return run is not None
 
-    def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
-        """When the schedule's most recent successful run (manual or cron)
-        finished, or None if it never succeeded. Used by the scheduler's
-        freshness guard to skip a due slot right after e.g. a manual run.
+    def last_successful_finish(self, schedule_id: UUID, *, manual_only: bool = False) -> datetime | None:
+        """When the schedule's most recent successful run finished, or None if
+        it never succeeded. Used by the scheduler's freshness guard to skip a
+        due slot right after a manual run.
         """
-        run = self.session.exec(
+        query = (
             self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.success)
+        )
+        if manual_only:
+            query = query.where(ScheduleRun.is_manual == True)  # noqa: E712
+        run = self.session.exec(
+            query
             .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
             .limit(1)
         ).first()
@@ -572,8 +653,13 @@ class ScheduleOccurrenceService:
             return None
         number = row["attempts"] + 1
         token = _new_token()
+        stmt = self._active(occurrence_id)
+        if row["trigger_source"] != "manual":
+            # Only an explicit pause stops it: a one-off is disabled by its
+            # own claim and its retries still run.
+            stmt = stmt.where(_not_paused(ScheduleOccurrence.schedule_id))
         took = self._update(
-            self._active(occurrence_id)
+            stmt
             .where(ScheduleOccurrence.attempts == row["attempts"])
             .where(ScheduleOccurrence.next_attempt_at.is_not(None))  # type: ignore[union-attr]
             .where(ScheduleOccurrence.next_attempt_at <= now)  # type: ignore[operator]
@@ -669,6 +755,7 @@ class ScheduleOccurrenceService:
             outcome == AttemptOutcome.failed_before_execution
             and retry_delay is not None
             and row["attempts"] < row["max_attempts"]
+            and not self._paused(row["schedule_id"])
         )
         stmt = self._active(occurrence_id, token)
         if retry:
@@ -679,14 +766,75 @@ class ScheduleOccurrenceService:
                 next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=retry_delay),
             ))
             return Settlement.retry_scheduled if landed else Settlement.lost
-        landed = self._update(stmt.values(**_settled(_occurrence_status(outcome), error)))
-        return Settlement.settled if landed else Settlement.lost
+        status = _occurrence_status(outcome)
+        if not self._update(stmt.values(**_settled(status, error))):
+            return Settlement.lost
+        self._count(row, status)
+        return Settlement.settled
 
     def settle(self, occurrence_id: UUID, status: str, *, error: str | None = None) -> bool:
         """Settle an active occurrence whoever holds it. Only for a process
         that knows no one else can: the desktop's boot, before its scheduler
         starts. The caller commits."""
-        return self._update(self._active(occurrence_id).values(**_settled(status, error)))
+        row = self._read(occurrence_id)
+        if row is None or not self._update(self._active(occurrence_id).values(**_settled(status, error))):
+            return False
+        self._count(row, status)
+        return True
+
+    def cancel_pending(self, schedule_id: UUID, *, error: str) -> int:
+        """Stage cancelling what would start on its own: a cron retry waiting
+        for its time, or a cron slot claimed whose first attempt has not
+        started. A running attempt, and a run-now, are left alone. The caller
+        commits."""
+        result = unsafe_unscoped_session(self.session).execute(
+            sa.update(ScheduleOccurrence)
+            .where(ScheduleOccurrence.schedule_id == schedule_id)
+            .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+            .where(ScheduleOccurrence.trigger_source != "manual")
+            .where(sa.or_(
+                ScheduleOccurrence.attempts == 0,
+                ScheduleOccurrence.lease_token.is_(None),  # type: ignore[union-attr]
+            ))
+            .values(**_settled(OccurrenceStatus.cancelled, error))
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount
+
+    def _paused(self, schedule_id: UUID) -> bool:
+        return unsafe_unscoped_session(self.session).execute(
+            sa.select(sa.literal(True)).where(~_not_paused(sa.literal(schedule_id, sa.Uuid())))
+        ).first() is not None
+
+    def _count(self, row, status: str) -> None:
+        """Stage the schedule's failure streak for an occurrence that just
+        settled, and pause the schedule when the streak reaches its limit.
+
+        Runs once per occurrence: only the write that settled it calls this.
+        A cron occurrence that settles failed extends the streak, however many
+        attempts it took; a success of either kind ends it. A cancelled one
+        leaves it as is, and so does a manual failure, which the user saw.
+        """
+        schedule_id = row["schedule_id"]
+        raw = unsafe_unscoped_session(self.session)
+        if status == OccurrenceStatus.success:
+            raw.execute(sa.update(Schedule).where(Schedule.id == schedule_id).values(consecutive_failures=0))
+            return
+        if status != OccurrenceStatus.failed or row["trigger_source"] == "manual":
+            return
+        raw.execute(
+            sa.update(Schedule).where(Schedule.id == schedule_id)
+            .values(consecutive_failures=Schedule.consecutive_failures + 1)
+        )
+        paused = raw.execute(
+            sa.update(Schedule)
+            .where(Schedule.id == schedule_id)
+            .where(Schedule.consecutive_failures >= MAX_FAILED_OCCURRENCES)
+            .where(Schedule.auto_paused_at.is_(None))  # type: ignore[union-attr]
+            .values(enabled=False, auto_paused_at=datetime.now(timezone.utc))
+        ).rowcount
+        if paused:
+            logger.warning(f"Schedule {schedule_id} paused after {MAX_FAILED_OCCURRENCES} failed runs in a row")
 
     def ready_for_attempt(self, now: datetime) -> list[UUID]:
         """Cron occurrences whose next attempt is due, oldest first. A manual
@@ -759,6 +907,8 @@ class ScheduleOccurrenceService:
         if not self._update(stmt.values(**values)):
             self.session.rollback()
             return Settlement.lost
+        if not retry:
+            self._count(row, OccurrenceStatus.failed)
         if run is not None:
             self._update(
                 sa.update(ScheduleRun)
@@ -776,6 +926,20 @@ class ScheduleOccurrenceService:
             .where(ScheduleRun.status == RunStatus.running)
             .limit(1)
         ).first()
+
+
+# Cron occurrences in a row that may settle failed before the schedule pauses
+# itself. Retries within one occurrence count once.
+MAX_FAILED_OCCURRENCES = 3
+
+
+def _not_paused(schedule_id):
+    """True while the schedule has no explicit pause or auto-pause."""
+    return sa.exists().where(
+        Schedule.id == schedule_id,
+        Schedule.paused_at.is_(None),  # type: ignore[union-attr]
+        Schedule.auto_paused_at.is_(None),  # type: ignore[union-attr]
+    )
 
 
 def _occurrence_status(outcome: AttemptOutcome) -> OccurrenceStatus:
