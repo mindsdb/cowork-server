@@ -16,6 +16,7 @@ from cowork.common.settings.user_settings import (
     UserSettings,
     default_turn_limits,
     effective_turn_limits,
+    setting_is_operator_pinned,
     setting_is_org_scoped,
 )
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
@@ -78,6 +79,10 @@ def test_the_switch_is_off_by_default_and_org_owned():
     assert UserSettings().limits_enabled is False
     # Org-scoped: in org mode only an org admin may write it, like the budgets.
     assert setting_is_org_scoped("limits_enabled")
+    # Pinned like the budgets, so in a personal partition the switch and the
+    # budgets it governs both resolve from the deployment row.
+    for key in ("limits_enabled", "max_tool_rounds", "max_continuations", "max_turn_tokens"):
+        assert setting_is_operator_pinned(key), key
 
 
 def test_off_ignores_stored_budgets_and_on_applies_them():
@@ -257,6 +262,28 @@ def test_saving_a_budget_turns_the_switch_on_at_once(engine, save):
 
     assert _switch_rows(engine) == {("org", ORG_A, None, "True")}
     assert effective_turn_limits(svc.load()).max_tool_rounds == 12
+
+
+def test_in_a_personal_partition_the_switch_follows_the_deployment_row(engine):
+    """One person's saved budget turns the switch on for every partition, since
+    the budget it applies is the deployment's; a person's own row is ignored."""
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    def person(partition: str, user: str) -> SettingService:
+        scope = TenantScope(
+            personal=True, org_id=partition, user_id=user,
+            personal_resources=ALL_PERSONAL_RESOURCES,
+        )
+        return SettingService(Session(engine), scope)
+
+    with Session(engine) as s:
+        s.add(Setting(key="limits_enabled", value="False", scope="org", org_id=ORG_B))
+        s.commit()
+    person(ORG_A, "alice").upsert_setting("max_tool_rounds", "12")
+
+    assert _switch_rows(engine) == {(None, None, None, "True"), ("org", ORG_B, None, "False")}
+    for svc in (person(ORG_A, "alice"), person(ORG_B, "bob"), SettingService(Session(engine), LOCAL_SCOPE)):
+        assert effective_turn_limits(svc.load()).max_tool_rounds == 12
 
 
 @pytest.mark.parametrize("save", ["upsert", "save_all"])
