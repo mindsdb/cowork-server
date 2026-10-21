@@ -28,6 +28,11 @@ name: Wheels Available
 
 on:
   workflow_call:
+    inputs:
+      floating:
+        description: "Probe compatibility ranges instead of the reviewed release lock"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -56,10 +61,19 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
+          version: "0.11.30"
           python-version: "3.12"
 
       # Resolution only — no venv, no install. The script cross-resolves for
       # every platform via `--python-platform`, so one ubuntu runner covers
       # macOS and Windows too, and no Intel-Mac hardware is needed.
       - name: Check every shipped platform resolves to versions with wheels
-        run: bash scripts/check_wheels_available.sh
+        env:
+          FLOATING: ${{ inputs.floating }}
+        run: |
+          if [ "$FLOATING" = true ]; then
+            bash scripts/check_wheels_available.sh --floating
+          else
+            python scripts/release_contract.py --check
+            bash scripts/check_wheels_available.sh
+          fi

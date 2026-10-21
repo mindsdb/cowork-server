@@ -1,6 +1,6 @@
 """Contract tests for the rc publish in publish-staging.yml.
 
-The pin step reads PyPI's JSON API, which lists an upload as soon as PyPI
+The selected rc is recorded in uv.lock. PyPI lists an upload as soon as it
 accepts it. uv resolves from the Simple index, which can trail by minutes. The
 publish has to wait for the index before anything resolves the pinned rc, or
 the wheel check fails on every platform for a wheel that is not missing.
@@ -11,13 +11,14 @@ import subprocess
 from pathlib import Path
 
 import yaml
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISH_STAGING = ROOT / ".github/workflows/publish-staging.yml"
 CHECK_WHEELS = ROOT / "scripts/check_wheels_available.sh"
 
-PIN_STEP = "Pin anton-agent to its latest staging rc"
+PIN_STEP = "Select anton-agent from the reviewed lock"
 WAIT_STEP = "Wait until uv resolves the pinned anton-agent rc"
 RC = "2.26.10.19.1rc2"
 
@@ -92,6 +93,23 @@ echo "anton-agent=={RC}"
     return result, lines("uv"), lines("sleep")
 
 
+@pytest.mark.parametrize("version", [RC, "2.26.10.21.1"])
+def test_release_selects_reviewed_anton_without_reading_latest(tmp_path, version):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stub(bin_dir, "curl", "echo 'must not select a new release from PyPI' >&2; exit 99\n")
+    (tmp_path / "uv.lock").write_text(
+        f'[[package]]\nname = "anton-agent"\nversion = "{version}"\n'
+    )
+    output = tmp_path / "output"
+    output.touch()
+    pin = next(step for step in _publish_steps() if step.get("id") == "pin")
+    result = _run(tmp_path, ["bash", "-e", "-c", pin["run"]], {"GITHUB_OUTPUT": str(output)})
+    assert result.returncode == 0, result.stderr
+    assert f"anton-agent=={version}" in result.stdout
+    assert output.read_text() == (f"rc={version}\n" if "rc" in version else "")
+
+
 def test_the_rc_wait_runs_between_the_pin_and_the_build():
     names = [step.get("name") for step in _publish_steps()]
     pin = _step(PIN_STEP)
@@ -104,8 +122,6 @@ def test_the_rc_wait_runs_between_the_pin_and_the_build():
     # The pin step exports the rc only on the branch that writes the pin, so a
     # stable anton-agent leaves the output empty and skips the wait.
     assert pin["id"] == "pin"
-    rc_branch = pin["run"].split("else", 1)[0]
-    assert 'echo "rc=$LATEST" >> "$GITHUB_OUTPUT"' in rc_branch
     assert wait["if"] == "steps.pin.outputs.rc != ''"
     assert wait["env"] == {"ANTON_RC": "${{ steps.pin.outputs.rc }}"}
 
@@ -173,3 +189,22 @@ esac
     assert "FAILED (resolves to a version with no wheel)" in result.stdout
     assert "publishes no wheel" in result.stdout
     assert "could not be resolved at all" not in result.stdout
+
+
+@pytest.mark.parametrize("filename", ["publish.yml", "publish-staging.yml"])
+def test_both_publishers_check_the_built_artifact_before_upload(tmp_path, filename):
+    workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
+    steps = workflow["jobs"]["publish"]["steps"]
+    step = next(item for item in steps if item.get("name") == "Check the built wheel resolves to wheels on every shipped platform")
+    assert steps.index(step) < next(i for i, item in enumerate(steps) if item.get("uses", "").startswith("pypa/gh-action-pypi-publish"))
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "check_wheels_available.sh").write_text('test "$1" = dist/reviewed.whl\n')
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "reviewed.whl").touch()
+    result = _run(tmp_path, ["bash", "-c", step["run"]], {})
+    assert result.returncode == 0, result.stdout + result.stderr
+    (dist / "second.whl").touch()
+    result = _run(tmp_path, ["bash", "-c", step["run"]], {})
+    assert result.returncode != 0
