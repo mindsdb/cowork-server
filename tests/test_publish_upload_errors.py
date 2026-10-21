@@ -8,6 +8,7 @@ import logging
 import urllib.error
 
 import pytest
+from fastapi import HTTPException
 
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
@@ -102,11 +103,14 @@ def test_an_already_typed_error_is_raised_unchanged(exc):
     assert error.value is exc
 
 
-@pytest.mark.parametrize("status", [403, 413, 503])
-def test_the_refusals_that_skip_the_publish_failure_log_are_logged(status, caplog):
+@pytest.mark.parametrize("status, body", [
+    (403, {"code": "permission_denied"}),
+    (413, {"error": "x"}),
+    (503, {"error": "x"}),
+])
+def test_the_refusals_that_skip_the_publish_failure_log_are_logged(status, body, caplog):
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
-        with pytest.raises(Exception):
-            body = {"code": "permission_denied"} if status == 403 else {"error": "x"}
+        with pytest.raises(HTTPException):
             classify_upload_error(_http_error(status, body))
     assert f"Publish service answered HTTP {status}" in caplog.text
 

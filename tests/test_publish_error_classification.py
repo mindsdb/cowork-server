@@ -180,12 +180,6 @@ def test_an_unconfirmed_publisher_403_is_not_a_permission_denial(tmp_path, monke
     assert "HTTP 403" in str(error.value)
 
 
-def _page(tmp_path: Path) -> Path:
-    page = tmp_path / "report.html"
-    page.write_text("<html></html>")
-    return page
-
-
 def _upstream(status: int, body, reason: str = "Rejected") -> urllib.error.HTTPError:
     import io
     import json
@@ -195,7 +189,8 @@ def _upstream(status: int, body, reason: str = "Rejected") -> urllib.error.HTTPE
 
 
 def _publish_failing_with(tmp_path, monkeypatch, exc):
-    page = _page(tmp_path)
+    page = tmp_path / "report.html"
+    page.write_text("<html></html>")
     _wire_publish(monkeypatch, tmp_path, page, "report.html", publish_side_effect=exc)
     return lambda: publish.publish_artifact(
         page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai",

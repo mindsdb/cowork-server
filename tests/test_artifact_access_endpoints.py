@@ -96,6 +96,29 @@ def publish_context(monkeypatch):
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("granted_product_permissions")]
 
 
+def _upload_service_answers(monkeypatch, status: int, reason: str, body: bytes) -> None:
+    """The real publish path runs, and the upload service answers `status`."""
+    import io
+    from urllib.error import HTTPError
+
+    def reject(*args, **kwargs):
+        raise HTTPError("https://publish.example/upload", status, reason, {}, io.BytesIO(body))
+
+    monkeypatch.setattr("anton.publisher.publish", reject)
+    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity.publish_authorization_key",
+        lambda *args: "owner/artifact",
+    )
+
+
+def _lock_is_free(folder) -> bool:
+    free = artifact_locks.acquire(folder.parent, folder.name, ttl_s=60)
+    if free:
+        artifact_locks.release(folder.parent, folder.name)
+    return free
+
+
 async def test_setting_access_republishes_with_the_chosen_audience(
     as_owner, publish_calls, publish_context,
 ):
@@ -187,24 +210,11 @@ async def test_share_preserves_mint_failure_after_waiting_for_publish_lock(
 async def test_share_preserves_authority_failure_from_the_artifact_consumer(
     as_owner, publish_context, monkeypatch, status,
 ):
-    import io
-    from urllib.error import HTTPError
-
     body = (
         {"code": "permission_denied"} if status == 403
         else {"error": "Auth unavailable", "code": "auth_unavailable"}
     )
-
-    def reject(*args, **kwargs):
-        raise HTTPError("https://publish.example/upload", status, "Rejected", {},
-                        io.BytesIO(json.dumps(body).encode()))
-
-    monkeypatch.setattr("anton.publisher.publish", reject)
-    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
-    monkeypatch.setattr(
-        "cowork.services.artifact_authorization_identity.publish_authorization_key",
-        lambda *args: "owner/artifact",
-    )
+    _upload_service_answers(monkeypatch, status, "Rejected", json.dumps(body).encode())
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
             "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
@@ -346,19 +356,7 @@ async def test_share_of_a_report_owned_by_another_account_is_409(as_owner, publi
 async def test_share_reports_an_unmarked_upload_503_as_the_service_being_unavailable(
     as_owner, publish_context, monkeypatch,
 ):
-    import io
-    from urllib.error import HTTPError
-
-    def reject(*args, **kwargs):
-        raise HTTPError("https://publish.example/upload", 503, "Service Unavailable", {},
-                        io.BytesIO(b'{"error": "Service Unavailable"}'))
-
-    monkeypatch.setattr("anton.publisher.publish", reject)
-    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
-    monkeypatch.setattr(
-        "cowork.services.artifact_authorization_identity.publish_authorization_key",
-        lambda *args: "owner/artifact",
-    )
+    _upload_service_answers(monkeypatch, 503, "Service Unavailable", b'{"error": "Service Unavailable"}')
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
             "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
@@ -369,31 +367,11 @@ async def test_share_reports_an_unmarked_upload_503_as_the_service_being_unavail
         "message": "The publishing service is temporarily unavailable. Try again in a moment.",
     }
     assert not (as_owner / ".published.json").exists()
-    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60)
-    artifact_locks.release(as_owner.parent, as_owner.name)
-
-
-def _lock_is_free(folder) -> bool:
-    free = artifact_locks.acquire(folder.parent, folder.name, ttl_s=60)
-    if free:
-        artifact_locks.release(folder.parent, folder.name)
-    return free
+    assert _lock_is_free(as_owner)
 
 
 async def test_a_too_large_artifact_is_413_with_its_code(as_owner, publish_context, monkeypatch):
-    import io
-    from urllib.error import HTTPError
-
-    def reject(*args, **kwargs):
-        raise HTTPError("https://publish.example/upload", 413, "Payload Too Large", {},
-                        io.BytesIO(b'{"message": "Request Too Long"}'))
-
-    monkeypatch.setattr("anton.publisher.publish", reject)
-    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
-    monkeypatch.setattr(
-        "cowork.services.artifact_authorization_identity.publish_authorization_key",
-        lambda *args: "owner/artifact",
-    )
+    _upload_service_answers(monkeypatch, 413, "Payload Too Large", b'{"message": "Request Too Long"}')
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
             "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
@@ -487,17 +465,22 @@ async def test_the_turn_key_is_revoked_after_a_failed_share(as_owner, publish_co
 async def test_the_turn_key_is_kept_while_a_timed_out_publish_still_runs(
     as_owner, publish_context, monkeypatch,
 ):
-    import time
+    import threading
+
+    finish = threading.Event()
 
     def slow(*args, **kwargs):
-        time.sleep(0.3)
+        finish.wait(5)
         return {"status": "ok", "url": "https://view.example/r/1"}
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", slow)
     monkeypatch.setattr(aw, "_LIVE_PUBLISH_TIMEOUT_S", 0.05)
-    with pytest.raises(HTTPException) as error:
-        await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
-        )
+    try:
+        with pytest.raises(HTTPException) as error:
+            await aw.set_artifact_access(
+                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            )
+    finally:
+        finish.set()
     assert error.value.detail == "Publishing timed out. Try again in a moment."
     assert publish_context == []

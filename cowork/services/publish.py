@@ -68,13 +68,20 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
+class _CodedRefusal(HTTPException):
+    """An HTTPException whose detail is `{"code", "message"}`: clients match on the code."""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(status_code, detail={"code": code, "message": message})
+
+
 # The upload service's 409 for a report that belongs to another account; the
 # renderer matches on the code.
 OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
 OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
 
 
-class PublishOwnedByOtherUser(HTTPException):
+class PublishOwnedByOtherUser(_CodedRefusal):
     """The upload service refused the publish: another account owns this report.
 
     An HTTPException, like ProductPermissionDenied, so any route that lets it
@@ -83,9 +90,7 @@ class PublishOwnedByOtherUser(HTTPException):
     """
 
     def __init__(self) -> None:
-        super().__init__(
-            409, detail={"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE},
-        )
+        super().__init__(409, OWNED_BY_OTHER_USER_CODE, OWNED_BY_OTHER_USER_MESSAGE)
 
 
 # The upload service's 413: the bundle is over its request size limit.
@@ -99,7 +104,7 @@ UPLOAD_UNAVAILABLE_CODE = "publish_unavailable"
 UPLOAD_UNAVAILABLE_MESSAGE = "The publishing service is temporarily unavailable. Try again in a moment."
 
 
-class PublishTooLarge(HTTPException):
+class PublishTooLarge(_CodedRefusal):
     """The upload service refused the bundle as too large.
 
     The same files are refused on every retry, so callers report it instead
@@ -107,18 +112,14 @@ class PublishTooLarge(HTTPException):
     """
 
     def __init__(self) -> None:
-        super().__init__(
-            413, detail={"code": ARTIFACT_TOO_LARGE_CODE, "message": ARTIFACT_TOO_LARGE_MESSAGE},
-        )
+        super().__init__(413, ARTIFACT_TOO_LARGE_CODE, ARTIFACT_TOO_LARGE_MESSAGE)
 
 
-class UploadServiceUnavailable(HTTPException):
+class UploadServiceUnavailable(_CodedRefusal):
     """The upload service answered 503 without marking it as an auth outage."""
 
     def __init__(self) -> None:
-        super().__init__(
-            503, detail={"code": UPLOAD_UNAVAILABLE_CODE, "message": UPLOAD_UNAVAILABLE_MESSAGE},
-        )
+        super().__init__(503, UPLOAD_UNAVAILABLE_CODE, UPLOAD_UNAVAILABLE_MESSAGE)
 
 
 class PublishRejected(RuntimeError):
@@ -199,16 +200,11 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     raise typed from exc
 
 
-_CLIP_HEAD = 100
-_CLIP_TAIL = 400
-_CLIP_GAP = " … "
-
-
-def _clip(text: str) -> str:
+def _clip(text: str, head: int = 100, tail: int = 400, gap: str = " … ") -> str:
     """Server text short enough to show, keeping the end where pip names the cause."""
-    if len(text) <= _CLIP_HEAD + len(_CLIP_GAP) + _CLIP_TAIL:
+    if len(text) <= head + len(gap) + tail:
         return text
-    return f"{text[:_CLIP_HEAD]}{_CLIP_GAP}{text[-_CLIP_TAIL:]}"
+    return f"{text[:head]}{gap}{text[-tail:]}"
 
 
 #: The files the publish store holds: its state, and the temporary file a
@@ -703,12 +699,12 @@ def publish_artifact(
     except Exception as exc:
         upload_error = classify_upload_error(exc)
         logger.exception("Publishing failed")
+        # A 401's text ("Invalid token") says less than the credentials advice below.
         if (
-            upload_error is not None
-            and 400 <= upload_error.status < 500
-            # "Invalid token" says less than the credentials advice below.
-            and upload_error.status != 401
+            upload_error
             and upload_error.error
+            and 400 <= upload_error.status < 500
+            and upload_error.status != 401
         ):
             raise PublishRejected(f"Publishing failed: {_clip(upload_error.error)}") from exc
         # Only network/HTTP failures get the "Connection failed" framing — a

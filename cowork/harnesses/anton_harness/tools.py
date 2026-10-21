@@ -341,7 +341,8 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             reason="owned_by_other_user",
         )
     except PublishTooLarge:
-        # Retrying the same files cannot succeed; the model can shrink them.
+        # Retrying the same files cannot succeed; the model can shrink them. Kept
+        # before the generic HTTPException branch for this do-not-retry advice.
         logger.info("Cowork publish refused: %s", ARTIFACT_TOO_LARGE_MESSAGE)
         return _fail(
             f"PUBLISH FAILED: {ARTIFACT_TOO_LARGE_MESSAGE} Do not retry with the same files. "
