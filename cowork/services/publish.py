@@ -157,8 +157,9 @@ def _read_http_error_body(exc: Exception) -> tuple[str, str | None, str | None]:
         return body, None, None
     code = payload.get("code")
     error = payload.get("error")
-    if not isinstance(error, str):
-        # API Gateway's own refusals (429, a missing route) carry their text here.
+    if not isinstance(error, str) and getattr(exc, "code", None) == 429:
+        # API Gateway's throttling text. Its other `message` answers, such as
+        # "Missing Authentication Token" for a wrong URL, would mislead.
         error = payload.get("message")
     return (
         body,
@@ -200,8 +201,9 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     raise typed from exc
 
 
-def _clip(text: str, head: int = 100, tail: int = 400, gap: str = " … ") -> str:
+def _clip(text: str) -> str:
     """Server text short enough to show, keeping the end where pip names the cause."""
+    head, tail, gap = 100, 400, " … "
     if len(text) <= head + len(gap) + tail:
         return text
     return f"{text[:head]}{gap}{text[-tail:]}"
@@ -701,7 +703,7 @@ def publish_artifact(
         logger.exception("Publishing failed")
         # A 401's text ("Invalid token") says less than the credentials advice below.
         if (
-            upload_error
+            upload_error is not None
             and upload_error.error
             and 400 <= upload_error.status < 500
             and upload_error.status != 401

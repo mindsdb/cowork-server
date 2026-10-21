@@ -131,8 +131,7 @@ def test_an_answer_left_to_the_caller_is_not_logged_here(status, body, caplog):
     ({"other": 1}, ('{"other": 1}', None, None)),
     ({"code": 7, "error": {"nested": True}}, ('{"code": 7, "error": {"nested": true}}', None, None)),
     ([1, 2], ("[1, 2]", None, None)),
-    ({"message": "Too Many Requests"}, ('{"message": "Too Many Requests"}', None, "Too Many Requests")),
-    ({"error": "e", "message": "m"}, ('{"error": "e", "message": "m"}', None, "e")),
+    ({"message": "Missing Authentication Token"}, ('{"message": "Missing Authentication Token"}', None, None)),
     (b"plain text", ("plain text", None, None)),
     (_BrokenBody(), ("", None, None)),
 ])
@@ -146,6 +145,14 @@ def test_the_body_is_read_once_into_text_code_and_error(body, expected):
 ])
 def test_publisher_http_detail_keeps_its_answer(body, expected):
     assert _publisher_http_detail(_http_error(404, body)) == expected
+
+
+@pytest.mark.parametrize("body, expected", [
+    ({"message": "Too Many Requests"}, ('{"message": "Too Many Requests"}', None, "Too Many Requests")),
+    ({"error": "e", "message": "m"}, ('{"error": "e", "message": "m"}', None, "e")),
+])
+def test_a_throttled_answer_takes_its_text_from_message(body, expected):
+    assert _read_http_error_body(_http_error(429, body)) == expected
 
 
 def test_publisher_http_detail_falls_back_to_the_exception_text():

@@ -274,10 +274,20 @@ def test_a_connection_failure_without_an_http_answer_is_shown_to_the_user(tmp_pa
     assert str(error.value).startswith("Publishing failed. Connection failed")
 
 
-def test_an_api_gateway_refusal_shows_its_message(tmp_path, monkeypatch):
+def test_a_throttled_publish_shows_the_gateway_text(tmp_path, monkeypatch):
     run = _publish_failing_with(
         tmp_path, monkeypatch, _upstream(429, {"message": "Too Many Requests"}, "Too Many Requests"),
     )
     with pytest.raises(publish.PublishRejected) as error:
         run()
     assert str(error.value) == "Publishing failed: Too Many Requests"
+
+
+def test_a_missing_gateway_route_keeps_the_wrong_endpoint_advice(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(403, {"message": "Missing Authentication Token"}, "Forbidden"),
+    )
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "Missing Authentication Token" not in str(error.value)
+    assert "wrong server/endpoint" in str(error.value)
