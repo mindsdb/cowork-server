@@ -514,3 +514,25 @@ def test_a_later_step_of_a_multi_step_save_may_add_fields_beside_a_stored_secret
     assert fields["api_key"] == "stored-api-key-7f3a"
     assert fields["host"] == "a.example.net"
     assert fields["account_email"] == "ops@example.net"
+
+
+async def test_an_edit_submit_of_a_browser_sign_in_connection_is_refused_and_changes_nothing(probes):
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    slug = persist_connection(
+        "hubspot", "mcp", "", {"access_token": "hubspot-oauth-token-51c2", "account_email": "ops@example.net"},
+        default_fields={"_access_mode": "none"},
+    )
+    before = vault.read_record("hubspot", slug)
+    request = SubmitFormRequest(
+        connector_id="hubspot", method="mcp", name=slug,
+        values={"access_token": VAULT_KEEP_SENTINEL, "account_email": "ops@example.net"},
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await submissions_ep.submit_form(request, LOCAL_SCOPE)
+
+    assert refused.value.status_code == 400
+    assert refused.value.detail == submissions_ep.BROWSER_SIGN_IN_EDIT_REFUSAL
+    assert probes == []
+    assert vault.read_record("hubspot", slug) == before
+    assert before["fields"]["_access_mode"] == "none"

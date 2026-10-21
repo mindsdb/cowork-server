@@ -16,6 +16,7 @@ from cowork.handlers.probe import ProbeHandler
 from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.databricks_genie import ORG_MODE_REFUSAL, is_genie_method
+from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
@@ -28,6 +29,29 @@ from cowork.services.connectors.submissions import store
 # model.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
+# Methods that sign in through the browser; a form edit of one would replace
+# the record without the bookkeeping its sign-in wrote.
+_BROWSER_SIGN_IN_METHODS = frozenset({"mcp", "browser_oauth_builtin"})
+BROWSER_SIGN_IN_EDIT_REFUSAL = (
+    "This connection signs in through the browser, so it can't be edited here. Reconnect it instead."
+)
+
+
+def _refuse_browser_sign_in_edit(scope: TenantScope, connector_id: str, name: str, method_def, values: dict) -> None:
+    """Refuse an edit submit of a saved browser sign-in connection with a 400.
+
+    An edit is a submit that names a saved connection and carries a keep
+    marker. A browser sign-in method is ``mcp``, ``browser_oauth_builtin``, or
+    one whose spec submit_action is ``oauth_launch``. Reads the vault only for
+    such a submit; raises HTTPException, returns None otherwise.
+    """
+    if VAULT_KEEP_SENTINEL not in values.values() or not name.strip() or method_def is None:
+        return
+    if method_def.id not in _BROWSER_SIGN_IN_METHODS and method_def.submit_action != "oauth_launch":
+        return
+    if vault_for_scope(scope).read_record(connector_id, name.strip()) is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=BROWSER_SIGN_IN_EDIT_REFUSAL)
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -103,6 +127,8 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Unknown method: {method!r}",
                 )
+
+            _refuse_browser_sign_in_edit(scope, connector_id, req.name, method_def, req.values)
 
         if scope.org_mode and is_genie_method(connector_id, method):
             # The workspace host is checked by suffix only, with no public-address
