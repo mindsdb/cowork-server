@@ -224,6 +224,7 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
     for entry in registry.root:
         if (entry.partition_id, entry.engine, entry.name) in stored:
             first_share.setdefault((entry.engine, entry.name), entry.partition_id)
+    shared_prefixes = Counter(_slug_env_prefix(engine, name) for engine, name in first_share)
     result = []
     for row in rows:
         notes = list(row.notes)
@@ -234,6 +235,8 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
                 notes.append("same-vault-prefix-collision")
             if row.origin == "personal" and row.visibility == "shared":
                 notes.append("recipient-own-prefix-takes-priority")
+                if shared_prefixes[row.prefix] > 1:
+                    notes.append("shared-prefix-collision-for-other-recipients")
                 if first_share[row.engine, row.name] != row.partition_id:
                     notes.append("earlier-share-takes-priority-for-other-recipients")
         if person is None or row.partition_id in {None, person.partition_id}:

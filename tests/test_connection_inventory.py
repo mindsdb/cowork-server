@@ -115,6 +115,20 @@ def test_duplicate_shares_report_the_registry_precedence(stack, capsys):
     assert rows[SUB_B]["notes"] == ["recipient-own-prefix-takes-priority", "earlier-share-takes-priority-for-other-recipients"]
 
 
+def test_distinct_shared_names_report_prefix_collisions_across_partitions(stack, capsys):
+    entries = [(ALICE, "team-db"), (BOB, "team_db")]
+    for person, name in entries:
+        _save(person, name)
+    stack.shared_dir.mkdir(exist_ok=True)
+    stack.shared_connections_file.write_text(json.dumps([
+        {"user_id": person.user_id, "partition_id": person.partition_id, "engine": "postgres", "name": name}
+        for person, name in entries
+    ]))
+    rows = _list(capsys)["connections"]
+    assert len(rows) == 2
+    assert all("shared-prefix-collision-for-other-recipients" in row["notes"] for row in rows)
+
+
 @pytest.mark.parametrize("kind", ["invalid-json", "invalid-creator", "invalid-fields", "wrong-name", "symlink", "hardlink", "fifo", "directory", "oversized"])
 def test_inventory_refuses_bad_records_without_printing_their_values(stack, tmp_path, capsys, kind):
     path = Path(_save(ALICE))
