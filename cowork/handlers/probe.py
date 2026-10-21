@@ -5,7 +5,7 @@ import logging
 import shutil
 import tempfile
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -29,6 +29,7 @@ from cowork.services.connectors.persist import persist_connection, vault_for_sco
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
+from cowork.services.connectors.vault_secrets import kept_secret_scrubber
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, unsafe_unscoped_session
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
 from cowork.services.conversations import ConversationService
@@ -59,33 +60,28 @@ def _extract_connection_label_fields(credentials: dict) -> tuple[str, str]:
     return label, user_label
 
 
-_REDACTED_SECRET = "[saved secret]"
-
-
-def _redact_secrets(value: Any, *, secrets: tuple[str, ...]) -> Any:
-    """``value`` with every one of ``secrets`` replaced by a marker, longest first.
+def _redact_secrets(value: Any, *, scrub: Callable[[str], str] | None) -> Any:
+    """``value`` with every string in it passed through ``scrub``.
 
     Walks strings, lists, dicts and ProbeOutcome, the shapes a probe event or
-    verdict carries, and returns other values as they are. Without secrets
+    verdict carries, and returns other values as they are. Without ``scrub``
     ``value`` is returned unchanged. Pure; it never logs a value.
     """
-    if not secrets:
+    if scrub is None:
         return value
     if isinstance(value, str):
-        for secret in sorted(secrets, key=len, reverse=True):
-            value = value.replace(secret, _REDACTED_SECRET)
-        return value
+        return scrub(value)
     if isinstance(value, dict):
-        return {key: _redact_secrets(item, secrets=secrets) for key, item in value.items()}
+        return {key: _redact_secrets(item, scrub=scrub) for key, item in value.items()}
     if isinstance(value, list):
-        return [_redact_secrets(item, secrets=secrets) for item in value]
+        return [_redact_secrets(item, scrub=scrub) for item in value]
     if isinstance(value, ProbeOutcome):
         return replace(
             value,
-            summary=_redact_secrets(value.summary, secrets=secrets),
-            error=_redact_secrets(value.error, secrets=secrets),
-            follow_up=_redact_secrets(value.follow_up, secrets=secrets),
-            extra_fields=_redact_secrets(value.extra_fields, secrets=secrets),
+            summary=_redact_secrets(value.summary, scrub=scrub),
+            error=_redact_secrets(value.error, scrub=scrub),
+            follow_up=_redact_secrets(value.follow_up, scrub=scrub),
+            extra_fields=_redact_secrets(value.extra_fields, scrub=scrub),
         )
     return value
 
@@ -403,7 +399,8 @@ class ProbeHandler:
                 return
             check_credentials = checked.credentials
             # The user did not type a kept secret, so nothing the probe streams may show it.
-            redact = partial(_redact_secrets, secrets=checked.kept_secrets)
+            scrub = kept_secret_scrubber(checked.kept_secrets) if checked.kept_secrets else None
+            redact = partial(_redact_secrets, scrub=scrub)
 
             # Probe path: build workspace + LLM client
             cell_sandbox = None

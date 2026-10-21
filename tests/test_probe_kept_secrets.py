@@ -6,8 +6,10 @@ can change, and the save must still update that record in place.
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
+from urllib.parse import quote
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
@@ -387,6 +389,9 @@ async def test_a_kept_secret_echoed_by_the_probe_never_reaches_the_stream(stores
             yield "scratchpad", {"action": "start"}
             yield "scratchpad", {"action": "end", "name": "c", "code": f"print('{token}')"}
             yield "scratchpad", {"action": "result", "content": json.dumps({"stdout": token})}
+            yield "scratchpad", {"action": "end", "name": "b", "code": "print(base64.b64encode(t))"}
+            yield "scratchpad", {"action": "result", "content": json.dumps({"stdout": _b64(token)})}
+            yield "text", f"Encoded {quote(token, safe='')} and {_b64(token)}."
             if ending == "crash":
                 raise RuntimeError(f"rejected {token}")
             yield "verdict", ProbeOutcome(status="failure", error=f"401 for {token}", follow_up=token)
@@ -401,7 +406,8 @@ async def test_a_kept_secret_echoed_by_the_probe_never_reaches_the_stream(stores
     stream = await _submit(_edit(user_label="Warehouse"), name=slug)
 
     assert TOKEN not in stream
-    assert "[saved secret]" in stream
+    assert _b64(TOKEN) not in stream
+    assert "[DS_CONNECTION_CHECK_KEPT__KEPT_0]" in stream
     assert "print(" in stream
     assert _outcome(stream)["_is_success"] is False
 
@@ -413,3 +419,8 @@ class _SilentLog:
         """Drop the line."""
 
     debug = info = warning = error = exception = _drop
+
+
+def _b64(value: str) -> str:
+    """``value`` in standard base64."""
+    return base64.b64encode(value.encode()).decode()

@@ -7,11 +7,14 @@ the remote seed) needs that registration done at request entry.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import re
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from anton.core.datasources.data_vault import is_secret_key
-from anton.utils.datasources import begin_ds_turn_scope, restore_namespaced_env
+from anton.utils.datasources import begin_ds_turn_scope, restore_namespaced_env, scrub_credentials
 
 from cowork.common.logger import get_logger
 from cowork.services.connectors.persist import vault_for_scope
@@ -70,6 +73,67 @@ class _ScrubRegistrationVault:
         if env is None:
             return None
         return {**env, **_hidden_secret_values(self._vault, engine, name)}
+
+
+_KEPT_ENGINE = "connection-check"
+_KEPT_NAME = "kept"
+
+
+class _KeptSecretsVault:
+    """The stored secrets one connection check kept, as an in-memory vault's
+    only connection, every field marked secure.
+
+    Only ever handed to ``restore_namespaced_env``, so the scrubber learns the
+    values; nothing builds a pad environment from it.
+    """
+
+    def __init__(self, secrets: tuple[str, ...]) -> None:
+        """Hold each secret as one secure field."""
+        self._fields = {f"kept_{index}": value for index, value in enumerate(secrets)}
+
+    def _is_kept(self, engine: str, name: str) -> bool:
+        """Whether ``engine``/``name`` names this vault's one connection."""
+        return (engine, name) == (_KEPT_ENGINE, _KEPT_NAME)
+
+    def list_connections(self) -> list[dict[str, str]]:
+        """The one connection, in the vault listing's shape."""
+        return [{"engine": _KEPT_ENGINE, "name": _KEPT_NAME, "created_at": ""}]
+
+    def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
+        """The connection's record with every field secure, or None for any other name."""
+        if not self._is_kept(engine, name):
+            return None
+        return {"fields": dict(self._fields), "secure_keys": list(self._fields)}
+
+    def load(self, engine: str, name: str) -> dict[str, str] | None:
+        """The connection's fields, or None for any other name."""
+        return dict(self._fields) if self._is_kept(engine, name) else None
+
+    def env_for(self, engine: str, name: str, *, flat: bool = False) -> dict[str, str] | None:
+        """The connection's DS_* names and values, named as anton names them, or None."""
+        if not self._is_kept(engine, name):
+            return None
+        prefix = "DS_" + re.sub(r"[^\w]", "_", f"{engine}-{name}").upper()
+        return {f"{prefix}__{key.upper()}": value for key, value in self._fields.items()}
+
+
+def _register_kept_secrets(secrets: tuple[str, ...]) -> None:
+    """Open a DS_* scope in the current context and register ``secrets`` in it."""
+    begin_ds_turn_scope()
+    restore_namespaced_env(_KeptSecretsVault(secrets))
+
+
+def kept_secret_scrubber(secrets: tuple[str, ...]) -> Callable[[str], str]:
+    """A function that hides ``secrets`` in a text the way ``scrub_credentials`` does.
+
+    The secrets are registered in a context of their own, so every printed or
+    encoded form anton matches is hidden, and neither the caller's scope nor
+    a scope a later turn opens is touched. Each call scrubs in that context.
+    Raises whatever the registration raises; it never logs a value.
+    """
+    context = contextvars.Context()
+    context.run(_register_kept_secrets, secrets)
+    return partial(context.run, scrub_credentials)
 
 
 def _restore_from_vault(scope: TenantScope | None) -> None:
