@@ -259,6 +259,7 @@ class ScheduleRun(BaseSQLModel, table=True):
     conversation_id: UUID | None = Field(
         default=None,
         foreign_key="conversations.id",
+        index=True,
         description="Conversation created during this run",
     )
     is_manual: bool = Field(default=False, description="True if triggered via run-now endpoint")
