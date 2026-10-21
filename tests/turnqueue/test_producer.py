@@ -493,8 +493,9 @@ def _deployment_defaults():
 
 
 @pytest.fixture
-def org_settings(monkeypatch):
-    """Writes settings rows for an org in the real store; removes them after."""
+def org_settings(monkeypatch, org_deployment):
+    """Writes settings rows for an org in the real store; removes them after.
+    Org tenancy: only there does the producer resolve a turn's org scope."""
     from cowork.common.settings import user_settings as us
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.scoped import TenantScope
