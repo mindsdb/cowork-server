@@ -337,7 +337,7 @@ async def test_a_kept_secret_with_no_record_to_resolve_against_is_refused_before
     assert _records() == []
 
 
-@pytest.mark.parametrize("ending", ["success", "crash"])
+@pytest.mark.parametrize("ending", ["success", "crash", "save-failure"])
 async def test_a_kept_secret_is_never_logged(probes, monkeypatch, ending):
     calls: list[tuple[str, tuple, dict]] = []
 
@@ -368,6 +368,13 @@ async def test_a_kept_secret_is_never_logged(probes, monkeypatch, ending):
     monkeypatch.setattr(probe_handler, "logger", _Log())
     slug = persist_connection("databricks", PAT, "", SAVED)
 
+    def _failing_save(*args: object, **kwargs: object) -> str:
+        """Fail the save after a working check, quoting the stored token."""
+        raise RuntimeError(f"vault refused {TOKEN}")
+
+    if ending == "save-failure":
+        monkeypatch.setattr(probe_handler, "persist_connection", _failing_save)
+
     stream = await _submit(_edit(user_label="Warehouse"), name=slug)
 
     assert TOKEN not in stream
@@ -375,7 +382,7 @@ async def test_a_kept_secret_is_never_logged(probes, monkeypatch, ending):
         assert TOKEN not in msg
         assert all(TOKEN not in str(arg) for arg in args)
         assert not kwargs.get("exc_info")
-    if ending == "crash":
+    if ending in ("crash", "save-failure"):
         assert any("RuntimeError" in str(arg) for _, args, _ in calls for arg in args)
 
 

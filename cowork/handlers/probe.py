@@ -566,7 +566,8 @@ class ProbeHandler:
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
                 except Exception as exc:
-                    logger.exception("Vault save failed despite probe success")
+                    # The class only: a vault error can quote the record, stored secrets included.
+                    logger.error("Vault save failed despite probe success (%s)", type(exc).__name__)
                     final_outcome.status = "failure"
                     final_outcome.error = f"Probe succeeded but save failed: {exc}"
             final_outcome = redact(final_outcome)
