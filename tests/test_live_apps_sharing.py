@@ -26,8 +26,10 @@ from tests._live_apps import (
     EMAIL_A,
     PARTITION_A,
     PARTITION_B,
+    PARTITION_C,
     SUB_A,
     SUB_B,
+    SUB_C,
     clear_live_app_rows,
     general_project,
     headers_for,
@@ -310,6 +312,38 @@ def test_a_later_duplicate_makes_a_new_copy(people):
     second = _duplicate(client, share["shareId"], people["b_project"]).json()
 
     assert first["folder"] != second["folder"]
+
+
+def test_anyone_on_the_stack_duplicates_an_app_shared_with_everyone(people):
+    """C, named in no share, sees and copies an app A shared with everyone.
+    The copy declares A's connections by engine and name only, so it runs
+    with C's own saved connections of those names; A's log, which held a
+    value, stays behind."""
+    c_project, c_path = general_project(person_scope(PARTITION_C, SUB_C))
+    client = _client()
+    everyone = _share(client, people["a_project"], everyone=True).json()
+
+    (listed,) = _shared_with(client, C).json()
+    response = _duplicate(client, everyone["shareId"], c_project, headers=C)
+
+    assert listed["shareId"] == everyone["shareId"] and listed["everyone"] is True
+    assert response.status_code == 200
+    copy = Path(response.json()["folder"])
+    assert copy.parent == Path(c_path) / ".anton" / "artifacts"
+    metadata = json.loads((copy / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["datasources"] == [{"engine": "postgres", "name": "demo"}]
+    assert not (copy / "backend.log").exists()
+    assert all("hunter2" not in path.read_text(encoding="utf-8") for path in copy.rglob("*") if path.is_file())
+    assert response.json()["receivedFrom"] == {"email": EMAIL_A}
+
+
+def test_the_owner_never_lists_or_copies_their_own_share(people):
+    client = _client()
+    everyone = _share(client, people["a_project"], everyone=True).json()
+
+    assert _shared_with(client, A).json() == []
+    response = _duplicate(client, everyone["shareId"], people["a_project"], headers=A)
+    assert (response.status_code, response.json()["detail"]) == (404, "This app is no longer shared with you.")
 
 
 def test_a_share_with_someone_else_or_into_their_project_is_404(people):
