@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from anton.core.datasources.data_vault import is_secret_key
 
@@ -11,6 +12,7 @@ from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
     keeps_secret_for_another_account,
+    kept_secret_keys,
     resolve_keep_sentinels,
 )
 from cowork.services.connectors.layered_vault import (
@@ -35,6 +37,14 @@ class KeptValuesRefused(Exception):
         """Keep ``message`` as both the error text and its ``message`` attribute."""
         super().__init__(message)
         self.message = message
+
+
+@dataclass(frozen=True)
+class ValuesForCheck:
+    """An edit's values for a connection check, and the stored secret values it kept."""
+
+    credentials: dict
+    kept_secrets: tuple[str, ...]
 
 
 class ConnectionsService:
@@ -179,15 +189,15 @@ class ConnectionsService:
 
     def values_for_check(
         self, engine: str, name: str, credentials: dict, *, method: str | None = None
-    ) -> dict:
+    ) -> ValuesForCheck:
         """The values a connection check runs with for an edit submit.
 
         ``credentials`` are the submitted values, where each value the edit
         form kept arrives as the keep sentinel. Without a sentinel they are
-        returned unchanged and the vault is not read. Otherwise each sentinel
-        is resolved against the record named ``name`` the way
-        persist_connection resolves it (resolve_keep_sentinels), and a new
-        dict is returned.
+        returned unchanged with no kept secrets, and the vault is not read.
+        Otherwise each sentinel is resolved against the record named ``name``
+        the way persist_connection resolves it (resolve_keep_sentinels), and
+        the stored values of the kept secret fields are returned beside them.
         Raises KeptValuesRefused with KEPT_VALUES_NOT_FOUND when there is no
         such record, with SHARED_CONNECTION_REFUSAL when the caller can't
         change it, and with KEPT_SECRET_MOVED when a secret is kept while the
@@ -196,7 +206,7 @@ class ConnectionsService:
         saved with. Reads the vault; writes nothing.
         """
         if _SENTINEL not in credentials.values():
-            return credentials
+            return ValuesForCheck(credentials=credentials, kept_secrets=())
         slug = (name or "").strip()
         vault = self._vault()
         record = self._read_record(vault, engine, slug) if slug else None
@@ -207,7 +217,11 @@ class ConnectionsService:
         if keeps_secret_for_another_account(credentials, record, engine, method):
             raise KeptValuesRefused(KEPT_SECRET_MOVED)
         resolved, _ = resolve_keep_sentinels(credentials, record)
-        return resolved
+        kept = kept_secret_keys(credentials, record, engine, method)
+        return ValuesForCheck(
+            credentials=resolved,
+            kept_secrets=tuple(str(resolved[key]) for key in kept if resolved.get(key)),
+        )
 
     def runtime_fields(self, engine: str, name: str) -> dict | None:
         """Return an internal-only credential copy for a connector runtime.

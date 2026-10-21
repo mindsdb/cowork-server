@@ -302,3 +302,49 @@ async def test_the_genie_edit_path_keeps_its_own_check(probes, monkeypatch):
     assert databricks_genie.SECRET_NEEDED in _text(stream)
     assert KEPT_VALUES_NOT_FOUND not in _text(stream)
     assert probes == []
+
+
+@pytest.mark.parametrize("ending", ["verdict", "crash"])
+async def test_a_kept_secret_echoed_by_the_probe_never_reaches_the_stream(stores, monkeypatch, ending):
+    class _EchoingProbe:
+        """A CredentialProbe whose cells and verdict all repeat the token it was given."""
+
+        def __init__(self, **kwargs):
+            """Keep the token the probe was handed."""
+            self.token = kwargs["credentials"]["access_token"]
+
+        async def run(self):
+            """Yield every event kind the handler streams, each carrying the token."""
+            token = self.token
+            yield "text", f"Using {token}.\n"
+            yield "status", f"Trying {token}"
+            yield "switch_method", {"method_id": PAT, "reason": f"Token {token} first"}
+            yield "scratchpad", {"action": "start"}
+            yield "scratchpad", {"action": "end", "name": "c", "code": f"print('{token}')"}
+            yield "scratchpad", {"action": "result", "content": json.dumps({"stdout": token})}
+            if ending == "crash":
+                raise RuntimeError(f"rejected {token}")
+            yield "verdict", ProbeOutcome(status="failure", error=f"401 for {token}", follow_up=token)
+
+    monkeypatch.setattr(probe_handler, "CredentialProbe", _EchoingProbe)
+    monkeypatch.setattr(
+        probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object())
+    )
+    monkeypatch.setattr(probe_handler, "logger", _SilentLog())
+    slug = persist_connection("databricks", PAT, "", SAVED)
+
+    stream = await _submit(_edit(user_label="Warehouse"), name=slug)
+
+    assert TOKEN not in stream
+    assert "[saved secret]" in stream
+    assert "print(" in stream
+    assert _outcome(stream)["_is_success"] is False
+
+
+class _SilentLog:
+    """A logger that drops every line, so a crash's traceback stays out of the test output."""
+
+    def _drop(self, msg: str, *args: object, **kwargs: object) -> None:
+        """Drop the line."""
+
+    debug = info = warning = error = exception = _drop

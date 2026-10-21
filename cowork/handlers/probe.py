@@ -6,7 +6,7 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,37 @@ def _extract_connection_label_fields(credentials: dict) -> tuple[str, str]:
     user_label = str(raw_user_label or raw_user_label_underscore).strip()
 
     return label, user_label
+
+
+_REDACTED_SECRET = "[saved secret]"
+
+
+def _redact_secrets(value: Any, *, secrets: tuple[str, ...]) -> Any:
+    """``value`` with every one of ``secrets`` replaced by a marker, longest first.
+
+    Walks strings, lists, dicts and ProbeOutcome, the shapes a probe event or
+    verdict carries, and returns other values as they are. Without secrets
+    ``value`` is returned unchanged. Pure; it never logs a value.
+    """
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        for secret in sorted(secrets, key=len, reverse=True):
+            value = value.replace(secret, _REDACTED_SECRET)
+        return value
+    if isinstance(value, dict):
+        return {key: _redact_secrets(item, secrets=secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_secrets(item, secrets=secrets) for item in value]
+    if isinstance(value, ProbeOutcome):
+        return replace(
+            value,
+            summary=_redact_secrets(value.summary, secrets=secrets),
+            error=_redact_secrets(value.error, secrets=secrets),
+            follow_up=_redact_secrets(value.follow_up, secrets=secrets),
+            extra_fields=_redact_secrets(value.extra_fields, secrets=secrets),
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -356,7 +387,7 @@ class ProbeHandler:
             # The probe checks kept secrets with their stored values; the save
             # still gets the sentinels, which mark it as an edit in place.
             try:
-                check_credentials = ConnectionsService(self.scope).values_for_check(
+                checked = ConnectionsService(self.scope).values_for_check(
                     connector_id, name, credentials, method=method
                 )
             except KeptValuesRefused as exc:
@@ -370,6 +401,9 @@ class ProbeHandler:
                 })
                 yield await _completed(db_conversation_id, {"status": "retry"})
                 return
+            check_credentials = checked.credentials
+            # The user did not type a kept secret, so nothing the probe streams may show it.
+            redact = partial(_redact_secrets, secrets=checked.kept_secrets)
 
             # Probe path: build workspace + LLM client
             cell_sandbox = None
@@ -447,6 +481,7 @@ class ProbeHandler:
             )
             try:
                 async for kind, payload in probe.run():
+                    payload = redact(payload)
                     if kind == "text":
                         yield _delta(payload)
                     elif kind == "status":
@@ -511,7 +546,7 @@ class ProbeHandler:
                 logger.exception("Probe iteration failed")
                 final_outcome = ProbeOutcome(
                     status="failure",
-                    error=f"Probe runner crashed: {exc}",
+                    error=redact(f"Probe runner crashed: {exc}"),
                     follow_up="Try resubmitting; if it persists, restart the app.",
                 )
 
@@ -536,6 +571,7 @@ class ProbeHandler:
                     logger.exception("Vault save failed despite probe success")
                     final_outcome.status = "failure"
                     final_outcome.error = f"Probe succeeded but save failed: {exc}"
+            final_outcome = redact(final_outcome)
 
             if final_outcome.status == "success":
                 summary = final_outcome.summary or "Connection works."
