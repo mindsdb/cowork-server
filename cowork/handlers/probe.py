@@ -19,6 +19,7 @@ from cowork.common.logger import log_context
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.responses import Role
+from cowork.services.connectors.connections import ConnectionsService, KeptValuesRefused
 from cowork.services.connectors.databricks_genie import (
     GenieConnectionError,
     is_genie_method,
@@ -352,6 +353,24 @@ class ProbeHandler:
                 yield await _completed(db_conversation_id, {"status": "success", "user_label": saved.user_label})
                 return
 
+            # The probe checks kept secrets with their stored values; the save
+            # still gets the sentinels, which mark it as an edit in place.
+            try:
+                check_credentials = ConnectionsService(self.scope).values_for_check(
+                    connector_id, name, credentials
+                )
+            except KeptValuesRefused as exc:
+                yield _delta(f"{exc.message}\n")
+                yield _patch_delta({
+                    "form_id": form_id,
+                    "status_text": None,
+                    "_is_probing": False,
+                    "form_error": exc.message,
+                    "_is_success": False,
+                })
+                yield await _completed(db_conversation_id, {"status": "retry"})
+                return
+
             # Probe path: build workspace + LLM client
             cell_sandbox = None
             try:
@@ -417,7 +436,7 @@ class ProbeHandler:
 
             probe = CredentialProbe(
                 engine=connector_id,
-                credentials=credentials,
+                credentials=check_credentials,
                 llm_client=llm_client,
                 workspace=workspace,
                 form_spec=form_spec,

@@ -9,11 +9,30 @@ from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummar
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
+    resolve_keep_sentinels,
 )
-from cowork.services.connectors.layered_vault import CREATED_BY_FIELD, LayeredDataVault
+from cowork.services.connectors.layered_vault import (
+    CREATED_BY_FIELD,
+    SHARED_CONNECTION_REFUSAL,
+    LayeredDataVault,
+)
 from cowork.services.connectors.persist import own_vault_root, vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.vault_lock import discard_lock, lock_for
+
+KEPT_VALUES_NOT_FOUND = (
+    "The saved connection this edit keeps values from was not found. "
+    "Enter its secrets again and try again."
+)
+
+
+class KeptValuesRefused(Exception):
+    """An edit's kept values can't be read for a check; ``message`` is the fixed text the form shows."""
+
+    def __init__(self, message: str) -> None:
+        """Keep ``message`` as both the error text and its ``message`` attribute."""
+        super().__init__(message)
+        self.message = message
 
 
 class ConnectionsService:
@@ -155,6 +174,31 @@ class ConnectionsService:
             managed=not self._can_change_in(vault, engine, name),
             shared=self._is_shared_in(vault, engine, name),
         )
+
+    def values_for_check(self, engine: str, name: str, credentials: dict) -> dict:
+        """The values a connection check runs with for an edit submit.
+
+        ``credentials`` are the submitted values, where each value the edit
+        form kept arrives as the keep sentinel. Without a sentinel they are
+        returned unchanged and the vault is not read. Otherwise each sentinel
+        is resolved against the record named ``name`` the way
+        persist_connection resolves it (resolve_keep_sentinels), and a new
+        dict is returned. Raises KeptValuesRefused with KEPT_VALUES_NOT_FOUND
+        when there is no such record, and with SHARED_CONNECTION_REFUSAL when
+        the caller can't change it, so a shared or managed record's secrets
+        never reach a check. Reads the vault; writes nothing.
+        """
+        if _SENTINEL not in credentials.values():
+            return credentials
+        slug = (name or "").strip()
+        vault = self._vault()
+        record = self._read_record(vault, engine, slug) if slug else None
+        if record is None:
+            raise KeptValuesRefused(KEPT_VALUES_NOT_FOUND)
+        if not self._can_change_in(vault, engine, slug):
+            raise KeptValuesRefused(SHARED_CONNECTION_REFUSAL)
+        resolved, _ = resolve_keep_sentinels(credentials, record)
+        return resolved
 
     def runtime_fields(self, engine: str, name: str) -> dict | None:
         """Return an internal-only credential copy for a connector runtime.
