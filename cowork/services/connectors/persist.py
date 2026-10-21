@@ -215,7 +215,6 @@ def persist_connection(
     extends: bool = False,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
-    secret_bound_by_caller: bool = False,
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -263,9 +262,7 @@ def persist_connection(
     out of a save that replaces the record, while a non-secret field outside
     the connector's SAFE_WITH_KEPT_SECRET differs from the record raises
     KeptSecretMovedError before anything is written (kept_secret_moved), so
-    a save can't send the stored secret elsewhere. ``secret_bound_by_caller`` skips
-    that check for a caller that already bound its kept secret to the
-    record's host and account, as the Databricks Genie save does.
+    a save can't send the stored secret elsewhere.
 
     ``scope`` names the vault saved into and the record lock the save takes
     (own_vault_root); a caller passing ``vault`` passes the scope it built
@@ -305,7 +302,7 @@ def persist_connection(
                 )
             stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
             cred = {**stored, **cred}
-        if not secret_bound_by_caller and keeps_secret_for_another_account(cred, target, connector_id, method):
+        if keeps_secret_for_another_account(cred, target, connector_id, method):
             raise KeptSecretMovedError()
         cred, is_edit = resolve_keep_sentinels(cred, target)
         payload = {**cred, "_connector_id": connector_id}
@@ -335,11 +332,7 @@ def persist_connection(
             if key not in payload and existing_fields.get(key)
         ]
         # A carried secret is kept as a sentinel's is, so it is bound the same way.
-        if (
-            carried
-            and not secret_bound_by_caller
-            and kept_secret_moved(existing, payload, connector_id, method)
-        ):
+        if carried and kept_secret_moved(existing, payload, connector_id, method):
             raise KeptSecretMovedError()
         for key in carried:
             payload[key] = existing_fields[key]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
@@ -238,18 +239,58 @@ def test_a_desktop_reconnect_that_leaves_out_the_token_on_the_same_host_keeps_it
     assert record["fields"]["access_token"] == TOKEN
     assert record["fields"]["http_path"] == NEW_PATH
 
-def test_a_save_whose_caller_bound_the_kept_secret_skips_the_destination_check(stores):
-    genie = {"workspace_url": HOST, "client_id": "principal", "_client_secret": "stored-secret"}
-    slug = persist_connection("databricks", "genie-mcp", "", genie)
-    edit = {**genie, "_client_secret": VAULT_KEEP_SENTINEL, "client_id": "another-principal"}
+GENIE_HOST = "adb-1234567890123456.7.azuredatabricks.net"
+GENIE_SAVED = {"workspace_url": GENIE_HOST, "client_id": "principal", "_client_secret": "stored-secret"}
+
+
+def _fake_genie_support(mints: list[str]) -> databricks_genie.GenieSupport:
+    """Genie support whose host check strips the scheme and whose token mint only records the call."""
+
+    class _Invalid(ValueError):
+        """A refused workspace address or space ID."""
+
+    async def _mint(host: str, client_id: str, secret: str) -> str:
+        """Record that a token was minted."""
+        mints.append(client_id)
+        return "minted"
+
+    helpers = SimpleNamespace(
+        canonical_workspace_host=lambda url: url.removeprefix("https://"),
+        genie_mcp_url=lambda host, space_id: f"https://{host}/api/2.0/mcp/genie",
+        mint_token=_mint,
+        InvalidWorkspaceHost=_Invalid,
+        InvalidGenieSpace=_Invalid,
+    )
+    return databricks_genie.GenieSupport(databricks=helpers, mcp_session=None)
+
+
+async def test_a_kept_genie_secret_is_not_reused_for_another_client(stores, monkeypatch):
+    mints: list[str] = []
+    monkeypatch.setattr(databricks_genie, "_anton_genie", lambda: _fake_genie_support(mints))
+    slug = persist_connection("databricks", "genie-mcp", "", GENIE_SAVED)
+    [before] = _records()
+    edit = {"workspace_url": GENIE_HOST, "client_id": "another-principal", "client_secret": VAULT_KEEP_SENTINEL}
+
+    with pytest.raises(databricks_genie.GenieConnectionError) as refused:
+        await databricks_genie.save_genie_connection(LOCAL_SCOPE, edit, slug)
+
+    assert refused.value.message == databricks_genie.SECRET_NEEDED
+    assert mints == []
+    assert _records() == [before]
+
+
+def test_a_genie_save_binds_a_kept_secret_like_every_connection(stores):
+    slug = persist_connection("databricks", "genie-mcp", "", GENIE_SAVED)
+    kept = {**GENIE_SAVED, "_client_secret": VAULT_KEEP_SENTINEL}
 
     with pytest.raises(KeptSecretMovedError):
-        persist_connection("databricks", "genie-mcp", slug, edit)
-    persist_connection("databricks", "genie-mcp", slug, edit, secret_bound_by_caller=True)
+        persist_connection("databricks", "genie-mcp", slug, {**kept, "client_id": "another-principal"})
+    persist_connection("databricks", "genie-mcp", slug, {**kept, "genie_space_id": "a" * 32})
 
     [record] = _records()
     assert record["fields"]["_client_secret"] == "stored-secret"
-    assert record["fields"]["client_id"] == "another-principal"
+    assert record["fields"]["client_id"] == "principal"
+    assert record["fields"]["genie_space_id"] == "a" * 32
 
 
 def test_a_connector_with_no_listed_safe_field_keeps_a_secret_only_when_every_field_matches(stores):

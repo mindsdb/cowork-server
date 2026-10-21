@@ -278,8 +278,6 @@ async def save_genie_connection(
         slug = persist_connection(
             CONNECTOR_ID, GENIE_METHOD, name, stored_fields(check, keep_secret=keep_secret),
             label=label, user_label=user_label, vault=vault, scope=scope,
-            # stored_secret_reader already bound a kept secret to the record's host and client ID.
-            secret_bound_by_caller=keep_secret,
         )
     except SharedConnectionError as exc:
         raise GenieConnectionError(exc.detail) from exc

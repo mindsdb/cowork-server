@@ -319,6 +319,7 @@ _DATABRICKS_SQL_SAFE_FIELDS = frozenset({"http_path", "catalog", "schema", "sess
 SAFE_WITH_KEPT_SECRET = {
     ("databricks", "personal-access-token"): _DATABRICKS_SQL_SAFE_FIELDS,
     ("databricks", "service-principal-oauth"): _DATABRICKS_SQL_SAFE_FIELDS,
+    ("databricks", "genie-mcp"): frozenset({"genie_space_id"}),
 }
 
 
