@@ -589,6 +589,16 @@ class ScheduleRunService:
             for row in rows
         }
 
+    def last_finished(self, schedule_id: UUID) -> ScheduleRun | None:
+        """The schedule's most recent run that has ended, manual or cron."""
+        return self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status != RunStatus.running)
+            .order_by(ScheduleRun.started_at.desc())  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
         # Anchor on parent visibility (child table, request-reachable).
         _stmt = self.session.select(Schedule).where(Schedule.id == schedule_id)
