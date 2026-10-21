@@ -23,7 +23,7 @@ from uuid import UUID
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
-from cowork.services.publish import PublishOwnedByOtherUser, publish_artifact
+from cowork.services.publish import PublishOwnedByOtherUser, PublishTooLarge, publish_artifact
 
 if TYPE_CHECKING:
     from cowork.services.artifact_ownership import OwnerResolution
@@ -361,6 +361,12 @@ async def _publish_one(
         # skip like `not_owner`, not a failure; no thread is left running.
         release(artifacts_base, slug)
         _record("skipped", slug=slug, reason="owned_by_other_user")
+        return False
+    except PublishTooLarge:
+        # Every retry of the same bundle is refused again, and the 413 is
+        # already logged by the classifier: a skip, not a failure.
+        release(artifacts_base, slug)
+        _record("skipped", slug=slug, reason="too_large")
         return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target
