@@ -292,3 +292,56 @@ async def test_default_hosts_keep_the_publish_tool_text(project):
         "call this tool again with action='publish' — MindsHub publishing works directly from "
         "chat in the desktop app, no slash command needed."
     )
+
+
+@pytest.mark.asyncio
+async def test_harness_tells_the_agent_not_to_retry_a_too_large_artifact(tmp_path):
+    from cowork.services.publish import PublishTooLarge
+
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=PublishTooLarge())
+    with mock.patch.object(htools, "_publish_artifact", fake):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path),
+            {"file_path": str(f), "action": "publish", "access_mode": "public"},
+        )
+
+    assert out.ok is False
+    assert out.reason == "too_large"
+    message = json.loads(out.content)["message"]
+    assert message.startswith("PUBLISH FAILED: This artifact is too large to publish.")
+    assert "Do not retry with the same files." in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind, reason, text", [
+    ("upload_unavailable", "publish_unavailable",
+     "The publishing service is temporarily unavailable. Try again in a moment."),
+    ("string_detail", "http_error", "Publishing is busy right now."),
+    ("dict_without_message", "bad", "{'code': 'bad'}"),
+])
+async def test_harness_passes_a_typed_refusal_on_without_a_traceback(tmp_path, caplog, kind, reason, text):
+    import logging
+
+    from fastapi import HTTPException
+
+    from cowork.services.publish import UploadServiceUnavailable
+
+    exc = {
+        "upload_unavailable": UploadServiceUnavailable(),
+        "string_detail": HTTPException(503, detail="Publishing is busy right now."),
+        "dict_without_message": HTTPException(400, detail={"code": "bad"}),
+    }[kind]
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=exc)
+    with caplog.at_level(logging.INFO, logger="cowork.harnesses.anton_harness.tools"):
+        with mock.patch.object(htools, "_publish_artifact", fake):
+            out = await htools._cowork_publish_or_preview(
+                _session(tmp_path),
+                {"file_path": str(f), "action": "publish", "access_mode": "public"},
+            )
+
+    assert out.ok is False
+    assert out.reason == reason
+    assert json.loads(out.content)["message"] == f"PUBLISH FAILED: {text}"
+    assert "Traceback" not in caplog.text

@@ -316,7 +316,14 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             return message
         return SideEffectResult.failed(message, reason=reason)
 
-    from cowork.services.publish import OWNED_BY_OTHER_USER_MESSAGE, PublishOwnedByOtherUser
+    from fastapi import HTTPException
+
+    from cowork.services.publish import (
+        ARTIFACT_TOO_LARGE_MESSAGE,
+        OWNED_BY_OTHER_USER_MESSAGE,
+        PublishOwnedByOtherUser,
+        PublishTooLarge,
+    )
 
     try:
         result = _publish_artifact(abs_path, access=access)
@@ -332,6 +339,23 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "ask after resolving it.",
             reason="owned_by_other_user",
         )
+    except PublishTooLarge:
+        # Retrying the same files cannot succeed; the model can shrink them.
+        logger.info("Cowork publish refused: %s", ARTIFACT_TOO_LARGE_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {ARTIFACT_TOO_LARGE_MESSAGE} Do not retry with the same files. "
+            "Tell the user, or remove or shrink large files in the artifact "
+            "(PDFs, images) and publish again.",
+            reason="too_large",
+        )
+    except HTTPException as exc:
+        # Typed refusals carry their text in `detail`; str(exc) would hand the
+        # model "503: {'code': ...}".
+        detail = exc.detail
+        message = (detail.get("message") if isinstance(detail, dict) else None) or str(detail)
+        reason = (detail.get("code") if isinstance(detail, dict) else None) or "http_error"
+        logger.info("Cowork publish refused: %s", message)
+        return _fail(f"PUBLISH FAILED: {message}", reason=reason)
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
