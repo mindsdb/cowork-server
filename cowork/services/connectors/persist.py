@@ -25,7 +25,9 @@ from cowork.managed import (
     reads_shared_registry,
 )
 from cowork.services.connectors.identity import (
+    KEPT_SECRET_MOVED,
     derive_connection_name,
+    keeps_secret_for_another_account,
     resolve_keep_sentinels,
     resolve_unique_slug,
     secure_keys_for,
@@ -43,6 +45,15 @@ logger = logging.getLogger(__name__)
 
 class ConnectionNotFoundError(LookupError):
     """An ``extends`` save named a connection that does not exist."""
+
+
+class KeptSecretMovedError(ValueError):
+    """A save keeps a stored secret for another host or account; ``message`` is the fixed text."""
+
+    def __init__(self, message: str = KEPT_SECRET_MOVED) -> None:
+        """Keep ``message`` as both the error text and its ``message`` attribute."""
+        super().__init__(message)
+        self.message = message
 
 
 def own_vault_root(scope: "TenantScope | None" = None) -> Path:
@@ -203,6 +214,7 @@ def persist_connection(
     extends: bool = False,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
+    secret_bound_by_caller: bool = False,
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -246,6 +258,13 @@ def persist_connection(
     refresh/re-auth reaching this same save path must not clobber a value the
     user already upgraded to ``"write"``).
 
+    A save that keeps a stored secret (the keep sentinel) while its other
+    identity fields differ from the record raises KeptSecretMovedError before
+    anything is written (keeps_secret_for_another_account), so an edit can't
+    send the stored secret to another host. ``secret_bound_by_caller`` skips
+    that check for a caller that already bound its kept secret to the
+    record's host and account, as the Databricks Genie save does.
+
     ``scope`` names the vault saved into and the record lock the save takes
     (own_vault_root); a caller passing ``vault`` passes the scope it built
     that vault for.
@@ -284,6 +303,8 @@ def persist_connection(
                 )
             stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
             cred = {**stored, **cred}
+        if not secret_bound_by_caller and keeps_secret_for_another_account(cred, target, connector_id, method):
+            raise KeptSecretMovedError()
         cred, is_edit = resolve_keep_sentinels(cred, target)
         payload = {**cred, "_connector_id": connector_id}
         if method:

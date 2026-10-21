@@ -21,13 +21,14 @@ from cowork.principal import personal_partition_id
 from cowork.schemas.connectors import SubmitFormRequest
 from cowork.services.connectors import databricks_genie
 from cowork.services.connectors.connections import KEPT_VALUES_NOT_FOUND
-from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
+from cowork.services.connectors.identity import KEPT_SECRET_MOVED, VAULT_KEEP_SENTINEL
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
-from cowork.services.connectors.persist import own_vault_for_scope, persist_connection
+from cowork.services.connectors.persist import KeptSecretMovedError, own_vault_for_scope, persist_connection
 from cowork.services.connectors.probe import ProbeOutcome
 
 PAT = "personal-access-token"
 HOST = "https://adb-1234567890123456.7.azuredatabricks.net"
+OTHER_HOST = "https://collector.example.net"
 TOKEN = "dapi-stored-token-4b8e"
 OLD_PATH = "/sql/1.0/warehouses/old"
 NEW_PATH = "/sql/1.0/warehouses/new"
@@ -120,19 +121,75 @@ def _edit(**changes: str) -> dict:
     return {**SAVED, "access_token": VAULT_KEEP_SENTINEL, "user_label": "", **changes}
 
 
-async def test_an_edit_that_keeps_the_token_is_checked_and_saved_with_the_stored_token(probes):
+async def test_an_edit_that_keeps_the_token_and_changes_only_the_label_is_checked_with_the_stored_token(probes):
     slug = persist_connection("databricks", PAT, "", SAVED)
 
-    stream = await _submit(_edit(http_path=NEW_PATH), name=slug)
+    stream = await _submit(_edit(user_label="Warehouse"), name=slug)
 
     assert _outcome(stream)["_is_success"] is True
     [probe] = probes
-    assert probe["credentials"] == {"workspace_url": HOST, "access_token": TOKEN, "http_path": NEW_PATH}
+    assert probe["credentials"] == SAVED
     [record] = _records()
     assert record["name"] == slug
     assert record["fields"]["access_token"] == TOKEN
-    assert record["fields"]["http_path"] == NEW_PATH
+    assert record["fields"]["_user_label"] == "Warehouse"
     assert VAULT_KEEP_SENTINEL not in json.dumps(record)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"workspace_url": OTHER_HOST}, {"http_path": NEW_PATH}, {"catalog": "main"}],
+    ids=["another-host", "another-warehouse", "an-added-catalog"],
+)
+async def test_an_edit_that_keeps_the_token_and_changes_the_account_is_refused_before_any_probe(
+    probes, changed,
+):
+    slug = persist_connection("databricks", PAT, "", SAVED)
+    [before] = _records()
+
+    stream = await _submit(_edit(**changed), name=slug)
+
+    assert KEPT_SECRET_MOVED in _text(stream)
+    assert _outcome(stream)["_is_success"] is False
+    assert probes == []
+    assert TOKEN not in stream
+    assert _records() == [before]
+
+
+def test_a_direct_save_that_keeps_the_token_for_another_host_is_refused_and_writes_nothing(stores):
+    slug = persist_connection("databricks", PAT, "", SAVED)
+    [before] = _records()
+    values = {**SAVED, "access_token": VAULT_KEEP_SENTINEL, "workspace_url": OTHER_HOST}
+
+    with pytest.raises(KeptSecretMovedError) as refused:
+        persist_connection("databricks", PAT, slug, values)
+
+    assert refused.value.message == KEPT_SECRET_MOVED
+    assert _records() == [before]
+
+
+def test_a_direct_save_that_keeps_the_token_and_changes_no_identity_field_saves_in_place(stores):
+    slug = persist_connection("databricks", PAT, "", SAVED)
+
+    saved = persist_connection("databricks", PAT, slug, {**SAVED, "access_token": VAULT_KEEP_SENTINEL})
+
+    assert saved == slug
+    [record] = _records()
+    assert record["fields"]["access_token"] == TOKEN
+
+
+def test_a_save_whose_caller_bound_the_kept_secret_may_change_other_fields(stores):
+    genie = {"workspace_url": HOST, "client_id": "principal", "_client_secret": "stored-secret"}
+    slug = persist_connection("databricks", "genie-mcp", "", genie)
+    edit = {**genie, "_client_secret": VAULT_KEEP_SENTINEL, "genie_space_id": "a" * 32}
+
+    with pytest.raises(KeptSecretMovedError):
+        persist_connection("databricks", "genie-mcp", slug, edit)
+    persist_connection("databricks", "genie-mcp", slug, edit, secret_bound_by_caller=True)
+
+    [record] = _records()
+    assert record["fields"]["_client_secret"] == "stored-secret"
+    assert record["fields"]["genie_space_id"] == "a" * 32
 
 
 async def test_an_edit_that_changes_the_token_is_checked_with_the_new_token(probes):
@@ -182,7 +239,7 @@ async def test_a_kept_secret_is_never_logged(probes, monkeypatch):
     monkeypatch.setattr(probe_handler, "logger", _Log())
     slug = persist_connection("databricks", PAT, "", SAVED)
 
-    stream = await _submit(_edit(http_path=NEW_PATH), name=slug)
+    stream = await _submit(_edit(user_label="Warehouse"), name=slug)
 
     assert TOKEN not in stream
     assert all(TOKEN not in line for line in lines)

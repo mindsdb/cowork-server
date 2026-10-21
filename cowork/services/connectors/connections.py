@@ -7,8 +7,10 @@ from anton.core.datasources.data_vault import is_secret_key
 from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
 from cowork.services.connectors.identity import (
+    KEPT_SECRET_MOVED,
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
+    keeps_secret_for_another_account,
     resolve_keep_sentinels,
 )
 from cowork.services.connectors.layered_vault import (
@@ -175,7 +177,9 @@ class ConnectionsService:
             shared=self._is_shared_in(vault, engine, name),
         )
 
-    def values_for_check(self, engine: str, name: str, credentials: dict) -> dict:
+    def values_for_check(
+        self, engine: str, name: str, credentials: dict, *, method: str | None = None
+    ) -> dict:
         """The values a connection check runs with for an edit submit.
 
         ``credentials`` are the submitted values, where each value the edit
@@ -183,10 +187,13 @@ class ConnectionsService:
         returned unchanged and the vault is not read. Otherwise each sentinel
         is resolved against the record named ``name`` the way
         persist_connection resolves it (resolve_keep_sentinels), and a new
-        dict is returned. Raises KeptValuesRefused with KEPT_VALUES_NOT_FOUND
-        when there is no such record, and with SHARED_CONNECTION_REFUSAL when
-        the caller can't change it, so a shared or managed record's secrets
-        never reach a check. Reads the vault; writes nothing.
+        dict is returned.
+        Raises KeptValuesRefused with KEPT_VALUES_NOT_FOUND when there is no
+        such record, with SHARED_CONNECTION_REFUSAL when the caller can't
+        change it, and with KEPT_SECRET_MOVED when a secret is kept while the
+        other identity fields differ from the record, as persist_connection
+        refuses it. So a stored secret never reaches a check it would not be
+        saved with. Reads the vault; writes nothing.
         """
         if _SENTINEL not in credentials.values():
             return credentials
@@ -197,6 +204,8 @@ class ConnectionsService:
             raise KeptValuesRefused(KEPT_VALUES_NOT_FOUND)
         if not self._can_change_in(vault, engine, slug):
             raise KeptValuesRefused(SHARED_CONNECTION_REFUSAL)
+        if keeps_secret_for_another_account(credentials, record, engine, method):
+            raise KeptValuesRefused(KEPT_SECRET_MOVED)
         resolved, _ = resolve_keep_sentinels(credentials, record)
         return resolved
 

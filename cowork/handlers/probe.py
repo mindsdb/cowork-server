@@ -357,7 +357,7 @@ class ProbeHandler:
             # still gets the sentinels, which mark it as an edit in place.
             try:
                 check_credentials = ConnectionsService(self.scope).values_for_check(
-                    connector_id, name, credentials
+                    connector_id, name, credentials, method=method
                 )
             except KeptValuesRefused as exc:
                 yield _delta(f"{exc.message}\n")

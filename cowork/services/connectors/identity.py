@@ -307,6 +307,46 @@ def resolve_keep_sentinels(
     return resolved, had_sentinel
 
 
+KEPT_SECRET_MOVED = (
+    "This edit changes the connection's address or account, so its saved secret can't be used. "
+    "Enter the secret again to change those details."
+)
+
+
+def kept_secret_keys(
+    credentials: dict, existing_record: dict | None, connector_id: str, method: str | None
+) -> list[str]:
+    """The secret fields ``credentials`` keep from ``existing_record`` with the keep sentinel.
+
+    A field counts as secret when the record lists it in ``secure_keys`` or
+    secure_keys_for classifies it. A sentinel for a field the record does not
+    hold keeps nothing, so it is not listed. Pure; reads nothing.
+    """
+    record = existing_record or {}
+    prior = record.get("fields") or {}
+    secure = set(secure_keys_for(connector_id, method, prior)) | set(record.get("secure_keys") or [])
+    return [
+        key for key, value in credentials.items()
+        if value == VAULT_KEEP_SENTINEL and key in prior and key in secure
+    ]
+
+
+def keeps_secret_for_another_account(
+    credentials: dict, existing_record: dict | None, connector_id: str, method: str | None
+) -> bool:
+    """True when ``credentials`` keep a stored secret but are not the record's account.
+
+    The account is compared the way the save's dedup compares it
+    (is_same_account), after the sentinels are resolved, so a kept secret is
+    never sent to another host or used as another account. Pure; reads nothing.
+    """
+    if not kept_secret_keys(credentials, existing_record, connector_id, method):
+        return False
+    resolved, _ = resolve_keep_sentinels(credentials, existing_record)
+    secure_keys = secure_keys_for(connector_id, method, resolved)
+    return not is_same_account(existing_record, resolved, secure_keys)
+
+
 def resolve_unique_slug(
     vault, engine: str, base_slug: str, payload: dict, secure_keys: list[str]
 ) -> str:
