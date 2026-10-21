@@ -207,7 +207,10 @@ def _catch_up(session: ScopedSession, schedule_id: UUID, now: datetime) -> None:
         schedule_id=schedule_id, first_slot=first, last_slot=last, slot_count=count, reason=reason,
     ))
     session.commit()
-    logger.info(f"Schedule {schedule_id}: passed over {count} missed slot(s) ({reason})")
+    logger.info(
+        "Passed over %s missed schedule slot(s) (%s)", count, reason,
+        extra=log_context(schedule_id=schedule_id),
+    )
 
 
 def _handle_missed_runs(session: ScopedSession, now: datetime) -> None:

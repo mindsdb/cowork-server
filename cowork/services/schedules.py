@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
-from cowork.common.logger import get_logger
+from cowork.common.logger import get_logger, log_context
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -834,7 +834,10 @@ class ScheduleOccurrenceService:
             .values(enabled=False, auto_paused_at=datetime.now(timezone.utc))
         ).rowcount
         if paused:
-            logger.warning(f"Schedule {schedule_id} paused after {MAX_FAILED_OCCURRENCES} failed runs in a row")
+            logger.warning(
+                "Schedule paused after %s failed runs in a row", MAX_FAILED_OCCURRENCES,
+                extra=log_context(schedule_id=schedule_id),
+            )
 
     def ready_for_attempt(self, now: datetime) -> list[UUID]:
         """Cron occurrences whose next attempt is due, oldest first. A manual
