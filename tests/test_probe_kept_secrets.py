@@ -296,25 +296,46 @@ async def test_a_kept_secret_with_no_record_to_resolve_against_is_refused_before
     assert _records() == []
 
 
-async def test_a_kept_secret_is_never_logged(probes, monkeypatch):
-    lines: list[str] = []
+@pytest.mark.parametrize("ending", ["success", "crash"])
+async def test_a_kept_secret_is_never_logged(probes, monkeypatch, ending):
+    calls: list[tuple[str, tuple, dict]] = []
 
     class _Log:
-        """A logger that keeps every line it is given."""
+        """A logger that keeps every call it is given, with its arguments."""
 
         def _record(self, msg: str, *args: object, **kwargs: object) -> None:
-            """Keep the formatted message."""
-            lines.append(str(msg) % args if args else str(msg))
+            """Keep the message, its arguments and its keyword arguments."""
+            calls.append((str(msg), args, kwargs))
 
         debug = info = warning = error = exception = _record
 
+    class _CrashingProbe:
+        """A CredentialProbe that fails with the token it was given in its error."""
+
+        def __init__(self, **kwargs):
+            """Keep the token the probe was handed."""
+            self.token = kwargs["credentials"]["access_token"]
+
+        async def run(self):
+            """Raise before any verdict, quoting the token."""
+            if self.token:
+                raise RuntimeError(f"rejected {self.token}")
+            yield "verdict", ProbeOutcome(status="success")
+
+    if ending == "crash":
+        monkeypatch.setattr(probe_handler, "CredentialProbe", _CrashingProbe)
     monkeypatch.setattr(probe_handler, "logger", _Log())
     slug = persist_connection("databricks", PAT, "", SAVED)
 
     stream = await _submit(_edit(user_label="Warehouse"), name=slug)
 
     assert TOKEN not in stream
-    assert all(TOKEN not in line for line in lines)
+    for msg, args, kwargs in calls:
+        assert TOKEN not in msg
+        assert all(TOKEN not in str(arg) for arg in args)
+        assert not kwargs.get("exc_info")
+    if ending == "crash":
+        assert any("RuntimeError" in str(arg) for _, args, _ in calls for arg in args)
 
 
 @pytest.fixture

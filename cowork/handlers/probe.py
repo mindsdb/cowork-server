@@ -540,7 +540,8 @@ class ProbeHandler:
                         final_outcome = payload
                         break
             except Exception as exc:
-                logger.exception("Probe iteration failed")
+                # No traceback: its frames and message can hold the secrets the probe was given.
+                logger.error("Probe iteration failed (%s): %s", type(exc).__name__, redact(str(exc)))
                 final_outcome = ProbeOutcome(
                     status="failure",
                     error=redact(f"Probe runner crashed: {exc}"),
