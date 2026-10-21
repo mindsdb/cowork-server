@@ -88,23 +88,112 @@ class PublishOwnedByOtherUser(HTTPException):
         )
 
 
-def raise_publish_permission_error(exc: Exception) -> None:
-    """Preserve the artifact consumer's explicit authority result through wrappers."""
+# The upload service's 413: the bundle is over its request size limit.
+ARTIFACT_TOO_LARGE_CODE = "artifact_too_large"
+ARTIFACT_TOO_LARGE_MESSAGE = (
+    "This artifact is too large to publish. "
+    "Remove or shrink large files in it, such as PDFs or images."
+)
+# Any 503 from the upload service other than an auth outage.
+UPLOAD_UNAVAILABLE_CODE = "publish_unavailable"
+UPLOAD_UNAVAILABLE_MESSAGE = "The publishing service is temporarily unavailable. Try again in a moment."
+
+
+class PublishTooLarge(HTTPException):
+    """The upload service refused the bundle as too large.
+
+    The same files are refused on every retry, so callers report it instead
+    of retrying.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            413, detail={"code": ARTIFACT_TOO_LARGE_CODE, "message": ARTIFACT_TOO_LARGE_MESSAGE},
+        )
+
+
+class UploadServiceUnavailable(HTTPException):
+    """The upload service answered 503 without marking it as an auth outage."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            503, detail={"code": UPLOAD_UNAVAILABLE_CODE, "message": UPLOAD_UNAVAILABLE_MESSAGE},
+        )
+
+
+class PublishRejected(RuntimeError):
+    """A publish failure whose text is safe to show the user.
+
+    A plain RuntimeError from `publish_artifact` can carry local detail such as
+    a shared-storage path, so org routes show this type's text and hide the
+    other's.
+    """
+
+
+class UploadError(NamedTuple):
+    """An upload-service answer `classify_upload_error` left to its caller."""
+
+    status: int
+    code: str | None
+    error: str | None
+
+
+def _read_http_error_body(exc: Exception) -> tuple[str, str | None, str | None]:
+    """(body, code, error) of an HTTPError, from a single read.
+
+    A second `read()` returns nothing, so every consumer goes through here once.
+    Any failure to read gives an empty body rather than replacing `exc`.
+    """
+    try:
+        body = exc.read(65_536).decode("utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        return "", None, None
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return body, None, None
+    if not isinstance(payload, dict):
+        return body, None, None
+    code = payload.get("code")
+    error = payload.get("error")
+    return (
+        body,
+        code if isinstance(code, str) else None,
+        error if isinstance(error, str) else None,
+    )
+
+
+def classify_upload_error(exc: Exception) -> UploadError | None:
+    """Raise the typed error for an upload-service refusal, or return it for wording.
+
+    413 is too large. A 503 is an auth outage only when the service says so
+    (`auth_unavailable`); any other 503 is the upload service itself. A 403 is
+    a denial only with `permission_denied`. Every other HTTP answer comes back
+    as an UploadError; a failure that got no HTTP answer returns None.
+    """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
-    if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
+    if isinstance(
+        exc,
+        (ProductPermissionDenied, ProductPermissionUnavailable, PublishTooLarge, UploadServiceUnavailable),
+    ):
         raise exc
     if not isinstance(exc, urllib.error.HTTPError):
-        return
-    if exc.code == 503:
-        raise ProductPermissionUnavailable() from exc
-    if exc.code == 403:
-        try:
-            body = json.loads(exc.read(65_536))
-        except (OSError, ValueError):
-            return
-        if isinstance(body, dict) and body.get("code") == "permission_denied":
-            raise ProductPermissionDenied() from exc
+        return None
+    status = exc.code
+    body, code, error = _read_http_error_body(exc)
+    typed: HTTPException | None = None
+    if status == 413:
+        typed = PublishTooLarge()
+    elif status == 503:
+        typed = ProductPermissionUnavailable() if code == "auth_unavailable" else UploadServiceUnavailable()
+    elif status == 403 and code == "permission_denied":
+        typed = ProductPermissionDenied()
+    if typed is None:
+        return UploadError(status, code, error)
+    # A typed refusal leaves publish_artifact before its own failure log.
+    logger.warning("Publish service answered HTTP %s code=%s body=%r", status, code, body[:200])
+    raise typed from exc
 
 
 #: The files the publish store holds: its state, and the temporary file a
@@ -597,7 +686,7 @@ def publish_artifact(
         # report_id for another account.
         raise PublishOwnedByOtherUser() from exc
     except Exception as exc:
-        raise_publish_permission_error(exc)
+        classify_upload_error(exc)
         logger.exception("Publishing failed")
         # Only network/HTTP failures get the "Connection failed" framing — a
         # gateway timeout (e.g. a fullstack artifact whose deps take too long
@@ -772,7 +861,7 @@ def unpublish_artifact(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
-        raise_publish_permission_error(exc)
+        classify_upload_error(exc)
         msg = str(exc) or "Unpublishing failed."
         if "404" in msg or "not found" in msg.lower():
             # Already gone upstream, OR still alive under another owner's prefix
@@ -889,12 +978,8 @@ def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> ResolvedR
 
 def _publisher_http_detail(exc: Exception) -> str:
     """Best-effort human message from an upstream HTTPError JSON body."""
-    body = ""
-    try:
-        body = exc.read().decode()  # type: ignore[attr-defined]
-        return json.loads(body).get("error") or body or str(exc)
-    except Exception:
-        return body or str(exc)
+    body, _code, error = _read_http_error_body(exc)
+    return error or body or str(exc)
 
 
 def list_versions(raw_path: str, *, scope: TenantScope | None) -> dict:

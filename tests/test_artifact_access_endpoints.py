@@ -184,7 +184,10 @@ async def test_share_preserves_authority_failure_from_the_artifact_consumer(
     import io
     from urllib.error import HTTPError
 
-    body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+    body = (
+        {"code": "permission_denied"} if status == 403
+        else {"error": "Auth unavailable", "code": "auth_unavailable"}
+    )
 
     def reject(*args, **kwargs):
         raise HTTPError("https://publish.example/upload", status, "Rejected", {},
@@ -328,4 +331,34 @@ async def test_share_of_a_report_owned_by_another_account_is_409(as_owner, publi
     assert len(calls) == 1
     assert not (as_owner / ".published.json").exists()
     assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
+    artifact_locks.release(as_owner.parent, as_owner.name)
+
+
+async def test_share_reports_an_unmarked_upload_503_as_the_service_being_unavailable(
+    as_owner, publish_context, monkeypatch,
+):
+    import io
+    from urllib.error import HTTPError
+
+    def reject(*args, **kwargs):
+        raise HTTPError("https://publish.example/upload", 503, "Service Unavailable", {},
+                        io.BytesIO(b'{"error": "Service Unavailable"}'))
+
+    monkeypatch.setattr("anton.publisher.publish", reject)
+    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity.publish_authorization_key",
+        lambda *args: "owner/artifact",
+    )
+    with pytest.raises(HTTPException) as error:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert error.value.status_code == 503
+    assert error.value.detail == {
+        "code": "publish_unavailable",
+        "message": "The publishing service is temporarily unavailable. Try again in a moment.",
+    }
+    assert not (as_owner / ".published.json").exists()
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60)
     artifact_locks.release(as_owner.parent, as_owner.name)
