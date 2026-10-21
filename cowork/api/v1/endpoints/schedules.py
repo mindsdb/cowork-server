@@ -9,6 +9,7 @@ from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.schedules import (
     DEFAULT_MODEL_SENTINEL,
     ScheduleCreateRequest,
+    ScheduleEventResponse,
     ScheduleResponse,
     ScheduleRunResponse,
     ScheduleUpdateRequest,
@@ -41,6 +42,7 @@ def _serialize(schedule, scoped) -> dict:
     data["state"] = schedule_state(schedule).value
     skipped = ScheduleService(scoped).last_skipped(schedule.id)
     data["lastSkipped"] = SkippedPeriodResponse.serialize(skipped) if skipped else None
+    data["version"] = ScheduleService(scoped).current_version_number(schedule.id)
     return data
 
 
@@ -179,5 +181,28 @@ def list_schedule_runs(schedule_id: UUID, scoped: ScopedSessionDep, limit: int =
         ScheduleService(scoped).get_schedule(schedule_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    runs = ScheduleRunService(scoped).list_runs(schedule_id, limit=limit)
-    return {"runs": [ScheduleRunResponse.serialize(r) for r in runs]}
+    service = ScheduleRunService(scoped)
+    runs = service.list_runs(schedule_id, limit=limit)
+    context = service.run_context(runs)
+    return {"runs": [
+        {**ScheduleRunResponse.serialize(r), **_camel(context.get(r.occurrence_id, {}))} for r in runs
+    ]}
+
+
+def _camel(fields: dict) -> dict:
+    return {
+        "trigger": fields.get("trigger"),
+        "scheduledFor": fields.get("scheduled_for"),
+        "version": fields.get("version"),
+    } if fields else {}
+
+
+@router.get("/{schedule_id}/events")
+def list_schedule_events(schedule_id: UUID, scoped: ScopedSessionDep, limit: int = 100):
+    """The schedule's lifecycle: created, edited, paused, resumed, auto-paused."""
+    service = ScheduleService(scoped)
+    try:
+        service.get_schedule(schedule_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return {"events": [ScheduleEventResponse.serialize(e) for e in service.events(schedule_id, limit=limit)]}

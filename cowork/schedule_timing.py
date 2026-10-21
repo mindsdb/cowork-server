@@ -134,6 +134,14 @@ def missed_slots(
     overdue: list[datetime] = []
     count = 0
     first: datetime | None = None
+    if cadence == Cadence.hourly and cursor < floor - timedelta(hours=1):
+        # Hourly slots are a fixed hour apart in UTC, so the ones well before
+        # the floor are counted, not walked: a schedule a year behind would
+        # otherwise step through thousands of slots.
+        first = cursor
+        jumped = int((floor - cursor) // timedelta(hours=1)) - 1
+        count += jumped
+        cursor += timedelta(hours=jumped)
     while cursor <= reference:
         count += 1
         if first is None:

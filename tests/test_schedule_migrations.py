@@ -110,7 +110,10 @@ def test_occurrences_upgrade_keeps_existing_runs_and_matches_the_models(database
 
     _migrate(engine, uri, OCCURRENCES)
 
-    assert _columns(engine, "schedule_occurrences") == set(ScheduleOccurrence.__table__.columns.keys())
+    # version_id arrives with the audit-trail revision.
+    assert _columns(engine, "schedule_occurrences") == set(ScheduleOccurrence.__table__.columns.keys()) - {
+        "version_id",
+    }
     assert set(ScheduleRun.__table__.columns.keys()) <= _columns(engine, "schedule_runs")
     row = _run_row(engine, run_id)
     assert row["status"] == "success"
@@ -181,3 +184,39 @@ def test_pause_upgrade_sorts_existing_disabled_schedules_into_their_states(datab
 
     assert "schedule_skipped_periods" not in sa.inspect(engine).get_table_names()
     assert {"paused_at", "missed_at"}.isdisjoint(_columns(engine, "schedules"))
+
+
+AUDIT_TRAIL = "4552aea8bb5f"
+
+
+def test_audit_upgrade_gives_every_schedule_its_first_version_and_keeps_history(database):
+    from cowork.models.schedule import ScheduleEvent, ScheduleVersion
+
+    engine, uri = database
+    _migrate(engine, uri, PAUSE_AND_MISSED)
+    schedule_id, run_id = _seed_schedule_and_run(engine)
+
+    _migrate(engine, uri, AUDIT_TRAIL)
+
+    assert _columns(engine, "schedule_versions") == set(ScheduleVersion.__table__.columns.keys())
+    assert _columns(engine, "schedule_events") == set(ScheduleEvent.__table__.columns.keys())
+    assert "version_id" in _columns(engine, "schedule_occurrences")
+    assert "ix_schedules_enabled_next_run_at" in {ix["name"] for ix in sa.inspect(engine).get_indexes("schedules")}
+    with engine.connect() as connection:
+        versions = sa.Table("schedule_versions", sa.MetaData(), autoload_with=connection)
+        rows = connection.execute(sa.select(versions)).mappings().all()
+    [version] = [r for r in rows if str(r["schedule_id"]).replace("-", "") == schedule_id.hex]
+    assert (version["number"], version["prompt"], version["model"], version["cadence"]) == (
+        1, "Summarize", "default", "daily",
+    )
+    assert _run_row(engine, run_id)["status"] == "success"
+
+    # Running it again on an up-to-date database adds no second version.
+    _migrate(engine, uri, PAUSE_AND_MISSED, down=True)
+    _migrate(engine, uri, AUDIT_TRAIL)
+    with engine.connect() as connection:
+        versions = sa.Table("schedule_versions", sa.MetaData(), autoload_with=connection)
+        assert connection.execute(sa.select(sa.func.count()).select_from(versions)).scalar() == 1
+
+    _migrate(engine, uri, PAUSE_AND_MISSED, down=True)
+    assert {"schedule_versions", "schedule_events"}.isdisjoint(sa.inspect(engine).get_table_names())
