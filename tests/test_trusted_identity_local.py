@@ -179,7 +179,7 @@ async def _memory_warnings_at_start(monkeypatch, caplog) -> list[str]:
 async def test_the_start_warns_that_memory_is_shared(
     trusted, monkeypatch, caplog, owned_logger, tmp_path, enabled, says, never
 ):
-    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,settings")
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     trusted.setenv("MEMORY_ENABLED", enabled)
     get_app_settings.cache_clear()
@@ -233,7 +233,7 @@ async def test_the_start_reads_no_stored_setting_while_memory_is_per_person(
 async def test_a_failed_memory_warning_does_not_stop_the_start(
     trusted, monkeypatch, caplog, owned_logger, tmp_path
 ):
-    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,settings")
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     get_app_settings.cache_clear()
     calls = _unreadable_stored_settings(monkeypatch)
@@ -817,7 +817,7 @@ def test_two_people_keep_their_own_schedules(trusted, made_projects, resources):
 def test_pins_and_schedules_left_off_the_list_are_shared(trusted, made_projects):
     """Left off, with every resource that does not need them still personal.
     This fails if either table is ever mapped to one of those resources."""
-    _personal_resources(trusted, "files,skills,connections,memory,settings")
+    _personal_resources(trusted, "files,skills,memory,settings")
     client = _client()
     pid = _made_project(client, A, made_projects)
     cid = _conversation(client, A, project_id=pid, topic="team-pinned")
@@ -831,10 +831,10 @@ def test_pins_and_schedules_left_off_the_list_are_shared(trusted, made_projects)
 
 # ── a shared project another person works in ────────────────────────────────
 
-# Projects shared, and schedules (then conversations too) per person.
+# Projects and connections shared, and schedules (then conversations too) per person.
 SHARED_PROJECTS = [
     "pins,schedules,memory",
-    ",".join(sorted(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS})),
+    ",".join(sorted(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS, PersonalResource.CONNECTIONS})),
 ]
 
 
