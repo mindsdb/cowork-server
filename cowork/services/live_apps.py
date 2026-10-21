@@ -768,7 +768,23 @@ def _check_name(name: str, *, path: PurePosixPath) -> None:
         raise LiveAppCopyRefused(f"{path} has a name the copy refuses")
 
 
-def _read_tree(folder: PinnedDir, path: PurePosixPath, *, depth: int, limit: int, out: list[AppFile]) -> None:
+class _LaunchCaps(NamedTuple):
+    files: int
+    file_bytes: int
+    total_bytes: int
+
+
+def _add_launched(out: list[AppFile], file: AppFile, *, caps: _LaunchCaps) -> None:
+    """Add ``file`` to the launch files, refusing as soon as they pass a cap,
+    so a huge tree is never read whole."""
+    out.append(file)
+    if len(out) > caps.files:
+        raise LiveAppCopyRefused(f"the app has more than {caps.files} files")
+    if sum(len(launched.content) for launched in out) > caps.total_bytes:
+        raise LiveAppCopyRefused(f"the app's files are larger than {caps.total_bytes} bytes")
+
+
+def _read_tree(folder: PinnedDir, path: PurePosixPath, *, depth: int, caps: _LaunchCaps, out: list[AppFile]) -> None:
     """Every regular file below ``folder``, at ``path`` in the app, into ``out``."""
     if depth > COPY_MAX_DEPTH:
         raise LiveAppCopyRefused(f"{path} is more than {COPY_MAX_DEPTH} folders deep")
@@ -780,13 +796,13 @@ def _read_tree(folder: PinnedDir, path: PurePosixPath, *, depth: int, limit: int
         if entry.is_dir(follow_symlinks=False):
             below = open_pinned_child(folder, entry.name)
             try:
-                _read_tree(below, child, depth=depth + 1, limit=limit, out=out)
+                _read_tree(below, child, depth=depth + 1, caps=caps, out=out)
             finally:
                 below.close()
             continue
-        content = _read_regular(folder, entry.name, path=child, limit=limit)
+        content = _read_regular(folder, entry.name, path=child, limit=caps.file_bytes)
         if content is not None:
-            out.append(AppFile(child, content))
+            _add_launched(out, AppFile(child, content), caps=caps)
 
 
 def read_shared_app(project_dir: Path, slug: str) -> SharedApp:
@@ -808,15 +824,18 @@ def read_shared_app(project_dir: Path, slug: str) -> SharedApp:
     )
 
     root = PurePosixPath()
+    caps = _LaunchCaps(
+        files=MAX_LAUNCH_FILES, file_bytes=MAX_LAUNCH_FILE_BYTES, total_bytes=MAX_LAUNCH_TOTAL_BYTES
+    )
     _check_name(slug, path=PurePosixPath(slug))
     try:
         with opened_subdir_nofollow(project_dir, *_ARTIFACTS_SUBPATH, slug) as folder:
             metadata = _read_metadata(folder)
             launched: list[AppFile] = []
             for name in LAUNCH_FILES:
-                content = _read_regular(folder, name, path=root / name, limit=MAX_LAUNCH_FILE_BYTES)
+                content = _read_regular(folder, name, path=root / name, limit=caps.file_bytes)
                 if content is not None:
-                    launched.append(AppFile(root / name, content))
+                    _add_launched(launched, AppFile(root / name, content), caps=caps)
             for name in LAUNCH_DIRS:
                 try:
                     below = open_pinned_child(folder, name)
@@ -827,7 +846,7 @@ def read_shared_app(project_dir: Path, slug: str) -> SharedApp:
                         raise LiveAppCopyRefused(f"{name} isn't a folder") from None
                     raise
                 try:
-                    _read_tree(below, root / name, depth=1, limit=MAX_LAUNCH_FILE_BYTES, out=launched)
+                    _read_tree(below, root / name, depth=1, caps=caps, out=launched)
                 finally:
                     below.close()
             docs = []
@@ -843,10 +862,6 @@ def read_shared_app(project_dir: Path, slug: str) -> SharedApp:
         raise
     if not any(file.path == root / "backend.py" for file in launched):
         raise LiveAppCopyRefused("backend.py is missing")
-    if len(launched) > MAX_LAUNCH_FILES:
-        raise LiveAppCopyRefused(f"the app has more than {MAX_LAUNCH_FILES} files")
-    if sum(len(file.content) for file in launched) > MAX_LAUNCH_TOTAL_BYTES:
-        raise LiveAppCopyRefused(f"the app's files are larger than {MAX_LAUNCH_TOTAL_BYTES} bytes")
     return SharedApp(
         name=metadata.name,
         description=metadata.description,

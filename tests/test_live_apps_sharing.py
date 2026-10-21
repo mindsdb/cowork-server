@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ from tests._live_apps import (
     BEARER_TOKEN,
     C,
     EMAIL_A,
+    MODULE,
     PARTITION_A,
     PARTITION_B,
     PARTITION_C,
@@ -375,6 +377,29 @@ def test_the_copy_refuses_a_link_a_hard_link_and_a_missing_backend(people, plant
 
     assert response.status_code == 422
     assert path in response.json()["detail"]
+    artifacts = people["b_path"] / ".anton" / "artifacts"
+    assert not artifacts.exists() or not any(artifacts.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("cap", "value", "detail"),
+    [
+        ("MAX_LAUNCH_FILES", 4, "the app has more than 4 files"),
+        ("MAX_LAUNCH_TOTAL_BYTES", 64, "the app's files are larger than 64 bytes"),
+        ("MAX_LAUNCH_FILE_BYTES", 16, "is larger than 16 bytes"),
+    ],
+)
+def test_the_copy_refuses_an_app_over_antons_launch_caps(stack, people, cap, value, detail):
+    """The copy reads anton's own launch caps, so it never holds an app anton
+    wouldn't launch."""
+    client = _client()
+    share = _share(client, people["a_project"], email="bob@example.com").json()
+    stack.setattr(sys.modules[MODULE], cap, value)
+
+    response = _duplicate(client, share["shareId"], people["b_project"])
+
+    assert response.status_code == 422
+    assert detail in response.json()["detail"]
     artifacts = people["b_path"] / ".anton" / "artifacts"
     assert not artifacts.exists() or not any(artifacts.iterdir())
 
