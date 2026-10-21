@@ -138,9 +138,11 @@ deployment:
   datasourceCapabilities: ""
 
   image:
-    # The build-push-ecr action derives the ECR repo name from the GitHub repo
-    # slug, so this must track the GitHub repo name (cowork-server).
-    repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
+    # The dev-tier repository, which holds the PR and staging images
+    # (`development-*`, `staging-*`). values-prod.yaml points prod at the
+    # prod-tier repository, which only main's builds write. Each name must match
+    # the ECR_REPOSITORY that .github/workflows/build-deploy.yml pushes to.
+    repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server-dev
     command: ["python", "-m", "uvicorn", "cowork.server:app"]
     # Async FastAPI: the event loop handles concurrency per worker. Scale via
     # replicas (and HPA) rather than worker count. --forwarded-allow-ips '*'
