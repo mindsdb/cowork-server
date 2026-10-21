@@ -554,12 +554,16 @@ class _LeaseKeeper:
                 )
             except Exception:
                 # The next renewal tries again; the lease has slack for a few.
-                logger.warning(f"Schedule {self._schedule_id}: could not renew its run's lease", exc_info=True)
+                logger.warning(
+                    "Could not renew scheduled run's lease",
+                    exc_info=True, extra=log_context(schedule_id=self._schedule_id),
+                )
                 continue
             if not held:
                 logger.warning(
-                    f"Schedule {self._schedule_id}: occurrence {self._occurrence_id} was taken back "
-                    "while its run was out of touch; its outcome will not be recorded on it"
+                    "Scheduled occurrence %s was taken back while its run was out of touch; "
+                    "its outcome will not be recorded on it",
+                    self._occurrence_id, extra=log_context(schedule_id=self._schedule_id),
                 )
                 return
 
@@ -582,11 +586,15 @@ async def execute_schedule(
     except PoolTimeoutError:
         # Nothing was written: a cron slot stays due and the next poll claims it.
         logger.warning(
-            f"Schedule {schedule_id}: no database connection freed to claim its run; it did not run"
+            "No database connection freed to claim scheduled run; it did not run",
+            extra=log_context(schedule_id=schedule_id),
         )
         return
     if occurrence_id is None:
-        logger.info(f"Schedule {schedule_id}: an occurrence is already in flight; not starting another")
+        logger.info(
+            "Scheduled occurrence already in flight; not starting another",
+            extra=log_context(schedule_id=schedule_id),
+        )
         return
     await run_occurrence(occurrence_id, is_manual=is_manual, conversation_id=conversation_id)
 
@@ -734,7 +742,10 @@ async def _execute_attempt(
         ):
             # Taken back while it was setting up: whoever holds the
             # occurrence now decides what runs. This attempt never acted.
-            logger.warning(f"Schedule {schedule_id}: run lost its occurrence before it started; not running it")
+            logger.warning(
+                "Scheduled run lost its occurrence before it started; not running it",
+                extra=log_context(schedule_id=schedule_id),
+            )
             return _AttemptEnd(
                 outcome=AttemptOutcome.failed_before_execution,
                 error="Run was taken over before it started.",
@@ -768,7 +779,7 @@ async def _execute_attempt(
     except asyncio.TimeoutError:
         timed_out = True
         logger.warning(
-            f"Schedule {schedule_id}: run exceeded {_MAX_RUN_DURATION_SECONDS}s; stopping it",
+            "Scheduled run exceeded %ss; stopping it", _MAX_RUN_DURATION_SECONDS,
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
     except Exception:
@@ -803,7 +814,10 @@ async def _stop_turn(conversation_id: str, *, run_id: UUID, schedule_id: UUID) -
     try:
         await run_db(partial(_request_stop, run_id=run_id), scope=SYSTEM_SCOPE)
     except Exception:
-        logger.warning(f"Schedule {schedule_id}: could not record the stop request", exc_info=True)
+        logger.warning(
+            "Could not record scheduled run's stop request",
+            exc_info=True, extra=log_context(schedule_id=schedule_id),
+        )
     handle = registry.get(conversation_id)
     if handle is None or not handle.is_running:
         return
@@ -812,11 +826,14 @@ async def _stop_turn(conversation_id: str, *, run_id: UUID, schedule_id: UUID) -
         await asyncio.wait_for(asyncio.shield(stopping), timeout=_STOP_GRACE_SECONDS)
     except asyncio.TimeoutError:
         logger.error(
-            f"Schedule {schedule_id}: its turn did not stop within {_STOP_GRACE_SECONDS}s; "
-            "holding the schedule until it does"
+            "Scheduled turn did not stop within %ss; holding the schedule until it does",
+            _STOP_GRACE_SECONDS, extra=log_context(schedule_id=schedule_id),
         )
     except Exception:
-        logger.exception(f"Schedule {schedule_id}: stopping its turn failed; holding the schedule until it ends")
+        logger.exception(
+            "Stopping scheduled turn failed; holding the schedule until it ends",
+            extra=log_context(schedule_id=schedule_id),
+        )
     await asyncio.wait({handle.task})
     if remote_backend():
         await asyncio.sleep(_REMOTE_STOP_GRACE_SECONDS)
@@ -966,8 +983,8 @@ def _reap_expired_leases(session: ScopedSession, now: datetime) -> None:
         )
         if settlement != Settlement.lost:
             logger.warning(
-                f"Schedule {lease.schedule_id}: occurrence {lease.occurrence_id} lease expired; "
-                f"reaped it ({settlement.value})"
+                "Scheduled occurrence %s lease expired; reaped it (%s)",
+                lease.occurrence_id, settlement.value, extra=log_context(schedule_id=lease.schedule_id),
             )
 
 
