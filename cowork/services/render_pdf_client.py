@@ -4,7 +4,9 @@ The server never makes a PDF itself and never falls back to another
 converter: ``RenderServicePdf`` posts a ``RenderPdfRequest`` to
 ``<render_url>/v1/pdf`` and reads back a ``RenderPdfResult``. It reads no
 proxy from the environment and follows no redirect, so the document goes to
-the configured service and nowhere else.
+the configured service and nowhere else. Ignoring the environment also skips
+``SSL_CERT_FILE`` and ``SSL_CERT_DIR``: an https render service is checked
+against certifi's public certificate authorities only.
 
 One deadline, ``ExportPdfSettings.timeout_seconds`` (60 s), covers the whole
 call, the retry and reading the PDF included. The proxies in front of a
@@ -83,7 +85,10 @@ class RenderPdfFailed(Exception):
     """No usable PDF came back. ``status`` is what the export route answers.
 
     The message says why, for the log. It never carries the render service's
-    own text, which the exported page can influence.
+    own text, which the exported page can influence, and neither does its
+    cause: it is raised ``from None``, because httpx, pydantic and pypdf errors
+    quote the bytes they couldn't read, and a log call with ``exc_info``
+    prints the whole chain.
     """
 
     def __init__(self, *, status: RenderPdfFailureStatus, reason: str) -> None:
@@ -100,8 +105,8 @@ class RenderServicePdf:
         settings: ExportPdfSettings,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if settings.render_url is None:
-            raise ValueError("PDF export has no render service URL")
+        if settings.engine != "render" or settings.render_url is None:
+            raise ValueError("PDF export needs the render engine and a render service URL")
         self._settings = settings
         self._transport = transport
         self._endpoint = f"{str(settings.render_url).rstrip('/')}/v1/pdf"
@@ -140,12 +145,12 @@ class RenderServicePdf:
                     max_pages=self._settings.max_pages,
                     deadline=time.monotonic() + (deadline - loop.time()),
                 )
-        except (TimeoutError, httpx.TimeoutException) as error:
-            raise RenderPdfFailed(status=504, reason=_NO_PDF_IN_TIME) from error
+        except (TimeoutError, httpx.TimeoutException):
+            raise RenderPdfFailed(status=504, reason=_NO_PDF_IN_TIME) from None
         except httpx.RequestError as error:
             raise RenderPdfFailed(
                 status=502, reason=f"the render service can't be reached ({type(error).__name__})"
-            ) from error
+            ) from None
 
     async def _post(self, *, client: httpx.AsyncClient, body: bytes, remaining: float) -> bytes | None:
         """Send one request. Return the 200 body, or None for a 503."""
@@ -214,12 +219,12 @@ def _decode_pdf(*, answer: bytes) -> bytes:
     """Return the PDF a 200 answer carries, or raise 502."""
     try:
         result = RenderPdfResult.model_validate_json(answer)
-    except ValidationError as error:
-        raise RenderPdfFailed(status=502, reason="the render service's answer isn't a PDF result") from error
+    except ValidationError:
+        raise RenderPdfFailed(status=502, reason="the render service's answer isn't a PDF result") from None
     try:
         pdf = base64.b64decode(result.pdf_base64, validate=True)
-    except ValueError as error:  # binascii.Error is a ValueError
-        raise RenderPdfFailed(status=502, reason="the render service's PDF isn't valid base64") from error
+    except ValueError:  # binascii.Error is a ValueError
+        raise RenderPdfFailed(status=502, reason="the render service's PDF isn't valid base64") from None
     if not pdf.startswith(PDF_MAGIC):
         raise RenderPdfFailed(status=502, reason="the render service's bytes aren't a PDF")
     return pdf
@@ -325,4 +330,6 @@ def _walk_page_tree(*, pdf: bytes, max_pages: int, stop_at: float) -> int:
         # A hostile PDF can make pypdf raise nearly anything: its own errors,
         # KeyError, TypeError, RecursionError. Each one means the bytes aren't
         # a PDF this server accepts.
-        raise RenderPdfFailed(status=502, reason="pypdf can't read the render service's PDF") from error
+        raise RenderPdfFailed(
+            status=502, reason=f"pypdf can't read the render service's PDF ({type(error).__name__})"
+        ) from None

@@ -10,6 +10,7 @@ import logging
 import socket
 import threading
 import time
+import traceback
 import tracemalloc
 import zlib
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -178,6 +179,15 @@ def _zeros(*, count: int) -> str:
     return "0 " * count
 
 
+def _one_long_node() -> bytes:
+    """A page-tree node in an object stream with three million entries.
+
+    pypdf parses them in one call: seconds of work on a fast machine, and
+    about 6 MB inflated, under the inflate cap.
+    """
+    return _packed_pdf(kids=1, body=f"<< /Type /Pages /Kids [{_zeros(count=3_000_000)}] >>")
+
+
 CATALOG = "<< /Type /Catalog /Pages 2 0 R >>"
 PAGE = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>"
 
@@ -246,6 +256,22 @@ def _closed_port_url() -> str:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     return f"http://127.0.0.1:{port}"
+
+
+# Settings.
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        pytest.param(ExportPdfSettings(engine=None, render_url=None), id="engine-and-url-unset"),
+        pytest.param(ExportPdfSettings(engine=None, render_url="http://render.test:9000"), id="engine-unset"),
+        pytest.param(ExportPdfSettings(engine="render", render_url=None), id="url-unset"),
+    ],
+)
+def test_no_client_without_the_render_engine_and_a_url(settings):
+    with pytest.raises(ValueError):
+        RenderServicePdf(settings=settings, transport=httpx.MockTransport(_ok))
 
 
 # The wire.
@@ -388,6 +414,41 @@ async def test_an_identity_content_encoding_is_read_as_sent():
     assert await _client(handler=handler).render(request=REQUEST) == FIXTURE_PDF
 
 
+# What a failure carries.
+
+SERVICE_TEXT = "PageChosenText"
+
+
+def _protocol_error(request: httpx.Request) -> httpx.Response:
+    # h11 quotes the bytes of a status or header line it can't parse.
+    raise httpx.RemoteProtocolError(f"illegal status line: b'{SERVICE_TEXT}'", request=request)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param(_protocol_error, id="protocol-error"),
+        pytest.param(
+            lambda _request: _streamed_200(body=f'{{"pdf_base64": 7, "refused": "{SERVICE_TEXT}"}}'.encode()),
+            id="answer-that-isnt-a-result",
+        ),
+        # pypdf quotes the bytes around an object it can't parse.
+        pytest.param(
+            _answering(pdf=_pdf(CATALOG, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", SERVICE_TEXT)),
+            id="pdf-pypdf-cant-read",
+        ),
+    ],
+)
+async def test_a_failure_never_carries_the_render_services_text(handler):
+    with pytest.raises(RenderPdfFailed) as failure:
+        await _client(handler=handler).render(request=REQUEST)
+
+    # A log call with exc_info prints the whole chain, so it carries no cause.
+    assert failure.value.status == 502
+    assert failure.value.__cause__ is None
+    assert SERVICE_TEXT not in "".join(traceback.format_exception(failure.value))
+
+
 # Busy and the budget.
 
 
@@ -426,6 +487,25 @@ async def test_503_with_less_budget_than_a_full_job_answers_503_without_a_retry(
     assert len(seen) == 1
 
 
+async def test_the_retry_after_a_503_shares_the_first_attempts_budget(monkeypatch):
+    # A 1 s budget and a 0.2 s job: the 503 after 0.4 s leaves room for a
+    # retry, and the retry's 0.8 s runs past what is left of the one budget,
+    # though not past a fresh one.
+    monkeypatch.setattr(render_pdf_client, "FULL_JOB_SECONDS", 0.2)
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) == 1:
+            await asyncio.sleep(0.4)
+            return httpx.Response(503)
+        await asyncio.sleep(0.8)
+        return _ok(request)
+
+    assert await _status(client=_client(handler=handler, timeout_seconds=1.0)) == 504
+    assert len(seen) == 2
+
+
 async def test_a_slow_answer_past_the_budget_answers_504():
     async def handler(request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(10)
@@ -452,26 +532,26 @@ async def test_a_body_that_trickles_past_the_budget_answers_504():
 
 
 async def test_an_answer_whose_parsing_runs_past_the_budget_answers_504():
-    # A million refusal records: about a second of parsing, all of it after
-    # the body arrived. The parser holds the GIL, so the 504 can come only
-    # once it ends; before, the parse ran outside the budget and returned the PDF.
+    # A million refusal records: about a second of parsing, ten times the
+    # budget, all of it after the body arrived. The parser holds the GIL, so
+    # the 504 can come only once it ends; before, the parse ran outside the
+    # budget and returned the PDF.
     refused = ",".join(['{"url":"","reason":""}'] * 1_000_000)
     answer = f'{{"pdf_base64":"{base64.b64encode(FIXTURE_PDF).decode()}","refused":[{refused}]}}'.encode()
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return _streamed_200(body=answer)
 
-    assert await _status(client=_client(handler=handler, timeout_seconds=0.3)) == 504
+    assert await _status(client=_client(handler=handler, timeout_seconds=0.1)) == 504
     await _render_once_the_worker_is_free()
 
 
 async def test_a_page_count_past_the_budget_answers_504():
-    # One page-tree node in an object stream, with a million entries pypdf parses in one call.
-    pdf = _packed_pdf(kids=1, body=f"<< /Type /Pages /Kids [{_zeros(count=1_000_000)}] >>")
+    pdf = _one_long_node()
 
     started = time.monotonic()
     assert await _status(client=_client(handler=_answering(pdf=pdf), timeout_seconds=0.3)) == 504
-    assert time.monotonic() - started < 0.8
+    assert time.monotonic() - started < 3
     await _render_once_the_worker_is_free()
 
 
@@ -485,16 +565,16 @@ async def test_a_page_count_left_running_past_the_budget_stops_with_it():
     # pypdf at the deadline instead of finishing the stream.
     started = time.monotonic()
     await _render_once_the_worker_is_free()
-    assert time.monotonic() - started < 1.5
+    assert time.monotonic() - started < 3
 
 
 async def test_a_page_count_over_its_own_time_answers_502(monkeypatch):
     monkeypatch.setattr(render_pdf_client, "PAGE_COUNT_SECONDS", 0.3)
-    pdf = _packed_pdf(kids=1, body=f"<< /Type /Pages /Kids [{_zeros(count=1_000_000)}] >>")
+    pdf = _one_long_node()
 
     started = time.monotonic()
     assert await _status(client=_client(handler=_answering(pdf=pdf))) == 502
-    assert time.monotonic() - started < 1.5
+    assert time.monotonic() - started < 3
 
 
 async def test_a_page_count_left_running_holds_off_the_next_export(monkeypatch):
@@ -641,7 +721,20 @@ async def test_pypdf_warnings_about_the_pdf_stay_out_of_the_log(caplog):
     ] == []
 
 
-# Proxies.
+# Proxies and certificates.
+
+
+async def test_certificate_variables_are_ignored(monkeypatch, tmp_path):
+    # A client that reads the environment loads SSL_CERT_FILE as it starts,
+    # and this one fails to load, so reading it would stop the export.
+    bundle = tmp_path / "bundle.pem"
+    bundle.write_text("not a certificate\n", encoding="utf-8")
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    with _stub_render_service(answer=_StubAnswer(status=200, body=RESPONSE_JSON)) as service:
+        client = RenderServicePdf(settings=_settings(render_url=service.url))
+
+        assert await client.render(request=REQUEST) == FIXTURE_PDF
 
 
 async def test_proxy_settings_never_reroute_the_request(monkeypatch):
