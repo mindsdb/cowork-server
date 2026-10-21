@@ -1003,7 +1003,7 @@ The `show_figure_sources` setting (on by default) is read only by the UI, which 
 
 Environment variables fall into these groups:
 
-**Server-level** (`COWORK_*`) — control the cowork-server process itself. Each one also reaches the desktop sidecar through `<COWORK_HOME>/.env`, which the server reads below the process environment, so a value written there turns a setting on for the desktop too:
+**Server-level** (`COWORK_*`) — control the cowork-server process itself. Each one also reaches the desktop sidecar through `<COWORK_HOME>/.env`, which the server reads below the process environment, so a value written there turns a setting on for the desktop too. The two `COWORK_EXPORT_*` PDF settings are the exception: the server reads them from the process environment only.
 
 | Variable | Default | Description |
 |----------|---------|-------------|

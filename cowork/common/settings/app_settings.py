@@ -1142,7 +1142,9 @@ def load_export_pdf_settings(*, environ: Mapping[str, str]) -> ExportPdfSettings
             f"{EXPORT_RENDER_URL_VAR} must be an http:// or https:// address with a host."
         ) from None
     render_url = settings.render_url
-    if render_url is not None and (render_url.query or render_url.fragment):
+    # A bare "?" or "#" parses as an empty query or fragment, not None, and
+    # still moves /v1/pdf out of the path.
+    if render_url is not None and (render_url.query is not None or render_url.fragment is not None):
         raise ValueError(
             f"{EXPORT_RENDER_URL_VAR} must be the render service's base address, with no "
             "query or fragment: the server adds /v1/pdf to it."

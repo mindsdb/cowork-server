@@ -37,3 +37,22 @@ refused_render_urls:
   - http://
   - http://render.internal:9000/?token=x
   - http://render.internal:9000/#top
+  # An empty query or fragment still moves /v1/pdf out of the path.
+  - http://render.internal:9000/?
+  - http://render.internal:9000/#
+  - http://render.internal:9000/base?#
+
+# Render URLs that turn PDF export on while the engine is "render".
+accepted_render_urls:
+  - http://127.0.0.1:9000
+  - https://render.internal/base/
+
+# Proxy variables a client that reads the environment would follow. The
+# render service's client reads none of them.
+proxy_variables:
+  - HTTP_PROXY
+  - HTTPS_PROXY
+  - ALL_PROXY
+  - http_proxy
+  - https_proxy
+  - all_proxy
