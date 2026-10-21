@@ -1,11 +1,13 @@
 """Exercise interruption persistence across actual process termination.
 
 A direct registry test cannot detect Uvicorn waiting forever for an open SSE
-response before entering the app's shutdown lifespan. Use the image's command,
-an open TCP stream, the real app lifespan/producer and a file-backed database.
+response before entering the app's shutdown lifespan. Use the command a hosted
+pod runs, an open TCP stream, the real app lifespan/producer and a file-backed
+database.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 from pathlib import Path
@@ -14,11 +16,14 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from urllib.error import URLError
 from urllib.request import urlopen
 
 import pytest
+
+from _hosted_command import GRACEFUL_SHUTDOWN_FLAG, graceful_shutdown_seconds, hosted_command
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -27,19 +32,23 @@ INTERRUPTED = "The response was interrupted before it finished. Please try again
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="requires SIGTERM and SIGKILL")
 
 
-def _image_command(port: int) -> list[str]:
-    command = next(
-        json.loads(line.removeprefix("CMD "))
-        for line in (REPO / "Dockerfile").read_text().splitlines()
-        if line.startswith("CMD [")
-    )
-    # Preserve all runtime options, particularly the actual image's drain
-    # timeout. Change only executable, isolated app and loopback bind address.
+def _hosted_command(port: int) -> list[str]:
+    command = hosted_command()
+    # Preserve all runtime options, particularly the drain timeout. Change only
+    # executable, isolated app and loopback bind address.
     command[0] = sys.executable
     command[command.index("cowork.server:app")] = "turn_shutdown_process_app:app"
     command[command.index("--host") + 1] = "127.0.0.1"
     command[command.index("--port") + 1] = str(port)
     return command
+
+
+def test_the_hosted_command_bounds_the_request_drain():
+    """Without the bound, Uvicorn waits for every open answer stream before
+    the lifespan's shutdown runs, so the kubelet's SIGKILL lands first and no
+    interrupted turn is saved. The process tests below inherit the command."""
+    assert GRACEFUL_SHUTDOWN_FLAG in hosted_command()
+    assert graceful_shutdown_seconds(hosted_command()) > 0
 
 
 @pytest.fixture
@@ -66,14 +75,14 @@ def server_process(tmp_path):
     env.pop("WEB_CONCURRENCY", None)
     children = []
 
-    def start():
+    def start(**overrides: str):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         log = tmp_path / f"server-{len(children)}.log"
         with log.open("wb") as output:
             process = subprocess.Popen(
-                _image_command(port), cwd=REPO, env=env,
+                _hosted_command(port), cwd=REPO, env={**env, **overrides},
                 stdout=output, stderr=subprocess.STDOUT,
             )
         children.append(process)
@@ -93,6 +102,52 @@ def server_process(tmp_path):
         if process.poll() is None:
             process.kill()
         process.wait(timeout=5)
+
+
+@pytest.fixture
+def fake_redis():
+    """A Redis the server process reaches over TCP, and a client that reads it
+    after that process has exited."""
+    import redis
+    from fakeredis import TcpFakeServer
+    from fakeredis._tcp_server import Resp2Writer, TCPFakeRequestHandler
+
+    class Resp2Handler(TCPFakeRequestHandler):
+        # fakeredis's TCP server answers in RESP3 whatever the client speaks,
+        # so a nil reaches a RESP2 client as "_", which redis-py cannot parse.
+        # Redis itself answers RESP2 until a client asks otherwise.
+        def setup(self) -> None:
+            super().setup()
+            self.writer = Resp2Writer(self.client_address, self.wfile, self)
+
+    server = TcpFakeServer(("127.0.0.1", 0), server_type="redis")
+    port = server.server_address[1]
+    server.RequestHandlerClass = Resp2Handler
+    # A connection the exited server left in a blocking XREAD holds its
+    # handler thread until the block times out; don't wait for it.
+    server.daemon_threads = True
+    server.block_on_close = False
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = redis.Redis(host="127.0.0.1", port=port, decode_responses=True)
+    try:
+        yield f"redis://127.0.0.1:{port}/0", client
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+
+
+def _sse_events(body: bytes) -> list[tuple[str, dict]]:
+    """(event, data) for each frame, keepalive comments skipped."""
+    events = []
+    for frame in body.decode().split("\n\n"):
+        fields = dict(
+            line.split(": ", 1) for line in frame.splitlines() if line and not line.startswith(":")
+        )
+        if "event" in fields:
+            events.append((fields["event"], json.loads(fields.get("data") or "{}")))
+    return events
 
 
 def _history(path: Path, conversation_id: str):
@@ -173,3 +228,60 @@ def test_open_stream_survives_process_restart_without_duplicate_history(
             restarted.wait(timeout=9)
         except subprocess.TimeoutExpired:
             pytest.fail(f"restarted server failed to stop:\n{restart_log.read_text()}")
+
+
+def test_sigterm_ends_an_open_remote_answer_on_its_stream_and_stops_its_controller_turn(
+    server_process, fake_redis, tmp_path,
+):
+    """A hosted replica stopping during a remote answer. The answer is ended
+    before Uvicorn's drain could cut its stream: the open stream gets
+    response.failed with the interrupted message and then a clean end, the
+    controller's cancel flag stops the sandbox turn, the answer is saved, and
+    the process exits. Without the SIGTERM pre-drain the bound cuts the stream
+    at about 2 s with no terminal frame, which reads below as IncompleteRead.
+
+    Stubbed: the sandbox controller (the harness's stand-in takes the job and
+    replies with the partial answer, then nothing) and the auth service's
+    turn key and connection list. The registry, relay, Redis job, reply and
+    turn streams, save and lifespan are the real ones, on a fakeredis server.
+    It runs in local tenancy with no principal, where hosted runs org
+    tenancy; the relay, its cancel branch and the save are the same code in
+    both.
+    """
+    from cowork.turnqueue.redis_client import cancel_flag_key
+
+    redis_url, redis_client = fake_redis
+    process, base_url, log = server_process(
+        COWORK_TURN_BACKEND="remote", COWORK_STREAM_BACKEND="redis", COWORK_TURN_REDIS_URL=redis_url,
+    )
+    with urlopen(f"{base_url}/__shutdown_test/start_remote", timeout=5) as stream:
+        conversation_id = stream.headers["X-Test-Conversation-Id"]
+        correlation_id = stream.headers["X-Test-Correlation-Id"]
+        before = b""
+        while PARTIAL.encode() not in before:
+            line = stream.readline()
+            assert line, f"stream ended before the partial answer:\n{log.read_text()}"
+            before += line
+        assert redis_client.get(cancel_flag_key(correlation_id)) is None
+        signalled_at = time.monotonic()
+        process.send_signal(signal.SIGTERM)
+        try:
+            after = stream.read()
+        except http.client.IncompleteRead as cut:
+            pytest.fail(f"the stream was cut with no terminal frame: {cut.partial!r}\n{log.read_text()}")
+        ended_after = time.monotonic() - signalled_at
+    try:
+        process.wait(timeout=9)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"shutdown exceeded Docker's default 10s grace:\n{log.read_text()}")
+
+    events = _sse_events(after)
+    assert events, f"nothing after the partial answer:\n{log.read_text()}"
+    last_event, last_data = events[-1]
+    assert last_event == "response.failed"
+    assert last_data["error"] == INTERRUPTED
+    # Well inside the request drain's bound: the pre-drain wrote it, not the
+    # lifespan's shutdown, which runs only after the drain.
+    assert ended_after < graceful_shutdown_seconds(hosted_command()), ended_after
+    assert redis_client.get(cancel_flag_key(correlation_id)) == "1"
+    _assert_interrupted(_history(tmp_path / "history.db", conversation_id))

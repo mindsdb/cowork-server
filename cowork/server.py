@@ -8,7 +8,10 @@ and all necessary configurations for the Cowork service.
 import asyncio
 import contextlib
 import os
+import signal
+import threading
 from contextlib import asynccontextmanager
+from types import FrameType
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,12 +47,13 @@ from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
-from cowork.streaming import TurnInProgress
+from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
+from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
-from cowork.scheduler import start_scheduler
+from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
 
 
@@ -127,6 +131,106 @@ async def _cancel_and_wait(task: asyncio.Task | None) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+async def _end_remote_turns() -> None:
+    """End this replica's turns for a shutdown, where turns run remotely.
+
+    Refuses new turns and cancels the scheduler's poll loop, then ends every
+    turn in flight: RunRegistry.shutdown writes each remote turn's controller
+    cancel flag, and the turn's relay saves it as interrupted and writes
+    response.failed to its stream. Only then does it wait for the poll loop,
+    which finishes a database read it was in before it stops, and for the
+    scheduled runs those turns belonged to, so each run's record lands.
+    TURN_SHUTDOWN_GRACE_SECONDS bounds all of it. Each step does nothing for
+    what an earlier call ended.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + TURN_SHUTDOWN_GRACE_SECONDS
+
+    def remaining() -> float:
+        return max(0.0, deadline - loop.time())
+
+    registry.close()
+    poll_loop = stop_scheduler()
+    cancelled = await registry.shutdown(timeout_seconds=remaining())
+    if cancelled:
+        logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+    if poll_loop is not None:
+        await asyncio.wait([poll_loop], timeout=remaining())
+    unfinished = await wait_for_scheduled_runs(timeout_seconds=remaining())
+    if unfinished:
+        logger.warning("%d scheduled run(s) still recording their outcome at shutdown", unfinished)
+
+
+def _server_busy(*, retry_after: int, status_code: int) -> JSONResponse:
+    """The refusal a client reads as "Cowork is busy": a sentence naming the
+    wait, its code, and Retry-After, which the web UI waits for before it
+    offers a retry."""
+    return JSONResponse(
+        Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+        status_code=status_code,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+# Another replica already serves while this one shuts down, so the retry needs
+# no longer than the client's own round trip.
+_SHUTDOWN_RETRY_AFTER_SECONDS = 1
+
+
+def _end_remote_turns_on_sigterm() -> None:
+    """Run _end_remote_turns on the first SIGTERM, then hand the signal on.
+
+    Uvicorn sets its own SIGTERM handler before lifespan startup runs
+    (Server.capture_signals), so the handler found here is Uvicorn's. On
+    SIGTERM it closes the listeners, waits at most --timeout-graceful-shutdown
+    for open responses, cuts the ones still open mid-stream, and only then
+    runs the lifespan's shutdown. Ending the turns first lets each open answer
+    stream carry its response.failed frame and end cleanly before that cut.
+    A second SIGTERM goes straight to Uvicorn.
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        logger.warning(
+            "SIGTERM handler is %r, not one to hand the signal on to; turns in progress "
+            "are ended only after the server's request drain", previous,
+        )
+        return
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "Server lifespan runs off the main thread, where no signal handler can be set; "
+            "turns in progress are ended only after the server's request drain",
+        )
+        return
+    loop = asyncio.get_running_loop()
+    signalled = False
+    # Held here because the event loop keeps only a weak reference to a task.
+    drain: asyncio.Task | None = None
+
+    def on_sigterm(signum: int, frame: FrameType | None) -> None:
+        nonlocal signalled
+        if signalled:
+            previous(signum, frame)
+            return
+        signalled = True
+
+        def hand_on(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error("Ending turns before shutdown failed", exc_info=task.exception())
+            previous(signum, frame)
+
+        def begin() -> None:
+            nonlocal drain
+            drain = loop.create_task(_end_remote_turns())
+            drain.add_done_callback(hand_on)
+
+        # A signal handler runs between two bytecodes of whatever the loop was
+        # doing, possibly while it waits in select(); call_soon_threadsafe
+        # wakes it to run begin().
+        loop.call_soon_threadsafe(begin)
+
+    signal.signal(signal.SIGTERM, on_sigterm)
 
 
 async def _run_artifact_owner_backfill() -> None:
@@ -255,6 +359,11 @@ async def lifespan(app: FastAPI):
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
         )
+    # Only where turns run remotely: desktop and in-process deployments keep
+    # Uvicorn's own SIGTERM handling and end their turns in the teardown below.
+    remote_turns = TurnQueueSettings().is_remote
+    if remote_turns:
+        _end_remote_turns_on_sigterm()
     try:
         yield
     finally:
@@ -265,13 +374,18 @@ async def lifespan(app: FastAPI):
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
-        from cowork.streaming.registry import registry
 
         # Uvicorn's request drain is bounded by the image command. Persist
         # interrupted turns before their database and runtime resources close.
-        cancelled = await registry.shutdown()
-        if cancelled:
-            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+        # Remote turns were usually ended already, by the SIGTERM handler while
+        # their streams were still open, and each step then does nothing; this
+        # covers a shutdown that began any other way.
+        if remote_turns:
+            await _end_remote_turns()
+        else:
+            cancelled = await registry.shutdown()
+            if cancelled:
+                logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
@@ -414,16 +528,19 @@ def create_app() -> FastAPI:
     # a retry, and the sentence names the wait for clients that don't read it.
     @app.exception_handler(PoolTimeoutError)
     async def _database_busy(request, exc):
-        retry_after = busy_retry_seconds()
         logger.warning(
             "%s %s refused with 503: no database connection freed in time",
             request.method, request.url.path,
         )
-        return JSONResponse(
-            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
-            status_code=DatabaseBusy.status_code,
-            headers={"Retry-After": str(retry_after)},
-        )
+        return _server_busy(retry_after=busy_retry_seconds(), status_code=DatabaseBusy.status_code)
+
+    # A question that reached a replica already ending its turns for a
+    # shutdown (RunRegistry.close). Refused as a busy server is: the client
+    # waits Retry-After, and its retry reaches another replica, which the
+    # rollout made ready before it stopped this one.
+    @app.exception_handler(ServerShuttingDown)
+    async def _shutting_down(request, exc: ServerShuttingDown):
+        return _server_busy(retry_after=_SHUTDOWN_RETRY_AFTER_SECONDS, status_code=exc.status_code)
 
     # A second question into a conversation whose turn is still answering.
     @app.exception_handler(TurnInProgress)

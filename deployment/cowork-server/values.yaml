@@ -141,11 +141,44 @@ deployment:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
     # slug, so this must track the GitHub repo name (cowork-server).
     repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
-    command: ["python", "-m", "uvicorn", "cowork.server:app"]
-    # Async FastAPI: the event loop handles concurrency per worker. Scale via
-    # replicas (and HPA) rather than worker count. --forwarded-allow-ips '*'
-    # trusts the in-cluster ingress for X-Forwarded-* headers.
-    args: ["--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*"]
+    # No command or args here: the image's CMD (Dockerfile) owns the uvicorn
+    # command, one worker per pod, scaled with replicas. That includes
+    # --forwarded-allow-ips '*', which trusts the in-cluster ingress for
+    # X-Forwarded-* headers, and --timeout-graceful-shutdown, the bound on the
+    # shutdown drain that terminationGracePeriodSeconds below counts.
+    # tests/test_chart_values.py fails if a values file sets either key again.
+
+  # A shutdown, counted from the pod's deletion (README.md, "What a shutdown
+  # does to answers in progress"):
+  #   0-15 s  the preStop sleep. ingress-nginx drops the pod's endpoint and
+  #           sends new requests to the other pods; open answers keep
+  #           streaming here.
+  #   up to 5 s  SIGTERM. Before uvicorn sees it, cowork.server ends each
+  #           remaining answer as interrupted on its open stream
+  #           (TURN_SHUTDOWN_GRACE_SECONDS).
+  #   2 s     uvicorn's own drain (--timeout-graceful-shutdown in the image).
+  #   about 18 s  the lifespan teardown's bounded waits: another pass over
+  #           turns (5 s), channel tasks (3 s, then up to 5 s more while each
+  #           one cancelled writes its sandbox turn's cancel flag) and
+  #           scratchpad closes (5 s).
+  # About 40 s in all, so 60 s leaves room for the unbounded closes at the end
+  # of teardown before the kubelet's SIGKILL.
+  terminationGracePeriodSeconds: 60
+
+  lifecycle:
+    preStop:
+      exec:
+        command: ["/bin/sh", "-c", "sleep 15"]
+
+  # Create every new pod at once, and stop no old pod until a new one is
+  # Ready. The old pods then stop within seconds of each other instead of a
+  # rollout step apart, so the retry an interrupted answer asks for lands on a
+  # new pod rather than on an old one about to stop too.
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: "100%"
+      maxUnavailable: 0
 
   # Alembic locks via the alembic_version table, so concurrent replicas don't
   # race; on already-migrated databases this is a no-op. The deployment

@@ -96,6 +96,43 @@ Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
 for the two selector checks to run alongside it, since getting either one wrong
 drops every real request without failing the release.
 
+## What a shutdown does to answers in progress
+
+A rollout, a node drain and a deleted pod all stop a pod the same way. The
+times below count from the pod's deletion.
+
+| Time | What happens |
+| --- | --- |
+| 0 to 15 s | The preStop hook sleeps. ingress-nginx drops the pod's endpoint and sends new requests, reconnects included, to the other pods. Answers already streaming from this pod keep streaming, and one that finishes now ends normally. |
+| About 15 s | The kubelet sends SIGTERM. Before uvicorn sees it, the server refuses new turns (503, code `server_busy`, `Retry-After: 1`) and stops its scheduler. A scheduled run whose turn it refuses is recorded as not started, and its slot stays due for the next poll on a pod still serving. Then it ends each answer still running: it writes the sandbox controller's cancel flag so the sandbox turn stops, saves the answer as it stands, and sends "The response was interrupted before it finished. Please try again." on the answer's open stream, which then ends cleanly. This takes at most 5 s (`TURN_SHUTDOWN_GRACE_SECONDS`), and the pod logs `Cancelled N in-flight turn(s) for shutdown` at WARNING. |
+| Up to about 22 s | uvicorn closes its listener and waits at most 2 s (`--timeout-graceful-shutdown` in the Dockerfile's `CMD`) for responses still open, such as a `/tail` of an answer another pod runs, then cuts them. |
+| Up to about 40 s | The lifespan teardown's bounded waits, about 18 s: another pass over turns and scheduled runs (5 s), channel tasks (3 s) and scratchpad closes (5 s). A channel answer still running is cancelled after its 3 s and writes its sandbox turn's cancel flag before it ends, which can add up to 5 s. |
+| 60 s | `terminationGracePeriodSeconds`. The process has exited well before the kubelet's SIGKILL. |
+
+The chart sets no `image.command` or `image.args`, so the image's `CMD` and its
+shutdown bound apply; `tests/test_chart_values.py` fails if a values file sets
+either again, and checks that the grace period covers the steps above.
+
+The rollout uses `maxSurge: 100%` and `maxUnavailable: 0`. It creates every new
+pod at once and stops no old pod until a new one is Ready, so the old pods stop
+within seconds of each other, and the retry an interrupted answer asks for
+lands on a new pod rather than on an old one about to stop too. During a
+rollout the namespace briefly runs twice `replicaCount` pods, plus the old ones
+still stopping, each requesting 1 CPU and 1Gi.
+
+An answer is interrupted rather than continued on another replica because only
+the replica that took the request relays the controller's replies into the
+answer's stream and saves the answer when it ends. Nothing hands that relay
+over: another replica can replay what the stopping one already wrote, but it
+reads no reply the controller sends after that and saves nothing. Ending the
+answer, saving it and stopping its sandbox turn leaves the user a saved answer
+to retry from instead of one that never ends.
+
+Desktop and other non-hosted deployments are unchanged. They run turns in the
+server's own process, keep uvicorn's SIGTERM handling, and end their turns in
+the lifespan teardown, as before. A single-replica PR environment renders these
+values too, and they change only how its pod stops.
+
 ## Browser organization boundary
 
 Every environment refuses a browser request whose tab names a different

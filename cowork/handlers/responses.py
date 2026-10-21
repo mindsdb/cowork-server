@@ -233,9 +233,9 @@ async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bo
     """Whether a remote ``turn_failed`` is the user's own Stop, not a failure.
 
     ``REMOTE_CANCEL_LITERAL`` is proof on its own. ``REMOTE_CANCEL_VIA_FAIL_JOB``
-    is not: a controller replica taking SIGTERM mid-turn unwinds through the
-    same handler that a keepalive-driven cancel does, so the string cannot tell
-    a Stop from a rolling deploy killing the turn.
+    is not: a controller replica without a shutdown drain unwinds a SIGTERM
+    mid-turn through the same handler that a keepalive-driven cancel does, so
+    the string cannot tell a Stop from a rolling deploy killing the turn.
 
     The cancel flag separates them. ``/cancel`` writes it, the producer clears
     a stale one before each turn, and the keepalive-driven path never clears
