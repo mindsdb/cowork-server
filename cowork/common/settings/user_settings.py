@@ -1430,7 +1430,8 @@ def setting_is_org_scoped(key: str) -> bool:
 def setting_is_operator_pinned(key: str) -> bool:
     """True for a key the operator sets for the whole deployment: the model and
     provider choices, their endpoints and credentials, memory, the per-turn
-    budgets, and how the agent acts (act_first, proactive_dashboards).
+    budgets and the switch that applies them, and how the agent acts
+    (act_first, proactive_dashboards).
     SecretStr credentials are pinned structurally; other fields iff
     tagged with the PINNED marker. A personal partition resolves these from the
     global row, then the environment, and ignores a row of its own
