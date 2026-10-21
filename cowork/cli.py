@@ -2,7 +2,7 @@
 
 import uvicorn
 
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import get_app_settings, get_export_pdf_settings
 from cowork.dev_setup import run_dev_setup
 
 # Long enough for in-flight requests to finish, short enough that a supervisor
@@ -11,6 +11,11 @@ SHUTDOWN_GRACE_SECONDS = 5
 
 
 def main() -> None:
+    # Read the PDF export settings before the .env file below joins the
+    # environment: they come from the environment the server started with.
+    # On the desktop that file can be <COWORK_HOME>/.env, which
+    # POST /settings/raw writes.
+    get_export_pdf_settings()
     try:
         from dotenv import load_dotenv
         load_dotenv(override=False)
