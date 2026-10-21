@@ -45,11 +45,13 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import has_figures
+from cowork.harnesses.memory.policy import memory_policy
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
     TurnContext,
     TurnEvidence,
+    TurnMemoryRead,
     find_answer_sources,
     format_responses_stream,
 )
@@ -172,6 +174,11 @@ class _RemoteTurnFailed(Exception):
 # this module synthesizes when a turn is stopped while a question is on screen.
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
+
+#: A direct answer from the routing gate runs no agent, so it reads no learned
+#: memory. It sends and saves the record an agent turn does, in the same shape
+#: (TurnMemoryRead.payload).
+_DIRECT_MEMORY_READ = TurnMemoryRead(read=False, entries=0)
 
 #: Budget for a pod-reported history summary. Well above what the summarizer's
 #: own output cap can produce, and the summary is sticky: it is replayed on
@@ -631,6 +638,18 @@ class ResponsesHandler:
 
         await require_product_permission(self.scope, "product.execute")
 
+        # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
+        # deployment where that still reads stored memory (memory_policy: the
+        # desktop), the question is refused rather than answered from memory.
+        if request.memory == "off" and not memory_policy(memory_enabled=False).off:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "This deployment can't keep one question from reading memory. "
+                    'Retry the request without "memory": "off".'
+                ),
+            )
+
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
         # metric be attributed to a release instead of to a date on which
@@ -659,8 +678,15 @@ class ResponsesHandler:
 
         # Every settings read for this turn, in the gate and in the producer
         # task created below (create_task copies this context), is served from
-        # the snapshot the unit loaded.
-        with use_turn_settings(self.scope, start.settings):
+        # the snapshot the unit loaded. A question with "memory": "off" gets a
+        # copy with memory off, so AntonHarness._build_chat_session gives it
+        # two empty tiers in its scratch folder and no background passes.
+        turn_settings = (
+            start.settings.model_copy(update={"memory_enabled": False})
+            if request.memory == "off"
+            else start.settings
+        )
+        with use_turn_settings(self.scope, turn_settings):
             try:
                 route, turn_llm = await self._route_request(
                     conversation_id=start.conversation_id,
@@ -1165,7 +1191,7 @@ class ResponsesHandler:
                 "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
-            }, *([] if sources is None else [{
+            }, _DIRECT_MEMORY_READ.payload(), *([] if sources is None else [{
                 "type": "response.figure_sources",
                 **sources.model_dump(mode="json"),
             }]), {"type": "response.completed"}]
@@ -1273,13 +1299,16 @@ class ResponsesHandler:
         async def answer() -> None:
             # Found before the save, which keeps them with the answer.
             sources = await self._direct_figure_sources(conversation_id=conv_id, answer=route.text, question=question)
+            memory_frame = _DIRECT_MEMORY_READ.payload(sequence_number=3)
             sources_frame = None if sources is None else {
                 "type": "response.figure_sources",
-                "sequence_number": 3,
+                "sequence_number": 4,
                 "item_id": item_id,
                 **sources.model_dump(mode="json"),
             }
-            saved_events = [delta, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"}]
+            saved_events = [
+                delta, memory_frame, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"},
+            ]
             async with conversation_writes(conv_id):
                 saved = await run_db(
                     partial(save_turn, events=saved_events), scope=scope_from_principal(self.principal),
@@ -1303,6 +1332,7 @@ class ResponsesHandler:
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
+            await buffer.append("sse", {"sse": sse_frame("response.memory_read", memory_frame)})
             if sources_frame is not None:
                 await buffer.append("sse", {"sse": sse_frame("response.figure_sources", sources_frame)})
             completed_response = Response(
@@ -1314,7 +1344,7 @@ class ResponsesHandler:
             ).model_dump()
             completed_frame = {
                 "type": "response.completed",
-                "sequence_number": 3 if sources_frame is None else 4,
+                "sequence_number": 4 if sources_frame is None else 5,
                 "response": completed_response,
             }
             # The persisted row's real id, at the frame root (not
@@ -2576,6 +2606,13 @@ class ResponsesHandler:
             # buffer, so it can never write after the terminal record.
             async with model_wait.running(buffer=buffer):
                 async for sse_string in harness.formatter(stream, model, event_sink):
+                    if lifecycle.discarded:
+                        # A frame sent after a turn delete's cancel landed, such
+                        # as the turn's memory record: the delete removed this
+                        # turn's buffer, and a write would recreate it for the
+                        # next turn at this number. The stream raises the
+                        # cancel on the next read.
+                        continue
                     event_count += 1
                     sse_string = self._inject_created(
                         sse_string, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id,
