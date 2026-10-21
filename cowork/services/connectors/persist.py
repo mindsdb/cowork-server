@@ -28,9 +28,9 @@ from cowork.services.connectors.identity import (
     KEPT_SECRET_MOVED,
     derive_connection_name,
     keeps_secret_for_another_account,
+    kept_secret_moved,
     resolve_keep_sentinels,
     resolve_unique_slug,
-    secret_destination_changed,
     secure_keys_for,
 )
 from cowork.services.connectors.layered_vault import LayeredDataVault, SharedFrom
@@ -260,10 +260,10 @@ def persist_connection(
     user already upgraded to ``"write"``).
 
     A save that keeps a stored secret, by the keep sentinel or by leaving it
-    out of a save that replaces the record, while a field that picks its
-    destination differs from the record raises KeptSecretMovedError before
-    anything is written (secret_destination_changed), so a save can't send
-    the stored secret to another host. ``secret_bound_by_caller`` skips
+    out of a save that replaces the record, while a non-secret field outside
+    the connector's SAFE_WITH_KEPT_SECRET differs from the record raises
+    KeptSecretMovedError before anything is written (kept_secret_moved), so
+    a save can't send the stored secret elsewhere. ``secret_bound_by_caller`` skips
     that check for a caller that already bound its kept secret to the
     record's host and account, as the Databricks Genie save does.
 
@@ -338,7 +338,7 @@ def persist_connection(
         if (
             carried
             and not secret_bound_by_caller
-            and secret_destination_changed(existing, payload, connector_id, method)
+            and kept_secret_moved(existing, payload, connector_id, method)
         ):
             raise KeptSecretMovedError()
         for key in carried:

@@ -142,10 +142,10 @@ async def test_an_edit_that_keeps_the_token_and_changes_only_the_label_is_checke
 
 @pytest.mark.parametrize(
     "changed",
-    [{"http_path": NEW_PATH}, {"catalog": "main"}],
-    ids=["another-warehouse", "an-added-catalog"],
+    [{"http_path": NEW_PATH}, {"catalog": "main"}, {"schema": "sales"}],
+    ids=["another-warehouse", "an-added-catalog", "an-added-schema"],
 )
-async def test_an_edit_that_keeps_the_token_and_changes_a_non_destination_field_saves_in_place(
+async def test_an_edit_that_keeps_the_token_and_changes_a_listed_safe_field_saves_in_place(
     probes, changed,
 ):
     slug = persist_connection("databricks", PAT, "", SAVED)
@@ -163,10 +163,15 @@ async def test_an_edit_that_keeps_the_token_and_changes_a_non_destination_field_
 
 @pytest.mark.parametrize(
     "changed",
-    [{"workspace_url": OTHER_HOST}, {"workspace_url": OTHER_HOST, "http_path": NEW_PATH}],
-    ids=["another-host", "another-host-and-warehouse"],
+    [
+        {"workspace_url": OTHER_HOST},
+        {"workspace_url": OTHER_HOST, "http_path": NEW_PATH},
+        {"server_hostname": "collector.example.net"},
+        {"ssl_verify": "false"},
+    ],
+    ids=["another-host", "another-host-and-warehouse", "an-added-host-field", "an-added-tls-flag"],
 )
-async def test_an_edit_that_keeps_the_token_and_changes_the_host_is_refused_before_any_probe(
+async def test_an_edit_that_keeps_the_token_and_changes_an_unlisted_field_is_refused_before_any_probe(
     probes, changed,
 ):
     slug = persist_connection("databricks", PAT, "", SAVED)
@@ -247,7 +252,7 @@ def test_a_save_whose_caller_bound_the_kept_secret_skips_the_destination_check(s
     assert record["fields"]["client_id"] == "another-principal"
 
 
-def test_a_record_with_no_destination_field_keeps_a_secret_only_when_every_field_matches(stores):
+def test_a_connector_with_no_listed_safe_field_keeps_a_secret_only_when_every_field_matches(stores):
     vault = own_vault_for_scope(LOCAL_SCOPE)
     saved = {"api_key": "stored-api-key-7f3a", "workspace_gid": "1201"}
     slug = persist_connection("example-tool", None, "", saved)

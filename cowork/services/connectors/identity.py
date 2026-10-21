@@ -313,30 +313,13 @@ KEPT_SECRET_MOVED = (
 )
 
 
-# Non-secret fields that choose where a saved secret is sent (host, address,
-# region, tenant) or whose account it acts for. Names come from the shipped specs.
-SECRET_DESTINATION_FIELDS = frozenset({
-    # Hosts, addresses and connection strings.
-    "host", "hostname", "server_hostname", "server", "port", "workspace_url",
-    "url", "uri", "dsn", "endpoint", "base_url", "base_url_override", "api_base_url",
-    "api_url", "apm_server_url", "cluster_url", "connection_string", "connection_uri",
-    "contact_points", "controller_url", "custom_host", "custom_region_domain",
-    "data_plane_url", "domain", "endpoint_url", "environment_url", "grafana_url",
-    "grpc_endpoint", "identity_url", "imap_host", "imap_port", "instance_url",
-    "loki_url", "nominatim_base_url", "overpass_base_url", "project_url", "query_url",
-    "rest_endpoint_url", "rest_url", "secure_connect_bundle_path", "server_url",
-    "site_url", "subdomain", "company_subdomain", "tempo_url", "tenant_url",
-    "tns_connection_string", "token_url", "account_endpoint",
-    # Regions, clouds, tenants and accounts that pick the host.
-    "region", "aws_region", "default_region", "region_domain", "datacenter",
-    "cloud_environment", "environment", "account", "account_identifier", "account_id",
-    "project_id", "tenant", "tenant_id",
-    # The account a secret acts for.
-    "user", "username", "db_username", "basic_auth_username", "service_account_username",
-    "email", "account_email", "login_email", "impersonate_email", "client_id",
-    "aura_client_id", "access_key_id", "aws_access_key_id", "access_id", "key_id",
-    "role_arn",
-})
+# Non-secret fields a save may change while it keeps a stored secret, by
+# (connector id, method). Every other non-secret field must match the record.
+_DATABRICKS_SQL_SAFE_FIELDS = frozenset({"http_path", "catalog", "schema", "session_configuration"})
+SAFE_WITH_KEPT_SECRET = {
+    ("databricks", "personal-access-token"): _DATABRICKS_SQL_SAFE_FIELDS,
+    ("databricks", "service-principal-oauth"): _DATABRICKS_SQL_SAFE_FIELDS,
+}
 
 
 def kept_secret_keys(
@@ -363,32 +346,31 @@ def keeps_secret_for_another_account(
     """True when ``credentials`` keep a stored secret but send it somewhere else.
 
     The sentinels are resolved first, then the result is compared with the
-    record by secret_destination_changed, so a kept secret is never sent to
+    record by kept_secret_moved, so a kept secret is never sent to
     another host or used as another account. Pure; reads nothing.
     """
     if not kept_secret_keys(credentials, existing_record, connector_id, method):
         return False
     resolved, _ = resolve_keep_sentinels(credentials, existing_record)
-    return secret_destination_changed(existing_record, resolved, connector_id, method)
+    return kept_secret_moved(existing_record, resolved, connector_id, method)
 
 
-def secret_destination_changed(
+def kept_secret_moved(
     existing_record: dict | None, payload: dict, connector_id: str, method: str | None
 ) -> bool:
-    """True when ``payload`` would take ``existing_record``'s secrets to another host or account.
+    """True when ``payload`` differs from ``existing_record`` in a field a kept secret is bound to.
 
-    Only the SECRET_DESTINATION_FIELDS either side holds are compared, so a
-    changed warehouse path or catalog keeps the secret. A record holding none
-    of them falls back to every non-secret field (is_same_account), since
-    nothing then says which field picks the destination. Pure; reads nothing.
+    Every non-secret field is compared as is_same_account compares it,
+    including one only ``payload`` holds, except the connector's
+    SAFE_WITH_KEPT_SECRET fields. ``_`` bookkeeping is never compared.
+    Pure; reads nothing.
     """
     record = existing_record or {}
-    prior = record.get("fields") or {}
-    secure = set(secure_keys_for(connector_id, method, payload)) | set(record.get("secure_keys") or [])
-    if not SECRET_DESTINATION_FIELDS & set(prior):
-        return not is_same_account(existing_record, payload, sorted(secure))
-    destination = (SECRET_DESTINATION_FIELDS & (set(prior) | set(payload))) - secure
-    return any(prior.get(key) != payload.get(key) for key in destination)
+    secure = sorted(set(secure_keys_for(connector_id, method, payload)) | set(record.get("secure_keys") or []))
+    safe = SAFE_WITH_KEPT_SECRET.get((connector_id, method), frozenset())
+    stored = _nonsecret_identity(record.get("fields") or {}, secure)
+    given = _nonsecret_identity(payload, secure)
+    return {k: v for k, v in stored.items() if k not in safe} != {k: v for k, v in given.items() if k not in safe}
 
 
 def resolve_unique_slug(
