@@ -99,6 +99,40 @@ def code_sandbox_on() -> bool:
     return get_app_settings().code_sandbox == "landlock"
 
 
+#: anton's live-apps switch, which the live-apps overlay sets on this service.
+#: anton reads it (live_apps_enabled); check_startup reads it by name only to
+#: refuse it on an anton that can't.
+LIVE_APP_SLOTS_VARIABLE = "ANTON_LIVE_APP_SLOTS"
+
+#: The shortest COWORK_LIVE_APPS_LAUNCH_TOKEN check_startup accepts.
+MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH = 32
+
+#: What this server uses of anton's live-app slots (anton.core.artifacts.live_app_slots).
+_LIVE_APP_SLOTS_API = (
+    "live_apps_enabled",
+    "live_app_slot_addresses",
+    "SlotStatus",
+    "LiveAppLauncher",
+    "LAUNCH_FILES",
+    "LAUNCH_DIRS",
+    "MAX_LAUNCH_FILES",
+    "MAX_LAUNCH_FILE_BYTES",
+    "MAX_LAUNCH_TOTAL_BYTES",
+)
+
+
+def live_apps_on() -> bool:
+    """Whether live apps run in app slots outside this server: anton's own
+    reading of ANTON_LIVE_APP_SLOTS. An anton without the slots reads as off,
+    and that means the variable is unset: check_startup refuses it on such an
+    anton (_live_apps_gap)."""
+    try:
+        from anton.core.artifacts.live_app_slots import live_apps_enabled
+    except ImportError:
+        return False
+    return live_apps_enabled()
+
+
 def refuse_a_missing_policy(cell_sandbox: CellSandbox | None, *, site: str) -> None:
     """Raise RuntimeError when the sandbox is on and ``cell_sandbox`` is None.
 
@@ -605,6 +639,73 @@ def _policy_model_gap() -> str | None:
     return None
 
 
+def _live_apps_gap() -> str | None:
+    """What the installed anton lacks of the live-app slots this server hands
+    its people's launches to, or None when it has all of it."""
+    try:
+        from anton.core.artifacts import live_app_slots
+    except ImportError:
+        return "has no anton.core.artifacts.live_app_slots"
+    missing = [name for name in _LIVE_APP_SLOTS_API if not hasattr(live_app_slots, name)]
+    if missing:
+        return f"has a live_app_slots without {', '.join(missing)}"
+    from anton.core.session import ChatSessionConfig
+
+    if "live_app_host" not in inspect.signature(ChatSessionConfig).parameters:
+        return "has a ChatSessionConfig that takes no live_app_host"
+    return None
+
+
+def _check_live_apps_startup(settings: AppSettings) -> None:
+    """Raise RuntimeError, naming what to change, where ANTON_LIVE_APP_SLOTS
+    is set and live apps can't keep each app to the person who launched it."""
+    if not os.environ.get(LIVE_APP_SLOTS_VARIABLE, "").strip():
+        return
+    if settings.code_sandbox != "landlock":
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_CODE_SANDBOX=landlock. Live apps run "
+            "outside this server only for an agent whose code is locked to its person's "
+            "space; leave the sandbox on and add the live-apps overlay beside it."
+        )
+    if not settings.trust_identity_headers:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_TRUST_IDENTITY_HEADERS. Only the person "
+            "who launched an app may open it, and without identity headers this server "
+            "knows no person."
+        )
+    if PersonalResource.PROJECTS not in settings.personal_resources:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs projects in COWORK_PERSONAL_RESOURCES. In a "
+            "shared project every member's agent can rewrite an app's backend, which then "
+            "runs with the connections of whoever launches it next."
+        )
+    gap = _live_apps_gap()
+    if gap is not None:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs an anton with live-app slots. The installed "
+            f"anton {gap}. Install the anton this cowork-server pins."
+        )
+    from anton.core.artifacts.live_app_slots import live_app_slot_addresses
+
+    try:
+        live_app_slot_addresses()
+    except ValueError as error:
+        raise RuntimeError(f"{LIVE_APP_SLOTS_VARIABLE} doesn't parse: {error}") from error
+    if not settings.live_apps_viewer_login_url.strip():
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_VIEWER_LOGIN_URL, the viewer "
+            "sign-in that tells this server who opens an app, for example "
+            "http://viewer-login:4180."
+        )
+    token = settings.live_apps_launch_token.get_secret_value()
+    if len(token) < MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_LAUNCH_TOKEN of at least "
+            f"{MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH} characters, the token every app slot "
+            "checks before it takes a launch."
+        )
+
+
 #: cowork-home's own files and folders the server reads and writes at fixed
 #: names: its settings (.env), the encryption key, every answer stream, the
 #: turns' scratch folders and the self-test's, and the shared registries.
@@ -631,7 +732,8 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
     what a shared project leaves shared.
 
     Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
-    headers with the sandbox off; and with ``landlock``, org tenancy, remote
+    headers with the sandbox off; live apps without what keeps each app to
+    its launcher (_check_live_apps_startup); and with ``landlock``, org tenancy, remote
     turns, an anton without the launcher or whose policy model refuses this
     server's policy, a kernel below the Landlock floor, a link at one of
     cowork-home's own entries (_COWORK_HOME_ENTRIES), or a self-test that
@@ -645,6 +747,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "space. Set COWORK_CODE_SANDBOX=landlock on a Linux host with Landlock "
             "(kernel 6.2 or later)."
         )
+    _check_live_apps_startup(settings)
     if settings.code_sandbox != "landlock":
         return
     if settings.tenancy_mode == "org":

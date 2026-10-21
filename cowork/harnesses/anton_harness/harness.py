@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timezone
 from functools import partial
 import inspect
 import os
@@ -16,6 +17,7 @@ from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.code_sandbox import (
     build_cell_sandbox,
     code_sandbox_on,
+    live_apps_on,
     refuse_a_linked_project,
     refuse_planted_links,
     shared_files_dir,
@@ -54,6 +56,12 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.conversations import read_earlier_answers
+from cowork.services.live_apps import (
+    TurnLiveApps,
+    current_live_app_launcher,
+    live_app_host_for_turn,
+    turn_live_apps,
+)
 from cowork.services.projects import display_label
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import link_turn_skills, reads_shared_skills
@@ -641,6 +649,44 @@ _SANDBOXED_BACKENDS_RULE = (
     "App backends are off on this deployment because your code runs in a sandbox, so never "
     "build a full-stack artifact or call `launch_backend`; build static artifacts instead."
 )
+
+# What the agent hears about long-running services with live apps on
+# (cowork.code_sandbox.live_apps_on): a full-stack artifact runs as a live app
+# in an app slot outside this server, which anton launches.
+_LIVE_APPS_RULE = (
+    "Live apps are on: a full-stack artifact runs as a live app in an app slot outside this server, "
+    "at its own address, and only the person who launched it can open it. Build the full-stack "
+    "artifact and start it with `launch_backend`; the person approves its first launch, and each "
+    "relaunch after its backend, its requirements or its connections change. Give the address from "
+    "the launch result as visible text in backticks, never a `127.0.0.1` or `localhost:<port>` "
+    "address. When a launch names a connection that is missing or not approved, ask the person to "
+    "add it or rename theirs to match, or their operator to approve it. When a launch is refused "
+    "because every app slot is taken, tell the person who holds each slot and since when, and that "
+    "they can wait or ask their operator for more slots. Before the first launch of an app someone "
+    "shared with the person, read its `backend.py` and tell the person what it reads and what it "
+    "writes. When the relay refuses a call that writes, say the connection is approved for reads "
+    "only, and that the operator can approve it for writes. "
+)
+
+
+def _live_apps_rule(apps: TurnLiveApps | None) -> str:
+    """_LIVE_APPS_RULE, then the turn's own live apps: the copies in its
+    project, the person's running apps, and each stop they haven't heard of."""
+    rule = _LIVE_APPS_RULE
+    if apps is None:
+        return rule
+    if apps.received:
+        copies = "; ".join(f"`{app.slug}`, from {app.owner_email}" for app in apps.received)
+        rule += f"Apps someone shared with the person, copied into this project: {copies}. "
+    for app in apps.running:
+        rule += f"The person's live app `{app.slug}` is running at `{app.address}`. "
+    for app in apps.stopped:
+        stopped_at = (app.stopped_at or app.started_at).astimezone(timezone.utc).strftime("%H:%M")
+        rule += (
+            f"The person's live app `{app.slug}` stopped at {stopped_at} UTC since their last "
+            f"message: {app.stop_text}. Tell them once, and offer to relaunch it. "
+        )
+    return rule
 
 
 def _units_scope() -> TenantScope:
@@ -1429,7 +1475,21 @@ class AntonHarness:
         ordered_messages = history.messages
 
         # App backends are refused under the code sandbox (`sandboxed`), so
-        # the agent is never told to build one.
+        # the agent is never told to build one, unless live apps run them in
+        # app slots outside this server.
+        live_apps = live_apps_on()
+        launcher = current_live_app_launcher() if live_apps else None
+        turn_apps = (
+            await turn_live_apps(launcher, project_id=conversation.project.id)
+            if launcher is not None
+            else None
+        )
+        if live_apps:
+            backends_rule = _live_apps_rule(turn_apps)
+        elif sandboxed:
+            backends_rule = _SANDBOXED_BACKENDS_RULE
+        else:
+            backends_rule = "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
@@ -1447,11 +1507,7 @@ class AntonHarness:
             # (close_session_scratchpads), with their whole process group.
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
-            + (
-                _SANDBOXED_BACKENDS_RULE
-                if sandboxed
-                else "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
-            )
+            + backends_rule
             + attachment_context
         )
         output_context = (
@@ -1462,7 +1518,7 @@ class AntonHarness:
             # (which conversation, which turns) is tracked server-side
             # and stamped into each folder's metadata.json + README.md
             # automatically.
-            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
+            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed and not live_apps else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
@@ -1704,6 +1760,9 @@ class AntonHarness:
             cell_sandbox = await asyncio.to_thread(
                 build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
             )
+            # None with live apps off, or for a turn that names nobody with an
+            # email, and then not passed at all.
+            live_app_host = live_app_host_for_turn(project_id=conversation.project.id)
 
             deployment = identity_for_turn()
             deployment_kwargs = {} if deployment is None else {
@@ -1800,6 +1859,9 @@ class AntonHarness:
                 # refuses the sandbox on an anton without the field, and a
                 # dropped policy would run every cell unlocked.
                 **({"cell_sandbox": cell_sandbox} if cell_sandbox is not None else {}),
+                # Passed directly as well: create_app refuses live apps on an
+                # anton whose ChatSessionConfig takes no live_app_host.
+                **({"live_app_host": live_app_host} if live_app_host is not None else {}),
                 cells=cells
             )
             # Not `ChatSession(config)` directly: every construction of anton's

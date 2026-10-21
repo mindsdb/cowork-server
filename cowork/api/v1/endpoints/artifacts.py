@@ -14,6 +14,7 @@ import secrets
 import stat as stat_module
 import subprocess
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
@@ -47,6 +48,7 @@ from cowork.api.v1.artifact_scope import (
 )
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
+from cowork.schemas.live_apps import LiveAppDuplicateRequest, LiveAppShareRequest
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
     artifacts_sources_for_scan,
@@ -184,7 +186,32 @@ def _artifact_cards(session, sources) -> list[dict]:
             card["capabilities"] = artifact_capabilities(
                 session, source, slug, resolution=resolutions[slug]
             )
+    _mark_received_live_apps(session, cards_by_base, by_base, cards)
     return cards
+
+
+def _mark_received_live_apps(session, cards_by_base, by_base, cards: list[dict]) -> None:
+    """With live apps on, give each card ``receivedFrom``: the owner's email
+    for a copy the caller duplicated from a share, from the server's own
+    record of the copy (cowork.services.live_apps.received_from), else None."""
+    from cowork.code_sandbox import live_apps_on
+
+    scope = getattr(session, "scope", None)
+    if not live_apps_on() or scope is None or not scope.personal:
+        return
+    from cowork.services.live_apps import received_from
+
+    received = received_from(session, partition_id=scope.org_id)
+    for card in cards:
+        card["receivedFrom"] = None
+    for base, entries in cards_by_base.items():
+        project_id = by_base[base].project_id
+        if not project_id:
+            continue
+        for slug, card in entries:
+            owner_email = received.get((UUID(str(project_id)), slug))
+            if owner_email:
+                card["receivedFrom"] = {"email": owner_email}
 
 
 def _scoped_project_sources(session, project_id: UUID | str):
@@ -1169,3 +1196,203 @@ def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
+
+
+# ── live apps: share and duplicate ──────────────────────────────────────────
+# Only with live apps on (cowork.code_sandbox.live_apps_on), which create_app
+# allows only on a trusted-identity deployment with personal projects; 404
+# everywhere else.
+
+_SHARE_ONE_WAY = "Choose one address, or everyone on this stack."
+_NOT_AN_EMAIL = "Enter a valid email address."
+_OWN_ADDRESS = "That's your own address."
+_NOT_A_LIVE_APP = "Only full-stack apps can be shared this way."
+_NO_SUCH_ARTIFACT = "No artifact by that name in this project."
+_NOT_CONFIRMED = "Confirm the disclaimer first."
+_NO_LONGER_SHARED = "This app is no longer shared with you."
+_NO_SUCH_PROJECT = "No project by that id."
+
+
+def _live_app_caller(principal: Principal | None):
+    """The caller of a live-app route: 404 with live apps off, 401 for a
+    caller with no verified email, which can neither share nor be shared with."""
+    from cowork.code_sandbox import live_apps_on
+    from cowork.services.live_apps import live_app_person
+
+    if not live_apps_on():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    person = live_app_person(principal)
+    if person is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return person
+
+
+def _project_dir(session: ScopedSession, *, project_id: UUID) -> Path | None:
+    """Project ``project_id``'s folder in the session's own scope, or None."""
+    from cowork.services.projects import ProjectNotFoundError
+
+    try:
+        return Path(ProjectService(session).get_project(project_id).path)
+    except ProjectNotFoundError:
+        return None
+
+
+@router.post("/live-app-share", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def share_live_app(
+    body: LiveAppShareRequest, principal: Principal | None = Depends(get_principal)
+) -> dict:
+    """Share one of the caller's full-stack apps with one colleague's address,
+    or with everyone on the stack. Sharing it the same way again returns the
+    same share."""
+    from cowork.db.scoped import SYSTEM_SCOPE, scope_from_principal
+    from cowork.db.units import run_db
+    from cowork.schemas.live_apps import LiveAppShareResponse
+    from cowork.services.live_apps import (
+        LiveAppCopyRefused,
+        LiveAppGone,
+        NotALiveApp,
+        is_email,
+        normalized_email,
+        read_app_metadata,
+        record_share,
+    )
+
+    owner = _live_app_caller(principal)
+    if (body.email is None) == (not body.everyone):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_SHARE_ONE_WAY)
+    recipient_email = None
+    if body.email is not None:
+        recipient_email = normalized_email(body.email)
+        if not is_email(recipient_email):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_NOT_AN_EMAIL)
+        if recipient_email == owner.email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_OWN_ADDRESS)
+    project_dir = await run_db(
+        partial(_project_dir, project_id=body.project_id), scope=scope_from_principal(principal)
+    )
+    if project_dir is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_PROJECT)
+    try:
+        await run_in_threadpool(read_app_metadata, project_dir, body.slug)
+    except LiveAppGone:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_ARTIFACT) from None
+    except NotALiveApp:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_NOT_A_LIVE_APP) from None
+    except LiveAppCopyRefused as refusal:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(refusal)) from None
+    share = await run_db(
+        partial(
+            record_share,
+            owner=owner,
+            project_id=body.project_id,
+            slug=body.slug,
+            recipient_email=recipient_email,
+        ),
+        scope=SYSTEM_SCOPE,
+    )
+    return LiveAppShareResponse(
+        share_id=share.share_id,
+        slug=share.slug,
+        email=share.recipient_email,
+        everyone=share.recipient_email is None,
+        shared_at=share.shared_at,
+    ).model_dump(by_alias=True, mode="json")
+
+
+@router.get("/shared-live-apps", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def shared_live_apps(principal: Principal | None = Depends(get_principal)) -> list[dict]:
+    """The apps other people shared with the caller's address or with
+    everyone, newest first, each once. An app whose owner deleted it, or whose
+    folder no longer holds a full-stack app, drops out."""
+    from cowork.db.scoped import SYSTEM_SCOPE, scope_for_identity
+    from cowork.db.units import run_db
+    from cowork.schemas.live_apps import SharedLiveAppResponse
+    from cowork.services.live_apps import (
+        LiveAppCopyRefused,
+        LiveAppGone,
+        read_app_metadata,
+        shared_text,
+        shares_with,
+    )
+
+    recipient = _live_app_caller(principal)
+    shares = await run_db(partial(shares_with, recipient=recipient), scope=SYSTEM_SCOPE)
+    listed = []
+    for share in shares:
+        owner_scope = scope_for_identity(org_id=share.owner_partition_id, user_id=share.owner_user_id)
+        project_dir = await run_db(partial(_project_dir, project_id=share.project_id), scope=owner_scope)
+        if project_dir is None:
+            continue
+        try:
+            metadata = await run_in_threadpool(read_app_metadata, project_dir, share.slug)
+        except (LiveAppGone, LiveAppCopyRefused):
+            continue
+        listed.append(
+            SharedLiveAppResponse(
+                share_id=share.share_id,
+                slug=share.slug,
+                name=shared_text(metadata.name) or share.slug,
+                description=shared_text(metadata.description),
+                owner_email=share.owner_email,
+                everyone=share.everyone,
+                shared_at=share.shared_at,
+            ).model_dump(by_alias=True, mode="json")
+        )
+    return listed
+
+
+@router.post("/live-app-duplicate", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def duplicate_live_app(
+    body: LiveAppDuplicateRequest,
+    session: ScopedSession = Depends(get_scoped_session),
+    principal: Principal | None = Depends(get_principal),
+) -> dict:
+    """Copy an app someone shared with the caller into a project of the
+    caller's own, after the caller confirmed the disclaimer, and answer the
+    copy's card. Each call makes a new copy."""
+    from cowork.db.scoped import SYSTEM_SCOPE, scope_for_identity
+    from cowork.db.units import run_db
+    from cowork.services.artifact_ownership import record_artifact_owner
+    from cowork.services.live_apps import (
+        LiveAppCopyRefused,
+        LiveAppGone,
+        read_shared_app,
+        record_copy,
+        share_for_recipient,
+        write_app_copy,
+    )
+
+    recipient = _live_app_caller(principal)
+    if not body.confirmed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_NOT_CONFIRMED)
+    share = await run_db(
+        partial(share_for_recipient, share_id=body.share_id, recipient=recipient), scope=SYSTEM_SCOPE
+    )
+    if share is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED)
+    owner_scope = scope_for_identity(org_id=share.owner_partition_id, user_id=share.owner_user_id)
+    owner_dir = await run_db(partial(_project_dir, project_id=share.project_id), scope=owner_scope)
+    if owner_dir is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED)
+    target_dir = await run_in_threadpool(_project_dir, session, project_id=body.project_id)
+    if target_dir is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_PROJECT)
+    try:
+        app = await run_in_threadpool(read_shared_app, owner_dir, share.slug)
+    except LiveAppGone:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED) from None
+    except LiveAppCopyRefused as refusal:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(refusal)) from None
+    slug = await run_in_threadpool(write_app_copy, target_dir, app)
+    await run_db(
+        partial(record_copy, recipient=recipient, project_id=body.project_id, slug=slug, share=share),
+        scope=SYSTEM_SCOPE,
+    )
+    await run_in_threadpool(
+        record_artifact_owner, session, body.project_id, slug, recipient.user_id, action="live_app_duplicate"
+    )
+    cards = await run_in_threadpool(_scoped_project_cards, session, str(body.project_id))
+    card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)
+    if card is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The copy has no card")
+    return card

@@ -1,0 +1,65 @@
+"""Request and response bodies of the live-app share routes (cowork.api.v1.endpoints.artifacts)."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+from uuid import UUID
+
+from pydantic import Field
+
+from cowork.models.live_app import EMAIL_MAX_LENGTH
+from cowork.schemas.base import CamelRequest, CamelResponse
+
+
+class LiveAppShareRequest(CamelRequest):
+    """Share one of the caller's apps with one address, or with everyone."""
+
+    project_id: UUID
+    slug: str = Field(min_length=1, max_length=255)
+    email: str | None = Field(default=None, max_length=EMAIL_MAX_LENGTH)
+    everyone: bool = False
+
+
+class LiveAppShareResponse(CamelResponse):
+    share_id: UUID
+    slug: str
+    # None for a share with everyone.
+    email: str | None
+    everyone: bool
+    shared_at: datetime
+
+
+class SharedLiveAppResponse(CamelResponse):
+    """One app someone shared with the caller, as "Shared with you" lists it."""
+
+    share_id: UUID
+    slug: str
+    name: str
+    description: str
+    owner_email: str
+    everyone: bool
+    shared_at: datetime
+
+
+class LiveAppDuplicateRequest(CamelRequest):
+    share_id: UUID
+    # The caller's own project the copy lands in.
+    project_id: UUID
+    # The caller confirmed the disclaimer: the app was built by its owner, runs
+    # with the caller's connections, and is theirs to review first.
+    confirmed: bool = False
+
+
+class LiveAppStateResponse(CamelResponse):
+    """The latest launch of one of the caller's apps, for its card's state line."""
+
+    project_id: UUID | None
+    slug: str
+    slot: int
+    state: Literal["running", "stopped"]
+    address: str
+    started_at: datetime
+    stopped_at: datetime | None
+    stop_reason: str | None
+    stop_reason_text: str | None
