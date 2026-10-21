@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -724,6 +725,28 @@ class AppSettings(Settings):
                 f"http://127.0.0.1:{self.renderer_port}",
             ]
         return self
+
+    # NoDecode: a bare name or a comma-separated list is the natural thing to
+    # type here, and failing JSON decoding would stop the server from booting.
+    allowed_hosts: Annotated[list[str], NoDecode] = Field(
+        default=[],
+        validation_alias=AliasChoices("COWORK_ALLOWED_HOSTS"),
+        description=(
+            "Extra Host names accepted whenever token auth is off in local "
+            "tenancy (JSON array or comma-separated). localhost, IP addresses and "
+            "the COWORK_PUBLIC_BASE_URL host are always accepted; any other name, "
+            "e.g. a domain, a tunnel or a Docker service name, must be listed here."
+        ),
+    )
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def _split_allowed_hosts(cls, v: object) -> object:
+        if not isinstance(v, str):
+            return v
+        if v.strip().startswith("["):
+            return json.loads(v)
+        return [name.strip() for name in v.split(",") if name.strip()]
 
     require_auth: bool = Field(
         default=False,

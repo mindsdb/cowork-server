@@ -56,7 +56,7 @@ async def test_a_streamed_turn_loads_its_settings_once_off_the_event_loop(monkey
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: gate)
 
     transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         answered = await asyncio.wait_for(
             client.post(
                 "/api/v1/responses/",

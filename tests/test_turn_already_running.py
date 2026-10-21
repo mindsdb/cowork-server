@@ -38,7 +38,7 @@ def _forget_turns():
 
 
 def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://test")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://testserver")
 
 
 def _ask(client: httpx.AsyncClient, conversation_id: str, text: str):
