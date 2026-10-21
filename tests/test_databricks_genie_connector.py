@@ -405,8 +405,15 @@ async def test_an_unchanged_secret_on_edit_keeps_the_stored_secret(genie, no_llm
     await _connect(GENIE_VALUES)
     [first] = _records()
 
+    # The payload the connection panel's edit form sends.
     stream = await _connect(
-        {**GENIE_VALUES, "client_secret": VAULT_KEEP_SENTINEL, "genie_space_id": SPACE_ID},
+        {
+            "workspace_url": HOST,
+            "client_id": CLIENT_ID,
+            "client_secret": VAULT_KEEP_SENTINEL,
+            "genie_space_id": SPACE_ID,
+            "user_label": "",
+        },
         name=first["name"],
     )
 
@@ -417,6 +424,30 @@ async def test_an_unchanged_secret_on_edit_keeps_the_stored_secret(genie, no_llm
     assert record["fields"]["_client_secret"] == SECRET
     assert record["fields"]["genie_space_id"] == SPACE_ID
     assert VAULT_KEEP_SENTINEL not in json.dumps(record)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"workspace_url": "dbc-0123abcd-ef45.cloud.databricks.com"},
+        {"client_id": "a-different-principal"},
+    ],
+    ids=["another-workspace", "another-client"],
+)
+async def test_a_kept_secret_is_not_reused_for_another_workspace_or_client(genie, no_llm_probe, changed):
+    await _connect(GENIE_VALUES)
+    [first] = _records()
+    mints_before = list(genie.mints)
+
+    stream = await _connect(
+        {**GENIE_VALUES, "client_secret": VAULT_KEEP_SENTINEL, "user_label": "", **changed},
+        name=first["name"],
+    )
+
+    assert databricks_genie.SECRET_NEEDED in _text(stream)
+    assert _outcome(stream)["_is_success"] is False
+    assert genie.mints == mints_before
+    assert _records() == [first]
 
 
 async def test_an_unchanged_secret_with_nothing_stored_asks_for_the_secret(genie, no_llm_probe):

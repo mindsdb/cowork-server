@@ -205,7 +205,9 @@ def stored_secret_reader(
     named ``name``, else the one ``name_from`` derives from ``client_id`` and
     the canonical host. A record the caller can't change, such as one shared
     with them, raises GenieConnectionError with the shared refusal, so its
-    secret is never used. Reads the vault; writes nothing.
+    secret is never used. The secret is returned only when the record's
+    ``workspace_url`` and ``client_id`` equal the submitted ones, else None.
+    Reads the vault; writes nothing.
     """
 
     def _read(host: str) -> str | None:
@@ -217,7 +219,11 @@ def stored_secret_reader(
             return None
         if not can_change(slug):
             raise GenieConnectionError(SHARED_CONNECTION_REFUSAL)
-        value = (record.get("fields") or {}).get(SECRET_FIELD)
+        fields = record.get("fields") or {}
+        # A kept secret must not be sent to a different workspace or as another principal.
+        if fields.get("workspace_url") != host or fields.get("client_id") != client_id:
+            return None
+        value = fields.get(SECRET_FIELD)
         return value if isinstance(value, str) else None
 
     return _read
