@@ -468,33 +468,6 @@ async def test_a_connector_probe_dump_after_a_stopped_cell_makes_no_cell(monkeyp
     assert extract_scratchpad_cells([*stopped, *probe]) == []
 
 
-def test_the_probes_copy_of_scratchpad_action_reads_calls_as_anton_does():
-    """The connector probe keeps a copy of anton's scratchpad_action until
-    the anton-agent floor reaches a release that exports it. Once the
-    installed anton exports it, the copy reads every call as anton does."""
-    from anton.core.utils import scratchpad
-
-    from cowork.services.connectors.probe import _scratchpad_action
-
-    if not hasattr(scratchpad, "scratchpad_action"):
-        pytest.skip("the installed anton-agent has no scratchpad_action to compare with")
-    calls = [
-        {"action": "exec", "code": "x = 1"},
-        {"code": "x = 1"},
-        {"action": "", "code": "x = 1"},
-        {"action": None, "code": "x = 1"},
-        {"action": "view"},
-        {"action": "dump", "code": "x = 1"},
-        {"action": "install", "packages": ["pandas"]},
-        {"packages": ["pandas"]},
-        {"code": ""},
-        {"action": 3},
-        {},
-    ]
-    for call in calls:
-        assert _scratchpad_action(call) == scratchpad.scratchpad_action(call), call
-
-
 def test_each_result_pairs_with_the_call_of_its_own_id():
     """The model can send several calls at once, so every end event comes
     before the first result. Each result makes its own cell, and one cut

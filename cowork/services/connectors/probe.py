@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
+from anton.core.utils.scratchpad import scratchpad_action
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
@@ -81,25 +82,6 @@ def _credential_env(credentials: Mapping[str, Any]) -> dict[str, str]:
         for key, value in (credentials or {}).items()
         if key
     }
-
-
-def _scratchpad_action(tc_input: Mapping[str, Any]) -> str:
-    """The action anton runs a scratchpad call as.
-
-    A copy of anton.core.utils.scratchpad.scratchpad_action, which owns the
-    rule: anton-agent 2.26.10.19.1, the version uv.lock pins, has no such
-    export. Tools go to the model without strict schemas, so a call can leave
-    out `action`, and anton runs one that carries `code` as an exec. One with
-    neither gets "", which no action matches.
-
-    Replace with `from anton.core.utils.scratchpad import scratchpad_action`
-    in the change that raises the anton-agent floor in pyproject.toml to the
-    release that carries it.
-    """
-    action = tc_input.get("action")
-    if not action and tc_input.get("code"):
-        return "exec"
-    return action if isinstance(action, str) else ""
 
 
 @dataclass(frozen=True)
@@ -697,7 +679,7 @@ class CredentialProbe:
                                 parsed = _json.loads(raw or "{}")
                             except Exception:
                                 parsed = {}
-                            if _scratchpad_action(parsed) == "exec":
+                            if scratchpad_action(parsed) == "exec":
                                 yield ("scratchpad", {
                                     "action": "end",
                                     "name": parsed.get("name", ""),
