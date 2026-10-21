@@ -267,4 +267,22 @@ def test_a_local_failure_stays_a_plain_runtime_error(tmp_path, monkeypatch):
 
 def test_clip_keeps_short_text_and_the_end_of_long_text():
     assert publish._clip("a" * 500) == "a" * 500
-    assert publish._clip("H" * 100 + "M" + "T" * 400) == "H" * 100 + " … " + "T" * 400
+    # Up to the clipped length itself, clipping would only lose text.
+    assert publish._clip("a" * 503) == "a" * 503
+    assert publish._clip("H" * 100 + "M" * 4 + "T" * 400) == "H" * 100 + " … " + "T" * 400
+
+
+def test_a_connection_failure_without_an_http_answer_is_shown_to_the_user(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, urllib.error.URLError(ConnectionRefusedError()))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value).startswith("Publishing failed. Connection failed")
+
+
+def test_an_api_gateway_refusal_shows_its_message(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(429, {"message": "Too Many Requests"}, "Too Many Requests"),
+    )
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: Too Many Requests"

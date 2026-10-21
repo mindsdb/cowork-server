@@ -23,7 +23,7 @@ from uuid import UUID
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
-from cowork.services.publish import PublishOwnedByOtherUser, PublishTooLarge, publish_artifact
+from cowork.services.publish import PublishOwnedByOtherUser, PublishRejected, PublishTooLarge, publish_artifact
 
 if TYPE_CHECKING:
     from cowork.services.artifact_ownership import OwnerResolution
@@ -375,7 +375,10 @@ async def _publish_one(
         # "next turn retries" promise.
         release(artifacts_base, slug)
         _record("failed", slug=slug, error=type(exc).__name__)
-        logger.warning("artifact autopublish failed for %s", slug, exc_info=True)
+        # publish_artifact has already logged a PublishRejected's traceback.
+        logger.warning(
+            "artifact autopublish failed for %s", slug, exc_info=not isinstance(exc, PublishRejected),
+        )
         return False
     release(artifacts_base, slug)
     _record("published", slug=slug)

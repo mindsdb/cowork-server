@@ -322,6 +322,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         ARTIFACT_TOO_LARGE_MESSAGE,
         OWNED_BY_OTHER_USER_MESSAGE,
         PublishOwnedByOtherUser,
+        PublishRejected,
         PublishTooLarge,
     )
 
@@ -352,8 +353,9 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         # Typed refusals carry their text in `detail`; str(exc) would hand the
         # model "503: {'code': ...}".
         detail = exc.detail
-        message = (detail.get("message") if isinstance(detail, dict) else None) or str(detail)
-        reason = (detail.get("code") if isinstance(detail, dict) else None) or "http_error"
+        info = detail if isinstance(detail, dict) else {}
+        message = info.get("message") or str(detail)
+        reason = info.get("code") or "http_error"
         logger.info("Cowork publish refused: %s", message)
         return _fail(f"PUBLISH FAILED: {message}", reason=reason)
     except ValueError as exc:
@@ -372,6 +374,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             )
         logger.info("Cowork publish rejected: %s", exc)
         return _fail(f"PUBLISH FAILED: {exc}", reason="ValueError")
+    except PublishRejected as exc:
+        # publish_artifact has already logged the traceback.
+        logger.warning("Cowork publish rejected: %s", exc)
+        return _fail(f"PUBLISH FAILED: {exc}", reason="PublishRejected")
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
         return _fail(f"PUBLISH FAILED: {exc}", reason=type(exc).__name__)

@@ -423,17 +423,28 @@ async def test_a_rejected_publish_shows_the_upload_service_text(as_owner, publis
     assert _lock_is_free(as_owner)
 
 
-async def test_a_local_publish_failure_hides_its_text(as_owner, publish_context, monkeypatch):
+@pytest.mark.parametrize("local_error", [
+    RuntimeError("Publishing failed: [Errno 2] No such file: '/data/org-1/proj/x.pdf'"),
+    PermissionError("[Errno 13] Permission denied: '/data/org-1/proj/.published.json'"),
+])
+async def test_a_local_publish_failure_hides_its_text_but_logs_it(
+    as_owner, publish_context, monkeypatch, caplog, local_error,
+):
+    import logging
+
     def fail(*args, **kwargs):
-        raise RuntimeError("Publishing failed: [Errno 2] No such file: '/data/org-1/proj/x.pdf'")
+        raise local_error
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fail)
-    with pytest.raises(HTTPException) as error:
-        await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
-        )
+    with caplog.at_level(logging.WARNING, logger=aw.logger.name):
+        with pytest.raises(HTTPException) as error:
+            await aw.set_artifact_access(
+                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            )
     assert error.value.status_code == 502
     assert error.value.detail == "Publishing failed. Try again in a moment."
+    record = next(r for r in caplog.records if "Could not change access for artifact" in r.getMessage())
+    assert record.exc_info is not None
     assert _lock_is_free(as_owner)
 
 

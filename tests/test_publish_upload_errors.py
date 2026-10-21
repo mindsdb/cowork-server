@@ -127,6 +127,8 @@ def test_an_answer_left_to_the_caller_is_not_logged_here(status, body, caplog):
     ({"other": 1}, ('{"other": 1}', None, None)),
     ({"code": 7, "error": {"nested": True}}, ('{"code": 7, "error": {"nested": true}}', None, None)),
     ([1, 2], ("[1, 2]", None, None)),
+    ({"message": "Too Many Requests"}, ('{"message": "Too Many Requests"}', None, "Too Many Requests")),
+    ({"error": "e", "message": "m"}, ('{"error": "e", "message": "m"}', None, "e")),
     (b"plain text", ("plain text", None, None)),
     (_BrokenBody(), ("", None, None)),
 ])

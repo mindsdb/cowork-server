@@ -877,9 +877,10 @@ async def set_artifact_access(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except PublishRejected as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        # A local failure's text can name shared-storage paths; publish_artifact
-        # has already logged it.
+    except (RuntimeError, OSError) as exc:
+        # A local failure's text can name shared-storage paths, so only the log
+        # gets it. Not every such error passed publish_artifact's own log.
+        logger.warning("Could not change access for artifact %s", artifact_id, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Publishing failed. Try again in a moment.",

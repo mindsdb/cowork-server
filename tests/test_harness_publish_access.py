@@ -345,3 +345,24 @@ async def test_harness_passes_a_typed_refusal_on_without_a_traceback(tmp_path, c
     assert out.reason == reason
     assert json.loads(out.content)["message"] == f"PUBLISH FAILED: {text}"
     assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_harness_reports_a_rejected_publish_without_a_second_traceback(tmp_path, caplog):
+    import logging
+
+    from cowork.services.publish import PublishRejected
+
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=PublishRejected("Publishing failed: This organization is archived."))
+    with caplog.at_level(logging.INFO, logger="cowork.harnesses.anton_harness.tools"):
+        with mock.patch.object(htools, "_publish_artifact", fake):
+            out = await htools._cowork_publish_or_preview(
+                _session(tmp_path),
+                {"file_path": str(f), "action": "publish", "access_mode": "public"},
+            )
+
+    assert out.ok is False
+    assert out.reason == "PublishRejected"
+    assert json.loads(out.content)["message"] == "PUBLISH FAILED: Publishing failed: This organization is archived."
+    assert "Traceback" not in caplog.text

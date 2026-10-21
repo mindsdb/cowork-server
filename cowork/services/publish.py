@@ -156,6 +156,9 @@ def _read_http_error_body(exc: Exception) -> tuple[str, str | None, str | None]:
         return body, None, None
     code = payload.get("code")
     error = payload.get("error")
+    if not isinstance(error, str):
+        # API Gateway's own refusals (429, a missing route) carry their text here.
+        error = payload.get("message")
     return (
         body,
         code if isinstance(code, str) else None,
@@ -196,11 +199,16 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     raise typed from exc
 
 
+_CLIP_HEAD = 100
+_CLIP_TAIL = 400
+_CLIP_GAP = " … "
+
+
 def _clip(text: str) -> str:
     """Server text short enough to show, keeping the end where pip names the cause."""
-    if len(text) <= 500:
+    if len(text) <= _CLIP_HEAD + len(_CLIP_GAP) + _CLIP_TAIL:
         return text
-    return f"{text[:100]} … {text[-400:]}"
+    return f"{text[:_CLIP_HEAD]}{_CLIP_GAP}{text[-_CLIP_TAIL:]}"
 
 
 #: The files the publish store holds: its state, and the temporary file a
