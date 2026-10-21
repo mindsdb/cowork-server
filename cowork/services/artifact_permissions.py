@@ -4,12 +4,20 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 
 from cowork.principal import Principal, can_manage_org
+from cowork.services.artifact_export import ExportSource, export_formats, export_pdf_settings
 
 _OWNER_ONLY = "Only the artifact owner can change this draft"
 _OWNER_UNKNOWN = "Artifact owner is unknown"
 
 
-def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dict:
+def artifact_capabilities(
+    session,
+    source,
+    slug: str,
+    *,
+    resolution=None,
+    export_source: ExportSource | None = None,
+) -> dict:
     """Return the permissions the API will enforce for this artifact.
 
     Desktop is a single-user boundary. In organization mode the owner is a
@@ -18,10 +26,14 @@ def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dic
     recorded attribution (legacy per-conversation roots: the conversation's
     creator). Project visibility grants review, never source mutation. An
     artifact nobody is recorded as owning says so with ``ownerUnknown``.
+
+    With ``export_source``, ``exportFormats`` lists the formats the export
+    route accepts from this caller, from ``export_formats`` alone: none for a
+    caller who can't edit.
     """
     scope = getattr(session, "scope", None)
     if not scope or not scope.org_mode:
-        return {
+        capabilities = {
             "role": "owner",
             "canPreview": True,
             "canComment": True,
@@ -29,22 +41,30 @@ def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dic
             "canAddressWithAgent": True,
             "canResolveComments": True,
         }
-    if resolution is None:
-        from cowork.services.artifact_ownership import resolve_artifact_owner
+    else:
+        if resolution is None:
+            from cowork.services.artifact_ownership import resolve_artifact_owner
 
-        resolution = resolve_artifact_owner(session, source, slug)
-    owner_id = resolution.owner_user_id
-    is_owner = bool(owner_id and scope.user_id and str(owner_id) == str(scope.user_id))
-    capabilities = {
-        "role": "owner" if is_owner else "reviewer",
-        "canPreview": True,
-        "canComment": True,
-        "canEdit": is_owner,
-        "canAddressWithAgent": is_owner,
-        "canResolveComments": is_owner,
-    }
-    if resolution.unknown:
-        capabilities["ownerUnknown"] = True
+            resolution = resolve_artifact_owner(session, source, slug)
+        owner_id = resolution.owner_user_id
+        is_owner = bool(owner_id and scope.user_id and str(owner_id) == str(scope.user_id))
+        capabilities = {
+            "role": "owner" if is_owner else "reviewer",
+            "canPreview": True,
+            "canComment": True,
+            "canEdit": is_owner,
+            "canAddressWithAgent": is_owner,
+            "canResolveComments": is_owner,
+        }
+        if resolution.unknown:
+            capabilities["ownerUnknown"] = True
+    if export_source is not None:
+        capabilities["exportFormats"] = export_formats(
+            source_name=export_source.source_name,
+            is_backend=export_source.is_backend,
+            can_edit=capabilities["canEdit"],
+            pdf=export_pdf_settings(),
+        )
     return capabilities
 
 

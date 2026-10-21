@@ -1,0 +1,168 @@
+"""The export service: what it fetches, and how it admits work.
+
+The no-fetch case runs the whole export in the test's own thread, inside
+``tests._no_fetch.no_fetch()``, with a 127.0.0.1 recording server started
+before the guard opens. It needs no event loop, so it means the same on every
+platform.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import xml.etree.ElementTree as ElementTree
+import zipfile
+from pathlib import Path
+from uuid import uuid4
+
+import anyio
+import docx
+import pytest
+import yaml
+
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.services import artifact_export
+from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot
+from cowork.services.artifacts import ProjectArtifacts
+from test_artifact_export_route import padded_png
+from tests._no_fetch import no_fetch, recording_server
+
+FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
+NO_FETCH_CASES = yaml.safe_load(
+    (FIXTURES / "no_fetch_sources.yaml").read_text(encoding="utf-8")
+)["cases"]
+SENTINEL = b"SENTINEL-OTHER-PARTITION-7f3a"
+_RELATIONSHIPS = "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
+_HYPERLINK = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
+
+
+@pytest.fixture
+def local_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def partitions(tmp_path):
+    """Two people's project folders side by side; the second holds a sentinel."""
+    mine = tmp_path / "partitions" / "a" / "general"
+    theirs = tmp_path / "partitions" / "b" / "general"
+    (mine / ".anton" / "artifacts").mkdir(parents=True)
+    secret = theirs / ".anton" / "artifacts" / "private" / "secret.png"
+    secret.parent.mkdir(parents=True)
+    secret.write_bytes(padded_png(4096, filler=SENTINEL))
+    return mine, secret
+
+
+def _write_report(project: Path, primary: str, source: str) -> tuple[ProjectArtifacts, Path, str]:
+    artifact_id = uuid4().hex
+    folder = project / ".anton" / "artifacts" / "report"
+    folder.mkdir()
+    (folder / primary).write_text(source, encoding="utf-8")
+    (folder / "metadata.json").write_text(
+        json.dumps({"id": artifact_id, "slug": "report", "type": "document", "primary": primary}),
+        encoding="utf-8",
+    )
+    source_root = ProjectArtifacts(
+        base=project / ".anton" / "artifacts",
+        project_id=None,
+        project_name="general",
+        trusted_anchor=project,
+        root_parts=(".anton", "artifacts"),
+    )
+    return source_root, folder, artifact_id
+
+
+@pytest.mark.parametrize("case", NO_FETCH_CASES, ids=[case["id"] for case in NO_FETCH_CASES])
+def test_a_word_export_fetches_nothing_and_takes_nothing_from_another_partition(
+    local_mode, partitions, case
+):
+    mine, secret = partitions
+    with recording_server() as server:
+        folder_path = mine / ".anton" / "artifacts" / "report"
+        source_text = (
+            case["source"]
+            .replace("{recording}", server.url)
+            .replace("{other_relative}", os.path.relpath(secret, folder_path).replace(os.sep, "/"))
+            .replace("{other_absolute}", secret.as_posix())
+        )
+        source, folder, artifact_id = _write_report(mine, case["primary"], source_text)
+
+        with no_fetch() as recorder:
+            result = artifact_export.export_primary_file(
+                source=source,
+                folder_name=folder.name,
+                metadata=json.loads((folder / "metadata.json").read_text()),
+                artifact_id=artifact_id,
+                export_format="docx",
+                can_edit=True,
+            )
+
+        assert recorder.calls == []
+        assert server.hits() == []
+
+    assert result.omitted_count > 0
+    written = (folder / result.filename).read_bytes()
+    docx.Document(io.BytesIO(written))
+    with zipfile.ZipFile(io.BytesIO(written)) as package:
+        for name in package.namelist():
+            assert SENTINEL not in package.read(name), name
+        relationships = ElementTree.fromstring(package.read("word/_rels/document.xml.rels"))
+    external = [
+        rel.attrib for rel in relationships.iter(_RELATIONSHIPS) if rel.get("TargetMode") == "External"
+    ]
+    assert external, "the document's own link should stay a hyperlink"
+    assert all(rel["Type"] == _HYPERLINK for rel in external), external
+    assert {rel["Target"] for rel in external} == {"https://example.com/report"}
+
+
+# ── admission ────────────────────────────────────────────────────────────────
+
+
+def _org_scope(org_id: str, user_id: str) -> TenantScope:
+    return TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
+
+
+async def test_one_export_per_user_and_per_org(monkeypatch):
+    """With room for more conversions, the user and the org still hold one
+    export each, and anyone else is admitted."""
+    monkeypatch.setattr(artifact_export, "_conversion_limiter", anyio.CapacityLimiter(3))
+    alice = _org_scope("org-1", "alice")
+
+    async with export_slot(scope=alice):
+        for other in (alice, _org_scope("org-1", "bob"), _org_scope("org-2", "alice")):
+            with pytest.raises(ExportRefused) as busy:
+                async with export_slot(scope=other):
+                    pass
+            assert busy.value.refusal is ExportRefusal.BUSY
+        async with export_slot(scope=_org_scope("org-2", "carol")):
+            pass
+
+    async with export_slot(scope=alice):
+        pass
+
+
+async def test_html_and_word_export_run_one_conversion_at_a_time():
+    async with export_slot(scope=_org_scope("org-1", "alice")):
+        for other in (_org_scope("org-2", "bob"), LOCAL_SCOPE, None):
+            with pytest.raises(ExportRefused) as busy:
+                async with export_slot(scope=other):
+                    pass
+            assert busy.value.refusal is ExportRefusal.BUSY
+
+    async with export_slot(scope=LOCAL_SCOPE):
+        pass
+
+
+async def test_a_failed_export_frees_its_slot():
+    alice = _org_scope("org-1", "alice")
+
+    with pytest.raises(RuntimeError):
+        async with export_slot(scope=alice):
+            raise RuntimeError("conversion failed")
+
+    async with export_slot(scope=alice):
+        pass

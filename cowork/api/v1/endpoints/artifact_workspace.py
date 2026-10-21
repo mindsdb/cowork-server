@@ -38,6 +38,14 @@ from cowork.services.artifact_permissions import (
 )
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
+from cowork.schemas.artifact_export import ExportRequest, ExportResult
+from cowork.services.artifact_export import (
+    ExportRefusal,
+    ExportRefused,
+    export_primary_file,
+    export_slot,
+    primary_export_source,
+)
 from cowork.services.artifact_revisions import (
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
@@ -589,12 +597,16 @@ async def _current_capabilities(session, capabilities: dict) -> dict:
         return capabilities
     can_edit = await has_product_permission(session.scope, "artifact.manage")
     can_execute = await has_product_permission(session.scope, "product.execute")
-    return {
+    current = {
         **capabilities,
         "canEdit": can_edit,
         "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
         "canResolveComments": capabilities["canResolveComments"] and can_edit,
     }
+    # The export route needs `artifact.manage` too, so it offers nothing here.
+    if not can_edit and "exportFormats" in capabilities:
+        current["exportFormats"] = []
+    return current
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}")
@@ -606,8 +618,13 @@ async def artifact_source(
     session: ScopedSession = Depends(get_scoped_session),
     path: str | None = Query(default=None, max_length=1000),
 ):
-    """Authenticated source + revision token for Desktop and Cowork SaaS."""
-    source, folder, metadata, capabilities = _owner_workspace(
+    """Authenticated source + revision token for Desktop and Cowork SaaS.
+
+    ``_owner_workspace`` is the owner gate. The capabilities this answers also
+    carry ``exportFormats``, which read the artifact's primary file, so they
+    are built once the folder is resolved.
+    """
+    source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     selected = await run_in_threadpool(_editable_source_selector, source, folder, path)
@@ -620,7 +637,13 @@ async def artifact_source(
             current_workspace, folder, metadata, artifact_id, selected
         )
         repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
-        capabilities = await _current_capabilities(session, capabilities)
+        export_source = await run_in_threadpool(
+            primary_export_source, folder=folder, metadata=metadata
+        )
+        capabilities = await _current_capabilities(
+            session,
+            artifact_capabilities(session, source, folder.name, export_source=export_source),
+        )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -672,6 +695,58 @@ async def update_artifact_source(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+_EXPORT_REFUSAL_STATUS = {
+    ExportRefusal.NOT_OFFERED: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    ExportRefusal.TOO_LARGE: status.HTTP_413_CONTENT_TOO_LARGE,
+    ExportRefusal.NOT_FOUND: status.HTTP_404_NOT_FOUND,
+    ExportRefusal.BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
+}
+
+
+@router.post("/workspace/{project_ref}/{artifact_id}/export")
+async def export_workspace_artifact(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: ExportRequest,
+    session: ScopedSessionDep,
+) -> ExportResult:
+    """Export the artifact's primary file as a new HTML or Word file beside it.
+
+    One route for every tenancy, checked the way a source edit is: the caller
+    needs ``artifact.manage`` and must own the artifact, and both checks run
+    before the format is read, so a caller who may not export gets 403 or 404
+    whatever they ask for. A busy server answers 429 at once. The conversion
+    runs in a worker thread, and only a 200 leaves a file behind.
+    """
+    await require_product_permission(session.scope, "artifact.manage")
+    source, folder, metadata, capabilities = _owner_workspace(
+        session, project_ref, artifact_id
+    )
+    folder_name = _artifact_folder_component(source, folder)
+    try:
+        async with export_slot(scope=session.scope):
+            return await run_in_threadpool(
+                export_primary_file,
+                source=source,
+                folder_name=folder_name,
+                metadata=metadata,
+                artifact_id=artifact_id,
+                export_format=body.format,
+                can_edit=bool(capabilities.get("canEdit")),
+            )
+    except ExportRefused as exc:
+        raise HTTPException(
+            status_code=_EXPORT_REFUSAL_STATUS[exc.refusal], detail=str(exc)
+        ) from exc
+    except Exception as exc:
+        logger.warning(
+            "Artifact export to %s failed for %s", body.format, artifact_id, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Export failed"
+        ) from exc
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions")
