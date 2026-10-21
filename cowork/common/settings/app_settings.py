@@ -554,10 +554,11 @@ class TurnQueueSettings(Settings):
         default=600.0,
         description=(
             "Fail a remote turn after this many seconds with no reply for it on the reply "
-            "stream (worker down, crashed, or wedged). scratchpad-controller relays a busy "
-            "pod's heartbeat as a `worker_alive` progress reply once a minute "
-            "(LIVENESS_RELAY_SECONDS), which counts as a reply here, so a long tool run or "
-            "an open ask_user question no longer goes quiet; keep this well above that "
+            "stream (worker down, crashed, or wedged). A scratchpad-controller that relays "
+            "liveness sends a busy pod's heartbeat as a `worker_alive` progress reply once a "
+            "minute (its SCRATCHPAD_CONTROLLER__LIVENESS_RELAY_SECONDS), which counts as a "
+            "reply here and reaches the UI as a model_wait frame, so a long tool run or an "
+            "open ask_user question no longer goes quiet; keep this well above that "
             "interval. A controller too old to relay sends nothing during either, so until "
             "every controller does, keep this above the longest quiet step and above the "
             "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s). <= 0 "
