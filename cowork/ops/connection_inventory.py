@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal
@@ -32,7 +32,7 @@ from cowork.common.paths import (
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE
-from cowork.managed import MAX_REGISTRY_BYTES, SharedConnections, managed_folder
+from cowork.managed import MAX_REGISTRY_BYTES, SharedConnection, SharedConnections, managed_folder
 from cowork.ops import OperatorCommandError, Person, require_trusted_identity
 from cowork.services.connectors.persist import own_vault_root
 
@@ -48,6 +48,17 @@ class RecordMetadata(BaseModel):
     fields: dict[str, object] = Field(exclude=True, repr=False)
 
 
+class ConnectionName(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    engine: str
+    name: str
+
+    @property
+    def prefix(self) -> str:
+        return _slug_env_prefix(self.engine, self.name)
+
+
 class ConnectionInventoryRow(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -57,6 +68,7 @@ class ConnectionInventoryRow(BaseModel):
     user_id: str | None = None
     partition_id: str | None = None
     visibility: Literal["private", "shared", "inactive", "stale"]
+    shared_as: tuple[ConnectionName, ...] = ()
     notes: tuple[str, ...] = ()
 
     @property
@@ -69,6 +81,12 @@ class ConnectionInventory(BaseModel):
 
     personal_connections: bool
     connections: tuple[ConnectionInventoryRow, ...]
+
+
+def _vault_filename(engine: str, name: str) -> str:
+    # Runtime reads resolve registry names through this same filename helper.
+    # Different names (sales.db and sales_db) can reach one stored record.
+    return LocalDataVault(Path("."))._path_for(engine, name).name
 
 
 def _read(d: PinnedDir, name: str, *, limit: int) -> bytes:
@@ -101,7 +119,7 @@ def _records(d: PinnedDir) -> list[RecordMetadata]:
             record = RecordMetadata.model_validate_json(raw)
         except ValidationError:
             raise OperatorCommandError("Connection inventory found a malformed vault record.") from None
-        if LocalDataVault(d.path)._path_for(record.engine, record.name).name != name:
+        if _vault_filename(record.engine, record.name) != name:
             raise OperatorCommandError("Connection inventory found a record with a noncanonical filename.")
         records.append(record)
     return records
@@ -189,29 +207,34 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
                 user_id=None if record.creator is None else str(record.creator),
                 visibility="inactive" if origin == "base" and personal else "shared",
             ))
-    shares = {(entry.partition_id, entry.engine, entry.name): entry for entry in registry.root}
+    shares: dict[tuple[str, str], list[SharedConnection]] = defaultdict(list)
+    for entry in registry.root:
+        shares[entry.partition_id, _vault_filename(entry.engine, entry.name)].append(entry)
     stored = set()
     for partition, records in partitions.items():
         for record in records:
-            key = (partition, record.engine, record.name)
+            key = (partition, _vault_filename(record.engine, record.name))
             stored.add(key)
-            share = shares.get(key)
+            registered = shares.get(key, [])
             creator = str(record.creator) if record.creator is not None else None
             notes = ()
-            if share is not None:
-                if creator is not None and creator != share.user_id:
+            if registered:
+                if creator is not None and any(creator != entry.user_id for entry in registered):
                     notes = ("registry-owner-differs-from-creator",)
-                creator = creator or share.user_id
+                creator = creator or registered[0].user_id
+                if any((entry.engine, entry.name) != (record.engine, record.name) for entry in registered):
+                    notes += ("registry-name-alias",)
                 if not personal:
                     notes += ("registered-share-inactive",)
             rows.append(ConnectionInventoryRow(
                 engine=record.engine, name=record.name, origin="personal",
                 user_id=creator, partition_id=partition,
-                visibility=("shared" if share is not None else "private") if personal else "inactive",
+                visibility=("shared" if registered else "private") if personal else "inactive",
+                shared_as=tuple(ConnectionName(engine=entry.engine, name=entry.name) for entry in registered),
                 notes=notes,
             ))
     for entry in registry.root:
-        if (entry.partition_id, entry.engine, entry.name) not in stored:
+        if (entry.partition_id, _vault_filename(entry.engine, entry.name)) not in stored:
             rows.append(ConnectionInventoryRow(
                 engine=entry.engine, name=entry.name, origin="registry",
                 user_id=entry.user_id, partition_id=entry.partition_id,
@@ -222,7 +245,7 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
     counts = Counter((row.origin, row.partition_id, row.prefix) for row in rows if row.origin != "registry")
     first_share = {}
     for entry in registry.root:
-        if (entry.partition_id, entry.engine, entry.name) in stored:
+        if (entry.partition_id, _vault_filename(entry.engine, entry.name)) in stored:
             first_share.setdefault((entry.engine, entry.name), entry.partition_id)
     shared_prefixes = Counter(_slug_env_prefix(engine, name) for engine, name in first_share)
     result = []
@@ -235,9 +258,11 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
                 notes.append("same-vault-prefix-collision")
             if row.origin == "personal" and row.visibility == "shared":
                 notes.append("recipient-own-prefix-takes-priority")
-                if shared_prefixes[row.prefix] > 1:
+                if any(alias.prefix in managed_prefixes and alias.prefix != row.prefix for alias in row.shared_as):
+                    notes.append("shared-alias-hidden-by-managed-prefix")
+                if any(shared_prefixes[alias.prefix] > 1 for alias in row.shared_as):
                     notes.append("shared-prefix-collision-for-other-recipients")
-                if first_share[row.engine, row.name] != row.partition_id:
+                if any(first_share[alias.engine, alias.name] != row.partition_id for alias in row.shared_as):
                     notes.append("earlier-share-takes-priority-for-other-recipients")
         if person is None or row.partition_id in {None, person.partition_id}:
             result.append(row.model_copy(update={"notes": tuple(notes)}))

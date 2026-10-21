@@ -115,6 +115,65 @@ def test_duplicate_shares_report_the_registry_precedence(stack, capsys):
     assert rows[SUB_B]["notes"] == ["recipient-own-prefix-takes-priority", "earlier-share-takes-priority-for-other-recipients"]
 
 
+def test_inventory_matches_a_live_share_by_vault_filename_after_an_alias_update(stack, tmp_path, capsys):
+    _save(ALICE, "sales.db")
+    status, _, err = _run(connections_ops.main, [
+        "share", *_arguments(ALICE), "--name", "sales.db", "--managed-dir", str(stack.root),
+    ], capsys)
+    assert status == 0, err
+    _save(ALICE, "sales_db")
+
+    recipient = vault_for_scope(personal_scope(BOB))
+    assert [(row["engine"], row["name"]) for row in recipient.list_connections()] == [("postgres", "sales.db")]
+    assert recipient.load("postgres", "sales.db")["PASSWORD"] == SECRET
+    before = _tree(tmp_path)
+    rows = _list(capsys)["connections"]
+    assert len(rows) == 1
+    assert (rows[0]["name"], rows[0]["visibility"]) == ("sales_db", "shared")
+    assert rows[0]["shared_as"] == [{"engine": "postgres", "name": "sales.db"}]
+    assert "registry-name-alias" in rows[0]["notes"]
+    assert _tree(tmp_path) == before
+
+    # A genuinely missing canonical file still leaves a stale registry entry.
+    own_vault_for_scope(personal_scope(ALICE)).delete("postgres", "sales_db")
+    assert recipient.read_record("postgres", "sales.db") is None
+    assert [(row["name"], row["visibility"]) for row in _list(capsys)["connections"]] == [("sales.db", "stale")]
+
+
+def test_alias_shares_keep_registry_names_for_precedence_and_prefix_collisions(stack, capsys):
+    _save(ALICE, "sales_db")
+    _save(BOB, "sales_db")
+    # Both aliases reach Alice's one file. Bob's duplicate registry name stays
+    # behind Alice's, while two different aliases share one DS_ prefix.
+    stack.shared_dir.mkdir(exist_ok=True)
+    stack.shared_connections_file.write_text(json.dumps([
+        {"user_id": person.user_id, "partition_id": person.partition_id, "engine": "postgres", "name": name}
+        for person, name in ((ALICE, "sales.db"), (ALICE, "sales/db"), (BOB, "sales.db"))
+    ]))
+    rows = {row["user_id"]: row for row in _list(capsys)["connections"]}
+    assert len(rows) == 2 and all(row["visibility"] == "shared" for row in rows.values())
+    assert rows[SUB_A]["shared_as"] == [
+        {"engine": "postgres", "name": "sales.db"}, {"engine": "postgres", "name": "sales/db"},
+    ]
+    assert all("shared-prefix-collision-for-other-recipients" in row["notes"] for row in rows.values())
+    assert "earlier-share-takes-priority-for-other-recipients" not in rows[SUB_A]["notes"]
+    assert "earlier-share-takes-priority-for-other-recipients" in rows[SUB_B]["notes"]
+
+
+def test_inventory_reports_a_managed_override_of_the_shared_alias_prefix(stack, capsys):
+    _save(ALICE, "sales")
+    LocalDataVault(stack.vault_dir).save("postgres", "sales_", {"PASSWORD": SECRET})
+    stack.shared_dir.mkdir(exist_ok=True)
+    stack.shared_connections_file.write_text(json.dumps([
+        {"user_id": SUB_A, "partition_id": ALICE.partition_id, "engine": "postgres", "name": "sales."},
+    ]))
+    assert [row["name"] for row in vault_for_scope(personal_scope(BOB)).list_connections()] == ["sales_"]
+    [row] = [row for row in _list(capsys)["connections"] if row["origin"] == "personal"]
+    assert row["visibility"] == "shared"
+    assert "hidden-by-managed-prefix" not in row["notes"]
+    assert "shared-alias-hidden-by-managed-prefix" in row["notes"]
+
+
 def test_distinct_shared_names_report_prefix_collisions_across_partitions(stack, capsys):
     entries = [(ALICE, "team-db"), (BOB, "team_db")]
     for person, name in entries:
