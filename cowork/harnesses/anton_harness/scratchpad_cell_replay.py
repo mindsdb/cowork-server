@@ -33,9 +33,10 @@ _CELL_JSON_START = re.compile(r'\{[ \t\n\r]*"code"[ \t\n\r]*:')
 @dataclass(frozen=True)
 class _SentCall:
     """A scratchpad call as its end event stored it: the action the model
-    sent, and its code when the stored event kept that whole."""
+    sent (None when it sent none), and its code when the stored event kept
+    that whole."""
 
-    action: str
+    action: str | None
     code: str | None
 
 
@@ -84,13 +85,33 @@ def _whole_fields(*, text: str) -> dict[str, Any]:
 
 
 def _sent_call(*, content: Any) -> _SentCall | None:
-    """The call an end event stored, or None when its action isn't readable."""
+    """The call an end event stored, or None when it doesn't read as one."""
     parsed = _parse_json(content)
-    action = parsed.get("action") if parsed else None
-    if not isinstance(action, str):
+    if parsed is None:
         return None
+    action = parsed.get("action")
     code = parsed.get("code")
-    return _SentCall(action=action, code=code if isinstance(code, str) else None)
+    return _SentCall(
+        action=action if isinstance(action, str) and action else None,
+        code=code if isinstance(code, str) else None,
+    )
+
+
+def _ran_action(*, call: _SentCall, result_action: Any) -> str | None:
+    """The action a call ran: the one the model sent, or, for a call that
+    sent none, `result_action`, the one anton reports on its result.
+
+    The end event stores the model's tool input as it streamed, so a call
+    that left out `action` has none there. anton runs such a call as an
+    exec when it carries `code` (anton's scratchpad_action) and names the
+    action it ran on the result, which the stream formatter stores as
+    `tool_action` (format_responses_stream). The connector probe's stored
+    results carry no `tool_action` (ProbeHandler.run), so the probe's cells,
+    which ran in the probe's own scratchpad, stay out.
+    """
+    if call.action is not None:
+        return call.action
+    return result_action if isinstance(result_action, str) else None
 
 
 def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
@@ -125,13 +146,15 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
     and a `content` key carrying the JSON payload for scratchpad events. A
     result pairs with the end event of its own `tool_use_id`: when the model
     sends several calls at once, every end event comes before the first
-    result. A result stored without one pairs with the end event just before
-    it.
+    result. A result stored without one pairs with an end event stored
+    without one just before it (the connector probe's). A result makes a cell
+    only when its call ran an exec (_ran_action).
     """
     cells: list[Cell] = []
     # The calls whose result hasn't come yet, by tool_use_id.
     sent: dict[str, _SentCall] = {}
-    # The last call, for a result stored without a tool_use_id.
+    # The last call stored without a tool_use_id, for a result stored
+    # without one.
     last: _SentCall | None = None
 
     for data in events:
@@ -150,15 +173,16 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
                 cells.clear()
                 sent.clear()
                 last = None
+            elif tool_use_id:
+                sent[tool_use_id] = call
+                last = None
             else:
                 last = call
-                if tool_use_id:
-                    sent[tool_use_id] = call
 
         elif role == _SCRATCHPAD_RESULT:
             call = sent.pop(tool_use_id, None) if tool_use_id else last
             last = None
-            if call is not None and call.action == "exec":
+            if call is not None and _ran_action(call=call, result_action=data.get("tool_action")) == "exec":
                 cell = _ran_cell(content=data.get("content"), sent_code=call.code)
                 if cell is not None:
                     cells.append(cell)
