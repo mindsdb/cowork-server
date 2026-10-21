@@ -47,11 +47,15 @@ PARTITION_C = personal_partition_id(DEPLOYMENT, SUB_C)
 
 
 class _LiveAppLauncher(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     subject: str
     email: str
 
 
 class _LiveAppLaunch(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     slot: int
     slug: str
     artifact_dir: str
@@ -59,19 +63,30 @@ class _LiveAppLaunch(BaseModel):
     boot_id: str
 
 
-class _SlotApp(BaseModel):
-    model_config = ConfigDict(extra="allow")
+class _Wire(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
+
+class _AppHashes(_Wire):
+    backend: str
+    requirements: str
+    connections: str
+
+
+class _SlotApp(_Wire):
     artifact: str
     launcher: _LiveAppLauncher
+    started_at: str
+    expires_at: str
+    last_request_at: str | None = None
+    hashes: _AppHashes
+    env_names: tuple[str, ...] = ()
 
 
-class _SlotStatus(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    version: int = 1
+class _SlotStatus(_Wire):
+    version: Literal[1]
     boot_id: str
-    booted_at: str = ""
+    booted_at: str
     state: Literal["empty", "running", "exited"]
     app: _SlotApp | None = None
 
@@ -198,9 +213,18 @@ class FakeServices:
             return httpx.Response(slot.fails_with)
         app = None
         if slot.state == "running":
-            app = {"artifact": slot.artifact, "launcher": {"subject": "sub", "email": slot.launcher_email}}
-        body = {"version": 1, "boot_id": slot.boot_id, "booted_at": "", "state": slot.state, "app": app}
-        return httpx.Response(200, content=json.dumps(body).encode())
+            app = {
+                "artifact": slot.artifact,
+                "launcher": {"subject": "sub", "email": slot.launcher_email},
+                "started_at": "2026-10-21T04:40:00Z",
+                "expires_at": "2026-10-21T12:40:00Z",
+                "hashes": {"backend": "0" * 64, "requirements": "0" * 64, "connections": "0" * 64},
+            }
+        body = {"version": 1, "boot_id": slot.boot_id, "booted_at": "2026-10-21T04:40:00Z", "state": slot.state, "app": app}
+        # Built through the installed anton's own model, so a reply this
+        # server's code can't read fails here rather than passing a test.
+        status = sys.modules[MODULE].SlotStatus.model_validate(body)
+        return httpx.Response(200, content=status.model_dump_json().encode())
 
 
 def answer_over_http(monkeypatch, services: FakeServices) -> None:
