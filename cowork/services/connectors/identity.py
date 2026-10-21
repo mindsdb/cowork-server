@@ -374,6 +374,29 @@ def kept_secret_moved(
     return {k: v for k, v in stored.items() if k not in safe} != {k: v for k, v in given.items() if k not in safe}
 
 
+def extends_step_moves_stored_secret(
+    existing_record: dict | None, submitted: dict, connector_id: str, method: str | None
+) -> bool:
+    """True when a later step of a multi-step save keeps a stored secret and changes a stored field.
+
+    The step keeps every stored secret it does not resubmit. A field the step
+    adds is the step's purpose and is not compared; a non-secret field the
+    record already holds must keep its value unless the connector's
+    SAFE_WITH_KEPT_SECRET lists it. Pure; reads nothing.
+    """
+    record = existing_record or {}
+    prior = record.get("fields") or {}
+    secure = sorted(set(secure_keys_for(connector_id, method, prior)) | set(record.get("secure_keys") or []))
+    if not any(key in secure and key not in submitted and prior.get(key) for key in prior):
+        return False
+    safe = SAFE_WITH_KEPT_SECRET.get((connector_id, method), frozenset())
+    return any(
+        key in submitted and submitted[key] != value
+        for key, value in _nonsecret_identity(prior, secure).items()
+        if key not in safe
+    )
+
+
 def resolve_unique_slug(
     vault, engine: str, base_slug: str, payload: dict, secure_keys: list[str]
 ) -> str:

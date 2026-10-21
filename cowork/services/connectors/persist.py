@@ -27,6 +27,7 @@ from cowork.managed import (
 from cowork.services.connectors.identity import (
     KEPT_SECRET_MOVED,
     derive_connection_name,
+    extends_step_moves_stored_secret,
     keeps_secret_for_another_account,
     kept_secret_moved,
     resolve_keep_sentinels,
@@ -259,7 +260,8 @@ def persist_connection(
     user already upgraded to ``"write"``).
 
     A save that keeps a stored secret, by the keep sentinel or by leaving it
-    out of a save that replaces the record, while a non-secret field outside
+    out of a save that replaces or ``extends`` the record (for extends,
+    extends_step_moves_stored_secret), while a non-secret field outside
     the connector's SAFE_WITH_KEPT_SECRET differs from the record raises
     KeptSecretMovedError before anything is written (kept_secret_moved), so
     a save can't send the stored secret elsewhere.
@@ -300,6 +302,8 @@ def persist_connection(
                 raise ConnectionNotFoundError(
                     f"No {connector_id} connection named {base_slug!r} to add these fields to."
                 )
+            if extends_step_moves_stored_secret(target, cred, connector_id, method):
+                raise KeptSecretMovedError()
             stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
             cred = {**stored, **cred}
         if keeps_secret_for_another_account(cred, target, connector_id, method):
@@ -332,7 +336,8 @@ def persist_connection(
             if key not in payload and existing_fields.get(key)
         ]
         # A carried secret is kept as a sentinel's is, so it is bound the same way.
-        if carried and kept_secret_moved(existing, payload, connector_id, method):
+        # An extends step adds fields by design; its own check ran before the merge.
+        if carried and not extends and kept_secret_moved(existing, payload, connector_id, method):
             raise KeptSecretMovedError()
         for key in carried:
             payload[key] = existing_fields[key]

@@ -491,3 +491,26 @@ class _SilentLog:
 def _b64(value: str) -> str:
     """``value`` in standard base64."""
     return base64.b64encode(value.encode()).decode()
+
+
+def test_a_later_step_of_a_multi_step_save_cannot_move_a_stored_secret(stores):
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    slug = persist_connection("example-tool", None, "", {"host": "a.example.net", "api_key": "stored-api-key-7f3a"})
+    before = vault.read_record("example-tool", slug)
+
+    with pytest.raises(KeptSecretMovedError):
+        persist_connection("example-tool", None, slug, {"host": "b.example.net"}, extends=True)
+
+    assert vault.read_record("example-tool", slug) == before
+
+
+def test_a_later_step_of_a_multi_step_save_may_add_fields_beside_a_stored_secret(stores):
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    slug = persist_connection("example-tool", None, "", {"host": "a.example.net", "api_key": "stored-api-key-7f3a"})
+
+    persist_connection("example-tool", None, slug, {"account_email": "ops@example.net"}, extends=True)
+
+    fields = vault.read_record("example-tool", slug)["fields"]
+    assert fields["api_key"] == "stored-api-key-7f3a"
+    assert fields["host"] == "a.example.net"
+    assert fields["account_email"] == "ops@example.net"
