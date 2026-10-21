@@ -30,6 +30,7 @@ from cowork.services.connectors.identity import (
     keeps_secret_for_another_account,
     resolve_keep_sentinels,
     resolve_unique_slug,
+    secret_destination_changed,
     secure_keys_for,
 )
 from cowork.services.connectors.layered_vault import LayeredDataVault, SharedFrom
@@ -258,10 +259,11 @@ def persist_connection(
     refresh/re-auth reaching this same save path must not clobber a value the
     user already upgraded to ``"write"``).
 
-    A save that keeps a stored secret (the keep sentinel) while its other
-    identity fields differ from the record raises KeptSecretMovedError before
-    anything is written (keeps_secret_for_another_account), so an edit can't
-    send the stored secret to another host. ``secret_bound_by_caller`` skips
+    A save that keeps a stored secret, by the keep sentinel or by leaving it
+    out of a save that replaces the record, while a field that picks its
+    destination differs from the record raises KeptSecretMovedError before
+    anything is written (secret_destination_changed), so a save can't send
+    the stored secret to another host. ``secret_bound_by_caller`` skips
     that check for a caller that already bound its kept secret to the
     record's host and account, as the Databricks Genie save does.
 
@@ -328,9 +330,19 @@ def persist_connection(
         # from `existing`, the record this save replaces: the record at
         # `base_slug` can belong to a different account that shares the slug.
         existing_fields = (existing or {}).get("fields", {})
-        for key in secure_keys_for(connector_id, method, existing_fields):
-            if key not in payload and existing_fields.get(key):
-                payload[key] = existing_fields[key]
+        carried = [
+            key for key in secure_keys_for(connector_id, method, existing_fields)
+            if key not in payload and existing_fields.get(key)
+        ]
+        # A carried secret is kept as a sentinel's is, so it is bound the same way.
+        if (
+            carried
+            and not secret_bound_by_caller
+            and secret_destination_changed(existing, payload, connector_id, method)
+        ):
+            raise KeptSecretMovedError()
+        for key in carried:
+            payload[key] = existing_fields[key]
         secure_keys = secure_keys_for(connector_id, method, payload)
         if extends:
             # A field the record already held as a secret stays one, even if

@@ -11,14 +11,16 @@ import re
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
+from fastapi import HTTPException
 
+from cowork.api.v1.endpoints.connectors import connections as connections_ep
 from cowork.api.v1.endpoints.connectors import submissions as submissions_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.principal import personal_partition_id
-from cowork.schemas.connectors import SubmitFormRequest
+from cowork.schemas.connectors import DirectSaveRequest, SubmitFormRequest
 from cowork.services.connectors import databricks_genie
 from cowork.services.connectors.connections import KEPT_VALUES_NOT_FOUND
 from cowork.services.connectors.identity import KEPT_SECRET_MOVED, VAULT_KEEP_SENTINEL
@@ -198,6 +200,36 @@ def test_a_direct_save_that_keeps_the_token_and_changes_no_identity_field_saves_
     [record] = _records()
     assert record["fields"]["access_token"] == TOKEN
 
+
+def test_a_desktop_reconnect_that_leaves_out_the_token_cannot_move_it_to_another_host(stores):
+    slug = persist_connection("databricks", PAT, "", SAVED)
+    [before] = _records()
+    body = DirectSaveRequest(
+        connector_id="databricks", method=PAT, name=slug, replace_existing=True,
+        values={"workspace_url": OTHER_HOST, "http_path": OLD_PATH},
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        connections_ep.save_connection_direct(body, LOCAL_SCOPE)
+
+    assert refused.value.status_code == 422
+    assert refused.value.detail == KEPT_SECRET_MOVED
+    assert _records() == [before]
+
+
+def test_a_desktop_reconnect_that_leaves_out_the_token_on_the_same_host_keeps_it(stores):
+    slug = persist_connection("databricks", PAT, "", SAVED)
+    body = DirectSaveRequest(
+        connector_id="databricks", method=PAT, name=slug, replace_existing=True,
+        values={"workspace_url": HOST, "http_path": NEW_PATH},
+    )
+
+    saved = connections_ep.save_connection_direct(body, LOCAL_SCOPE)
+
+    assert saved["name"] == slug
+    [record] = _records()
+    assert record["fields"]["access_token"] == TOKEN
+    assert record["fields"]["http_path"] == NEW_PATH
 
 def test_a_save_whose_caller_bound_the_kept_secret_skips_the_destination_check(stores):
     genie = {"workspace_url": HOST, "client_id": "principal", "_client_secret": "stored-secret"}
