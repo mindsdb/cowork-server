@@ -196,6 +196,13 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     raise typed from exc
 
 
+def _clip(text: str) -> str:
+    """Server text short enough to show, keeping the end where pip names the cause."""
+    if len(text) <= 500:
+        return text
+    return f"{text[:100]} … {text[-400:]}"
+
+
 #: The files the publish store holds: its state, and the temporary file a
 #: save writes and moves over it.
 _STATE_FILES = ("state.json", "state.json.tmp")
@@ -613,7 +620,7 @@ def publish_artifact(
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
-        from anton.publisher import ArtifactOwnedByOtherUserError, publish
+        from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked, publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
@@ -686,18 +693,28 @@ def publish_artifact(
         # report_id for another account.
         raise PublishOwnedByOtherUser() from exc
     except Exception as exc:
-        classify_upload_error(exc)
+        upload_error = classify_upload_error(exc)
         logger.exception("Publishing failed")
+        if (
+            upload_error is not None
+            and 400 <= upload_error.status < 500
+            # "Invalid token" says less than the credentials advice below.
+            and upload_error.status != 401
+            and upload_error.error
+        ):
+            raise PublishRejected(f"Publishing failed: {_clip(upload_error.error)}") from exc
         # Only network/HTTP failures get the "Connection failed" framing — a
         # gateway timeout (e.g. a fullstack artifact whose deps take too long
-        # to install remotely, ENG-1547/ENG-1580) or a server-side 5xx reads
-        # very differently to the user than an auth rejection, but neither
-        # applies to a local failure (e.g. reading the artifact's files to
-        # zip it) that happened before any request went out. urllib.error
-        # HTTPError is a URLError subclass, so this covers both.
+        # to install remotely) or a server-side 5xx reads very differently to
+        # the user than an auth rejection, but neither applies to a local
+        # failure (e.g. reading the artifact's files to zip it) that happened
+        # before any request went out. urllib.error HTTPError is a URLError
+        # subclass, so this covers both.
         if isinstance(exc, urllib.error.URLError):
             headline, advice = describe_minds_connection_error(exc)
-            raise RuntimeError(f"Publishing failed. {headline} {advice}") from exc
+            raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
+        if isinstance(exc, StatePublishBlocked):
+            raise PublishRejected(f"Publishing failed: {exc}") from exc
         raise RuntimeError(f"Publishing failed: {exc}") from exc
     finally:
         if md_tmp_dir is not None:
