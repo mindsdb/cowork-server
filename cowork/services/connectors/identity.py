@@ -308,8 +308,8 @@ def resolve_keep_sentinels(
 
 
 KEPT_SECRET_MOVED = (
-    "This edit changes the connection's address or account, so its saved secret can't be used. "
-    "Enter the secret again to change those details."
+    "The saved secret can't be reused with these connection details. "
+    "Enter the secret again to change these connection details."
 )
 
 
