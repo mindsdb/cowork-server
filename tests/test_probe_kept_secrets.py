@@ -138,10 +138,31 @@ async def test_an_edit_that_keeps_the_token_and_changes_only_the_label_is_checke
 
 @pytest.mark.parametrize(
     "changed",
-    [{"workspace_url": OTHER_HOST}, {"http_path": NEW_PATH}, {"catalog": "main"}],
-    ids=["another-host", "another-warehouse", "an-added-catalog"],
+    [{"http_path": NEW_PATH}, {"catalog": "main"}],
+    ids=["another-warehouse", "an-added-catalog"],
 )
-async def test_an_edit_that_keeps_the_token_and_changes_the_account_is_refused_before_any_probe(
+async def test_an_edit_that_keeps_the_token_and_changes_a_non_destination_field_saves_in_place(
+    probes, changed,
+):
+    slug = persist_connection("databricks", PAT, "", SAVED)
+
+    stream = await _submit(_edit(**changed), name=slug)
+
+    assert _outcome(stream)["_is_success"] is True
+    [probe] = probes
+    assert probe["credentials"] == {**SAVED, **changed}
+    [record] = _records()
+    assert record["name"] == slug
+    assert record["fields"]["access_token"] == TOKEN
+    assert all(record["fields"][key] == value for key, value in changed.items())
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"workspace_url": OTHER_HOST}, {"workspace_url": OTHER_HOST, "http_path": NEW_PATH}],
+    ids=["another-host", "another-host-and-warehouse"],
+)
+async def test_an_edit_that_keeps_the_token_and_changes_the_host_is_refused_before_any_probe(
     probes, changed,
 ):
     slug = persist_connection("databricks", PAT, "", SAVED)
@@ -178,10 +199,10 @@ def test_a_direct_save_that_keeps_the_token_and_changes_no_identity_field_saves_
     assert record["fields"]["access_token"] == TOKEN
 
 
-def test_a_save_whose_caller_bound_the_kept_secret_may_change_other_fields(stores):
+def test_a_save_whose_caller_bound_the_kept_secret_skips_the_destination_check(stores):
     genie = {"workspace_url": HOST, "client_id": "principal", "_client_secret": "stored-secret"}
     slug = persist_connection("databricks", "genie-mcp", "", genie)
-    edit = {**genie, "_client_secret": VAULT_KEEP_SENTINEL, "genie_space_id": "a" * 32}
+    edit = {**genie, "_client_secret": VAULT_KEEP_SENTINEL, "client_id": "another-principal"}
 
     with pytest.raises(KeptSecretMovedError):
         persist_connection("databricks", "genie-mcp", slug, edit)
@@ -189,7 +210,19 @@ def test_a_save_whose_caller_bound_the_kept_secret_may_change_other_fields(store
 
     [record] = _records()
     assert record["fields"]["_client_secret"] == "stored-secret"
-    assert record["fields"]["genie_space_id"] == "a" * 32
+    assert record["fields"]["client_id"] == "another-principal"
+
+
+def test_a_record_with_no_destination_field_keeps_a_secret_only_when_every_field_matches(stores):
+    vault = own_vault_for_scope(LOCAL_SCOPE)
+    saved = {"api_key": "stored-api-key-7f3a", "workspace_gid": "1201"}
+    slug = persist_connection("example-tool", None, "", saved)
+
+    with pytest.raises(KeptSecretMovedError):
+        persist_connection("example-tool", None, slug, {"api_key": VAULT_KEEP_SENTINEL, "workspace_gid": "1202"})
+    persist_connection("example-tool", None, slug, {"api_key": VAULT_KEEP_SENTINEL, "workspace_gid": "1201"})
+
+    assert vault.read_record("example-tool", slug)["fields"]["api_key"] == "stored-api-key-7f3a"
 
 
 async def test_an_edit_that_changes_the_token_is_checked_with_the_new_token(probes):
