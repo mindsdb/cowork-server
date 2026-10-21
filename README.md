@@ -967,6 +967,23 @@ includes the typed helper that reads the gateway from the turn's inference host,
 with live pods from an older image recycled first. With the flag off nothing
 in this path runs, so the flag is also the rollback.
 
+### Sharing selected projects
+
+On a local deployment with trusted identity headers and personal projects, an operator can grant read-only file access to one project. Keep `projects` in `COWORK_PERSONAL_RESOURCES`. The owner alone can execute tasks, schedule work, change files or edit instructions. Recipient visibility is confined to `GET /api/v1/projects/` descriptors and the UUID-addressed `GET /api/v1/shared-projects/{project_id}/files`, `/files/{path}` and `/files-raw/{path}` routes. Ordinary project services, execution and mutation lookups remain scoped to the requester's own partition.
+
+Run these as Cowork's user, with the owner's identity pair:
+
+```sh
+python -m cowork.ops.projects share --organization-id <deployment-id> --user-id <owner-sub> --project <slug> --recipient <recipient-sub>
+python -m cowork.ops.projects share --organization-id <deployment-id> --user-id <owner-sub> --project <slug> --everyone
+python -m cowork.ops.projects unshare --organization-id <deployment-id> --user-id <owner-sub> --project-id <project-uuid>
+python -m cowork.ops.projects list
+```
+
+Repeat `--recipient` for multiple subjects. An explicit audience is required; resharing replaces it. Grants live in `<COWORK_SHARED_DIR>/shared/projects.json`, outside agent-writable project roots, and name immutable project and subject IDs. A rename retains a grant; a deleted and recreated project or account does not inherit a named grant. Everyone means this deployment only. Commands lock and atomically replace the registry, refusing to overwrite malformed or unreadable bytes. Requests fail closed on a broken registry. No database migration is required. Revoke grants before rolling back application versions.
+
+Recipients never read dot paths, conversations, skills, memory, symlinks, hardlinks or nonregular files through these routes. Every path component is opened relative to pinned directories without following links. Listings visit at most 10,000 entries and 32 levels; text is capped at 2 MiB and downloads at 100 MiB. Downloads use attachment disposition and an opaque content type; no shared HTML preview token exists. Each request rereads the grant, so revocation affects subsequent requests. Previously downloaded bytes cannot be recalled. Desktop, hosted organization tenancy, and deployments that leave all projects globally shared keep their existing behavior.
+
 ### Sharing one skill with everyone
 
 On a deployment that trusts identity headers and keeps `skills` in `COWORK_PERSONAL_RESOURCES`, a person shares one of their own skills with everyone, read-only, or hides it again.
