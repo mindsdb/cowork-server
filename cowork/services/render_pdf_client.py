@@ -9,10 +9,9 @@ the configured service and nowhere else. Ignoring the environment also skips
 against certifi's public certificate authorities only.
 
 One deadline, ``ExportPdfSettings.timeout_seconds`` (60 s), covers the whole
-call, the retry and reading the PDF included. The proxies in front of a
-self-hosted stack wait far longer: its edge allows 3600 s to read an answer,
-and its recording proxy has no read timeout on its connection to this server.
-So the server's own 504 reaches the browser before any proxy gives up.
+call, the retry and reading the PDF included. Any proxy in front of the
+server must wait longer than this budget for an answer, so that the
+server's own 504 reaches the browser before the proxy gives up.
 
 The client is async. The export route is async, and waiting on the render
 service is network I/O that needs no worker thread. An ``asyncio`` timeout
