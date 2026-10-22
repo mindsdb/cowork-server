@@ -11,10 +11,13 @@ replaces a file.
 
 from __future__ import annotations
 
+import codecs
+import errno
 import html
 import json
 import os
 import secrets
+import stat
 from collections.abc import AsyncIterator, Callable
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -59,7 +62,7 @@ from cowork.services.artifacts import (
     serve_url_for,
 )
 from cowork.services.docx_writer import write_docx
-from cowork.services.markdown_render import render_markdown
+from cowork.services.markdown_render import MarkdownRefused, render_markdown
 from cowork.services.render_pdf_client import RenderServicePdf, pdf_request
 
 if TYPE_CHECKING:
@@ -92,6 +95,13 @@ ORG_INLINE_BUDGET_BYTES = 10 * 1024 * 1024
 PDF_INLINE_BUDGET_BYTES = 5 * 1024 * 1024
 # How many "name (n).ext" spellings an export tries before it gives up.
 _MAX_OUTPUT_NAMES = 100
+# The longest file name the volumes Cowork runs on all take: Linux allows 255
+# bytes, macOS 255 characters and Windows 255 UTF-16 units, and a name of 255
+# UTF-8 bytes fits each.
+_MAX_NAME_BYTES = 255
+# What link() answers on a volume with no hard links: ENOTSUP on macOS exFAT
+# and FAT32, and EPERM on Linux vfat. EOPNOTSUPP is ENOTSUP's other spelling.
+_NO_HARD_LINKS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM})
 
 _OUTPUT_EXTENSIONS: dict[ExportFormat, str] = {"html": ".html", "docx": ".docx", "pdf": ".pdf"}
 _INLINE_MODES: dict[ExportFormat, InlineMode] = {
@@ -164,6 +174,8 @@ def export_formats(
     segments = source_name.replace("\\", "/").split("/")
     if any(not segment or segment.casefold() in _HOUSEKEEPING_NAMES for segment in segments):
         return []
+    if not _read_takes_name(segments):
+        return []
     suffix = PurePosixPath(segments[-1]).suffix.lower()
     formats: list[ExportFormat] = []
     if suffix in _HTML_EXPORT_SOURCES:
@@ -173,6 +185,21 @@ def export_formats(
         if pdf.engine == "render" and pdf.render_url is not None:
             formats.append("pdf")
     return formats
+
+
+def _read_takes_name(segments: list[str]) -> bool:
+    """Whether the export's pinned read takes a path of these segments, by text alone.
+
+    It refuses a name Windows would read as another file, such as ``aux.md``
+    or ``notes:q3.md``, on every platform, and a path nested past its depth.
+    """
+    if len(segments) > artifact_files._MAX_PATH_PARTS:
+        return False
+    try:
+        artifact_files._refuse_unsafe_parts(parts=tuple(segments))
+    except artifact_files.ArtifactFileRefused:
+        return False
+    return True
 
 
 def export_pdf_settings() -> ExportPdfSettings:
@@ -219,12 +246,27 @@ def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
 
 
 def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
-    """The export source of the artifact in *folder*: its primary file and its type."""
+    """The export source of the artifact in *folder*: its primary file and its type.
+
+    A primary the export's read refuses for what it is on disk names no
+    source, so no format is offered for it: a file that isn't regular, or one
+    with a second hard link, which a sync or backup tool can give it.
+    """
     parts = _primary_parts(folder=folder, metadata=metadata)
+    if parts is not None and not _single_link_file(folder.joinpath(*parts)):
+        parts = None
     return ExportSource(
         source_name="/".join(parts or ()),
         is_backend=is_backend_type(metadata.get("type")),
     )
+
+
+def _single_link_file(path: Path) -> bool:
+    try:
+        found = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(found.st_mode) and found.st_nlink == 1
 
 
 def card_export_source(card: dict) -> ExportSource:
@@ -311,16 +353,34 @@ def _source_html(*, data: bytes, suffix: str, title: str) -> bytes:
 
     An HTML page stays as it is. Markdown is rendered and text becomes a
     ``pre`` block, and either is wrapped as the body of a minimal document
-    titled *title*, which is what an HTML export of it writes.
+    titled *title*, which is what an HTML export of it writes. Markdown that
+    ``render_markdown`` refuses is answered as a source over its read bound
+    is, before anything is written.
     """
     if suffix in _HTML_SOURCES:
         return data
-    text = data.decode("utf-8", errors="replace")
+    text = _source_text(data)
     if suffix in _MARKDOWN_SOURCES:
-        body = render_markdown(text=text)
+        try:
+            body = render_markdown(text=text)
+        except MarkdownRefused as exc:
+            raise ExportRefused(ExportRefusal.TOO_LARGE, "This file can't be exported.") from exc
     else:
         body = f"<pre>{html.escape(text)}</pre>"
     return _wrap_html_document(body, title).encode("utf-8")
+
+
+def _source_text(data: bytes) -> str:
+    """A Markdown or text source's bytes as text.
+
+    They are read as UTF-8, and a UTF-8 byte order mark is dropped, so a first
+    line such as ``# Title`` stays a heading. A UTF-16 byte order mark, which
+    Windows editors write for "Unicode" text, reads the rest as UTF-16. Bytes
+    that don't decode become U+FFFD.
+    """
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("utf-8-sig", errors="replace")
 
 
 def _html_export(document: str) -> bytes:
@@ -355,18 +415,35 @@ def _wrap_html_document(body_html: str, title: str) -> str:
     )
 
 
+def _primary_names_a_file(*, folder: PinnedDir, primary: object) -> bool:
+    """Whether metadata's *primary* names a file the card shows.
+
+    The card reads the hint through ``_pick_primary``; with no files to fall
+    back on, it returns a file only when the hint names one.
+    """
+    io_folder = _pinned_directory_path(folder)
+    if not isinstance(primary, str) or not primary or io_folder is None:
+        return False
+    return _pick_primary(io_folder, [], primary_hint=primary) is not None
+
+
 def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     """Record the primary the card shows when ``metadata.json`` names none.
 
     Without it, the new file could become the card's primary: the card picks an
-    HTML file over Markdown, and otherwise the newest file. The primary is
-    merged into the latest document and written atomically, as
+    HTML file over Markdown, and otherwise the newest file. So it runs before
+    the new file takes its name. A primary that names no file, such as one the
+    agent renamed, counts as none, because the card falls back the same way.
+    The primary is merged into the latest document and written atomically, as
     ``ensure_full_id`` widens an id, and the file's timestamps are put back
-    because the artifact's content did not change. A primary that is already
-    set is never changed.
+    because the artifact's content did not change. If the export then fails,
+    the record stays: it names the file the card already shows. A primary
+    that names a file is never changed.
     """
     latest = json.loads(_read_no_follow(folder, _METADATA))
-    if not isinstance(latest, dict) or latest.get("primary"):
+    if not isinstance(latest, dict) or _primary_names_a_file(
+        folder=folder, primary=latest.get("primary")
+    ):
         return
     before = dir_stat(folder, _METADATA, follow_symlinks=False)
     _atomic_json(folder, _METADATA, {**latest, "primary": primary})
@@ -412,25 +489,61 @@ def _link_without_replacing(folder: PinnedDir, source_name: str, destination_nam
         os.rename(folder.path / source_name, folder.path / destination_name)
 
 
+def _create_without_replacing(folder: PinnedDir, name: str, data: bytes) -> None:
+    """Write *data* to a new file at *name*, refusing one that already exists.
+
+    For a volume with no hard links, such as exFAT or FAT32. ``O_EXCL |
+    O_NOFOLLOW`` refuses any existing entry, a symlink included, as a link
+    does. Unlike a link, the file shows at its name while it is written, so a
+    failed write removes it.
+    """
+    fd = dir_open(folder, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
+    try:
+        try:
+            _write_all(fd, data)
+        finally:
+            os.close(fd)
+    except BaseException:
+        try:
+            dir_unlink(folder, name)
+        except OSError:
+            pass
+        raise
+
+
+def _output_stem(*, stem: str, extension: str) -> str:
+    """*stem*, cut so that every output name fits ``_MAX_NAME_BYTES``.
+
+    The longest output name is ``stem (100).ext``. The cut falls between
+    characters, never inside one.
+    """
+    room = _MAX_NAME_BYTES - len(os.fsencode(f" ({_MAX_OUTPUT_NAMES}){extension}"))
+    while len(os.fsencode(stem)) > room:
+        stem = stem[:-1]
+    return stem
+
+
 def _write_beside(
     *,
     folder: PinnedDir,
     parts: tuple[str, ...],
     extension: str,
     data: bytes,
-    after_placing: Callable[[], None],
+    before_placing: Callable[[], None],
 ) -> str:
     """Write *data* next to the source at *parts* under the first free name.
 
     The names run ``report.docx``, ``report (2).docx``, ``report (3).docx``,
     and never the source's own name. The bytes go to a temporary file created
-    with ``O_EXCL | O_NOFOLLOW``, which then takes the free name without
-    replacing anything; the temporary name is always removed, as soon as the
-    file has its own. Then *after_placing* runs; if it raises, the new file
-    is removed too, so a failed export leaves nothing behind. Returns the name.
+    with ``O_EXCL | O_NOFOLLOW``. Then *before_placing* runs, and only once it
+    returns does the file take the free name, without replacing anything; on
+    a volume with no hard links the bytes are written to the free name
+    itself, created the same way. The temporary name is always removed, as
+    soon as the file has its own, so a failed export leaves no file behind.
+    Returns the name.
     """
     source_name = parts[-1]
-    stem = PurePosixPath(source_name).stem
+    stem = _output_stem(stem=PurePosixPath(source_name).stem, extension=extension)
     with ExitStack() as opened:
         parent = folder
         for requested in parts[:-1]:
@@ -440,40 +553,69 @@ def _write_beside(
             opened.callback(parent.close)
         temporary = f".cowork-export-{secrets.token_hex(12)}.tmp"
         fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
+        name = None
         try:
             try:
                 _write_all(fd, data)
             finally:
                 os.close(fd)
+            before_placing()
             name = _place_temporary(
-                parent=parent, temporary=temporary, stem=stem, extension=extension, source_name=source_name
+                parent=parent,
+                temporary=temporary,
+                stem=stem,
+                extension=extension,
+                source_name=source_name,
+                data=data,
             )
         finally:
-            try:
-                dir_unlink(parent, temporary)
-            except FileNotFoundError:
-                pass
-        try:
-            after_placing()
-        except BaseException:
-            try:
-                dir_unlink(parent, name)
-            except OSError:
-                pass
-            raise
+            _remove_temporary(parent=parent, temporary=temporary, placed=name)
         return name
 
 
+def _remove_temporary(*, parent: PinnedDir, temporary: str, placed: str | None) -> None:
+    """Remove the temporary name, and the placed file too if that fails.
+
+    Until the temporary name goes, a linked file has two links, and the drafts
+    route never serves a file with a second link. So an export whose
+    temporary name stays fails, and leaves no file at an output name.
+    """
+    try:
+        dir_unlink(parent, temporary)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        if placed is not None:
+            try:
+                dir_unlink(parent, placed)
+            except OSError:
+                pass
+        raise
+
+
 def _place_temporary(
-    *, parent: PinnedDir, temporary: str, stem: str, extension: str, source_name: str
+    *, parent: PinnedDir, temporary: str, stem: str, extension: str, source_name: str, data: bytes
 ) -> str:
-    """Give *temporary* the first free output name and return that name."""
+    """Give *temporary* the first free output name and return that name.
+
+    Where the volume refuses a hard link, *data* is written to the free name
+    directly instead, still never over an existing entry.
+    """
+    link = True
     for number in range(1, _MAX_OUTPUT_NAMES + 1):
         name = f"{stem}{extension}" if number == 1 else f"{stem} ({number}){extension}"
         if name.casefold() == source_name.casefold():
             continue
         try:
-            _link_without_replacing(parent, temporary, name)
+            if link:
+                try:
+                    _link_without_replacing(parent, temporary, name)
+                    return name
+                except OSError as exc:
+                    if exc.errno not in _NO_HARD_LINKS:
+                        raise
+                    link = False
+            _create_without_replacing(parent, name, data)
         except FileExistsError:
             continue
         return name
@@ -493,9 +635,10 @@ def export_primary_file(
 
     Blocking: the route runs it in an anyio worker thread (``run_in_threadpool``),
     which a PDF export needs to reach the event loop. Raises ``ExportRefused``
-    for a format the artifact doesn't offer, a source over its size bound or
-    a source that can't be opened, and ``RenderPdfFailed`` when no usable PDF
-    came back, and writes nothing then.
+    for a format the artifact doesn't offer, a source over its size bound,
+    Markdown that ``render_markdown`` refuses or a source that can't be
+    opened, and ``RenderPdfFailed`` when no usable PDF came back, and writes
+    nothing then.
     """
     org_mode = _org_mode()
     with opened_artifact_folder(source, folder_name) as folder:
@@ -539,7 +682,7 @@ def export_primary_file(
             parts=parts,
             extension=extension,
             data=output,
-            after_placing=lambda: _record_primary(folder=folder, primary="/".join(parts)),
+            before_placing=lambda: _record_primary(folder=folder, primary="/".join(parts)),
         )
     rel_path = "/".join((*parts[:-1], name))
     return ExportResult(

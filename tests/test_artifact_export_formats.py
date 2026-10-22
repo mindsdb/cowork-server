@@ -7,9 +7,11 @@ export route accepts exactly the formats that list holds.
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -24,7 +26,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.schemas.artifact_export import ExportPdfSettings
-from cowork.services import artifact_export
+from cowork.services import artifact_export, artifact_permissions
 from cowork.services import artifact_ownership as ownership
 from cowork.services.artifact_export import (
     ExportSource,
@@ -54,6 +56,18 @@ def test_export_formats_follow_the_primary_file_and_the_caller(case):
     )
 
     assert offered == case["expected"]
+
+
+@pytest.mark.parametrize(("depth", "expected"), [(64, ["html", "docx"]), (65, [])])
+def test_a_primary_nested_past_the_read_depth_offers_nothing(depth, expected):
+    """The export's read follows at most 64 path segments."""
+    source_name = "/".join(["d"] * (depth - 1) + ["report.md"])
+
+    offered = export_formats(
+        source_name=source_name, is_backend=False, can_edit=True, pdf=export_pdf_settings()
+    )
+
+    assert offered == expected
 
 
 def test_no_deployment_offers_pdf_until_a_render_service_is_configured():
@@ -133,6 +147,8 @@ _LOCAL_ARTIFACTS = {
         [],
     ),
     "readme": ({"README.md": "# R\n"}, {"type": "document", "primary": "README.md"}, []),
+    # Windows reads aux.md as a device, so the export's read refuses the name.
+    "device": ({"aux.md": "# A\n"}, {"type": "document", "primary": "aux.md"}, []),
     "revision": (
         {".revisions/old.md": "# R\n", "current.md": "# C\n"},
         {"type": "document", "primary": ".revisions/old.md"},
@@ -178,6 +194,67 @@ def test_the_local_workspace_response_carries_export_formats(tmp_path, local_mod
 
     assert response.status_code == 200, response.text
     assert response.json()["capabilities"]["exportFormats"] == ["html", "docx"]
+
+
+def test_the_workspace_response_decides_export_formats_where_artifact_capabilities_does(
+    tmp_path, local_mode, monkeypatch
+):
+    """The workspace response already holds its owner's capabilities, and adds
+    exportFormats through the helper artifact_capabilities() adds it with. A
+    change to how the list is decided then reaches both answers alike."""
+    source = _local_source(tmp_path)
+    artifact_id, folder = _write_artifact(
+        source.base, "report", {"report.md": "# R\n"}, type="document", primary="report.md"
+    )
+    monkeypatch.setattr(
+        workspace_ep,
+        "review_artifact_for_request",
+        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+    )
+    monkeypatch.setattr(artifact_permissions, "offered_export_formats", lambda **_kwargs: ["docx"])
+    from cowork.server import create_app
+
+    response = TestClient(create_app()).get(f"/api/v1/artifacts/workspace/local/{artifact_id}")
+    capabilities = artifact_capabilities(
+        SimpleNamespace(scope=LOCAL_SCOPE),
+        source,
+        "report",
+        export_source=ExportSource(source_name="report.md", is_backend=False),
+    )
+
+    assert response.status_code == 200, response.text
+    assert capabilities["exportFormats"] == ["docx"]
+    assert response.json()["capabilities"]["exportFormats"] == ["docx"]
+
+
+def test_the_workspace_response_offers_nothing_for_a_hard_linked_primary(
+    tmp_path, local_mode, monkeypatch
+):
+    """A sync or backup tool can give the primary a second hard link. The
+    export's read refuses such a file, so the workspace response offers no
+    format the route would then answer 404."""
+    source = _local_source(tmp_path)
+    artifact_id, folder = _write_artifact(
+        source.base, "report", {"report.md": "# R\n"}, type="document", primary="report.md"
+    )
+    os.link(folder / "report.md", tmp_path / "backup.md")
+    monkeypatch.setattr(
+        workspace_ep,
+        "review_artifact_for_request",
+        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+    )
+    from cowork.server import create_app
+
+    client = TestClient(create_app())
+    response = client.get(f"/api/v1/artifacts/workspace/local/{artifact_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["capabilities"]["exportFormats"] == []
+    for export_format in ("html", "docx"):
+        refused = client.post(
+            f"/api/v1/artifacts/workspace/local/{artifact_id}/export", json={"format": export_format}
+        )
+        assert refused.status_code == 404, refused.text
 
 
 def test_capabilities_without_an_export_source_leave_the_field_out():
@@ -259,6 +336,23 @@ async def test_the_org_workspace_response_offers_formats_to_an_owner_who_may_man
         )
 
     assert result["capabilities"]["exportFormats"] == offered
+
+
+async def test_while_org_export_is_off_the_workspace_response_never_walks_the_folder(
+    org_world, monkeypatch
+):
+    """Org export off offers nothing whatever the folder holds, so the
+    response skips the walk that finds the primary."""
+    monkeypatch.setattr(
+        workspace_ep, "primary_export_source", Mock(side_effect=AssertionError("walked the folder"))
+    )
+    _role_permissions(monkeypatch, artifact_manage=True)
+    with _scoped(org_world.org_id, org_world.creator) as session:
+        result = await workspace_ep.artifact_source(
+            str(org_world.project.id), org_world.ids["mine"], session, path=None
+        )
+
+    assert result["capabilities"]["exportFormats"] == []
 
 
 async def test_the_workspace_response_offers_nothing_once_artifact_manage_is_gone(

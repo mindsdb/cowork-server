@@ -35,6 +35,7 @@ from cowork.services.docx_writer import (
     MAX_NODES,
     MAX_TABLE_CELLS,
     MAX_TABLE_COLUMNS,
+    TABLE_CELLS_NOTE,
     TRUNCATION_NOTE,
     write_docx,
 )
@@ -474,6 +475,120 @@ def test_images_pass_as_bytes_or_become_a_placeholder(case):
         assert package.text == f"Chart: {placeholder}"
 
 
+def _exif_jpeg(*, entries: int) -> bytes:
+    """A 3x2 JPEG whose Exif directory holds *entries* text entries, all naming one 1 KiB string."""
+    text = b"x" * 1023 + b"\x00"
+    text_offset = 8 + 2 + 12 * entries + 4
+    directory = (
+        struct.pack(">H", entries)
+        + b"".join(
+            struct.pack(">HHII", 0x8000 + index, 2, len(text), text_offset) for index in range(entries)
+        )
+        + struct.pack(">I", 0)
+    )
+    tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + directory + text
+    app1 = b"\xff\xe1" + struct.pack(">H", 8 + len(tiff)) + b"Exif\x00\x00" + tiff
+    sof0 = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, 2, 3, 1) + b"\x01\x11\x00"
+    sos = b"\xff\xda" + struct.pack(">HB", 8, 1) + b"\x01\x00\x00\x3f\x00"
+    return b"\xff\xd8" + app1 + sof0 + sos + b"\x00\xff\xd9"
+
+
+_JFIF_APP0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00\x01\x01\x00\x00\x48\x00\x48\x00\x00"
+_SOF0 = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, 2, 3, 1) + b"\x01\x11\x00"
+_SOS = b"\xff\xda" + struct.pack(">HB", 8, 1) + b"\x01\x00\x00\x3f\x00"
+
+
+def _short_exif_jpeg(*, entries: int, length: int) -> bytes:
+    """A 3x2 JFIF JPEG whose Exif block, after the frame header, says it is *length* bytes long.
+
+    Its directory holds *entries* text entries, and no byte of the block is
+    0xFF. Under 8 bytes, python-docx reads the block to the end of the file
+    and parses it.
+    """
+    text = b"x" * 1023 + b"\x00"
+    text_offset = 8 + 2 + 12 * entries + 4
+    tags = [tag for tag in range(0x8001, 0x9000) if 0xFF not in tag.to_bytes(2, "big")][:entries]
+    directory = (
+        struct.pack(">H", entries)
+        + b"".join(struct.pack(">HHII", tag, 2, len(text), text_offset) for tag in tags)
+        + struct.pack(">I", 0)
+    )
+    tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + directory + text
+    app1 = b"\xff\xe1" + struct.pack(">H", length) + b"Exif\x00\x00" + tiff
+    return b"\xff\xd8" + _JFIF_APP0 + _SOF0 + app1 + _SOS + b"\x00\xff\xd9"
+
+
+def _padded_jpeg(*, markers: int, padding: bytes) -> bytes:
+    """A 3x2 JFIF JPEG with *markers* in all before its scan, SOI first.
+
+    *padding*, a TEM marker or an 0xFF 0x00 pair, fills them out after the
+    frame header.
+    """
+    return b"\xff\xd8" + _JFIF_APP0 + _SOF0 + padding * (markers - 3) + _SOS + b"\x00\xff\xd9"
+
+
+def _gif_signed(*, tag: bytes, jpeg: bytes) -> bytes:
+    """*jpeg* behind a GIF signature, with *tag* at offset 6.
+
+    python-docx checks for a JFIF or Exif tag at offset 6 before it checks
+    for a GIF signature, so it reads this as a JPEG and walks every marker.
+    """
+    return b"GIF89a" + tag + b"\x00" + jpeg
+
+
+def _chunky_png(*, chunks: int) -> bytes:
+    """A 3x2 PNG of *chunks* chunks in all, padded with empty tEXt chunks."""
+    png = _png(width=3, height=2)
+    header, rest = png[:33], png[33:]  # the signature and IHDR, then IDAT and IEND
+    empty_text = struct.pack(">I", 0) + b"tEXt" + struct.pack(">I", zlib.crc32(b"tEXt"))
+    return header + empty_text * (chunks - 3) + rest
+
+
+@pytest.mark.parametrize(
+    ("data", "picture"),
+    [
+        (_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES), True),
+        (_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1), False),
+        (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS), True),
+        (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS + 1), False),
+        (_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1, length=2), False),
+        (_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1, length=7), False),
+        (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS, padding=b"\xff\x01"), True),
+        (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x01"), False),
+        (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x00"), False),
+        (
+            _gif_signed(
+                tag=b"JFIF",
+                jpeg=_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x01"),
+            ),
+            False,
+        ),
+        (
+            _gif_signed(
+                tag=b"Exif",
+                jpeg=_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1, length=2),
+            ),
+            False,
+        ),
+    ],
+    ids=[
+        "exif-at-the-cap", "exif-past-the-cap", "png-at-the-cap", "png-past-the-cap",
+        "exif-shorter-than-its-header", "exif-a-byte-short-of-its-header",
+        "markers-at-the-cap", "markers-past-the-cap", "ff00-pairs-past-the-cap",
+        "gif-signed-jfif-past-the-marker-cap", "gif-signed-exif-shorter-than-its-header",
+    ],
+)
+def test_a_header_python_docx_would_blow_up_on_becomes_the_placeholder(data, picture):
+    mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
+    uri = f"data:{mime};base64," + base64.b64encode(data).decode()
+    package = _write(f'<p>Chart: <img src="{uri}" alt="crafted"></p>')
+    if picture:
+        assert list(package.media().values()) == [data]
+    else:
+        assert package.media() == {}
+        assert package.text == "Chart: [image: crafted]"
+
+
 @pytest.mark.parametrize("case", _cases("image_sizes.yaml"), ids=_ids(_cases("image_sizes.yaml")))
 def test_images_scale_down_to_fit(case):
     width_px, height_px = case["px"]
@@ -669,13 +784,54 @@ def test_content_outside_table_cells_is_kept(case):
     assert tables == case["tables"]
 
 
-def test_tables_clamp_to_63_columns():
+def test_tables_clamp_to_63_columns_and_say_so():
     cells = "".join(f"<td>c{index}</td>" for index in range(1, MAX_TABLE_COLUMNS + 2))
     package = _write(f"<table><tr>{cells}</tr></table>")
     [table] = package.document.tables
     assert len(table.columns) == MAX_TABLE_COLUMNS
     assert table.cell(0, MAX_TABLE_COLUMNS - 1).text == f"c{MAX_TABLE_COLUMNS}"
     assert f"c{MAX_TABLE_COLUMNS + 1}" not in package.text
+    assert package.document.paragraphs[-1].text == TABLE_CELLS_NOTE
+
+
+def test_a_cell_pushed_past_63_columns_by_spans_is_left_out_and_said_so():
+    spanning = f'<td colspan="{MAX_TABLE_COLUMNS}">wide</td><td>pushed out</td>'
+    package = _write(f"<table><tr>{spanning}</tr></table>")
+    assert "pushed out" not in package.text
+    assert package.document.paragraphs[-1].text == TABLE_CELLS_NOTE
+
+
+def test_rows_past_the_cell_budget_are_left_out_and_said_so():
+    row = "<tr>" + "<td>cell</td>" * MAX_TABLE_COLUMNS + "</tr>"
+    rows_that_fit = MAX_TABLE_CELLS // MAX_TABLE_COLUMNS
+    package = _write(f"<table>{row * (rows_that_fit + 1)}</table><p>after</p>")
+    [table] = package.document.tables
+    assert len(table.rows) == rows_that_fit
+    assert [paragraph.text for paragraph in package.document.paragraphs[-2:]] == [
+        "after",
+        TABLE_CELLS_NOTE,
+    ]
+
+
+@pytest.mark.parametrize(
+    "late", ["<tr><td>late</td></tr>", "<td>late</td>"], ids=["row", "loose_cell"]
+)
+def test_a_table_after_the_cell_budget_is_spent_is_left_out_and_said_so(late):
+    full_row = "<tr>" + "<td></td>" * MAX_TABLE_COLUMNS + "</tr>"
+    rows_that_fit = MAX_TABLE_CELLS // MAX_TABLE_COLUMNS
+    rest = "<tr><td></td></tr>" * (MAX_TABLE_CELLS - rows_that_fit * MAX_TABLE_COLUMNS)
+    package = _write(
+        f"<table>{full_row * rows_that_fit}</table><table>{rest}</table><table>{late}</table>"
+    )
+    assert len(package.document.tables) == 2
+    assert "late" not in package.text
+    assert package.document.paragraphs[-1].text == TABLE_CELLS_NOTE
+
+
+def test_a_table_within_the_limits_says_nothing():
+    package = _write("<table><tr><td>a</td><td>b</td></tr></table><p>after</p>")
+    assert TABLE_CELLS_NOTE not in package.text
+    assert package.document.paragraphs[-1].text == "after"
 
 
 def test_table_cells_stay_within_the_document_budget():
@@ -696,7 +852,10 @@ def test_table_cells_stay_within_the_document_budget():
     assert table.cell(0, 0)._tc is table.cell(rows_that_fit - 1, MAX_TABLE_COLUMNS - 1)._tc
     assert len(list(package.document.element.body.iter(qn("w:tc")))) <= MAX_TABLE_CELLS
     assert "second table" not in package.text
-    assert package.document.paragraphs[-1].text == "after the tables"
+    assert [paragraph.text for paragraph in package.document.paragraphs[-2:]] == [
+        "after the tables",
+        TABLE_CELLS_NOTE,
+    ]
 
 
 def test_nested_table_keeps_the_text_order():

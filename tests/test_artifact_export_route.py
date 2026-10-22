@@ -8,6 +8,8 @@ would run under the local scope and prove nothing about who may export.
 """
 from __future__ import annotations
 
+import codecs
+import errno
 import io
 import json
 import os
@@ -41,6 +43,7 @@ from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
 from cowork.services.artifact_export import ExportRefused, ExportSource, export_slot
 from cowork.services.artifacts import ProjectArtifacts
+from cowork.services.markdown_render import MAX_FENCE_LENGTH
 from cowork.services.render_pdf_client import RenderServicePdf
 from test_artifact_ownership import legacy_root, make_conversation, make_project, project_root
 
@@ -240,6 +243,124 @@ def test_a_hard_link_at_the_output_name_is_never_written_through(client, local_a
     assert (folder / "report.html").stat().st_ino == victim.stat().st_ino
 
 
+@pytest.mark.parametrize("planted", ["symlink", "hard-link", "file"])
+def test_an_entry_planted_at_the_temporary_name_is_never_written_through(
+    client, local_artifact, tmp_path, monkeypatch, planted
+):
+    """The temporary file is created with O_EXCL and O_NOFOLLOW, so an entry
+    already at its name fails the export instead of taking its bytes."""
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    monkeypatch.setattr(
+        artifact_export, "secrets", SimpleNamespace(token_hex=lambda nbytes: "0" * (2 * nbytes))
+    )
+    temporary = folder / f".cowork-export-{'0' * 24}.tmp"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"victim bytes")
+    if planted == "symlink":
+        temporary.symlink_to(victim)
+    elif planted == "hard-link":
+        os.link(victim, temporary)
+    else:
+        temporary.write_bytes(b"planted bytes")
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert _snapshot(folder) == before
+    assert victim.read_bytes() == b"victim bytes"
+
+
+def _no_hard_links(code: int):
+    """Make link() fail the way a volume without hard links fails it."""
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(code, os.strerror(code))
+
+    return refuse
+
+
+@pytest.mark.parametrize(
+    "code", [errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM], ids=["ENOTSUP", "EOPNOTSUPP", "EPERM"]
+)
+@pytest.mark.parametrize("planted", ["symlink", "dangling-symlink", "file"])
+def test_a_volume_without_hard_links_still_exports_and_replaces_nothing(
+    client, local_artifact, tmp_path, monkeypatch, code, planted
+):
+    """exFAT and FAT32 refuse link(): the export writes the free name directly,
+    and an entry planted at the first name is still never written through."""
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    victim = tmp_path / "victim.docx"
+    if planted == "file":
+        (folder / "report.docx").write_bytes(b"old bytes")
+    else:
+        if planted == "symlink":
+            victim.write_bytes(b"victim bytes")
+        (folder / "report.docx").symlink_to(victim)
+    before = _snapshot(folder)
+    monkeypatch.setattr(os, "link", _no_hard_links(code))
+
+    first = client.post(EXPORT_URL, json={"format": "docx"})
+    second = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["filename"] == "report (2).docx"
+    assert second.json()["filename"] == "report.html"
+    after = _snapshot(folder)
+    assert set(after) - set(before) == {"report (2).docx", "report.html"}
+    assert {key: after[key] for key in before} == before
+    if planted == "symlink":
+        assert victim.read_bytes() == b"victim bytes"
+    elif planted == "dangling-symlink":
+        assert not victim.exists()
+    docx.Document(io.BytesIO((folder / "report (2).docx").read_bytes()))
+    _assert_reloads(folder / "report.html", "html")
+
+
+def test_a_failed_write_without_hard_links_leaves_nothing(client, local_artifact, monkeypatch):
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    before = _snapshot(folder)
+    monkeypatch.setattr(os, "link", _no_hard_links(errno.ENOTSUP))
+    written = artifact_export._write_all
+    calls: list[int] = []
+
+    def full_disk(fd, data):
+        # The temporary file is written first, then the output name.
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        written(fd, data)
+
+    monkeypatch.setattr(artifact_export, "_write_all", full_disk)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert len(calls) == 2
+    assert _snapshot(folder) == before
+
+
+@pytest.mark.parametrize("stem", ["a" * 250, "報" * 84], ids=["ascii-250-bytes", "cjk-252-bytes"])
+def test_a_source_name_near_the_name_limit_still_exports(client, local_artifact, stem):
+    """The stem plus " (2)" and the new extension would pass the 255-byte
+    name limit, so the stem is cut, the same way for every output name."""
+    folder = local_artifact({f"{stem}.md": "# R\n"}, primary=f"{stem}.md")
+
+    names = []
+    for _ in range(2):
+        response = client.post(EXPORT_URL, json={"format": "docx"})
+        assert response.status_code == 200, response.text
+        names.append(response.json()["filename"])
+
+    assert all(len(os.fsencode(name)) <= 255 for name in names)
+    cut = names[0].removesuffix(".docx")
+    assert names[1] == f"{cut} (2).docx"
+    assert stem.startswith(cut) and len(cut) < len(stem)
+    for name in names:
+        docx.Document(io.BytesIO((folder / name).read_bytes()))
+
+
 def test_an_html_export_of_markdown_writes_one_document_beside_it(client, local_artifact):
     source = "# Quarterly report\n\nRevenue *grew*.\n\n<script>alert(1)</script>\n"
     folder = local_artifact({"report.md": source}, primary="report.md")
@@ -254,6 +375,52 @@ def test_an_html_export_of_markdown_writes_one_document_beside_it(client, local_
     assert "<title>report</title>" in written
     assert "Quarterly report</h1>" in written
     assert "<em>grew</em>" in written
+
+
+_MARKED_SOURCE = "# Título\n\nCuerpo del informe.\n"
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        codecs.BOM_UTF8 + _MARKED_SOURCE.encode("utf-8"),
+        codecs.BOM_UTF16_LE + _MARKED_SOURCE.encode("utf-16-le"),
+        codecs.BOM_UTF16_BE + _MARKED_SOURCE.encode("utf-16-be"),
+    ],
+    ids=["utf-8", "utf-16-le", "utf-16-be"],
+)
+def test_a_source_with_a_byte_order_mark_keeps_its_first_heading(client, local_artifact, encoded):
+    """Windows editors start a file with a byte order mark. It is no text, so
+    the first line stays a heading in Word and in HTML."""
+    folder = local_artifact({"report.md": encoded}, primary="report.md")
+
+    word = client.post(EXPORT_URL, json={"format": "docx"})
+    page = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert word.status_code == 200, word.text
+    assert page.status_code == 200, page.text
+    paragraphs = docx.Document(io.BytesIO((folder / "report.docx").read_bytes())).paragraphs
+    assert [(p.style.name, p.text) for p in paragraphs[:2]] == [
+        ("Heading 1", "Título"),
+        ("Normal", "Cuerpo del informe."),
+    ]
+    written = (folder / "report.html").read_text(encoding="utf-8")
+    assert "Título</h1>" in written
+    assert "\ufeff" not in written and "\ufffd" not in written
+
+
+def test_a_text_source_with_a_byte_order_mark_exports_without_it(client, local_artifact):
+    """A plain text file is read the same way as Markdown, so its byte order
+    mark never reaches the exported page."""
+    encoded = codecs.BOM_UTF8 + _MARKED_SOURCE.encode("utf-8")
+    folder = local_artifact({"notes.txt": encoded}, primary="notes.txt")
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    written = (folder / "notes.html").read_text(encoding="utf-8")
+    assert "<pre># Título" in written
+    assert "\ufeff" not in written
 
 
 def test_a_large_html_export_is_written_whole(client, local_artifact):
@@ -304,6 +471,23 @@ def test_a_markdown_source_at_its_read_bound_still_exports(client, local_artifac
     assert response.status_code == 200, response.text
 
 
+@pytest.mark.parametrize("export_format", ["html", "docx"])
+def test_markdown_with_a_fence_past_the_cap_answers_413_and_writes_nothing(
+    client, local_artifact, export_format
+):
+    # No primary recorded, so a refusal that came after the record would
+    # show in metadata.json.
+    fence = "`" * (MAX_FENCE_LENGTH + 1)
+    folder = local_artifact({"report.md": f"# Report\n\n{fence}\ncode\n{fence}\n"})
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": export_format})
+
+    assert response.status_code == 413, response.text
+    assert response.json()["detail"] == "This file can't be exported."
+    assert _snapshot(folder) == before
+
+
 def test_a_conversion_failure_answers_500_and_writes_nothing(client, local_artifact, monkeypatch):
     folder = local_artifact({"report.md": "# R\n"})
     before = _snapshot(folder)
@@ -325,8 +509,13 @@ def _newest(path: Path) -> None:
     os.utime(path, (later, later))
 
 
-def test_an_export_with_no_free_name_answers_500_and_changes_nothing(client, local_artifact):
-    """No primary is recorded and no temporary file stays when no name is free."""
+def _without_metadata(snapshot: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in snapshot.items() if key != "metadata.json"}
+
+
+def test_an_export_with_no_free_name_answers_500_and_writes_no_file(client, local_artifact):
+    """The primary is recorded before any name is tried, as the card already
+    shows it, and no temporary file stays when no name is free."""
     taken = {"report.docx": b"old", **{f"report ({n}).docx": b"old" for n in range(2, 101)}}
     folder = local_artifact({**taken, "report.md": "# R\n"})
     _newest(folder / "report.md")
@@ -335,10 +524,59 @@ def test_an_export_with_no_free_name_answers_500_and_changes_nothing(client, loc
     response = client.post(EXPORT_URL, json={"format": "docx"})
 
     assert response.status_code == 500, response.text
-    assert _snapshot(folder) == before
+    assert _without_metadata(_snapshot(folder)) == _without_metadata(before)
+    assert _metadata(folder)["primary"] == "report.md"
 
 
-def test_a_failure_after_the_file_is_placed_removes_it(client, local_artifact, monkeypatch):
+def test_the_primary_is_recorded_before_the_new_file_takes_its_name(
+    client, local_artifact, monkeypatch
+):
+    """A process stopped between the two steps leaves the card as it was: the
+    new report.html never stands beside report.md with no primary recorded."""
+    folder = local_artifact({"report.md": "# R\n"})
+    place = artifact_export._place_temporary
+    recorded: list[object] = []
+
+    def spy(**kwargs):
+        recorded.append(_metadata(folder).get("primary"))
+        return place(**kwargs)
+
+    monkeypatch.setattr(artifact_export, "_place_temporary", spy)
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    assert recorded == ["report.md"]
+
+
+def test_a_temporary_name_that_stays_takes_the_placed_file_with_it(
+    client, local_artifact, monkeypatch
+):
+    """The placed file shares its inode with the temporary name until that
+    goes, and the drafts route refuses a file with two links. So when the
+    temporary name can't be removed, no file is left at an output name."""
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    before = _snapshot(folder)
+    unlink = artifact_export.dir_unlink
+
+    def stuck(parent, name):
+        if name.startswith(".cowork-export-"):
+            raise OSError(errno.EIO, "Input/output error")
+        unlink(parent, name)
+
+    monkeypatch.setattr(artifact_export, "dir_unlink", stuck)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    after = _snapshot(folder)
+    (left,) = set(after) - set(before)
+    assert left.startswith(".cowork-export-")
+    assert {key: after[key] for key in before} == before
+    assert (folder / left).stat().st_nlink == 1
+
+
+def test_a_failure_to_record_the_primary_writes_nothing(client, local_artifact, monkeypatch):
     folder = local_artifact({"report.md": "# R\n"})
     before = _snapshot(folder)
 
@@ -404,7 +642,8 @@ def _card(folder: Path) -> dict:
         root_parts=(".anton", "artifacts"),
     )
     (card,) = artifacts_service.list_artifacts([source])
-    return {key: card[key] for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
+    # A card with no primary file has no draftUrl.
+    return {key: card.get(key) for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
 
 
 @pytest.mark.parametrize("recorded", [True, False], ids=["primary-recorded", "no-primary"])
@@ -438,9 +677,9 @@ def test_exports_leave_the_card_primary_and_publish_state_alone(
 
 
 def test_a_recorded_primary_is_never_changed(client, local_artifact):
-    """A primary naming a file that no longer exists stays as it is: the
-    export follows the card's own fallback and writes no metadata."""
-    folder = local_artifact({"notes.md": "# N\n"}, primary="gone.md")
+    """A primary that names a file stays as it is, even where the card's own
+    fallback would pick another file, and the export writes no metadata."""
+    folder = local_artifact({"notes.md": "# N\n", "index.html": "<h1>I</h1>"}, primary="notes.md")
     metadata_before = (folder / "metadata.json").read_bytes()
 
     response = client.post(EXPORT_URL, json={"format": "html"})
@@ -448,6 +687,80 @@ def test_a_recorded_primary_is_never_changed(client, local_artifact):
     assert response.status_code == 200, response.text
     assert response.json()["filename"] == "notes.html"
     assert (folder / "metadata.json").read_bytes() == metadata_before
+
+
+@pytest.mark.parametrize(("export_format", "extension"), [("docx", ".docx"), ("html", ".html")])
+def test_a_primary_that_names_no_file_counts_as_unset(
+    client, local_artifact, export_format, extension
+):
+    """The agent renamed report.md to final.md, and metadata.json still names
+    report.md. The card shows final.md, and the export records it, so the new
+    file never takes the card over and Export stays offered."""
+    folder = local_artifact({"final.md": "# F\n"}, primary="report.md")
+    _published(folder, "final.md")
+    card_before = _card(folder)
+    assert card_before["path"] == str(folder / "final.md")
+
+    first = client.post(EXPORT_URL, json={"format": export_format})
+    time.sleep(0.01)
+    second = client.post(EXPORT_URL, json={"format": export_format})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert [first.json()["filename"], second.json()["filename"]] == [
+        f"final{extension}",
+        f"final (2){extension}",
+    ]
+    assert _card(folder) == card_before
+    assert _metadata(folder)["primary"] == "final.md"
+
+
+@pytest.mark.parametrize(
+    ("files", "status", "card_path"),
+    [({"report.md": "# R\n"}, 200, "report.md"), ({}, 422, "")],
+    ids=["another-file", "no-other-file"],
+)
+def test_a_primary_that_names_a_symlink_loop_falls_back_like_the_card(
+    client, local_artifact, files, status, card_path
+):
+    """Python 3.12 raises RuntimeError resolving a link to itself. The card
+    and the export both fall back past such a primary instead."""
+    folder = local_artifact(files, primary="loop")
+    (folder / "loop").symlink_to("loop")
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == status, response.text
+    assert _card(folder)["path"] == (str(folder / card_path) if card_path else str(folder))
+    if status == 200:
+        assert response.json()["filename"] == "report.docx"
+        assert _metadata(folder)["primary"] == "report.md"
+
+
+@pytest.mark.parametrize(
+    "hint", ["//203.0.113.5/share/x.md", "\\\\203.0.113.5\\share\\x.md"], ids=["slashes", "backslashes"]
+)
+def test_a_unc_primary_is_passed_over_before_any_file_call(client, local_artifact, monkeypatch, hint):
+    """On Windows, a UNC hint replaces the folder when joined onto it, and
+    resolving it opens a connection to that host with the user's credentials.
+    The export falls back to the card's own pick without resolving it."""
+    folder = local_artifact({"report.md": "# R\n"}, primary=hint)
+    resolved: list[str] = []
+    resolve = Path.resolve
+
+    def spy(self, *args, **kwargs):
+        resolved.append(str(self))
+        return resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", spy)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == "report.docx"
+    assert resolved, "the export should resolve its own paths through the spy"
+    assert [path for path in resolved if "203.0.113.5" in path] == []
+    assert _metadata(folder)["primary"] == "report.md"
 
 
 def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):

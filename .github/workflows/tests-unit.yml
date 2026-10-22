@@ -61,8 +61,11 @@ jobs:
         run: uv sync --group dev
 
       - name: Run export tests
+        # -rs names every skipped test and its reason in the log. The export
+        # service tests place files through Windows' rename, which runs only
+        # here.
         run: >-
-          uv run python -m pytest
+          uv run python -m pytest -rs
           tests/test_artifact_files.py
           tests/test_markdown_render.py
           tests/test_artifact_inline.py

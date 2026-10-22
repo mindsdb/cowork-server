@@ -10,6 +10,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
+import sys
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from pathlib import Path
@@ -23,10 +25,10 @@ import yaml
 from cowork.common.paths import PinnedDir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
-from cowork.services import artifact_export
+from cowork.services import artifact_export, artifact_identity
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot
 from cowork.services.artifacts import ProjectArtifacts
-from test_artifact_export_route import padded_png
+from test_artifact_export_route import _snapshot, padded_png
 from tests._no_fetch import no_fetch, recording_server
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
@@ -126,6 +128,162 @@ def test_a_first_export_records_the_primary_the_card_shows(local_mode, partition
     metadata = json.loads((folder / "metadata.json").read_text())
     del metadata["primary"]
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = artifact_export.export_primary_file(
+        source=source,
+        folder_name=folder.name,
+        metadata=metadata,
+        artifact_id=artifact_id,
+        export_format="docx",
+        can_edit=True,
+    )
+
+    assert result.filename == "report.docx"
+    assert json.loads((folder / "metadata.json").read_text())["primary"] == "report.md"
+
+
+# ── placement ────────────────────────────────────────────────────────────────
+# These run on every platform: POSIX names the file with a hard link, and
+# Windows, which has no directory descriptor, with a rename.
+
+
+def _export_docx(source: ProjectArtifacts, folder: Path, artifact_id: str) -> str:
+    return artifact_export.export_primary_file(
+        source=source,
+        folder_name=folder.name,
+        metadata=json.loads((folder / "metadata.json").read_text()),
+        artifact_id=artifact_id,
+        export_format="docx",
+        can_edit=True,
+    ).filename
+
+
+def test_each_export_takes_the_next_free_name_and_replaces_none(local_mode, partitions):
+    mine, _secret = partitions
+    source, folder, artifact_id = _write_report(mine, "report.md", "# R\n")
+    (folder / "report (2).docx").write_bytes(b"planted bytes")
+
+    names = [_export_docx(source, folder, artifact_id) for _ in range(2)]
+    first = (folder / "report.docx").read_bytes()
+    names.append(_export_docx(source, folder, artifact_id))
+
+    assert names == ["report.docx", "report (3).docx", "report (4).docx"]
+    assert (folder / "report.docx").read_bytes() == first
+    assert (folder / "report (2).docx").read_bytes() == b"planted bytes"
+    assert not [path.name for path in folder.iterdir() if path.name.startswith(".cowork-export-")]
+
+
+def test_an_export_with_no_free_name_raises_and_writes_nothing(local_mode, partitions):
+    mine, _secret = partitions
+    source, folder, artifact_id = _write_report(mine, "report.md", "# R\n")
+    for number in range(1, 101):
+        name = "report.docx" if number == 1 else f"report ({number}).docx"
+        (folder / name).write_bytes(b"old")
+    before = _snapshot(folder)
+
+    with pytest.raises(FileExistsError):
+        _export_docx(source, folder, artifact_id)
+
+    assert _snapshot(folder) == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a pinned folder has no descriptor on Windows")
+@pytest.mark.parametrize("export_format", ["docx", "html"])
+def test_a_parent_folder_swapped_for_a_link_mid_export_is_never_written_through(
+    local_mode, tmp_path, monkeypatch, export_format
+):
+    """The source's folder is read, then swapped for a link to another folder
+    while the conversion runs. The write descends with O_NOFOLLOW, so the
+    export fails and writes nothing anywhere."""
+    project = tmp_path / "project"
+    folder = project / ".anton" / "artifacts" / "report"
+    (folder / "docs").mkdir(parents=True)
+    (folder / "docs" / "report.md").write_text("# R\n", encoding="utf-8")
+    artifact_id = uuid4().hex
+    metadata = {"id": artifact_id, "slug": "report", "type": "document", "primary": "docs/report.md"}
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    source = ProjectArtifacts(
+        base=project / ".anton" / "artifacts",
+        project_id=None,
+        project_name="project",
+        trusted_anchor=project,
+        root_parts=(".anton", "artifacts"),
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    inline = artifact_export.inline_artifact_html
+
+    def swap_after_inlining(**kwargs):
+        inlined = inline(**kwargs)
+        (folder / "docs").rename(folder / "docs-moved")
+        (folder / "docs").symlink_to(outside, target_is_directory=True)
+        return inlined
+
+    monkeypatch.setattr(artifact_export, "inline_artifact_html", swap_after_inlining)
+
+    with pytest.raises(OSError):
+        artifact_export.export_primary_file(
+            source=source,
+            folder_name=folder.name,
+            metadata=metadata,
+            artifact_id=artifact_id,
+            export_format=export_format,
+            can_edit=True,
+        )
+
+    assert list(outside.iterdir()) == []
+    assert [path.name for path in (folder / "docs-moved").iterdir()] == ["report.md"]
+    assert sorted(path.name for path in folder.iterdir()) == ["docs", "docs-moved", "metadata.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows keeps no permission bits beyond read-only")
+@pytest.mark.parametrize("writer", ["export", "ensure_full_id"])
+def test_rewriting_metadata_keeps_its_permission_bits(local_mode, partitions, writer):
+    """Recording a primary and widening a legacy id both replace
+    metadata.json; the new document keeps the old one's mode, as it keeps
+    its timestamps."""
+    mine, _secret = partitions
+    source, folder, artifact_id = _write_report(mine, "report.md", "# R\n")
+    path = folder / "metadata.json"
+    metadata = json.loads(path.read_text())
+    if writer == "export":
+        del metadata["primary"]
+    else:
+        metadata["id"] = artifact_id[:8]
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+    os.chmod(path, 0o644)
+
+    if writer == "export":
+        artifact_export.export_primary_file(
+            source=source,
+            folder_name=folder.name,
+            metadata=metadata,
+            artifact_id=artifact_id,
+            export_format="docx",
+            can_edit=True,
+        )
+        assert json.loads(path.read_text())["primary"] == "report.md"
+    else:
+        artifact_identity.ensure_full_id(folder)
+        assert len(json.loads(path.read_text())["id"]) == 32
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_a_volume_that_refuses_a_mode_change_still_records_the_primary(
+    local_mode, partitions, monkeypatch
+):
+    """Linux vfat answers chmod with EPERM; the mode is kept where it can be."""
+    mine, _secret = partitions
+    source, folder, artifact_id = _write_report(mine, "report.md", "# R\n")
+    metadata = json.loads((folder / "metadata.json").read_text())
+    del metadata["primary"]
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    def refuse(*_args):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchmod", refuse, raising=False)
 
     result = artifact_export.export_primary_file(
         source=source,

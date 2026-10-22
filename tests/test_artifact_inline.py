@@ -410,6 +410,43 @@ def test_links_into_another_partition_are_refused(tmp_path, outside):
     ]
 
 
+@pytest.mark.parametrize("reference", ["sub/a:b.png", "a_b:stream.png", "sub\\x:y.png"])
+def test_a_segment_holding_a_colon_is_refused_before_the_file_walk(reference):
+    """The file walk refuses ':' too, so only a direct call shows this step holds."""
+    with pytest.raises(artifact_inline.ArtifactFileRefused) as refused:
+        artifact_inline._reference_parts(reference=reference)
+
+    assert refused.value.reason is OmittedReason.TRAVERSAL
+
+
+@pytest.mark.parametrize(
+    ("tag", "namespace", "name"),
+    [
+        ("p", artifact_inline._Namespace.HTML, "onclick"),
+        ("img", artifact_inline._Namespace.HTML, "onerror"),
+        ("rect", artifact_inline._Namespace.SVG, "onbegin"),
+        ("mi", artifact_inline._Namespace.MATH, "onload"),
+    ],
+)
+def test_an_event_handler_goes_even_where_an_allowlist_would_keep_it(
+    tag, namespace, name, monkeypatch
+):
+    """The allowlists drop every on* name today; this check must not lean on them."""
+    monkeypatch.setattr(artifact_inline, "_attribute_allowed", lambda **_: True)
+    inliner = artifact_inline._Inliner(
+        folder=None,
+        base_parts=(),
+        mode=InlineMode.PDF,
+        limits=_limits(),
+        deadline=time.monotonic() + artifact_inline.DEADLINE_SECONDS,
+    )
+
+    kept = inliner._kept_attribute(tag=tag, namespace=namespace, name=name, value="alert(1)")
+
+    assert kept is None
+    assert inliner._kept_attribute(tag=tag, namespace=namespace, name="title", value="t") == "t"
+
+
 def test_doctype_entities_and_dtd_load_nothing(artifact, outside):
     """libxml2's HTML parser reads no internal subset, so no entity resolves."""
     secret = (artifact.other / "secret.txt").as_uri()
@@ -686,6 +723,43 @@ def test_total_budget_counts_spliced_css(artifact, outside):
     assert ".more" not in document.html
 
 
+def test_the_budget_counts_a_spliced_stylesheet_as_read_not_as_escaped(tmp_path):
+    """Each "<" becomes four characters in the output, but costs one byte of the budget."""
+    folder = tmp_path / "art"
+    folder.mkdir()
+    sheet = b'p::after{content:"' + b"<" * 1000 + b'"}'
+    (folder / "angles.css").write_bytes(sheet)
+    document = _inline(
+        artifact=Artifact(folder=folder, other=folder),
+        html=b'<style>@import "angles.css";</style>',
+        limits=_limits(max_total_bytes=len(sheet)),
+    )
+    assert document.omitted == []
+    assert document.inlined_bytes == len(sheet)
+    assert document.html.count("\\3c ") == 1000
+
+
+def test_a_file_past_the_spent_budget_is_still_read_then_left_out(artifact, monkeypatch):
+    """The budget counts a file once it is read, so it never bounds the reading."""
+    reads = []
+    read = artifact_inline.read_artifact_file_entry
+
+    def counting_read(*, folder, parts, max_bytes):
+        reads.append(parts)
+        return read(folder=folder, parts=parts, max_bytes=max_bytes)
+
+    monkeypatch.setattr(artifact_inline, "read_artifact_file_entry", counting_read)
+    html = b'<img src="chart.png"><img src="photo.jpg"><img src="anim.gif">'
+    document = _inline(
+        artifact=artifact, html=html, limits=_limits(max_total_bytes=len(CHART_PNG))
+    )
+    assert reads == [("chart.png",), ("photo.jpg",), ("anim.gif",)]
+    assert [(entry.reason, entry.reference) for entry in document.omitted] == [
+        (OmittedReason.BUDGET, "photo.jpg"),
+        (OmittedReason.BUDGET, "anim.gif"),
+    ]
+
+
 def test_node_cap_drops_the_rest_of_the_tree_and_says_so(artifact, outside):
     html = "".join(f"<p>para {index}</p>" for index in range(100)).encode()
     limits = _limits(max_nodes=20)
@@ -768,6 +842,19 @@ def test_a_source_parse_cut_short_by_libxml2_ends_with_the_note(artifact, outsid
     assert "<p>start</p>" in document.html
     assert "LOST" not in document.html
     assert document.html.endswith(f"<p>{TRUNCATION_NOTE}</p></body></html>")
+
+
+def test_loads_inside_dropped_elements_are_listed_up_to_the_node_cap(artifact, outside):
+    images = "".join(f'<img src="{outside.url}/{index}.png">' for index in range(10))
+    html = f"<template>{images}</template><noscript>{images}</noscript><p>kept</p>".encode()
+    document = _guarded_inline(
+        artifact=artifact, server=outside, html=html, limits=_limits(max_nodes=12)
+    )
+    assert [entry.reference for entry in document.omitted] == [
+        f"{outside.url}/{index}.png" for index in (*range(10), 0, 1)
+    ]
+    assert "<p>kept</p>" in document.html
+    assert TRUNCATION_NOTE not in document.html
 
 
 def test_omitted_entries_cap_the_reference_at_200_characters(artifact, outside):

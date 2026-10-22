@@ -253,14 +253,18 @@ _QUERY_OR_FRAGMENT = re.compile(r"[?#]")
 _PATH_SEPARATORS = re.compile(r"[/\\]")
 _NAVIGATION_SCHEME = re.compile(r"(?:https?|mailto):", re.IGNORECASE)
 _DATA_URI = re.compile(r"data:([^,]*),(.*)", re.IGNORECASE | re.DOTALL)
-_HTML_WHITESPACE = " \t\n\r\f"
+# A ``srcset`` candidate's URL runs to the next whitespace; commas before it
+# separate candidates. Its descriptors run to a comma outside parentheses.
+_SRCSET_URL = re.compile(r"[ \t\n\r\f,]*([^ \t\n\r\f,][^ \t\n\r\f]*)")
+_SRCSET_DESCRIPTORS = re.compile(r"(?:[^,(]|\([^)]*\)?)*,?")
 _HTML_TOKEN_SEPARATORS = re.compile(r"[ \t\n\r\f]+")
 _BASE64_WHITESPACE = re.compile(rb"[ \t\n\r\f]")
 
 _JPEG_FRAME_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 )
-_JPEG_STANDALONE_MARKERS = frozenset({0x01, 0xD8, *range(0xD0, 0xD8)})
+# The JPEG markers with no length after them: TEM, SOI and RST0-7.
+JPEG_STANDALONE_MARKERS = frozenset({0x01, 0xD8, *range(0xD0, 0xD8)})
 _FONT_SIGNATURES = (
     (b"wOF2", "font/woff2"),
     (b"wOFF", "font/woff"),
@@ -337,6 +341,13 @@ class _AssetKind(Enum):
 class _Asset:
     uri: str
     size: int
+
+
+class _ImageSources(NamedTuple):
+    """An image's references: those tried in order, then those never tried."""
+
+    tried: list[str]
+    untried: list[str]
 
 
 class _ImageHeader(NamedTuple):
@@ -475,6 +486,8 @@ class _Inliner:
     scripts_dropped: bool = False
     title_kept: bool = False
     truncated: bool = False
+    # Elements inside dropped subtrees scanned for what they would have loaded.
+    dropped_scanned: int = 0
     assets: dict[tuple[tuple[str, ...], _AssetKind], _Asset] = field(default_factory=dict)
     # Why each file that failed to read or type was refused, so a repeated
     # reference costs no second read. Only the reason is kept: a refusal's
@@ -558,6 +571,29 @@ class _Inliner:
                 frame.pending.extend(reversed(item))
             else:
                 frame.texts[-1].append(item.tail or "")
+                self._omit_dropped_loads(element=item, namespace=visit.namespace)
+
+    def _omit_dropped_loads(
+        self, *, element: lxml.html.HtmlElement, namespace: _Namespace
+    ) -> None:
+        """List what the elements inside a dropped element would have loaded.
+
+        The walk never visits them, so a ``<source>`` inside a ``<video>`` or
+        an ``<img>`` inside a ``<noscript>`` is found here. The scan stops
+        once ``omitted`` is full, past the node cap across every dropped
+        subtree, or past the deadline; the subtree goes either way.
+        """
+        stack = [(child, namespace) for child in reversed(element)]
+        while stack and len(self.omitted) < _MAX_OMITTED:
+            if self.dropped_scanned >= self.limits.max_nodes or self._out_of_time():
+                return
+            self.dropped_scanned += 1
+            node, node_namespace = stack.pop()
+            if not isinstance(node.tag, str):
+                continue
+            self._omit_loads(element=node, namespace=node_namespace)
+            inner = _child_namespace(tag=node.tag, namespace=node_namespace) or node_namespace
+            stack.extend((child, inner) for child in reversed(node))
 
     def _out_of_time(self) -> bool:
         """Whether the deadline has passed; once it has, the output is cut short."""
@@ -591,9 +627,9 @@ class _Inliner:
             self._omit_loads(element=element, namespace=namespace)
             return _Visit(_Action.UNWRAP, namespace)
         if tag == "img":
-            candidates = _pop_image_sources(element=element)
+            sources = _pop_image_sources(element=element)
             self._sanitize_attributes(element=element, namespace=child_namespace)
-            self._inline_image(element=element, candidates=candidates)
+            self._inline_image(element=element, sources=sources)
         else:
             self._sanitize_attributes(element=element, namespace=child_namespace)
         if tag == "style":
@@ -605,21 +641,23 @@ class _Inliner:
 
         libxml2 reads every script as raw text, but a browser reads a script
         inside SVG or MathML as markup, where it can build elements, such as
-        an image with an outside source, that this walk never sees.
+        an image with an outside source, that this walk never sees. Every
+        script that goes lists its ``src`` in ``omitted``, and an SVG script
+        its ``href`` too.
         """
-        if self.mode is InlineMode.PDF:
-            src = element.attrib.pop("src", None)
-            if namespace is _Namespace.HTML:
-                if src is None and _inline_script_is_stable(text=element.text or ""):
-                    self._sanitize_attributes(element=element, namespace=namespace)
-                    return _Visit(_Action.KEEP, namespace)
-                if src is not None and _PINNED_CDN_SCRIPT.fullmatch(src):
-                    element.text = None
-                    self._sanitize_attributes(element=element, namespace=namespace)
-                    element.set("src", src)
-                    return _Visit(_Action.KEEP, namespace)
-            if src is not None:
-                self._omit_unloaded(reference=src)
+        src = element.attrib.pop("src", None)
+        if self.mode is InlineMode.PDF and namespace is _Namespace.HTML:
+            if src is None and _inline_script_is_stable(text=element.text or ""):
+                self._sanitize_attributes(element=element, namespace=namespace)
+                return _Visit(_Action.KEEP, namespace)
+            if src is not None and _PINNED_CDN_SCRIPT.fullmatch(src):
+                element.text = None
+                self._sanitize_attributes(element=element, namespace=namespace)
+                element.set("src", src)
+                return _Visit(_Action.KEEP, namespace)
+        if src is not None:
+            self._omit_unloaded(reference=src)
+        self._omit_loads(element=element, namespace=namespace)
         self.scripts_dropped = True
         return _Visit(_Action.DROP, namespace)
 
@@ -683,9 +721,9 @@ class _Inliner:
         if name in _HREF_ATTRIBUTES:
             return self._kept_href(tag=tag, namespace=namespace, value=value)
         if name in _LOAD_ATTRIBUTES:
-            if name == "srcset":
-                value = _first_srcset_candidate(value=value)
-            self._omit_unloaded(reference=value)
+            references = _srcset_candidates(value=value) if name == "srcset" else [value]
+            for reference in references:
+                self._omit_unloaded(reference=reference)
             return None
         if not _attribute_allowed(tag=tag, namespace=namespace, name=name):
             return None
@@ -729,7 +767,8 @@ class _Inliner:
         """List what a dropped or unwrapped element would have loaded."""
         for name, value in element.attrib.items():
             if name == "srcset":
-                self._omit_unloaded(reference=_first_srcset_candidate(value=value))
+                for candidate in _srcset_candidates(value=value):
+                    self._omit_unloaded(reference=candidate)
             elif name in _LOAD_ATTRIBUTES:
                 self._omit_unloaded(reference=value)
             elif name in _HREF_ATTRIBUTES and _href_loads(tag=element.tag, namespace=namespace):
@@ -747,15 +786,27 @@ class _Inliner:
         if len(self.omitted) < _MAX_OMITTED:
             self.omitted.append(OmittedReference(reference=reference, reason=reason))
 
-    def _inline_image(self, *, element: lxml.html.HtmlElement, candidates: list[str]) -> None:
-        """Set ``src`` to the first candidate that inlines; with none, the image keeps no source."""
-        for candidate in candidates:
+    def _inline_image(self, *, element: lxml.html.HtmlElement, sources: _ImageSources) -> None:
+        """Set ``src`` to the first source tried that inlines; with none, the image keeps no source.
+
+        Every source the image doesn't use is listed: one tried and refused
+        with its reason, and one never tried as a load nothing read. A
+        candidate that names the source the image uses isn't listed.
+        """
+        unused = sources.untried
+        used = None
+        for index, candidate in enumerate(sources.tried):
             asset = self._inline_asset(
                 reference=candidate, base_parts=self.base_parts, kind=_AssetKind.IMAGE
             )
             if asset is not None:
                 element.set("src", self._placeholder(uri=asset.uri))
-                return
+                used = _clean_reference(value=candidate)
+                unused = [*sources.tried[index + 1:], *sources.untried]
+                break
+        for reference in unused:
+            if _clean_reference(value=reference) != used:
+                self._omit_unloaded(reference=reference)
 
     def _inline_asset(
         self, *, reference: str, base_parts: tuple[str, ...], kind: _AssetKind
@@ -1152,24 +1203,36 @@ def _links_a_stylesheet(*, element: lxml.html.HtmlElement) -> bool:
     )
 
 
-def _pop_image_sources(*, element: lxml.html.HtmlElement) -> list[str]:
-    """Take ``src`` and the first ``srcset`` candidate off an image, in that order."""
-    candidates = []
+def _pop_image_sources(*, element: lxml.html.HtmlElement) -> _ImageSources:
+    """Take ``src`` and the ``srcset`` candidates off an image.
+
+    ``src`` and then the first candidate are tried; the others never are.
+    """
     src = element.attrib.pop("src", None)
     srcset = element.attrib.pop("srcset", None)
     element.attrib.pop("sizes", None)
-    if src is not None:
-        candidates.append(src)
-    if srcset is not None:
-        candidates.append(_first_srcset_candidate(value=srcset))
-    return candidates
+    candidates = _srcset_candidates(value=srcset) if srcset is not None else []
+    tried = [src] if src is not None else []
+    return _ImageSources(tried=[*tried, *candidates[:1]], untried=candidates[1:])
 
 
-def _first_srcset_candidate(*, value: str) -> str:
-    """The URL of the first ``srcset`` candidate, as the HTML parsing rules split it."""
-    text = value.lstrip(_HTML_WHITESPACE + ",")
-    end = next((index for index, char in enumerate(text) if char in _HTML_WHITESPACE), len(text))
-    return text[:end].rstrip(",")
+def _srcset_candidates(*, value: str) -> list[str]:
+    """The URL of each ``srcset`` candidate, as the HTML parsing rules split them.
+
+    At most ``_MAX_OMITTED``, as many as ``omitted`` can hold.
+    """
+    urls: list[str] = []
+    position = 0
+    while len(urls) < _MAX_OMITTED and (match := _SRCSET_URL.match(value, position)):
+        url = match.group(1)
+        position = match.end()
+        if url.endswith(","):
+            # A URL that ends with commas has no descriptors.
+            url = url.rstrip(",")
+        else:
+            position = _SRCSET_DESCRIPTORS.match(value, position).end()
+        urls.append(url)
+    return urls
 
 
 def _inline_script_is_stable(*, text: str) -> bool:
@@ -1302,7 +1365,7 @@ def _jpeg_header(*, data: bytes) -> _ImageHeader | None:
         if marker == 0xFF:
             position += 1
             continue
-        if marker in _JPEG_STANDALONE_MARKERS:
+        if marker in JPEG_STANDALONE_MARKERS:
             position += 2
             continue
         if marker in (0xD9, 0xDA):

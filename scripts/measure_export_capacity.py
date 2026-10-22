@@ -8,9 +8,14 @@ back every few milliseconds, but one long C call such as a regex match holds
 it, and that shows up as one long wake-up.
 
 Every case runs in its own process, so each case's peak RSS is its own. A
-case still running at its time budget stops itself and reports the longest
-stall it saw. Only a single stall past the grace period keeps it from doing
-that; the parent then kills it and reports the grace as a lower bound.
+replica imports the whole server and warms its agent runtime before it
+reports ready, so each case does both before it reads its baseline, and
+reads it before it builds the artifact. Peak RSS is then what a replica peaks
+at before its database and caches, which only add more. RSS added counts
+building the case as well as the export, so it errs high. A case still
+running at its time budget stops itself and reports the longest stall it saw.
+Only a single stall past the grace period keeps it from doing that; the
+parent then kills it and reports the grace as a lower bound.
 
 The cases cover ordinary reports at the org caps (10 MiB inline budget, 10 MiB
 HTML and 2 MiB Markdown read bounds), the heaviest HTML the caps allow, and
@@ -64,6 +69,7 @@ class Row(BaseModel):
     case: str
     wall_seconds: float
     longest_stall_ms: float
+    baseline_rss_mib: float
     peak_rss_mib: float
     rss_added_mib: float
     result: str
@@ -262,6 +268,15 @@ def _peak_rss_mib() -> float:
     return peak / (MIB if sys.platform == "darwin" else 1024)
 
 
+def _replica_baseline_mib() -> float:
+    """Peak RSS with the server imported and its agent runtime warmed, as a
+    replica holds it once it reports ready."""
+    import cowork.server
+
+    cowork.server._warm_agent_runtime()
+    return _peak_rss_mib()
+
+
 @dataclass
 class _Watch:
     longest: float = 0.0
@@ -276,6 +291,9 @@ async def _watch_loop(*, watch: _Watch, stop: anyio.Event, on_overrun: Callable[
 
 
 def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
+    # Read before the case is built: building holds the source and its images
+    # in memory once, as the export's read does.
+    baseline = _replica_baseline_mib()
     from cowork.services import artifact_export
     from cowork.services.artifacts import ProjectArtifacts
 
@@ -298,7 +316,6 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
             trusted_anchor=project,
             root_parts=(".anton", "artifacts"),
         )
-        baseline = _peak_rss_mib()
         watch = _Watch()
         started = time.perf_counter()
 
@@ -308,6 +325,7 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
                 case=case_id,
                 wall_seconds=round(time.perf_counter() - started, 2),
                 longest_stall_ms=round(watch.longest * 1000, 1),
+                baseline_rss_mib=round(baseline, 1),
                 peak_rss_mib=round(peak, 1),
                 rss_added_mib=round(peak - baseline, 1),
                 result=outcome,
@@ -359,6 +377,7 @@ def _run_isolated(*, case_id: str, budget_seconds: float) -> Row:
             case=case_id,
             wall_seconds=budget_seconds + GRACE_SECONDS,
             longest_stall_ms=GRACE_SECONDS * 1000,
+            baseline_rss_mib=0.0,
             peak_rss_mib=0.0,
             rss_added_mib=0.0,
             result=f"killed: one stall outlasted the {GRACE_SECONDS:.0f} s grace",
@@ -370,6 +389,7 @@ def _run_isolated(*, case_id: str, budget_seconds: float) -> Row:
             case=case_id,
             wall_seconds=0.0,
             longest_stall_ms=0.0,
+            baseline_rss_mib=0.0,
             peak_rss_mib=0.0,
             rss_added_mib=0.0,
             result=f"exit {finished.returncode}: {tail[:120]}",
@@ -398,13 +418,16 @@ def main() -> None:
         return
     print(f"Python {sys.version.split()[0]} on {sys.platform}; {_limits()}")
     print()
-    print("| Case | What it holds | Wall s | Longest stall ms | Peak RSS MiB | RSS added MiB | Result |")
-    print("| -- | -- | -- | -- | -- | -- | -- |")
+    print(
+        "| Case | What it holds | Wall s | Longest stall ms | Baseline RSS MiB | Peak RSS MiB "
+        "| RSS added MiB | Result |"
+    )
+    print("| -- | -- | -- | -- | -- | -- | -- | -- |")
     for case_id in args.only or list(CASES):
         row = _run_isolated(case_id=case_id, budget_seconds=args.budget)
         print(
             f"| {row.case} | {CASES[case_id].note} | {row.wall_seconds} | {row.longest_stall_ms} "
-            f"| {row.peak_rss_mib} | {row.rss_added_mib} | {row.result} |",
+            f"| {row.baseline_rss_mib} | {row.peak_rss_mib} | {row.rss_added_mib} | {row.result} |",
             flush=True,
         )
 

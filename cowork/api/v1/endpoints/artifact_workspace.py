@@ -31,6 +31,7 @@ from cowork.services.product_permissions import has_product_permission, require_
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
+    with_export_formats,
 )
 from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
@@ -39,9 +40,9 @@ from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.services.artifact_export import (
     ExportRefusal,
     ExportRefused,
+    ExportSource,
     export_primary_file,
     export_slot,
-    offered_export_formats,
     org_export_refused,
     primary_export_source,
 )
@@ -79,7 +80,9 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
-# Matched against the first path component of a draft request.
+# Matched against the first path component of a draft request. The file
+# walk refuses them there casefolded too, and the store-owned ones at any
+# depth (`artifact_files._refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 
@@ -513,7 +516,7 @@ async def artifact_source(
 
     ``_owner_workspace`` is the owner gate. The capabilities it returns gain
     ``exportFormats``, which read the artifact's primary file, once the folder
-    is resolved.
+    is resolved, through the helper ``artifact_capabilities`` adds it with.
     """
     source, folder, metadata, owner_capabilities = _owner_workspace(
         session, project_ref, artifact_id
@@ -528,19 +531,16 @@ async def artifact_source(
             current_workspace, folder, metadata, artifact_id, selected
         )
         repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
-        export_source = await run_in_threadpool(
-            primary_export_source, folder=folder, metadata=metadata
-        )
+        if org_export_refused(org_mode=bool(session.scope.org_mode)):
+            # No format is offered whatever the folder holds, so the walk that
+            # finds the primary is skipped, and the source names none.
+            export_source = ExportSource(source_name="", is_backend=False)
+        else:
+            export_source = await run_in_threadpool(
+                primary_export_source, folder=folder, metadata=metadata
+            )
         capabilities = await _current_capabilities(
-            session,
-            {
-                **owner_capabilities,
-                "exportFormats": offered_export_formats(
-                    source=export_source,
-                    can_edit=owner_capabilities["canEdit"],
-                    org_mode=bool(session.scope.org_mode),
-                ),
-            },
+            session, with_export_formats(session, owner_capabilities, export_source)
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:

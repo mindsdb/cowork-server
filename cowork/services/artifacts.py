@@ -393,7 +393,15 @@ def _pick_primary(
     preserve_folder_path: bool = False,
 ) -> Path | None:
     """The "open this" file for an artifact card."""
-    if primary_hint:
+    # The hint is agent-written. Two leading separators make it a UNC or
+    # device path, which replaces the folder in the join below, and on Windows
+    # even resolving one can send the user's credentials to another host. So
+    # such a hint is passed over before any file call.
+    if (
+        isinstance(primary_hint, str)
+        and primary_hint
+        and not primary_hint.replace("\\", "/").startswith("//")
+    ):
         try:
             candidate = folder / primary_hint
             target = candidate.resolve()
@@ -403,7 +411,8 @@ def _pick_primary(
                 # Keep that stable descriptor path rather than returning the
                 # resolved, swappable storage name after the containment check.
                 return candidate if preserve_folder_path else target
-        except (ValueError, OSError):
+        # Python 3.12's resolve() raises RuntimeError for a symlink loop.
+        except (ValueError, OSError, RuntimeError):
             pass
     if not files:
         return None
