@@ -281,14 +281,16 @@ def _disk_name(*, directory: PinnedDir, requested: str, budget: _ScanBudget | No
     drafts route doesn't run the text rules, and ``metadata.json.`` would
     otherwise open ``metadata.json``. A name ``lstat`` can't find is missing
     without a scan. The scan still decides every name that exists, so an open
-    only ever receives the spelling the directory returned.
+    only ever receives the spelling the directory returned. A name the
+    filesystem can't encode, such as one holding a lone surrogate, names
+    nothing on disk either.
     """
     if directory.fd is None and _windows_rewrites(name=requested):
         raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "segment is not a plain name")
     try:
         dir_lstat(directory, requested)
         return _existing_draft_entry_name(directory, requested, budget=budget)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise ArtifactFileRefused(OmittedReason.MISSING, "no such entry") from exc
 
 

@@ -218,6 +218,20 @@ def test_a_missing_file_or_directory_is_missing(art, case):
     assert _refusal(folder=art, parts=tuple(case["parts"])) is OmittedReason.MISSING
 
 
+@pytest.mark.parametrize(
+    "parts", [("\ud800.png",), ("\ud800", "chart.png")], ids=["file", "folder"]
+)
+def test_a_name_holding_a_lone_surrogate_is_missing(art, tmp_path, parts):
+    """The filesystem can't encode it, so it names nothing, and only a refusal leaves."""
+    source, folder = _draft_artifact(tmp_path=tmp_path)
+
+    with pytest.raises(ArtifactFileRefused) as drafts:
+        artifact_files._open_pinned_draft_file(source, folder, parts)
+
+    assert _refusal(folder=art, parts=parts) is OmittedReason.MISSING
+    assert drafts.value.reason is OmittedReason.MISSING
+
+
 def test_a_directory_at_the_end_is_missing(art):
     (art / "sub").mkdir()
 
