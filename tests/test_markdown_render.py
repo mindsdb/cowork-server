@@ -8,7 +8,7 @@ import markdown
 import pytest
 from markdown.extensions.toc import TocExtension
 
-from cowork.services.markdown_render import render_markdown
+from cowork.services.markdown_render import MAX_FENCE_LENGTH, MarkdownRefused, render_markdown
 from tests._no_fetch import no_fetch, recording_server
 
 
@@ -107,6 +107,38 @@ def test_nesting_too_deep_to_parse_comes_back_as_escaped_text(quote, marker):
     assert html.endswith("</pre>")
     assert "&lt;b&gt;399&lt;/b&gt;" in html
     assert "<b>" not in html
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "`" * (MAX_FENCE_LENGTH + 1) + "\ncode\n" + "`" * (MAX_FENCE_LENGTH + 1) + "\n",
+        "~" * (MAX_FENCE_LENGTH + 1) + "python\n",
+        "intro\n\n   " + "`" * (MAX_FENCE_LENGTH + 1) + "\n",
+        "intro\r" + "~" * (MAX_FENCE_LENGTH + 1) + "\r",
+        "intro\n\x02" + "`" * (MAX_FENCE_LENGTH + 1) + "\n",
+        # A ladder of ever-longer fences, none of them closed.
+        "".join("~" * length + "\n" for length in range(3, 200)),
+    ],
+    ids=["backticks", "tildes", "indented-three", "carriage-returns", "after-stx", "ladder"],
+)
+def test_a_fence_longer_than_the_cap_is_refused(text):
+    with pytest.raises(MarkdownRefused):
+        render_markdown(text=text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "`" * MAX_FENCE_LENGTH + "\ncode\n" + "`" * MAX_FENCE_LENGTH + "\n",
+        "~" * MAX_FENCE_LENGTH + "\ncode\n" + "~" * MAX_FENCE_LENGTH + "\n",
+        # Four spaces make an indented code block, not a fence.
+        "    " + "`" * (MAX_FENCE_LENGTH + 1) + "\n",
+    ],
+    ids=["backticks", "tildes", "indented-four"],
+)
+def test_a_fence_at_the_cap_renders(text):
+    assert render_markdown(text=text)
 
 
 def test_rendering_makes_no_network_or_process_call():

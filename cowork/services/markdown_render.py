@@ -17,7 +17,17 @@ from markdown.extensions.sane_lists import SaneListExtension
 from markdown.extensions.tables import TableExtension
 from markdown.extensions.toc import IDCOUNT_RE, render_inner_html, slugify
 from markdown.treeprocessors import Treeprocessor
+from markdown.util import ETX, STX
 
+# The longest run of backticks or tildes a fence may open with. Python-Markdown
+# looks for each unclosed fence's closer through the rest of the document, so
+# a ladder of ever-longer fences, which no real document needs, holds the
+# whole process for about a minute at the 2 MiB read bound.
+MAX_FENCE_LENGTH = 32
+# A line that opens a longer fence, after at most three spaces.
+_LONG_FENCE = re.compile(
+    r"^ {0,3}(?:`{%d,}|~{%d,})" % (MAX_FENCE_LENGTH + 1, MAX_FENCE_LENGTH + 1), re.MULTILINE
+)
 _HEADINGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
 # A tag in a heading's rendered HTML. It can't run past another "<", so a
 # heading full of unclosed "<" still strips in linear time.
@@ -25,6 +35,10 @@ _TAG = re.compile(r"<[^<>]*>")
 # A longer numeric suffix is part of the id's stem. ``int()`` is quadratic in
 # the digits and refuses more than 4300 of them.
 _MAX_COUNT_DIGITS = 32
+
+
+class MarkdownRefused(Exception):
+    """Markdown that ``render_markdown`` refuses before Python-Markdown reads it."""
 
 
 def render_markdown(*, text: str) -> str:
@@ -38,7 +52,11 @@ def render_markdown(*, text: str) -> str:
     Python-Markdown parses nested lists recursively, so a few hundred levels
     raise ``RecursionError``. Such a document comes back as
     its own text in a ``pre`` block, so the export still holds every word.
+
+    Raises ``MarkdownRefused`` when a line opens a fence longer than
+    ``MAX_FENCE_LENGTH``. Nothing else bounds how long a conversion takes.
     """
+    _refuse_long_fence(text=text)
     renderer = markdown.Markdown(
         extensions=[
             TableExtension(),
@@ -52,6 +70,14 @@ def render_markdown(*, text: str) -> str:
         return renderer.convert(text)
     except RecursionError:
         return f"<pre>{html.escape(text, quote=False)}</pre>"
+
+
+def _refuse_long_fence(*, text: str) -> None:
+    # Python-Markdown drops STX and ETX and reads a lone CR as a line end
+    # before it looks for fences, so the check reads the text the same way.
+    normalized = text.replace(STX, "").replace(ETX, "").replace("\r", "\n")
+    if _LONG_FENCE.search(normalized):
+        raise MarkdownRefused(f"a fence longer than {MAX_FENCE_LENGTH} characters")
 
 
 class _HeadingIdExtension(Extension):
