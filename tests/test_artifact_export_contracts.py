@@ -1,16 +1,26 @@
 """The export contract: the wire models, the render-service fixtures and the helpers' signatures."""
 import base64
 import inspect
+import typing
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import AnyHttpUrl, BaseModel, ValidationError
+from pydantic_core import PydanticUndefined
 
+from cowork.common.paths import PinnedDir
 from cowork.schemas.artifact_export import (
+    ExportFormat,
+    ExportPdfSettings,
     ExportRequest,
     ExportResult,
+    InlinedDocument,
+    InlineLimits,
+    InlineMode,
     OmittedReason,
     OmittedReference,
+    PdfEngine,
+    RenderPdfRefusal,
     RenderPdfRequest,
     RenderPdfResult,
 )
@@ -93,3 +103,101 @@ def test_export_helpers_take_keyword_arguments_only(helper, names):
     parameters = inspect.signature(helper).parameters.values()
     assert [p.name for p in parameters] == names
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in parameters)
+
+
+@pytest.mark.parametrize(
+    ("helper", "hints"),
+    [
+        (render_markdown, {"text": str, "return": str}),
+        (
+            read_artifact_file,
+            {"folder": PinnedDir, "parts": tuple[str, ...], "max_bytes": int, "return": bytes},
+        ),
+        (
+            inline_artifact_html,
+            {
+                "html": bytes,
+                "folder": PinnedDir,
+                "base_parts": tuple[str, ...],
+                "mode": InlineMode,
+                "limits": InlineLimits,
+                "return": InlinedDocument,
+            },
+        ),
+        (write_docx, {"document": InlinedDocument, "title": str, "return": bytes}),
+        (
+            export_formats,
+            {
+                "source_name": str,
+                "is_backend": bool,
+                "can_edit": bool,
+                "pdf": ExportPdfSettings,
+                "return": list[ExportFormat],
+            },
+        ),
+    ],
+)
+def test_export_helpers_keep_their_parameter_and_return_types(helper, hints):
+    assert typing.get_type_hints(helper) == hints
+
+
+def _fields(model: type[BaseModel]) -> dict[str, tuple[object, object]]:
+    """Each field's type and default, in order; a required field's default is PydanticUndefined."""
+    return {name: (field.annotation, field.default) for name, field in model.model_fields.items()}
+
+
+@pytest.mark.parametrize(
+    ("model", "fields"),
+    [
+        (
+            InlinedDocument,
+            {
+                "html": (str, PydanticUndefined),
+                "omitted": (list[OmittedReference], PydanticUndefined),
+                "inlined_bytes": (int, PydanticUndefined),
+                "scripts_dropped": (bool, PydanticUndefined),
+            },
+        ),
+        (
+            RenderPdfRefusal,
+            {"url": (str, PydanticUndefined), "reason": (str, PydanticUndefined)},
+        ),
+        (
+            RenderPdfResult,
+            {
+                "pdf_base64": (str, PydanticUndefined),
+                "refused": (list[RenderPdfRefusal], PydanticUndefined),
+            },
+        ),
+        (
+            ExportPdfSettings,
+            {
+                "engine": (PdfEngine | None, PydanticUndefined),
+                "render_url": (AnyHttpUrl | None, PydanticUndefined),
+                "timeout_seconds": (float, 60.0),
+                "max_pdf_bytes": (int, 48 * 1024 * 1024),
+                "max_pages": (int, 500),
+            },
+        ),
+    ],
+    ids=["InlinedDocument", "RenderPdfRefusal", "RenderPdfResult", "ExportPdfSettings"],
+)
+def test_export_models_keep_their_fields_and_defaults(model, fields):
+    assert _fields(model) == fields
+
+
+def test_omitted_reasons_and_inline_modes_keep_their_values():
+    assert [reason.value for reason in OmittedReason] == [
+        "scheme",
+        "absolute",
+        "traversal",
+        "housekeeping",
+        "symlink",
+        "reparse_point",
+        "unc_path",
+        "missing",
+        "too_large",
+        "budget",
+        "unsupported_type",
+    ]
+    assert [mode.value for mode in InlineMode] == ["html", "word", "pdf"]
