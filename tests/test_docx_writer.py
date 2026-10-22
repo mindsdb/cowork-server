@@ -475,6 +475,53 @@ def test_images_pass_as_bytes_or_become_a_placeholder(case):
         assert package.text == f"Chart: {placeholder}"
 
 
+def _exif_jpeg(*, entries: int) -> bytes:
+    """A 3x2 JPEG whose Exif directory holds *entries* text entries, all naming one 1 KiB string."""
+    text = b"x" * 1023 + b"\x00"
+    text_offset = 8 + 2 + 12 * entries + 4
+    directory = (
+        struct.pack(">H", entries)
+        + b"".join(
+            struct.pack(">HHII", 0x8000 + index, 2, len(text), text_offset) for index in range(entries)
+        )
+        + struct.pack(">I", 0)
+    )
+    tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + directory + text
+    app1 = b"\xff\xe1" + struct.pack(">H", 8 + len(tiff)) + b"Exif\x00\x00" + tiff
+    sof0 = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, 2, 3, 1) + b"\x01\x11\x00"
+    sos = b"\xff\xda" + struct.pack(">HB", 8, 1) + b"\x01\x00\x00\x3f\x00"
+    return b"\xff\xd8" + app1 + sof0 + sos + b"\x00\xff\xd9"
+
+
+def _chunky_png(*, chunks: int) -> bytes:
+    """A 3x2 PNG of *chunks* chunks in all, padded with empty tEXt chunks."""
+    png = _png(width=3, height=2)
+    header, rest = png[:33], png[33:]  # the signature and IHDR, then IDAT and IEND
+    empty_text = struct.pack(">I", 0) + b"tEXt" + struct.pack(">I", zlib.crc32(b"tEXt"))
+    return header + empty_text * (chunks - 3) + rest
+
+
+@pytest.mark.parametrize(
+    ("data", "picture"),
+    [
+        (_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES), True),
+        (_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1), False),
+        (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS), True),
+        (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS + 1), False),
+    ],
+    ids=["exif-at-the-cap", "exif-past-the-cap", "png-at-the-cap", "png-past-the-cap"],
+)
+def test_a_header_python_docx_would_blow_up_on_becomes_the_placeholder(data, picture):
+    mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
+    uri = f"data:{mime};base64," + base64.b64encode(data).decode()
+    package = _write(f'<p>Chart: <img src="{uri}" alt="crafted"></p>')
+    if picture:
+        assert list(package.media().values()) == [data]
+    else:
+        assert package.media() == {}
+        assert package.text == "Chart: [image: crafted]"
+
+
 @pytest.mark.parametrize("case", _cases("image_sizes.yaml"), ids=_ids(_cases("image_sizes.yaml")))
 def test_images_scale_down_to_fit(case):
     width_px, height_px = case["px"]

@@ -90,6 +90,16 @@ _READ_ATTRIBUTES = ("src", "alt", "href")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_SIGNATURE = b"\xff\xd8\xff"
 _GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
+# python-docx keeps every chunk of a PNG, and every entry of each Exif block's
+# first directory, strings and all, before it reads an image's size. So a
+# small crafted header can cost a second and hundreds of MiB, twice per image.
+# No camera or chart library writes a header past these; an image past them
+# becomes its placeholder text.
+_MAX_PNG_CHUNKS = 4096
+_MAX_EXIF_ENTRIES = 256
+# The JPEG markers python-docx reads without a length: TEM, SOI and RST0-7.
+_JPEG_STANDALONE_MARKERS = frozenset({0x01, 0xD8, *range(0xD0, 0xD8)})
+_JPEG_EOI, _JPEG_SOS, _JPEG_APP1 = 0xD9, 0xDA, 0xE1
 
 # Elements whose content is not document text.
 _SKIPPED_TAGS = frozenset(
@@ -1026,8 +1036,11 @@ def _picture_size(*, data: bytes, max_width: int, max_height: int) -> _PictureSi
     """The image's size in EMU at its own DPI, scaled down to fit the box.
 
     None when python-docx can't read the header: it reads PNG, JPEG with a
-    JFIF or Exif marker, and GIF, and reads no pixels.
+    JFIF or Exif marker, and GIF, and reads no pixels. None too for a header
+    past ``_MAX_PNG_CHUNKS`` or ``_MAX_EXIF_ENTRIES``.
     """
+    if not _header_is_bounded(data=data):
+        return None
     try:
         image = Image.from_blob(data)
         px_width, px_height = image.px_width, image.px_height
@@ -1042,6 +1055,58 @@ def _picture_size(*, data: bytes, max_width: int, max_height: int) -> _PictureSi
     height = px_height * _EMU_PER_INCH / (vert_dpi or _DEFAULT_DPI)
     scale = min(1.0, max_width / width, max_height / height)
     return _PictureSize(width=max(1, int(width * scale)), height=max(1, int(height * scale)))
+
+
+def _header_is_bounded(*, data: bytes) -> bool:
+    """Whether python-docx reads this image's header without a blowup."""
+    if data.startswith(_PNG_SIGNATURE):
+        return _png_chunk_count(data=data) <= _MAX_PNG_CHUNKS
+    if data.startswith(_JPEG_SIGNATURE):
+        return _exif_entry_count(data=data) <= _MAX_EXIF_ENTRIES
+    # python-docx reads only a GIF's screen size.
+    return True
+
+
+def _png_chunk_count(*, data: bytes) -> int:
+    """The chunks python-docx reads, up to IEND; it stops counting past the cap."""
+    count, offset = 0, len(_PNG_SIGNATURE)
+    while offset + 8 <= len(data) and count <= _MAX_PNG_CHUNKS:
+        count += 1
+        if data[offset + 4 : offset + 8] == b"IEND":
+            break
+        offset += 12 + int.from_bytes(data[offset : offset + 4], "big")
+    return count
+
+
+def _exif_entry_count(*, data: bytes) -> int:
+    """The entries python-docx reads from the Exif blocks before a JPEG's scan.
+
+    It finds each marker as python-docx does: the next 0xFF after the last
+    segment, past any 0xFF fill, where an 0xFF 0x00 pair is no marker.
+    """
+    total, position = 0, 0
+    while (ff := data.find(b"\xff", position)) != -1:
+        position = ff + 1
+        while position < len(data) and data[position] == 0xFF:
+            position += 1
+        if position >= len(data) or data[position] in (_JPEG_EOI, _JPEG_SOS):
+            break
+        marker = data[position]
+        position += 1
+        if marker == 0x00 or marker in _JPEG_STANDALONE_MARKERS:
+            continue
+        length = int.from_bytes(data[position : position + 2], "big")
+        if marker == _JPEG_APP1 and data[position + 2 : position + 8] == b"Exif\x00\x00":
+            total += _ifd0_entry_count(tiff=data[position + 8 : position + length])
+        position += length
+    return total
+
+
+def _ifd0_entry_count(*, tiff: bytes) -> int:
+    """How many entries the first directory of a TIFF block declares."""
+    order = "big" if tiff[:2] == b"MM" else "little"
+    directory = int.from_bytes(tiff[4:8], order)
+    return int.from_bytes(tiff[directory : directory + 2], order)
 
 
 def _document_title(*, root: HtmlElement | None) -> str:
