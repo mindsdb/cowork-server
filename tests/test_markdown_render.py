@@ -1,7 +1,12 @@
 """Markdown renders to HTML that the inliner sanitizes afterwards."""
 from __future__ import annotations
 
+import re
+import time
+
+import markdown
 import pytest
+from markdown.extensions.toc import TocExtension
 
 from cowork.services.markdown_render import render_markdown
 from tests._no_fetch import no_fetch, recording_server
@@ -34,6 +39,47 @@ def test_void_elements_render_as_html_not_xhtml():
 
 def test_headings_get_ids():
     assert '<h2 id="results">Results</h2>' in render_markdown(text="## Results\n")
+
+
+def _heading_ids(*, html: str) -> list[str]:
+    return re.findall(r'<h[1-6] id="([^"]*)"', html)
+
+
+# A published copy renders with TocExtension, so a #fragment link must land
+# on the same id in both.
+@pytest.mark.parametrize(
+    "headings",
+    [
+        ["Results", "Results", "Results"],
+        ["a", "a", "a_1", "a_1", "a"],
+        ["a_5", "a_5", "a", "a"],
+        ["", "", "_1"],
+        ["The *big* result", "Use `a<b`", "Fish &amp; chips", "1 < 2 > 0", "žlutý"],
+        ["Note <em>raw</em> html", "Note raw html"],
+        ["a_99999999999", "a_99999999999"],
+    ],
+)
+def test_heading_ids_match_what_toc_extension_gives(headings):
+    text = "".join(f"## {heading}\n\n" for heading in headings)
+    oracle = markdown.Markdown(extensions=[TocExtension()], output_format="html")
+
+    assert _heading_ids(html=render_markdown(text=text)) == _heading_ids(html=oracle.convert(text))
+
+
+def _render_seconds(*, text: str) -> float:
+    started = time.perf_counter()
+    render_markdown(text=text)
+    return time.perf_counter() - started
+
+
+@pytest.mark.parametrize("heading", ["a", "a_100"])
+def test_repeated_headings_take_no_longer_than_distinct_ones(heading):
+    """TocExtension counted past every id a repeat took, so 20,000 repeats took minutes."""
+    count = 20_000
+    distinct = _render_seconds(text="".join(f"# h{index}\n\n" for index in range(count)))
+    repeated = _render_seconds(text=f"# {heading}\n\n" * count)
+
+    assert repeated < 3 * distinct + 0.5
 
 
 def test_raw_html_and_image_references_pass_through_unsanitized():
