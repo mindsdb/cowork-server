@@ -323,11 +323,12 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     """Record the primary the card shows when ``metadata.json`` names none.
 
     Without it, the new file could become the card's primary: the card picks an
-    HTML file over Markdown, and otherwise the newest file. The primary is
-    merged into the latest document and written atomically, as
-    ``ensure_full_id`` widens an id, and the file's timestamps are put back
-    because the artifact's content did not change. A primary that is already
-    set is never changed.
+    HTML file over Markdown, and otherwise the newest file. So it runs before
+    the new file takes its name. The primary is merged into the latest
+    document and written atomically, as ``ensure_full_id`` widens an id, and
+    the file's timestamps are put back because the artifact's content did not
+    change. If the export then fails, the record stays: it names the file the
+    card already shows. A primary that is already set is never changed.
     """
     latest = json.loads(_read_no_follow(folder, _METADATA))
     if not isinstance(latest, dict) or latest.get("primary"):
@@ -404,18 +405,18 @@ def _write_beside(
     parts: tuple[str, ...],
     extension: str,
     data: bytes,
-    after_placing: Callable[[], None],
+    before_placing: Callable[[], None],
 ) -> str:
     """Write *data* next to the source at *parts* under the first free name.
 
     The names run ``report.docx``, ``report (2).docx``, ``report (3).docx``,
     and never the source's own name. The bytes go to a temporary file created
-    with ``O_EXCL | O_NOFOLLOW``, which then takes the free name without
-    replacing anything; on a volume with no hard links the bytes are written
-    to the free name itself, created the same way. The temporary name is
-    always removed, as soon as the file has its own. Then *after_placing*
-    runs; if it raises, the new file is removed too, so a failed export
-    leaves nothing behind. Returns the name.
+    with ``O_EXCL | O_NOFOLLOW``. Then *before_placing* runs, and only once it
+    returns does the file take the free name, without replacing anything; on
+    a volume with no hard links the bytes are written to the free name
+    itself, created the same way. The temporary name is always removed, as
+    soon as the file has its own, so a failed export leaves no file behind.
+    Returns the name.
     """
     source_name = parts[-1]
     stem = PurePosixPath(source_name).stem
@@ -433,6 +434,7 @@ def _write_beside(
                 _write_all(fd, data)
             finally:
                 os.close(fd)
+            before_placing()
             name = _place_temporary(
                 parent=parent,
                 temporary=temporary,
@@ -446,14 +448,6 @@ def _write_beside(
                 dir_unlink(parent, temporary)
             except FileNotFoundError:
                 pass
-        try:
-            after_placing()
-        except BaseException:
-            try:
-                dir_unlink(parent, name)
-            except OSError:
-                pass
-            raise
         return name
 
 
@@ -539,7 +533,7 @@ def export_primary_file(
             parts=parts,
             extension=extension,
             data=output,
-            after_placing=lambda: _record_primary(folder=folder, primary="/".join(parts)),
+            before_placing=lambda: _record_primary(folder=folder, primary="/".join(parts)),
         )
     rel_path = "/".join((*parts[:-1], name))
     return ExportResult(

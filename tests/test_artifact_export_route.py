@@ -392,8 +392,13 @@ def _newest(path: Path) -> None:
     os.utime(path, (later, later))
 
 
-def test_an_export_with_no_free_name_answers_500_and_changes_nothing(client, local_artifact):
-    """No primary is recorded and no temporary file stays when no name is free."""
+def _without_metadata(snapshot: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in snapshot.items() if key != "metadata.json"}
+
+
+def test_an_export_with_no_free_name_answers_500_and_writes_no_file(client, local_artifact):
+    """The primary is recorded before any name is tried, as the card already
+    shows it, and no temporary file stays when no name is free."""
     taken = {"report.docx": b"old", **{f"report ({n}).docx": b"old" for n in range(2, 101)}}
     folder = local_artifact({**taken, "report.md": "# R\n"})
     _newest(folder / "report.md")
@@ -402,10 +407,32 @@ def test_an_export_with_no_free_name_answers_500_and_changes_nothing(client, loc
     response = client.post(EXPORT_URL, json={"format": "docx"})
 
     assert response.status_code == 500, response.text
-    assert _snapshot(folder) == before
+    assert _without_metadata(_snapshot(folder)) == _without_metadata(before)
+    assert _metadata(folder)["primary"] == "report.md"
 
 
-def test_a_failure_after_the_file_is_placed_removes_it(client, local_artifact, monkeypatch):
+def test_the_primary_is_recorded_before_the_new_file_takes_its_name(
+    client, local_artifact, monkeypatch
+):
+    """A process stopped between the two steps leaves the card as it was: the
+    new report.html never stands beside report.md with no primary recorded."""
+    folder = local_artifact({"report.md": "# R\n"})
+    place = artifact_export._place_temporary
+    recorded: list[object] = []
+
+    def spy(**kwargs):
+        recorded.append(_metadata(folder).get("primary"))
+        return place(**kwargs)
+
+    monkeypatch.setattr(artifact_export, "_place_temporary", spy)
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    assert recorded == ["report.md"]
+
+
+def test_a_failure_to_record_the_primary_writes_nothing(client, local_artifact, monkeypatch):
     folder = local_artifact({"report.md": "# R\n"})
     before = _snapshot(folder)
 
