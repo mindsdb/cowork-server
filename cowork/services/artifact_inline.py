@@ -263,7 +263,8 @@ _BASE64_WHITESPACE = re.compile(rb"[ \t\n\r\f]")
 _JPEG_FRAME_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 )
-_JPEG_STANDALONE_MARKERS = frozenset({0x01, 0xD8, *range(0xD0, 0xD8)})
+# The JPEG markers with no length after them: TEM, SOI and RST0-7.
+JPEG_STANDALONE_MARKERS = frozenset({0x01, 0xD8, *range(0xD0, 0xD8)})
 _FONT_SIGNATURES = (
     (b"wOF2", "font/woff2"),
     (b"wOFF", "font/woff"),
@@ -1358,7 +1359,7 @@ def _jpeg_header(*, data: bytes) -> _ImageHeader | None:
         if marker == 0xFF:
             position += 1
             continue
-        if marker in _JPEG_STANDALONE_MARKERS:
+        if marker in JPEG_STANDALONE_MARKERS:
             position += 2
             continue
         if marker in (0xD9, 0xDA):

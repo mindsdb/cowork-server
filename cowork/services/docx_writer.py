@@ -40,7 +40,12 @@ from lxml.etree import ParserError
 from lxml.html import HtmlElement
 
 from cowork.schemas.artifact_export import InlinedDocument
-from cowork.services.artifact_inline import TRUNCATION_NOTE, XML_UNSAFE, parse_stopped
+from cowork.services.artifact_inline import (
+    JPEG_STANDALONE_MARKERS,
+    TRUNCATION_NOTE,
+    XML_UNSAFE,
+    parse_stopped,
+)
 
 MAX_DEPTH = 256
 MAX_NODES = 200_000
@@ -90,15 +95,16 @@ _READ_ATTRIBUTES = ("src", "alt", "href")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_SIGNATURE = b"\xff\xd8\xff"
 _GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
-# python-docx keeps every chunk of a PNG, and every entry of each Exif block's
-# first directory, strings and all, before it reads an image's size. So a
-# small crafted header can cost a second and hundreds of MiB, twice per image.
-# No camera or chart library writes a header past these; an image past them
-# becomes its placeholder text.
+# python-docx keeps every chunk of a PNG, every marker before a JPEG's scan,
+# and every entry of each Exif block's first directory, strings and all,
+# before it reads an image's size. So a small crafted header can cost a
+# second and hundreds of MiB, twice per image. No camera or chart library
+# writes a header past these; an image past them becomes its placeholder
+# text. The marker cap counts each 0xFF 0x00 pair among the markers too, as
+# python-docx steps past those one at a time.
 _MAX_PNG_CHUNKS = 4096
+_MAX_JPEG_MARKERS = 4096
 _MAX_EXIF_ENTRIES = 256
-# The JPEG markers python-docx reads without a length: TEM, SOI and RST0-7.
-_JPEG_STANDALONE_MARKERS = frozenset({0x01, 0xD8, *range(0xD0, 0xD8)})
 _JPEG_EOI, _JPEG_SOS, _JPEG_APP1 = 0xD9, 0xDA, 0xE1
 
 # Elements whose content is not document text.
@@ -1037,7 +1043,8 @@ def _picture_size(*, data: bytes, max_width: int, max_height: int) -> _PictureSi
 
     None when python-docx can't read the header: it reads PNG, JPEG with a
     JFIF or Exif marker, and GIF, and reads no pixels. None too for a header
-    past ``_MAX_PNG_CHUNKS`` or ``_MAX_EXIF_ENTRIES``.
+    past ``_MAX_PNG_CHUNKS``, ``_MAX_JPEG_MARKERS`` or ``_MAX_EXIF_ENTRIES``,
+    or with an Exif block shorter than its own header.
     """
     if not _header_is_bounded(data=data):
         return None
@@ -1062,7 +1069,7 @@ def _header_is_bounded(*, data: bytes) -> bool:
     if data.startswith(_PNG_SIGNATURE):
         return _png_chunk_count(data=data) <= _MAX_PNG_CHUNKS
     if data.startswith(_JPEG_SIGNATURE):
-        return _exif_entry_count(data=data) <= _MAX_EXIF_ENTRIES
+        return _jpeg_header_is_bounded(data=data)
     # python-docx reads only a GIF's screen size.
     return True
 
@@ -1078,13 +1085,14 @@ def _png_chunk_count(*, data: bytes) -> int:
     return count
 
 
-def _exif_entry_count(*, data: bytes) -> int:
-    """The entries python-docx reads from the Exif blocks before a JPEG's scan.
+def _jpeg_header_is_bounded(*, data: bytes) -> bool:
+    """Whether python-docx reads the markers before a JPEG's scan within the caps.
 
     It finds each marker as python-docx does: the next 0xFF after the last
-    segment, past any 0xFF fill, where an 0xFF 0x00 pair is no marker.
+    segment, past any 0xFF fill, where an 0xFF 0x00 pair is no marker. It
+    stops as soon as a cap is passed, so its own cost stays small.
     """
-    total, position = 0, 0
+    markers, entries, position = 0, 0, 0
     while (ff := data.find(b"\xff", position)) != -1:
         position = ff + 1
         while position < len(data) and data[position] == 0xFF:
@@ -1093,13 +1101,22 @@ def _exif_entry_count(*, data: bytes) -> int:
             break
         marker = data[position]
         position += 1
-        if marker == 0x00 or marker in _JPEG_STANDALONE_MARKERS:
+        markers += 1
+        if markers > _MAX_JPEG_MARKERS:
+            return False
+        if marker == 0x00 or marker in JPEG_STANDALONE_MARKERS:
             continue
         length = int.from_bytes(data[position : position + 2], "big")
         if marker == _JPEG_APP1 and data[position + 2 : position + 8] == b"Exif\x00\x00":
-            total += _ifd0_entry_count(tiff=data[position + 8 : position + length])
+            # python-docx reads an Exif block shorter than its own header to
+            # the end of the file.
+            if length < 8:
+                return False
+            entries += _ifd0_entry_count(tiff=data[position + 8 : position + length])
+            if entries > _MAX_EXIF_ENTRIES:
+                return False
         position += length
-    return total
+    return True
 
 
 def _ifd0_entry_count(*, tiff: bytes) -> int:

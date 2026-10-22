@@ -493,6 +493,39 @@ def _exif_jpeg(*, entries: int) -> bytes:
     return b"\xff\xd8" + app1 + sof0 + sos + b"\x00\xff\xd9"
 
 
+_JFIF_APP0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00\x01\x01\x00\x00\x48\x00\x48\x00\x00"
+_SOF0 = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, 2, 3, 1) + b"\x01\x11\x00"
+_SOS = b"\xff\xda" + struct.pack(">HB", 8, 1) + b"\x01\x00\x00\x3f\x00"
+
+
+def _short_exif_jpeg(*, entries: int) -> bytes:
+    """A 3x2 JFIF JPEG whose Exif block, after the frame header, says it is 2 bytes long.
+
+    Its directory holds *entries* text entries, and no byte of the block is
+    0xFF, so python-docx reads the block to the end of the file and parses it.
+    """
+    text = b"x" * 1023 + b"\x00"
+    text_offset = 8 + 2 + 12 * entries + 4
+    tags = [tag for tag in range(0x8001, 0x9000) if 0xFF not in tag.to_bytes(2, "big")][:entries]
+    directory = (
+        struct.pack(">H", entries)
+        + b"".join(struct.pack(">HHII", tag, 2, len(text), text_offset) for tag in tags)
+        + struct.pack(">I", 0)
+    )
+    tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + directory + text
+    app1 = b"\xff\xe1" + struct.pack(">H", 2) + b"Exif\x00\x00" + tiff
+    return b"\xff\xd8" + _JFIF_APP0 + _SOF0 + app1 + _SOS + b"\x00\xff\xd9"
+
+
+def _padded_jpeg(*, markers: int, padding: bytes) -> bytes:
+    """A 3x2 JFIF JPEG with *markers* in all before its scan, SOI first.
+
+    *padding*, a TEM marker or an 0xFF 0x00 pair, fills them out after the
+    frame header.
+    """
+    return b"\xff\xd8" + _JFIF_APP0 + _SOF0 + padding * (markers - 3) + _SOS + b"\x00\xff\xd9"
+
+
 def _chunky_png(*, chunks: int) -> bytes:
     """A 3x2 PNG of *chunks* chunks in all, padded with empty tEXt chunks."""
     png = _png(width=3, height=2)
@@ -508,8 +541,16 @@ def _chunky_png(*, chunks: int) -> bytes:
         (_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1), False),
         (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS), True),
         (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS + 1), False),
+        (_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1), False),
+        (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS, padding=b"\xff\x01"), True),
+        (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x01"), False),
+        (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x00"), False),
     ],
-    ids=["exif-at-the-cap", "exif-past-the-cap", "png-at-the-cap", "png-past-the-cap"],
+    ids=[
+        "exif-at-the-cap", "exif-past-the-cap", "png-at-the-cap", "png-past-the-cap",
+        "exif-shorter-than-its-header", "markers-at-the-cap", "markers-past-the-cap",
+        "ff00-pairs-past-the-cap",
+    ],
 )
 def test_a_header_python_docx_would_blow_up_on_becomes_the_placeholder(data, picture):
     mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
