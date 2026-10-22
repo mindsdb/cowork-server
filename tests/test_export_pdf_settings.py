@@ -114,6 +114,20 @@ def test_the_cli_refuses_to_start_before_serving(monkeypatch):
     assert served == []
 
 
+def test_a_refused_render_url_stays_out_of_the_error():
+    """The URL can carry credentials, so the message names the setting instead."""
+    with pytest.raises(ValueError) as refused:
+        load_export_pdf_settings(
+            environ={
+                EXPORT_PDF_ENGINE_VAR: "render",
+                EXPORT_RENDER_URL_VAR: "ftp://user:secret@render.internal/",
+            }
+        )
+    assert EXPORT_RENDER_URL_VAR in str(refused.value)
+    assert "secret" not in str(refused.value)
+    assert "render.internal" not in str(refused.value)
+
+
 def test_pdf_settings_only_in_cowork_home_dotenv_offer_no_pdf(monkeypatch, tmp_path):
     monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     (tmp_path / ".env").write_text(PDF_LINES + "COWORK_SERVER_HOST=0.0.0.0\n", encoding="utf-8")

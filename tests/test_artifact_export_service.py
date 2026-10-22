@@ -173,37 +173,57 @@ async def test_one_export_per_user_and_per_org(monkeypatch):
     monkeypatch.setattr(artifact_export, "_conversion_limiter", anyio.CapacityLimiter(3))
     alice = _org_scope("org-1", "alice")
 
-    async with export_slot(scope=alice):
+    async with export_slot(scope=alice, export_format="docx"):
         for other in (alice, _org_scope("org-1", "bob"), _org_scope("org-2", "alice")):
             with pytest.raises(ExportRefused) as busy:
-                async with export_slot(scope=other):
+                async with export_slot(scope=other, export_format="docx"):
                     pass
             assert busy.value.refusal is ExportRefusal.BUSY
-        async with export_slot(scope=_org_scope("org-2", "carol")):
+        async with export_slot(scope=_org_scope("org-2", "carol"), export_format="docx"):
             pass
 
-    async with export_slot(scope=alice):
+    async with export_slot(scope=alice, export_format="docx"):
         pass
 
 
 async def test_html_and_word_export_run_one_conversion_at_a_time():
-    async with export_slot(scope=_org_scope("org-1", "alice")):
+    async with export_slot(scope=_org_scope("org-1", "alice"), export_format="docx"):
         for other in (_org_scope("org-2", "bob"), LOCAL_SCOPE, None):
             with pytest.raises(ExportRefused) as busy:
-                async with export_slot(scope=other):
+                async with export_slot(scope=other, export_format="docx"):
                     pass
             assert busy.value.refusal is ExportRefusal.BUSY
 
-    async with export_slot(scope=LOCAL_SCOPE):
+    async with export_slot(scope=LOCAL_SCOPE, export_format="docx"):
         pass
+
+
+@pytest.mark.parametrize(
+    ("running", "second"), [("pdf", "docx"), ("docx", "pdf"), ("pdf", "html"), ("html", "pdf")]
+)
+async def test_one_person_and_one_org_run_one_export_across_formats(running, second):
+    async with export_slot(scope=_org_scope("org-1", "alice"), export_format=running):
+        for other in (_org_scope("org-1", "alice"), _org_scope("org-1", "bob")):
+            with pytest.raises(ExportRefused) as busy:
+                async with export_slot(scope=other, export_format=second):
+                    pass
+            assert busy.value.refusal is ExportRefusal.BUSY
+
+
+async def test_a_deployment_that_names_no_person_runs_one_export_across_formats():
+    async with export_slot(scope=LOCAL_SCOPE, export_format="pdf"):
+        with pytest.raises(ExportRefused) as busy:
+            async with export_slot(scope=LOCAL_SCOPE, export_format="docx"):
+                pass
+        assert busy.value.refusal is ExportRefusal.BUSY
 
 
 async def test_a_failed_export_frees_its_slot():
     alice = _org_scope("org-1", "alice")
 
     with pytest.raises(RuntimeError):
-        async with export_slot(scope=alice):
+        async with export_slot(scope=alice, export_format="docx"):
             raise RuntimeError("conversion failed")
 
-    async with export_slot(scope=alice):
+    async with export_slot(scope=alice, export_format="docx"):
         pass

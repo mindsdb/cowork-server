@@ -434,6 +434,18 @@ async def test_an_unreachable_render_service_answers_502():
     assert await _status(client=client) == 502
 
 
+async def test_an_unreachable_render_service_leaves_its_url_out_of_the_failure():
+    url = _closed_port_url().replace("http://", "http://user:secret@")
+    client = RenderServicePdf(settings=_settings(render_url=url))
+
+    with pytest.raises(RenderPdfFailed) as failure:
+        await client.render(request=REQUEST)
+
+    assert failure.value.status == 502
+    assert "secret" not in str(failure.value)
+    assert "127.0.0.1" not in str(failure.value)
+
+
 async def test_a_compressed_answer_answers_502_before_it_is_inflated():
     # Two gzip layers: a few hundred bytes on the wire, 32 MiB once inflated.
     body = gzip.compress(gzip.compress(bytes(32 * MIB)))
