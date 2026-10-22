@@ -60,6 +60,8 @@ MAX_LIST_NUMBER = 32_767
 MAX_TITLE_LENGTH = 255
 LINK_SCHEMES = frozenset({"http", "https", "mailto"})
 MONOSPACE_FONT = "Courier New"
+# The paragraph that ends a document whose tables lost cells to the limits above.
+TABLE_CELLS_NOTE = "Some table cells were left out because a table was too large to convert."
 
 _LINK_COLOR = RGBColor(0x05, 0x63, 0xC1)
 _SMALL_SIZE = Pt(9)
@@ -263,6 +265,7 @@ class _CellPlacement:
 class _TableLayout:
     placements: list[_CellPlacement]
     columns: int
+    cells_dropped: bool  # a row ran past MAX_TABLE_COLUMNS
 
 
 def write_docx(*, document: InlinedDocument, title: str) -> bytes:
@@ -284,7 +287,13 @@ def write_docx(*, document: InlinedDocument, title: str) -> bytes:
     _set_core_properties(
         word=word, title=_document_title(root=root) or _collapse(text=_xml_safe(text=title)).strip()
     )
-    complete = root is None or _Writer(word=word, deadline=deadline).write(root=root)
+    complete, cells_dropped = True, False
+    if root is not None:
+        writer = _Writer(word=word, deadline=deadline)
+        complete = writer.write(root=root)
+        cells_dropped = writer.cells_dropped
+    if cells_dropped:
+        word.add_paragraph(TABLE_CELLS_NOTE)
     # Past a resource limit, such as nesting deeper than 256, libxml2 stops
     # parsing and the tree holds only what came before.
     if not complete or parse_stopped(error_log=parser.error_log):
@@ -363,6 +372,8 @@ class _Writer:
         self._nodes = 0
         self._cells_left = MAX_TABLE_CELLS
         self._stopped = False
+        # Set when a table limit leaves out a cell or a row.
+        self.cells_dropped = False
         section = word.sections[0]
         self._page_width = section.page_width - section.left_margin - section.right_margin
         self._page_height = section.page_height - section.top_margin - section.bottom_margin
@@ -718,16 +729,20 @@ class _Writer:
                 if row is None:
                     if loose_row is None:
                         if len(parts.rows) >= self._cells_left:
+                            self.cells_dropped = True
                             break
                         loose_row = []
                         parts.rows.append(loose_row)
                     row = loose_row
                 if len(row) < MAX_TABLE_COLUMNS:
                     row.append(element)
+                else:
+                    self.cells_dropped = True
                 _add_stray_text(parts=parts, table=table, text=element.tail)
             elif tag == "tr":
                 loose_row = None
                 if len(parts.rows) >= self._cells_left:
+                    self.cells_dropped = True
                     break
                 cells: list[HtmlElement] = []
                 parts.rows.append(cells)
@@ -763,6 +778,9 @@ class _Writer:
         layout = _layout(rows=parts.rows)
         columns = layout.columns
         row_count = min(len(parts.rows), self._cells_left // columns) if columns else 0
+        dropped_rows = any(placement.row >= row_count for placement in layout.placements)
+        if layout.cells_dropped or dropped_rows:
+            self.cells_dropped = True
         if row_count == 0:
             return []
         self._cells_left -= row_count * columns
@@ -860,6 +878,7 @@ def _layout(*, rows: list[list[HtmlElement]]) -> _TableLayout:
     covered = [0] * MAX_TABLE_COLUMNS
     placements: list[_CellPlacement] = []
     columns = 0
+    cells_dropped = False
     for row_index, cells in enumerate(rows):
         column = 0
         rows_left = len(rows) - row_index
@@ -867,6 +886,7 @@ def _layout(*, rows: list[list[HtmlElement]]) -> _TableLayout:
             while column < MAX_TABLE_COLUMNS and covered[column]:
                 column += 1
             if column >= MAX_TABLE_COLUMNS:
+                cells_dropped = True
                 break
             wanted = _span(value=cell.get("colspan"), limit=MAX_TABLE_COLUMNS, zero_means=1)
             colspan = 0
@@ -881,7 +901,7 @@ def _layout(*, rows: list[list[HtmlElement]]) -> _TableLayout:
             column += colspan
             columns = max(columns, column)
         covered = [max(0, left - 1) for left in covered]
-    return _TableLayout(placements=placements, columns=columns)
+    return _TableLayout(placements=placements, columns=columns, cells_dropped=cells_dropped)
 
 
 def _span(*, value: str | None, limit: int, zero_means: int) -> int:

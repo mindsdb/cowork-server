@@ -35,6 +35,7 @@ from cowork.services.docx_writer import (
     MAX_NODES,
     MAX_TABLE_CELLS,
     MAX_TABLE_COLUMNS,
+    TABLE_CELLS_NOTE,
     TRUNCATION_NOTE,
     write_docx,
 )
@@ -669,13 +670,54 @@ def test_content_outside_table_cells_is_kept(case):
     assert tables == case["tables"]
 
 
-def test_tables_clamp_to_63_columns():
+def test_tables_clamp_to_63_columns_and_say_so():
     cells = "".join(f"<td>c{index}</td>" for index in range(1, MAX_TABLE_COLUMNS + 2))
     package = _write(f"<table><tr>{cells}</tr></table>")
     [table] = package.document.tables
     assert len(table.columns) == MAX_TABLE_COLUMNS
     assert table.cell(0, MAX_TABLE_COLUMNS - 1).text == f"c{MAX_TABLE_COLUMNS}"
     assert f"c{MAX_TABLE_COLUMNS + 1}" not in package.text
+    assert package.document.paragraphs[-1].text == TABLE_CELLS_NOTE
+
+
+def test_a_cell_pushed_past_63_columns_by_spans_is_left_out_and_said_so():
+    spanning = f'<td colspan="{MAX_TABLE_COLUMNS}">wide</td><td>pushed out</td>'
+    package = _write(f"<table><tr>{spanning}</tr></table>")
+    assert "pushed out" not in package.text
+    assert package.document.paragraphs[-1].text == TABLE_CELLS_NOTE
+
+
+def test_rows_past_the_cell_budget_are_left_out_and_said_so():
+    row = "<tr>" + "<td>cell</td>" * MAX_TABLE_COLUMNS + "</tr>"
+    rows_that_fit = MAX_TABLE_CELLS // MAX_TABLE_COLUMNS
+    package = _write(f"<table>{row * (rows_that_fit + 1)}</table><p>after</p>")
+    [table] = package.document.tables
+    assert len(table.rows) == rows_that_fit
+    assert [paragraph.text for paragraph in package.document.paragraphs[-2:]] == [
+        "after",
+        TABLE_CELLS_NOTE,
+    ]
+
+
+@pytest.mark.parametrize(
+    "late", ["<tr><td>late</td></tr>", "<td>late</td>"], ids=["row", "loose_cell"]
+)
+def test_a_table_after_the_cell_budget_is_spent_is_left_out_and_said_so(late):
+    full_row = "<tr>" + "<td></td>" * MAX_TABLE_COLUMNS + "</tr>"
+    rows_that_fit = MAX_TABLE_CELLS // MAX_TABLE_COLUMNS
+    rest = "<tr><td></td></tr>" * (MAX_TABLE_CELLS - rows_that_fit * MAX_TABLE_COLUMNS)
+    package = _write(
+        f"<table>{full_row * rows_that_fit}</table><table>{rest}</table><table>{late}</table>"
+    )
+    assert len(package.document.tables) == 2
+    assert "late" not in package.text
+    assert package.document.paragraphs[-1].text == TABLE_CELLS_NOTE
+
+
+def test_a_table_within_the_limits_says_nothing():
+    package = _write("<table><tr><td>a</td><td>b</td></tr></table><p>after</p>")
+    assert TABLE_CELLS_NOTE not in package.text
+    assert package.document.paragraphs[-1].text == "after"
 
 
 def test_table_cells_stay_within_the_document_budget():
@@ -696,7 +738,10 @@ def test_table_cells_stay_within_the_document_budget():
     assert table.cell(0, 0)._tc is table.cell(rows_that_fit - 1, MAX_TABLE_COLUMNS - 1)._tc
     assert len(list(package.document.element.body.iter(qn("w:tc")))) <= MAX_TABLE_CELLS
     assert "second table" not in package.text
-    assert package.document.paragraphs[-1].text == "after the tables"
+    assert [paragraph.text for paragraph in package.document.paragraphs[-2:]] == [
+        "after the tables",
+        TABLE_CELLS_NOTE,
+    ]
 
 
 def test_nested_table_keeps_the_text_order():
