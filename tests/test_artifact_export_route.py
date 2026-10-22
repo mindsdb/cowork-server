@@ -432,6 +432,33 @@ def test_the_primary_is_recorded_before_the_new_file_takes_its_name(
     assert recorded == ["report.md"]
 
 
+def test_a_temporary_name_that_stays_takes_the_placed_file_with_it(
+    client, local_artifact, monkeypatch
+):
+    """The placed file shares its inode with the temporary name until that
+    goes, and the drafts route refuses a file with two links. So when the
+    temporary name can't be removed, no file is left at an output name."""
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    before = _snapshot(folder)
+    unlink = artifact_export.dir_unlink
+
+    def stuck(parent, name):
+        if name.startswith(".cowork-export-"):
+            raise OSError(errno.EIO, "Input/output error")
+        unlink(parent, name)
+
+    monkeypatch.setattr(artifact_export, "dir_unlink", stuck)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    after = _snapshot(folder)
+    (left,) = set(after) - set(before)
+    assert left.startswith(".cowork-export-")
+    assert {key: after[key] for key in before} == before
+    assert (folder / left).stat().st_nlink == 1
+
+
 def test_a_failure_to_record_the_primary_writes_nothing(client, local_artifact, monkeypatch):
     folder = local_artifact({"report.md": "# R\n"})
     before = _snapshot(folder)

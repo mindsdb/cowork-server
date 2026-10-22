@@ -445,6 +445,7 @@ def _write_beside(
             opened.callback(parent.close)
         temporary = f".cowork-export-{secrets.token_hex(12)}.tmp"
         fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
+        name = None
         try:
             try:
                 _write_all(fd, data)
@@ -460,11 +461,28 @@ def _write_beside(
                 data=data,
             )
         finally:
-            try:
-                dir_unlink(parent, temporary)
-            except FileNotFoundError:
-                pass
+            _remove_temporary(parent=parent, temporary=temporary, placed=name)
         return name
+
+
+def _remove_temporary(*, parent: PinnedDir, temporary: str, placed: str | None) -> None:
+    """Remove the temporary name, and the placed file too if that fails.
+
+    Until the temporary name goes, a linked file has two links, and the drafts
+    route never serves a file with a second link. So an export whose
+    temporary name stays fails, and leaves no file at an output name.
+    """
+    try:
+        dir_unlink(parent, temporary)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        if placed is not None:
+            try:
+                dir_unlink(parent, placed)
+            except OSError:
+                pass
+        raise
 
 
 def _place_temporary(
