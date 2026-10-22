@@ -1065,12 +1065,18 @@ def _picture_size(*, data: bytes, max_width: int, max_height: int) -> _PictureSi
 
 
 def _header_is_bounded(*, data: bytes) -> bool:
-    """Whether python-docx reads this image's header without a blowup."""
+    """Whether python-docx reads this image's header without a blowup.
+
+    It picks the parser in python-docx's order: the PNG signature first,
+    then a JFIF or Exif tag at offset 6, and only then the GIF signature.
+    So bytes with a GIF signature and either tag are read as a JPEG.
+    """
     if data.startswith(_PNG_SIGNATURE):
         return _png_chunk_count(data=data) <= _MAX_PNG_CHUNKS
-    if data.startswith(_JPEG_SIGNATURE):
+    if data[6:10] in (b"JFIF", b"Exif"):
         return _jpeg_header_is_bounded(data=data)
-    # python-docx reads only a GIF's screen size.
+    # python-docx reads a GIF only for its screen size, and raises at once
+    # on a JPEG with neither tag.
     return True
 
 

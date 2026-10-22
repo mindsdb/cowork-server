@@ -498,11 +498,12 @@ _SOF0 = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, 2, 3, 1) + b"\x01\x11\x00"
 _SOS = b"\xff\xda" + struct.pack(">HB", 8, 1) + b"\x01\x00\x00\x3f\x00"
 
 
-def _short_exif_jpeg(*, entries: int) -> bytes:
-    """A 3x2 JFIF JPEG whose Exif block, after the frame header, says it is 2 bytes long.
+def _short_exif_jpeg(*, entries: int, length: int) -> bytes:
+    """A 3x2 JFIF JPEG whose Exif block, after the frame header, says it is *length* bytes long.
 
     Its directory holds *entries* text entries, and no byte of the block is
-    0xFF, so python-docx reads the block to the end of the file and parses it.
+    0xFF. Under 8 bytes, python-docx reads the block to the end of the file
+    and parses it.
     """
     text = b"x" * 1023 + b"\x00"
     text_offset = 8 + 2 + 12 * entries + 4
@@ -513,7 +514,7 @@ def _short_exif_jpeg(*, entries: int) -> bytes:
         + struct.pack(">I", 0)
     )
     tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + directory + text
-    app1 = b"\xff\xe1" + struct.pack(">H", 2) + b"Exif\x00\x00" + tiff
+    app1 = b"\xff\xe1" + struct.pack(">H", length) + b"Exif\x00\x00" + tiff
     return b"\xff\xd8" + _JFIF_APP0 + _SOF0 + app1 + _SOS + b"\x00\xff\xd9"
 
 
@@ -524,6 +525,15 @@ def _padded_jpeg(*, markers: int, padding: bytes) -> bytes:
     frame header.
     """
     return b"\xff\xd8" + _JFIF_APP0 + _SOF0 + padding * (markers - 3) + _SOS + b"\x00\xff\xd9"
+
+
+def _gif_signed(*, tag: bytes, jpeg: bytes) -> bytes:
+    """*jpeg* behind a GIF signature, with *tag* at offset 6.
+
+    python-docx checks for a JFIF or Exif tag at offset 6 before it checks
+    for a GIF signature, so it reads this as a JPEG and walks every marker.
+    """
+    return b"GIF89a" + tag + b"\x00" + jpeg
 
 
 def _chunky_png(*, chunks: int) -> bytes:
@@ -541,15 +551,31 @@ def _chunky_png(*, chunks: int) -> bytes:
         (_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1), False),
         (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS), True),
         (_chunky_png(chunks=docx_writer._MAX_PNG_CHUNKS + 1), False),
-        (_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1), False),
+        (_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1, length=2), False),
+        (_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1, length=7), False),
         (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS, padding=b"\xff\x01"), True),
         (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x01"), False),
         (_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x00"), False),
+        (
+            _gif_signed(
+                tag=b"JFIF",
+                jpeg=_padded_jpeg(markers=docx_writer._MAX_JPEG_MARKERS + 1, padding=b"\xff\x01"),
+            ),
+            False,
+        ),
+        (
+            _gif_signed(
+                tag=b"Exif",
+                jpeg=_short_exif_jpeg(entries=docx_writer._MAX_EXIF_ENTRIES + 1, length=2),
+            ),
+            False,
+        ),
     ],
     ids=[
         "exif-at-the-cap", "exif-past-the-cap", "png-at-the-cap", "png-past-the-cap",
-        "exif-shorter-than-its-header", "markers-at-the-cap", "markers-past-the-cap",
-        "ff00-pairs-past-the-cap",
+        "exif-shorter-than-its-header", "exif-a-byte-short-of-its-header",
+        "markers-at-the-cap", "markers-past-the-cap", "ff00-pairs-past-the-cap",
+        "gif-signed-jfif-past-the-marker-cap", "gif-signed-exif-shorter-than-its-header",
     ],
 )
 def test_a_header_python_docx_would_blow_up_on_becomes_the_placeholder(data, picture):
