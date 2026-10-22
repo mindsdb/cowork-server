@@ -169,6 +169,7 @@ dependencies = [
     # Floor for the PyJWT security fixes; redis and mcp (via anton-agent) pull
     # it in transitively with lower bounds that still allow 2.13.
     "pyjwt>=2.15.0",
+    "structlog==26.1.0",
 ]
 
 [project.urls]
