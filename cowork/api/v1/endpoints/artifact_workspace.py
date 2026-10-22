@@ -41,6 +41,7 @@ from cowork.services.artifact_export import (
     ExportRefused,
     export_primary_file,
     export_slot,
+    org_export_refused,
     primary_export_source,
 )
 from cowork.services.artifact_revisions import (
@@ -605,13 +606,20 @@ async def export_workspace_artifact(
     One route for every tenancy, checked the way a source edit is: the caller
     needs ``artifact.manage`` and must own the artifact, and both checks run
     before the format is read, so a caller who may not export gets 403 or 404
-    whatever they ask for. A busy server answers 429 at once. The conversion
-    runs in a worker thread, and only a 200 leaves a file behind.
+    whatever they ask for. While org export is off, the owner gets 403 too,
+    after those checks, so a caller with no grant still gets 404. A busy
+    server answers 429 at once. The conversion runs in a worker thread, and
+    only a 200 leaves a file behind.
     """
     await require_product_permission(session.scope, "artifact.manage")
     source, folder, metadata, capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
+    if org_export_refused(org_mode=bool(session.scope.org_mode)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Export isn't available on this deployment.",
+        )
     folder_name = _artifact_folder_component(source, folder)
     try:
         async with export_slot(scope=session.scope):

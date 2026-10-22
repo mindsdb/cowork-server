@@ -24,6 +24,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.schemas.artifact_export import ExportPdfSettings
+from cowork.services import artifact_export
 from cowork.services import artifact_ownership as ownership
 from cowork.services.artifact_export import (
     ExportSource,
@@ -214,12 +215,24 @@ def org_world(tmp_path, org_deployment):
     )
 
 
-def test_org_cards_offer_formats_to_the_owner_only(org_world):
-    with _scoped(org_world.org_id, org_world.creator) as session:
-        cards = artifacts_ep._artifact_cards(session, [org_world.source])
+@pytest.fixture
+def org_export_on(monkeypatch):
+    """Turn org export on, as the release that lifts the switch will."""
+    monkeypatch.setattr(artifact_export, "ORG_EXPORT_ENABLED", True)
 
-    listed = {card["slug"]: card["capabilities"]["exportFormats"] for card in cards}
-    assert listed == {"mine": ["html", "docx"], "theirs": [], "orphan": []}
+
+def _org_card_formats(world) -> dict[str, list[str]]:
+    with _scoped(world.org_id, world.creator) as session:
+        cards = artifacts_ep._artifact_cards(session, [world.source])
+    return {card["slug"]: card["capabilities"]["exportFormats"] for card in cards}
+
+
+def test_org_cards_offer_formats_to_the_owner_only(org_world, org_export_on):
+    assert _org_card_formats(org_world) == {"mine": ["html", "docx"], "theirs": [], "orphan": []}
+
+
+def test_org_cards_offer_nothing_while_org_export_is_off(org_world):
+    assert _org_card_formats(org_world) == {"mine": [], "theirs": [], "orphan": []}
 
 
 def _role_permissions(monkeypatch, *, artifact_manage: bool):
@@ -232,16 +245,20 @@ def _role_permissions(monkeypatch, *, artifact_manage: bool):
     monkeypatch.setattr(workspace_ep, "has_product_permission", decide)
 
 
+@pytest.mark.parametrize(
+    ("org_export", "offered"), [(True, ["html", "docx"]), (False, [])], ids=["on", "off"]
+)
 async def test_the_org_workspace_response_offers_formats_to_an_owner_who_may_manage(
-    org_world, monkeypatch
+    org_world, monkeypatch, org_export, offered
 ):
+    monkeypatch.setattr(artifact_export, "ORG_EXPORT_ENABLED", org_export)
     _role_permissions(monkeypatch, artifact_manage=True)
     with _scoped(org_world.org_id, org_world.creator) as session:
         result = await workspace_ep.artifact_source(
             str(org_world.project.id), org_world.ids["mine"], session, path=None
         )
 
-    assert result["capabilities"]["exportFormats"] == ["html", "docx"]
+    assert result["capabilities"]["exportFormats"] == offered
 
 
 async def test_the_workspace_response_offers_nothing_once_artifact_manage_is_gone(

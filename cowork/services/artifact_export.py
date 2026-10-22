@@ -91,6 +91,15 @@ _METADATA = "metadata.json"
 _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
 
+# Org mode offers no export format, and the route answers 403 there. On
+# hosted's pod limits, 1 CPU and 1 GiB, single exports within the org caps
+# held the event loop for 7 s (a ladder of Markdown code fences) or peaked
+# past 500 MiB (a 2 MiB Markdown table, a 10 MiB page of one-word paragraphs);
+# scripts/measure_export_capacity.py holds the cases. A replica serves many
+# people at once, so org export waits until the conversion runs in a process
+# of its own that can be killed.
+ORG_EXPORT_ENABLED = False
+
 # HTML and Word export share one conversion at a time, and each user and each
 # organization one export at a time. Both hold per process, so every replica
 # admits its own. Nothing waits for a slot: a busy server answers at once.
@@ -155,6 +164,25 @@ def export_formats(
 def export_pdf_settings() -> ExportPdfSettings:
     """The PDF settings exports run with. No engine is set, so no format list offers PDF."""
     return ExportPdfSettings(engine=None, render_url=None)
+
+
+def org_export_refused(*, org_mode: bool) -> bool:
+    """Whether export is off for this request: org mode while ``ORG_EXPORT_ENABLED`` is off."""
+    return org_mode and not ORG_EXPORT_ENABLED
+
+
+def offered_export_formats(
+    *, source: ExportSource, can_edit: bool, org_mode: bool
+) -> list[ExportFormat]:
+    """The formats this caller may export: ``export_formats``, or none while org export is off."""
+    if org_export_refused(org_mode=org_mode):
+        return []
+    return export_formats(
+        source_name=source.source_name,
+        is_backend=source.is_backend,
+        can_edit=can_edit,
+        pdf=export_pdf_settings(),
+    )
 
 
 def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
@@ -404,11 +432,13 @@ def export_primary_file(
         if io_folder is None:
             raise ExportRefused(ExportRefusal.NOT_FOUND, "Artifact source not found")
         parts = _primary_parts(folder=io_folder, metadata=metadata)
-        offered = export_formats(
-            source_name="/".join(parts or ()),
-            is_backend=is_backend_type(metadata.get("type")),
+        offered = offered_export_formats(
+            source=ExportSource(
+                source_name="/".join(parts or ()),
+                is_backend=is_backend_type(metadata.get("type")),
+            ),
             can_edit=can_edit,
-            pdf=export_pdf_settings(),
+            org_mode=org_mode,
         )
         extension = _OUTPUT_EXTENSIONS.get(export_format)
         if parts is None or export_format not in offered or extension is None:

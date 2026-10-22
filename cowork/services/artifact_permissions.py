@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 
 from cowork.principal import Principal, can_manage_org
-from cowork.services.artifact_export import ExportSource, export_formats, export_pdf_settings
+from cowork.services.artifact_export import ExportSource, offered_export_formats
 
 _OWNER_ONLY = "Only the artifact owner can change this draft"
 _OWNER_UNKNOWN = "Artifact owner is unknown"
@@ -28,8 +28,9 @@ def artifact_capabilities(
     artifact nobody is recorded as owning says so with ``ownerUnknown``.
 
     With ``export_source``, ``exportFormats`` lists the formats the export
-    route accepts from this caller, from ``export_formats`` alone: none for a
-    caller who can't edit.
+    route accepts from this caller, from ``offered_export_formats`` alone:
+    none for a caller who can't edit, and none in organization mode while
+    org export is off.
     """
     scope = getattr(session, "scope", None)
     if not scope or not scope.org_mode:
@@ -59,11 +60,10 @@ def artifact_capabilities(
         if resolution.unknown:
             capabilities["ownerUnknown"] = True
     if export_source is not None:
-        capabilities["exportFormats"] = export_formats(
-            source_name=export_source.source_name,
-            is_backend=export_source.is_backend,
+        capabilities["exportFormats"] = offered_export_formats(
+            source=export_source,
             can_edit=capabilities["canEdit"],
-            pdf=export_pdf_settings(),
+            org_mode=bool(scope and scope.org_mode),
         )
     return capabilities
 

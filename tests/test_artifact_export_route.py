@@ -550,6 +550,12 @@ def role(monkeypatch):
     return decision
 
 
+@pytest.fixture
+def org_export_on(monkeypatch):
+    """Turn org export on, as the release that lifts the switch will."""
+    monkeypatch.setattr(artifact_export, "ORG_EXPORT_ENABLED", True)
+
+
 async def _export(world, user_id: str, slug: str, export_format: str = "docx", *, org_id=None):
     with _scoped(org_id or world.org_id, user_id) as session:
         return await workspace_ep.export_workspace_artifact(
@@ -560,7 +566,9 @@ async def _export(world, user_id: str, slug: str, export_format: str = "docx", *
         )
 
 
-async def test_the_owner_with_artifact_manage_exports_and_gets_no_serve_url(org_world, role):
+async def test_the_owner_with_artifact_manage_exports_and_gets_no_serve_url(
+    org_world, role, org_export_on
+):
     result = await _export(org_world, org_world.creator, "mine")
 
     folder = org_world.artifacts["mine"].folder
@@ -589,7 +597,12 @@ async def test_the_owner_with_artifact_manage_exports_and_gets_no_serve_url(org_
     ],
     ids=["reviewer", "reviewer-asking-a-format-not-offered", "ownerless", "no-grant", "other-org"],
 )
-async def test_only_the_owner_may_export(org_world, role, who, slug, export_format, status):
+@pytest.mark.parametrize("org_export", [False, True], ids=["org-export-off", "org-export-on"])
+async def test_only_the_owner_may_export(
+    org_world, role, monkeypatch, org_export, who, slug, export_format, status
+):
+    """Each refusal comes before the org export switch, so it holds either way."""
+    monkeypatch.setattr(artifact_export, "ORG_EXPORT_ENABLED", org_export)
     folder = org_world.artifacts[slug].folder
     before = _snapshot(folder)
     user_id = {"member": org_world.member, "creator": org_world.creator, "stranger": str(uuid4())}[who]
@@ -614,7 +627,21 @@ async def test_an_owner_without_artifact_manage_gets_403(org_world, role):
     assert _snapshot(folder) == before
 
 
-async def test_the_owner_asking_a_format_not_offered_gets_422(org_world, role):
+@pytest.mark.parametrize(("slug", "export_format"), [("mine", "docx"), ("page", "html")])
+async def test_while_org_export_is_off_the_owner_gets_403_and_nothing_is_written(
+    org_world, role, slug, export_format
+):
+    folder = org_world.artifacts[slug].folder
+    before = _snapshot(folder)
+
+    with pytest.raises(HTTPException) as refused:
+        await _export(org_world, org_world.creator, slug, export_format)
+
+    assert refused.value.status_code == 403
+    assert _snapshot(folder) == before
+
+
+async def test_the_owner_asking_a_format_not_offered_gets_422(org_world, role, org_export_on):
     folder = org_world.artifacts["page"].folder
     before = _snapshot(folder)
 
@@ -627,7 +654,7 @@ async def test_the_owner_asking_a_format_not_offered_gets_422(org_world, role):
 
 @pytest.mark.parametrize(("org_mode", "budget"), [(True, 10 * MIB), (False, 25 * MIB)])
 async def test_the_word_inline_budget_is_smaller_in_org_mode(
-    org_world, role, monkeypatch, org_mode, budget
+    org_world, role, org_export_on, monkeypatch, org_mode, budget
 ):
     if not org_mode:
         monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
@@ -675,7 +702,7 @@ def padded_png(size: int, *, filler: bytes = b"x") -> bytes:
     return head + chunk(b"teXt", filled) + tail
 
 
-async def test_org_assets_past_the_budget_are_dropped_and_counted(org_world, role):
+async def test_org_assets_past_the_budget_are_dropped_and_counted(org_world, role, org_export_on):
     folder = org_world.artifacts["mine"].folder
     # Each image is under the 2 MiB asset cap even as base64; together they
     # are over the 10 MiB budget.
@@ -692,7 +719,7 @@ async def test_org_assets_past_the_budget_are_dropped_and_counted(org_world, rol
     assert 1 <= len(document.inline_shapes) <= 7
 
 
-async def test_one_export_per_user_and_org_at_a_time(org_world, role, monkeypatch):
+async def test_one_export_per_user_and_org_at_a_time(org_world, role, org_export_on, monkeypatch):
     """While the creator's export runs, the creator's second export and a
     co-member's export of their own artifact both answer 429 at once."""
     import asyncio
