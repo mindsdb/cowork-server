@@ -143,12 +143,14 @@ dependencies = [
     "tzlocal>=5.0",
     "uvicorn>=0.47.0",
     # Document libraries, for export and for agent code cells. Pins are exact
-    # because the desktop app installs this package with `uv tool install`
-    # and no lockfile, so these lines decide the versions it runs.
+    # so that a new upstream release can't change what export or an agent
+    # cell does without review. They match the reviewed runtime export,
+    # cowork/release-requirements.txt; to move one, change it here, relock and
+    # regenerate that file with scripts/release_contract.py.
     #
     # Export: Markdown rendering, the fetch-free HTML inliner (lxml parses,
     # tinycss2 rewrites CSS) and the Word writer.
-    "markdown==3.11.1",
+    "markdown==3.11.2",
     "python-docx==1.2.0",
     "lxml==6.1.3",
     "tinycss2==1.5.1",
@@ -160,16 +162,17 @@ dependencies = [
     # anton's prompt names BeautifulSoup. The PDF export client also counts a
     # render service's pages with pypdf. Declared directly so they stay
     # installed whatever another package's dependencies become.
-    "pypdf==6.14.2",
-    "reportlab==4.5.1",
+    "pypdf==6.21.1",
+    "reportlab==5.0.1",
     "beautifulsoup4==4.15.0",
     # Kept for agent code cells that render PDFs with it. cowork/ never
     # imports it, because it fetches what the HTML names, and
     # tests/test_no_subprocess_static.py bans it there.
-    "xhtml2pdf==0.2.17",
+    "xhtml2pdf==0.2.26",
     # Floor for the PyJWT security fixes; redis and mcp (via anton-agent) pull
     # it in transitively with lower bounds that still allow 2.13.
     "pyjwt>=2.15.0",
+    "structlog==26.1.0",
 ]
 
 [project.urls]

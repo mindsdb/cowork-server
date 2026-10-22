@@ -312,7 +312,9 @@ def test_what_takes_its_place():
     def frame(kind, **data):
         return f"event: {kind}\ndata: {json.dumps({'type': kind, **data})}\n\n"
 
-    assert ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="Here"))
+    # Anton's text is narration until the renderer says otherwise: it no longer
+    # ends the take here, so the take finishes its sentence (ENG-3554).
+    assert not ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="Let me check."))
     assert not ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="\n\n"))
     for kind in ("response.ask_user", "response.completed", "response.failed"):
         assert ft.clears_take(kind, frame(kind))
@@ -339,7 +341,7 @@ async def _route(handler, monkeypatch, *, first_take: bool, enabled: bool = True
 
     monkeypatch.setattr(responses, "decide_route", delegated)
     monkeypatch.setattr(
-        responses, "_first_take_binding", lambda minted: RouterBinding(provider=provider, model="m", label="x"),
+        responses, "_first_take_binding", lambda minted, **kwargs: RouterBinding(provider=provider, model="m", label="x"),
     )
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: enabled)
     await handler._route_request(
@@ -389,6 +391,200 @@ async def test_attachments_never_start_one(monkeypatch):
     assert handler.first_take is None
 
 
+@pytest.mark.asyncio
+async def test_first_take_and_gate_build_one_provider_per_request(monkeypatch):
+    from types import SimpleNamespace
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+
+    providers = []
+    gated = []
+    settings = SimpleNamespace(
+        resolved_gate_model="first-model",
+        resolved_router_provider=SimpleNamespace(value="openai_compatible"),
+    )
+
+    def build_client(**kwargs):
+        assert kwargs["settings"] is settings
+        provider = _Provider(["On it."])
+        providers.append(provider)
+        return SimpleNamespace(router_provider=provider)
+
+    async def gate(binding, *, history):
+        gated.append(binding)
+        await _settle()
+        return None
+
+    monkeypatch.setattr(routing, "get_user_settings", lambda: settings)
+    monkeypatch.setattr(routing, "build_llm_client", build_client)
+    monkeypatch.setattr(routing, "_gate", gate)
+    monkeypatch.setattr(responses, "_first_take_enabled", lambda: True)
+    for model in ("first-model", "second-model"):
+        settings.resolved_gate_model = model
+        handler = _handler()
+        decision, _ = await handler._route_request(
+            conversation_id=None, gate_rows=[], harness_input=[{"type": "text", "text": "hi"}],
+            has_attachments=False, has_disabled_connections=False, first_take=True,
+        )
+        assert decision.reason == "router_declined_direct_response"
+        assert handler.first_take is not None
+        await _settle()
+        handler.first_take.cancel()
+
+    assert len(providers) == 2
+    assert [binding.provider for binding in gated] == providers
+    assert [binding.model for binding in gated] == ["first-model", "second-model"]
+    assert [provider.calls[0]["model"] for provider in providers] == ["first-model", "second-model"]
+
+
+@pytest.mark.asyncio
+async def test_no_gate_model_is_resolved_once_for_take_and_gate(monkeypatch):
+    from unittest.mock import Mock
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+
+    resolve = Mock(return_value=None)
+    monkeypatch.setattr(routing, "_settings_binding", resolve)
+    monkeypatch.setattr(responses, "_settings_binding", resolve)
+    monkeypatch.setattr(responses, "_first_take_enabled", lambda: True)
+    handler = _handler()
+    decision, _ = await handler._route_request(
+        conversation_id=None, gate_rows=[], harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False, has_disabled_connections=False, first_take=True,
+    )
+    assert handler.first_take is None
+    assert decision.reason == "router_model_unavailable"
+    resolve.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested,enabled", [(False, True), (True, False)])
+async def test_skipped_gate_and_disabled_take_do_not_resolve_a_provider(monkeypatch, requested, enabled):
+    from unittest.mock import Mock
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+
+    resolve = Mock(side_effect=AssertionError("no provider is needed"))
+    monkeypatch.setattr(routing, "_settings_binding", resolve)
+    monkeypatch.setattr(responses, "_settings_binding", resolve)
+    monkeypatch.setattr(responses, "_first_take_enabled", lambda: enabled)
+    monkeypatch.setattr(responses, "scrubbed_openai_dump", lambda row: row)
+    handler = _handler()
+    decision, _ = await handler._route_request(
+        conversation_id=None,
+        gate_rows=[{"role": "assistant", "content": [{"type": "tool_use", "name": "scratchpad"}]}],
+        harness_input=[{"type": "text", "text": "summarize that"}],
+        has_attachments=False, has_disabled_connections=False, first_take=requested,
+    )
+    assert decision.reason == "prior_turn_ran_tools"
+    assert handler.first_take is None
+    resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_first_take_resolution_failure_does_not_hide_gate_pool_timeout(monkeypatch):
+    from unittest.mock import Mock
+
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+
+    resolve = Mock(side_effect=PoolTimeoutError("pool full"))
+    monkeypatch.setattr(routing, "_settings_binding", resolve)
+    monkeypatch.setattr(responses, "_settings_binding", resolve)
+    monkeypatch.setattr(responses, "_first_take_enabled", lambda: True)
+    handler = _handler()
+    with pytest.raises(PoolTimeoutError):
+        await handler._route_request(
+            conversation_id=None, gate_rows=[], harness_input=[{"type": "text", "text": "hi"}],
+            has_attachments=False, has_disabled_connections=False, first_take=True,
+        )
+    assert handler.first_take is None
+    # Failed resolutions stay retryable, preserving the gate's existing boundary.
+    assert resolve.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_openai_provider_keeps_streams_and_trace_contexts_separate(monkeypatch):
+    from types import SimpleNamespace
+
+    import httpx
+    import openai
+    from anton.core.llm.openai import OpenAIProvider
+    from anton.core.llm.tracing import get_trace_context
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+
+    provider = OpenAIProvider(
+        api_key="test-key", base_url="https://example.invalid/v1",
+        flavor=OpenAIProvider.FLAVOR_OPENAI, reasoning_effort="low",
+    )
+    initial_calls = []
+    calls = []
+    closed = []
+    both_started = asyncio.Event()
+    take_wait = asyncio.Event()
+
+    class Stream:
+        def __init__(self, tag):
+            self.tag = tag
+
+        async def __aiter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="Hello.")
+            if self.tag == "cowork-first-take":
+                await take_wait.wait()
+            yield SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed"))
+
+        async def close(self):
+            closed.append(self.tag)
+
+    async def create(**kwargs):
+        tag = get_trace_context().tags[0]
+        assert kwargs["extra_headers"]["Langfuse-Tags"] == f"anton,{tag}"
+        calls.append((tag, kwargs))
+        if "summary" in kwargs.get("reasoning", {}):
+            initial_calls.append(tag)
+            if len(initial_calls) == 2:
+                both_started.set()
+            await both_started.wait()
+            raise openai.BadRequestError(
+                "reasoning summary unavailable",
+                response=httpx.Response(400, request=httpx.Request("POST", "https://example.invalid")),
+                body={"param": "reasoning.summary"},
+            )
+        return Stream(tag)
+
+    monkeypatch.setattr(provider, "_emit_trace_headers", True)
+    monkeypatch.setattr(provider._client.responses, "create", create)
+    monkeypatch.setattr(routing, "_settings_binding", lambda: RouterBinding(provider, "gpt-5", "openai"))
+    monkeypatch.setattr(responses, "_settings_binding", routing._settings_binding)
+    monkeypatch.setattr(responses, "_first_take_enabled", lambda: True)
+    handler = _handler()
+    try:
+        decision, _ = await handler._route_request(
+            conversation_id=None, gate_rows=[], harness_input=[{"type": "text", "text": "hi"}],
+            has_attachments=False, has_disabled_connections=False, first_take=True,
+        )
+        assert decision.text == "Hello."
+        assert sorted(initial_calls) == ["cowork-first-take", "cowork-gate"]
+        assert len(calls) == 4
+        assert closed == ["cowork-gate"]
+        handler.first_take.cancel()
+        await _settle()
+        assert sorted(closed) == ["cowork-first-take", "cowork-gate"]
+        assert provider._reasoning_summary is False
+    finally:
+        if handler.first_take:
+            handler.first_take.cancel()
+            await _settle()
+        await provider.aclose()
+
+
 # ── which model it speaks with ─────────────────────────────────────────────
 
 
@@ -436,7 +632,7 @@ async def test_route_request_hands_the_gates_binding_over(monkeypatch):
         seen["gate"] = kwargs["binding"]
         return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
 
-    def binding_for(binding):
+    def binding_for(binding, **kwargs):
         seen["take"] = binding
         return None
 
@@ -502,9 +698,11 @@ def test_the_setting_defaults_on():
 
 
 @pytest.mark.asyncio
-async def test_the_turn_clears_it_right_before_anton_speaks():
+async def test_anton_speaking_does_not_clear_it_the_turns_end_does():
     """In-process producer, end to end: created, then the take's words, then
-    its clear, then Anton's first words. Nothing of it reaches the saved turn."""
+    Anton's words (narration or answer: the renderer decides), then the take's
+    clear right before the turn ends (ENG-3554). Nothing of it reaches the
+    saved turn."""
     from unittest.mock import MagicMock, patch
     from types import SimpleNamespace
     from uuid import uuid4
@@ -540,7 +738,8 @@ async def test_the_turn_clears_it_right_before_anton_speaks():
 
     kinds = [frame.split("\n", 1)[0].removeprefix("event: ") for frame in buffer.frames]
     assert kinds[0] == "response.created"
-    assert kinds.index(ft.DELTA) < kinds.index(ft.CLEARED) < kinds.index("response.output_text.delta")
+    assert kinds.index(ft.DELTA) < kinds.index("response.output_text.delta") < kinds.index(ft.CLEARED)
+    assert kinds.index(ft.CLEARED) < kinds.index("response.completed")
     assert kinds.count(ft.CLEARED) == 1
     assert all(k not in kinds[kinds.index(ft.CLEARED) + 1:] for k in (ft.DELTA, ft.DONE))
     saved_text = json.dumps([str(c) for c in conv_svc.return_value.save_assistant_turn.call_args_list])
