@@ -41,6 +41,7 @@ from cowork.services.artifact_export import (
     ExportRefused,
     export_primary_file,
     export_slot,
+    offered_export_formats,
     org_export_refused,
     primary_export_source,
 )
@@ -509,11 +510,11 @@ async def artifact_source(
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS.
 
-    ``_owner_workspace`` is the owner gate. The capabilities this answers also
-    carry ``exportFormats``, which read the artifact's primary file, so they
-    are built once the folder is resolved.
+    ``_owner_workspace`` is the owner gate. The capabilities it returns gain
+    ``exportFormats``, which read the artifact's primary file, once the folder
+    is resolved.
     """
-    source, folder, metadata, _capabilities = _owner_workspace(
+    source, folder, metadata, owner_capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     selected = await run_in_threadpool(_editable_source_selector, source, folder, path)
@@ -531,7 +532,14 @@ async def artifact_source(
         )
         capabilities = await _current_capabilities(
             session,
-            artifact_capabilities(session, source, folder.name, export_source=export_source),
+            {
+                **owner_capabilities,
+                "exportFormats": offered_export_formats(
+                    source=export_source,
+                    can_edit=owner_capabilities["canEdit"],
+                    org_mode=bool(session.scope.org_mode),
+                ),
+            },
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
