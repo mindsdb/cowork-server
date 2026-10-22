@@ -253,6 +253,33 @@ async def test_slow_gate_times_out_and_fails_open(monkeypatch):
     assert provider.closed
 
 
+@pytest.mark.asyncio
+async def test_configured_decision_budget_replaces_the_default(monkeypatch):
+    import cowork.handlers.response_routing as routing
+    from cowork.common.settings.app_settings import AppSettings
+
+    provider = _StreamProvider([_text("Hello!"), _complete()], first_delay=0.2)
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
+    )
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.02)
+    monkeypatch.setenv("COWORK_GATE_FIRST_EVENT_SECONDS", "1.0")
+    monkeypatch.setattr(routing, "get_app_settings", AppSettings)
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "Hello"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "Hello!"
+
+
 def test_sse_frames_use_real_newlines():
     from cowork.streaming import sse_frame
 
@@ -2021,7 +2048,7 @@ async def test_gate_total_budget_survives_events_that_decide_nothing(monkeypatch
 def _usage_log(monkeypatch, enabled):
     import cowork.handlers.response_routing as routing
 
-    monkeypatch.setattr(routing, "get_app_settings", lambda: SimpleNamespace(usage_log=enabled))
+    monkeypatch.setattr(routing, "get_app_settings", lambda: SimpleNamespace(usage_log=enabled, gate_first_event_seconds=None))
 
 
 async def _drained():

@@ -398,7 +398,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _GATE_TOTAL_SECONDS
-    per_event = _GATE_FIRST_EVENT_SECONDS
+    per_event = get_app_settings().gate_first_event_seconds or _GATE_FIRST_EVENT_SECONDS
     text = ""
     drain = False
     try:
