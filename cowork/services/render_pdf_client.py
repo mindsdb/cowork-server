@@ -255,18 +255,21 @@ class _PageCountStopped(BaseException):
 
 
 def _stop_after(*, stop_at: float) -> Callable[[FrameType, str, object], None]:
-    """A profile function that raises as pypdf starts a function past ``stop_at``.
+    """A profile function that raises as pypdf runs past ``stop_at``.
 
-    It raises only at the start of a pypdf function, before that function has
-    run any of its code. Anywhere else a stop can land between taking a lock
-    and the ``try`` that releases it. Python 3.12's logging takes its module
-    lock that way, and pypdf calls logging for each fault it works around, so
-    a stop there would leave the lock held and block every later logging call
-    in the process.
+    It raises only inside pypdf code, as pypdf starts a function or calls a
+    builtin, before that function or builtin has run. pypdf takes no lock of
+    its own, so the stop can't land between taking a lock and the ``try``
+    that releases it. Code outside pypdf can: Python 3.12's logging takes its
+    module lock that way, and pypdf calls logging for each fault it works
+    around, so a stop in logging would leave the lock held and block every
+    later logging call in the process. The stop never lands outside pypdf, so
+    Python code that pypdf calls, such as the standard library's
+    ``base64.a85decode``, still runs to its end.
     """
 
     def profile(frame: FrameType, event: str, _arg: object) -> None:
-        if event != "call":
+        if event != "call" and event != "c_call":
             return
         module = frame.f_globals.get("__name__", "")
         if (module == "pypdf" or module.startswith("pypdf.")) and time.monotonic() > stop_at:
@@ -281,8 +284,8 @@ def _count_pages(*, pdf: bytes, max_pages: int, deadline: float) -> int:
     pypdf parses a whole object in one call, and one hostile object can hold
     millions of entries, or an object stream thousands of objects. Nothing
     stops that call from outside, so a profile hook on this thread stops it
-    from inside: it raises as pypdf starts its first function past
-    ``deadline`` (a ``time.monotonic()`` value, answered 504) or past
+    from inside: it raises as pypdf next starts a function or calls a builtin
+    past ``deadline`` (a ``time.monotonic()`` value, answered 504) or past
     ``PAGE_COUNT_SECONDS`` of counting (answered 502). The hook slows pypdf
     down several times, which a count of well under a second can afford.
     """

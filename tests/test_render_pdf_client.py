@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
-from types import FrameType
+from types import FrameType, SimpleNamespace
 from typing import Literal
 
 import httpx
@@ -721,17 +721,39 @@ def test_a_page_count_never_stops_while_logging_holds_its_lock(monkeypatch):
     assert (pages, stopped) == (1, [])
 
 
-def test_the_page_count_hook_stops_only_as_a_pypdf_function_starts():
+def test_the_page_count_hook_stops_only_inside_pypdf():
     previous = sys.getprofile()
     try:
         sys.setprofile(render_pdf_client._stop_after(stop_at=-math.inf))
         # Past the stop, code outside pypdf still runs to its end...
         logging.getLogger(__name__).isEnabledFor(logging.DEBUG)
-        # ...and pypdf stops as its next function starts.
+        # ...and pypdf stops as it next starts a function or calls a builtin.
         with pytest.raises(render_pdf_client._PageCountStopped):
             create_string_object("x")
     finally:
         sys.setprofile(previous)
+
+
+@pytest.mark.parametrize("event", ["return", "c_return", "c_exception"])
+def test_the_page_count_hook_never_stops_pypdf_once_its_code_ran(event):
+    # These events come after a function or builtin ran, which may have taken
+    # a lock that the code right after it releases.
+    pypdf_frame = SimpleNamespace(f_globals={"__name__": "pypdf._reader"})
+
+    assert render_pdf_client._stop_after(stop_at=-math.inf)(pypdf_frame, event, None) is None
+
+
+def test_a_page_count_stops_inside_one_long_pypdf_loop():
+    # pypdf reads a literal string byte by byte in one function that starts no
+    # other pypdf function: seconds of work for a 16 MB string.
+    catalog = "<< /Type /Catalog /Pages 2 0 R /X (" + "x" * 16_000_000 + ") >>"
+    pdf = _pdf(catalog, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", PAGE)
+
+    started = time.monotonic()
+    with pytest.raises(RenderPdfFailed) as failure:
+        render_pdf_client._count_pages(pdf=pdf, max_pages=500, deadline=started + 0.3)
+    assert failure.value.status == 504
+    assert time.monotonic() - started < 3
 
 
 async def test_a_page_count_left_running_holds_off_the_next_export(monkeypatch):
