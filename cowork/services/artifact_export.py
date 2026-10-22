@@ -9,6 +9,7 @@ source, under a name nothing else holds, so an export never replaces a file.
 
 from __future__ import annotations
 
+import codecs
 import errno
 import html
 import json
@@ -283,12 +284,25 @@ def _source_html(*, data: bytes, suffix: str, title: str) -> bytes:
     """
     if suffix in _HTML_SOURCES:
         return data
-    text = data.decode("utf-8", errors="replace")
+    text = _source_text(data)
     if suffix in _MARKDOWN_SOURCES:
         body = render_markdown(text=text)
     else:
         body = f"<pre>{html.escape(text)}</pre>"
     return _wrap_html_document(body, title).encode("utf-8")
+
+
+def _source_text(data: bytes) -> str:
+    """A Markdown or text source's bytes as text.
+
+    They are read as UTF-8, and a UTF-8 byte order mark is dropped, so a first
+    line such as ``# Title`` stays a heading. A UTF-16 byte order mark, which
+    Windows editors write for "Unicode" text, reads the rest as UTF-16. Bytes
+    that don't decode become U+FFFD.
+    """
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("utf-8-sig", errors="replace")
 
 
 def _html_export(document: str) -> bytes:

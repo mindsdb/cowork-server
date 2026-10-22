@@ -8,6 +8,7 @@ would run under the local scope and prove nothing about who may export.
 """
 from __future__ import annotations
 
+import codecs
 import errno
 import io
 import json
@@ -369,6 +370,38 @@ def test_an_html_export_of_markdown_writes_one_document_beside_it(client, local_
     assert "<title>report</title>" in written
     assert "Quarterly report</h1>" in written
     assert "<em>grew</em>" in written
+
+
+_MARKED_SOURCE = "# Título\n\nCuerpo del informe.\n"
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        codecs.BOM_UTF8 + _MARKED_SOURCE.encode("utf-8"),
+        codecs.BOM_UTF16_LE + _MARKED_SOURCE.encode("utf-16-le"),
+        codecs.BOM_UTF16_BE + _MARKED_SOURCE.encode("utf-16-be"),
+    ],
+    ids=["utf-8", "utf-16-le", "utf-16-be"],
+)
+def test_a_source_with_a_byte_order_mark_keeps_its_first_heading(client, local_artifact, encoded):
+    """Windows editors start a file with a byte order mark. It is no text, so
+    the first line stays a heading in Word and in HTML."""
+    folder = local_artifact({"report.md": encoded}, primary="report.md")
+
+    word = client.post(EXPORT_URL, json={"format": "docx"})
+    page = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert word.status_code == 200, word.text
+    assert page.status_code == 200, page.text
+    paragraphs = docx.Document(io.BytesIO((folder / "report.docx").read_bytes())).paragraphs
+    assert [(p.style.name, p.text) for p in paragraphs[:2]] == [
+        ("Heading 1", "Título"),
+        ("Normal", "Cuerpo del informe."),
+    ]
+    written = (folder / "report.html").read_text(encoding="utf-8")
+    assert "Título</h1>" in written
+    assert "﻿" not in written and "�" not in written
 
 
 def test_a_large_html_export_is_written_whole(client, local_artifact):
