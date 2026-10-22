@@ -3,7 +3,7 @@
 
 .DEFAULT_GOAL := help
 
-PYTEST := uv run python -m pytest
+PYTEST := uv run --locked python -m pytest
 TESTS := tests/ --ignore=tests/integration
 INTEGRATION_TESTS := tests/integration
 

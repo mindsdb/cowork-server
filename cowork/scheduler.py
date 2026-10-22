@@ -144,8 +144,20 @@ def _apply_success_write_back(
 
 def _locked_schedule(session: ScopedSession, schedule_id: UUID) -> Schedule | None:
     """The schedule as the database holds it now, locked until the caller's
-    commit on Postgres, so a pause or another poller's write waits for it,
-    or it for them. SQLite runs one writer at a time anyway."""
+    commit, so a pause or another poller's write waits for it, or it for them.
+
+    SQLite ignores FOR UPDATE, and its driver opens a transaction only at the
+    first write. Without a write first, the read below could see the row just
+    before a pause commits, and the claim would then act on that stale row. A
+    no-op update takes SQLite's write lock before the read.
+    """
+    if session.get_bind().dialect.name == "sqlite":
+        unsafe_unscoped_session(session).execute(
+            sa.update(Schedule)
+            .where(Schedule.id == schedule_id)
+            .values(id=Schedule.id)
+            .execution_options(synchronize_session=False)
+        )
     return session.exec(
         session.select(Schedule)
         .where(Schedule.id == schedule_id)
