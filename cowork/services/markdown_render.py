@@ -29,9 +29,6 @@ _LONG_FENCE = re.compile(
     r"^ {0,3}(?:`{%d,}|~{%d,})" % (MAX_FENCE_LENGTH + 1, MAX_FENCE_LENGTH + 1), re.MULTILINE
 )
 _HEADINGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
-# A tag in a heading's rendered HTML. It can't run past another "<", so a
-# heading full of unclosed "<" still strips in linear time.
-_TAG = re.compile(r"<[^<>]*>")
 # A longer numeric suffix is part of the id's stem. ``int()`` is quadratic in
 # the digits and refuses more than 4300 of them.
 _MAX_COUNT_DIGITS = 32
@@ -94,8 +91,9 @@ class _HeadingIds(Treeprocessor):
     published copy of the same Markdown, which uses ``TocExtension``, carries
     the same ones. ``TocExtension`` itself counts up from ``_1`` past every
     id a repeated heading already took, so n identical headings cost n²
-    lookups. Its table of contents goes too, so a ``[TOC]`` marker stays as
-    text.
+    lookups. Two ids differ from its: a numeric suffix longer than
+    ``_MAX_COUNT_DIGITS`` is part of the stem, and its table of contents
+    goes, so a ``[TOC]`` marker stays as text.
     """
 
     def run(self, root: etree.Element) -> None:
@@ -106,8 +104,84 @@ class _HeadingIds(Treeprocessor):
         for element in root.iter():
             if element.tag not in _HEADINGS or "id" in element.attrib:
                 continue
-            name = html.unescape(_TAG.sub("", render_inner_html(element, self.md)))
+            name = html.unescape(_strip_tags(text=render_inner_html(element, self.md)))
             element.set("id", _unique_id(candidate=slugify(name, "-"), taken=taken, skips=skips))
+
+
+def _strip_tags(*, text: str) -> str:
+    """What ``toc.strip_tags`` returns for *text*, in linear time.
+
+    It drops each ``<!--`` through the next ``-->``, then each ``<`` through
+    the next ``>``, then collapses whitespace as ``str.split`` finds it.
+    ``strip_tags`` itself copies the whole string after each one it drops,
+    so a heading of n tags costs n² copying.
+    """
+    text = _drop_comments(text=text)
+    kept, position = [], 0
+    # Nothing before the first "<" holds one, so dropping a tag can't join
+    # what was kept and what follows into a new one.
+    while (start := text.find("<", position)) != -1 and (end := text.find(">", start)) != -1:
+        kept.append(text[position:start])
+        position = end + 1
+    kept.append(text[position:])
+    return " ".join("".join(kept).split())
+
+
+def _drop_comments(*, text: str) -> str:
+    """*text* without the comments ``toc.strip_tags`` drops, in linear time.
+
+    ``strip_tags`` searches the joined string from its start after each
+    comment, so a ``<``, ``<!`` or ``<!-`` kept just before a comment can
+    open another with what follows it. Each search here tries the last three
+    kept characters first. Kept text is held as slices of *text*, so giving
+    those characters back copies nothing.
+    """
+    kept: list[tuple[int, int]] = []
+    position = 0
+    while True:
+        tail = _kept_tail(text=text, kept=kept)
+        joined = (tail + text[position : position + 3]).find("<!--")
+        if 0 <= joined < len(tail):
+            # Its "-->" can start in the kept characters too, as in "<!-->".
+            held = tail[joined:]
+            closer = (held + text[position : position + 2]).find("-->")
+            if closer != -1:
+                end = position + closer + 3 - len(held)
+            elif (closer := text.find("-->", position)) != -1:
+                end = closer + 3
+            else:
+                break
+            _give_back(kept=kept, count=len(held))
+        elif (opener := text.find("<!--", position)) != -1 and (
+            closer := text.find("-->", opener)
+        ) != -1:
+            if opener > position:
+                kept.append((position, opener))
+            end = closer + 3
+        else:
+            break
+        position = end
+    return "".join(text[start:end] for start, end in kept) + text[position:]
+
+
+def _kept_tail(*, text: str, kept: list[tuple[int, int]]) -> str:
+    """The last three characters the slices in *kept* hold, or all of them."""
+    tail = ""
+    for start, end in reversed(kept):
+        tail = text[max(start, end - 3 + len(tail)) : end] + tail
+        if len(tail) == 3:
+            break
+    return tail
+
+
+def _give_back(*, kept: list[tuple[int, int]], count: int) -> None:
+    """Drop the last *count* characters the slices in *kept* hold."""
+    while count:
+        start, end = kept.pop()
+        if end - start > count:
+            kept.append((start, end - count))
+            return
+        count -= end - start
 
 
 def _unique_id(*, candidate: str, taken: set[str], skips: dict[tuple[str, int], int]) -> str:

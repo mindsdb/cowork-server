@@ -6,8 +6,9 @@ import time
 
 import markdown
 import pytest
-from markdown.extensions.toc import TocExtension
+from markdown.extensions.toc import TocExtension, strip_tags
 
+from cowork.services import markdown_render
 from cowork.services.markdown_render import MAX_FENCE_LENGTH, MarkdownRefused, render_markdown
 from tests._no_fetch import no_fetch, recording_server
 
@@ -57,6 +58,10 @@ def _heading_ids(*, html: str) -> list[str]:
         ["The *big* result", "Use `a<b`", "Fish &amp; chips", "1 < 2 > 0", "žlutý"],
         ["Note <em>raw</em> html", "Note raw html"],
         ["a_99999999999", "a_99999999999"],
+        ["Results <!-- old -> new -->", "Results"],
+        ["a <?x <y ?> b"],
+        ["a <![CDATA[ <b ]]> c"],
+        ["a\u2028b", "a\u2029b", "a\x85b", "a\u1680b"],
     ],
 )
 def test_heading_ids_match_what_toc_extension_gives(headings):
@@ -64,6 +69,48 @@ def test_heading_ids_match_what_toc_extension_gives(headings):
     oracle = markdown.Markdown(extensions=[TocExtension()], output_format="html")
 
     assert _heading_ids(html=render_markdown(text=text)) == _heading_ids(html=oracle.convert(text))
+
+
+# toc.strip_tags searches from the start again after each comment it drops,
+# so a "<", "<!" or "<!-" kept before one can open another with what follows.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<!<!-- x -->-- a > b -->",
+        "<<!-- -->!-- --> x",
+        "<!-<!-- -->-> y",
+        "<<<!-- -->!-- -->!-- --> z",
+        "a <!--> b",
+        "a <!---> b",
+        "a <!-- b",
+        "a <b c",
+        "a <b> <!-- c > d --> e",
+        "a\u2028\x85\u1680 b",
+    ],
+)
+def test_tags_strip_as_toc_strip_tags_strips_them(text):
+    assert markdown_render._strip_tags(text=text) == strip_tags(text)
+
+
+# Each shape is linear for the port; toc.strip_tags copies the whole string
+# after each tag or comment it drops, and a cascade gives back one kept
+# character per comment.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<b>" * 200_000,
+        "<!---->" * 200_000,
+        "<" * 200_000,
+        "<!-- x" * 200_000,
+        "<" * 200_000 + "<!-- -->" + "!-- -->" * 200_000,
+    ],
+    ids=["tags", "comments", "unclosed-tags", "unclosed-comments", "cascade"],
+)
+def test_tags_strip_in_linear_time(text):
+    started = time.perf_counter()
+    markdown_render._strip_tags(text=text)
+
+    assert time.perf_counter() - started < 1.0
 
 
 def _render_seconds(*, text: str) -> float:
