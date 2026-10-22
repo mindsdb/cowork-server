@@ -233,7 +233,7 @@ async def test_start_compaction_returns_before_the_model_answers(world, monkeypa
     world.model = _Model(answer=held)
     monkeypatch.setattr(memory_compaction, "GlobalMemoryStore", lambda scope: SimpleNamespace(root=world.root))
     memory_compaction.start_compaction(
-        scope=SCOPE, principal=None, project_id=None, personal_applied=1, project_applied=0
+        scope=SCOPE, principal=None, project_id=None, personal_entries=1, project_entries=0
     )
     await reached.wait()
     assert len(memory_compaction._compaction_tasks) == 1

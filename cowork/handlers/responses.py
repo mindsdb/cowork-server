@@ -122,7 +122,8 @@ from cowork.services.files import FileService
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
-from cowork.services.memory import apply_turn_memory, build_turn_memory
+from cowork.services.memory import TurnMemoryWrite, apply_turn_memory, build_turn_memory, turn_memory_write
+from cowork.services.memory_compaction import start_compaction
 from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
@@ -1635,14 +1636,15 @@ class ResponsesHandler:
         conv_id: UUID,
         entries: list,
         principal: Principal | None,
-    ) -> None:
+    ) -> TurnMemoryWrite | None:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
+        Returns where the entries went, None when nothing was written.
 
         Never fails the turn — a lost memory is recoverable, a lost reply isn't.
         """
         if not entries:
-            return
+            return None
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
             from cowork.models.project import Project
@@ -1678,8 +1680,10 @@ class ResponsesHandler:
                 )
             logger.info("[responses] applied %d memory entr(ies) for conversation %s",
                         applied, conv_id)
+            return turn_memory_write(entries, project.id)
         except Exception:
             logger.exception("[responses] failed to apply memory", extra=log_context(conversation_id=conv_id))
+            return None
 
     def _read_remote_turn_inputs(self, session: ScopedSession, *, conv_id: UUID) -> _RemoteTurnInputs:
         """What a remote turn's pod is seeded with, read as one unit once the
@@ -1898,7 +1902,7 @@ class ResponsesHandler:
             if not entries:
                 return
             try:
-                await run_db(
+                written = await run_db(
                     partial(
                         self._persist_turn_memory,
                         conv_id=conv_id, entries=entries, principal=self.principal,
@@ -1910,10 +1914,20 @@ class ResponsesHandler:
                     "[responses] no database connection freed in time to apply memory for "
                     "conversation %s", conv_id, extra={"request_id": corr},
                 )
+                return
             except Exception:
                 logger.exception(
                     "[responses] failed to apply memory",
                     extra=log_context(request_id=corr, conversation_id=conv_id),
+                )
+                return
+            if written is not None and TurnQueueSettings().memory_compaction_enabled:
+                start_compaction(
+                    scope=scope,
+                    principal=self.principal,
+                    project_id=written.project_id,
+                    personal_entries=written.personal,
+                    project_entries=written.project,
                 )
 
         async def save_compaction(data: dict, seed_info: dict | None) -> None:

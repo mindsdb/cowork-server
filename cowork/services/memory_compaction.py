@@ -139,8 +139,8 @@ def start_compaction(
     scope: TenantScope,
     principal: Principal | None,
     project_id: UUID | None,
-    personal_applied: int,
-    project_applied: int,
+    personal_entries: int,
+    project_entries: int,
 ) -> None:
     """Compact, in the background, the tiers a turn just wrote to that are due.
 
@@ -151,8 +151,8 @@ def start_compaction(
             scope=scope,
             principal=principal,
             project_id=project_id,
-            personal_applied=personal_applied,
-            project_applied=project_applied,
+            personal_entries=personal_entries,
+            project_entries=project_entries,
         )
     )
     _compaction_tasks.add(task)
@@ -172,16 +172,16 @@ async def _compact_after_turn(
     scope: TenantScope,
     principal: Principal | None,
     project_id: UUID | None,
-    personal_applied: int,
-    project_applied: int,
+    personal_entries: int,
+    project_entries: int,
 ) -> None:
     try:
-        if personal_applied and scope.user_id:
+        if personal_entries and scope.user_id:
             person = MemoryTier(org_id=scope.org_id, kind="person", owner_id=scope.user_id)
             await _compact_tier(
                 person, scope=scope, target=(GlobalMemoryStore(scope=scope).root, [s for s, _ in _FILE_KINDS])
             )
-        if project_applied and project_id is not None:
+        if project_entries and project_id is not None:
             target = await run_db(
                 partial(project_slots_to_compact, principal=principal, project_id=project_id),
                 scope=scope,

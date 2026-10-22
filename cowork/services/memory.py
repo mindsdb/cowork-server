@@ -238,6 +238,23 @@ def _validated_engrams(entries: list[dict]) -> list[_WireEngram]:
     return validated
 
 
+@dataclass(frozen=True)
+class TurnMemoryWrite:
+    """Where a remote turn's memory went: the conversation's project, and how
+    many valid entries the turn sent to the person's own memory and to the
+    project's. Sent, not kept: a write may be a duplicate or refused."""
+
+    project_id: UUID
+    personal: int
+    project: int
+
+
+def turn_memory_write(entries: list[dict], project_id: UUID) -> TurnMemoryWrite:
+    validated = _validated_engrams(entries)
+    project = sum(1 for entry in validated if entry.targets_project)
+    return TurnMemoryWrite(project_id=project_id, personal=len(validated) - project, project=project)
+
+
 def _encode_engram(hippocampus: "Hippocampus", entry: _WireEngram) -> None:
     """Write one entry through anton's own encoder for its kind."""
     if entry.kind == "profile":
