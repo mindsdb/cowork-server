@@ -40,6 +40,9 @@ deployment:
     - name: ENV
       value: "staging"
 
+    - name: ACCESS_LOG_MODE
+      value: "all"
+
     - name: LOG_LEVEL
       value: "WARNING"
 

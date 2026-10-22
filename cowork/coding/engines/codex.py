@@ -192,6 +192,15 @@ class CodexEngineSession:
         existing_session_id: str | None,
         approval_handler: ApprovalHandler,
     ) -> None:
+        from cowork.code_sandbox import NO_CODE_MODE_DETAIL, code_sandbox_on
+
+        # Codex runs its app-server, terminals and MCP servers beside this
+        # server, outside the sandbox's launcher. The coding routes already
+        # refuse under the sandbox; this keeps the engine from starting even
+        # if a new caller skips them.
+        if code_sandbox_on():
+            raise RuntimeError(NO_CODE_MODE_DETAIL)
+
         from openai_codex.client import CodexClient, CodexConfig
 
         if not credentials.minds_api_key:

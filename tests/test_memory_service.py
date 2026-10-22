@@ -475,3 +475,41 @@ async def test_clearing_a_project_slot_keeps_its_first_author(org_engine, tmp_pa
         == 0
     )
     assert not (project_dir / ".anton" / "memory" / "rules.md").exists()
+
+
+# a deleted project's memory tier, where projects are personal
+
+PARTITION = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
+
+
+def test_a_deleted_projects_tier_refuses_a_user_id_that_is_not_one_folder_name(
+    personal_deployment, monkeypatch, tmp_path
+):
+    """Where projects are personal, the walk takes the deleter's ids from the
+    request's scope. A user id of "../x" would reach
+    <shared>/<partition>/memory/x/projects/<id>, outside every person's tier,
+    and remove it. The id is refused before anything goes, the deployment's
+    tier for the project included."""
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+    from cowork.harnesses.memory.store import PROJECT_TIERS_DIRNAME, deployment_memory_root
+    from cowork.services.memory import remove_project_memory_tiers
+
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "deployment-memory"))
+    get_app_settings.cache_clear()
+    project_id = UUID("3c2b1a09-8f7e-4d6c-9b5a-4f3e2d1c0b9a")
+    memory = tmp_path / "shared" / PARTITION / "memory"
+    (memory / "users").mkdir(parents=True)
+    outside = memory / "x" / "projects" / str(project_id)
+    outside.mkdir(parents=True)
+    deployment_tier = deployment_memory_root() / PROJECT_TIERS_DIRNAME / str(project_id)
+    deployment_tier.mkdir(parents=True)
+    scope = TenantScope(
+        personal=True, org_id=PARTITION, user_id="../x", personal_resources=ALL_PERSONAL_RESOURCES
+    )
+
+    with pytest.raises(ValueError, match="invalid storage user segment"):
+        remove_project_memory_tiers(scope=scope, project_id=project_id)
+
+    assert outside.is_dir()
+    assert deployment_tier.is_dir()

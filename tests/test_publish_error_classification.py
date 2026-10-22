@@ -23,6 +23,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from anton.publisher import PublishJobFailed, PublishJobTimeout
+
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import publish
 from cowork.services.publish import PublisherUnavailable, PublishOwnedByOtherUser
@@ -39,7 +41,7 @@ def _patch_context():
     exception-mapping tests below must get past that step to reach `_publish`."""
     return patch.object(
         publish_ep, "_desktop_context",
-        lambda raw: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
+        lambda raw, *, scope: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
     )
 
 
@@ -107,9 +109,13 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, publish_side
     )
     monkeypatch.setattr(
         publish, "get_app_settings",
-        lambda: SimpleNamespace(connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))),
+        lambda: SimpleNamespace(
+            tenancy_mode="local", connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))
+        ),
     )
-    monkeypatch.setattr(publish, "resolve_artifact_path", lambda raw, allow_dir=True: target)
+    monkeypatch.setattr(
+        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True: target
+    )
     monkeypatch.setattr(
         publish, "_resolve_publish_target",
         lambda a, container_dirs=None: (target, target.parent, key, False),
@@ -176,45 +182,146 @@ def test_an_unconfirmed_publisher_403_is_not_a_permission_denial(tmp_path, monke
     assert "HTTP 403" in str(error.value)
 
 
-from anton.publisher import PublishJobFailed, PublishJobTimeout
-from cowork.services.product_permissions import ProductPermissionUnavailable
+def _upstream(status: int, body, reason: str = "Rejected") -> urllib.error.HTTPError:
+    import io
+    import json
+
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return urllib.error.HTTPError("https://publish.example/upload", status, reason, {}, io.BytesIO(raw))
 
 
-def test_job_failed_503_maps_to_product_permission_unavailable():
-    exc = PublishJobFailed(503, "auth service unavailable", job_id="a" * 32, report_id="r")
-    with pytest.raises(ProductPermissionUnavailable):
-        publish.raise_publish_permission_error(exc)
+def _publish_failing_with(tmp_path, monkeypatch, exc):
+    page = tmp_path / "report.html"
+    page.write_text("<html></html>")
+    _wire_publish(monkeypatch, tmp_path, page, "report.html", publish_side_effect=exc)
+    return lambda: publish.publish_artifact(
+        page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai",
+    )
+
+
+def test_a_413_is_too_large_not_a_runtime_error(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(413, {"message": "Request Too Long"}, "Payload Too Large"),
+    )
+    with pytest.raises(publish.PublishTooLarge):
+        run()
+
+
+def test_a_4xx_shows_the_upload_service_text(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(
+        403, {"code": "organization_inactive", "error": "This organization is archived or still being provisioned."},
+    ))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: This organization is archived or still being provisioned."
+
+
+def test_a_401_keeps_the_credentials_advice_instead_of_the_server_text(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(401, {"error": "Invalid token"}, "Unauthorized"))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    msg = str(error.value)
+    assert "Invalid token" not in msg
+    assert "invalid or expired credentials" in msg
+
+
+def test_long_server_text_keeps_its_end_where_pip_names_the_cause(tmp_path, monkeypatch):
+    text = "pip install failed: " + "x" * 1000 + " ERROR: No matching distribution found for foo"
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(400, {"error": text}))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    msg = str(error.value)
+    assert msg.startswith("Publishing failed: pip install failed: ")
+    assert msg.endswith("ERROR: No matching distribution found for foo")
+    assert " … " in msg
+    assert len(msg) == len("Publishing failed: ") + 100 + len(" … ") + 400
+
+
+def test_a_5xx_without_server_text_is_framed_as_a_connection_failure(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(500, b"boom", "Internal Server Error"))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "Connection failed (HTTP 500" in str(error.value)
+
+
+def test_a_blocked_state_publish_is_shown_to_the_user(tmp_path, monkeypatch):
+    from anton.publisher import StatePublishBlocked
+
+    blocked = StatePublishBlocked("Collections ['notes'] exist in the published version")
+    run = _publish_failing_with(tmp_path, monkeypatch, blocked)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: Collections ['notes'] exist in the published version"
+
+
+def test_a_local_failure_stays_a_plain_runtime_error(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, FileNotFoundError("/data/org-1/proj/missing.js"))
+    with pytest.raises(RuntimeError) as error:
+        run()
+    assert not isinstance(error.value, publish.PublishRejected)
+    assert str(error.value) == "Publishing failed: /data/org-1/proj/missing.js"
+
+
+def test_clip_keeps_short_text_and_the_end_of_long_text():
+    assert publish._clip("a" * 500) == "a" * 500
+    # Up to the clipped length itself, clipping would only lose text.
+    assert publish._clip("a" * 503) == "a" * 503
+    assert publish._clip("H" * 100 + "M" * 4 + "T" * 400) == "H" * 100 + " … " + "T" * 400
+
+
+def test_a_connection_failure_without_an_http_answer_is_shown_to_the_user(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, urllib.error.URLError(ConnectionRefusedError()))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value).startswith("Publishing failed. Connection failed")
+
+
+def test_a_throttled_publish_shows_the_gateway_text(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(429, {"message": "Too Many Requests"}, "Too Many Requests"),
+    )
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: Too Many Requests"
+
+
+def test_a_missing_gateway_route_keeps_the_wrong_endpoint_advice(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(403, {"message": "Missing Authentication Token"}, "Forbidden"),
+    )
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "Missing Authentication Token" not in str(error.value)
+    assert "wrong server/endpoint" in str(error.value)
+
+
+
+def test_job_failed_503_is_the_upload_service_not_an_auth_outage():
+    exc = PublishJobFailed(503, "publish worker did not start", job_id="a" * 32, report_id="r")
+    with pytest.raises(publish.UploadServiceUnavailable):
+        publish.classify_upload_error(exc)
+
+
+def test_other_job_failures_come_back_as_upload_errors():
+    exc = PublishJobFailed(400, "pip install failed: x", job_id="a" * 32, report_id="r")
+    assert publish.classify_upload_error(exc) == publish.UploadError(400, None, "pip install failed: x")
+    assert publish.classify_upload_error(PublishJobTimeout(job_id="a" * 32, report_id="r", waited_s=180)) is None
+
+
+def test_job_failed_400_shows_the_server_text(tmp_path, monkeypatch):
+    exc = PublishJobFailed(400, "pip install failed: no wheel", job_id="a" * 32, report_id="r")
+    run = _publish_failing_with(tmp_path, monkeypatch, exc)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: pip install failed: no wheel"
 
 
 @pytest.mark.parametrize("exc", [
-    PublishJobFailed(400, "pip install failed: x", job_id="a" * 32, report_id="r"),
-    PublishJobFailed(403, "denied", job_id="a" * 32, report_id="r"),
-    PublishJobTimeout(job_id="a" * 32, report_id="r", waited_s=180),
+    PublishJobFailed(504, "publish worker timed out", job_id="b" * 32, report_id="r"),
+    PublishJobTimeout(job_id="b" * 32, report_id="r", waited_s=180),
 ])
-def test_other_job_errors_are_left_alone(exc):
-    publish.raise_publish_permission_error(exc)  # returns None, no raise
-
-
-def test_job_failed_400_surfaces_server_text_as_502(tmp_path, monkeypatch):
-    art = tmp_path / "art"
-    art.mkdir()
-    page = art / "dashboard.html"
-    page.write_text("<h1>dash</h1>")
-    exc = PublishJobFailed(400, "pip install failed: no wheel", job_id="a" * 32, report_id="r")
-    _wire_publish(monkeypatch, tmp_path, page, "dashboard.html", publish_side_effect=exc)
-    with pytest.raises(RuntimeError) as ei:
-        publish.publish_artifact(page, artifacts_base=tmp_path, api_key="k", publish_url="https://p")
-    assert str(ei.value) == "Publishing failed: " + str(exc)
-    assert "pip install failed: no wheel" in str(ei.value)
-
-
-def test_job_timeout_surfaces_job_id_as_502(tmp_path, monkeypatch):
-    art = tmp_path / "art"
-    art.mkdir()
-    page = art / "dashboard.html"
-    page.write_text("<h1>dash</h1>")
-    exc = PublishJobTimeout(job_id="b" * 32, report_id="r", waited_s=180)
-    _wire_publish(monkeypatch, tmp_path, page, "dashboard.html", publish_side_effect=exc)
-    with pytest.raises(RuntimeError) as ei:
-        publish.publish_artifact(page, artifacts_base=tmp_path, api_key="k", publish_url="https://p")
-    assert "b" * 32 in str(ei.value)
+def test_job_5xx_and_timeout_show_the_job_id(tmp_path, monkeypatch, exc):
+    run = _publish_failing_with(tmp_path, monkeypatch, exc)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "b" * 32 in str(error.value)

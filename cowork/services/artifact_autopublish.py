@@ -24,7 +24,7 @@ from anton.minds_client import DEFAULT_REQUEST_TIMEOUT_S
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
-from cowork.services.publish import PublishOwnedByOtherUser, publish_artifact
+from cowork.services.publish import PublishOwnedByOtherUser, PublishRejected, PublishTooLarge, publish_artifact
 
 if TYPE_CHECKING:
     from cowork.services.artifact_ownership import OwnerResolution
@@ -126,9 +126,9 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     """
     from cowork.services.artifacts import _user_files, content_mtime, load_published_map
     from cowork.services.publish import (
-        PUBLISHABLE_STATIC_SUFFIXES,
         _resolve_publish_target,
         compute_publish_md5,
+        is_publishable_static,
     )
 
     if not _user_files(folder):
@@ -146,10 +146,11 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         # /upload is strict here: literally backend.py plus static/index.html.
         if not (folder / "backend.py").is_file() or not (folder / "static" / "index.html").is_file():
             return PublishDecision(None, REASON_NOT_PUBLISHABLE, True)
-    elif publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    elif not is_publishable_static(publish_target, artifacts_base):
         # Suffix, not the on-disk name: _zip_html renames a single file to
         # index.html inside the archive, so an artifact whose primary is
-        # `report.html` publishes normally.
+        # `report.html` publishes normally. A non-content primary (README,
+        # generation input) is refused by `publish_artifact`, so skip it here.
         return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     current_mtime = content_mtime(folder)
@@ -401,6 +402,12 @@ async def _publish_one(
         release(artifacts_base, slug)
         _record("skipped", slug=slug, reason="owned_by_other_user")
         return False
+    except PublishTooLarge:
+        # Every retry of the same bundle is refused again, and the 413 is
+        # already logged by the classifier: a skip, not a failure.
+        release(artifacts_base, slug)
+        _record("skipped", slug=slug, reason="too_large")
+        return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target
         # resolver, PublisherUnavailable) leaves NO running thread, so holding the
@@ -408,7 +415,10 @@ async def _publish_one(
         # "next turn retries" promise.
         release(artifacts_base, slug)
         _record("failed", slug=slug, error=type(exc).__name__)
-        logger.warning("artifact autopublish failed for %s", slug, exc_info=True)
+        # publish_artifact has already logged a PublishRejected's traceback.
+        logger.warning(
+            "artifact autopublish failed for %s", slug, exc_info=not isinstance(exc, PublishRejected),
+        )
         return False
     release(artifacts_base, slug)
     _record("published", slug=slug)

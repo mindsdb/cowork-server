@@ -30,6 +30,9 @@ class SkillCapabilities(CamelResponse):
     can_edit: bool
     can_delete: bool
     can_disable: bool
+    # The caller may share this skill of their own with everyone, or hide it
+    # again (PUT /api/v1/skills/{skill_id}/sharing).
+    can_share: bool = False
 
 
 class MutableResourceCapabilities(CamelResponse):
