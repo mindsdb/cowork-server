@@ -315,6 +315,50 @@ def test_a_conversion_failure_answers_500_and_writes_nothing(client, local_artif
     assert _snapshot(folder) == before
 
 
+def _newest(path: Path) -> None:
+    """Make *path* the folder's newest file, so the card picks it as primary."""
+    later = time.time() + 60
+    os.utime(path, (later, later))
+
+
+def test_an_export_with_no_free_name_answers_500_and_changes_nothing(client, local_artifact):
+    """No primary is recorded and no temporary file stays when no name is free."""
+    taken = {"report.docx": b"old", **{f"report ({n}).docx": b"old" for n in range(2, 101)}}
+    folder = local_artifact({**taken, "report.md": "# R\n"})
+    _newest(folder / "report.md")
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert _snapshot(folder) == before
+
+
+def test_a_failure_after_the_file_is_placed_removes_it(client, local_artifact, monkeypatch):
+    folder = local_artifact({"report.md": "# R\n"})
+    before = _snapshot(folder)
+
+    def broken(**_kwargs):
+        raise OSError("metadata.json can't be written")
+
+    monkeypatch.setattr(artifact_export, "_record_primary", broken)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert _snapshot(folder) == before
+
+
+def test_an_html_source_past_the_markdown_bound_still_exports(client, local_artifact):
+    page = "<html><body>" + "<p>row</p>" * (2 * MIB // 10 + 1000) + "</body></html>"
+    assert 2 * MIB < len(page) < 10 * MIB
+    local_artifact({"report.html": page}, primary="report.html")
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 200, response.text
+
+
 def test_a_symlinked_primary_is_never_read(client, local_artifact, tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text("# SECRET-OUTSIDE\n", encoding="utf-8")

@@ -13,7 +13,7 @@ import html
 import json
 import os
 import secrets
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -335,7 +335,11 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
         if folder.fd is not None:
             os.utime(_METADATA, ns=times, dir_fd=folder.fd, follow_symlinks=False)
         else:
-            os.utime(folder.path / _METADATA, ns=times, follow_symlinks=False)
+            # Windows, the only place a pinned folder has no descriptor, can't
+            # set times without following a link: follow_symlinks=False raises
+            # NotImplementedError there. _atomic_json has just put a regular
+            # file at this name.
+            os.utime(folder.path / _METADATA, ns=times)
     except OSError:
         pass
 
@@ -369,14 +373,21 @@ def _link_without_replacing(folder: PinnedDir, source_name: str, destination_nam
 
 
 def _write_beside(
-    *, folder: PinnedDir, parts: tuple[str, ...], extension: str, data: bytes
+    *,
+    folder: PinnedDir,
+    parts: tuple[str, ...],
+    extension: str,
+    data: bytes,
+    after_placing: Callable[[], None],
 ) -> str:
     """Write *data* next to the source at *parts* under the first free name.
 
     The names run ``report.docx``, ``report (2).docx``, ``report (3).docx``,
     and never the source's own name. The bytes go to a temporary file created
     with ``O_EXCL | O_NOFOLLOW``, which then takes the free name without
-    replacing anything; the temporary name is always removed. Returns the name.
+    replacing anything; the temporary name is always removed, as soon as the
+    file has its own. Then *after_placing* runs; if it raises, the new file
+    is removed too, so a failed export leaves nothing behind. Returns the name.
     """
     source_name = parts[-1]
     stem = PurePosixPath(source_name).stem
@@ -394,21 +405,39 @@ def _write_beside(
                 _write_all(fd, data)
             finally:
                 os.close(fd)
-            for number in range(1, _MAX_OUTPUT_NAMES + 1):
-                name = f"{stem}{extension}" if number == 1 else f"{stem} ({number}){extension}"
-                if name.casefold() == source_name.casefold():
-                    continue
-                try:
-                    _link_without_replacing(parent, temporary, name)
-                except FileExistsError:
-                    continue
-                return name
-            raise FileExistsError(f"no free name for {stem}{extension}")
+            name = _place_temporary(
+                parent=parent, temporary=temporary, stem=stem, extension=extension, source_name=source_name
+            )
         finally:
             try:
                 dir_unlink(parent, temporary)
             except FileNotFoundError:
                 pass
+        try:
+            after_placing()
+        except BaseException:
+            try:
+                dir_unlink(parent, name)
+            except OSError:
+                pass
+            raise
+        return name
+
+
+def _place_temporary(
+    *, parent: PinnedDir, temporary: str, stem: str, extension: str, source_name: str
+) -> str:
+    """Give *temporary* the first free output name and return that name."""
+    for number in range(1, _MAX_OUTPUT_NAMES + 1):
+        name = f"{stem}{extension}" if number == 1 else f"{stem} ({number}){extension}"
+        if name.casefold() == source_name.casefold():
+            continue
+        try:
+            _link_without_replacing(parent, temporary, name)
+        except FileExistsError:
+            continue
+        return name
+    raise FileExistsError(f"no free name for {stem}{extension}")
 
 
 def export_primary_file(
@@ -459,8 +488,13 @@ def export_primary_file(
             output = write_docx(document=inlined, title=title)
         else:
             output = _html_export(inlined.html)
-        _record_primary(folder=folder, primary="/".join(parts))
-        name = _write_beside(folder=folder, parts=parts, extension=extension, data=output)
+        name = _write_beside(
+            folder=folder,
+            parts=parts,
+            extension=extension,
+            data=output,
+            after_placing=lambda: _record_primary(folder=folder, primary="/".join(parts)),
+        )
     rel_path = "/".join((*parts[:-1], name))
     return ExportResult(
         filename=name,

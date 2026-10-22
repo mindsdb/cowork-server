@@ -20,6 +20,7 @@ import docx
 import pytest
 import yaml
 
+from cowork.common.paths import PinnedDir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_export
@@ -117,6 +118,46 @@ def test_a_word_export_fetches_nothing_and_takes_nothing_from_another_partition(
     assert external, "the document's own link should stay a hyperlink"
     assert all(rel["Type"] == _HYPERLINK for rel in external), external
     assert {rel["Target"] for rel in external} == {"https://example.com/report"}
+
+
+def test_a_first_export_records_the_primary_the_card_shows(local_mode, partitions):
+    mine, _secret = partitions
+    source, folder, artifact_id = _write_report(mine, "report.md", "# R\n")
+    metadata = json.loads((folder / "metadata.json").read_text())
+    del metadata["primary"]
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = artifact_export.export_primary_file(
+        source=source,
+        folder_name=folder.name,
+        metadata=metadata,
+        artifact_id=artifact_id,
+        export_format="docx",
+        can_edit=True,
+    )
+
+    assert result.filename == "report.docx"
+    assert json.loads((folder / "metadata.json").read_text())["primary"] == "report.md"
+
+
+def test_recording_a_primary_without_a_directory_descriptor_sets_times_by_path(tmp_path, monkeypatch):
+    """Windows has no directory descriptor, and its utime refuses follow_symlinks=False."""
+    metadata = tmp_path / "metadata.json"
+    metadata.write_text(json.dumps({"id": "x"}), encoding="utf-8")
+    os.utime(metadata, ns=(1_000_000_000, 2_000_000_000))
+    real_utime = os.utime
+
+    def windows_utime(path, *args, follow_symlinks=True, **kwargs):
+        if not follow_symlinks:
+            raise NotImplementedError("utime: follow_symlinks unavailable on this platform")
+        return real_utime(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "utime", windows_utime)
+
+    artifact_export._record_primary(folder=PinnedDir(None, tmp_path), primary="report.md")
+
+    assert json.loads(metadata.read_text())["primary"] == "report.md"
+    assert metadata.stat().st_mtime_ns == 2_000_000_000
 
 
 # ── admission ────────────────────────────────────────────────────────────────
