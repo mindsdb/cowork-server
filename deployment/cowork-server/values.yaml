@@ -141,7 +141,7 @@ deployment:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
     # slug, so this must track the GitHub repo name (cowork-server).
     repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
-    command: ["python", "-m", "uvicorn", "cowork.server:app"]
+    command: ["python", "-m", "uvicorn", "cowork.server:app", "--log-config", "/app/cowork/logging.json"]
     # Async FastAPI: the event loop handles concurrency per worker. Scale via
     # replicas (and HPA) rather than worker count. --forwarded-allow-ips '*'
     # trusts the in-cluster ingress for X-Forwarded-* headers.

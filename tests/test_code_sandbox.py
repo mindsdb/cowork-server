@@ -475,6 +475,77 @@ def test_a_persons_policy(stack, tmp_path):
     assert "COWORK_AUTH_TOKEN" not in env
 
 
+def test_a_build_resolves_each_configured_root_once(stack, tmp_path, monkeypatch):
+    """Every grant checks its descendants, but shares this build's root resolution."""
+    from collections import Counter
+
+    home = tmp_path / "home"
+    project = _project(home, PARTITION_A, "projects", "general")
+    attachments = [_project(home, PARTITION_A, "files", str(i)) for i in range(6)]
+    roots = set(code_sandbox._trusted_roots())
+    real = code_sandbox._real
+    calls = Counter()
+
+    def counted(path):
+        calls[path] += 1
+        return real(path)
+
+    monkeypatch.setattr(code_sandbox, "_real", counted)
+    for _ in range(2):
+        calls.clear()
+        policy = build_cell_sandbox(scope=ALICE, project_dir=project, read_only_dirs=attachments)
+        assert policy.read_only_dirs == tuple(path.resolve() for path in attachments)
+        assert {root: calls[root] for root in roots} == dict.fromkeys(roots, 1)
+
+
+def test_a_later_build_rechecks_a_previously_granted_child(stack, tmp_path):
+    """A cached root must not make a prior successful descendant check reusable."""
+    home = tmp_path / "home"
+    project = _project(home, PARTITION_A, "projects", "general")
+    attachment = _project(home, PARTITION_A, "files", "attachment")
+    first = build_cell_sandbox(scope=ALICE, project_dir=project, read_only_dirs=[attachment])
+    assert first.read_only_dirs == (attachment.resolve(),)
+    attachment.rename(attachment.with_name("original"))
+    attachment.symlink_to(_project(home, PARTITION_B, "files", "private"), target_is_directory=True)
+    second = build_cell_sandbox(scope=ALICE, project_dir=project, read_only_dirs=[attachment])
+    assert second.read_only_dirs == ()
+
+
+@pytest.mark.parametrize(
+    ("suffix", "names"),
+    [
+        ("root", ()),
+        ("root/child", ("child",)),
+        ("root/../root/child", ("child",)),
+        ("rooted/child", None),
+        ("ROOT/child", ("child",) if os.name == "nt" else None),
+    ],
+)
+def test_anchoring_compares_whole_normalized_path_components(monkeypatch, tmp_path, suffix, names):
+    root = tmp_path / "root"
+    monkeypatch.setattr(code_sandbox, "_trusted_roots", lambda: [root])
+    found = code_sandbox._anchored(tmp_path / suffix)
+    if names is None:
+        assert found is None
+    else:
+        assert found == code_sandbox._Anchored(root.resolve(), names)
+
+
+def test_a_cached_outer_root_still_checks_a_linked_inner_root(monkeypatch, tmp_path):
+    outer = _project(tmp_path, "outer")
+    inner = outer / "projects"
+    inner.symlink_to(_project(tmp_path, "outside"), target_is_directory=True)
+    monkeypatch.setattr(code_sandbox, "_trusted_roots", lambda: [inner, outer])
+    roots = code_sandbox._TrustedRoots()
+    path = inner / "project"
+    assert code_sandbox._anchored(path, roots=roots) == code_sandbox._Anchored(
+        outer.resolve(), ("projects", "project"),
+    )
+    with pytest.raises(OSError) as refused:
+        code_sandbox._required_dir(path, roots=roots)
+    assert refused.value.errno in code_sandbox._LINK_ERRNOS
+
+
 def test_a_persons_home_stays_theirs_with_everything_else_shared(stack, tmp_path):
     """The sandbox store is the person's own whatever the list leaves shared,
     memory included."""

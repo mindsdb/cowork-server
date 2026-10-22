@@ -281,7 +281,7 @@ def test_the_console_formatter_renders_the_request_context(monkeypatch, rich_log
             setattr(rec, key, value)
         return rec
 
-    assert "[Req:corr-abc]" in formatter.format(record(request_id="corr-abc"))
+    assert json.loads(formatter.format(record(request_id="corr-abc")))["request_id"] == "corr-abc"
     # The same formatter still has to render the records that carry no id,
     # which is nearly all of them.
-    assert "[Req:" not in formatter.format(record())
+    assert "request_id" not in json.loads(formatter.format(record()))

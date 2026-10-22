@@ -421,7 +421,7 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
             "_sandbox_root",
             "scoped_storage_root(cowork_home() / 'sandbox', scope, store='sandbox')",
         ),
-        ("cowork/code_sandbox.py", "_forbidden_roots.roots", "cowork_home()"),
+        ("cowork/code_sandbox.py", "_forbidden_roots.forbidden", "cowork_home()"),
         ("cowork/code_sandbox.py", "_trusted_roots", "cowork_home()"),
         ("cowork/code_sandbox.py", "_run_self_test.scratch", "cowork_home() / 'tmp'"),
         ("cowork/code_sandbox.py", "_refuse_linked_cowork_home_entries.entry", "cowork_home() / name"),

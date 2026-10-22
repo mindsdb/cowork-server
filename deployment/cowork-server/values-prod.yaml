@@ -52,6 +52,9 @@ deployment:
     - name: ENV
       value: "prod"
 
+    - name: ACCESS_LOG_MODE
+      value: "all"
+
     - name: LOG_LEVEL
       value: "WARNING"
 
