@@ -52,10 +52,14 @@ class InlineMode(StrEnum):
 class InlineLimits(BaseModel, frozen=True):
     """Caps the inliner enforces; going over one drops an asset, never the export.
 
-    ``max_total_bytes`` counts the bytes the inliner reads: each asset as
-    decoded and each spliced stylesheet as read. The HTML it writes is
-    larger, since base64 adds a third and escaping can make a stylesheet up
-    to four times its size, so the budget bounds the reading, not the output.
+    ``max_total_bytes`` counts what the output inlines, at source size: each
+    use of an asset at its decoded size, and each spliced stylesheet at its
+    size as read. It bounds neither the output nor the reading. The HTML
+    written is larger, since base64 adds a third and escaping can make a
+    stylesheet up to four times its size. An asset read once counts at each
+    use, and a file is read before it is counted, so one past the budget is
+    read and then left out; ``max_references`` and ``max_asset_bytes`` bound
+    the reading.
     """
 
     max_asset_bytes: int = 2 * 1024 * 1024
@@ -97,7 +101,7 @@ class InlinedDocument(BaseModel):
 
     html: str
     omitted: list[OmittedReference]
-    inlined_bytes: int  # read for what was inlined, as max_total_bytes counts them
+    inlined_bytes: int  # what max_total_bytes counted: each inlined use at its source size
     scripts_dropped: bool
 
 

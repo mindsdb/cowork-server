@@ -739,6 +739,27 @@ def test_the_budget_counts_a_spliced_stylesheet_as_read_not_as_escaped(tmp_path)
     assert document.html.count("\\3c ") == 1000
 
 
+def test_a_file_past_the_spent_budget_is_still_read_then_left_out(artifact, monkeypatch):
+    """The budget counts a file once it is read, so it never bounds the reading."""
+    reads = []
+    read = artifact_inline.read_artifact_file_entry
+
+    def counting_read(*, folder, parts, max_bytes):
+        reads.append(parts)
+        return read(folder=folder, parts=parts, max_bytes=max_bytes)
+
+    monkeypatch.setattr(artifact_inline, "read_artifact_file_entry", counting_read)
+    html = b'<img src="chart.png"><img src="photo.jpg"><img src="anim.gif">'
+    document = _inline(
+        artifact=artifact, html=html, limits=_limits(max_total_bytes=len(CHART_PNG))
+    )
+    assert reads == [("chart.png",), ("photo.jpg",), ("anim.gif",)]
+    assert [(entry.reason, entry.reference) for entry in document.omitted] == [
+        (OmittedReason.BUDGET, "photo.jpg"),
+        (OmittedReason.BUDGET, "anim.gif"),
+    ]
+
+
 def test_node_cap_drops_the_rest_of_the_tree_and_says_so(artifact, outside):
     html = "".join(f"<p>para {index}</p>" for index in range(100)).encode()
     limits = _limits(max_nodes=20)
