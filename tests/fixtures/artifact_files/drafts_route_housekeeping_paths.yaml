@@ -8,5 +8,5 @@
   rel_path: sub/Metadata.JSON
 - id: revisions-directory-at-depth
   rel_path: sub/.revisions/r1.md
-- id: readme-at-depth
-  rel_path: docs/README.md
+- id: publish-state-at-depth
+  rel_path: sub/.published.json

@@ -68,7 +68,9 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
-# Matched against the first path component of a draft request.
+# Matched against the first path component of a draft request. The file
+# walk refuses them there casefolded too, and the store-owned ones at any
+# depth (`artifact_files._refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 

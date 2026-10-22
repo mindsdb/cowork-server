@@ -25,7 +25,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
+from anton.core.artifacts.internal_files import (
+    BACKEND_LOG_FILENAME,
+    GENERATION_INPUT_FILES,
+    NON_CONTENT_NAMES,
+    README_FILENAME,
+    REVISIONS_DIRNAME,
+)
 
 from cowork.common.paths import (
     O_DIRECTORY,
@@ -44,10 +50,16 @@ from cowork.services.artifact_identity import opened_artifact_folder
 if TYPE_CHECKING:
     from cowork.services.artifacts import ProjectArtifacts
 
-# Store-owned files and the revision journal, compared casefolded: on a
-# case-insensitive volume ``Metadata.JSON`` opens ``metadata.json``.
+# Housekeeping names, compared casefolded: on a case-insensitive volume
+# ``Metadata.JSON`` opens ``metadata.json``. Every one is refused as the first
+# segment. anton matches its names on the first segment only, and the
+# generation inputs, README.md and backend.log are content inside a subfolder
+# (``docs/README.md``), so only the store-owned rest is refused at any depth.
 _HOUSEKEEPING_NAMES = frozenset(
     name.casefold() for name in (*NON_CONTENT_NAMES, REVISIONS_DIRNAME)
+)
+_HOUSEKEEPING_AT_ANY_DEPTH = _HOUSEKEEPING_NAMES - frozenset(
+    name.casefold() for name in (*GENERATION_INPUT_FILES, README_FILENAME, BACKEND_LOG_FILENAME)
 )
 
 # Names Windows maps to a device whatever follows the first dot, so ``nul.txt``
@@ -255,9 +267,10 @@ def _refuse_unsafe_parts(*, parts: tuple[str, ...]) -> None:
 
 
 def _refuse_housekeeping(*, parts: tuple[str, ...]) -> None:
-    for segment in parts:
-        if segment.casefold() in _HOUSEKEEPING_NAMES:
-            raise ArtifactFileRefused(OmittedReason.HOUSEKEEPING, "housekeeping name")
+    if parts[0].casefold() in _HOUSEKEEPING_NAMES or any(
+        segment.casefold() in _HOUSEKEEPING_AT_ANY_DEPTH for segment in parts[1:]
+    ):
+        raise ArtifactFileRefused(OmittedReason.HOUSEKEEPING, "housekeeping name")
 
 
 def _disk_name(*, directory: PinnedDir, requested: str, budget: _ScanBudget | None) -> str:
@@ -424,7 +437,8 @@ def read_artifact_file_entry(
     """Read the regular file at *parts* below *folder*, at most *max_bytes* long.
 
     Raises ``ArtifactFileRefused`` with the reason: a path that isn't plain
-    names is ``TRAVERSAL``, a store-owned name is ``HOUSEKEEPING``, a symlink
+    names is ``TRAVERSAL``, a housekeeping name as the first segment or a
+    store-owned one at any depth is ``HOUSEKEEPING``, a symlink
     or a second hard link is ``SYMLINK``, a UNC or device path is
     ``UNC_PATH``, a junction or other reparse point that stands for another
     path is ``REPARSE_POINT``, anything absent or not a regular file is

@@ -40,6 +40,7 @@ WINDOWS_REWRITTEN_NAMES = _fixture_cases(name="windows_rewritten_names.yaml")
 MISSING_PATHS = _fixture_cases(name="missing_paths.yaml")
 REPARSE_POINTS = _fixture_cases(name="reparse_points.yaml")
 DRAFTS_ROUTE_HOUSEKEEPING_PATHS = _fixture_cases(name="drafts_route_housekeeping_paths.yaml")
+CONTENT_NAMES_AT_DEPTH = _fixture_cases(name="content_names_at_depth.yaml")
 API_IMPORT_FORMS = _fixture_cases(name="api_import_forms.yaml")
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(32))
@@ -647,6 +648,30 @@ async def test_the_drafts_route_hides_a_housekeeping_name_at_any_depth(
             monkeypatch=monkeypatch, source=source, folder=folder, rel_path=rel_path
         )
     assert error.value.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "case", CONTENT_NAMES_AT_DEPTH, ids=[case["id"] for case in CONTENT_NAMES_AT_DEPTH]
+)
+async def test_a_top_level_housekeeping_name_inside_a_subfolder_is_content(
+    tmp_path, monkeypatch, case
+):
+    rel_path = case["rel_path"]
+    source, folder = _draft_artifact(tmp_path=tmp_path)
+    content = folder / rel_path
+    content.parent.mkdir(parents=True)
+    content.write_text("content", encoding="utf-8")
+
+    served = await _serve_draft(
+        monkeypatch=monkeypatch, source=source, folder=folder, rel_path=rel_path
+    )
+    with pinned_dir(folder) as pinned:
+        read = read_artifact_file(
+            folder=pinned, parts=tuple(rel_path.split("/")), max_bytes=1024
+        )
+
+    assert await _body(response=served) == b"content"
+    assert read == b"content"
 
 
 async def test_the_drafts_route_answers_404_for_a_hard_linked_file(

@@ -89,8 +89,14 @@
 - id: revisions-directory-at-depth
   parts: ["sub", ".revisions", "r1.md"]
   reason: housekeeping
-- id: generation-input-at-depth
-  parts: ["docs", "PRD.md"]
+- id: generation-input-at-the-root-casefolded
+  parts: ["PRD.md"]
+  reason: housekeeping
+- id: publish-state-at-depth
+  parts: ["sub", ".published.json"]
+  reason: housekeeping
+- id: state-database-at-depth-casefolded
+  parts: ["sub", ".Anton_State.db"]
   reason: housekeeping
 - id: readme-casefolded
   parts: ["readme.MD"]
