@@ -68,18 +68,18 @@ class _OpenRecorder:
 
     def __init__(self) -> None:
         self._paths: list[str] | None = None
-        self._ignored: frozenset[int | None] = frozenset()
+        self._ignored: frozenset[threading.Thread] = frozenset()
 
     def __call__(self, event: str, args: tuple) -> None:
-        if event == "open" and self._paths is not None and threading.get_ident() not in self._ignored:
+        # Thread objects, not idents: a thread started while recording can
+        # reuse the ident of one that was running before and has ended.
+        if event == "open" and self._paths is not None and threading.current_thread() not in self._ignored:
             path = args[0]
             self._paths.append(os.fsdecode(path) if isinstance(path, str | bytes | os.PathLike) else repr(path))
 
     @contextmanager
     def recording(self) -> Iterator[list[str]]:
-        self._ignored = frozenset(thread.ident for thread in threading.enumerate()) - {
-            threading.get_ident()
-        }
+        self._ignored = frozenset(threading.enumerate()) - {threading.current_thread()}
         self._paths = paths = []
         try:
             yield paths
