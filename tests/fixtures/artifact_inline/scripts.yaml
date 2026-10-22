@@ -93,6 +93,15 @@
     <script src="//cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js"></script>
     <script src="app.js"></script>
     <script src="../other/app.js"></script>
+    <script src="https://cdn.jsdelivr.net@evil.example/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net:444/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/%2e%2e/%2e%2e/gh/user/repo/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/.%2e/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist%2fchart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/user/repo/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/./dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1//dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js#x"></script>
     <p>kept</p>
   present: ['<p>kept</p>']
   absent: ['<script']
@@ -113,3 +122,12 @@
     - [absolute, '//cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js']
     - [unsupported_type, app.js]
     - [traversal, ../other/app.js]
+    - [scheme, 'https://cdn.jsdelivr.net@evil.example/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net:444/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/%2e%2e/%2e%2e/gh/user/repo/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/.%2e/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist%2fchart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/user/repo/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/./dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1//dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js#x']
