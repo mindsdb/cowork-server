@@ -48,6 +48,8 @@ HostileShape = Literal[
     "unknown_type_with_kids",
 ]
 
+StreamFilter = Literal["/FlateDecode", "/ASCII85Decode"]
+
 
 class UpstreamStatusCase(BaseModel, frozen=True, extra="forbid"):
     upstream: int
@@ -195,17 +197,26 @@ def _pdf(*objects: str) -> bytes:
     return bytes(out)
 
 
-def _packed_pdf(*, kids: int, body: str) -> bytes:
+STREAM_ENCODERS: dict[StreamFilter, Callable[[bytes], bytes]] = {
+    "/FlateDecode": lambda data: zlib.compress(data, 9),
+    "/ASCII85Decode": lambda data: base64.a85encode(data, adobe=True),
+}
+
+
+def _packed_pdf(*, kids: int, body: str, filters: tuple[StreamFilter, ...] = ("/FlateDecode",)) -> bytes:
     """A PDF whose page-tree root lists ``kids`` objects packed in one object stream.
 
-    Object 1 is the catalog, 2 the page-tree root, 3 a FlateDecode object
-    stream and 4 the cross-reference stream. Objects 5 and up sit in the
-    object stream, all at the same offset, so each one is ``body`` and pypdf
-    parses ``body`` once for each of them.
+    Object 1 is the catalog, 2 the page-tree root, 3 the object stream,
+    encoded with ``filters`` in the order pypdf decodes them, and 4 the
+    cross-reference stream. Objects 5 and up sit in the object stream, all at
+    the same offset, so each one is ``body`` and pypdf parses ``body`` once
+    for each of them.
     """
     packed = list(range(5, 5 + kids))
     index = " ".join(f"{number} 0" for number in packed) + " "
-    compressed = zlib.compress(index.encode() + body.encode(), 9)
+    encoded = index.encode() + body.encode()
+    for name in reversed(filters):
+        encoded = STREAM_ENCODERS[name](encoded)
     root_kids = " ".join(f"{number} 0 R" for number in packed)
     out = bytearray(b"%PDF-1.7\n")
     offsets = [len(out)]
@@ -214,10 +225,10 @@ def _packed_pdf(*, kids: int, body: str) -> bytes:
     out += f"2 0 obj\n<< /Type /Pages /Kids [{root_kids}] /Count {kids} >>\nendobj\n".encode()
     offsets.append(len(out))
     out += (
-        f"3 0 obj\n<< /Type /ObjStm /N {kids} /First {len(index)} /Filter /FlateDecode "
-        f"/Length {len(compressed)} >>\nstream\n"
+        f"3 0 obj\n<< /Type /ObjStm /N {kids} /First {len(index)} /Filter [{' '.join(filters)}] "
+        f"/Length {len(encoded)} >>\nstream\n"
     ).encode()
-    out += compressed + b"\nendstream\nendobj\n"
+    out += encoded + b"\nendstream\nendobj\n"
     offsets.append(len(out))
     # Each row: type 1 (offset in the file) or type 2 (object stream 3, index in it).
     rows = bytearray(bytes(6))
@@ -898,6 +909,32 @@ def test_an_object_stream_past_the_inflate_cap_answers_502_in_a_new_thread():
     thread.join(timeout=30)
 
     assert [(failure.status, "LimitReachedError" in str(failure)) for failure in failures] == [(502, True)]
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [("/ASCII85Decode",), ("/FlateDecode", "/ASCII85Decode")],
+    ids=["ascii85", "ascii85_inside_flate"],
+)
+def test_an_ascii85_stream_that_could_decode_past_the_cap_answers_502_without_decoding_it(filters):
+    # The page tree is fine: only the zeros after the page take the stream
+    # past the cap. ASCII85 writes four zero bytes as one "z", and pypdf hands
+    # the stream to the standard library's decoder, which no pypdf cap bounds:
+    # pypdf would decode past the cap, read the one page and return the PDF.
+    # Inside a FlateDecode, the PDF itself is a few KB.
+    pdf = _packed_pdf(kids=1, body=PAGE + "\0" * (render_pdf_client.PYPDF_STREAM_CAP + MIB), filters=filters)
+
+    started = time.monotonic()
+    with pytest.raises(RenderPdfFailed) as failure:
+        render_pdf_client._read_pdf(answer=_answer(pdf=pdf), max_pages=500, deadline=started + 60)
+    assert (failure.value.status, "ASCII85" in str(failure.value)) == (502, True)
+    assert time.monotonic() - started < 2
+
+
+async def test_an_ascii85_stream_under_the_cap_is_counted():
+    pdf = _packed_pdf(kids=1, body=PAGE, filters=("/ASCII85Decode",))
+
+    assert await _client(handler=_answering(pdf=pdf)).render(request=REQUEST) == pdf
 
 
 def test_counting_pages_sets_no_deprecated_pypdf_limit(monkeypatch):

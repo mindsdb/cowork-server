@@ -36,6 +36,7 @@ from typing import Literal
 import httpx
 from pydantic import ValidationError
 from pypdf import Configuration, PdfReader, apply_configuration
+from pypdf.filters import ASCII85Decode
 from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 
 from cowork.schemas.artifact_export import ExportPdfSettings, RenderPdfRequest, RenderPdfResult
@@ -60,6 +61,14 @@ _PYPDF_LIMITS = Configuration(
     run_length_maximum_output_length=PYPDF_STREAM_CAP,
     array_based_stream_maximum_output_length=PYPDF_STREAM_CAP,
 )
+
+# pypdf hands an ASCII85Decode stream to the standard library's
+# base64.a85decode, which no pypdf limit bounds: a 33 MB stream of "z" takes
+# gigabytes. A "z" decodes to four zero bytes, the most any ASCII85 byte
+# does, so only an input over a quarter of the cap can decode past it. The
+# page-count hook refuses such an input before pypdf decodes it.
+_ASCII85_INPUT_CAP = PYPDF_STREAM_CAP // 4
+_ASCII85_DECODE = ASCII85Decode.decode.__code__
 
 # The render service stops a print job 30 s after it starts. A retry after a
 # 503 is worth sending only while the budget left covers that whole job; with
@@ -254,6 +263,13 @@ class _PageCountStopped(BaseException):
     """
 
 
+class _ASCII85OverCap(BaseException):
+    """An ASCII85 stream's input is over ``_ASCII85_INPUT_CAP``.
+
+    A BaseException for the same reason as ``_PageCountStopped``.
+    """
+
+
 def _stop_after(*, stop_at: float) -> Callable[[FrameType, str, object], None]:
     """A profile function that raises as pypdf runs past ``stop_at``.
 
@@ -266,6 +282,10 @@ def _stop_after(*, stop_at: float) -> Callable[[FrameType, str, object], None]:
     later logging call in the process. The stop never lands outside pypdf, so
     Python code that pypdf calls, such as the standard library's
     ``base64.a85decode``, still runs to its end.
+
+    That decoder is also the one no pypdf limit bounds, so the hook raises
+    too as pypdf's ASCII85Decode filter starts on an input over
+    ``_ASCII85_INPUT_CAP``, before the filter calls ``a85decode``.
     """
 
     def profile(frame: FrameType, event: str, _arg: object) -> None:
@@ -274,6 +294,8 @@ def _stop_after(*, stop_at: float) -> Callable[[FrameType, str, object], None]:
         module = frame.f_globals.get("__name__", "")
         if (module == "pypdf" or module.startswith("pypdf.")) and time.monotonic() > stop_at:
             raise _PageCountStopped
+        if event == "call" and frame.f_code is _ASCII85_DECODE and len(frame.f_locals["data"]) > _ASCII85_INPUT_CAP:
+            raise _ASCII85OverCap
 
     return profile
 
@@ -286,8 +308,10 @@ def _count_pages(*, pdf: bytes, max_pages: int, deadline: float) -> int:
     stops that call from outside, so a profile hook on this thread stops it
     from inside: it raises as pypdf next starts a function or calls a builtin
     past ``deadline`` (a ``time.monotonic()`` value, answered 504) or past
-    ``PAGE_COUNT_SECONDS`` of counting (answered 502). The hook slows pypdf
-    down several times, which a count of well under a second can afford.
+    ``PAGE_COUNT_SECONDS`` of counting (answered 502). It also stops an
+    ASCII85 stream that could decode past the stream cap (answered 502). The
+    hook slows pypdf down several times, which a count of well under a
+    second can afford.
     """
     stop_at = min(deadline, time.monotonic() + PAGE_COUNT_SECONDS)
     previous = sys.getprofile()
@@ -306,6 +330,10 @@ def _count_pages(*, pdf: bytes, max_pages: int, deadline: float) -> int:
             raise RenderPdfFailed(status=504, reason=_NO_PDF_IN_TIME) from None
         raise RenderPdfFailed(
             status=502, reason=f"counting the render service's PDF pages took over {PAGE_COUNT_SECONDS} s"
+        ) from None
+    except _ASCII85OverCap:
+        raise RenderPdfFailed(
+            status=502, reason=f"the render service's PDF has an ASCII85 stream over {_ASCII85_INPUT_CAP} bytes"
         ) from None
 
 
