@@ -11,6 +11,7 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -304,6 +305,23 @@ async def test_the_org_workspace_response_offers_formats_to_an_owner_who_may_man
         )
 
     assert result["capabilities"]["exportFormats"] == offered
+
+
+async def test_while_org_export_is_off_the_workspace_response_never_walks_the_folder(
+    org_world, monkeypatch
+):
+    """Org export off offers nothing whatever the folder holds, so the
+    response skips the walk that finds the primary."""
+    monkeypatch.setattr(
+        workspace_ep, "primary_export_source", Mock(side_effect=AssertionError("walked the folder"))
+    )
+    _role_permissions(monkeypatch, artifact_manage=True)
+    with _scoped(org_world.org_id, org_world.creator) as session:
+        result = await workspace_ep.artifact_source(
+            str(org_world.project.id), org_world.ids["mine"], session, path=None
+        )
+
+    assert result["capabilities"]["exportFormats"] == []
 
 
 async def test_the_workspace_response_offers_nothing_once_artifact_manage_is_gone(

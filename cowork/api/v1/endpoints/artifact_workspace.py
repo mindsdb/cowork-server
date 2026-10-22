@@ -39,6 +39,7 @@ from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.services.artifact_export import (
     ExportRefusal,
     ExportRefused,
+    ExportSource,
     export_primary_file,
     export_slot,
     offered_export_formats,
@@ -527,9 +528,15 @@ async def artifact_source(
             current_workspace, folder, metadata, artifact_id, selected
         )
         repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
-        export_source = await run_in_threadpool(
-            primary_export_source, folder=folder, metadata=metadata
-        )
+        org_mode = bool(session.scope.org_mode)
+        if org_export_refused(org_mode=org_mode):
+            # No format is offered whatever the folder holds, so the walk that
+            # finds the primary is skipped, and the source names none.
+            export_source = ExportSource(source_name="", is_backend=False)
+        else:
+            export_source = await run_in_threadpool(
+                primary_export_source, folder=folder, metadata=metadata
+            )
         capabilities = await _current_capabilities(
             session,
             {
@@ -537,7 +544,7 @@ async def artifact_source(
                 "exportFormats": offered_export_formats(
                     source=export_source,
                     can_edit=owner_capabilities["canEdit"],
-                    org_mode=bool(session.scope.org_mode),
+                    org_mode=org_mode,
                 ),
             },
         )
