@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 import sys
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ from cowork.db.session import get_engine
 from cowork.models.live_app import LiveAppLaunchRecord
 from cowork.services import live_apps
 from cowork.services.live_apps import CoworkLiveAppHost, LiveAppPerson, stop_reason_text, stop_time_text
+from tests._logging_assertions import assert_log_fields
 from tests._live_apps import (
     ALICE,
     BEARER_TOKEN,
@@ -221,6 +223,20 @@ def test_viewer_login_or_the_slot_failing_answers_503(services):
     services.slots[1].fails_with = None
     services.viewer_fails_with = 502
     assert _access(client, 1, "a").status_code == 503
+
+
+def test_an_unavailable_check_logs_the_slot_and_which_service_failed(services, owned_logger):
+    from cowork.api.v1.endpoints import live_apps as live_apps_routes
+
+    logged = owned_logger(live_apps_routes.logger.name, level=logging.WARNING)
+    _launch(services, 1, ALICE, slug="dash", boot_id=BOOT_1)
+    services.viewer_fails_with = 502
+
+    assert _access(_client(), 1, "a").status_code == 503
+
+    assert_log_fields(
+        logged.output(), event="live_app_access_unavailable", slot=1, reason="viewer_login_status_502"
+    )
 
 
 @pytest.mark.parametrize(
@@ -434,6 +450,17 @@ def test_a_report_through_a_proxy_is_refused(from_slot_1, header, value):
     assert record.state == "running"
 
 
+def test_a_refused_report_logs_the_slot_and_why(from_slot_1, owned_logger):
+    from cowork.api.v1.endpoints import live_apps as live_apps_routes
+
+    logged = owned_logger(live_apps_routes.logger.name, level=logging.WARNING)
+    _launch(from_slot_1, 1, ALICE, slug="dash", boot_id=BOOT_1)
+
+    assert _report(_client(), 1, headers={"X-Forwarded-For": "172.30.16.11"}).status_code == 403
+
+    assert_log_fields(logged.output(), event="live_app_stop_report_refused", slot=1, reason="forwarded")
+
+
 def test_the_report_is_checked_against_the_slots_resolved_address(services, monkeypatch):
     """The real check: slot n's host name, resolved here, must be the
     report's peer."""
@@ -538,6 +565,36 @@ def test_an_exited_slot_keeps_the_record_for_its_report(from_slot_1):
     assert _report(client, 1, reason="max_time", limit_hours=8).status_code == 204
     (entry,) = _mine(client).json()
     assert (entry["stopReason"], entry["stopReasonText"]) == ("max_time", "it reached its 8 h limit")
+
+
+def test_a_report_that_came_before_the_record_is_read_from_the_slots_status(from_slot_1):
+    """The app exits and the slot reports before launched writes the record,
+    which leaves the report nothing to stop. The slot's status still says
+    why, so the record stops for that reason, not as lost once the slot
+    restarts."""
+    client = _client()
+    assert _report(client, 1, reason="app_exited").status_code == 204
+    _launch(from_slot_1, 1, ALICE, slug="dash", boot_id=BOOT_1)
+    from_slot_1.slots[1].state = "exited"
+    from_slot_1.slots[1].stop_reason = "app_exited"
+
+    (entry,) = _mine(client).json()
+
+    assert (entry["state"], entry["stopReason"]) == ("stopped", "app_exited")
+
+
+def test_a_report_after_the_status_said_why_fills_in_the_hours(from_slot_1):
+    _launch(from_slot_1, 1, ALICE, slug="dash", boot_id=BOOT_1)
+    from_slot_1.slots[1].state = "exited"
+    from_slot_1.slots[1].stop_reason = "idle"
+    client = _client()
+
+    (entry,) = _mine(client).json()
+    assert (entry["stopReason"], entry["stopReasonText"]) == ("idle", "no requests for a while")
+
+    assert _report(client, 1, reason="idle", limit_hours=2).status_code == 204
+    (entry,) = _mine(client).json()
+    assert (entry["stopReason"], entry["stopReasonText"]) == ("idle", "no requests for 2 h")
 
 
 def test_a_record_on_a_slot_the_list_dropped_is_lost(services, monkeypatch):
@@ -731,6 +788,58 @@ def test_launch_failed_never_raises_into_antons_launch(services, monkeypatch):
     monkeypatch.setattr(live_apps, "run_db", broken)
 
     asyncio.run(host.launch_failed(1))
+
+
+def test_a_launch_whose_record_fails_is_told_as_failed(services, monkeypatch):
+    """anton claims A's dash for another app of A's, the slot takes it, and
+    writing its record fails: anton resets the slot and calls launch_failed,
+    and dash's stop is one A hasn't heard of."""
+    _launch(services, 1, ALICE, slug="dash", boot_id=BOOT_1)
+    host = _host(ALICE)
+
+    def write_fails(*_args, **_kwargs):
+        raise RuntimeError("the database went away")
+
+    async def launch_whose_record_fails() -> None:
+        await host.claim(1)
+        with monkeypatch.context() as patched:
+            patched.setattr(live_apps, "_start_record", write_fails)
+            with pytest.raises(RuntimeError):
+                await host.launched(_launch_model(1, "report", BOOT_2))
+        await host.launch_failed(1)
+
+    asyncio.run(launch_whose_record_fails())
+
+    (record,) = _records(1)
+    assert (record.slug, record.stop_reason, record.stop_noticed) == ("dash", "launch_failed", False)
+
+
+def test_a_relaunch_stopped_once_its_record_is_written_is_told_as_failed(services, monkeypatch):
+    """A Stop lands as launched's write commits: run_db finishes the write,
+    then the cancel goes on, and anton resets the slot and calls
+    launch_failed, which stops the relaunch's record too."""
+    _launch(services, 1, ALICE, slug="dash", boot_id=BOOT_1)
+    host = _host(ALICE)
+    real_run_db = live_apps.run_db
+
+    async def commit_then_stop(unit, *, scope):
+        await real_run_db(unit, scope=scope)
+        raise asyncio.CancelledError
+
+    async def relaunch_stopped_after_its_record() -> None:
+        await host.claim(1)
+        with monkeypatch.context() as patched:
+            patched.setattr(live_apps, "run_db", commit_then_stop)
+            with pytest.raises(asyncio.CancelledError):
+                await host.launched(_launch_model(1, "dash", BOOT_2))
+        await host.launch_failed(1)
+
+    asyncio.run(relaunch_stopped_after_its_record())
+
+    relaunch = next(record for record in _records(1) if record.boot_id == BOOT_2)
+    assert (relaunch.state, relaunch.stop_reason, relaunch.stop_noticed) == ("stopped", "launch_failed", False)
+    (entry,) = _mine(_client()).json()
+    assert (entry["state"], entry["stopReason"]) == ("stopped", "launch_failed")
 
 
 def test_a_launch_into_a_freed_slot_dates_the_earlier_apps_loss_by_the_slots_boot(services):

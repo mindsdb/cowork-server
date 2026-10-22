@@ -21,11 +21,31 @@ The server starts on `http://127.0.0.1:26866`. Confirm with:
 curl http://127.0.0.1:26866/api/v1/health/
 ```
 
+## Reviewed release dependencies
+
+`uv.lock` is the runtime selection for this repository. CI, Docker and release smoke tests refuse a stale lock. `cowork/release-requirements.txt` is its generated runtime export, with environment markers and artifact hashes. Every wheel and source distribution carries that exact file; publishing checks both artifacts against the lock.
+
+The release workflow selects Anton from `uv.lock`. Publishing a newer Anton alone does not change this server release. To move a dependency deliberately:
+
+```sh
+uv lock --upgrade-package anton-agent
+python scripts/release_contract.py
+uv sync --locked --group dev
+bash scripts/check_wheels_available.sh
+make test/unit
+```
+
+Review both the lock and export diffs, run the release checks, and publish a new server release. Change a declared compatibility constraint first when the intended version is outside it. Use the same process for any other dependency. Do not run a general upgrade while preparing a source-only release.
+
+Cowork's release installer consumes the contract from the selected wheel or Git commit. Direct `pip install` and `uv tool install cowork-server` still resolve the public library compatibility ranges; they do not automatically consume this export. For a standalone server with this repository's reviewed selection, check out a reviewed release tag and run `uv sync --locked --no-dev`, then `uv run --locked --no-dev cowork-server`.
+
+The eight platform/Python wheel checks use release constraints. When the lock selects an Anton release candidate, the required wheel gate waits for that exact version to reach PyPI's Simple index before resolving it; the publish runner repeats the wait before building. The weekly `--floating` check separately probes the public compatibility ranges and never rewrites the release lock. Build backends, the Python interpreter and operating-system packages are separate inputs; this policy fixes the application dependency selection, not every byte of an image.
+
 ## Development
 
 ```sh
 # Run from source (auto-manages virtualenv + deps)
-uv run cowork-server
+uv run --locked cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
@@ -35,7 +55,7 @@ cowork-server imports anton's artifact folder constants (`anton.core.artifacts.i
 ### Dev setup helper
 
 ```sh
-uv run cowork-dev-setup
+uv run --locked cowork-dev-setup
 ```
 
 Initializes the database and validates configuration.
@@ -43,7 +63,7 @@ Initializes the database and validates configuration.
 ### Testing
 
 ```sh
-uv run pytest
+uv run --locked pytest
 ```
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
@@ -994,8 +1014,8 @@ With anton's `ANTON_LIVE_APP_SLOTS` set, a full-stack artifact runs as a live ap
 
 - `GET /api/v1/live-apps/<n>/access` answers the edge in front of slot `n`'s address, which sends the visitor's `Cookie` and nothing else. It answers 200 when the viewer sign-in (`COWORK_LIVE_APPS_VIEWER_LOGIN_URL`, its `/oauth2/userinfo`) names, by `sub` and by email, the launcher of the app the slot runs now, by the slot's running record and by the slot's own `GET /status`; 401 for a visitor who isn't signed in; 403 for anyone else; and 503 when the sign-in or the slot can't answer. The owner never comes from the request, and no reply passes on the sign-in's `Set-Cookie`.
 - `GET /api/v1/live-apps/<n>/stopped-page` is the page the edge shows at that address instead of a bare 403, 502 or 503: for its launcher, the app by the name its card shows, and when and why it stopped (`12:04 UTC` today, `19 Oct 12:04 UTC` before), with whether another person's app runs there now, or the address it runs at now; a plain refusal for anyone else.
-- `POST /api/v1/live-apps/<n>/stopped` takes slot `n`'s report that its app ended: `idle` or `max_time` with the hours, `app_exited`, `terminated` or `reset`, and when it ended, which the record keeps within the launch's own life. It takes no credential, since a slot holds none to send: the report is believed only from slot `n`'s own address, with no forwarding header, and only for the boot id of the slot's running record. A `reset` changes nothing: after a claim the record is already stopped, and otherwise the slot's next boot marks a record it still runs lost.
-- `GET /api/v1/live-apps/mine` lists the latest launch of each of the caller's apps, newest first, running or stopped, with the reason as a code and a sentence. A running app whose slot is on a later boot, or that the slot list no longer has, is marked stopped, `lost`: at the slot's new boot time where the slot gives it, else when it is found. A slot that still shows the app's boot keeps it running until its report says why it ended.
+- `POST /api/v1/live-apps/<n>/stopped` takes slot `n`'s report that its app ended: `idle` or `max_time` with the hours, `app_exited`, `terminated` or `reset`, and when it ended, which the record keeps within the launch's own life. It takes no credential, since a slot holds none to send: the report is believed only from slot `n`'s own address, with no forwarding header, and only for the boot id of the slot's running record, or of one the slot's status already stopped for the same reason, whose hours and time the report fills in. A `reset` changes nothing: after a claim the record is already stopped, and otherwise the slot's next boot marks a record it still runs lost.
+- `GET /api/v1/live-apps/mine` lists the latest launch of each of the caller's apps, newest first, running or stopped, with the reason as a code and a sentence. A running app whose slot is on a later boot, or that the slot list no longer has, is marked stopped, `lost`: at the slot's new boot time where the slot gives it, else when it is found. A slot that shows the app's boot exited, with the reason it keeps in its status, stops it for that reason; one that still runs it, or exited without a reason yet, keeps it running until its report says why it ended.
 - `POST /api/v1/artifacts/live-app-share` shares one of the caller's full-stack apps with one address (`{"projectId", "slug", "email"}`) or with everyone (`{"projectId", "slug", "everyone": true}`). `GET /api/v1/artifacts/live-app-shares?projectId=&slug=` lists the caller's shares of that app, newest first, and `DELETE /api/v1/artifacts/live-app-share/<shareId>` withdraws one of them (404 "This share no longer exists." for anyone else's); copies already made stay. `GET /api/v1/artifacts/shared-live-apps` lists what others shared with the caller's address or with everyone, each app once, with the owner's address; an app whose folder is gone or can't be read drops out.
 - `POST /api/v1/artifacts/live-app-duplicate` copies a shared app into a project of the caller's own once the caller confirms the disclaimer (`"confirmed": true`, JSON true only), and answers the copy's card. The copy runs with the caller's connections. It takes `backend.py`, `requirements.txt`, `state_manifest.json`, `prd.md`, `spec.md` and every regular file under `static/`, read without following links (at the owner's project folder too), and gets a new `metadata.json` from anton's store with the app's name, description, type and declared connections, an empty provenance and a null port. It never takes the log, the publish state, the owner's port or any other file, and a link, a hard-linked file, a missing `backend.py`, a folder it can't read or a file over anton's launch caps refuses the whole copy with 422 naming the path. A copy whose received mark can't be recorded is removed again. Each artifact card then carries `receivedFrom`, the owner's address for a copy, from the server's own record of it. Moving a conversation to another project takes its app's shares, received mark and launch records along with the folder.
 
@@ -1038,7 +1058,7 @@ Environment variables fall into these groups:
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
-| `ANTON_LIVE_APP_SLOTS` | unset | anton's live-apps switch, the app slots' control addresses, comma-separated, read through anton (`live_apps_enabled`). With it set, the agent builds full-stack apps and anton launches each into a slot outside this server ([Live apps](#live-apps)). The server refuses to start, whenever it is set or anton reads live apps as on, with `COWORK_CODE_SANDBOX` off, `COWORK_TRUST_IDENTITY_HEADERS` off, `projects` left off `COWORK_PERSONAL_RESOURCES`, an anton without `anton.core.artifacts.live_app_slots`, whose `live_app_slots` lacks a name this server uses (the switch, the slot addresses, `SlotStatus`, `LiveAppLauncher`, the launch list and its caps, `MAX_REPLY_BYTES`), or whose `ChatSessionConfig` takes no `live_app_host`, an entry that doesn't parse or no entry at all, `COWORK_LIVE_APPS_VIEWER_LOGIN_URL` that isn't an `http://` or `https://` address with a host, no query or fragment and no space around it, or `COWORK_LIVE_APPS_LAUNCH_TOKEN` shorter than 32 printable ASCII characters or with a space around it. |
+| `ANTON_LIVE_APP_SLOTS` | unset | anton's live-apps switch, the app slots' control addresses, comma-separated, read through anton (`live_apps_enabled`). With it set, the agent builds full-stack apps and anton launches each into a slot outside this server ([Live apps](#live-apps)). The server refuses to start, whenever it is set or anton reads live apps as on, with `COWORK_CODE_SANDBOX` off, `COWORK_TRUST_IDENTITY_HEADERS` off, `projects` left off `COWORK_PERSONAL_RESOURCES`, an anton without `anton.core.artifacts.live_app_slots`, whose `live_app_slots` lacks a name this server uses (the switch, the slot addresses, `SlotStatus`, `LiveAppLauncher`, the launch list and its caps, `MAX_REPLY_BYTES`), or whose `ChatSessionConfig` takes no `live_app_host`, an entry that doesn't parse (a blank one included), `COWORK_LIVE_APPS_VIEWER_LOGIN_URL` that isn't an `http://` or `https://` address with a host, no query or fragment and no space around it, or `COWORK_LIVE_APPS_LAUNCH_TOKEN` shorter than 32 printable ASCII characters or with a space around it. |
 | `COWORK_LIVE_APPS_VIEWER_LOGIN_URL` | unset | With live apps on, the viewer sign-in (oauth2-proxy) the access check asks who a visitor is, for example `http://viewer-login:4180`: its `/oauth2/userinfo`, with the visitor's cookie, never through a proxy variable, trusting `SSL_CERT_FILE` or `SSL_CERT_DIR` for an `https://` one on a private CA. |
 | `COWORK_LIVE_APPS_LAUNCH_TOKEN` | unset | With live apps on, the token anton sends each slot with a launch, and this server with each status read; a slot holds only its SHA-256. With `COWORK_CODE_SANDBOX=landlock` the agent's code never gets it, because anton's launcher passes no `COWORK_*` name. |
 | `COWORK_PUBLISH_TOKEN` | unset | In local tenancy, the bearer the server sends the publish service (`ANTON_PUBLISH_URL`) for every share, unpublish and version change, in place of the provider's key, whatever the provider. Org tenancy ignores it: there each publish carries a per-user key the server mints. Without it, the server sends `openai_compatible_api_key` when `openai_base_url` is a MindsHub API host (`api*.mindshub.ai`), and `minds_api_key` otherwise. Set it for a publisher you run yourself: on a MindsHub endpoint the agent's code holds the model key as its `OPENAI_API_KEY`, so a publisher that takes that key takes calls from the agent's code too. With `COWORK_CODE_SANDBOX=landlock` the agent's code never gets this variable, because anton's launcher passes no `COWORK_*` name. With `off`, a cell inherits the server's whole environment, this variable included. Blank means unset. |
@@ -1093,3 +1113,10 @@ On a deployment that trusts identity headers, an operator with a shell where cow
 ## License
 
 See [LICENSE](LICENSE).
+
+## Diagnostics
+
+See [structured logging](docs/structured-logging.md) for defaults, troubleshooting
+overrides, retained evidence streams and rollout requirements.
+Shared-memory startup warnings state whether turns learn into the shared store
+or leave it unread, without logging its private path.

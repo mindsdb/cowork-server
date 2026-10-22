@@ -1,28 +1,20 @@
 """Live apps for tests: anton's live-app slots, a viewer sign-in and app slots
 answering over HTTP, and the people who use them.
 
-anton's ``anton.core.artifacts.live_app_slots`` (owner: anton,
-``anton/core/artifacts/live_app_slots.py``) isn't in the anton this server
-pins yet. Where the installed anton lacks it, install_live_app_slots puts a
-stand-in written from that module's published names and limits in its place:
-the switch, the slot addresses, the launch list and its caps, the reply cap,
-and the models this server reads. Where the installed anton has it, the real
-module is used, and an error importing it fails the test.
+The live-app slots are anton's own ``anton.core.artifacts.live_app_slots``
+(owner: anton, ``anton/core/artifacts/live_app_slots.py``), which every anton
+this server installs has, so a test reads the real switch, slot list, launch
+list, caps and models.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import importlib.util
-import os
-import re
 import sys
 import types
 from dataclasses import dataclass, field
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import personal_partition_id
@@ -45,114 +37,10 @@ PARTITION_B = personal_partition_id(DEPLOYMENT, SUB_B)
 PARTITION_C = personal_partition_id(DEPLOYMENT, SUB_C)
 
 
-# ── the stand-in for anton's module ──────────────────────────────────────────
-
-
-class _LiveAppLauncher(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    subject: str = Field(min_length=1, max_length=255)
-    email: str = Field(min_length=3, max_length=254)
-
-
-class _LiveAppLaunch(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    slot: int
-    slug: str
-    artifact_dir: str
-    address: str
-    boot_id: str
-
-
-class _Wire(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-
-class _AppHashes(_Wire):
-    backend: str
-    requirements: str
-    connections: str
-
-
-class _SlotApp(_Wire):
-    artifact: str
-    launcher: _LiveAppLauncher
-    started_at: str
-    expires_at: str
-    last_request_at: str | None = None
-    hashes: _AppHashes
-    env_names: tuple[str, ...] = ()
-
-
-class _SlotStatus(_Wire):
-    version: Literal[1]
-    boot_id: str = Field(min_length=1)
-    booted_at: str
-    state: Literal["empty", "running", "exited"]
-    app: _SlotApp | None = None
-
-
-_SLOT_ADDRESS = re.compile(r"^http://[A-Za-z0-9.-]+:(?P<port>\d{1,5})$")
-
-
-def _live_apps_enabled() -> bool:
-    return bool(os.environ.get(SLOTS_VARIABLE, "").strip())
-
-
-def _live_app_slot_addresses() -> tuple[str, ...]:
-    entries = tuple(entry.strip() for entry in os.environ.get(SLOTS_VARIABLE, "").split(",") if entry.strip())
-    for entry in entries:
-        match = _SLOT_ADDRESS.match(entry)
-        if match is None or not 1 <= int(match["port"]) <= 65535:
-            raise ValueError(f"{SLOTS_VARIABLE} entry {entry!r} isn't http://<host>:<port>")
-    return entries
-
-
-def _stand_in() -> types.ModuleType:
-    module = types.ModuleType(MODULE)
-    module.live_apps_enabled = _live_apps_enabled
-    module.live_app_slot_addresses = _live_app_slot_addresses
-    module.LiveAppLauncher = _LiveAppLauncher
-    module.LiveAppLaunch = _LiveAppLaunch
-    module.SlotStatus = _SlotStatus
-    module.LAUNCH_FILES = ("backend.py", "requirements.txt", "state_manifest.json")
-    module.LAUNCH_DIRS = ("static",)
-    module.MAX_LAUNCH_FILES = 500
-    module.MAX_LAUNCH_FILE_BYTES = 8 * 1024 * 1024
-    module.MAX_LAUNCH_TOTAL_BYTES = 64 * 1024 * 1024
-    module.MAX_REPLY_BYTES = 1024 * 1024
-    return module
-
-
-def install_live_app_slots(monkeypatch) -> types.ModuleType:
-    """anton's live-app slots, real or stood in, and a ChatSessionConfig that
-    takes ``live_app_host``. The stand-in goes in only where the installed
-    anton has no such module, so a real module that fails to import fails
-    the test instead of passing on the stand-in."""
-    import anton.core.artifacts as artifacts_package
-    import anton.core.session as session_module
-
-    if sys.modules.get(MODULE) is None and importlib.util.find_spec(MODULE) is None:
-        module = _stand_in()
-        monkeypatch.setitem(sys.modules, MODULE, module)
-        monkeypatch.setattr(artifacts_package, "live_app_slots", module, raising=False)
-    else:
-        import anton.core.artifacts.live_app_slots as module
-    config = session_module.ChatSessionConfig
-    if "live_app_host" not in {item.name for item in dataclasses.fields(config)}:
-
-        @dataclass
-        class ChatSessionConfigWithHost(config):
-            live_app_host: object = None
-
-        monkeypatch.setattr(session_module, "ChatSessionConfig", ChatSessionConfigWithHost)
-    return module
-
-
 def turn_on_live_apps(monkeypatch) -> types.ModuleType:
     """Live apps on, as the overlay sets them on the cowork service."""
-    module = install_live_app_slots(monkeypatch)
+    import anton.core.artifacts.live_app_slots as module
+
     monkeypatch.setenv(SLOTS_VARIABLE, ",".join(SLOT_ADDRESSES))
     monkeypatch.setenv("COWORK_LIVE_APPS_VIEWER_LOGIN_URL", VIEWER_LOGIN)
     monkeypatch.setenv("COWORK_LIVE_APPS_LAUNCH_TOKEN", LAUNCH_TOKEN)
@@ -171,6 +59,8 @@ class FakeSlot:
     artifact: str = ""
     launcher_subject: str = ""
     launcher_email: str = ""
+    # Why the app stopped, which the slot keeps in its status while exited.
+    stop_reason: Literal["idle", "max_time", "app_exited", "reset", "terminated"] | None = None
     # Answer status with this code instead, or None.
     fails_with: int | None = None
 
@@ -252,7 +142,7 @@ class FakeServices:
                 "launcher": {"subject": slot.launcher_subject, "email": slot.launcher_email},
                 "started_at": "2026-10-21T04:40:00Z",
                 "expires_at": "2026-10-21T12:40:00Z",
-                "stop_reason": None,
+                "stop_reason": slot.stop_reason,
                 "hashes": {"backend": "0" * 64, "requirements": "0" * 64, "connections": "0" * 64, "files": "0" * 64},
             }
         body = {"version": 1, "boot_id": slot.boot_id, "booted_at": slot.booted_at, "state": slot.state, "app": app}

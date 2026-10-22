@@ -201,6 +201,10 @@ class CoworkLiveAppHost:
         # The record each claim stopped, by slot, so launched can tell the
         # person's relaunch of the same app from a replacement.
         self._claimed: dict[int, UUID] = {}
+        # The boot of each launch launched is recording, by slot, so a
+        # launch_failed after a Stop that landed once its record was written
+        # stops that record too.
+        self._launching: dict[int, str] = {}
 
     async def claim(self, slot: int) -> None:
         lost_at = await _slot_boot_time(slot)
@@ -213,6 +217,7 @@ class CoworkLiveAppHost:
             self._claimed[slot] = stopped
 
     async def launched(self, launch: LiveAppLaunch) -> None:
+        self._launching[launch.slot] = launch.boot_id
         lost_at = await _slot_boot_time(launch.slot, boot_id=launch.boot_id)
         await run_db(
             partial(
@@ -220,24 +225,36 @@ class CoworkLiveAppHost:
                 launch=launch,
                 launcher=self._person,
                 project_id=self._project_id,
-                claimed=self._claimed.pop(launch.slot, None),
+                claimed=self._claimed.get(launch.slot),
                 lost_at=lost_at,
             ),
             scope=SYSTEM_SCOPE,
         )
+        # Only once the record is written: a launched that raises, or that a
+        # Stop ends, leaves both for launch_failed, which anton calls next.
+        self._claimed.pop(launch.slot, None)
+        self._launching.pop(launch.slot, None)
 
     async def launch_failed(self, slot: int) -> None:
         """A launch that claimed ``slot`` didn't finish: anton reset the slot,
         so the app claim stopped is gone and nothing runs there. Its stop
-        becomes ``launch_failed``, which the card, the stopped page and the
+        becomes ``launch_failed``, and so does a record launched wrote for
+        this launch before a Stop, which the card, the stopped page and the
         next turn tell. Never raises into anton's launch."""
         claimed = self._claimed.pop(slot, None)
-        if claimed is None:
+        launching = self._launching.pop(slot, None)
+        if claimed is None and launching is None:
             return
         try:
-            await run_db(partial(_launch_failed, record_id=claimed), scope=SYSTEM_SCOPE)
+            await run_db(
+                partial(_launch_failed, record_id=claimed, slot=slot, boot_id=launching), scope=SYSTEM_SCOPE
+            )
         except Exception:
-            logger.warning("live app %d: the failed launch can't be recorded", slot, exc_info=True)
+            logger.warning(
+                "Live app launch failure not recorded",
+                exc_info=True,
+                extra={"event": "live_app_launch_failure_unrecorded", "slot": slot},
+            )
 
 
 def live_app_host_for_turn(*, project_id: UUID) -> CoworkLiveAppHost | None:
@@ -320,17 +337,20 @@ def _stop_for_claim(
     return record.id
 
 
-def _launch_failed(session: ScopedSession, *, record_id: UUID) -> None:
+def _launch_failed(session: ScopedSession, *, record_id: UUID | None, slot: int, boot_id: str | None) -> None:
     """Make the stop claim recorded for ``record_id`` a failed launch the
-    person hasn't heard of."""
-    record = session.get(LiveAppLaunchRecord, record_id)
+    person hasn't heard of, and stop slot ``slot``'s running record of boot
+    ``boot_id`` the same way: launched wrote it, and anton then reset the slot."""
+    record = None if record_id is None else session.get(LiveAppLaunchRecord, record_id)
     # Only the person's own app the claim replaced: another person's record
     # a claim ended was already gone (lost), and stays theirs as it is.
-    if record is None or record.state != "stopped" or record.stop_reason != "replaced":
-        return
-    record.stop_reason = "launch_failed"
-    record.stop_noticed = False
-    session.add(record)
+    if record is not None and record.state == "stopped" and record.stop_reason == "replaced":
+        record.stop_reason = "launch_failed"
+        record.stop_noticed = False
+        session.add(record)
+    running = _running_record(session, slot=slot) if boot_id is not None else None
+    if running is not None and running.boot_id == boot_id:
+        _stop(session, running, reason="launch_failed")
 
 
 def _start_record(
@@ -432,7 +452,12 @@ class ViewerIdentity(NamedTuple):
 
 
 class LiveAppAccessUnavailable(RuntimeError):
-    """viewer-login or the slot didn't answer, so nobody's access can be told."""
+    """viewer-login or the slot didn't answer, so nobody's access can be told.
+    ``reason`` says which and how, as a code the log keeps."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 AccessOutcome = Literal["allowed", "signed_out", "refused"]
@@ -535,18 +560,24 @@ async def viewer_identity(client: httpx.AsyncClient, cookie: str) -> ViewerIdent
         reply = await _get(client, url, headers={"Cookie": cookie.encode("latin-1")})
     except (httpx.HTTPError, UnicodeError) as error:
         raise LiveAppAccessUnavailable(
-            f"viewer-login didn't answer ({type(error).__name__})"
+            f"viewer-login didn't answer ({type(error).__name__})", reason="viewer_login_unreachable"
         ) from error
     except _ReplyTooLarge:
-        raise LiveAppAccessUnavailable("viewer-login's answer is too large") from None
+        raise LiveAppAccessUnavailable(
+            "viewer-login's answer is too large", reason="viewer_login_reply_too_large"
+        ) from None
     if reply.status_code == 401:
         return None
     if reply.status_code != 200:
-        raise LiveAppAccessUnavailable(f"viewer-login answered {reply.status_code}")
+        raise LiveAppAccessUnavailable(
+            f"viewer-login answered {reply.status_code}", reason=f"viewer_login_status_{reply.status_code}"
+        )
     try:
         session = ViewerSession.model_validate_json(reply.content)
     except ValidationError as error:
-        raise LiveAppAccessUnavailable("viewer-login's answer doesn't parse") from error
+        raise LiveAppAccessUnavailable(
+            "viewer-login's answer doesn't parse", reason="viewer_login_reply_unparsed"
+        ) from error
     email = normalized_email(session.email)
     if not email:
         return None
@@ -571,16 +602,22 @@ async def _slot_status(client: httpx.AsyncClient, slot: int) -> SlotStatus:
         reply = await _get(client, f"{address}/status", headers={"Authorization": f"Bearer {token}"})
     except httpx.HTTPError as error:
         raise LiveAppAccessUnavailable(
-            f"live-app slot {slot} didn't answer ({type(error).__name__})"
+            f"live-app slot {slot} didn't answer ({type(error).__name__})", reason="slot_unreachable"
         ) from error
     except _ReplyTooLarge:
-        raise LiveAppAccessUnavailable(f"live-app slot {slot}'s status is too large") from None
+        raise LiveAppAccessUnavailable(
+            f"live-app slot {slot}'s status is too large", reason="slot_reply_too_large"
+        ) from None
     if reply.status_code != 200:
-        raise LiveAppAccessUnavailable(f"live-app slot {slot} answered {reply.status_code}")
+        raise LiveAppAccessUnavailable(
+            f"live-app slot {slot} answered {reply.status_code}", reason=f"slot_status_{reply.status_code}"
+        )
     try:
         return SlotStatus.model_validate_json(reply.content)
     except ValidationError as error:
-        raise LiveAppAccessUnavailable(f"live-app slot {slot}'s status doesn't parse") from error
+        raise LiveAppAccessUnavailable(
+            f"live-app slot {slot}'s status doesn't parse", reason="slot_reply_unparsed"
+        ) from error
 
 
 # ── stops ────────────────────────────────────────────────────────────────────
@@ -602,7 +639,12 @@ class SlotStopReport(BaseModel):
 
 
 class SlotReportRefused(PermissionError):
-    """A stop report from an address other than its slot's own."""
+    """A stop report from an address other than its slot's own. ``reason``
+    says how, as a code the log keeps."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 #: Headers a proxy in front of the server adds. uvicorn takes the client
@@ -618,7 +660,9 @@ async def _slot_ips(slot: int) -> frozenset[str]:
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(host, None)
     except OSError as error:
-        raise LiveAppAccessUnavailable(f"live-app slot {slot}'s host doesn't resolve ({error})") from error
+        raise LiveAppAccessUnavailable(
+            f"live-app slot {slot}'s host doesn't resolve ({error})", reason="slot_host_unresolved"
+        ) from error
     return frozenset(info[4][0] for info in infos)
 
 
@@ -629,26 +673,46 @@ async def record_slot_stop(
 
     Believed only from the slot's own address, with no forwarding header, and
     only for the boot id of the slot's running record, which only anton and
-    the slot know. A ``reset`` changes nothing: after a claim the record is
+    the slot know, or of a record the slot's status already stopped for the
+    same reason (reconcile_running), whose hours and time it fills in. A
+    ``reset`` changes nothing: after a claim the record is
     already stopped, and otherwise (anton resets an exited slot, or one after
     a launch that didn't finish) the slot's next boot marks a record it still
     runs lost. Raises SlotReportRefused for any other address.
     """
     if peer is None or any(name.lower() in _FORWARDING_HEADERS for name in headers):
-        raise SlotReportRefused(f"a stop report for live-app slot {slot} came through a proxy")
+        raise SlotReportRefused(f"a stop report for live-app slot {slot} came through a proxy", reason="forwarded")
     if peer not in await _slot_ips(slot):
-        raise SlotReportRefused(f"a stop report for live-app slot {slot} came from another address")
+        raise SlotReportRefused(
+            f"a stop report for live-app slot {slot} came from another address", reason="other_address"
+        )
     if report.reason == "reset":
         return False
     return await run_db(partial(_stop_reported, slot=slot, report=report), scope=SYSTEM_SCOPE)
 
 
 def _stop_reported(session: ScopedSession, *, slot: int, report: SlotStopReport) -> bool:
-    record = _running_record(session, slot=slot)
-    if record is None or record.boot_id != report.boot_id:
-        return False
     limit_hours = report.limit_hours if report.reason in ("idle", "max_time") else None
-    _stop(session, record, reason=report.reason, limit_hours=limit_hours, stopped_at=report.stopped_at)
+    record = _running_record(session, slot=slot)
+    if record is not None and record.boot_id == report.boot_id:
+        _stop(session, record, reason=report.reason, limit_hours=limit_hours, stopped_at=report.stopped_at)
+        return True
+    # reconcile_running may have stopped it first, from the slot's status,
+    # which says why but carries neither the hours nor when: the report
+    # fills them in.
+    stopped = session.exec(
+        session.select(LiveAppLaunchRecord).where(
+            LiveAppLaunchRecord.slot == slot,
+            LiveAppLaunchRecord.boot_id == report.boot_id,
+            LiveAppLaunchRecord.state == "stopped",
+            LiveAppLaunchRecord.stop_reason == report.reason,
+        )
+    ).first()
+    if stopped is None:
+        return False
+    stopped.limit_hours = limit_hours
+    stopped.stopped_at = _when_stopped(stopped, report.stopped_at)
+    session.add(stopped)
     return True
 
 
@@ -745,17 +809,29 @@ def _latest_apps(session: ScopedSession, *, person: LiveAppPerson) -> list[Perso
     return list(latest.values())
 
 
-def _mark_lost(session: ScopedSession, *, lost: dict[UUID, datetime | None]) -> dict[UUID, PersonApp]:
-    """Stop each record in ``lost`` still running as ``lost``, at the time
-    given for it (now for None), and return each record as it now stands,
-    one a report stopped meanwhile included."""
+class _FoundStop(NamedTuple):
+    """A stop reconcile_running found: why, and when (None for now)."""
+
+    reason: StopReason
+    at: datetime | None
+
+
+#: The stops a slot reports (SlotStopReport), which its status repeats while
+#: it stays exited. A ``reset`` isn't one (record_slot_stop).
+_SLOT_STOPS: frozenset[str] = frozenset({"idle", "max_time", "app_exited", "terminated"})
+
+
+def _mark_stopped(session: ScopedSession, *, found: dict[UUID, _FoundStop]) -> dict[UUID, PersonApp]:
+    """Stop each record in ``found`` still running, for the reason and at the
+    time found for it, and return each record as it now stands, one a report
+    stopped meanwhile included."""
     now_standing: dict[UUID, PersonApp] = {}
-    for record_id, at in lost.items():
+    for record_id, stop in found.items():
         record = session.get(LiveAppLaunchRecord, record_id)
         if record is None:
             continue
         if record.state == "running":
-            _stop(session, record, reason="lost", stopped_at=at)
+            _stop(session, record, reason=stop.reason, stopped_at=stop.at)
         now_standing[record_id] = _as_person_app(record)
     return now_standing
 
@@ -786,17 +862,20 @@ def _booted_at(status: SlotStatus) -> datetime | None:
 
 async def reconcile_running(apps: list[PersonApp]) -> list[PersonApp]:
     """``apps`` with every running one its slot no longer runs marked
-    stopped, ``lost``, in the database too: a slot on a later boot, or a slot
-    the slot list no longer has. A slot that still shows the record's boot,
-    running or exited, keeps it running: an exited slot's report of why is
-    on its way. A slot that can't answer leaves its app as recorded."""
+    stopped, in the database too: ``lost`` for a slot on a later boot, or a
+    slot the slot list no longer has, and the slot's own reason for one that
+    shows the record's boot exited and says why. A slot that still runs the
+    record's boot keeps it running, and so does one exited without a reason
+    yet. A slot that can't answer leaves its app as recorded."""
     running = [app for app in apps if app.running]
     if not running:
         return apps
     count = len(live_app_slot_addresses())
     # A slot past the list (the operator lowered the slot count) has no
     # address to ask and no route for its report.
-    lost: dict[UUID, datetime | None] = {app.record_id: None for app in running if not 1 <= app.slot <= count}
+    found: dict[UUID, _FoundStop] = {
+        app.record_id: _FoundStop("lost", None) for app in running if not 1 <= app.slot <= count
+    }
     asked = [app for app in running if 1 <= app.slot <= count]
     async with _http_client() as client:
         statuses = await asyncio.gather(
@@ -804,14 +883,22 @@ async def reconcile_running(apps: list[PersonApp]) -> list[PersonApp]:
         )
     for app, status in zip(asked, statuses):
         if isinstance(status, LiveAppAccessUnavailable):
-            logger.warning("live app %d: its status can't be read: %s", app.slot, status)
+            logger.warning(
+                "Live app slot status unreadable",
+                extra={"event": "live_app_status_unreadable", "slot": app.slot, "reason": status.reason},
+            )
         elif isinstance(status, BaseException):
             raise status
         elif status.boot_id != app.boot_id:
-            lost[app.record_id] = _booted_at(status)
-    if not lost:
+            found[app.record_id] = _FoundStop("lost", _booted_at(status))
+        elif status.state == "exited" and status.app is not None and status.app.stop_reason in _SLOT_STOPS:
+            # The slot's report of why can come before launched wrote this
+            # record, which leaves it nothing to stop (_stop_reported), so
+            # the status says why instead.
+            found[app.record_id] = _FoundStop(status.app.stop_reason, None)
+    if not found:
         return apps
-    now_standing = await run_db(partial(_mark_lost, lost=lost), scope=SYSTEM_SCOPE)
+    now_standing = await run_db(partial(_mark_stopped, found=found), scope=SYSTEM_SCOPE)
     return [now_standing.get(app.record_id, app) for app in apps]
 
 
@@ -1480,7 +1567,14 @@ def _still_there(artifacts_dir: Path, slug: str) -> bool:
     except (FileNotFoundError, NotADirectoryError):
         return False
     except OSError as error:
-        logger.warning("live app copy %s: its folder can't be checked (%s)", slug, error.strerror)
+        logger.warning(
+            "Live app copy folder unchecked",
+            extra={
+                "event": "live_app_copy_unchecked",
+                "artifact_slug": slug,
+                "reason": errno.errorcode.get(error.errno or 0, "os_error"),
+            },
+        )
         return True
 
 

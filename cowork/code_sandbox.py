@@ -706,14 +706,10 @@ def _check_live_apps_startup(settings: AppSettings) -> None:
     from anton.core.artifacts.live_app_slots import live_app_slot_addresses
 
     try:
-        addresses = live_app_slot_addresses()
+        # A blank entry fails to parse, so a set variable names a slot.
+        live_app_slot_addresses()
     except ValueError as error:
         raise RuntimeError(f"{LIVE_APP_SLOTS_VARIABLE} doesn't parse: {error}") from error
-    if not addresses:
-        raise RuntimeError(
-            f"{LIVE_APP_SLOTS_VARIABLE} lists no slot address. Set it to the slots' "
-            "http://<host>:<port> addresses, comma-separated, or leave it unset."
-        )
     viewer_login_url = settings.live_apps_viewer_login_url
     if viewer_login_url != viewer_login_url.strip() or not _is_viewer_login_url(viewer_login_url):
         raise RuntimeError(

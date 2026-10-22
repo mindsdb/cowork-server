@@ -1457,7 +1457,14 @@ async def duplicate_live_app(
                 partial(forget_copy, recipient=recipient, project_id=body.project_id, slug=slug), scope=SYSTEM_SCOPE
             )
         except Exception:
-            logger.warning("live app copy %s: its received mark can't be removed", slug, exc_info=True)
+            logger.warning(
+                "Live app copy mark not removed",
+                exc_info=True,
+                extra={
+                    "event": "live_app_copy_mark_unremoved",
+                    **log_context(project_id=body.project_id, artifact_slug=slug),
+                },
+            )
         raise
     cards = await run_in_threadpool(_scoped_project_cards, session, str(body.project_id))
     card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)

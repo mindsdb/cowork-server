@@ -100,12 +100,15 @@ async def live_app_access(slot: int, request: Request) -> Response:
     try:
         outcome = await check_access(slot, cookie=request.headers.get("cookie", ""))
     except LiveAppAccessUnavailable as error:
-        logger.warning("live app %d: access can't be told: %s", slot, error)
+        logger.warning(
+            "Live app access unavailable",
+            extra={"event": "live_app_access_unavailable", "slot": slot, "reason": error.reason},
+        )
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_UNAVAILABLE) from None
     if outcome == "signed_out":
         return Response(status_code=status.HTTP_401_UNAUTHORIZED)
     if outcome == "refused":
-        logger.warning("live app %d: refused a signed-in visitor who didn't launch it", slot)
+        # The request boundary logs the refusal (cowork.common.request_logging).
         return Response(status_code=status.HTTP_403_FORBIDDEN)
     return Response(status_code=status.HTTP_200_OK)
 
@@ -119,7 +122,10 @@ async def live_app_stopped_page(slot: int, request: Request) -> HTMLResponse:
     try:
         page = await stopped_page(slot, cookie=request.headers.get("cookie", ""))
     except LiveAppAccessUnavailable as error:
-        logger.warning("live app %d: its stopped page can't be told: %s", slot, error)
+        logger.warning(
+            "Live app stopped page unavailable",
+            extra={"event": "live_app_stopped_page_unavailable", "slot": slot, "reason": error.reason},
+        )
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_UNAVAILABLE) from None
     return HTMLResponse(page.html, status_code=page.status_code)
 
@@ -138,9 +144,15 @@ async def live_app_stopped(slot: int, report: SlotStopReport, request: Request) 
     try:
         await record_slot_stop(slot, report, peer=peer, headers=request.headers.keys())
     except SlotReportRefused as refusal:
-        logger.warning("live app %d: %s", slot, refusal)
+        logger.warning(
+            "Live app stop report refused",
+            extra={"event": "live_app_stop_report_refused", "slot": slot, "reason": refusal.reason},
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden") from None
     except LiveAppAccessUnavailable as error:
-        logger.warning("live app %d: its stop report can't be checked: %s", slot, error)
+        logger.warning(
+            "Live app stop report unchecked",
+            extra={"event": "live_app_stop_report_unchecked", "slot": slot, "reason": error.reason},
+        )
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_UNAVAILABLE) from None
     return Response(status_code=status.HTTP_204_NO_CONTENT)

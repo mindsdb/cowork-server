@@ -962,7 +962,11 @@ class AntonHarness:
                 try:
                     await release_stop_notices(built.live_app_notices)
                 except Exception:
-                    logger.warning("Could not hand back this turn's live-app stop notices", exc_info=True)
+                    logger.warning(
+                        "Could not hand back this turn's live-app stop notices",
+                        exc_info=True,
+                        extra={"event": "live_app_notices_unreleased", **log_context(conversation_id=conv_id)},
+                    )
             if session is not None and seed_info is not None and getattr(session, "last_compaction", None) is not None:
                 # Best-effort: a missing compaction does not lose the answer.
                 try:
@@ -1339,7 +1343,14 @@ class AntonHarness:
                 try:
                     await run_to_completion(release_stop_notices(notices))
                 except Exception:
-                    logger.warning("Could not hand back this turn's live-app stop notices", exc_info=True)
+                    logger.warning(
+                        "Could not hand back this turn's live-app stop notices",
+                        exc_info=True,
+                        extra={
+                            "event": "live_app_notices_unreleased",
+                            **log_context(conversation_id=getattr(conversation, "id", None)),
+                        },
+                    )
             raise
         return built._replace(live_app_notices=tuple(notices))
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -775,7 +776,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
     assert len(lines) == 2
     for line in lines:
-        assert f"[Schedule:{schedule_id}][Conversation:{conversation_id}]" in line
+        assert_log_fields(line, schedule_id=str(schedule_id), conversation_id=str(conversation_id))
     assert driver_text not in logged.output()
     assert "private_statement_marker" not in logged.output()
 

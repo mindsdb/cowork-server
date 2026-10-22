@@ -22,7 +22,6 @@ from tests._live_apps import (
     SLOT_ADDRESSES,
     SLOTS_VARIABLE,
     clear_live_app_rows,
-    install_live_app_slots,
     turn_on_live_apps,
 )
 
@@ -62,7 +61,6 @@ def _refusal() -> str:
 
 
 def test_live_apps_are_off_without_the_variable(stack):
-    install_live_app_slots(stack)
     assert live_apps_on() is False
 
 
@@ -139,7 +137,6 @@ def test_live_apps_anton_reads_as_on_are_checked_without_the_variable(stack):
     live apps as on even with the variable unset."""
     import cowork.code_sandbox as code_sandbox
 
-    install_live_app_slots(stack)
     stack.setattr(code_sandbox, "live_apps_on", lambda: True)
     stack.setenv("COWORK_CODE_SANDBOX", "off")
     stack.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
@@ -152,11 +149,13 @@ def test_a_slot_list_that_doesnt_parse_is_refused(stack):
     assert "ANTON_LIVE_APP_SLOTS doesn't parse" in _refusal()
 
 
-@pytest.mark.parametrize("value", [",", " , "])
-def test_a_slot_list_with_no_address_is_refused(stack, value):
+@pytest.mark.parametrize("value", [",", " , ", "http://live-app-1:8001,,http://live-app-2:8001"])
+def test_a_slot_list_with_a_blank_entry_is_refused(stack, value):
+    """anton keeps a blank entry rather than renumbering the slots after it,
+    and refuses it, so the server refuses to start."""
     turn_on_live_apps(stack)
     stack.setenv(SLOTS_VARIABLE, value)
-    assert "ANTON_LIVE_APP_SLOTS lists no slot address" in _refusal()
+    assert "ANTON_LIVE_APP_SLOTS doesn't parse" in _refusal()
 
 
 @pytest.mark.parametrize(
@@ -212,7 +211,6 @@ _ROUTES = [
     "path", ["/api/v1/artifacts/live-app-share", "/api/v1/artifacts/live-app-duplicate", "/api/v1/live-apps/1/stopped"]
 )
 def test_a_body_that_isnt_json_is_404_with_live_apps_off(stack, path):
-    install_live_app_slots(stack)
     get_app_settings.cache_clear()
     client = TestClient(cowork_server.create_app())
 
@@ -223,7 +221,6 @@ def test_a_body_that_isnt_json_is_404_with_live_apps_off(stack, path):
 
 @pytest.mark.parametrize(("method", "path", "body"), _ROUTES)
 def test_every_live_app_route_is_404_with_live_apps_off(stack, method, path, body):
-    install_live_app_slots(stack)
     get_app_settings.cache_clear()
     client = TestClient(cowork_server.create_app())
 
