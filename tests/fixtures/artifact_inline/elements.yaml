@@ -127,6 +127,9 @@
   html: '<xmp><img src="{outside}/x" onerror="alert(1)"></xmp><p>kept</p>'
   present: ['<p>kept</p>']
   absent: ['xmp', 'onerror', 'alert']
+  # libxml2 before 2.14 (the Windows wheel bundles 2.11) reads xmp's content
+  # as markup, so the dropped element's img is listed there.
+  omitted_before_libxml2_2_14: [[scheme, '{outside}/x']]
 
 - id: noembed-and-noframes
   html: '<noembed><b>NOEMBED-TEXT</b></noembed><noframes>NOFRAMES-TEXT</noframes><p>kept</p>'
