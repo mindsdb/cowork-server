@@ -1,4 +1,7 @@
 """The export tests' no-fetch guard records each kind of call it watches."""
+import ctypes
+import multiprocessing
+import os
 import socket
 import subprocess
 import sys
@@ -43,6 +46,23 @@ def test_records_a_subprocess():
     with no_fetch() as recorder:
         subprocess.run([sys.executable, "-c", "pass"], check=True)
     assert "subprocess.Popen" in _events(recorder)
+
+
+def test_records_a_process_start_by_spawn():
+    """Spawn launches through _posixsubprocess, which raises no audit event."""
+    context = multiprocessing.get_context("spawn")
+    with no_fetch() as recorder:
+        process = context.Process(target=int)
+        process.start()
+        process.join(timeout=60)
+    assert process.exitcode == 0
+    assert "multiprocessing.start" in _events(recorder)
+
+
+def test_records_a_library_loaded_through_ctypes():
+    with no_fetch() as recorder:
+        ctypes.CDLL("kernel32" if os.name == "nt" else None)
+    assert "ctypes.dlopen" in _events(recorder)
 
 
 def test_records_calls_from_another_thread():
