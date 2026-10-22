@@ -26,7 +26,7 @@ deployment:
   # The ceiling stays at 4 because each replica widens a race. Every replica runs
   # the scheduler, and `_due_schedules` in cowork/scheduler.py checks
   # `has_active_run` and then fires with no cross-replica claim. Two replicas
-  # polling together can both fire one schedule. ENG-2636 owns that claim.
+  # polling together can both fire one schedule.
   autoscaling:
     enabled: true
     minReplicas: 2
