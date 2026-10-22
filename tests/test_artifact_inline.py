@@ -410,6 +410,15 @@ def test_links_into_another_partition_are_refused(tmp_path, outside):
     ]
 
 
+@pytest.mark.parametrize("reference", ["sub/a:b.png", "a_b:stream.png", "sub\\x:y.png"])
+def test_a_segment_holding_a_colon_is_refused_before_the_file_walk(reference):
+    """The file walk refuses ':' too, so only a direct call shows this step holds."""
+    with pytest.raises(artifact_inline.ArtifactFileRefused) as refused:
+        artifact_inline._reference_parts(reference=reference)
+
+    assert refused.value.reason is OmittedReason.TRAVERSAL
+
+
 def test_doctype_entities_and_dtd_load_nothing(artifact, outside):
     """libxml2's HTML parser reads no internal subset, so no entity resolves."""
     secret = (artifact.other / "secret.txt").as_uri()

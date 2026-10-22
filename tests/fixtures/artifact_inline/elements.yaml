@@ -104,6 +104,14 @@
   absent: ['video', 'audio', 'source', 'track', 'VIDEO-TEXT', 'AUDIO-TEXT']
   omitted: [[scheme, '{outside}/v.mp4'], [scheme, '{outside}/poster.png'], [unsupported_type, a.mp3]]
 
+# A segment holding ':' names a Windows alternate data stream, so a load
+# nothing reads still records it as traversal.
+- id: video-naming-a-stream
+  html: '<video src="sub/inner.mp4:stream"></video><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['video', 'stream']
+  omitted: [[traversal, 'sub/inner.mp4:stream']]
+
 - id: picture-keeps-only-its-img
   html: '<picture><source srcset="{outside}/x.webp 1x, y.webp 2x" type="image/webp"><img src="chart.png" alt="chart"></picture>'
   present: ['<img alt="chart" src="data:image/png;base64,']
