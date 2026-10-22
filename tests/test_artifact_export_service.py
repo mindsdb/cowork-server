@@ -28,7 +28,7 @@ from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_export, artifact_identity
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot
 from cowork.services.artifacts import ProjectArtifacts
-from test_artifact_export_route import padded_png
+from test_artifact_export_route import _snapshot, padded_png
 from tests._no_fetch import no_fetch, recording_server
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
@@ -140,6 +140,51 @@ def test_a_first_export_records_the_primary_the_card_shows(local_mode, partition
 
     assert result.filename == "report.docx"
     assert json.loads((folder / "metadata.json").read_text())["primary"] == "report.md"
+
+
+# ── placement ────────────────────────────────────────────────────────────────
+# These run on every platform: POSIX names the file with a hard link, and
+# Windows, which has no directory descriptor, with a rename.
+
+
+def _export_docx(source: ProjectArtifacts, folder: Path, artifact_id: str) -> str:
+    return artifact_export.export_primary_file(
+        source=source,
+        folder_name=folder.name,
+        metadata=json.loads((folder / "metadata.json").read_text()),
+        artifact_id=artifact_id,
+        export_format="docx",
+        can_edit=True,
+    ).filename
+
+
+def test_each_export_takes_the_next_free_name_and_replaces_none(local_mode, partitions):
+    mine, _secret = partitions
+    source, folder, artifact_id = _write_report(mine, "report.md", "# R\n")
+    (folder / "report (2).docx").write_bytes(b"planted bytes")
+
+    names = [_export_docx(source, folder, artifact_id) for _ in range(2)]
+    first = (folder / "report.docx").read_bytes()
+    names.append(_export_docx(source, folder, artifact_id))
+
+    assert names == ["report.docx", "report (3).docx", "report (4).docx"]
+    assert (folder / "report.docx").read_bytes() == first
+    assert (folder / "report (2).docx").read_bytes() == b"planted bytes"
+    assert not [path.name for path in folder.iterdir() if path.name.startswith(".cowork-export-")]
+
+
+def test_an_export_with_no_free_name_raises_and_writes_nothing(local_mode, partitions):
+    mine, _secret = partitions
+    source, folder, artifact_id = _write_report(mine, "report.md", "# R\n")
+    for number in range(1, 101):
+        name = "report.docx" if number == 1 else f"report ({number}).docx"
+        (folder / name).write_bytes(b"old")
+    before = _snapshot(folder)
+
+    with pytest.raises(FileExistsError):
+        _export_docx(source, folder, artifact_id)
+
+    assert _snapshot(folder) == before
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a pinned folder has no descriptor on Windows")
