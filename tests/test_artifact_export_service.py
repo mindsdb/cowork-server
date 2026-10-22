@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from pathlib import Path
@@ -138,6 +139,55 @@ def test_a_first_export_records_the_primary_the_card_shows(local_mode, partition
 
     assert result.filename == "report.docx"
     assert json.loads((folder / "metadata.json").read_text())["primary"] == "report.md"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a pinned folder has no descriptor on Windows")
+@pytest.mark.parametrize("export_format", ["docx", "html"])
+def test_a_parent_folder_swapped_for_a_link_mid_export_is_never_written_through(
+    local_mode, tmp_path, monkeypatch, export_format
+):
+    """The source's folder is read, then swapped for a link to another folder
+    while the conversion runs. The write descends with O_NOFOLLOW, so the
+    export fails and writes nothing anywhere."""
+    project = tmp_path / "project"
+    folder = project / ".anton" / "artifacts" / "report"
+    (folder / "docs").mkdir(parents=True)
+    (folder / "docs" / "report.md").write_text("# R\n", encoding="utf-8")
+    artifact_id = uuid4().hex
+    metadata = {"id": artifact_id, "slug": "report", "type": "document", "primary": "docs/report.md"}
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    source = ProjectArtifacts(
+        base=project / ".anton" / "artifacts",
+        project_id=None,
+        project_name="project",
+        trusted_anchor=project,
+        root_parts=(".anton", "artifacts"),
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    inline = artifact_export.inline_artifact_html
+
+    def swap_after_inlining(**kwargs):
+        inlined = inline(**kwargs)
+        (folder / "docs").rename(folder / "docs-moved")
+        (folder / "docs").symlink_to(outside, target_is_directory=True)
+        return inlined
+
+    monkeypatch.setattr(artifact_export, "inline_artifact_html", swap_after_inlining)
+
+    with pytest.raises(OSError):
+        artifact_export.export_primary_file(
+            source=source,
+            folder_name=folder.name,
+            metadata=metadata,
+            artifact_id=artifact_id,
+            export_format=export_format,
+            can_edit=True,
+        )
+
+    assert list(outside.iterdir()) == []
+    assert [path.name for path in (folder / "docs-moved").iterdir()] == ["report.md"]
+    assert sorted(path.name for path in folder.iterdir()) == ["docs", "docs-moved", "metadata.json"]
 
 
 def test_recording_a_primary_without_a_directory_descriptor_sets_times_by_path(tmp_path, monkeypatch):
