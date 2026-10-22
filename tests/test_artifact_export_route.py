@@ -237,6 +237,34 @@ def test_a_hard_link_at_the_output_name_is_never_written_through(client, local_a
     assert (folder / "report.html").stat().st_ino == victim.stat().st_ino
 
 
+@pytest.mark.parametrize("planted", ["symlink", "hard-link", "file"])
+def test_an_entry_planted_at_the_temporary_name_is_never_written_through(
+    client, local_artifact, tmp_path, monkeypatch, planted
+):
+    """The temporary file is created with O_EXCL and O_NOFOLLOW, so an entry
+    already at its name fails the export instead of taking its bytes."""
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    monkeypatch.setattr(
+        artifact_export, "secrets", SimpleNamespace(token_hex=lambda nbytes: "0" * (2 * nbytes))
+    )
+    temporary = folder / f".cowork-export-{'0' * 24}.tmp"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"victim bytes")
+    if planted == "symlink":
+        temporary.symlink_to(victim)
+    elif planted == "hard-link":
+        os.link(victim, temporary)
+    else:
+        temporary.write_bytes(b"planted bytes")
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert _snapshot(folder) == before
+    assert victim.read_bytes() == b"victim bytes"
+
+
 def _no_hard_links(code: int):
     """Make link() fail the way a volume without hard links fails it."""
 
