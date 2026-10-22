@@ -1102,3 +1102,5 @@ See [LICENSE](LICENSE).
 
 See [structured logging](docs/structured-logging.md) for defaults, troubleshooting
 overrides, retained evidence streams and rollout requirements.
+Shared-memory startup warnings state whether turns learn into the shared store
+or leave it unread, without logging its private path.

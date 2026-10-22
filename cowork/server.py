@@ -33,7 +33,6 @@ from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
-from cowork.harnesses.memory.store import deployment_memory_root
 from cowork.managed import (
     ManagedFolder,
     SharedRegistryError,
@@ -175,7 +174,7 @@ async def lifespan(app: FastAPI):
     try:
         memory_warning = memory_start_warning()
         if memory_warning is not None:
-            logger.warning("memory: %s (%s)", memory_warning, deployment_memory_root())
+            logger.warning(memory_warning)
     except Exception:
         logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
