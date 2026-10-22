@@ -36,6 +36,7 @@ from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import (
     BUDGET_SETTING_KEYS,
+    is_chosen_budget,
     ENV_ALIAS_TO_SETTING,
     UserSettings,
     normalize_provider_value,
@@ -205,9 +206,11 @@ def enable_limits_for_saved_budgets(session: Session) -> bool:
     """Turn ``limits_enabled`` on wherever a budget was saved without it.
 
     Only a user's Save in Settings (or a direct settings API call) stores a
-    budget row, so one means the user chose a limit. For each scope (global,
-    org, or user row) that holds a budget row and no ``limits_enabled`` row,
-    this writes ``limits_enabled=True`` at that scope, as a Save would. A scope
+    budget row, so one means the user chose a limit, unless it holds the old
+    default: a renderer that predates the switch stores that when a field is
+    cleared, to reset it (``is_chosen_budget``). For each scope (global, org,
+    or user row) that holds a chosen budget and no ``limits_enabled`` row, this
+    writes ``limits_enabled=True`` at that scope, as a Save would. A scope
     that already has the switch, on or off, is left alone, so turning it off
     sticks. Idempotent and sentinel-free: it also catches a budget saved later
     by a renderer that predates the switch. Returns True if any row was written.
@@ -226,7 +229,7 @@ def enable_limits_for_saved_budgets(session: Session) -> bool:
     pending = {
         (r.scope, r.org_id, r.user_id)
         for r in rows
-        if r.key != "limits_enabled"
+        if r.key != "limits_enabled" and is_chosen_budget(r.key, r.value)
     } - has_switch
     written = 0
     for scope, org_id, user_id in sorted(pending, key=lambda k: tuple(v or "" for v in k)):

@@ -1447,6 +1447,22 @@ def setting_is_operator_pinned(key: str) -> bool:
 #: The per-turn budgets the ``limits_enabled`` switch governs.
 BUDGET_SETTING_KEYS: tuple[str, ...] = ("max_turn_tokens", "max_tool_rounds", "max_continuations")
 
+#: What a renderer that predates the switch stores when a budget field is
+#: cleared, its way to reset it: the old defaults.
+_PRE_SWITCH_RESET_VALUES: dict[str, int] = {
+    "max_turn_tokens": 1_250_000, "max_tool_rounds": 50, "max_continuations": 5,
+}
+
+
+def is_chosen_budget(key: str, value: str) -> bool:
+    """Whether a stored budget is a limit the user chose, so it turns the
+    limits switch on. A value equal to the old default is most likely a
+    pre-switch reset, which meant "use the default", so it doesn't."""
+    try:
+        return int(value) != _PRE_SWITCH_RESET_VALUES[key]
+    except (KeyError, ValueError):
+        return True
+
 
 class TurnLimits(NamedTuple):
     max_turn_tokens: int

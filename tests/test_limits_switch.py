@@ -167,6 +167,37 @@ def test_a_saved_budget_turns_the_switch_on_at_its_scope(engine):
     assert org_c.limits_enabled is False
 
 
+def test_a_budget_reset_to_the_old_default_does_not_turn_the_switch_on(engine):
+    """A renderer that predates the switch stores the old default (50 / 5 /
+    1.25M) when a field is cleared, to reset it. That meant "use the default",
+    so the scope runs to the safety limits; a chosen value beside it still
+    turns the switch on."""
+    with Session(engine) as s:
+        s.add(Setting(key="max_tool_rounds", value="50", scope="org", org_id=ORG_A))
+        s.add(Setting(key="max_continuations", value="5", scope="org", org_id=ORG_A))
+        s.add(Setting(key="max_turn_tokens", value="1250000", scope="org", org_id=ORG_A))
+        s.add(Setting(key="max_tool_rounds", value="50", scope="org", org_id=ORG_B))
+        s.add(Setting(key="max_continuations", value="2", scope="org", org_id=ORG_B))
+        s.commit()
+
+    enable_limits_for_saved_budgets(Session(engine))
+    assert _switch_rows(engine) == {("org", ORG_B, None, "True")}
+    org_a = SettingService(Session(engine), TenantScope(org_mode=True, org_id=ORG_A)).load()
+    assert effective_turn_limits(org_a) == _defaults()
+
+
+@pytest.mark.parametrize("save", ["upsert", "save_all"])
+def test_saving_a_budget_reset_to_the_old_default_does_not_turn_the_switch_on(engine, save):
+    svc = SettingService(Session(engine), TenantScope(org_mode=True, org_id=ORG_A))
+    if save == "upsert":
+        svc.upsert_setting("max_turn_tokens", "1250000")
+    else:
+        svc.save_all({"max_tool_rounds": "50", "max_continuations": "5"})
+
+    assert _switch_rows(engine) == set()
+    assert effective_turn_limits(svc.load()) == _defaults()
+
+
 def test_an_installs_saved_budget_turns_its_switch_on(engine):
     """Desktop rows have no scope. A global row also reaches every org without
     its own, like the budget it sits next to, so both keep applying together."""
