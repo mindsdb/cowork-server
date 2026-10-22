@@ -1282,6 +1282,21 @@ def test_without_a_render_service_pdf_answers_422_and_nothing_makes_one(client, 
     assert _snapshot(folder) == before
 
 
+def test_a_pdf_of_markdown_with_a_fence_past_the_cap_answers_413_and_sends_nothing(
+    client, local_artifact, render_service
+):
+    fence = "`" * (MAX_FENCE_LENGTH + 1)
+    folder = local_artifact({"report.md": f"# Report\n\n{fence}\ncode\n{fence}\n"})
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 413, response.text
+    assert response.json()["detail"] == "This file can't be exported."
+    assert render_service.requests == []
+    assert _snapshot(folder) == before
+
+
 def _local_person(user_id: str) -> TenantScope:
     return TenantScope(org_mode=False, org_id=None, user_id=user_id)
 
