@@ -164,10 +164,11 @@ def test_nesting_too_deep_to_parse_comes_back_as_escaped_text(quote, marker):
         "intro\n\n   " + "`" * (MAX_FENCE_LENGTH + 1) + "\n",
         "intro\r" + "~" * (MAX_FENCE_LENGTH + 1) + "\r",
         "intro\n\x02" + "`" * (MAX_FENCE_LENGTH + 1) + "\n",
+        "intro\n\x03" + "`" * (MAX_FENCE_LENGTH + 1) + "\n",
         # A ladder of ever-longer fences, none of them closed.
         "".join("~" * length + "\n" for length in range(3, 200)),
     ],
-    ids=["backticks", "tildes", "indented-three", "carriage-returns", "after-stx", "ladder"],
+    ids=["backticks", "tildes", "indented-three", "carriage-returns", "after-stx", "after-etx", "ladder"],
 )
 def test_a_fence_longer_than_the_cap_is_refused(text):
     with pytest.raises(MarkdownRefused):

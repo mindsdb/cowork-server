@@ -22,7 +22,9 @@ from markdown.util import ETX, STX
 # The longest run of backticks or tildes a fence may open with. Python-Markdown
 # looks for each unclosed fence's closer through the rest of the document, so
 # a ladder of ever-longer fences, which no real document needs, holds the
-# whole process for about a minute at the 2 MiB read bound.
+# whole process for about a minute at the 2 MiB read bound. The cap refuses
+# only the ladder: an unclosed fence of any length still makes that search,
+# so many short unclosed fences still stall a conversion.
 MAX_FENCE_LENGTH = 32
 # A line that opens a longer fence, after at most three spaces.
 _LONG_FENCE = re.compile(
@@ -51,7 +53,9 @@ def render_markdown(*, text: str) -> str:
     its own text in a ``pre`` block, so the export still holds every word.
 
     Raises ``MarkdownRefused`` when a line opens a fence longer than
-    ``MAX_FENCE_LENGTH``. Nothing else bounds how long a conversion takes.
+    ``MAX_FENCE_LENGTH``. Nothing else bounds how long a conversion takes:
+    many short unclosed fences, or a paragraph of backtick runs that never
+    close, can still hold it for minutes or more.
     """
     _refuse_long_fence(text=text)
     renderer = markdown.Markdown(
