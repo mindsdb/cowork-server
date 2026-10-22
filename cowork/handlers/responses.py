@@ -2193,7 +2193,9 @@ class ResponsesHandler:
                     # it never flashes "Still working" while text streams.
                     if time.monotonic() - quiet_since >= liveness.MODEL_WAIT_TICK_SECONDS:
                         quiet_since = time.monotonic()
-                        yield StreamTaskProgress(phase=MODEL_WAIT_PHASE, message="")
+                        # The UI shows the message, or "Waiting for the model"
+                        # without one, which a long cell is not doing.
+                        yield StreamTaskProgress(phase=MODEL_WAIT_PHASE, message=liveness.MODEL_WAIT_LABEL)
                     continue
                 quiet_since = time.monotonic()
                 if kind == "progress" and data.get("phase") == "workspace_authorized":

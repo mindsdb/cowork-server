@@ -1153,8 +1153,49 @@ async def test_a_relayed_liveness_reply_after_a_quiet_stretch_reaches_the_buffer
 
     waits = [f for f in buffer.frames if '"phase": "model_wait"' in f or '"phase":"model_wait"' in f]
     assert len(waits) == 1
+    assert '"message": "Still working"' in waits[0] or '"message":"Still working"' in waits[0]
     assert saved["assistant"] == "hello"
     assert not any(e.get("phase") == "model_wait" for e in saved["events"])
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_liveness_reply_right_after_output_shows_nothing(monkeypatch):
+    """Quiet means quiet since the pod's last output, not since the turn
+    started: a relay that lands just after text that followed a long pause
+    must not flash "Still working" over the answer."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        await asyncio.sleep(0.1)
+        yield "turn_delta", {"text": "hello"}
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert not [f for f in buffer.frames if "model_wait" in f]
+    assert saved["assistant"] == "hello"
 
 
 @pytest.mark.asyncio
