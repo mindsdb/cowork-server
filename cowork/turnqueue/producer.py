@@ -673,9 +673,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
               # The per-task limits (steps, auto-continues, tokens) this turn
-              # runs under. Without them the pod ran on anton's built-in
-              # 25 / 3 / 1.25M, whatever the tenant set. Absent when they can't
-              # be read.
+              # runs under. Without them the pod runs on anton's built-in
+              # defaults, whatever the tenant set. Absent when they can't be
+              # read.
               **({"limits": limits_block} if limits_block else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
