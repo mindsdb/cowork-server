@@ -279,6 +279,32 @@ def test_one_walk_stops_reading_entries_at_the_scan_cap(art, monkeypatch):
     assert read == ["other", "sub", "more", "extra"]
 
 
+def test_the_shipped_scan_cap_reads_20000_entries_and_refuses_the_next(art, monkeypatch):
+    """The cap as shipped, unpatched, so raising it fails a test."""
+    (art / "chart.png").write_bytes(PNG)
+    others = [f"tile{index}.png" for index in range(20_000)]
+    listings = {"art": [*others[:-1], "chart.png"]}
+    read: list[str] = []
+    monkeypatch.setattr(
+        artifact_files, "dir_scandir", _scripted_scandir(listings=listings, read=read)
+    )
+
+    assert _read(folder=art, parts=("chart.png",)).data == PNG
+    listings["art"] = [*others, "chart.png"]
+    assert _refusal(folder=art, parts=("chart.png",)) is OmittedReason.BUDGET
+
+
+def test_the_shipped_depth_cap_reads_64_segments_and_refuses_65(art):
+    """The cap as shipped, unpatched, so raising it fails a test."""
+    art.joinpath(*("d",) * 63).mkdir(parents=True)
+    art.joinpath(*("d",) * 63, "chart.png").write_bytes(PNG)
+    art.joinpath(*("d",) * 64).mkdir()
+    art.joinpath(*("d",) * 64, "chart.png").write_bytes(PNG)
+
+    assert _read(folder=art, parts=(*("d",) * 63, "chart.png")).data == PNG
+    assert _refusal(folder=art, parts=(*("d",) * 64, "chart.png")) is OmittedReason.BUDGET
+
+
 @pytest.mark.parametrize("linked", ["leaf", "middle"])
 def test_a_symlink_at_any_segment_is_refused(art, outside, linked):
     if linked == "leaf":
