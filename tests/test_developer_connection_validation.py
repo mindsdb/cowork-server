@@ -161,7 +161,7 @@ def test_missing_or_unsupported_credentials_fail_before_network(provider, method
 
 def test_validate_and_save_augments_the_vault_record_with_verified_identity(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+        "cowork.services.connectors.persist.ConnectorSettings",
         lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
     )
     monkeypatch.setattr(
@@ -188,7 +188,7 @@ def test_validated_reconnect_replaces_the_named_record_without_creating_a_duplic
 ) -> None:
     vault_path = tmp_path / "vault"
     monkeypatch.setattr(
-        "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+        "cowork.services.connectors.persist.ConnectorSettings",
         lambda: type("S", (), {"vault_dir": str(vault_path)})(),
     )
     monkeypatch.setattr(

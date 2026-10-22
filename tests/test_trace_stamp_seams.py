@@ -206,12 +206,12 @@ def _declares_harness(call: ast.Call) -> bool:
     """A literal ``harness=`` keyword — deliberately NOT the ``**helper()``
     shape that :func:`_declares_surface` also accepts.
 
-    The asymmetry is intentional and load-bearing. ``surface`` is **absent**
-    from the pinned anton (``uv.lock`` → ``466520b``, v2.26.8.20.3), so passing
-    it unconditionally would raise ``TypeError`` on every turn — hence the
-    defensive ``**surface_kwarg(ChatSessionConfig)``. ``harness`` *is* declared
-    at that same commit, so it can be passed as a plain keyword, and requiring
-    the literal keeps this guard exact.
+    The asymmetry is intentional and load-bearing. ``surface`` goes through the
+    defensive ``**surface_kwarg(ChatSessionConfig)``, which drops it on an
+    anton that lacks the field rather than raise ``TypeError`` on every turn.
+    ``harness`` is declared in every anton the ``anton-agent`` floor in
+    ``pyproject.toml`` admits, so it can be passed as a plain keyword, and
+    requiring the literal keeps this guard exact.
 
     If a future change ever needs harness passed defensively too, this
     predicate will reject that shape and must be widened the way

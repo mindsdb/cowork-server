@@ -17,6 +17,7 @@ from cowork.services.artifact_identity import (
     artifact_key,
     resolve_artifact_folder,
 )
+from cowork.db.scoped import TenantScope
 from cowork.services.artifact_lock import artifact_lock
 from cowork.services.artifact_roots import artifacts_sources_for_scan
 
@@ -33,11 +34,17 @@ def _now() -> str:
 
 
 class LocalArtifactComments:
-    """Small atomic journal with the same response shape as inference comments."""
+    """Small atomic journal with the same response shape as inference comments.
 
-    def __init__(self, artifact_id: str) -> None:
+    The artifact is found only among ``scope``'s artifacts roots, so another
+    person's artifact id answers 404.
+    """
+
+    def __init__(self, artifact_id: str, *, scope: TenantScope | None) -> None:
         try:
-            _, folder, _ = resolve_artifact_folder(artifacts_sources_for_scan(), artifact_id)
+            _, folder, _ = resolve_artifact_folder(
+                artifacts_sources_for_scan(scope=scope), artifact_id
+            )
         except ArtifactIdentityConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (FileNotFoundError, ValueError) as exc:
@@ -221,8 +228,10 @@ class LocalArtifactComments:
         return self._mutate(mutation)
 
 
-async def handle_local_comments(request: Request, artifact_id: str, subpath: str):
-    service = LocalArtifactComments(artifact_id)
+async def handle_local_comments(
+    request: Request, artifact_id: str, subpath: str, *, scope: TenantScope | None
+):
+    service = LocalArtifactComments(artifact_id, scope=scope)
     parts = [part for part in subpath.split("/") if part]
     method = request.method.upper()
     try:
@@ -254,8 +263,8 @@ async def handle_local_comments(request: Request, artifact_id: str, subpath: str
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown comment operation")
 
 
-def local_comments_stream(artifact_id: str) -> StreamingResponse:
-    service = LocalArtifactComments(artifact_id)
+def local_comments_stream(artifact_id: str, *, scope: TenantScope | None) -> StreamingResponse:
+    service = LocalArtifactComments(artifact_id, scope=scope)
 
     async def events():
         previous = {

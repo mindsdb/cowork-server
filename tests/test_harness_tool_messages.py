@@ -31,7 +31,7 @@ def test_stream_response_forwards_the_flag_and_defaults_it_off(monkeypatch):
 
     async def _fake_build(self, conversation, **kwargs):
         received.append(kwargs["tool_messages"])
-        return _FakeSession(), None, None
+        return harness.BuiltChatSession(session=_FakeSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(harness.AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

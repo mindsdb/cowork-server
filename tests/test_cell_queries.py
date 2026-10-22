@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import random
+import re
 import textwrap
 import time
+from itertools import pairwise
 
 import pytest
 
@@ -788,6 +791,55 @@ class TestStatementsInOneString:
     def test_dialect_comment_boundary_disagreement_omits_the_batch(self, sql: str):
         assert read_cell(f"cur.execute({sql!r})", names={}).queries == ()
 
+    # Snowflake ends a // comment at the line end; BigQuery and ClickHouse
+    # read # and a -- with no space after it as comments; Postgres escapes a
+    # quote with a backslash in an E'' or e'' string but not in a
+    # double-quoted name or a standard string (all three read a doubled quote
+    # as one), and an E that ends a name or a keyword opens no E'' string
+    # (LIKE'\', €E'\', t$E'\'); Postgres reads [ as an array, whose string
+    # may hold a ]; Postgres takes any non-ASCII character in a dollar tag,
+    # and reads one before $$ as part of a name. Each database ends the query
+    # at the ; and runs the statement that sets a password.
+    @pytest.mark.parametrize("sql", [
+        "SELECT qty FROM stock // it's\n; CREATE USER bob PASSWORD 'XyZhunter2'",
+        "SELECT qty FROM stock //* note\n; CREATE USER bob PASSWORD 'XyZhunter2' -- */",
+        "SELECT qty FROM stock --it's\nWHERE a = 1 # /* note\n; CREATE USER bob IDENTIFIED BY 'XyZhunter2'",
+        "SELECT qty FROM stock WHERE note = E'it\\'s' AND \"col\\\" = 1; CREATE USER bob PASSWORD 'XyZhunter2'",
+        "SELECT E'\\'', '\\' FROM stock; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT e'\\'', '\\' FROM stock; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS \"\\\", '\\' FROM t; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'it''s\\'', '\\' FROM t; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS a FROM t WHERE b LIKE'\\'; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS a FROM t WHERE b = €E'\\'; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS a FROM t WHERE b = t$E'\\'; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT ARRAY['a]'] FROM stock; CREATE USER bob PASSWORD 'XyZhunter2'",
+        'SELECT data["a]"] FROM stock; CREATE USER bob IDENTIFIED BY \'XyZhunter2\'',
+        "SELECT $é$it's$é$ FROM stock; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT $a€$it's$a€$ FROM t; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT $$/*$$ AS €$$ FROM stock; ALTER ROLE bob PASSWORD 'XyZhunter2'; SELECT $$*/$$ FROM stock",
+    ], ids=[
+        "double-slash-comment", "double-slash-before-a-block-comment", "hash-and-dashdash-comments",
+        "e-string-beside-a-quoted-name", "e-string-beside-a-standard-string",
+        "lowercase-e-string-beside-a-standard-string", "e-string-beside-a-quoted-name-and-a-standard-string",
+        "e-string-with-a-doubled-quote-beside-a-standard-string", "keyword-ending-in-e-before-a-string",
+        "non-ascii-name-ending-in-e-before-a-string", "name-with-a-dollar-ending-in-e-before-a-string",
+        "array-of-a-string-with-a-bracket", "subscript-of-a-name-with-a-bracket", "non-ascii-dollar-tag",
+        "dollar-tag-ending-in-a-non-ascii-symbol", "non-ascii-name-before-a-dollar-quote",
+    ])
+    def test_a_statement_another_database_ends_at_a_semicolon_lists_nothing(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == ()
+
+    @pytest.mark.parametrize(("sql", "listed"), [
+        (
+            "SELECT qty FROM stock WHERE url = 'http://x'; DELETE FROM stock",
+            "SELECT qty FROM stock WHERE url = 'http://x';",
+        ),
+        ("SELECT qty FROM stock WHERE note = 'a#b'; DELETE FROM stock", "SELECT qty FROM stock WHERE note = 'a#b';"),
+        ("SELECT ARRAY[1, 2] FROM t; DELETE FROM t", "SELECT ARRAY[1, 2] FROM t;"),
+    ], ids=["double-slash-in-a-literal", "hash-in-a-literal", "array-without-a-string"])
+    def test_a_split_the_added_readings_agree_on_keeps_its_query(self, sql: str, listed: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (listed,)
+
     @pytest.mark.parametrize("comment", [
         "/* outer /* inner */ ' */",
         "/*!50000 SELECT secret FROM credentials */",
@@ -841,6 +893,98 @@ class TestStatementsInOneString:
 
         assert time.perf_counter() - start < TIME_BOUND_SECONDS
         assert reading.queries == (() if ambiguous else (sql,))
+
+    # Every reading splits this string alike, so each one scans it to the
+    # end: 20,000 closed block comments, each checked for a nested /*, and
+    # 20,000 statements after the query.
+    def test_a_string_every_reading_splits_alike_splits_in_linear_time(self):
+        sql = "SELECT qty FROM stock WHERE note = 'a'; " + "/**/;" * 20_000
+        code = f"cur.execute({sql!r})"
+        start = time.perf_counter()
+
+        reading = read_cell(code, names={})
+
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
+        assert reading.queries == ("SELECT qty FROM stock WHERE note = 'a';",)
+
+    # The same string after a literal that holds every character the
+    # readings are told apart by, so every reading scans it to the end.
+    def test_a_string_that_runs_every_reading_splits_in_linear_time(self, monkeypatch: pytest.MonkeyPatch):
+        sql = "SELECT qty FROM stock WHERE note = 'a\\b #c //d --e [f] $g$'; " + "/**/;" * 20_000
+        reads = _counting_reads(monkeypatch)
+        start = time.perf_counter()
+
+        reading = read_cell(f"cur.execute({sql!r})", names={})
+
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
+        assert reading.queries == ("SELECT qty FROM stock WHERE note = 'a\\b #c //d --e [f] $g$';",)
+        assert len(reads) == len(cell_queries_mod._SQL_READINGS)
+
+    # The readings differ only where a text holds a backslash (the quote
+    # rules), -- or # (MySQL's comments), # (BigQuery's), // (Snowflake's),
+    # [ (a bracket a quote ends) or $ (dollar quoting). A query with none of
+    # them reads alike under every reading, so it is read once.
+    @pytest.mark.parametrize(("where", "reads"), [
+        ("", 1), ("AND note = 'a\\b'", 4), ("-- note\n", 2), ("AND note = 'a#b'", 3), ("AND note = 'a//b'", 2),
+        ("AND a[1] = 2", 2), ("AND note = $$a$$", 2), ("AND note = 'a\\b #c //d --e [f] $g$'", 64),
+    ], ids=["none", "backslash", "dashdash", "hash", "double-slash", "bracket", "dollar", "every-mark"])
+    def test_only_the_readings_a_querys_characters_can_tell_apart_run(
+        self, where: str, reads: int, monkeypatch: pytest.MonkeyPatch,
+    ):
+        sql = f"SELECT qty FROM stock WHERE qty > 0 {where}"
+        counted = _counting_reads(monkeypatch)
+
+        read_cell(f"cur.execute({sql!r})", names={})
+
+        assert len(counted) == reads
+
+    # 20 reads of a 64 KiB query whose characters no reading tells apart.
+    # 20 reads with every reading take about 2 s on a laptop; with one
+    # reading, about 0.05 s.
+    def test_a_long_query_no_reading_tells_apart_reads_quickly(self):
+        sql = "SELECT id FROM orders WHERE id IN (" + "'ord-0000001', " * 4_350 + "'x')"
+        code = f"cur.execute({sql!r})"
+        start = time.perf_counter()
+
+        for _ in range(20):
+            reading = read_cell(code, names={})
+
+        assert time.perf_counter() - start < 1.0
+        assert reading.queries == (sql,)
+
+    # Skipping a reading never changes a split: on texts of the characters
+    # the readings differ on, the readings that run agree exactly when all
+    # of them would.
+    def test_the_readings_that_run_split_every_text_as_all_of_them_do(self):
+        rng = random.Random(3433)
+        for alphabet in (
+            "'\"`[]$;-#/*\\\n aSxE\x01é€", "';- \nSELECTFROMa", "'\";-/ \n", "[]';\"", "$;'a \né€", "\\';\"-#\n E",
+        ):
+            for _ in range(500):
+                text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 60)))
+                assert cell_queries_mod._statements(text) == _split_by_every_reading(text), text
+
+
+def _counting_reads(monkeypatch: pytest.MonkeyPatch) -> list[re.Pattern[str]]:
+    """The readings the SQL split runs from here on, one entry per scan."""
+    reads: list[re.Pattern[str]] = []
+    statement_ends = cell_queries_mod._statement_ends
+
+    def counted(text: str, *, token: re.Pattern[str]) -> list[int] | None:
+        reads.append(token)
+        return statement_ends(text, token=token)
+
+    monkeypatch.setattr(cell_queries_mod, "_statement_ends", counted)
+    return reads
+
+
+def _split_by_every_reading(text: str) -> list[str]:
+    """``text`` split as _statements splits it, with every reading run."""
+    tokens = [reading.token for reading in cell_queries_mod._SQL_READINGS]
+    ends = cell_queries_mod._statement_ends(text, token=tokens[0])
+    if ends is None or any(ends != cell_queries_mod._statement_ends(text, token=token) for token in tokens[1:]):
+        return []
+    return [text[start:end] for start, end in pairwise([0, *ends, len(text)])]
 
 
 class TestRequestsACellMakes:

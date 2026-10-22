@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed, and its database
 units run inline on fakes (inline_run_db) unless a test needs the real ones.
 """
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import asyncio
 import json
@@ -21,6 +22,7 @@ import pytest
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
+from cowork.turnqueue.producer import RemoteWorkspace
 
 from _fakes import inline_run_db, opens
 
@@ -64,6 +66,7 @@ def _kwargs(**overrides) -> dict:
         buffer=object(),
         trace_tags=None,
         trace_metadata=None,
+        first_take=None,
     )
     base.update(overrides)
     return base
@@ -225,6 +228,12 @@ def test_remote_backend_selected(monkeypatch):
     assert called["buffer"] is kwargs["buffer"]
 
 
+async def _no_earlier_answers(*, conversation_id, scope):
+    """The earlier answers' read, finding none, so a turn's figures keep the
+    origins this turn gives them."""
+    return ()
+
+
 def _remote_handler(monkeypatch, saved):
     """Handler wired for _produce_remote with the DB layer faked out."""
     handler = _handler()
@@ -258,6 +267,7 @@ def _remote_handler(monkeypatch, saved):
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
 
@@ -783,8 +793,8 @@ def _no_workspace_or_memory_units(monkeypatch):
     The fake unit session cannot run them, and each would log an error."""
     monkeypatch.setattr(ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
-    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: {}))
-    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id, *, workspace: None))
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1031,7 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
     assert record.exc_info is None
     assert "POOL_TIMEOUT" not in repr(record.__dict__)
     [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
-    assert f"[Project:{project.id}][Conversation:{conversation_id}][Artifacts:{slug!r}]" in line
+    assert_log_fields(line, project_id=str(project.id), conversation_id=str(conversation_id), artifact_slugs=[slug])
     assert "POOL_TIMEOUT" not in logged.output()
     assert not [
         r for r in caplog.records
@@ -1688,7 +1698,7 @@ async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_agent_files = lambda session, conv_id: AgentFiles.in_cloud_pod(
+    handler._remote_agent_files = lambda session, conv_id, *, workspace: AgentFiles.in_cloud_pod(
         tmp_path, conversation_id=conv_id, workspace_rel_path=None,
     )
     code = "print(open('/workspace/stock.csv').read())"
@@ -1720,7 +1730,7 @@ async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_
 def _figure_sources_handler(monkeypatch, saved):
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_agent_files = lambda session, conv_id: None
+    handler._remote_agent_files = lambda session, conv_id, *, workspace: None
     return handler
 
 
@@ -1771,10 +1781,199 @@ async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows
 
 
 @pytest.mark.asyncio
+async def test_a_remote_turns_context_carries_the_earlier_answers(monkeypatch):
+    """The turn reads the conversation's earlier answers in a unit of its
+    own, and a figure one of them gave is marked as repeated."""
+    from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    conv_id = uuid4()
+    earlier = EarlierAnswer(figures=[Figure(start=0, end=5, text="4,600", origin=FigureOrigin.step)])
+    reads = []
+
+    async def read_earlier_answers(*, conversation_id, scope):
+        reads.append((conversation_id, scope))
+        return (earlier,)
+
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", read_earlier_answers)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "Up from 4,600."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=conv_id, input_text="And 2024?", original_content="And 2024?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert [(conversation_id, type(scope)) for conversation_id, scope in reads] == [(conv_id, _FakeScope)]
+    assert _saved_figures(saved) == {
+        "4,600": {"start": 8, "end": 13, "text": "4,600", "origin": "earlier_answer", "sources": []},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["busy", "refused"])
+async def test_a_failed_earlier_answers_read_leaves_the_remote_answer_and_its_sources(monkeypatch, caplog, error):
+    """The database refuses the earlier answers' unit. The turn runs on, its
+    answer is saved, and its own figures keep their origins."""
+    import cowork.services.conversations as conversations_mod
+    from cowork.db.units import DatabaseBusy
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+
+    async def refusing(fn, *, scope):
+        raise DatabaseBusy("no connection") if error == "busy" else ValueError("Conversation not found")
+
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", conversations_mod.read_earlier_answers)
+    monkeypatch.setattr(conversations_mod, "run_db", refusing)
+    code = "print(open('/workspace/stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "t1", "args": json.dumps({"action": "exec", "code": code})}
+        yield "turn_step", {
+            "step": "tool_result", "id": "t1", "name": "scratchpad", "action": "exec", "content": json.dumps(cell),
+        }
+        yield "turn_delta", {"text": "S1 holds 250 units, up from 4,600."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.conversations"):
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="How many at S1?", original_content="How many at S1?",
+            model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        )
+
+    assert saved["assistant"] == "S1 holds 250 units, up from 4,600."
+    figures = _saved_figures(saved)
+    assert {text: figure["origin"] for text, figure in figures.items()} == {"250": "step", "4,600": "none"}
+    assert figures["250"]["sources"] == [{"tool_use_id": "t1", "page": None}]
+    assert [r.levelname for r in caplog.records if r.name == "cowork.services.conversations"] == ["WARNING"]
+
+
+def _web_fetch_replies(tool_use_id: str, url: str) -> list[tuple[str, dict]]:
+    """A web_fetch call that succeeded, as the pod's turn_step replies carry it."""
+    import json
+
+    return [
+        ("turn_step", {"step": "tool_start", "id": tool_use_id, "name": "web_fetch"}),
+        ("turn_step", {"step": "tool_end", "id": tool_use_id, "args": json.dumps({"url": url})}),
+        ("turn_step", {"step": "progress", "phase": "tool_done", "id": tool_use_id, "ok": True}),
+    ]
+
+
+def _web_fetch_rows(tool_use_id: str, url: str, page: str) -> list[dict]:
+    return [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tool_use_id, "name": "web_fetch", "input": {"url": url}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": page}]},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["compaction-reply", "compacted-step"])
+async def test_produce_remote_reads_a_compacted_turns_history_frame_and_saves_no_rows(monkeypatch, signal):
+    """A pod sends a turn's rows after a compaction too. The figures are
+    found in them, from the rounds on both sides of the compaction, and none
+    are saved, so the next turn replays this one as text only. A summary
+    sends both signals; a hard truncation sends only the step."""
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    rows = [
+        *_web_fetch_rows("w1", "https://example.com/rates", "Overtime rate: $42 per hour."),
+        *_web_fetch_rows("w4", "https://example.com/lines", "The plant runs 9 lines."),
+    ]
+
+    async def fake_replies(**kwargs):
+        for reply in _web_fetch_replies("w1", "https://example.com/rates"):
+            yield reply
+        if signal == "compacted-step":
+            yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        for reply in _web_fetch_replies("w4", "https://example.com/lines"):
+            yield reply
+        yield "turn_delta", {"text": "Overtime costs $42 an hour, the plant runs 9 lines, and 17 shifts."}
+        if signal == "compaction-reply":
+            yield "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}
+        yield "turn_history", {"rows": rows}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="What does overtime cost?", original_content="What does overtime cost?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    figures = _saved_figures(saved)
+    assert figures["$42"]["sources"] == [{"tool_use_id": "w1", "page": None}]
+    assert figures["9"]["sources"] == [{"tool_use_id": "w4", "page": None}]
+    assert figures["17"]["origin"] == "none"
+    assert saved["tool_rows"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_frame", [
+    [],
+    [("turn_history", {"rows": "not a list"})],
+], ids=["no-frame", "frame-without-a-list-of-rows"])
+async def test_produce_remote_leaves_a_figure_no_step_holds_unmarked_when_a_pod_sends_no_rows_after_a_compaction(
+    monkeypatch, history_frame,
+):
+    """A pod whose anton predates ChatSession.turn_messages sends no history
+    frame after a compaction, and a frame whose rows are not a list carries
+    none either. The page the turn read is then missing, and a figure no step
+    holds may be one it read, so such a figure gets no mark."""
+    import json
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    code = "print(open('/workspace/stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "tool_start", "id": "c1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "c1", "args": json.dumps({"action": "exec", "code": code})}
+        yield "turn_step", {
+            "step": "tool_result", "id": "c1", "name": "scratchpad", "action": "exec", "content": json.dumps(cell),
+        }
+        for reply in _web_fetch_replies("w1", "https://example.com/rates"):
+            yield reply
+        yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        yield "turn_delta", {"text": "Overtime costs $42 an hour and S1 holds 250 units."}
+        yield "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}
+        for reply in history_frame:
+            yield reply
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="What does overtime cost?", original_content="What does overtime cost?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    figures = _saved_figures(saved)
+    assert "$42" not in figures
+    assert figures["250"]["sources"] == [{"tool_use_id": "c1", "page": None}]
+    assert saved["tool_rows"] == []
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_names_the_earlier_turns_cell_a_figure_was_computed_from(monkeypatch):
     """The seeded history reaches the formatter: this turn's cell sums a frame
     an earlier turn's cell read, so the figure names both. A figure the
-    answer only repeats from the earlier turn has no source."""
+    answer only repeats from the earlier turn, whose answer saved no figure
+    sources, has no source."""
     import json
 
     saved = {}
@@ -2058,10 +2257,6 @@ def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_p
     project_dir = tmp_path / "proj"
     conversation = _conversation_at(project_dir)
     _patch_conversation_service(monkeypatch, conversation)
-    monkeypatch.setattr(
-        ResponsesHandler, "_remote_workspace",
-        staticmethod(lambda session, conv_id: {"project_id": str(conversation.project_id), "workspace_rel_path": "projects/proj"}),
-    )
     conv_id = uuid4()
     attachment = Attachment(file_id="f1", stored_path="/files/f1/stock.csv")
     monkeypatch.setattr(
@@ -2069,7 +2264,9 @@ def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_p
         lambda session, *, conversation_id: (attachment,) if conversation_id == conv_id else (),
     )
 
-    assert ResponsesHandler._remote_agent_files(None, conv_id) == AgentFiles.in_cloud_pod(
+    workspace = RemoteWorkspace(project_id=str(conversation.project_id), workspace_rel_path="projects/proj")
+
+    assert ResponsesHandler._remote_agent_files(None, conv_id, workspace=workspace) == AgentFiles.in_cloud_pod(
         project_dir,
         conversation_id=conv_id,
         workspace_rel_path="projects/proj",
@@ -2078,10 +2275,107 @@ def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_p
     )
 
 
+def test_remote_agent_files_without_a_workspace_leave_the_projects_path_unknown(monkeypatch, tmp_path):
+    from cowork.harnesses.anton_harness import agent_files as agent_files_mod
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+
+    project_dir = tmp_path / "proj"
+    conversation = _conversation_at(project_dir)
+    _patch_conversation_service(monkeypatch, conversation)
+    monkeypatch.setattr(agent_files_mod, "conversation_attachments", lambda session, *, conversation_id: ())
+    conv_id = uuid4()
+
+    assert ResponsesHandler._remote_agent_files(None, conv_id, workspace=None) == AgentFiles.in_cloud_pod(
+        project_dir, conversation_id=conv_id, workspace_rel_path=None, project_id=conversation.project_id,
+    )
+
+
 def test_remote_agent_files_are_none_when_the_project_cannot_be_read(monkeypatch):
     _patch_conversation_service(monkeypatch, SimpleNamespace(project=None))
 
-    assert ResponsesHandler._remote_agent_files(None, uuid4()) is None
+    assert ResponsesHandler._remote_agent_files(None, uuid4(), workspace=None) is None
+
+
+def test_remote_workspace_is_the_project_relative_to_the_org_root(monkeypatch):
+    from pathlib import Path
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    root = Path(get_app_settings().project.root_dir)
+    project = SimpleNamespace(path=str(root / "proj"), id=uuid4())
+    _patch_conversation_service(monkeypatch, SimpleNamespace(project=project))
+
+    assert ResponsesHandler._remote_workspace(SimpleNamespace(scope=LOCAL_SCOPE), uuid4()) == RemoteWorkspace(
+        project_id=str(project.id), workspace_rel_path=f"{root.name}/proj",
+    )
+
+
+def test_remote_workspace_is_none_when_the_project_cannot_be_read(monkeypatch):
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    _patch_conversation_service(monkeypatch, SimpleNamespace(project=None))
+
+    assert ResponsesHandler._remote_workspace(SimpleNamespace(scope=LOCAL_SCOPE), uuid4()) is None
+
+
+def test_a_remote_turns_inputs_look_up_the_workspace_once(monkeypatch):
+    """The turn's inputs read the workspace once and place the pod's files by it."""
+    workspace = RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/proj")
+    looked_up: list[object] = []
+    placed: list[RemoteWorkspace | None] = []
+
+    def remote_workspace(session, conv_id):
+        looked_up.append(conv_id)
+        return workspace
+
+    def remote_agent_files(session, conv_id, *, workspace):
+        placed.append(workspace)
+
+    monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], None)))
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_started_at", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(remote_agent_files))
+
+    inputs = object.__new__(ResponsesHandler)._read_remote_turn_inputs(None, conv_id=uuid4())
+
+    assert len(looked_up) == 1
+    assert inputs.workspace is workspace
+    assert placed == [workspace]
+
+
+@pytest.mark.asyncio
+async def test_a_web_turns_job_runs_in_the_workspace_it_looked_up(monkeypatch):
+    """The job gets the workspace the turn's inputs looked up, so it runs in the
+    conversation's project rather than the org's default one."""
+    handler = _remote_handler(monkeypatch, {})
+    workspace = RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/proj")
+    looked_up: list[object] = []
+
+    def remote_workspace(session, conv_id):
+        looked_up.append(conv_id)
+        return workspace
+
+    _no_workspace_or_memory_units(monkeypatch)
+    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(lambda session, conv_id: None))
+    sent: list[RemoteWorkspace | None] = []
+
+    async def fake_replies(**kwargs):
+        sent.append(kwargs["workspace"])
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert len(looked_up) == 1
+    assert sent == [workspace]
 
 
 def test_stage_remote_workspace_files_creates_the_project_artifacts_base(monkeypatch, tmp_path):
@@ -2338,7 +2632,7 @@ async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_
     assert record.exc_info is None
     assert busy_text not in repr(record.__dict__)
     [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
-    assert f"[Project:{project_id}][Conversation:{conv_id}][Artifacts:'sales-report']" in line
+    assert_log_fields(line, project_id=str(project_id), conversation_id=str(conv_id), artifact_slugs=["sales-report"])
     assert busy_text not in logged.output()
 
 
@@ -2694,6 +2988,7 @@ def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id)
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
 

@@ -2,6 +2,7 @@
 project and slugs on the log line. A database refusal reduces the message to
 its call site, so the ids ride the record."""
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import logging
 
@@ -51,9 +52,7 @@ async def test_a_refused_index_unit_names_the_conversation_project_and_slugs(
     assert (record.conversation_id, record.project_id, record.artifact_slugs) == (
         "conv-1", "proj-1", ("sales-report",),
     )
-    assert "[Project:proj-1][Conversation:conv-1][Artifacts:'sales-report']: Database operation failed" in (
-        logged.output()
-    )
+    assert_log_fields(logged.output(), project_id="proj-1", conversation_id="conv-1", artifact_slugs=["sales-report"], error_type="DatabaseBusy")
 
 
 async def test_a_failure_before_any_slug_is_known_renders_no_empty_slug_field(
@@ -70,4 +69,5 @@ async def test_a_failure_before_any_slug_is_known_renders_no_empty_slug_field(
     [record] = _warnings(caplog=caplog)
     assert record.getMessage() == "Could not index artifacts created this turn"
     assert not hasattr(record, "artifact_slugs")
-    assert "[Project:proj-1][Conversation:conv-1]: Could not index artifacts created this turn" in logged.output()
+    assert_log_fields(logged.output(), project_id="proj-1", conversation_id="conv-1", error_type="OSError")
+    assert "artifact_slugs" not in logged.output()
