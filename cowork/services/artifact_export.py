@@ -1,66 +1,303 @@
-"""Convert a document artifact (markdown or HTML) to PDF / Word / HTML.
+"""Export a document artifact's primary file to HTML or Word, beside the source.
 
-Pure-Python pipeline — no native deps, no external binaries — so the
-desktop install stays clean across platforms:
-
-    markdown → HTML   (markdown)
-    HTML     → PDF    (xhtml2pdf / reportlab)
-    HTML     → DOCX   (htmldocx / python-docx)
-
-The output is written next to the source (same artifact folder) as
-``<stem>.<ext>`` and the path is returned so the caller can open or
-download it. Conversion fidelity is good for ordinary reports/memos; it
-is not publication-grade typesetting (that would need pandoc + LaTeX,
-which we deliberately don't ship).
+The export reads the primary through the pinned artifact folder, bounded by
+size. Markdown and text become HTML first. ``inline_artifact_html`` then makes
+the document self-contained: it keeps only files from the artifact's own folder
+and never reaches the network. The result is written as a new file next to the
+source, under a name nothing else holds, so an export never replaces a file.
 """
 
 from __future__ import annotations
 
-import logging
-from pathlib import Path
+import html
+import json
+import os
+import secrets
+from collections.abc import AsyncIterator, Callable
+from contextlib import ExitStack, asynccontextmanager
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
-from cowork.schemas.artifact_export import ExportFormat, ExportPdfSettings
+import anyio
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
 
-logger = logging.getLogger(__name__)
+from cowork.common.paths import (
+    O_NOFOLLOW,
+    PinnedDir,
+    dir_open,
+    dir_stat,
+    dir_unlink,
+    open_pinned_child,
+)
+from cowork.schemas.artifact_export import (
+    ExportFormat,
+    ExportPdfSettings,
+    ExportResult,
+    InlineLimits,
+    InlineMode,
+    OmittedReason,
+)
+from cowork.services import artifact_files
+from cowork.services.artifact_identity import (
+    _atomic_json,
+    _read_no_follow,
+    opened_artifact_folder,
+)
+from cowork.services.artifact_inline import inline_artifact_html
+from cowork.services.artifacts import (
+    ProjectArtifacts,
+    _org_mode,
+    _pick_primary,
+    _pinned_directory_path,
+    _user_files,
+    draft_url_for,
+    serve_url_for,
+)
+from cowork.services.docx_writer import write_docx
+from cowork.services.markdown_render import render_markdown
 
-# Target formats we can produce, and the source extensions we accept.
-SUPPORTED_FORMATS = ("pdf", "docx", "html")
-_SOURCE_EXTS = (".md", ".markdown", ".html", ".htm", ".txt")
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
 
-class ExportError(Exception):
-    """Raised for an unsupported source/target or a conversion failure."""
+_MARKDOWN_SOURCES = frozenset({".md", ".markdown"})
+_HTML_SOURCES = frozenset({".html", ".htm"})
+# HTML export is offered only where it makes a new document: an HTML source
+# would only be copied.
+_HTML_EXPORT_SOURCES = _MARKDOWN_SOURCES | {".txt"}
+_WORD_EXPORT_SOURCES = _HTML_EXPORT_SOURCES | _HTML_SOURCES
+# Store-owned files and the revision journal never export, compared casefolded
+# on every segment: on a case-insensitive volume ``Metadata.JSON`` opens
+# ``metadata.json``.
+_HOUSEKEEPING_NAMES = frozenset(
+    name.casefold() for name in (*NON_CONTENT_NAMES, REVISIONS_DIRNAME)
+)
+
+# The most of a source an export reads. A page carries its own markup and
+# styles, so HTML gets more room than Markdown or text.
+HTML_SOURCE_MAX_BYTES = 10 * 1024 * 1024
+TEXT_SOURCE_MAX_BYTES = 2 * 1024 * 1024
+# The inliner's budget for everything it embeds. Org mode serves many people
+# from small replicas, so it embeds less.
+INLINE_BUDGET_BYTES = 25 * 1024 * 1024
+ORG_INLINE_BUDGET_BYTES = 10 * 1024 * 1024
+# How many "name (n).ext" spellings an export tries before it gives up.
+_MAX_OUTPUT_NAMES = 100
+
+_OUTPUT_EXTENSIONS: dict[ExportFormat, str] = {"html": ".html", "docx": ".docx"}
+_METADATA = "metadata.json"
+_BUSY = "An export is already running; try again in a moment."
+_NOT_OFFERED = "This file can't be exported to that format."
+
+# Org mode offers no export format, and the route answers 403 there. On
+# hosted's pod limits, 1 CPU and 1 GiB, single exports within the org caps
+# held the event loop for 7 s (a ladder of Markdown code fences) or peaked
+# past 500 MiB (a 2 MiB Markdown table, a 10 MiB page of one-word paragraphs);
+# scripts/measure_export_capacity.py holds the cases. A replica serves many
+# people at once, so org export waits until the conversion runs in a process
+# of its own that can be killed.
+ORG_EXPORT_ENABLED = False
+
+# HTML and Word export share one conversion at a time, and each user and each
+# organization one export at a time. Both hold per process, so every replica
+# admits its own. Nothing waits for a slot: a busy server answers at once.
+_conversion_limiter = anyio.CapacityLimiter(1)
+_running_jobs: set[str] = set()
 
 
-def _read_source_html(source: Path) -> str:
-    """Return the source document as an HTML string.
+class ExportRefusal(StrEnum):
+    """Why an export was refused before anything was written."""
 
-    Markdown is rendered to HTML; HTML is used as-is; plain text is wrapped
-    in a <pre>. Anything else is rejected by the caller via extension check.
+    NOT_OFFERED = "not_offered"
+    TOO_LARGE = "too_large"
+    NOT_FOUND = "not_found"
+    BUSY = "busy"
+
+
+class ExportRefused(Exception):
+    """An export the route answers with a 4xx. Nothing was written."""
+
+    def __init__(self, refusal: ExportRefusal, detail: str) -> None:
+        super().__init__(detail)
+        self.refusal = refusal
+
+
+@dataclass(frozen=True)
+class ExportSource:
+    """What decides an artifact's export formats.
+
+    ``source_name`` is the primary file's path inside the artifact folder,
+    "/"-separated, or "" when the artifact has no primary file.
     """
-    text = source.read_text(encoding="utf-8", errors="replace")
-    ext = source.suffix.lower()
-    if ext in (".html", ".htm"):
-        return text
-    if ext == ".txt":
-        import html as _html
 
-        return f"<pre>{_html.escape(text)}</pre>"
-    # markdown
-    import markdown as _markdown
+    source_name: str
+    is_backend: bool
 
-    body = _markdown.markdown(
-        text,
-        extensions=["tables", "fenced_code", "sane_lists", "toc"],
+
+def is_backend_type(artifact_type: object) -> bool:
+    """Whether metadata's ``type`` names a full-stack app, which never exports."""
+    return str(artifact_type or "").startswith("fullstack-")
+
+
+def export_formats(
+    *, source_name: str, is_backend: bool, can_edit: bool, pdf: ExportPdfSettings
+) -> list[ExportFormat]:
+    """The formats an artifact's Export offers this caller, in the order html, docx, pdf."""
+    if is_backend or not can_edit:
+        return []
+    segments = source_name.replace("\\", "/").split("/")
+    if any(not segment or segment.casefold() in _HOUSEKEEPING_NAMES for segment in segments):
+        return []
+    suffix = PurePosixPath(segments[-1]).suffix.lower()
+    formats: list[ExportFormat] = []
+    if suffix in _HTML_EXPORT_SOURCES:
+        formats.append("html")
+    if suffix in _WORD_EXPORT_SOURCES:
+        formats.append("docx")
+        if pdf.engine == "render" and pdf.render_url is not None:
+            formats.append("pdf")
+    return formats
+
+
+def export_pdf_settings() -> ExportPdfSettings:
+    """The PDF settings exports run with. No engine is set, so no format list offers PDF."""
+    return ExportPdfSettings(engine=None, render_url=None)
+
+
+def org_export_refused(*, org_mode: bool) -> bool:
+    """Whether export is off for this request: org mode while ``ORG_EXPORT_ENABLED`` is off."""
+    return org_mode and not ORG_EXPORT_ENABLED
+
+
+def offered_export_formats(
+    *, source: ExportSource, can_edit: bool, org_mode: bool
+) -> list[ExportFormat]:
+    """The formats this caller may export: ``export_formats``, or none while org export is off."""
+    if org_export_refused(org_mode=org_mode):
+        return []
+    return export_formats(
+        source_name=source.source_name,
+        is_backend=source.is_backend,
+        can_edit=can_edit,
+        pdf=export_pdf_settings(),
     )
-    return body
+
+
+def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
+    """The primary file's path inside *folder*, picked the way the artifact card picks it."""
+    hint = metadata.get("primary")
+    primary = _pick_primary(
+        folder, _user_files(folder), primary_hint=hint if isinstance(hint, str) else None
+    )
+    if primary is None:
+        return None
+    try:
+        relative = primary.resolve(strict=False).relative_to(folder.resolve(strict=False))
+    except (OSError, ValueError):
+        return None
+    return relative.parts or None
+
+
+def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
+    """The export source of the artifact in *folder*: its primary file and its type."""
+    parts = _primary_parts(folder=folder, metadata=metadata)
+    return ExportSource(
+        source_name="/".join(parts or ()),
+        is_backend=is_backend_type(metadata.get("type")),
+    )
+
+
+def card_export_source(card: dict) -> ExportSource:
+    """The export source an artifact card describes, from its ``path``, ``folder`` and ``type``."""
+    try:
+        relative = Path(str(card.get("path") or "")).relative_to(
+            Path(str(card.get("folder") or ""))
+        )
+    except ValueError:
+        relative = Path()
+    return ExportSource(
+        source_name="/".join(relative.parts),
+        is_backend=is_backend_type(card.get("type")),
+    )
+
+
+def _job_keys(scope: TenantScope | None) -> frozenset[str]:
+    if scope is None:
+        return frozenset()
+    keys = set()
+    if scope.user_id:
+        keys.add(f"user:{scope.user_id}")
+    if scope.org_id:
+        keys.add(f"org:{scope.org_id}")
+    return frozenset(keys)
+
+
+@asynccontextmanager
+async def export_slot(*, scope: TenantScope | None) -> AsyncIterator[None]:
+    """Admit one export now, or raise ``ExportRefused`` as busy. Nothing waits."""
+    keys = _job_keys(scope)
+    if keys & _running_jobs:
+        raise ExportRefused(ExportRefusal.BUSY, _BUSY)
+    # Its own borrower, so the token is this job's whichever task holds it.
+    borrower = object()
+    try:
+        _conversion_limiter.acquire_on_behalf_of_nowait(borrower)
+    except anyio.WouldBlock as exc:
+        raise ExportRefused(ExportRefusal.BUSY, _BUSY) from exc
+    _running_jobs.update(keys)
+    try:
+        yield
+    finally:
+        _running_jobs.difference_update(keys)
+        _conversion_limiter.release_on_behalf_of(borrower)
+
+
+def _read_source(*, folder: PinnedDir, parts: tuple[str, ...], suffix: str) -> bytes:
+    max_bytes = HTML_SOURCE_MAX_BYTES if suffix in _HTML_SOURCES else TEXT_SOURCE_MAX_BYTES
+    try:
+        return artifact_files.read_artifact_file(folder=folder, parts=parts, max_bytes=max_bytes)
+    except artifact_files.ArtifactFileRefused as exc:
+        if exc.reason is OmittedReason.TOO_LARGE:
+            raise ExportRefused(ExportRefusal.TOO_LARGE, "This file is too large to export.") from exc
+        if exc.reason is OmittedReason.HOUSEKEEPING:
+            raise ExportRefused(ExportRefusal.NOT_OFFERED, _NOT_OFFERED) from exc
+        raise ExportRefused(ExportRefusal.NOT_FOUND, "Artifact source not found") from exc
+
+
+def _source_html(*, data: bytes, suffix: str, title: str) -> bytes:
+    """The source as one HTML document for the inliner.
+
+    An HTML page stays as it is. Markdown is rendered and text becomes a
+    ``pre`` block, and either is wrapped as the body of a minimal document
+    titled *title*, which is what an HTML export of it writes.
+    """
+    if suffix in _HTML_SOURCES:
+        return data
+    text = data.decode("utf-8", errors="replace")
+    if suffix in _MARKDOWN_SOURCES:
+        body = render_markdown(text=text)
+    else:
+        body = f"<pre>{html.escape(text)}</pre>"
+    return _wrap_html_document(body, title).encode("utf-8")
+
+
+def _html_export(document: str) -> bytes:
+    """The inlined document as the bytes of an ``.html`` file.
+
+    Written as the inliner serialized it, never parsed again: lxml's HTML
+    parser stops at about 10 MB unless its limits are lifted, and inlined
+    images can take a document past that.
+    """
+    if not document.lstrip()[:9].lower().startswith("<!doctype"):
+        document = "<!DOCTYPE html>" + document
+    return document.encode("utf-8")
 
 
 def _wrap_html_document(body_html: str, title: str) -> str:
     """Wrap rendered body HTML in a minimal, print-friendly document."""
-    import html as _html
-
-    safe_title = _html.escape(title or "Document")
+    safe_title = html.escape(title or "Document")
     return (
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         f"<title>{safe_title}</title>"
@@ -78,64 +315,199 @@ def _wrap_html_document(body_html: str, title: str) -> str:
     )
 
 
-def _to_pdf(html_doc: str, dest: Path) -> None:
-    from xhtml2pdf import pisa
+def _record_primary(*, folder: PinnedDir, primary: str) -> None:
+    """Record the primary the card shows when ``metadata.json`` names none.
 
-    with dest.open("wb") as fh:
-        result = pisa.CreatePDF(src=html_doc, dest=fh)
-    if result.err:
-        raise ExportError("PDF conversion failed")
-
-
-def _to_docx(body_html: str, dest: Path) -> None:
-    from docx import Document
-    from htmldocx import HtmlToDocx
-
-    document = Document()
-    HtmlToDocx().add_html_to_document(body_html, document)
-    document.save(str(dest))
-
-
-def export_artifact(source_path: Path, fmt: str) -> Path:
-    """Convert `source_path` to `fmt`, writing the result beside the source.
-
-    Returns the output Path. Raises ExportError on an unsupported
-    source/target or a conversion failure.
+    Without it, the new file could become the card's primary: the card picks an
+    HTML file over Markdown, and otherwise the newest file. The primary is
+    merged into the latest document and written atomically, as
+    ``ensure_full_id`` widens an id, and the file's timestamps are put back
+    because the artifact's content did not change. A primary that is already
+    set is never changed.
     """
-    fmt = (fmt or "").lower().lstrip(".")
-    if fmt not in SUPPORTED_FORMATS:
-        raise ExportError(f"Unsupported export format: {fmt!r}")
-    if source_path.suffix.lower() not in _SOURCE_EXTS:
-        raise ExportError(
-            f"Can only export markdown or HTML documents, not {source_path.suffix!r}"
-        )
-    if not source_path.is_file():
-        raise ExportError("Source document not found")
-
-    dest = source_path.with_suffix(f".{fmt}")
-    title = source_path.stem
-
+    latest = json.loads(_read_no_follow(folder, _METADATA))
+    if not isinstance(latest, dict) or latest.get("primary"):
+        return
+    before = dir_stat(folder, _METADATA, follow_symlinks=False)
+    _atomic_json(folder, _METADATA, {**latest, "primary": primary})
+    times = (before.st_atime_ns, before.st_mtime_ns)
     try:
-        if fmt == "html":
-            dest.write_text(
-                _wrap_html_document(_read_source_html(source_path), title),
-                encoding="utf-8",
+        if folder.fd is not None:
+            os.utime(_METADATA, ns=times, dir_fd=folder.fd, follow_symlinks=False)
+        else:
+            # Windows, the only place a pinned folder has no descriptor, can't
+            # set times without following a link: follow_symlinks=False raises
+            # NotImplementedError there. _atomic_json has just put a regular
+            # file at this name.
+            os.utime(folder.path / _METADATA, ns=times)
+    except OSError:
+        pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written == 0:
+            raise OSError("export write made no progress")
+        remaining = remaining[written:]
+
+
+def _link_without_replacing(folder: PinnedDir, source_name: str, destination_name: str) -> None:
+    """Give *source_name* a second name, refusing one that already exists.
+
+    A hard link fails on any existing entry, a symlink or a dangling one
+    included, so nothing is written through it. Windows has no directory
+    descriptor, and its rename refuses an existing destination the same way.
+    """
+    if folder.fd is not None:
+        os.link(
+            source_name,
+            destination_name,
+            src_dir_fd=folder.fd,
+            dst_dir_fd=folder.fd,
+            follow_symlinks=False,
+        )
+    else:
+        os.rename(folder.path / source_name, folder.path / destination_name)
+
+
+def _write_beside(
+    *,
+    folder: PinnedDir,
+    parts: tuple[str, ...],
+    extension: str,
+    data: bytes,
+    after_placing: Callable[[], None],
+) -> str:
+    """Write *data* next to the source at *parts* under the first free name.
+
+    The names run ``report.docx``, ``report (2).docx``, ``report (3).docx``,
+    and never the source's own name. The bytes go to a temporary file created
+    with ``O_EXCL | O_NOFOLLOW``, which then takes the free name without
+    replacing anything; the temporary name is always removed, as soon as the
+    file has its own. Then *after_placing* runs; if it raises, the new file
+    is removed too, so a failed export leaves nothing behind. Returns the name.
+    """
+    source_name = parts[-1]
+    stem = PurePosixPath(source_name).stem
+    with ExitStack() as opened:
+        parent = folder
+        for requested in parts[:-1]:
+            parent = open_pinned_child(
+                parent, artifact_files._existing_draft_entry_name(parent, requested)
             )
-        elif fmt == "pdf":
-            _to_pdf(_wrap_html_document(_read_source_html(source_path), title), dest)
-        elif fmt == "docx":
-            _to_docx(_read_source_html(source_path), dest)
-    except ExportError:
-        raise
-    except Exception as exc:  # converter blew up — surface a clean message
-        logger.warning("Artifact export to %s failed for %s", fmt, source_path, exc_info=True)
-        raise ExportError(f"Could not convert document to {fmt.upper()}") from exc
+            opened.callback(parent.close)
+        temporary = f".cowork-export-{secrets.token_hex(12)}.tmp"
+        fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
+        try:
+            try:
+                _write_all(fd, data)
+            finally:
+                os.close(fd)
+            name = _place_temporary(
+                parent=parent, temporary=temporary, stem=stem, extension=extension, source_name=source_name
+            )
+        finally:
+            try:
+                dir_unlink(parent, temporary)
+            except FileNotFoundError:
+                pass
+        try:
+            after_placing()
+        except BaseException:
+            try:
+                dir_unlink(parent, name)
+            except OSError:
+                pass
+            raise
+        return name
 
-    return dest
+
+def _place_temporary(
+    *, parent: PinnedDir, temporary: str, stem: str, extension: str, source_name: str
+) -> str:
+    """Give *temporary* the first free output name and return that name."""
+    for number in range(1, _MAX_OUTPUT_NAMES + 1):
+        name = f"{stem}{extension}" if number == 1 else f"{stem} ({number}){extension}"
+        if name.casefold() == source_name.casefold():
+            continue
+        try:
+            _link_without_replacing(parent, temporary, name)
+        except FileExistsError:
+            continue
+        return name
+    raise FileExistsError(f"no free name for {stem}{extension}")
 
 
-def export_formats(
-    *, source_name: str, is_backend: bool, can_edit: bool, pdf: ExportPdfSettings
-) -> list[ExportFormat]:
-    """The formats an artifact's Export offers this caller, in the order html, docx, pdf."""
-    raise NotImplementedError
+def export_primary_file(
+    *,
+    source: ProjectArtifacts,
+    folder_name: str,
+    metadata: dict,
+    artifact_id: str,
+    export_format: ExportFormat,
+    can_edit: bool,
+) -> ExportResult:
+    """Export the artifact's primary file, writing the result beside it.
+
+    Blocking: the route runs it in a worker thread. Raises ``ExportRefused``
+    for a format the artifact doesn't offer, a source over its size bound or
+    a source that can't be opened, and writes nothing then.
+    """
+    org_mode = _org_mode()
+    with opened_artifact_folder(source, folder_name) as folder:
+        io_folder = _pinned_directory_path(folder)
+        if io_folder is None:
+            raise ExportRefused(ExportRefusal.NOT_FOUND, "Artifact source not found")
+        parts = _primary_parts(folder=io_folder, metadata=metadata)
+        offered = offered_export_formats(
+            source=ExportSource(
+                source_name="/".join(parts or ()),
+                is_backend=is_backend_type(metadata.get("type")),
+            ),
+            can_edit=can_edit,
+            org_mode=org_mode,
+        )
+        extension = _OUTPUT_EXTENSIONS.get(export_format)
+        if parts is None or export_format not in offered or extension is None:
+            raise ExportRefused(ExportRefusal.NOT_OFFERED, _NOT_OFFERED)
+        suffix = PurePosixPath(parts[-1]).suffix.lower()
+        title = PurePosixPath(parts[-1]).stem
+        data = _read_source(folder=folder, parts=parts, suffix=suffix)
+        inlined = inline_artifact_html(
+            html=_source_html(data=data, suffix=suffix, title=title),
+            folder=folder,
+            base_parts=parts[:-1],
+            mode=InlineMode.WORD if export_format == "docx" else InlineMode.HTML,
+            limits=InlineLimits(
+                max_total_bytes=ORG_INLINE_BUDGET_BYTES if org_mode else INLINE_BUDGET_BYTES
+            ),
+        )
+        if export_format == "docx":
+            output = write_docx(document=inlined, title=title)
+        else:
+            output = _html_export(inlined.html)
+        name = _write_beside(
+            folder=folder,
+            parts=parts,
+            extension=extension,
+            data=output,
+            after_placing=lambda: _record_primary(folder=folder, primary="/".join(parts)),
+        )
+    rel_path = "/".join((*parts[:-1], name))
+    return ExportResult(
+        filename=name,
+        draft_url=draft_url_for(
+            project_id=source.project_id, artifact_id=artifact_id, rel_path=rel_path
+        ),
+        # "" in org mode, where the server serves no artifact file by path.
+        serve_url=serve_url_for(
+            Path(source.base) / folder_name / rel_path,
+            scope=None,
+            artifacts_base=Path(source.base),
+            project_name=source.project_name,
+        ),
+        omitted_count=len(inlined.omitted),
+        scripts_dropped=inlined.scripts_dropped,
+    )

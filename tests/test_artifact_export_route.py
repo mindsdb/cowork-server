@@ -1,0 +1,785 @@
+"""POST /api/v1/artifacts/workspace/{project_ref}/{artifact_id}/export.
+
+Local tenancy goes over HTTP, with artifact resolution pointed at a folder the
+test builds, as the workspace identity-gate tests do. Org tenancy calls the
+handler with a scoped session over real project rows: the app wires the org
+principal middleware only when the process starts in org mode, so a request
+would run under the local scope and prove nothing about who may export.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import struct
+import threading
+import time
+import zlib
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+from urllib.parse import quote
+from uuid import uuid4
+
+import docx
+import pytest
+import yaml
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from sqlmodel import Session
+
+from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.db.session import get_engine
+from cowork.schemas.artifact_export import ExportRequest, ExportResult
+from cowork.services import artifact_export
+from cowork.services import artifact_ownership as ownership
+from cowork.services import artifacts as artifacts_service
+from cowork.services.artifacts import ProjectArtifacts
+from test_artifact_ownership import legacy_root, make_conversation, make_project, project_root
+
+FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
+ROUTE_CASES = yaml.safe_load((FIXTURES / "route_cases.yaml").read_text(encoding="utf-8"))["cases"]
+ARTIFACT_ID = "0123456789abcdef0123456789abcdef"
+EXPORT_URL = f"/api/v1/artifacts/workspace/local/{ARTIFACT_ID}/export"
+MIB = 1024 * 1024
+
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
+
+
+def _snapshot(folder: Path) -> dict[str, object]:
+    """Every entry below *folder*: a file's bytes, or a symlink's target."""
+    entries: dict[str, object] = {}
+    for directory, dirnames, filenames in os.walk(folder):
+        for name in [*dirnames, *filenames]:
+            path = Path(directory) / name
+            key = path.relative_to(folder).as_posix()
+            if path.is_symlink():
+                entries[key] = ("symlink", os.readlink(path))
+            elif path.is_file():
+                entries[key] = path.read_bytes()
+    return entries
+
+
+def _metadata(folder: Path) -> dict:
+    return json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+
+
+# ── local tenancy ────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def client(monkeypatch):
+    from cowork.server import create_app
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    get_app_settings.cache_clear()
+    yield TestClient(create_app())
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def local_artifact(tmp_path, monkeypatch):
+    """Build one artifact folder that every export request resolves to."""
+
+    def build(
+        files: dict[str, str | bytes], *, primary: str | None = None, artifact_type: str = "document"
+    ) -> Path:
+        project = tmp_path / "project"
+        base = project / ".anton" / "artifacts"
+        folder = base / "report"
+        folder.mkdir(parents=True)
+        for name, content in files.items():
+            path = folder / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content, encoding="utf-8")
+        metadata = {"id": ARTIFACT_ID, "slug": "report", "name": "Report", "type": artifact_type}
+        if primary is not None:
+            metadata["primary"] = primary
+        (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        source = ProjectArtifacts(
+            base=base,
+            project_id=None,
+            project_name="project",
+            trusted_anchor=project,
+            root_parts=(".anton", "artifacts"),
+        )
+        monkeypatch.setattr(
+            workspace_ep,
+            "review_artifact_for_request",
+            lambda *_args: (source, folder, _metadata(folder), True),
+        )
+        return folder
+
+    return build
+
+
+def _assert_reloads(path: Path, export_format: str) -> None:
+    if export_format == "docx":
+        docx.Document(io.BytesIO(path.read_bytes()))
+    else:
+        text = path.read_text(encoding="utf-8")
+        assert text[:15].lower() == "<!doctype html>"
+        assert f"<title>{Path(path.name).stem}</title>" in text
+
+
+@pytest.mark.parametrize("case", ROUTE_CASES, ids=[case["id"] for case in ROUTE_CASES])
+def test_route_cases(client, local_artifact, case):
+    folder = local_artifact(
+        case["files"], primary=case["primary"], artifact_type=case.get("type", "document")
+    )
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": case["format"]})
+
+    assert response.status_code == case["status"], response.text
+    after = _snapshot(folder)
+    if case["status"] != 200:
+        assert after == before
+        return
+    written = case["written"]
+    assert response.json() == {
+        "filename": Path(written).name,
+        "draftUrl": f"/api/v1/artifacts/drafts/local/{ARTIFACT_ID}/{quote(written)}",
+        "serveUrl": f"/api/v1/artifacts/serve/project/report/{quote(written)}",
+        "omittedCount": 0,
+        "scriptsDropped": case.get("scripts_dropped", False),
+    }
+    assert set(after) - set(before) == {written}
+    assert {key: after[key] for key in before} == before
+    _assert_reloads(folder / written, case["format"])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"format": "docx", "path": "/etc/passwd"},
+        {"path": "report.md", "format": "html"},
+        {"format": "docx", "filename": "report.docx"},
+        {"format": "rtf"},
+        {"format": "DOCX"},
+        {},
+    ],
+)
+def test_any_body_but_one_format_answers_422_and_writes_nothing(
+    client, local_artifact, monkeypatch, body
+):
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    before = _snapshot(folder)
+    monkeypatch.setattr(
+        workspace_ep, "export_primary_file", Mock(side_effect=AssertionError("no export"))
+    )
+
+    response = client.post(EXPORT_URL, json=body)
+
+    assert response.status_code == 422, response.text
+    assert _snapshot(folder) == before
+
+
+def test_a_second_export_takes_the_next_free_name(client, local_artifact):
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+
+    first = client.post(EXPORT_URL, json={"format": "docx"})
+    original = (folder / "report.docx").read_bytes()
+    second = client.post(EXPORT_URL, json={"format": "docx"})
+    third = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert [r.json()["filename"] for r in (first, second, third)] == [
+        "report.docx",
+        "report (2).docx",
+        "report (3).docx",
+    ]
+    assert second.json()["draftUrl"].endswith("/report%20%282%29.docx")
+    assert (folder / "report.docx").read_bytes() == original
+    docx.Document(io.BytesIO((folder / "report (2).docx").read_bytes()))
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_a_symlink_at_the_output_name_is_never_written_through(
+    client, local_artifact, tmp_path, dangling
+):
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    victim = tmp_path / "victim.docx"
+    if not dangling:
+        victim.write_bytes(b"victim bytes")
+    (folder / "report.docx").symlink_to(victim)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == "report (2).docx"
+    assert (folder / "report.docx").is_symlink()
+    assert os.readlink(folder / "report.docx") == str(victim)
+    if dangling:
+        assert not victim.exists()
+    else:
+        assert victim.read_bytes() == b"victim bytes"
+
+
+def test_a_hard_link_at_the_output_name_is_never_written_through(client, local_artifact, tmp_path):
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    victim = tmp_path / "victim.html"
+    victim.write_bytes(b"victim bytes")
+    os.link(victim, folder / "report.html")
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == "report (2).html"
+    assert victim.read_bytes() == b"victim bytes"
+    assert (folder / "report.html").stat().st_ino == victim.stat().st_ino
+
+
+def test_an_html_export_of_markdown_writes_one_document_beside_it(client, local_artifact):
+    source = "# Quarterly report\n\nRevenue *grew*.\n\n<script>alert(1)</script>\n"
+    folder = local_artifact({"report.md": source}, primary="report.md")
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    assert (folder / "report.md").read_text(encoding="utf-8") == source
+    written = (folder / "report.html").read_text(encoding="utf-8")
+    assert written[:15].lower() == "<!doctype html>"
+    assert written.count("<html") == 1 and written.count("<body") == 1
+    assert "<title>report</title>" in written
+    assert "Quarterly report</h1>" in written
+    assert "<em>grew</em>" in written
+
+
+def test_a_large_html_export_is_written_whole(client, local_artifact):
+    """Eight 1.4 MiB images fit the 25 MiB budget and make a document over
+    10 MB, past where lxml's HTML parser stops unless its limits are lifted.
+    Every image and the text after them reach the file."""
+    images = {f"chart{i}.png": padded_png(int(1.4 * MIB)) for i in range(8)}
+    markdown = "\n\n".join(f"![chart]({name})" for name in images) + "\n\nTHE-END\n"
+    folder = local_artifact({"report.md": markdown, **images}, primary="report.md")
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["omittedCount"] == 0
+    written = (folder / "report.html").read_text(encoding="utf-8")
+    assert len(written) > 10_000_000
+    assert written.count("data:image/png;base64,") == 8
+    assert "THE-END" in written
+
+
+@pytest.mark.parametrize(
+    ("name", "size"),
+    [
+        ("page.html", 10 * MIB + 1),
+        ("page.htm", 10 * MIB + 1),
+        ("report.md", 2 * MIB + 1),
+        ("report.markdown", 2 * MIB + 1),
+        ("notes.txt", 2 * MIB + 1),
+    ],
+)
+def test_a_source_over_its_read_bound_answers_413_and_writes_nothing(
+    client, local_artifact, name, size
+):
+    folder = local_artifact({name: b"a" * size}, primary=name)
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 413, response.text
+    assert _snapshot(folder) == before
+
+
+def test_a_markdown_source_at_its_read_bound_still_exports(client, local_artifact):
+    local_artifact({"report.md": b"a" * (2 * MIB)}, primary="report.md")
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+
+
+def test_a_conversion_failure_answers_500_and_writes_nothing(client, local_artifact, monkeypatch):
+    folder = local_artifact({"report.md": "# R\n"})
+    before = _snapshot(folder)
+
+    def broken(**_kwargs):
+        raise ValueError("the writer failed")
+
+    monkeypatch.setattr(artifact_export, "write_docx", broken)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert _snapshot(folder) == before
+
+
+def _newest(path: Path) -> None:
+    """Make *path* the folder's newest file, so the card picks it as primary."""
+    later = time.time() + 60
+    os.utime(path, (later, later))
+
+
+def test_an_export_with_no_free_name_answers_500_and_changes_nothing(client, local_artifact):
+    """No primary is recorded and no temporary file stays when no name is free."""
+    taken = {"report.docx": b"old", **{f"report ({n}).docx": b"old" for n in range(2, 101)}}
+    folder = local_artifact({**taken, "report.md": "# R\n"})
+    _newest(folder / "report.md")
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert _snapshot(folder) == before
+
+
+def test_a_failure_after_the_file_is_placed_removes_it(client, local_artifact, monkeypatch):
+    folder = local_artifact({"report.md": "# R\n"})
+    before = _snapshot(folder)
+
+    def broken(**_kwargs):
+        raise OSError("metadata.json can't be written")
+
+    monkeypatch.setattr(artifact_export, "_record_primary", broken)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert _snapshot(folder) == before
+
+
+def test_an_html_source_past_the_markdown_bound_still_exports(client, local_artifact):
+    page = "<html><body>" + "<p>row</p>" * (2 * MIB // 10 + 1000) + "</body></html>"
+    assert 2 * MIB < len(page) < 10 * MIB
+    local_artifact({"report.html": page}, primary="report.html")
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 200, response.text
+
+
+def test_a_symlinked_primary_is_never_read(client, local_artifact, tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text("# SECRET-OUTSIDE\n", encoding="utf-8")
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    (folder / "report.md").unlink()
+    (folder / "report.md").symlink_to(outside)
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code in (404, 422), response.text
+    assert _snapshot(folder) == before
+
+
+def _published(folder: Path, primary: str) -> None:
+    (folder / ".published.json").write_text(
+        json.dumps(
+            {
+                primary: {
+                    "report_id": "report-1",
+                    "url": "https://view.example/r/1",
+                    "published": True,
+                    "mode": "restricted",
+                    "emails": ["a@example.com"],
+                    "published_mtime": time.time() + 60,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _card(folder: Path) -> dict:
+    source = ProjectArtifacts(
+        base=folder.parent,
+        project_id=None,
+        project_name="project",
+        trusted_anchor=folder.parent.parent.parent,
+        root_parts=(".anton", "artifacts"),
+    )
+    (card,) = artifacts_service.list_artifacts([source])
+    return {key: card[key] for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
+
+
+@pytest.mark.parametrize("recorded", [True, False], ids=["primary-recorded", "no-primary"])
+@pytest.mark.parametrize(
+    ("primary", "files", "exports"),
+    [
+        ("report.md", {"report.md": "# R\n"}, ["docx", "html", "docx"]),
+        ("index.html", {"index.html": "<h1>P</h1>", "notes.md": "# N\n"}, ["docx", "docx"]),
+    ],
+    ids=["markdown", "html"],
+)
+def test_exports_leave_the_card_primary_and_publish_state_alone(
+    client, local_artifact, primary, files, exports, recorded
+):
+    # With no recorded primary, the card shows the only HTML file, or else the
+    # newest file, so each new export could take the card over.
+    folder = local_artifact(files, primary=primary if recorded else None)
+    _published(folder, primary)
+    card_before = _card(folder)
+    metadata_mtime = (folder / "metadata.json").stat().st_mtime_ns
+    assert card_before["path"] == str(folder / primary)
+
+    for export_format in exports:
+        response = client.post(EXPORT_URL, json={"format": export_format})
+        assert response.status_code == 200, response.text
+        time.sleep(0.01)
+
+    assert _card(folder) == card_before
+    assert _metadata(folder)["primary"] == primary
+    assert (folder / "metadata.json").stat().st_mtime_ns == metadata_mtime
+
+
+def test_a_recorded_primary_is_never_changed(client, local_artifact):
+    """A primary naming a file that no longer exists stays as it is: the
+    export follows the card's own fallback and writes no metadata."""
+    folder = local_artifact({"notes.md": "# N\n"}, primary="gone.md")
+    metadata_before = (folder / "metadata.json").read_bytes()
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == "notes.html"
+    assert (folder / "metadata.json").read_bytes() == metadata_before
+
+
+def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
+    from cowork.db.scoped import get_scoped_session
+    from cowork.services import product_permissions
+
+    async def denied(_scope, _permission):
+        return False
+
+    monkeypatch.setattr(product_permissions, "has_product_permission", denied)
+    resolve = Mock(side_effect=AssertionError("resolved an artifact"))
+    monkeypatch.setattr(workspace_ep, "_owner_workspace", resolve)
+    app = FastAPI()
+    app.include_router(workspace_ep.router)
+    org = TenantScope(org_mode=True, org_id="org", user_id="user")
+    app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=org)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            f"/workspace/project/{ARTIFACT_ID}/export", json={"format": "docx"}
+        )
+
+    assert response.status_code == 403, response.text
+    resolve.assert_not_called()
+
+
+# ── load ─────────────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def _held_export(monkeypatch):
+    """Make every export block in its worker thread until the test lets it go."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held(**kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return ExportResult(
+            filename="report.docx",
+            draft_url="/api/v1/artifacts/drafts/local/x/report.docx",
+            serve_url="",
+            omitted_count=0,
+            scripts_dropped=False,
+        )
+
+    monkeypatch.setattr(workspace_ep, "export_primary_file", held)
+    try:
+        yield SimpleNamespace(entered=entered, release=release)
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("second_format", ["docx", "html"])
+def test_a_second_export_while_one_runs_answers_429_at_once(
+    client, local_artifact, monkeypatch, second_format
+):
+    local_artifact({"report.md": "# R\n"}, primary="report.md")
+    answers: list[int] = []
+    with _held_export(monkeypatch) as held:
+        first = threading.Thread(
+            target=lambda: answers.append(
+                client.post(EXPORT_URL, json={"format": "docx"}).status_code
+            )
+        )
+        first.start()
+        assert held.entered.wait(timeout=10)
+
+        started = time.monotonic()
+        second = client.post(EXPORT_URL, json={"format": second_format})
+        elapsed = time.monotonic() - started
+
+        held.release.set()
+        first.join(timeout=10)
+
+    assert second.status_code == 429, second.text
+    assert second.json()["detail"] == "An export is already running; try again in a moment."
+    assert elapsed < 1.0
+    assert answers == [200]
+    # The slot is free again once the first export answers.
+    after = client.post(EXPORT_URL, json={"format": "html"})
+    assert after.status_code == 200, after.text
+
+
+# ── org tenancy ──────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def _scoped(org_id: str, user_id: str):
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        yield ScopedSession(raw, TenantScope(org_mode=True, org_id=org_id, user_id=user_id))
+
+
+def _write_artifact(base: Path, slug: str, files: dict[str, str | bytes], **metadata) -> tuple[str, Path]:
+    artifact_id = uuid4().hex
+    folder = base / slug
+    for name, content in files.items():
+        path = folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding="utf-8")
+    (folder / "metadata.json").write_text(
+        json.dumps({"id": artifact_id, "slug": slug, "name": slug, **metadata}), encoding="utf-8"
+    )
+    return artifact_id, folder
+
+
+@pytest.fixture
+def org_world(tmp_path, org_deployment):
+    """One org project: the creator's report, a member's report, an ownerless
+    page, and a report in the creator's private conversation workspace."""
+    org_id, creator, member = str(uuid4()), str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    shared = project_root(project)
+    private = legacy_root(project, str(make_conversation(project, creator)))
+    artifacts = {}
+    for slug, owner, files, primary, root in (
+        ("mine", creator, {"report.md": "# Mine\n"}, "report.md", shared),
+        ("theirs", member, {"report.md": "# Theirs\n"}, "report.md", shared),
+        ("page", creator, {"index.html": "<h1>Page</h1>"}, "index.html", shared),
+        ("orphan", None, {"report.md": "# Orphan\n"}, "report.md", shared),
+        ("private", creator, {"report.md": "# Private\n"}, "report.md", private),
+    ):
+        artifact_id, folder = _write_artifact(root.base, slug, files, type="document", primary=primary)
+        artifacts[slug] = SimpleNamespace(id=artifact_id, folder=folder)
+        if owner is not None and root is shared:
+            with _scoped(org_id, owner) as session:
+                ownership.record_artifact_owner(session, project.id, slug, owner, action="create")
+    return SimpleNamespace(
+        org_id=org_id, creator=creator, member=member, project=project, artifacts=artifacts
+    )
+
+
+@pytest.fixture
+def role(monkeypatch):
+    """Answer the live ``artifact.manage`` check as each test says."""
+    from cowork.services import product_permissions
+
+    decision = SimpleNamespace(artifact_manage=True)
+
+    async def decide(_scope, permission):
+        return decision.artifact_manage if permission == "artifact.manage" else True
+
+    monkeypatch.setattr(product_permissions, "has_product_permission", decide)
+    monkeypatch.setattr(workspace_ep, "has_product_permission", decide)
+    return decision
+
+
+@pytest.fixture
+def org_export_on(monkeypatch):
+    """Turn org export on, as the release that lifts the switch will."""
+    monkeypatch.setattr(artifact_export, "ORG_EXPORT_ENABLED", True)
+
+
+async def _export(world, user_id: str, slug: str, export_format: str = "docx", *, org_id=None):
+    with _scoped(org_id or world.org_id, user_id) as session:
+        return await workspace_ep.export_workspace_artifact(
+            str(world.project.id),
+            world.artifacts[slug].id,
+            ExportRequest(format=export_format),
+            session,
+        )
+
+
+async def test_the_owner_with_artifact_manage_exports_and_gets_no_serve_url(
+    org_world, role, org_export_on
+):
+    result = await _export(org_world, org_world.creator, "mine")
+
+    folder = org_world.artifacts["mine"].folder
+    assert result.model_dump(by_alias=True) == {
+        "filename": "report.docx",
+        "draftUrl": (
+            f"/api/v1/artifacts/drafts/{org_world.project.id}/"
+            f"{org_world.artifacts['mine'].id}/report.docx"
+        ),
+        "serveUrl": "",
+        "omittedCount": 0,
+        "scriptsDropped": False,
+    }
+    docx.Document(io.BytesIO((folder / "report.docx").read_bytes()))
+
+
+@pytest.mark.parametrize(
+    ("who", "slug", "export_format", "status"),
+    [
+        ("member", "mine", "docx", 403),
+        # Permission comes before format: the page offers no HTML export.
+        ("member", "page", "html", 403),
+        ("creator", "orphan", "docx", 403),
+        ("member", "private", "docx", 404),
+        ("stranger", "mine", "docx", 404),
+    ],
+    ids=["reviewer", "reviewer-asking-a-format-not-offered", "ownerless", "no-grant", "other-org"],
+)
+@pytest.mark.parametrize("org_export", [False, True], ids=["org-export-off", "org-export-on"])
+async def test_only_the_owner_may_export(
+    org_world, role, monkeypatch, org_export, who, slug, export_format, status
+):
+    """Each refusal comes before the org export switch, so it holds either way."""
+    monkeypatch.setattr(artifact_export, "ORG_EXPORT_ENABLED", org_export)
+    folder = org_world.artifacts[slug].folder
+    before = _snapshot(folder)
+    user_id = {"member": org_world.member, "creator": org_world.creator, "stranger": str(uuid4())}[who]
+    org_id = str(uuid4()) if who == "stranger" else None
+
+    with pytest.raises(HTTPException) as refused:
+        await _export(org_world, user_id, slug, export_format, org_id=org_id)
+
+    assert refused.value.status_code == status
+    assert _snapshot(folder) == before
+
+
+async def test_an_owner_without_artifact_manage_gets_403(org_world, role):
+    role.artifact_manage = False
+    folder = org_world.artifacts["mine"].folder
+    before = _snapshot(folder)
+
+    with pytest.raises(HTTPException) as refused:
+        await _export(org_world, org_world.creator, "mine")
+
+    assert refused.value.status_code == 403
+    assert _snapshot(folder) == before
+
+
+@pytest.mark.parametrize(("slug", "export_format"), [("mine", "docx"), ("page", "html")])
+async def test_while_org_export_is_off_the_owner_gets_403_and_nothing_is_written(
+    org_world, role, slug, export_format
+):
+    folder = org_world.artifacts[slug].folder
+    before = _snapshot(folder)
+
+    with pytest.raises(HTTPException) as refused:
+        await _export(org_world, org_world.creator, slug, export_format)
+
+    assert refused.value.status_code == 403
+    assert _snapshot(folder) == before
+
+
+async def test_the_owner_asking_a_format_not_offered_gets_422(org_world, role, org_export_on):
+    folder = org_world.artifacts["page"].folder
+    before = _snapshot(folder)
+
+    with pytest.raises(HTTPException) as refused:
+        await _export(org_world, org_world.creator, "page", "html")
+
+    assert refused.value.status_code == 422
+    assert _snapshot(folder) == before
+
+
+@pytest.mark.parametrize(("org_mode", "budget"), [(True, 10 * MIB), (False, 25 * MIB)])
+async def test_the_word_inline_budget_is_smaller_in_org_mode(
+    org_world, role, org_export_on, monkeypatch, org_mode, budget
+):
+    if not org_mode:
+        monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+        get_app_settings.cache_clear()
+    budgets: list[int] = []
+    inline = artifact_export.inline_artifact_html
+
+    def spy(**kwargs):
+        budgets.append(kwargs["limits"].max_total_bytes)
+        return inline(**kwargs)
+
+    monkeypatch.setattr(artifact_export, "inline_artifact_html", spy)
+    folder = org_world.artifacts["mine"].folder
+    source = ProjectArtifacts(
+        base=folder.parent,
+        project_id=str(org_world.project.id),
+        project_name=org_world.project.name,
+        trusted_anchor=Path(org_world.project.path),
+        root_parts=(".anton", "artifacts"),
+    )
+
+    artifact_export.export_primary_file(
+        source=source,
+        folder_name=folder.name,
+        metadata=_metadata(folder),
+        artifact_id=org_world.artifacts["mine"].id,
+        export_format="docx",
+        can_edit=True,
+    )
+
+    assert budgets == [budget]
+
+
+def padded_png(size: int, *, filler: bytes = b"x") -> bytes:
+    """A valid 1x1 PNG of *size* bytes, padded with a private ancillary chunk
+    that repeats *filler*."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    head = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    tail = chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00")) + chunk(b"IEND", b"")
+    padding = size - len(head) - len(tail) - 12
+    filled = (filler * (padding // len(filler) + 1))[:padding]
+    return head + chunk(b"teXt", filled) + tail
+
+
+async def test_org_assets_past_the_budget_are_dropped_and_counted(org_world, role, org_export_on):
+    folder = org_world.artifacts["mine"].folder
+    # Each image is under the 2 MiB asset cap even as base64; together they
+    # are over the 10 MiB budget.
+    images = {f"chart{i}.png": padded_png(int(1.4 * MIB)) for i in range(8)}
+    for name, data in images.items():
+        (folder / name).write_bytes(data)
+    markdown = "# Charts\n\n" + "\n\n".join(f"![chart]({name})" for name in images) + "\n"
+    (folder / "report.md").write_text(markdown, encoding="utf-8")
+
+    result = await _export(org_world, org_world.creator, "mine")
+
+    assert result.omitted_count >= 1
+    document = docx.Document(io.BytesIO((folder / result.filename).read_bytes()))
+    assert 1 <= len(document.inline_shapes) <= 7
+
+
+async def test_one_export_per_user_and_org_at_a_time(org_world, role, org_export_on, monkeypatch):
+    """While the creator's export runs, the creator's second export and a
+    co-member's export of their own artifact both answer 429 at once."""
+    import asyncio
+
+    with _held_export(monkeypatch) as held:
+        first = asyncio.create_task(_export(org_world, org_world.creator, "mine"))
+        assert await asyncio.to_thread(held.entered.wait, 10)
+
+        for user_id, slug in ((org_world.creator, "mine"), (org_world.member, "theirs")):
+            started = time.monotonic()
+            with pytest.raises(HTTPException) as busy:
+                await _export(org_world, user_id, slug)
+            assert busy.value.status_code == 429
+            assert time.monotonic() - started < 1.0
+
+        held.release.set()
+        result = await first
+
+    assert result.filename == "report.docx"

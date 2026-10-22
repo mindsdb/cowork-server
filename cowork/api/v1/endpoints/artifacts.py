@@ -164,6 +164,7 @@ def _artifact_cards(session, sources) -> list[dict]:
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
     cards = _list_artifacts(sources)
+    from cowork.services.artifact_export import card_export_source
     from cowork.services.artifact_ownership import resolve_artifact_owners
     from cowork.services.artifact_permissions import artifact_capabilities
 
@@ -182,7 +183,11 @@ def _artifact_cards(session, sources) -> list[dict]:
         resolutions = resolve_artifact_owners(session, source, [slug for slug, _ in entries])
         for slug, card in entries:
             card["capabilities"] = artifact_capabilities(
-                session, source, slug, resolution=resolutions[slug]
+                session,
+                source,
+                slug,
+                resolution=resolutions[slug],
+                export_source=card_export_source(card),
             )
     return cards
 
@@ -893,58 +898,6 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=415, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not read artifact") from e
-
-
-class _ExportBody(BaseModel):
-    path: str
-    format: str  # 'pdf' | 'docx' | 'html'
-
-
-@router.post("/export", dependencies=[Depends(require(DesktopOnly))])
-async def export_artifact_endpoint(req: _ExportBody, scope: ScopeDep):
-    """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
-    the result into the same artifact folder. Returns the new file's path so
-    the client can open or download it.
-
-    The route-level `DesktopOnly` is broader than the pdf/docx refusal
-    inside: it takes `req.path`, an absolute server path, and nothing in an org
-    deployment can say which organization that path belongs to. The inner check
-    stays because it is the one the direct-call tests exercise, and because it
-    documents WHY those two formats are unsafe even where a path is trusted.
-    """
-    from fastapi.concurrency import run_in_threadpool
-
-    from cowork.services.artifact_export import ExportError, export_artifact
-    from cowork.services.artifacts import _org_mode
-
-    fmt = (req.format or "").lower().lstrip(".")
-    if fmt in ("pdf", "docx") and (_org_mode() or scope.personal):
-        # Both converters resolve URIs referenced in the source HTML to embed
-        # them in the output: xhtml2pdf fetches <img>/<link>/@import for PDF;
-        # htmldocx's image handling calls urllib.request.urlopen for docx. The
-        # source HTML is artifact content from the shared filesystem, written
-        # by any org's agent, so this is an SSRF and local-file-read primitive
-        # (including other orgs' trees) into a file the requester downloads.
-        # A person's partition is refused the same way, as /open and /reveal
-        # are: their HTML can name a file in another person's partition.
-        # Plain HTML export does no such resolution, so it stays available.
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="PDF and Word export are not available on this deployment. Export to HTML instead.",
-        )
-    try:
-        source = resolve_artifact_path(req.path, scope=scope)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    try:
-        out = await run_in_threadpool(export_artifact, source, req.format)
-    except ExportError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Export failed") from e
-    return {"path": str(out), "filename": out.name}
 
 
 @router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
