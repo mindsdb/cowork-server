@@ -24,3 +24,11 @@
 - {name: empty_mailto, href: "mailto:", target: null}
 - {name: broken_ipv6_host, href: "http://[::1/x", target: null}
 - {name: fragment_only, href: "#section", target: null}
+# A Target must be a valid URI, so every character RFC 3986 doesn't allow as
+# it is gets percent-encoded. Escapes already there stay as they are.
+- {name: space_quote_and_angles, href: 'https://example.com/a b"c<d>', target: "https://example.com/a%20b%22c%3Cd%3E"}
+- {name: braces_bar_backslash_caret_backtick, href: 'https://example.com/{e}|f\g^h`i', target: "https://example.com/%7Be%7D%7Cf%5Cg%5Eh%60i"}
+- {name: non_ascii, href: "https://example.com/ü?q=é", target: "https://example.com/%C3%BC?q=%C3%A9"}
+- {name: lone_percent, href: "https://example.com/100%", target: "https://example.com/100%25"}
+- {name: escapes_and_reserved_kept, href: "https://example.com/a%20b;c=d?x=%2F&y=[1]#f!", target: "https://example.com/a%20b;c=d?x=%2F&y=[1]#f!"}
+- {name: junk_in_the_host, href: "https://a<b/", target: "https://a%3Cb/"}

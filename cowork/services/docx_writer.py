@@ -19,7 +19,7 @@ import secrets
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import docx
 import lxml.html
@@ -40,7 +40,12 @@ from lxml.etree import ParserError
 from lxml.html import HtmlElement
 
 from cowork.schemas.artifact_export import InlinedDocument
-from cowork.services.artifact_inline import TRUNCATION_NOTE, XML_UNSAFE, parse_stopped
+from cowork.services.artifact_inline import (
+    JPEG_STANDALONE_MARKERS,
+    TRUNCATION_NOTE,
+    XML_UNSAFE,
+    parse_stopped,
+)
 
 MAX_DEPTH = 256
 MAX_NODES = 200_000
@@ -60,6 +65,8 @@ MAX_LIST_NUMBER = 32_767
 MAX_TITLE_LENGTH = 255
 LINK_SCHEMES = frozenset({"http", "https", "mailto"})
 MONOSPACE_FONT = "Courier New"
+# The paragraph that ends a document whose tables lost cells to the limits above.
+TABLE_CELLS_NOTE = "Some table cells were left out because a table was too large to convert."
 
 _LINK_COLOR = RGBColor(0x05, 0x63, 0xC1)
 _SMALL_SIZE = Pt(9)
@@ -67,6 +74,12 @@ _EMU_PER_INCH = 914_400
 _DEFAULT_DPI = 72
 
 _HTML_SPACE = re.compile("[ \t\n\r\f]+")
+# What RFC 3986 lets a URI hold as it is, beyond letters, digits and "-._~".
+# Every other character in a link target is percent-encoded, so a consumer
+# that checks a relationship's Target reads a valid URI.
+_URI_SAFE = "!#$%&'()*+,/:;=?@[]"
+# A "%" that starts no escape, which the encoding writes as "%25".
+_LONE_PERCENT = re.compile("%(?![0-9A-Fa-f]{2})")
 _LEADING_DIGITS = re.compile(r"\s*([0-9]+)")
 # python-docx writes each of these as its own element.
 _PRE_BREAKS = re.compile("[\n\t]")
@@ -82,6 +95,17 @@ _READ_ATTRIBUTES = ("src", "alt", "href")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_SIGNATURE = b"\xff\xd8\xff"
 _GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
+# python-docx keeps every chunk of a PNG, every marker before a JPEG's scan,
+# and every entry of each Exif block's first directory, strings and all,
+# before it reads an image's size. So a small crafted header can cost a
+# second and hundreds of MiB, twice per image. No camera or chart library
+# writes a header past these; an image past them becomes its placeholder
+# text. The marker cap counts each 0xFF 0x00 pair among the markers too, as
+# python-docx steps past those one at a time.
+_MAX_PNG_CHUNKS = 4096
+_MAX_JPEG_MARKERS = 4096
+_MAX_EXIF_ENTRIES = 256
+_JPEG_EOI, _JPEG_SOS, _JPEG_APP1 = 0xD9, 0xDA, 0xE1
 
 # Elements whose content is not document text.
 _SKIPPED_TAGS = frozenset(
@@ -263,6 +287,7 @@ class _CellPlacement:
 class _TableLayout:
     placements: list[_CellPlacement]
     columns: int
+    cells_dropped: bool  # a row ran past MAX_TABLE_COLUMNS
 
 
 def write_docx(*, document: InlinedDocument, title: str) -> bytes:
@@ -284,7 +309,13 @@ def write_docx(*, document: InlinedDocument, title: str) -> bytes:
     _set_core_properties(
         word=word, title=_document_title(root=root) or _collapse(text=_xml_safe(text=title)).strip()
     )
-    complete = root is None or _Writer(word=word, deadline=deadline).write(root=root)
+    complete, cells_dropped = True, False
+    if root is not None:
+        writer = _Writer(word=word, deadline=deadline)
+        complete = writer.write(root=root)
+        cells_dropped = writer.cells_dropped
+    if cells_dropped:
+        word.add_paragraph(TABLE_CELLS_NOTE)
     # Past a resource limit, such as nesting deeper than 256, libxml2 stops
     # parsing and the tree holds only what came before.
     if not complete or parse_stopped(error_log=parser.error_log):
@@ -363,6 +394,8 @@ class _Writer:
         self._nodes = 0
         self._cells_left = MAX_TABLE_CELLS
         self._stopped = False
+        # Set when a table limit leaves out a cell or a row.
+        self.cells_dropped = False
         section = word.sections[0]
         self._page_width = section.page_width - section.left_margin - section.right_margin
         self._page_height = section.page_height - section.top_margin - section.bottom_margin
@@ -718,16 +751,20 @@ class _Writer:
                 if row is None:
                     if loose_row is None:
                         if len(parts.rows) >= self._cells_left:
+                            self.cells_dropped = True
                             break
                         loose_row = []
                         parts.rows.append(loose_row)
                     row = loose_row
                 if len(row) < MAX_TABLE_COLUMNS:
                     row.append(element)
+                else:
+                    self.cells_dropped = True
                 _add_stray_text(parts=parts, table=table, text=element.tail)
             elif tag == "tr":
                 loose_row = None
                 if len(parts.rows) >= self._cells_left:
+                    self.cells_dropped = True
                     break
                 cells: list[HtmlElement] = []
                 parts.rows.append(cells)
@@ -763,6 +800,9 @@ class _Writer:
         layout = _layout(rows=parts.rows)
         columns = layout.columns
         row_count = min(len(parts.rows), self._cells_left // columns) if columns else 0
+        dropped_rows = any(placement.row >= row_count for placement in layout.placements)
+        if layout.cells_dropped or dropped_rows:
+            self.cells_dropped = True
         if row_count == 0:
             return []
         self._cells_left -= row_count * columns
@@ -860,6 +900,7 @@ def _layout(*, rows: list[list[HtmlElement]]) -> _TableLayout:
     covered = [0] * MAX_TABLE_COLUMNS
     placements: list[_CellPlacement] = []
     columns = 0
+    cells_dropped = False
     for row_index, cells in enumerate(rows):
         column = 0
         rows_left = len(rows) - row_index
@@ -867,6 +908,7 @@ def _layout(*, rows: list[list[HtmlElement]]) -> _TableLayout:
             while column < MAX_TABLE_COLUMNS and covered[column]:
                 column += 1
             if column >= MAX_TABLE_COLUMNS:
+                cells_dropped = True
                 break
             wanted = _span(value=cell.get("colspan"), limit=MAX_TABLE_COLUMNS, zero_means=1)
             colspan = 0
@@ -881,7 +923,7 @@ def _layout(*, rows: list[list[HtmlElement]]) -> _TableLayout:
             column += colspan
             columns = max(columns, column)
         covered = [max(0, left - 1) for left in covered]
-    return _TableLayout(placements=placements, columns=columns)
+    return _TableLayout(placements=placements, columns=columns, cells_dropped=cells_dropped)
 
 
 def _span(*, value: str | None, limit: int, zero_means: int) -> int:
@@ -974,7 +1016,7 @@ def _link_target(*, href: str | None) -> str | None:
         return None
     if parts.scheme != "mailto" and not parts.netloc:
         return None
-    return parts.geturl()
+    return quote(_LONE_PERCENT.sub("%25", parts.geturl()), safe=_URI_SAFE)
 
 
 def _image_bytes(*, src: str) -> bytes | None:
@@ -1000,8 +1042,12 @@ def _picture_size(*, data: bytes, max_width: int, max_height: int) -> _PictureSi
     """The image's size in EMU at its own DPI, scaled down to fit the box.
 
     None when python-docx can't read the header: it reads PNG, JPEG with a
-    JFIF or Exif marker, and GIF, and reads no pixels.
+    JFIF or Exif marker, and GIF, and reads no pixels. None too for a header
+    past ``_MAX_PNG_CHUNKS``, ``_MAX_JPEG_MARKERS`` or ``_MAX_EXIF_ENTRIES``,
+    or with an Exif block shorter than its own header.
     """
+    if not _header_is_bounded(data=data):
+        return None
     try:
         image = Image.from_blob(data)
         px_width, px_height = image.px_width, image.px_height
@@ -1016,6 +1062,74 @@ def _picture_size(*, data: bytes, max_width: int, max_height: int) -> _PictureSi
     height = px_height * _EMU_PER_INCH / (vert_dpi or _DEFAULT_DPI)
     scale = min(1.0, max_width / width, max_height / height)
     return _PictureSize(width=max(1, int(width * scale)), height=max(1, int(height * scale)))
+
+
+def _header_is_bounded(*, data: bytes) -> bool:
+    """Whether python-docx reads this image's header without a blowup.
+
+    It picks the parser in python-docx's order: the PNG signature first,
+    then a JFIF or Exif tag at offset 6, and only then the GIF signature.
+    So bytes with a GIF signature and either tag are read as a JPEG.
+    """
+    if data.startswith(_PNG_SIGNATURE):
+        return _png_chunk_count(data=data) <= _MAX_PNG_CHUNKS
+    if data[6:10] in (b"JFIF", b"Exif"):
+        return _jpeg_header_is_bounded(data=data)
+    # python-docx reads a GIF only for its screen size, and raises at once
+    # on a JPEG with neither tag.
+    return True
+
+
+def _png_chunk_count(*, data: bytes) -> int:
+    """The chunks python-docx reads, up to IEND; it stops counting past the cap."""
+    count, offset = 0, len(_PNG_SIGNATURE)
+    while offset + 8 <= len(data) and count <= _MAX_PNG_CHUNKS:
+        count += 1
+        if data[offset + 4 : offset + 8] == b"IEND":
+            break
+        offset += 12 + int.from_bytes(data[offset : offset + 4], "big")
+    return count
+
+
+def _jpeg_header_is_bounded(*, data: bytes) -> bool:
+    """Whether python-docx reads the markers before a JPEG's scan within the caps.
+
+    It finds each marker as python-docx does: the next 0xFF after the last
+    segment, past any 0xFF fill, where an 0xFF 0x00 pair is no marker. It
+    stops as soon as a cap is passed, so its own cost stays small.
+    """
+    markers, entries, position = 0, 0, 0
+    while (ff := data.find(b"\xff", position)) != -1:
+        position = ff + 1
+        while position < len(data) and data[position] == 0xFF:
+            position += 1
+        if position >= len(data) or data[position] in (_JPEG_EOI, _JPEG_SOS):
+            break
+        marker = data[position]
+        position += 1
+        markers += 1
+        if markers > _MAX_JPEG_MARKERS:
+            return False
+        if marker == 0x00 or marker in JPEG_STANDALONE_MARKERS:
+            continue
+        length = int.from_bytes(data[position : position + 2], "big")
+        if marker == _JPEG_APP1 and data[position + 2 : position + 8] == b"Exif\x00\x00":
+            # python-docx reads an Exif block shorter than its own header to
+            # the end of the file.
+            if length < 8:
+                return False
+            entries += _ifd0_entry_count(tiff=data[position + 8 : position + length])
+            if entries > _MAX_EXIF_ENTRIES:
+                return False
+        position += length
+    return True
+
+
+def _ifd0_entry_count(*, tiff: bytes) -> int:
+    """How many entries the first directory of a TIFF block declares."""
+    order = "big" if tiff[:2] == b"MM" else "little"
+    directory = int.from_bytes(tiff[4:8], order)
+    return int.from_bytes(tiff[directory : directory + 2], order)
 
 
 def _document_title(*, root: HtmlElement | None) -> str:

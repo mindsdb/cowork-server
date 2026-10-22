@@ -61,15 +61,18 @@
     - [unsupported_type, 'data:image/png;base64,!!!!']
     - [unsupported_type, 'data:image/png']
 
+# src and then the first srcset candidate are tried. Every other reference
+# the image names is listed, whether or not the image got a source.
 - id: srcset-first-candidate
   html: '<img srcset="chart.png 1x, photo.jpg 2x" sizes="100vw">'
   present: ['<img src="data:image/png;base64,{png_b64}">']
   absent: ['srcset', 'sizes', 'jpeg']
+  omitted: [[unsupported_type, photo.jpg]]
 
 - id: srcset-first-candidate-outside
   html: '<img srcset="{outside}/x.png 1x, chart.png 2x">'
   present: ['<img>']
-  omitted: [[scheme, '{outside}/x.png']]
+  omitted: [[scheme, '{outside}/x.png'], [unsupported_type, chart.png]]
 
 - id: srcset-data-uri-candidate
   html: '<img srcset="data:image/png;base64,{png_b64} 1x">'
@@ -83,6 +86,18 @@
 - id: src-wins-and-srcset-is-not-read
   html: '<img src="chart.png" srcset="{outside}/x.png 2x">'
   present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[scheme, '{outside}/x.png']]
+
+- id: srcset-candidates-split-as-a-browser-does
+  html: '<img srcset=" ,chart.png (a, b) 1x,photo.jpg,,, {outside}/x.png 2x , c,d.png">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[unsupported_type, photo.jpg], [scheme, '{outside}/x.png'], [unsupported_type, 'c,d.png']]
+
+# A candidate naming the source the image inlined is used, not left out.
+- id: srcset-candidate-naming-the-inlined-src
+  html: '<img src="chart.png" srcset="chart.png 1x, photo.jpg 2x">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[unsupported_type, photo.jpg]]
 
 - id: table-cell-images
   html: '<table><tr><td><img src="chart.png"></td><td><img src="http://169.254.169.254/latest"></td></tr></table>'

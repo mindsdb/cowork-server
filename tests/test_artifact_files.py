@@ -40,6 +40,7 @@ WINDOWS_REWRITTEN_NAMES = _fixture_cases(name="windows_rewritten_names.yaml")
 MISSING_PATHS = _fixture_cases(name="missing_paths.yaml")
 REPARSE_POINTS = _fixture_cases(name="reparse_points.yaml")
 DRAFTS_ROUTE_HOUSEKEEPING_PATHS = _fixture_cases(name="drafts_route_housekeeping_paths.yaml")
+CONTENT_NAMES_AT_DEPTH = _fixture_cases(name="content_names_at_depth.yaml")
 API_IMPORT_FORMS = _fixture_cases(name="api_import_forms.yaml")
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(32))
@@ -217,6 +218,20 @@ def test_a_missing_file_or_directory_is_missing(art, case):
     assert _refusal(folder=art, parts=tuple(case["parts"])) is OmittedReason.MISSING
 
 
+@pytest.mark.parametrize(
+    "parts", [("\ud800.png",), ("\ud800", "chart.png")], ids=["file", "folder"]
+)
+def test_a_name_holding_a_lone_surrogate_is_missing(art, tmp_path, parts):
+    """The filesystem can't encode it, so it names nothing, and only a refusal leaves."""
+    source, folder = _draft_artifact(tmp_path=tmp_path)
+
+    with pytest.raises(ArtifactFileRefused) as drafts:
+        artifact_files._open_pinned_draft_file(source, folder, parts)
+
+    assert _refusal(folder=art, parts=parts) is OmittedReason.MISSING
+    assert drafts.value.reason is OmittedReason.MISSING
+
+
 def test_a_directory_at_the_end_is_missing(art):
     (art / "sub").mkdir()
 
@@ -262,6 +277,32 @@ def test_one_walk_stops_reading_entries_at_the_scan_cap(art, monkeypatch):
     monkeypatch.setattr(artifact_files, "_MAX_SCANNED_ENTRIES", 3)
     assert _refusal(folder=art, parts=("sub", "chart.png")) is OmittedReason.BUDGET
     assert read == ["other", "sub", "more", "extra"]
+
+
+def test_the_shipped_scan_cap_reads_20000_entries_and_refuses_the_next(art, monkeypatch):
+    """The cap as shipped, unpatched, so raising it fails a test."""
+    (art / "chart.png").write_bytes(PNG)
+    others = [f"tile{index}.png" for index in range(20_000)]
+    listings = {"art": [*others[:-1], "chart.png"]}
+    read: list[str] = []
+    monkeypatch.setattr(
+        artifact_files, "dir_scandir", _scripted_scandir(listings=listings, read=read)
+    )
+
+    assert _read(folder=art, parts=("chart.png",)).data == PNG
+    listings["art"] = [*others, "chart.png"]
+    assert _refusal(folder=art, parts=("chart.png",)) is OmittedReason.BUDGET
+
+
+def test_the_shipped_depth_cap_reads_64_segments_and_refuses_65(art):
+    """The cap as shipped, unpatched, so raising it fails a test."""
+    art.joinpath(*("d",) * 63).mkdir(parents=True)
+    art.joinpath(*("d",) * 63, "chart.png").write_bytes(PNG)
+    art.joinpath(*("d",) * 64).mkdir()
+    art.joinpath(*("d",) * 64, "chart.png").write_bytes(PNG)
+
+    assert _read(folder=art, parts=(*("d",) * 63, "chart.png")).data == PNG
+    assert _refusal(folder=art, parts=(*("d",) * 64, "chart.png")) is OmittedReason.BUDGET
 
 
 @pytest.mark.parametrize("linked", ["leaf", "middle"])
@@ -328,6 +369,8 @@ def test_without_a_directory_descriptor_only_a_link_is_refused_by_lstat_before_a
             return found
         return SimpleNamespace(
             st_mode=found.st_mode,
+            st_dev=found.st_dev,
+            st_ino=found.st_ino,
             st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
             st_reparse_tag=case["reparse_tag"],
         )
@@ -343,6 +386,72 @@ def test_without_a_directory_descriptor_only_a_link_is_refused_by_lstat_before_a
 
     assert refused.value.reason is OmittedReason.REPARSE_POINT
     assert opened == []
+
+
+def _swap_before_the_open(*, monkeypatch, opened: str, swap) -> None:
+    """Run *swap* just before the walk opens *opened*, as a racing process could."""
+    real_dir_open = artifact_files.dir_open
+
+    def swapping_open(directory, name, flags, mode=0o777):
+        if name == opened:
+            swap()
+        return real_dir_open(directory, name, flags, mode)
+
+    monkeypatch.setattr(artifact_files, "dir_open", swapping_open)
+
+
+@pytest.mark.parametrize("swapped", ["folder", "file"])
+def test_without_a_directory_descriptor_a_link_swapped_in_during_the_walk_is_refused(
+    art, outside, monkeypatch, swapped
+):
+    """The walk Windows runs: each lstat passes, then a link takes a name before the open.
+
+    A joined path follows a link in a folder, and without ``O_NOFOLLOW``, as
+    on Windows, a link at the file too.
+    """
+    (art / "assets").mkdir()
+    (art / "assets" / "secret.txt").write_bytes(b"inside")
+    monkeypatch.setattr(artifact_files, "O_NOFOLLOW", 0)
+
+    def swap() -> None:
+        if swapped == "folder":
+            (art / "assets").rename(art / "assets-moved")
+            _symlink(link=art / "assets", target=outside, directory=True)
+        else:
+            (art / "assets" / "secret.txt").rename(art / "assets" / "moved.txt")
+            _symlink(link=art / "assets" / "secret.txt", target=outside / "secret.txt")
+
+    _swap_before_the_open(monkeypatch=monkeypatch, opened="secret.txt", swap=swap)
+
+    with pytest.raises(ArtifactFileRefused) as refused:
+        read_artifact_file_entry(
+            folder=PinnedDir(None, art), parts=("assets", "secret.txt"), max_bytes=1024
+        )
+
+    assert refused.value.reason is OmittedReason.SYMLINK
+
+
+def test_without_a_directory_descriptor_a_folder_replaced_during_the_walk_is_refused(
+    art, monkeypatch
+):
+    """A folder that is no link but no longer the one its lstat saw."""
+    (art / "assets").mkdir()
+    (art / "assets" / "chart.png").write_bytes(PNG)
+    (art / "decoy").mkdir()
+    (art / "decoy" / "chart.png").write_bytes(b"decoy")
+
+    def swap() -> None:
+        (art / "assets").rename(art / "assets-moved")
+        (art / "decoy").rename(art / "assets")
+
+    _swap_before_the_open(monkeypatch=monkeypatch, opened="chart.png", swap=swap)
+
+    with pytest.raises(ArtifactFileRefused) as refused:
+        read_artifact_file_entry(
+            folder=PinnedDir(None, art), parts=("assets", "chart.png"), max_bytes=1024
+        )
+
+    assert refused.value.reason is OmittedReason.MISSING
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows reparse point")
@@ -647,6 +756,30 @@ async def test_the_drafts_route_hides_a_housekeeping_name_at_any_depth(
             monkeypatch=monkeypatch, source=source, folder=folder, rel_path=rel_path
         )
     assert error.value.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "case", CONTENT_NAMES_AT_DEPTH, ids=[case["id"] for case in CONTENT_NAMES_AT_DEPTH]
+)
+async def test_a_top_level_housekeeping_name_inside_a_subfolder_is_content(
+    tmp_path, monkeypatch, case
+):
+    rel_path = case["rel_path"]
+    source, folder = _draft_artifact(tmp_path=tmp_path)
+    content = folder / rel_path
+    content.parent.mkdir(parents=True)
+    content.write_text("content", encoding="utf-8")
+
+    served = await _serve_draft(
+        monkeypatch=monkeypatch, source=source, folder=folder, rel_path=rel_path
+    )
+    with pinned_dir(folder) as pinned:
+        read = read_artifact_file(
+            folder=pinned, parts=tuple(rel_path.split("/")), max_bytes=1024
+        )
+
+    assert await _body(response=served) == b"content"
+    assert read == b"content"
 
 
 async def test_the_drafts_route_answers_404_for_a_hard_linked_file(

@@ -74,6 +74,21 @@
   modes: [html, word]
   absent: ['<script', 'jsdelivr']
   scripts_dropped: true
+  omitted: [[scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js']]
+
+- id: script-sources-outside-pdf
+  html: '<script src="app.js"></script><script src="{outside}/x.js"></script><svg><script src="../other/app.js"></script></svg><p>kept</p>'
+  modes: [html, word]
+  absent: ['<script', 'app.js', '{outside}']
+  scripts_dropped: true
+  omitted: [[unsupported_type, app.js], [scheme, '{outside}/x.js'], [traversal, ../other/app.js]]
+
+# An SVG script loads from href, so a dropped one lists that too.
+- id: svg-script-href-is-listed
+  html: '<svg><script href="{outside}/a.js"></script><script xlink:href="b.js"></script></svg><p>kept</p>'
+  absent: ['<script', 'a.js', 'b.js']
+  scripts_dropped: true
+  omitted: [[scheme, '{outside}/a.js'], [unsupported_type, b.js]]
 
 - id: every-other-script-source-in-pdf
   modes: [pdf]
@@ -93,6 +108,15 @@
     <script src="//cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js"></script>
     <script src="app.js"></script>
     <script src="../other/app.js"></script>
+    <script src="https://cdn.jsdelivr.net@evil.example/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net:444/npm/chart.js@4.4.1/dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/%2e%2e/%2e%2e/gh/user/repo/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/.%2e/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist%2fchart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/user/repo/x.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/./dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1//dist/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js#x"></script>
     <p>kept</p>
   present: ['<p>kept</p>']
   absent: ['<script']
@@ -113,3 +137,12 @@
     - [absolute, '//cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js']
     - [unsupported_type, app.js]
     - [traversal, ../other/app.js]
+    - [scheme, 'https://cdn.jsdelivr.net@evil.example/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net:444/npm/chart.js@4.4.1/dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/%2e%2e/%2e%2e/gh/user/repo/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/.%2e/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist%2fchart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/../../gh/user/repo/x.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/./dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1//dist/chart.js']
+    - [scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.js#x']
