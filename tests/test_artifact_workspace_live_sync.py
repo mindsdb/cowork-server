@@ -389,3 +389,31 @@ async def test_another_owners_report_fails_the_sync_without_a_traceback(artifact
     assert "another account owns its report" in record.getMessage()
     assert record.exc_info is None
     assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True
+
+
+@pytest.mark.asyncio
+async def test_a_too_large_artifact_stops_live_sync_without_a_traceback(artifact, monkeypatch, caplog):
+    """The edit stays saved, and a 413 that repeats on every save logs no stack."""
+    import logging
+
+    from cowork.services.publish import PublishTooLarge
+
+    folder, _metadata = artifact
+    _publish(folder, {"mode": "public"})
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("desktop-key", "https://api.desktop.example"),
+    )
+
+    def too_large(*_args, **_kwargs):
+        raise PublishTooLarge()
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", too_large)
+
+    with caplog.at_level(logging.WARNING, logger=workspace.logger.name):
+        assert await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder) is False
+
+    record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
+    assert "too large to publish" in record.getMessage()
+    assert record.exc_info is None
+    assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True

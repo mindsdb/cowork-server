@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.artifacts import _content_mtime, _user_files_with_mtimes
 
 
@@ -110,6 +111,7 @@ def test_prepare_artifact_card_walks_folder_once(tmp_path: Path, monkeypatch):
         project_name="proj",
         pinned_folder=None,
         pinned_root=None,
+        scope=LOCAL_SCOPE,
     )
 
     assert prepared is not None
@@ -141,14 +143,14 @@ def _make_static_html(tmp_path: Path, body: str = "<h1>hi</h1>") -> Path:
 
 
 def _patch_scan(container: Path):
-    return patch("cowork.services.artifacts._scan_artifact_dirs", lambda: [container])
+    return patch("cowork.services.artifacts._scan_artifact_dirs", lambda *, scope: [container])
 
 
 def _patch_publish_scan(container: Path):
     """publish.py binds `_scan_artifact_dirs` at import, so patching only the
     artifacts module leaves its own reference pointing at the real projects
     root — which `desktop_publish_context` then scans and finds nothing in."""
-    return patch.object(publish_mod, "_scan_artifact_dirs", lambda: [container])
+    return patch.object(publish_mod, "_scan_artifact_dirs", lambda *, scope: [container])
 
 
 def _publish(root: Path, container: Path, **kw):
@@ -191,6 +193,8 @@ class _FakeUserSettings:
 
 
 class _FakeAppSettings:
+    publish_token = None
+
     class connector:  # noqa: N801
         vault_dir = "/tmp/does-not-matter"
 
@@ -202,8 +206,8 @@ def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1",
     stack.enter_context(_patch_publish_scan(container))
     stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
     stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
-    stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
-    stack.enter_context(patch.object(publish_mod, "_save_state", lambda state: None))
+    stack.enter_context(patch.object(publish_mod, "_load_state", lambda *, scope: {}))
+    stack.enter_context(patch.object(publish_mod, "_save_state", lambda state, *, scope: None))
     stack.enter_context(patch("anton.core.datasources.data_vault.LocalDataVault", lambda *a, **k: object()))
     stack.enter_context(
         patch("anton.publisher.publish",
@@ -240,14 +244,14 @@ def _publish_static(tmp_path: Path) -> Path:
 def test_modified_false_when_unchanged(tmp_path: Path):
     root = _publish_static(tmp_path)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root)
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
     assert card["modified"] is False
 
 
 def test_modified_false_for_unpublished(tmp_path: Path):
     root = _make_static_html(tmp_path)  # never published
     with _patch_scan(tmp_path):
-        card = card_for_folder(root)
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
     assert card["modified"] is False
 
 
@@ -258,7 +262,7 @@ def test_modified_true_after_content_change(tmp_path: Path):
     idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
     _touch(idx, publish_mod._content_mtime(root) + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root)
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
     assert card["modified"] is True
 
 
@@ -270,7 +274,7 @@ def test_touch_without_change_self_heals(tmp_path: Path):
     idx = root / "index.html"
     _touch(idx, old + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root)
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
     assert card["modified"] is False
     # Self-heal: published_mtime advanced so the next listing hits the cheap gate.
     healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
@@ -305,11 +309,11 @@ def test_update_reuses_report_id_and_refreshes_state(tmp_path: Path):
         stack.enter_context(_patch_publish_scan(tmp_path))
         stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
         stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
-        stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
-        stack.enter_context(patch.object(publish_mod, "_save_state", lambda state: None))
+        stack.enter_context(patch.object(publish_mod, "_load_state", lambda *, scope: {}))
+        stack.enter_context(patch.object(publish_mod, "_save_state", lambda state, *, scope: None))
         stack.enter_context(patch("anton.core.datasources.data_vault.LocalDataVault", lambda *a, **k: object()))
         stack.enter_context(patch("anton.publisher.publish", _spy_publish))
-        out = publish_mod.update_artifact(str(root))
+        out = publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 
     assert seen["report_id"] == "uuid-1"          # same anchor -> AWS update
     assert out["status"] == "ok"
@@ -341,11 +345,11 @@ def test_update_preserves_password_access(tmp_path: Path):
         stack.enter_context(_patch_publish_scan(tmp_path))
         stack.enter_context(patch.object(publish_mod, "get_user_settings", lambda: _FakeUserSettings()))
         stack.enter_context(patch.object(publish_mod, "get_app_settings", lambda: _FakeAppSettings()))
-        stack.enter_context(patch.object(publish_mod, "_load_state", lambda: {}))
-        stack.enter_context(patch.object(publish_mod, "_save_state", lambda state: None))
+        stack.enter_context(patch.object(publish_mod, "_load_state", lambda *, scope: {}))
+        stack.enter_context(patch.object(publish_mod, "_save_state", lambda state, *, scope: None))
         stack.enter_context(patch("anton.core.datasources.data_vault.LocalDataVault", lambda *a, **k: object()))
         stack.enter_context(patch("anton.publisher.publish", _spy_publish))
-        publish_mod.update_artifact(str(root))
+        publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 
     assert seen["access"] == {"mode": "password", "password": "s3cret"}
     entry = json.loads((root / ".published.json").read_text(encoding="utf-8"))["index.html"]
@@ -374,7 +378,7 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
         stack.enter_context(patch.object(
             publish_mod, "publish_artifact", lambda *args, **kwargs: {"status": "ok"}
         ))
-        publish_mod.update_artifact(str(root))
+        publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 
     entry = json.loads(published_json.read_text(encoding="utf-8"))["index.html"]
     assert entry["published_mtime"] == publish_mod._content_mtime(root)
@@ -385,7 +389,7 @@ def test_update_unpublished_raises(tmp_path: Path):
     root = _make_static_html(tmp_path)  # no .published.json at all
     with _patch_scan(tmp_path):
         with pytest.raises(FileNotFoundError):
-            publish_mod.update_artifact(str(root))
+            publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 
 
 # ---------------------------------------------------------------------------
@@ -404,8 +408,9 @@ def test_update_endpoint_delegates(tmp_path: Path):
 
     captured = {}
 
-    def _fake_update(path):
+    def _fake_update(path, *, scope):
         captured["path"] = path
+        captured["scope"] = scope
         return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
 
     with patch.object(publish_ep, "_update", _fake_update):
@@ -413,6 +418,8 @@ def test_update_endpoint_delegates(tmp_path: Path):
     assert res.status_code == 200
     assert res.json()["url"] == "https://4nton.ai/a/uuid-1"
     assert captured["path"] == "/some/art"
+    # The request's own scope, which resolves the path; no person here.
+    assert captured["scope"] == LOCAL_SCOPE
 
 
 def test_update_endpoint_404_when_not_published(tmp_path: Path):
@@ -424,7 +431,7 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     client = TestClient(app)
 
-    def _raise(path):
+    def _raise(path, *, scope):
         raise FileNotFoundError("No published version to update")
 
     with patch.object(publish_ep, "_update", _raise):
@@ -442,7 +449,7 @@ from cowork.services.artifacts import artifact_status
 def test_artifact_status_unpublished(tmp_path: Path):
     root = _make_static_html(tmp_path)  # never published
     with _patch_scan(tmp_path):
-        s = artifact_status(str(root))
+        s = artifact_status(str(root), scope=LOCAL_SCOPE)
     assert s["publishedUrl"] == ""
     assert s["modified"] is False
     assert s["accessMode"] == "public"
@@ -452,7 +459,7 @@ def test_artifact_status_unpublished(tmp_path: Path):
 def test_artifact_status_published_unmodified(tmp_path: Path):
     root = _publish_static(tmp_path)
     with _patch_scan(tmp_path):
-        s = artifact_status(str(root))
+        s = artifact_status(str(root), scope=LOCAL_SCOPE)
     assert s["publishedUrl"]            # carries the view_url
     assert s["modified"] is False
 
@@ -463,7 +470,7 @@ def test_artifact_status_modified_after_change(tmp_path: Path):
     idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
     _touch(idx, publish_mod._content_mtime(root) + 100)
     with _patch_scan(tmp_path):
-        s = artifact_status(str(root))
+        s = artifact_status(str(root), scope=LOCAL_SCOPE)
     assert s["modified"] is True
     assert s["publishedUrl"]            # still published
 
@@ -471,7 +478,7 @@ def test_artifact_status_modified_after_change(tmp_path: Path):
 def test_artifact_status_unknown_path_is_blank(tmp_path: Path):
     # A path that can't be resolved → blank default, never raises.
     with _patch_scan(tmp_path):
-        s = artifact_status(str(tmp_path / "does-not-exist"))
+        s = artifact_status(str(tmp_path / "does-not-exist"), scope=LOCAL_SCOPE)
     assert s["publishedUrl"] == ""
     assert s["modified"] is False
     assert s["accessMode"] == "public"
@@ -494,7 +501,7 @@ def test_artifact_status_loose_file_never_leaks_password(tmp_path: Path):
         encoding="utf-8",
     )
     with _patch_scan(tmp_path):
-        s = artifact_status(str(f))
+        s = artifact_status(str(f), scope=LOCAL_SCOPE)
     assert s["accessMode"] == "password"
     assert s["accessProtected"] is True
     assert s["publishedUrl"] == "https://4nton.ai/a/rid"
@@ -507,20 +514,7 @@ def test_artifact_status_loose_file_never_leaks_password(tmp_path: Path):
 
 import time
 
-import pytest
-
 from anton.publisher import _zip_fullstack
-import anton.publisher as _anton_publisher
-
-# These cases assert the publish bundle md5 is time-independent, which requires
-# anton's deterministic-zip fix (_write_scrubbed via a fixed-date_time ZipInfo,
-# marked by the `_ZIP_EPOCH` constant). CI pins anton-agent to a main commit in
-# uv.lock that may predate it — skip there and auto-re-enable once anton is
-# bumped. Remove this guard when uv.lock points at an anton that has the fix.
-_needs_anton_deterministic_zip = pytest.mark.skipif(
-    not hasattr(_anton_publisher, "_ZIP_EPOCH"),
-    reason="requires anton deterministic-zip fix (_write_scrubbed / _ZIP_EPOCH)",
-)
 
 
 def _make_fullstack(tmp_path: Path) -> Path:
@@ -542,7 +536,6 @@ def _make_fullstack(tmp_path: Path) -> Path:
     return root
 
 
-@_needs_anton_deterministic_zip
 def test_publish_bundle_md5_is_time_independent(tmp_path: Path):
     """The bundle md5 must depend only on content + arcname, never on the
     wall clock (the root cause of the false 'Unpublished changes' badge)."""
@@ -594,7 +587,7 @@ def test_fullstack_modified_false_when_only_backend_log_changes(tmp_path: Path):
     log.write_text("server started\n", encoding="utf-8")
     _touch(log, publish_mod._content_mtime(root) + 10_000)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root)
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
     assert card["modified"] is False
 
 
@@ -658,11 +651,10 @@ def test_fullstack_modified_true_after_real_change(tmp_path: Path):
     idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
     _touch(idx, publish_mod._content_mtime(root) + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root)
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
     assert card["modified"] is True
 
 
-@_needs_anton_deterministic_zip
 def test_fullstack_binary_touch_self_heals(tmp_path: Path):
     """Touching a binary asset (no content change) must not raise the badge:
     the recomputed md5 matches and published_mtime self-heals."""
@@ -672,7 +664,7 @@ def test_fullstack_binary_touch_self_heals(tmp_path: Path):
     png = root / "static" / "logo.png"
     _touch(png, old + 100)  # bump past the gate, identical bytes
     with _patch_scan(tmp_path):
-        card = card_for_folder(root)
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
     assert card["modified"] is False
     healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
     assert healed >= old + 100

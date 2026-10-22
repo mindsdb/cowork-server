@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -31,10 +31,12 @@ from cowork.common.settings.user_settings import (
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
+from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     _MAX_HISTORY_MESSAGES,
+    _settings_binding,
     _text_history,
     RouteDecision,
     RouterBinding,
@@ -42,12 +44,14 @@ from cowork.handlers.response_routing import (
     ineligible_reason,
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
-from cowork.schemas.figure_sources import FigureSources
+from cowork.harnesses.anton_harness.figure_sources import has_figures
+from cowork.harnesses.memory.policy import memory_policy
+from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
     TurnContext,
     TurnEvidence,
-    TurnHistory,
+    TurnMemoryRead,
     find_answer_sources,
     format_responses_stream,
 )
@@ -58,7 +62,7 @@ from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity
-from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
     cancel_cause_key,
@@ -77,7 +81,7 @@ from cowork.schemas.responses import (
 )
 from cowork.handlers._turn_history import (
     reject_unreplayable_tool_rows,
-    sanitize_turn_history_rows,
+    remote_turn_history,
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
@@ -113,13 +117,13 @@ from cowork.db.scoped import (
 )
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
-from cowork.services.conversations import ConversationService
+from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
-from cowork.services.projects import ProjectService
+from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
@@ -170,6 +174,11 @@ class _RemoteTurnFailed(Exception):
 # this module synthesizes when a turn is stopped while a question is on screen.
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
+
+#: A direct answer from the routing gate runs no agent, so it reads no learned
+#: memory. It sends and saves the record an agent turn does, in the same shape
+#: (TurnMemoryRead.payload).
+_DIRECT_MEMORY_READ = TurnMemoryRead(read=False, entries=0)
 
 #: Budget for a pod-reported history summary. Well above what the summarizer's
 #: own output cap can produce, and the summary is sticky: it is replayed on
@@ -496,9 +505,9 @@ class _RemoteTurnInputs:
     seed_info: dict | None
     artifacts: _RemoteArtifactsDir | None
     memory: dict | None
-    # stream_remote_replies' project_id and workspace_rel_path, or empty when
-    # they could not be resolved (_remote_workspace).
-    workspace: dict
+    # The project the turn runs in, or None when it could not be resolved
+    # (_remote_workspace).
+    workspace: RemoteWorkspace | None
     started_at: str | None
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
@@ -547,6 +556,65 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
+def _first_take_binding(
+    minted: RouterBinding | None,
+    *,
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
+) -> RouterBinding | None:
+    """The gate's own binding: the take only helps if it lands within a second
+    or two, which a chat model is routinely too slow for. `minted` is the
+    gate's per-turn MindsHub binding on hosted orgs. None when there is no
+    gate model, and then there is no take; the turn is unaffected."""
+    if minted is not None:
+        return minted
+    try:
+        return (binding_factory or _settings_binding)()
+    except Exception:
+        return None
+
+
+def _first_take_enabled() -> bool:
+    try:
+        return bool(get_user_settings().first_take_enabled)
+    except Exception:
+        return False
+
+
+def _start_first_take(
+    minted: RouterBinding | None,
+    *,
+    history: list[dict],
+    conversation_id: UUID,
+    harness: str | None,
+    metadata: dict[str, str],
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
+) -> FirstTake | None:
+    """Start the turn's first take on the gate's model, or None when it is
+    switched off or there is no model to run it on.
+
+    Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
+    the correlation id, so its cost is countable apart from the gate's.
+    """
+    if not _first_take_enabled():
+        return None
+    binding = _first_take_binding(minted, binding_factory=binding_factory)
+    if binding is None:
+        return None
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
+    token = set_trace_context(TraceContext(
+        session_id=str(conversation_id),
+        harness=harness,
+        tags=("cowork-first-take",),
+        metadata=metadata,
+    ))
+    try:
+        # The task copies the context here, trace included.
+        return FirstTake(binding, history).start()
+    finally:
+        reset_trace_context(token)
+
+
 class ResponsesHandler:
     def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
         self.principal = principal
@@ -561,6 +629,9 @@ class ResponsesHandler:
         self.last_run_handle: RunHandle | None = None
         # Whether a person is watching this turn and can answer ask_user cards.
         self.interactive = interactive
+        # The instant first take, started beside the gate by
+        # _route_request and handed to the turn's producer if it delegates.
+        self.first_take: FirstTake | None = None
 
     def _get_harness(self):
         if self.harness is None:
@@ -571,6 +642,18 @@ class ResponsesHandler:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
         await require_product_permission(self.scope, "product.execute")
+
+        # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
+        # deployment where that still reads stored memory (memory_policy: the
+        # desktop), the question is refused rather than answered from memory.
+        if request.memory == "off" and not memory_policy(memory_enabled=False).off:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "This deployment can't keep one question from reading memory. "
+                    'Retry the request without "memory": "off".'
+                ),
+            )
 
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
@@ -600,16 +683,32 @@ class ResponsesHandler:
 
         # Every settings read for this turn, in the gate and in the producer
         # task created below (create_task copies this context), is served from
-        # the snapshot the unit loaded.
-        with use_turn_settings(self.scope, start.settings):
-            route, turn_llm = await self._route_request(
-                conversation_id=start.conversation_id,
-                harness_input=start.harness_input,
-                gate_rows=start.gate_rows,
-                has_attachments=bool(request.attachment_ids),
-                has_disabled_connections=bool(disabled),
-                trace_metadata=trace_metadata,
-            )
+        # the snapshot the unit loaded. A question with "memory": "off" gets a
+        # copy with memory off, so AntonHarness._build_chat_session gives it
+        # two empty tiers in its scratch folder and no background passes.
+        turn_settings = (
+            start.settings.model_copy(update={"memory_enabled": False})
+            if request.memory == "off"
+            else start.settings
+        )
+        with use_turn_settings(self.scope, turn_settings):
+            try:
+                route, turn_llm = await self._route_request(
+                    conversation_id=start.conversation_id,
+                    harness_input=start.harness_input,
+                    gate_rows=start.gate_rows,
+                    has_attachments=bool(request.attachment_ids),
+                    has_disabled_connections=bool(disabled),
+                    trace_metadata=trace_metadata,
+                    first_take=bool(request.stream) and self.interactive,
+                )
+            except BaseException:
+                # A refused or cancelled request must not leave the take's model call running.
+                if getattr(self, "first_take", None) is not None:
+                    self.first_take.cancel()
+                    self.first_take = None
+                raise
+            first_take, self.first_take = getattr(self, "first_take", None), None
             trace_metadata = {
                 **trace_metadata,
                 "response_route": route.route,
@@ -623,6 +722,11 @@ class ResponsesHandler:
                 route.route, route.reason, route.fallback, route.provider, route.model,
                 start.conversation_id,
             )
+
+            if route.route == DIRECT_CONTEXT and first_take is not None:
+                # The gate answered: there is nothing to fill the wait for.
+                first_take.cancel()
+                first_take = None
 
             if route.route == DIRECT_CONTEXT:
                 return await self._handle_direct_response(
@@ -676,19 +780,28 @@ class ResponsesHandler:
                         trace_tags=request.trace_tags,
                         trace_metadata=trace_metadata,
                         turn_llm=turn_llm,
+                        first_take=first_take,
                     )
 
-                handle = await registry.start(
-                    conversation_id=str(start.conversation_id),
-                    turn_id=start.turn_id,
-                    open_buffer=partial(new_buffer, str(start.conversation_id), start.turn_id),
-                    produce=produce,
-                    org_id=self.scope.org_id,
-                    user_id=self.scope.user_id,
-                    lifecycle=lifecycle,
-                )
+                try:
+                    handle = await registry.start(
+                        conversation_id=str(start.conversation_id),
+                        turn_id=start.turn_id,
+                        open_buffer=partial(new_buffer, str(start.conversation_id), start.turn_id),
+                        produce=produce,
+                        org_id=self.scope.org_id,
+                        user_id=self.scope.user_id,
+                        lifecycle=lifecycle,
+                    )
+                except BaseException:
+                    if first_take is not None:
+                        first_take.cancel()
+                    raise
                 self.last_run_handle = handle
                 return sse_from_buffer(handle.buffer, 0)
+
+            if first_take is not None:
+                first_take.cancel()
 
             # Non-streaming (legacy/rare): run synchronously within the request.
             # There is nowhere to run it in org mode. Only the streaming branch
@@ -786,8 +899,16 @@ class ResponsesHandler:
                         # registry refuses whichever reaches it second, while
                         # the first turn answers or after it has ended, since
                         # that turn saved its question.
+                        #
+                        # Or the id is a conversation outside the caller's
+                        # scope, which the read above could not see either:
+                        # another person's or another org's. That reads as
+                        # absent, a 404, never the IntegrityError's 500.
                         session.rollback()
-                        conversation = conversation_service.get_conversation(conv_id)
+                        try:
+                            conversation = conversation_service.get_conversation(conv_id)
+                        except ValueError as exc:
+                            raise HTTPException(status_code=404, detail="Conversation not found") from exc
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
                 # allocator, or a name-based format) — it can't become the
@@ -864,8 +985,13 @@ class ResponsesHandler:
         has_attachments: bool,
         has_disabled_connections: bool,
         trace_metadata: dict[str, str] | None = None,
+        first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        With `first_take`, the instant first take starts beside the gate on the
+        same history and model, left on `self.first_take` for handle() to keep
+        or cancel once the route is known.
 
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart).
@@ -925,7 +1051,27 @@ class ResponsesHandler:
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
+
+                    @cache
+                    def binding_for_turn() -> RouterBinding | None:
+                        # Share successful resolution (including no model) only
+                        # in this request. Exceptions remain retryable by the gate,
+                        # which must still propagate a database pool timeout.
+                        return binding if binding is not None else _settings_binding()
+
                     correlation_id = (turn_llm or {}).get("correlation_id")
+                    if first_take:
+                        self.first_take = _start_first_take(
+                            binding,
+                            binding_factory=binding_for_turn,
+                            history=history,
+                            conversation_id=conversation_id,
+                            harness=self.harness_name,
+                            metadata={
+                                **(trace_metadata or {}),
+                                **({"correlation_id": correlation_id} if correlation_id else {}),
+                            },
+                        )
                     trace_token = set_trace_context(TraceContext(
                         session_id=str(conversation_id),
                         harness=self.harness_name,
@@ -944,6 +1090,7 @@ class ResponsesHandler:
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
+                        binding_factory=binding_for_turn,
                     )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
@@ -1051,13 +1198,15 @@ class ResponsesHandler:
         figure in the answer may repeat."""
         if not request.stream:
             text = route.text
-            sources = await self._direct_figure_sources(answer=text, question=question)
+            sources = await self._direct_figure_sources(
+                conversation_id=conversation_id, answer=text, question=question,
+            )
             events = [{
                 "type": "response.output_text.delta",
                 "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
-            }, *([] if sources is None else [{
+            }, _DIRECT_MEMORY_READ.payload(), *([] if sources is None else [{
                 "type": "response.figure_sources",
                 **sources.model_dump(mode="json"),
             }]), {"type": "response.completed"}]
@@ -1099,12 +1248,20 @@ class ResponsesHandler:
         self.last_run_handle = handle
         return sse_from_buffer(handle.buffer, 0)
 
-    @staticmethod
-    async def _direct_figure_sources(*, answer: str, question: str) -> FigureSources | None:
+    async def _direct_figure_sources(
+        self, *, conversation_id: UUID, answer: str, question: str,
+    ) -> FigureSources | None:
         """A direct answer's figures, or None when it has none. The router
         answers from what it knows and runs no step, so each figure is the
-        question's or has no source."""
-        sources = await find_answer_sources(TurnEvidence(answer=answer, question=question))
+        question's, an earlier answer's, or has no source. The earlier
+        answers are read only for an answer with figures, before this one
+        is saved. The figure check parses the whole answer, so it runs in a
+        worker thread, as the matching does: every other request waits on
+        the loop."""
+        earlier: tuple[EarlierAnswer, ...] = ()
+        if await asyncio.to_thread(has_figures, answer):
+            earlier = await read_earlier_answers(conversation_id=conversation_id, scope=self.scope)
+        sources = await find_answer_sources(TurnEvidence(answer=answer, question=question, earlier_answers=earlier))
         return sources if sources.figures else None
 
     async def _produce_direct(
@@ -1156,14 +1313,17 @@ class ResponsesHandler:
 
         async def answer() -> None:
             # Found before the save, which keeps them with the answer.
-            sources = await self._direct_figure_sources(answer=route.text, question=question)
+            sources = await self._direct_figure_sources(conversation_id=conv_id, answer=route.text, question=question)
+            memory_frame = _DIRECT_MEMORY_READ.payload(sequence_number=3)
             sources_frame = None if sources is None else {
                 "type": "response.figure_sources",
-                "sequence_number": 3,
+                "sequence_number": 4,
                 "item_id": item_id,
                 **sources.model_dump(mode="json"),
             }
-            saved_events = [delta, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"}]
+            saved_events = [
+                delta, memory_frame, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"},
+            ]
             async with conversation_writes(conv_id):
                 saved = await run_db(
                     partial(save_turn, events=saved_events), scope=scope_from_principal(self.principal),
@@ -1187,6 +1347,7 @@ class ResponsesHandler:
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
+            await buffer.append("sse", {"sse": sse_frame("response.memory_read", memory_frame)})
             if sources_frame is not None:
                 await buffer.append("sse", {"sse": sse_frame("response.figure_sources", sources_frame)})
             completed_response = Response(
@@ -1198,7 +1359,7 @@ class ResponsesHandler:
             ).model_dump()
             completed_frame = {
                 "type": "response.completed",
-                "sequence_number": 3 if sources_frame is None else 4,
+                "sequence_number": 4 if sources_frame is None else 5,
                 "response": completed_response,
             }
             # The persisted row's real id, at the frame root (not
@@ -1253,6 +1414,7 @@ class ResponsesHandler:
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
+        first_take: FirstTake | None = None,
     ):
         """Choose the streaming producer coroutine.
 
@@ -1282,6 +1444,7 @@ class ResponsesHandler:
                 turn_id=turn_id,
                 turn_llm=turn_llm,
                 disabled=disabled,
+                first_take=first_take,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -1296,6 +1459,7 @@ class ResponsesHandler:
             buffer=buffer,
             trace_tags=trace_tags,
             trace_metadata=trace_metadata,
+            first_take=first_take,
         )
 
     @staticmethod
@@ -1345,40 +1509,41 @@ class ResponsesHandler:
             return None
 
     @staticmethod
-    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
-        """The conversation's project as a path relative to the org root.
+    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> RemoteWorkspace | None:
+        """The conversation's project, with its path relative to the org root.
 
         Absolute paths must not cross the wire: cowork-server sees the shared
         tree at ``<root>/<org_id>`` and the pod mounts its own org's access
         point at ``<root>``, so an absolute path built here names nothing
         inside the pod. Both sides join their own root to this.
 
-        A lookup failure degrades to the org's default project rather than
-        failing the turn, matching how memory and skills used to degrade.
+        None on a lookup failure, which runs the turn in the org's default
+        project (stream_remote_replies) rather than failing it.
         """
         from pathlib import Path
 
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.scoped import scoped_storage_root
+        from cowork.services.projects import projects_root
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            org_root = scoped_storage_root(
-                Path(get_app_settings().project.root_dir), session.scope, store="projects"
-            ).parent
+            org_root = projects_root(scope=session.scope).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
-            return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}
+            return RemoteWorkspace(project_id=str(conversation.project.id), workspace_rel_path=rel)
         except Exception:
             logger.exception("[responses] failed to resolve workspace", extra=log_context(conversation_id=conv_id))
-            return {}
+            return None
 
     @staticmethod
-    def _remote_agent_files(session: ScopedSession, conv_id: UUID) -> AgentFiles | None:
+    def _remote_agent_files(
+        session: ScopedSession, conv_id: UUID, *, workspace: RemoteWorkspace | None,
+    ) -> AgentFiles | None:
         """What the pod's scratchpad reads, as this server finds it: the
         conversation's folder in its project on the shared mount, placed in
-        the pod by the same project path the turn's job carries
+        the pod by ``workspace``, the same project path the turn's job carries
         (_remote_workspace), the project the turn runs in, and the files
         attached to the conversation, which the pod reads from that folder.
+        ``workspace`` is None when the project could not be resolved, and the
+        project's path is then unknown (AgentFiles.in_cloud_pod).
 
         None on a lookup failure, so the turn's figure sources name no files
         rather than the turn failing.
@@ -1390,7 +1555,7 @@ class ResponsesHandler:
             return AgentFiles.in_cloud_pod(
                 conversation.project.path,
                 conversation_id=conv_id,
-                workspace_rel_path=ResponsesHandler._remote_workspace(session, conv_id).get("workspace_rel_path"),
+                workspace_rel_path=workspace.workspace_rel_path if workspace is not None else None,
                 project_id=conversation.project_id,
                 attachments=conversation_attachments(session, conversation_id=conv_id),
             )
@@ -1523,6 +1688,7 @@ class ResponsesHandler:
         workspace, and when the conversation started."""
         history, seed_info = self._remote_seed_history(session, conv_id)
         artifacts = self._remote_artifacts_context(session, conv_id)
+        workspace = self._remote_workspace(session, conv_id)
         return _RemoteTurnInputs(
             history=history,
             seed_info=seed_info,
@@ -1533,9 +1699,9 @@ class ResponsesHandler:
                 creator=getattr(artifacts[0], "created_by", None),
             ),
             memory=self._remote_memory(session, conv_id),
-            workspace=self._remote_workspace(session, conv_id),
+            workspace=workspace,
             started_at=self._remote_started_at(session, conv_id),
-            files=self._remote_agent_files(session, conv_id),
+            files=self._remote_agent_files(session, conv_id, workspace=workspace),
         )
 
     @staticmethod
@@ -1649,7 +1815,11 @@ class ResponsesHandler:
         # and the turn's settings snapshot, which handle() bound around this
         # task's creation, answers it without a connection (use_turn_settings).
         with use_settings_scope(scope_from_principal(self.principal)):
-            await self._run_remote_turn(**kwargs)
+            try:
+                await self._run_remote_turn(**kwargs)
+            finally:
+                if kwargs.get("first_take") is not None:
+                    kwargs["first_take"].cancel()
 
     async def _run_remote_turn(
         self,
@@ -1664,6 +1834,7 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
         disabled: list[dict] | None = None,
+        first_take: FirstTake | None = None,
     ) -> None:
         """Remote-backend counterpart of _run_turn: pipe the pod's replies
         through the same SSE formatter as the in-process path (full step /
@@ -1961,7 +2132,9 @@ class ResponsesHandler:
             # re-reading it when the reply arrives could map the count onto a
             # different list.
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
-            yield TurnContext(question=input_text, files=seed.files, history=seed.history)
+            # A unit of its own, so a failed read can't abort the seed's.
+            earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
+            yield TurnContext(question=input_text, files=seed.files, history=seed.history, earlier_answers=earlier)
             if seed.artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
@@ -1977,6 +2150,10 @@ class ResponsesHandler:
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
             completed_cleanly = False
+            # Whether the pod compacted or hard-truncated the turn's context:
+            # its compacted step comes for both, its compaction reply for a
+            # summary. Both arrive before the history frame.
+            compacted = False
 
             async for kind, data in stream_remote_replies(
                 conversation_id=str(conv_id),
@@ -1990,7 +2167,7 @@ class ResponsesHandler:
                 # memory is outside the conversation workspace and therefore
                 # travels as a bounded, sheddable wire block.
                 memory=seed.memory,
-                **seed.workspace,
+                workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
                 run_id=lifecycle.identity.run_id,
@@ -2012,22 +2189,25 @@ class ResponsesHandler:
                 elif kind == "turn_delta":
                     yield StreamTextDelta(text=data.get("text", ""))
                 elif kind == "turn_step":
+                    if data.get("step") == "compacted":
+                        compacted = True
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":
                     await save_memory(data.get("entries") or [])
                 elif kind == "turn_history":
-                    pod_rows = data.get("rows")
-                    # Slice-assign, not extend: the pod emits one frame per
-                    # turn, so a repeated frame must replace the rows rather
-                    # than double them. Sanitized at the boundary — the pod
+                    # Sanitized at the boundary (remote_turn_history): the pod
                     # is semi-trusted and these rows reach both the DB and
                     # every later turn's LLM context.
-                    turn_rows[:] = sanitize_turn_history_rows(pod_rows)
-                    # The formatter finds the answer's figures in every tool's
-                    # results, read before the replay caps trimmed them.
-                    yield TurnHistory(list(turn_rows), read=pod_rows if isinstance(pod_rows, list) else None)
+                    history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)
+                    # Slice-assign, not extend: the pod emits one frame per
+                    # turn, so a repeated frame must replace the rows rather
+                    # than double them.
+                    turn_rows[:] = [] if history is None else history.rows
+                    if history is not None:
+                        yield history
                 elif kind == "turn_compaction":
+                    compacted = True
                     await save_compaction(data, seed.seed_info)
                 elif kind == "turn_skill":
                     # Not persisted like memory: a draft is the user's decision.
@@ -2109,12 +2289,19 @@ class ResponsesHandler:
             async for sse in format_responses_stream(
                 replies_as_stream_events(), model or "", event_sink,
             ):
+                event_type = self._sse_event_type(sse)
+                if first_take is not None and first_take_clears(event_type, sse):
+                    await first_take.clear(buffer)
                 if first:
                     # The formatter's created frame lacks conversation_id +
                     # harness; inject them like the in-process path does.
                     sse = self._inject_created(sse, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id)
                     first = False
-                if self._sse_event_type(sse) == "response.completed":
+                    await buffer.append("sse", {"sse": sse})
+                    if first_take is not None:
+                        first_take.attach(buffer)
+                    continue
+                if event_type == "response.completed":
                     # The formatter yields its terminal frame last, once its
                     # source is exhausted, so event_sink has already seen
                     # everything this turn produced. finish() sends it once
@@ -2243,7 +2430,12 @@ class ResponsesHandler:
         # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
         with use_settings_scope(scope_from_principal(self.principal)):
-            await self._run_turn(**kwargs)
+            try:
+                await self._run_turn(**kwargs)
+            finally:
+                # However the turn ended, the first take writes nothing more.
+                if kwargs.get("first_take") is not None:
+                    kwargs["first_take"].cancel()
 
     async def _run_turn(
         self,
@@ -2261,6 +2453,7 @@ class ResponsesHandler:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
+        first_take: FirstTake | None = None,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -2428,11 +2621,21 @@ class ResponsesHandler:
             # buffer, so it can never write after the terminal record.
             async with model_wait.running(buffer=buffer):
                 async for sse_string in harness.formatter(stream, model, event_sink):
+                    if lifecycle.discarded:
+                        # A frame sent after a turn delete's cancel landed, such
+                        # as the turn's memory record: the delete removed this
+                        # turn's buffer, and a write would recreate it for the
+                        # next turn at this number. The stream raises the
+                        # cancel on the next read.
+                        continue
                     event_count += 1
                     sse_string = self._inject_created(
                         sse_string, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id,
                     )
-                    if self._sse_event_type(sse_string) == "response.completed":
+                    event_type = self._sse_event_type(sse_string)
+                    if first_take is not None and first_take_clears(event_type, sse_string):
+                        await first_take.clear(buffer)
+                    if event_type == "response.completed":
                         # The formatter yields its terminal frame last, once its
                         # source is exhausted, so event_sink has already seen
                         # everything this turn produced. finish() sends it once
@@ -2440,6 +2643,10 @@ class ResponsesHandler:
                         completed_frame = sse_string
                         continue
                     await buffer.append("sse", {"sse": sse_string})
+                    if event_count == 1 and first_take is not None:
+                        # After response.created, so the renderer has a turn
+                        # to put the take on.
+                        first_take.attach(buffer)
             logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
             # A Stop that lands here waits for the save and its frame, so the
             # stream's terminal record always matches what the database holds.
@@ -2950,7 +3157,13 @@ class ResponsesHandler:
         """
         service = ProjectService(session)
         if request.project_id is not None:
-            return request.project_id
+            # An id outside the caller's scope answers like one that never
+            # existed. create_conversation anchors the parent too, but its
+            # ValueError would surface as a 500.
+            try:
+                return service.get_project(request.project_id).id
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=f"Project not found: {request.project_id}") from exc
         if request.project:
             try:
                 # Provisions the org's default when the name is `general` — a fresh

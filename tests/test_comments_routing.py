@@ -23,11 +23,11 @@ def artifact(tmp_path: Path, monkeypatch):
     folder.mkdir()
 
     state: dict = {"entry": {}}
-    monkeypatch.setattr(router, "artifacts_sources_for_scan", lambda: [])
+    monkeypatch.setattr(router, "artifacts_sources_for_scan", lambda *, scope: [])
     monkeypatch.setattr(
         router, "resolve_artifact_folder", lambda _sources, _aid: (object(), folder, {})
     )
-    monkeypatch.setattr(router, "published_owner_state", lambda _path: state["entry"])
+    monkeypatch.setattr(router, "published_owner_state", lambda _path, *, scope: state["entry"])
     monkeypatch.setattr(router, "_org_mode", lambda: False)
     return state
 

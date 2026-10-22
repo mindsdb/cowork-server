@@ -25,7 +25,13 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.services.product_permissions import require_product_permission
-from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
+from cowork.db.scoped import (
+    ScopedSession,
+    ScopedSessionDep,
+    TenantScope,
+    get_scoped_session,
+    get_tenant_scope,
+)
 from cowork.db.session import get_session
 from cowork.principal import Principal, get_principal
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
@@ -46,16 +52,17 @@ from cowork.services.artifact_roots import (
     artifacts_sources_for_scan,
 )
 from cowork.services.artifacts import (
+    BackendPreviewRefused,
     ExecutionRefused,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
     delete_artifact as _delete_artifact,
     delete_artifact_from_source as _delete_artifact_from_source,
-    get_preview_mount,
     list_artifacts as _list_artifacts,
     mount_preview,
     preview_artifact as _preview_artifact,
+    preview_mount_for,
     resolve_artifact_path,
     reveal_in_file_manager,
 )
@@ -65,6 +72,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 class _PathBody(BaseModel):
@@ -221,7 +229,7 @@ def _scoped_project_cards(session, project_ref: str) -> list[dict]:
     the scoped server catalog, so root discovery still receives server-owned
     identity rather than the request string.
     """
-    _server_project_id, sources = _scoped_project_sources(session, project_ref)
+    server_project_id, sources = _scoped_project_sources(session, project_ref)
     return _artifact_cards(session, sources)
 
 
@@ -275,15 +283,18 @@ class _DesktopSourceCatalogEntry:
     source: object
 
 
-def _desktop_registered_path_catalog() -> tuple[_DesktopSourceCatalogEntry, ...]:
-    """Build the complete legacy source catalog without an HTTP selector."""
+def _desktop_registered_path_catalog(
+    *, scope: TenantScope | None
+) -> tuple[_DesktopSourceCatalogEntry, ...]:
+    """Build the complete legacy source catalog of ``scope``'s projects
+    without an HTTP selector."""
     return tuple(
         _DesktopSourceCatalogEntry(
             path_key=path_key,
             project_name=os.path.basename(str(Path(source.base).parent.parent)),
             source=source,
         )
-        for source in artifacts_sources_for_scan()
+        for source in artifacts_sources_for_scan(scope=scope)
         for path_key in sorted(_desktop_source_path_keys(source))
     )
 
@@ -317,7 +328,7 @@ def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict
     retained in that catalog keeps ``project_id=None``, preserving local draft
     URLs and card addressing.
     """
-    catalog = _desktop_registered_path_catalog()
+    catalog = _desktop_registered_path_catalog(scope=session.scope)
     if not project_path or "\x00" in project_path:
         return []
     requested = os.path.normpath(os.path.expanduser(project_path))
@@ -513,8 +524,8 @@ def _pinned_loose_match(
     return None
 
 
-def _desktop_artifact_status_for_path(path: str) -> dict:
-    """Match a legacy path only against entries scanned from discovered roots.
+def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -> dict:
+    """Match a legacy path only against entries scanned from ``scope``'s roots.
 
     The request is reduced to a string lookup key. Every card and folder key is
     built first from server-discovered ``ProjectArtifacts`` roots, so no
@@ -537,7 +548,7 @@ def _desktop_artifact_status_for_path(path: str) -> dict:
     )
     from cowork.services.artifacts import card_for_folder
 
-    for source in artifacts_sources_for_scan():
+    for source in artifacts_sources_for_scan(scope=scope):
         source_base = Path(source.base)
         try:
             with opened_artifact_root(source) as root:
@@ -595,6 +606,7 @@ def _desktop_artifact_status_for_path(path: str) -> dict:
                                 continue
                             card = card_for_folder(
                                 logical,
+                                scope=scope,
                                 project_id=source.project_id,
                                 project_name=source.project_name,
                                 _pinned_folder=folder,
@@ -630,7 +642,9 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
-            catalog = await run_in_threadpool(_desktop_registered_path_catalog)
+            catalog = await run_in_threadpool(
+                _desktop_registered_path_catalog, scope=session.scope
+            )
             if not project_path or "\x00" in project_path:
                 return []
             requested = os.path.normpath(os.path.expanduser(project_path))
@@ -847,23 +861,28 @@ async def delete_artifact_for_request(
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which
-# IS the require_local_tenancy guard: it 403s them outright in org mode, so they only
-# ever run on desktop, where there is no multi-tenant identity concept to
-# check in the first place. /proxy is the exception and says so at its own
-# definition. A comment covering a range of routes only holds while the range
-# does; each route carries the declaration itself, so inserting one here
-# cannot inherit this paragraph by accident.
+# IS the require_local_tenancy guard: it 403s them outright in org mode, so they
+# only ever run in local tenancy. There the request's scope is LOCAL_SCOPE, or,
+# on a deployment that trusts identity headers, a person's partition, so each
+# route takes the scope and resolves a path only inside that scope's artifacts
+# roots: another person's path answers 404, as an unknown one does. /proxy is
+# the exception and says so at its own definition. A comment covering a range
+# of routes only holds while the range does; each route carries the
+# declaration itself, so inserting one here cannot inherit this paragraph by
+# accident.
 @router.get("/status", dependencies=[Depends(require(DesktopOnly))])
-async def artifact_status(path: str = Query(..., min_length=1, max_length=4096)):
+async def artifact_status(
+    scope: ScopeDep, path: str = Query(..., min_length=1, max_length=4096)
+):
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
-    return _desktop_artifact_status_for_path(path)
+    return _desktop_artifact_status_for_path(path, scope=scope)
 
 
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
-async def preview_artifact(path: str = Query(...)):
+async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
     try:
-        artifact = resolve_artifact_path(path)
+        artifact = resolve_artifact_path(path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -882,7 +901,7 @@ class _ExportBody(BaseModel):
 
 
 @router.post("/export", dependencies=[Depends(require(DesktopOnly))])
-async def export_artifact_endpoint(req: _ExportBody):
+async def export_artifact_endpoint(req: _ExportBody, scope: ScopeDep):
     """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
     the result into the same artifact folder. Returns the new file's path so
     the client can open or download it.
@@ -899,20 +918,22 @@ async def export_artifact_endpoint(req: _ExportBody):
     from cowork.services.artifacts import _org_mode
 
     fmt = (req.format or "").lower().lstrip(".")
-    if fmt in ("pdf", "docx") and _org_mode():
+    if fmt in ("pdf", "docx") and (_org_mode() or scope.personal):
         # Both converters resolve URIs referenced in the source HTML to embed
         # them in the output: xhtml2pdf fetches <img>/<link>/@import for PDF;
         # htmldocx's image handling calls urllib.request.urlopen for docx. The
         # source HTML is artifact content from the shared filesystem, written
         # by any org's agent, so this is an SSRF and local-file-read primitive
         # (including other orgs' trees) into a file the requester downloads.
+        # A person's partition is refused the same way, as /open and /reveal
+        # are: their HTML can name a file in another person's partition.
         # Plain HTML export does no such resolution, so it stays available.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="PDF and Word export are not available on this deployment. Export to HTML instead.",
         )
     try:
-        source = resolve_artifact_path(req.path)
+        source = resolve_artifact_path(req.path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -927,15 +948,17 @@ async def export_artifact_endpoint(req: _ExportBody):
 
 
 @router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
-async def preview_mount_endpoint(req: _PathBody, request: Request):
+async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeDep):
     try:
-        artifact = resolve_artifact_path(req.path)
+        artifact = resolve_artifact_path(req.path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        payload = await mount_preview(artifact)
+        payload = await mount_preview(artifact, scope=scope)
+    except BackendPreviewRefused as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
 
@@ -953,8 +976,8 @@ async def preview_mount_endpoint(req: _PathBody, request: Request):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require(DesktopOnly))])
-async def preview_asset(token: str, rel_path: str, request: Request):
-    parent = get_preview_mount(token)
+async def preview_asset(token: str, rel_path: str, request: Request, scope: ScopeDep):
+    parent = preview_mount_for(token, scope=scope)
     if parent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preview mount has expired or is unknown")
     try:
@@ -1013,13 +1036,16 @@ def serve_artifact_file(
 
 
 @router.post("/open", dependencies=[Depends(require(DesktopOnly))])
-async def open_artifact(req: _PathBody):
+async def open_artifact(req: _PathBody, scope: ScopeDep):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
-    if _org_mode():
+    # A person's partition refuses too: the server is not that person's
+    # machine, so opening a file runs a program on a host they don't sit at.
+    # Both refuse before the path resolves, so the answer says nothing about it.
+    if _org_mode() or scope.personal:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     try:
-        artifact = resolve_artifact_path(req.path)
+        artifact = resolve_artifact_path(req.path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -1033,7 +1059,7 @@ async def open_artifact(req: _PathBody):
 
 def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     try:
-        return resolve_artifact_path(path)
+        return resolve_artifact_path(path, scope=session.scope)
     except FileNotFoundError:
         pass
     except ValueError as e:
@@ -1075,6 +1101,12 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
 
 @router.post("/reveal", dependencies=[Depends(require(DesktopOnly))])
 async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
+    if session.scope.personal:
+        # Same refusal as /open, before the path resolves: the server's file
+        # manager is not on a person's machine.
+        from cowork.services.artifacts import _NO_EXEC_DETAIL
+
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     target = _resolve_reveal_path(req.path, session)
     try:
         reveal_in_file_manager(target)
@@ -1095,7 +1127,7 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     dependencies=[Depends(require(OpenByDesign))],
 )
-async def proxy(token: str, rel_path: str, request: Request):
+async def proxy(token: str, rel_path: str, request: Request, scope: ScopeDep):
     """HTTP forwarder for fullstack-artifact previews.
 
     Streams the request to the artifact's backend running on
@@ -1104,30 +1136,31 @@ async def proxy(token: str, rel_path: str, request: Request):
 
     OpenByDesign, not `DesktopOnly` like its siblings: the token is the
     real guard here, not tenancy. `_PREVIEW_MOUNTS` (see
-    `cowork.services.artifacts.get_preview_mount`) is only ever populated by
+    `cowork.services.artifacts.preview_mount_for`) is only ever populated by
     `/preview-mount`, which IS `DesktopOnly` — so in org mode
     this dict is permanently empty and any token 404s here regardless, by
-    construction rather than by a declared guard.
+    construction rather than by a declared guard. The token resolves only
+    inside the caller's own artifacts roots, as on `/preview-asset`.
     """
     from cowork.services.preview_proxy import proxy_artifact_request
-    return await proxy_artifact_request(token, rel_path, request)
+    return await proxy_artifact_request(token, rel_path, request, scope=scope)
 
 
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])
-def delete_artifact_endpoint(path: str = Query(...)):
+def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
     try:
         from cowork.services.publish import (
             desktop_artifact_and_base,
             desktop_publish_credential,
         )
 
-        artifact, artifacts_base = desktop_artifact_and_base(path)
+        found = desktop_artifact_and_base(path, scope=scope)
         # Credential resolved after the path so an unresolvable artifact still
         # reports 404 rather than "configure your API key". Only needed at all
         # because delete unpublishes first.
         api_key, publish_url = desktop_publish_credential()
         _delete_artifact(
-            artifact, artifacts_base=artifacts_base,
+            found.artifact, artifacts_base=found.artifacts_base,
             api_key=api_key, publish_url=publish_url,
         )
     except FileNotFoundError as e:

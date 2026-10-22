@@ -22,7 +22,7 @@ def vault_dir(tmp_path, monkeypatch):
     def settings():
         return type("S", (), {"vault_dir": str(path)})()
 
-    monkeypatch.setattr("cowork.services.connectors.connections.ConnectorSettings", settings)
+    monkeypatch.setattr("cowork.services.connectors.persist.ConnectorSettings", settings)
     return path
 
 
