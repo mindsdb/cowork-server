@@ -40,6 +40,7 @@ from cowork.services import artifact_export
 from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
 from cowork.services.artifacts import ProjectArtifacts
+from cowork.services.markdown_render import MAX_FENCE_LENGTH
 from test_artifact_ownership import legacy_root, make_conversation, make_project, project_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
@@ -464,6 +465,23 @@ def test_a_markdown_source_at_its_read_bound_still_exports(client, local_artifac
     response = client.post(EXPORT_URL, json={"format": "html"})
 
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("export_format", ["html", "docx"])
+def test_markdown_with_a_fence_past_the_cap_answers_413_and_writes_nothing(
+    client, local_artifact, export_format
+):
+    # No primary recorded, so a refusal that came after the record would
+    # show in metadata.json.
+    fence = "`" * (MAX_FENCE_LENGTH + 1)
+    folder = local_artifact({"report.md": f"# Report\n\n{fence}\ncode\n{fence}\n"})
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": export_format})
+
+    assert response.status_code == 413, response.text
+    assert response.json()["detail"] == "This file can't be exported."
+    assert _snapshot(folder) == before
 
 
 def test_a_conversion_failure_answers_500_and_writes_nothing(client, local_artifact, monkeypatch):

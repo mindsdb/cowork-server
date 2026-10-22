@@ -59,7 +59,7 @@ from cowork.services.artifacts import (
     serve_url_for,
 )
 from cowork.services.docx_writer import write_docx
-from cowork.services.markdown_render import render_markdown
+from cowork.services.markdown_render import MarkdownRefused, render_markdown
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
@@ -313,13 +313,18 @@ def _source_html(*, data: bytes, suffix: str, title: str) -> bytes:
 
     An HTML page stays as it is. Markdown is rendered and text becomes a
     ``pre`` block, and either is wrapped as the body of a minimal document
-    titled *title*, which is what an HTML export of it writes.
+    titled *title*, which is what an HTML export of it writes. Markdown that
+    ``render_markdown`` refuses is answered as a source over its read bound
+    is, before anything is written.
     """
     if suffix in _HTML_SOURCES:
         return data
     text = _source_text(data)
     if suffix in _MARKDOWN_SOURCES:
-        body = render_markdown(text=text)
+        try:
+            body = render_markdown(text=text)
+        except MarkdownRefused as exc:
+            raise ExportRefused(ExportRefusal.TOO_LARGE, "This file can't be exported.") from exc
     else:
         body = f"<pre>{html.escape(text)}</pre>"
     return _wrap_html_document(body, title).encode("utf-8")
@@ -589,8 +594,9 @@ def export_primary_file(
     """Export the artifact's primary file, writing the result beside it.
 
     Blocking: the route runs it in a worker thread. Raises ``ExportRefused``
-    for a format the artifact doesn't offer, a source over its size bound or
-    a source that can't be opened, and writes nothing then.
+    for a format the artifact doesn't offer, a source over its size bound,
+    Markdown that ``render_markdown`` refuses or a source that can't be
+    opened, and writes nothing then.
     """
     org_mode = _org_mode()
     with opened_artifact_folder(source, folder_name) as folder:
