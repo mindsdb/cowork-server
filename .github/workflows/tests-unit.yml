@@ -19,6 +19,7 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
+          version: "0.11.30"
           python-version: "3.12"
 
       - name: Check uv.lock matches pyproject.toml
@@ -27,7 +28,10 @@ jobs:
         run: uv lock --check
 
       - name: Install dependencies
-        run: uv sync --group dev
+        run: uv sync --locked --group dev
+
+      - name: Check exported release dependencies
+        run: python scripts/release_contract.py --check
 
       - name: Run unit tests
         run: make test/unit/coverage
