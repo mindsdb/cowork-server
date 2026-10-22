@@ -147,6 +147,11 @@ _LOCAL_ARTIFACTS = {
         [],
     ),
     "readme": ({"README.md": "# R\n"}, {"type": "document", "primary": "README.md"}, []),
+    "nested-readme": (
+        {"docs/README.md": "# R\n"},
+        {"type": "document", "primary": "docs/README.md"},
+        ["html", "docx"],
+    ),
     # Windows reads aux.md as a device, so the export's read refuses the name.
     "device": ({"aux.md": "# A\n"}, {"type": "document", "primary": "aux.md"}, []),
     "revision": (

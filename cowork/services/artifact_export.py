@@ -24,7 +24,6 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import anyio
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
 
 from cowork.common.paths import (
     O_NOFOLLOW,
@@ -71,12 +70,6 @@ _HTML_SOURCES = frozenset({".html", ".htm"})
 # would only be copied.
 _HTML_EXPORT_SOURCES = _MARKDOWN_SOURCES | {".txt"}
 _WORD_EXPORT_SOURCES = _HTML_EXPORT_SOURCES | _HTML_SOURCES
-# Store-owned files and the revision journal never export, compared casefolded
-# on every segment: on a case-insensitive volume ``Metadata.JSON`` opens
-# ``metadata.json``.
-_HOUSEKEEPING_NAMES = frozenset(
-    name.casefold() for name in (*NON_CONTENT_NAMES, REVISIONS_DIRNAME)
-)
 
 # The most of a source an export reads. A page carries its own markup and
 # styles, so HTML gets more room than Markdown or text.
@@ -158,8 +151,6 @@ def export_formats(
     if is_backend or not can_edit:
         return []
     segments = source_name.replace("\\", "/").split("/")
-    if any(not segment or segment.casefold() in _HOUSEKEEPING_NAMES for segment in segments):
-        return []
     if not _read_takes_name(segments):
         return []
     suffix = PurePosixPath(segments[-1]).suffix.lower()
@@ -178,11 +169,15 @@ def _read_takes_name(segments: list[str]) -> bool:
 
     It refuses a name Windows would read as another file, such as ``aux.md``
     or ``notes:q3.md``, on every platform, and a path nested past its depth.
+    It refuses housekeeping names as the read does: any as the first segment,
+    and a store-owned one such as ``metadata.json`` at any depth, so
+    ``docs/README.md`` exports.
     """
     if len(segments) > artifact_files._MAX_PATH_PARTS:
         return False
     try:
         artifact_files._refuse_unsafe_parts(parts=tuple(segments))
+        artifact_files._refuse_housekeeping(parts=tuple(segments))
     except artifact_files.ArtifactFileRefused:
         return False
     return True
