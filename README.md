@@ -28,6 +28,7 @@ curl http://127.0.0.1:26866/api/v1/health/
 uv run cowork-server
 ```
 
+
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
 
 cowork-server imports anton's artifact folder constants (`anton.core.artifacts.internal_files`) at startup, with no fallback. An anton without those constants (`NON_CONTENT_NAMES` and `REVISIONS_DIRNAME`, which [mindsdb/anton#521](https://github.com/mindsdb/anton/pull/521) added, first in 2.26.10.2.1rc2 and first in a stable release in 2.26.10.4.1) makes the server fail to start with `ImportError`.
