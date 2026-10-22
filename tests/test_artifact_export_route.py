@@ -401,7 +401,21 @@ def test_a_source_with_a_byte_order_mark_keeps_its_first_heading(client, local_a
     ]
     written = (folder / "report.html").read_text(encoding="utf-8")
     assert "Título</h1>" in written
-    assert "﻿" not in written and "�" not in written
+    assert "\ufeff" not in written and "\ufffd" not in written
+
+
+def test_a_text_source_with_a_byte_order_mark_exports_without_it(client, local_artifact):
+    """A plain text file is read the same way as Markdown, so its byte order
+    mark never reaches the exported page."""
+    encoded = codecs.BOM_UTF8 + _MARKED_SOURCE.encode("utf-8")
+    folder = local_artifact({"notes.txt": encoded}, primary="notes.txt")
+
+    response = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert response.status_code == 200, response.text
+    written = (folder / "notes.html").read_text(encoding="utf-8")
+    assert "<pre># Título" in written
+    assert "\ufeff" not in written
 
 
 def test_a_large_html_export_is_written_whole(client, local_artifact):
