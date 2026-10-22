@@ -16,6 +16,7 @@
 - name: controls_in_alt
   html: "<p><img src=\"data:image/svg+xml;base64,PHN2Zy8+\" alt=\"x\x02y&#3;z\"></p>"
   text: "[image: xyz]"
+  text_before_libxml2_2_12: "[image: xy]"
 - name: controls_in_link
   html: "<p><a href=\"https://example.com/\x01a&#2;b\">l\x03ink</a></p>"
   text: "link"

@@ -28,11 +28,13 @@ import ntpath
 import re
 import secrets
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import NamedTuple
 from urllib.parse import unquote, unquote_to_bytes
 
+import lxml.etree
 import lxml.html
 import tinycss2
 from lxml.etree import ParserError
@@ -1037,11 +1039,28 @@ def _parse_html(*, data: bytes) -> _ParsedHtml:
         root = lxml.html.document_fromstring(data, parser=parser)
     except ParserError:
         root = None
-    stopped = any(entry.type_name == "ERR_RESOURCE_LIMIT" for entry in parser.error_log)
+    stopped = parse_stopped(error_log=parser.error_log)
     if root is None:
         # Nothing but whitespace, or nothing before a limit: an empty document.
         root = lxml.html.document_fromstring(b"<html></html>", parser=parser)
     return _ParsedHtml(root=root, stopped=stopped)
+
+
+# libxml2 2.12 and later report a parse stopped at a resource limit as
+# ERR_RESOURCE_LIMIT. 2.11, which the Windows lxml wheel bundles, reports
+# nesting past 256 as an internal error naming XML_PARSE_HUGE, a huge text
+# node as out of memory and a huge attribute value as unfinished, so those
+# messages count too.
+_STOPPED_PARSE_MESSAGES = ("XML_PARSE_HUGE", "huge text node", "attribute value too long")
+
+
+def parse_stopped(*, error_log: Iterable[lxml.etree._LogEntry]) -> bool:
+    """Whether libxml2 stopped reading at a resource limit and dropped the rest."""
+    return any(
+        entry.type_name == "ERR_RESOURCE_LIMIT"
+        or any(message in entry.message for message in _STOPPED_PARSE_MESSAGES)
+        for entry in error_log
+    )
 
 
 def _is_utf8(*, data: bytes) -> bool:

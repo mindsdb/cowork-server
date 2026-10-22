@@ -103,7 +103,9 @@
 # delete or set a name holding one, so the attribute goes.
 - id: attribute-name-with-a-control-character
   html: "<p a\x01b=\"1\" id=\"p1\">x</p><img a\x02=\"1\" src=\"chart.png\" alt=\"c\"><div data-a\x0bb=\"1\" data-\uFFFE=\"2\" data-ok=\"3\">d</div>"
-  present: ['<p id="p1">x</p>', '<img alt="c" src="data:image/png;base64,', '<div data-ok="3">d</div>']
+  # libxml2 before 2.12 splits a name at the bad character, which can leave a
+  # valueless data- attribute; either way no such character survives.
+  present: ['<p id="p1">x</p>', '<img alt="c" src="data:image/png;base64,', 'data-ok="3">d</div>']
   absent: ["\x01", "\x02", "\x0b", "\uFFFE"]
 
 - id: kept-attribute-value-with-a-character-xml-refuses

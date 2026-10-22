@@ -751,6 +751,16 @@ def test_deadline_stops_a_style_attribute(artifact, monkeypatch):
     assert document.html.endswith(f"<p>{TRUNCATION_NOTE}</p></body></html>")
 
 
+STOPPED_PARSES = _cases(name="stopped_parses.yaml")
+
+
+@pytest.mark.parametrize("case", STOPPED_PARSES, ids=[case["id"] for case in STOPPED_PARSES])
+def test_a_stopped_parse_is_recognized_in_every_libxml2_version(case):
+    entry = types.SimpleNamespace(type_name=case["type_name"], message=case["message"])
+
+    assert artifact_inline.parse_stopped(error_log=[entry]) is case["stopped"]
+
+
 def test_a_source_parse_cut_short_by_libxml2_ends_with_the_note(artifact, outside):
     """Past 256 levels of nesting libxml2 stops reading and keeps only what came before."""
     html = b"<p>start</p>" + b"<div>" * 300 + b"<p>LOST</p>"
