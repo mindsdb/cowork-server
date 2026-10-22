@@ -75,6 +75,9 @@ class _OpenRecorder:
         # reuse the ident of one that was running before and has ended.
         if event == "open" and self._paths is not None and threading.current_thread() not in self._ignored:
             path = args[0]
+            if isinstance(path, int):
+                # A descriptor names no file; the open that made it named one.
+                return
             self._paths.append(os.fsdecode(path) if isinstance(path, str | bytes | os.PathLike) else repr(path))
 
     @contextmanager
@@ -123,7 +126,11 @@ def _opened_outside_the_template(*, paths: list[str]) -> list[str]:
         resolved = Path(path).resolve()
         if resolved.is_relative_to(_DOCX_TEMPLATES):
             continue
-        if resolved.suffix in _MODULE_SUFFIXES and any(resolved.is_relative_to(root) for root in _IMPORT_ROOTS):
+        in_import_roots = any(resolved.is_relative_to(root) for root in _IMPORT_ROOTS)
+        if resolved.suffix in _MODULE_SUFFIXES and in_import_roots:
+            continue
+        # The import system writes a module's bytecode cache on its first import.
+        if "__pycache__" in resolved.parts and in_import_roots:
             continue
         unexpected.append(path)
     return unexpected
@@ -620,10 +627,24 @@ def test_xml_incompatible_characters_are_stripped(case):
     if "table_text" in case:
         assert package.document.tables[0].cell(0, 0).text == case["table_text"]
     else:
-        assert [p.text for p in package.document.paragraphs] == [case["text"]]
+        # libxml2 before 2.12 cuts an attribute value at an invalid character
+        # reference instead of reading past it.
+        before_2_12 = etree.LIBXML_VERSION < (2, 12, 0)
+        expected = case.get("text_before_libxml2_2_12", case["text"]) if before_2_12 else case["text"]
+        assert [p.text for p in package.document.paragraphs] == [expected]
 
 
 # Tables
+
+
+def test_tables_nest_only_as_deep_as_word_reads_and_the_deepest_text_stays():
+    nested = 40
+    package = _write("<table><tr><td>" * nested + "deep text" + "</td></tr></table>" * nested)
+    body = etree.fromstring(package.parts["word/document.xml"], _SAFE_XML)
+    tables = [element for element in body.iter() if element.tag.endswith("}tbl")]
+    depth = max(sum(1 for a in table.iterancestors() if a.tag.endswith("}tbl")) for table in tables) + 1
+    assert depth == docx_writer.MAX_TABLE_NESTING
+    assert "deep text" in package.text
 
 
 @pytest.mark.parametrize("case", _cases("tables.yaml"), ids=_ids(_cases("tables.yaml")))

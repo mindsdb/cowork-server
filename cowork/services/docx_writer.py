@@ -40,7 +40,7 @@ from lxml.etree import ParserError
 from lxml.html import HtmlElement
 
 from cowork.schemas.artifact_export import InlinedDocument
-from cowork.services.artifact_inline import TRUNCATION_NOTE, XML_UNSAFE
+from cowork.services.artifact_inline import TRUNCATION_NOTE, XML_UNSAFE, parse_stopped
 
 MAX_DEPTH = 256
 MAX_NODES = 200_000
@@ -48,6 +48,11 @@ DEADLINE_SECONDS = 10.0
 # Word's own column limit, and a cap on every table cell in one document.
 MAX_TABLE_COLUMNS = 63
 MAX_TABLE_CELLS = 20_000
+# Each nested table adds three levels to document.xml (table, row and cell),
+# and Word's and python-docx's XML parsers refuse a part nested past 256
+# levels. A table nested deeper than this lets its cells' text flow into the
+# cell around it.
+MAX_TABLE_NESTING = 32
 MAX_LIST_LEVEL = 3
 # Word's highest list start number.
 MAX_LIST_NUMBER = 32_767
@@ -199,6 +204,7 @@ class _Context:
     list_level: int = 0
     list_numbering: _ListNumbering | None = None
     depth: int = 0
+    table_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -281,8 +287,7 @@ def write_docx(*, document: InlinedDocument, title: str) -> bytes:
     complete = root is None or _Writer(word=word, deadline=deadline).write(root=root)
     # Past a resource limit, such as nesting deeper than 256, libxml2 stops
     # parsing and the tree holds only what came before.
-    parse_stopped = any(entry.type_name == "ERR_RESOURCE_LIMIT" for entry in parser.error_log)
-    if not complete or parse_stopped:
+    if not complete or parse_stopped(error_log=parser.error_log):
         word.add_paragraph(TRUNCATION_NOTE)
     buffer = io.BytesIO()
     word.save(buffer)
@@ -414,7 +419,7 @@ class _Writer:
             self._image(element=element, context=outer)
             self._write_tail(visit=visit)
             return
-        elif tag == "table":
+        elif tag == "table" and outer.table_depth < MAX_TABLE_NESTING:
             parts = self._table_parts(table=element)
             _close_paragraph(flow=outer.flow)
             # The stray content is written first, then the table is added.
@@ -790,7 +795,9 @@ class _Writer:
             visits.append(
                 _Visit(
                     element=placement.element,
-                    outer=_Context(flow=cell_flow, depth=outer.depth + 2),
+                    outer=_Context(
+                        flow=cell_flow, depth=outer.depth + 2, table_depth=outer.table_depth + 1
+                    ),
                     write_tail=False,
                     prepaid=True,
                 )
