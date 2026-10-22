@@ -606,7 +606,8 @@ def _card(folder: Path) -> dict:
         root_parts=(".anton", "artifacts"),
     )
     (card,) = artifacts_service.list_artifacts([source])
-    return {key: card[key] for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
+    # A card with no primary file has no draftUrl.
+    return {key: card.get(key) for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
 
 
 @pytest.mark.parametrize("recorded", [True, False], ids=["primary-recorded", "no-primary"])
@@ -676,6 +677,28 @@ def test_a_primary_that_names_no_file_counts_as_unset(
     ]
     assert _card(folder) == card_before
     assert _metadata(folder)["primary"] == "final.md"
+
+
+@pytest.mark.parametrize(
+    ("files", "status", "card_path"),
+    [({"report.md": "# R\n"}, 200, "report.md"), ({}, 422, "")],
+    ids=["another-file", "no-other-file"],
+)
+def test_a_primary_that_names_a_symlink_loop_falls_back_like_the_card(
+    client, local_artifact, files, status, card_path
+):
+    """Python 3.12 raises RuntimeError resolving a link to itself. The card
+    and the export both fall back past such a primary instead."""
+    folder = local_artifact(files, primary="loop")
+    (folder / "loop").symlink_to("loop")
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == status, response.text
+    assert _card(folder)["path"] == (str(folder / card_path) if card_path else str(folder))
+    if status == 200:
+        assert response.json()["filename"] == "report.docx"
+        assert _metadata(folder)["primary"] == "report.md"
 
 
 def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):

@@ -403,7 +403,8 @@ def _pick_primary(
                 # Keep that stable descriptor path rather than returning the
                 # resolved, swappable storage name after the containment check.
                 return candidate if preserve_folder_path else target
-        except (ValueError, OSError):
+        # Python 3.12's resolve() raises RuntimeError for a symlink loop.
+        except (ValueError, OSError, RuntimeError):
             pass
     if not files:
         return None
