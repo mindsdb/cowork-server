@@ -30,6 +30,10 @@ values, source lines, locals, arbitrary extras, HTTP queries and provider bodies
 are excluded. Use the structured fields when querying logs; the previous text
 prefixes are no longer a parsing contract.
 
+Shared-memory startup warnings retain the fixed policy text, including whether
+learning is enabled or the shared store is kept unread. They omit the memory
+store path.
+
 Enable extra detail only for an owned troubleshooting session, repeat the failing
 operation, and restore the default afterward. Logging controls do not enable
 framework debug responses. Roll back a release by restoring its previous image

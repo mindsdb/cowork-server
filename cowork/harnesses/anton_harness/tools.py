@@ -316,7 +316,15 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             return message
         return SideEffectResult.failed(message, reason=reason)
 
-    from cowork.services.publish import OWNED_BY_OTHER_USER_MESSAGE, PublishOwnedByOtherUser
+    from fastapi import HTTPException
+
+    from cowork.services.publish import (
+        ARTIFACT_TOO_LARGE_MESSAGE,
+        OWNED_BY_OTHER_USER_MESSAGE,
+        PublishOwnedByOtherUser,
+        PublishRejected,
+        PublishTooLarge,
+    )
 
     try:
         result = _publish_artifact(abs_path, access=access)
@@ -332,6 +340,25 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "ask after resolving it.",
             reason="owned_by_other_user",
         )
+    except PublishTooLarge:
+        # Retrying the same files cannot succeed; the model can shrink them. Kept
+        # before the generic HTTPException branch for this do-not-retry advice.
+        logger.info("Cowork publish refused: %s", ARTIFACT_TOO_LARGE_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {ARTIFACT_TOO_LARGE_MESSAGE} Do not retry with the same files. "
+            "Tell the user, or remove or shrink large files in the artifact "
+            "(PDFs, images) and publish again.",
+            reason="too_large",
+        )
+    except HTTPException as exc:
+        # Typed refusals carry their text in `detail`; str(exc) would hand the
+        # model "503: {'code': ...}".
+        detail = exc.detail
+        info = detail if isinstance(detail, dict) else {}
+        message = info.get("message") or str(detail)
+        reason = info.get("code") or "http_error"
+        logger.info("Cowork publish refused: %s", message)
+        return _fail(f"PUBLISH FAILED: {message}", reason=reason)
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
@@ -348,6 +375,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             )
         logger.info("Cowork publish rejected: %s", exc)
         return _fail(f"PUBLISH FAILED: {exc}", reason="ValueError")
+    except PublishRejected as exc:
+        # publish_artifact has already logged the traceback.
+        logger.warning("Cowork publish rejected: %s", exc)
+        return _fail(f"PUBLISH FAILED: {exc}", reason="PublishRejected")
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
         return _fail(f"PUBLISH FAILED: {exc}", reason=type(exc).__name__)
