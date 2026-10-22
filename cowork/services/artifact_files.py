@@ -14,8 +14,11 @@ there and an open joins the name onto a path. There the segment rules are the
 guard, plus an ``lstat`` of every segment that refuses a link or a reparse
 point before anything opens through it, and again once the file is open,
 which refuses a walk whose names changed in between. A folder swapped for a
-junction and back again within that window is still followed: only the
-opened handle's final path would show it.
+junction, or the file for a link, and back again between the two checks is
+still followed. Comparing the open file's ``fstat`` with its ``lstat`` would
+catch that, but on Windows the two calls read different file-information
+records, so the walk compares ``lstat`` with ``lstat`` until a Windows test
+shows they agree.
 """
 from __future__ import annotations
 
