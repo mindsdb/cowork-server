@@ -116,7 +116,7 @@ class _FakeVault:
 
 
 def test_disconnect_never_calls_figma(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
 
     def _boom(request, timeout=10):
         raise AssertionError("Figma has no revoke endpoint; disconnect must stay local")
