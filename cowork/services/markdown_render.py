@@ -95,9 +95,9 @@ class _HeadingIds(Treeprocessor):
     published copy of the same Markdown, which uses ``TocExtension``, carries
     the same ones. ``TocExtension`` itself counts up from ``_1`` past every
     id a repeated heading already took, so n identical headings cost n²
-    lookups. Two ids differ from its: a numeric suffix longer than
-    ``_MAX_COUNT_DIGITS`` is part of the stem, and its table of contents
-    goes, so a ``[TOC]`` marker stays as text.
+    lookups. This differs from it in two ways: a numeric suffix longer than
+    ``_MAX_COUNT_DIGITS`` is part of the stem, and there is no table of
+    contents, so a ``[TOC]`` marker stays as text.
     """
 
     def run(self, root: etree.Element) -> None:
