@@ -21,11 +21,31 @@ The server starts on `http://127.0.0.1:26866`. Confirm with:
 curl http://127.0.0.1:26866/api/v1/health/
 ```
 
+## Reviewed release dependencies
+
+`uv.lock` is the runtime selection for this repository. CI, Docker and release smoke tests refuse a stale lock. `cowork/release-requirements.txt` is its generated runtime export, with environment markers and artifact hashes. Every wheel and source distribution carries that exact file; publishing checks both artifacts against the lock.
+
+The release workflow selects Anton from `uv.lock`. Publishing a newer Anton alone does not change this server release. To move a dependency deliberately:
+
+```sh
+uv lock --upgrade-package anton-agent
+python scripts/release_contract.py
+uv sync --locked --group dev
+bash scripts/check_wheels_available.sh
+make test/unit
+```
+
+Review both the lock and export diffs, run the release checks, and publish a new server release. Change a declared compatibility constraint first when the intended version is outside it. Use the same process for any other dependency. Do not run a general upgrade while preparing a source-only release.
+
+Cowork's release installer consumes the contract from the selected wheel or Git commit. Direct `pip install` and `uv tool install cowork-server` still resolve the public library compatibility ranges; they do not automatically consume this export. For a standalone server with this repository's reviewed selection, check out a reviewed release tag and run `uv sync --locked --no-dev`, then `uv run --locked --no-dev cowork-server`.
+
+The eight platform/Python wheel checks use release constraints. When the lock selects an Anton release candidate, the required wheel gate waits for that exact version to reach PyPI's Simple index before resolving it; the publish runner repeats the wait before building. The weekly `--floating` check separately probes the public compatibility ranges and never rewrites the release lock. Build backends, the Python interpreter and operating-system packages are separate inputs; this policy fixes the application dependency selection, not every byte of an image.
+
 ## Development
 
 ```sh
 # Run from source (auto-manages virtualenv + deps)
-uv run cowork-server
+uv run --locked cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
@@ -35,7 +55,7 @@ cowork-server imports anton's artifact folder constants (`anton.core.artifacts.i
 ### Dev setup helper
 
 ```sh
-uv run cowork-dev-setup
+uv run --locked cowork-dev-setup
 ```
 
 Initializes the database and validates configuration.
@@ -43,7 +63,7 @@ Initializes the database and validates configuration.
 ### Testing
 
 ```sh
-uv run pytest
+uv run --locked pytest
 ```
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
@@ -298,6 +318,10 @@ defaults to `false`, and requires `"stream": true`. Browser questions leave it o
 still reconnects to the detached answer. Closing a `/responses/tail` observer never cancels a run.
 If a client leaves during routing or setup, that request's cleanup prevents it from leaving a
 live producer behind. Completion and server shutdown retain their existing outcomes.
+
+A question can set `"memory": "off"` to read no learned memory and learn nothing, while other questions keep memory, for example a scored evaluation run on a deployment whose testers have it on. The turn runs as every turn does with `MEMORY_ENABLED=false`: two empty memory tiers in its scratch folder, no background memory passes, and the operator's managed rules still read. A later turn sent without the key in the same conversation learns from the whole conversation, its earlier memory-off turns included, so send the key on every turn of the conversation. The field takes `"on"` (the default) or `"off"`. A deployment that doesn't trust identity headers, such as the desktop app, still reads stored memory with memory off, so it refuses the question with 501.
+
+Each answer also gets one `response.memory_read` event, before its `response.figure_sources`, if any, and its `response.completed`. `read` says whether the turn read learned memory, the person's own or the shared store, and `entries` counts the rules, lessons, profile lines and scratchpad tips anton put in front of the model (`ChatSession.memory_read`). The operator's managed rules aren't counted. A turn on two empty tiers, as every question with `"memory": "off"` runs, reads nobody's learned memory, so it gets `"read": false` and `"entries": 0` whether or not the deployment sets `COWORK_DEPLOYMENT_KIND`. So does a direct answer from the routing gate, which runs no agent. The harness sends the event with the first event anton streams after building the turn's prompt, which anton does before its first model call, or as the turn fails, is stopped or ends, if anton streams nothing after it. So a turn that fails after building its prompt carries it, and so does a turn the user stops after that. The event is saved with the answer's events. An answer that ended before anton built its prompt gets none, and so do a turn on the remote worker and a turn on an anton without `ChatSession.memory_read`.
 
 The root of `response.created` carries a `run_id` UUID for that execution. An API client or proxy
 can send `{"conversation_id": "...", "expected_run_id": "...", "reason": "client_gone"}` to
@@ -1073,3 +1097,10 @@ On a deployment that trusts identity headers, an operator with a shell where cow
 ## License
 
 See [LICENSE](LICENSE).
+
+## Diagnostics
+
+See [structured logging](docs/structured-logging.md) for defaults, troubleshooting
+overrides, retained evidence streams and rollout requirements.
+Shared-memory startup warnings state whether turns learn into the shared store
+or leave it unread, without logging its private path.
