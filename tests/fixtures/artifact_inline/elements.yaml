@@ -156,6 +156,13 @@
     - [unsupported_type, x.swf]
     - [traversal, ../other/secret.png]
 
+# Inside a dropped element an svg still switches namespace, so an SVG image's
+# href is read as a load.
+- id: svg-load-inside-dropped-element
+  html: '<template><svg><image href="{outside}/i.png"/></svg></template><p>kept</p>'
+  present: ['<p>kept</p>']
+  omitted: [[scheme, '{outside}/i.png']]
+
 - id: textarea-raw-text
   html: '<textarea>&lt;/textarea&gt;&lt;img src=x onerror=alert(1)&gt;</textarea><p>kept</p>'
   present: ['<p>kept</p>']
