@@ -28,6 +28,7 @@ from pathlib import Path
 from xml.etree.ElementTree import Element
 
 import html5lib
+import lxml.etree
 import lxml.html
 import pytest
 import yaml
@@ -337,10 +338,10 @@ def test_document_case(case, mode, artifact, outside):
         assert _fill(text=text, server=outside) in document.html
     for text in case.get("absent", []):
         assert _fill(text=text, server=outside) not in document.html
-    expected = [
-        (reason, _fill(text=reference, server=outside))
-        for reason, reference in case.get("omitted", [])
-    ]
+    omitted = case.get("omitted", [])
+    if lxml.etree.LIBXML_VERSION < (2, 14) and "omitted_before_libxml2_2_14" in case:
+        omitted = case["omitted_before_libxml2_2_14"]
+    expected = [(reason, _fill(text=reference, server=outside)) for reason, reference in omitted]
     assert [(entry.reason.value, entry.reference) for entry in document.omitted] == expected
     if "scripts_dropped" in case:
         assert document.scripts_dropped is case["scripts_dropped"]
