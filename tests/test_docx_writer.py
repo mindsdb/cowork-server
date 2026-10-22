@@ -6,6 +6,7 @@ import io
 import os
 import struct
 import sys
+import threading
 import types
 import zipfile
 import zlib
@@ -54,7 +55,12 @@ _IMPORT_ROOTS = tuple(Path(entry).resolve() for entry in sys.path if entry)
 
 
 class _OpenRecorder:
-    """Collects the path of every file opened while recording, from any thread.
+    """Collects the path of every file opened while recording.
+
+    It records the recording thread and any thread started while recording,
+    so a writer that hands its I/O to a thread is still caught. Threads that
+    were already running belong to other tests, such as a service one of
+    them left writing in the background, and are ignored.
 
     An audit hook can't be removed, so one recorder stays installed for the
     session and records only inside ``recording()``.
@@ -62,23 +68,52 @@ class _OpenRecorder:
 
     def __init__(self) -> None:
         self._paths: list[str] | None = None
+        self._ignored: frozenset[int | None] = frozenset()
 
     def __call__(self, event: str, args: tuple) -> None:
-        if event == "open" and self._paths is not None:
+        if event == "open" and self._paths is not None and threading.get_ident() not in self._ignored:
             path = args[0]
             self._paths.append(os.fsdecode(path) if isinstance(path, str | bytes | os.PathLike) else repr(path))
 
     @contextmanager
     def recording(self) -> Iterator[list[str]]:
+        self._ignored = frozenset(thread.ident for thread in threading.enumerate()) - {
+            threading.get_ident()
+        }
         self._paths = paths = []
         try:
             yield paths
         finally:
             self._paths = None
+            self._ignored = frozenset()
 
 
 _OPENS = _OpenRecorder()
 sys.addaudithook(_OPENS)
+
+
+def test_the_open_recorder_ignores_threads_that_were_already_running(tmp_path):
+    """A thread another test left running may open a file at any moment; a
+    thread started while recording is still caught."""
+    go, done = threading.Event(), threading.Event()
+
+    def background() -> None:
+        go.wait(5)
+        (tmp_path / "background.txt").write_text("x")
+        done.set()
+
+    earlier = threading.Thread(target=background)
+    earlier.start()
+    with _OPENS.recording() as opened:
+        go.set()
+        assert done.wait(5)
+        started = threading.Thread(target=lambda: (tmp_path / "started.txt").write_text("y"))
+        started.start()
+        started.join()
+    earlier.join()
+
+    names = {Path(path).name for path in opened}
+    assert names & {"background.txt", "started.txt"} == {"started.txt"}
 
 
 def _opened_outside_the_template(*, paths: list[str]) -> list[str]:
