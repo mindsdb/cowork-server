@@ -93,6 +93,12 @@
   present: ['<img src="data:image/png;base64,{png_b64}">']
   omitted: [[unsupported_type, photo.jpg], [scheme, '{outside}/x.png'], [unsupported_type, 'c,d.png']]
 
+# A candidate naming the source the image inlined is used, not left out.
+- id: srcset-candidate-naming-the-inlined-src
+  html: '<img src="chart.png" srcset="chart.png 1x, photo.jpg 2x">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[unsupported_type, photo.jpg]]
+
 - id: table-cell-images
   html: '<table><tr><td><img src="chart.png"></td><td><img src="http://169.254.169.254/latest"></td></tr></table>'
   present: ['<td><img src="data:image/png;base64,{png_b64}"></td><td><img></td>']

@@ -788,19 +788,23 @@ class _Inliner:
         """Set ``src`` to the first source tried that inlines; with none, the image keeps no source.
 
         Every source the image doesn't use is listed: one tried and refused
-        with its reason, and one never tried as a load nothing read.
+        with its reason, and one never tried as a load nothing read. A
+        candidate that names the source the image uses isn't listed.
         """
         unused = sources.untried
+        used = None
         for index, candidate in enumerate(sources.tried):
             asset = self._inline_asset(
                 reference=candidate, base_parts=self.base_parts, kind=_AssetKind.IMAGE
             )
             if asset is not None:
                 element.set("src", self._placeholder(uri=asset.uri))
+                used = _clean_reference(value=candidate)
                 unused = [*sources.tried[index + 1:], *sources.untried]
                 break
         for reference in unused:
-            self._omit_unloaded(reference=reference)
+            if _clean_reference(value=reference) != used:
+                self._omit_unloaded(reference=reference)
 
     def _inline_asset(
         self, *, reference: str, base_parts: tuple[str, ...], kind: _AssetKind
