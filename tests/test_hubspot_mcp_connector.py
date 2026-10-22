@@ -34,14 +34,12 @@ ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 
 def _vault(tmp_path, monkeypatch):
     fake_settings = lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})()
+    # Every save, ConnectionsService (patch_access_mode's local-mode branch) and
+    # a delete's revoke find the vault through persist.own_vault_for_scope, which
+    # reads persist's own ConnectorSettings import, so patching it alone points
+    # the whole flow at the one test vault.
     monkeypatch.setattr(
-        "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings", fake_settings,
-    )
-    # ConnectionsService (used by patch_access_mode's local-mode branch) reads
-    # its own module-level ConnectorSettings import, separate from the one
-    # above — both must point at the same test vault.
-    monkeypatch.setattr(
-        "cowork.services.connectors.connections.ConnectorSettings", fake_settings,
+        "cowork.services.connectors.persist.ConnectorSettings", fake_settings,
     )
 
 
@@ -211,23 +209,6 @@ class TestPatchAccessMode:
         assert calls == [("hubspot", "acme-hubspot", "write")]
 
 
-#: These tests monkeypatch `anton.core.mcp.wiring.call_mcp_tool`, which needs
-#: the module to exist. cowork-server's published anton floor
-#: (`anton-agent>=2.26.8.23.1`) still resolves builds that predate the MCP
-#: client — promoting it to anton's `main` is a separate release step
-#: (ENG-1816) — so on those builds there is genuinely nothing to exercise.
-#: Skipping is the honest outcome; the endpoint's own behaviour under that
-#: skew is covered by `TestMcpIdentityBridgeWithoutAntonMcp` below, which
-#: runs either way.
-try:  # pragma: no cover - import probe, not logic
-    import anton.core.mcp.wiring  # noqa: F401
-
-    HAS_ANTON_MCP = True
-except ImportError:  # pragma: no cover
-    HAS_ANTON_MCP = False
-
-
-@pytest.mark.skipif(not HAS_ANTON_MCP, reason="installed anton has no anton.core.mcp (ENG-1816 not yet on anton main)")
 class TestMcpIdentityBridge:
     async def test_resolves_email_and_portal_name_from_json_string_tool_results(self, monkeypatch):
         """Real shapes, live-verified 2026-09-15 against an actual HubSpot

@@ -8,6 +8,7 @@ from __future__ import annotations
 import http.client
 import os
 import re
+import socket
 import subprocess
 import sys
 import textwrap
@@ -39,12 +40,14 @@ def _collect(*, stream: IO[str], lines: list[str]) -> None:
         lines.append(line)
 
 
-def _port(*, stderr: list[str], process: subprocess.Popen) -> int:
+def _port(*, stderr: list[str], process: subprocess.Popen, port: int) -> int:
     deadline = time.monotonic() + _TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        for line in list(stderr):
-            if match := _STARTED.search(line):
-                return int(match.group(1))
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return port
+        except OSError:
+            pass
         if process.poll() is not None:
             break
         time.sleep(0.05)
@@ -59,15 +62,19 @@ def run_uvicorn_app(
     app_dir = tmp_path / "served"
     app_dir.mkdir()
     (app_dir / "served_app.py").write_text(textwrap.dedent(app_source))
+    with socket.socket() as bound:
+        bound.bind(("127.0.0.1", 0))
+        port = bound.getsockname()[1]
+    config = str(Path(__file__).parents[1] / "cowork/logging.json")
     if launch == "module":
         command = [sys.executable, "-m", "uvicorn", "served_app:app", "--app-dir", str(app_dir),
-                   "--host", "127.0.0.1", "--port", "0"]
+                   "--host", "127.0.0.1", "--port", str(port), "--log-config", config]
     else:
         command = [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import served_app, uvicorn; "
-                   "uvicorn.run(served_app.app, host='127.0.0.1', port=0)", str(app_dir)]
+                   "uvicorn.run(served_app.app, host='127.0.0.1', port=int(sys.argv[2]), log_config=sys.argv[3])", str(app_dir), str(port), config]
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://"},
+        env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://", "LOG_LEVEL": "WARNING", "ACCESS_LOG_MODE": "all"},
     )
     stdout: list[str] = []
     stderr: list[str] = []
@@ -76,7 +83,7 @@ def run_uvicorn_app(
     for reader in readers:
         reader.start()
     try:
-        port = _port(stderr=stderr, process=process)
+        port = _port(stderr=stderr, process=process, port=port)
         statuses = []
         for path in paths:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=_TIMEOUT_SECONDS)

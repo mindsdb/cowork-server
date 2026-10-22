@@ -87,7 +87,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
 
     decision = await decide_route(
@@ -121,7 +121,7 @@ async def test_ineligible_request_shapes_delegate_without_router_call(
 ):
     import cowork.handlers.response_routing as routing
 
-    monkeypatch.setattr(routing, "build_llm_client", lambda: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: (_ for _ in ()).throw(AssertionError()))
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -159,7 +159,7 @@ async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch)
             resolved_gate_model="mindshub_air",
         ),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
 
     decision = await decide_route(
@@ -183,7 +183,7 @@ async def test_router_decline_delegates(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(
         routing,
         "_gate",
@@ -210,7 +210,7 @@ async def test_router_error_fails_open_to_anton(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -236,7 +236,7 @@ async def test_slow_gate_times_out_and_fails_open(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
     monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.02)
 
     decision = await decide_route(
@@ -871,7 +871,7 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
     )
     monkeypatch.setattr(
         routing, "build_llm_client",
-        lambda: (_ for _ in ()).throw(AssertionError("client must not build")),
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("client must not build")),
     )
     provider = _Client(_response(content="Hi there."))
 
@@ -1103,9 +1103,10 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
     )
 
     await handler._produce_direct(
-        lifecycle=SimpleNamespace(discarded=False),
+        lifecycle=responses.TurnLifecycle(),
         conv_id=conv_id,
         original_content="Hello",
+        question="Hello",
         route=route,
         buffer=buffer,
     )
@@ -1158,9 +1159,10 @@ async def test_produce_direct_answers_a_full_pool_with_a_timed_retry(monkeypatch
     buffer = _Buffer()
 
     await handler._produce_direct(
-        lifecycle=SimpleNamespace(discarded=False),
+        lifecycle=responses.TurnLifecycle(),
         conv_id=_uuid4(),
         original_content="Hello",
+        question="Hello",
         route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi."),
         buffer=buffer,
     )
@@ -1176,28 +1178,27 @@ async def test_produce_direct_answers_a_full_pool_with_a_timed_retry(monkeypatch
 
 @pytest.mark.asyncio
 async def test_streaming_direct_response_registers_its_shared_redis_buffer(monkeypatch):
+    import asyncio
     from uuid import UUID
+    import fakeredis.aioredis
 
     import cowork.handlers.responses as responses
+    from cowork.streaming import buffer as buffer_mod, cancellation, turn_index
+    from cowork.streaming.registry import RunRegistry
 
     handler = _routing_handler(monkeypatch)
     handler.scope = SimpleNamespace(org_id="org-1", user_id="user-1")
-    buffer = SimpleNamespace()
-    recorded = {}
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    for module in (buffer_mod, cancellation, turn_index):
+        monkeypatch.setattr(module, "get_redis", lambda: redis)
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+    runs = RunRegistry()
+    monkeypatch.setattr(responses, "registry", runs)
 
-    async def fake_start(**kwargs):
-        opened = kwargs["open_buffer"]()
-        kwargs["produce"](opened).close()
-        return SimpleNamespace(buffer=opened)
+    async def held_producer(**kwargs):
+        await asyncio.Event().wait()
 
-    async def fake_record(conversation_id, **kwargs):
-        recorded["conversation_id"] = conversation_id
-        recorded.update(kwargs)
-
-    monkeypatch.setattr(responses, "new_buffer", lambda _cid, _turn_id: buffer)
-    monkeypatch.setattr(responses.registry, "start", fake_start)
-    monkeypatch.setattr(responses, "get_backend", lambda: "redis")
-    monkeypatch.setattr(responses, "record_turn", fake_record)
+    monkeypatch.setattr(handler, "_produce_direct", held_producer)
     conversation_id = UUID("d27d3533-2e4e-4021-bb5a-6e238245974c")
 
     await handler._handle_direct_response(
@@ -1205,6 +1206,7 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
         conversation_id=conversation_id,
         turn_id=3,
         original_content="Hello",
+        question="Hello",
         route=RouteDecision(
             route=DIRECT_CONTEXT,
             reason="router_direct_response",
@@ -1213,11 +1215,297 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
         ),
     )
 
-    assert recorded["conversation_id"] == str(conversation_id)
-    assert recorded["turn_id"] == 3
-    assert recorded["correlation_id"].startswith("direct-")
-    assert recorded["org_id"] == "org-1"
-    assert recorded["user_id"] == "user-1"
+    try:
+        recorded = await turn_index.get_turn(str(conversation_id))
+        assert recorded["turn_id"] == "3"
+        assert recorded["run_id"] == handler.last_run_handle.run_id
+        assert recorded["correlation_id"] == handler.last_run_handle.lifecycle.identity.correlation_id
+        assert recorded["org_id"] == "org-1"
+        assert recorded["user_id"] == "user-1"
+    finally:
+        await asyncio.sleep(0)  # start the bounded producer before shutdown
+        await runs.shutdown()
+
+
+# --- a direct answer's figure sources ------------------------------------------
+
+_OVERTIME_QUESTION = "What does an hour of overtime cost over 2 shifts?"
+_OVERTIME_ANSWER = "About $30 an hour, so $60 over 2 shifts."
+
+
+def _saving_conversation_service(monkeypatch, saved: dict):
+    from uuid import uuid4 as _uuid4
+
+    import cowork.handlers.responses as responses
+
+    def save_assistant_turn(cid, text, events, harness=None):
+        saved["events"] = events
+        return SimpleNamespace(id=_uuid4())
+
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            save_user_message=lambda cid, content, pending=False: SimpleNamespace(id=_uuid4()),
+            save_assistant_turn=save_assistant_turn,
+        ),
+    )
+
+
+class _DirectBuffer:
+    def __init__(self):
+        self.frames = []
+        self.closed = None
+        self.is_closed = False
+
+    async def append(self, kind, record):
+        self.frames.append(record["sse"])
+
+    async def close(self, reason):
+        self.closed = reason
+        self.is_closed = True
+
+    def events(self) -> list[dict]:
+        import json
+
+        return [json.loads(frame.split("data: ", 1)[1]) for frame in self.frames]
+
+
+def _reading_earlier_answers(monkeypatch, *answers) -> list[tuple]:
+    """Replace the earlier answers' read with one that finds ``answers``, and
+    return the (conversation_id, scope) of each read it is asked for."""
+    import cowork.handlers.responses as responses
+
+    reads: list[tuple] = []
+
+    async def read_earlier_answers(*, conversation_id, scope):
+        reads.append((conversation_id, scope))
+        return answers
+
+    monkeypatch.setattr(responses, "read_earlier_answers", read_earlier_answers)
+    return reads
+
+
+async def _produce_direct_answer(
+    monkeypatch, *, text: str, saved: dict, conv_id=None, handler: ResponsesHandler | None = None,
+) -> _DirectBuffer:
+    from uuid import uuid4 as _uuid4
+
+    import cowork.handlers.responses as responses
+
+    handler = handler or _routing_handler(monkeypatch)
+    _saving_conversation_service(monkeypatch, saved)
+    buffer = _DirectBuffer()
+    await handler._produce_direct(
+        lifecycle=responses.TurnLifecycle(),
+        conv_id=conv_id or _uuid4(),
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=text),
+        buffer=buffer,
+    )
+    return buffer
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_carries_its_figure_sources_live_and_saved(monkeypatch):
+    saved: dict = {}
+    _reading_earlier_answers(monkeypatch)
+
+    buffer = await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved=saved)
+
+    events = buffer.events()
+    assert [e["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.memory_read", "response.figure_sources",
+        "response.completed",
+    ]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4, 5]
+    sources = events[3]
+    assert sources["item_id"] == events[1]["item_id"]
+    assert sources["steps"] == []
+    assert {f["text"]: f["origin"] for f in sources["figures"]} == {"$30": "none", "$60": "none", "2": "question"}
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.figure_sources", "response.completed",
+    ]
+    assert saved["events"][2] == sources
+    assert buffer.closed == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_without_figures_streams_as_before(monkeypatch):
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(monkeypatch, text="Hi.", saved=saved)
+
+    events = buffer.events()
+    assert [e["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4]
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    # It runs no agent, so it reads no learned memory.
+    assert events[2] == {"type": "response.memory_read", "sequence_number": 3, "read": False, "entries": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_matcher_failure_leaves_the_direct_answer_whole(monkeypatch, caplog):
+    import cowork.harnesses.anton_harness.stream_formatter as formatter
+
+    def broken(**_kwargs):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(formatter, "find_figure_sources", broken)
+    _reading_earlier_answers(monkeypatch)
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved=saved)
+
+    assert [e["type"] for e in buffer.events()] == [
+        "response.created", "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    assert buffer.closed == "completed"
+    assert [r for r in caplog.records if r.name == formatter.logger.name and r.levelname == "ERROR"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_direct_answer_returns_and_saves_its_figure_sources(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    saved: dict = {}
+    _saving_conversation_service(monkeypatch, saved)
+    _reading_earlier_answers(monkeypatch)
+
+    response = await handler._handle_direct_response(
+        request=SimpleNamespace(stream=False),
+        conversation_id=_uuid4(),
+        turn_id=1,
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=_OVERTIME_ANSWER),
+    )
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert {f["text"]: f["origin"] for f in output["figure_sources"]["figures"]} == {
+        "$30": "none", "$60": "none", "2": "question",
+    }
+    [saved_sources] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
+    assert saved_sources["figures"] == output["figure_sources"]["figures"]
+    # The order a streamed direct answer sends them in.
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.figure_sources", "response.completed",
+    ]
+    assert [e for e in saved["events"] if e["type"] == "response.memory_read"] == [
+        {"type": "response.memory_read", "read": False, "entries": 0}
+    ]
+
+
+def _overtime_earlier_answer():
+    """An earlier answer that read the overtime rate, $30, from a step."""
+    from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
+
+    return EarlierAnswer(figures=[Figure(start=0, end=3, text="$30", origin=FigureOrigin.step)])
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_marks_a_figure_an_earlier_answer_gave(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = _uuid4()
+    reads = _reading_earlier_answers(monkeypatch, _overtime_earlier_answer())
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(
+        monkeypatch, text=_OVERTIME_ANSWER, saved=saved, conv_id=conv_id, handler=handler,
+    )
+
+    [live] = [e for e in buffer.events() if e["type"] == "response.figure_sources"]
+    assert {f["text"]: f["origin"] for f in live["figures"]} == {
+        "$30": "earlier_answer", "$60": "none", "2": "question",
+    }
+    assert [f["sources"] for f in live["figures"]] == [[], [], []]
+    assert live["steps"] == []
+    [persisted] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
+    assert persisted == live
+    assert reads == [(conv_id, handler.scope)]
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_direct_answer_marks_a_figure_an_earlier_answer_gave(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = _uuid4()
+    saved: dict = {}
+    _saving_conversation_service(monkeypatch, saved)
+    reads = _reading_earlier_answers(monkeypatch, _overtime_earlier_answer())
+
+    response = await handler._handle_direct_response(
+        request=SimpleNamespace(stream=False),
+        conversation_id=conv_id,
+        turn_id=1,
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=_OVERTIME_ANSWER),
+    )
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert {f["text"]: f["origin"] for f in output["figure_sources"]["figures"]} == {
+        "$30": "earlier_answer", "$60": "none", "2": "question",
+    }
+    [persisted] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
+    assert persisted["figures"] == output["figure_sources"]["figures"]
+    assert reads == [(conv_id, handler.scope)]
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_checks_for_figures_off_the_event_loop(monkeypatch):
+    """The figure check parses the whole answer, which takes tens of
+    milliseconds on a long one, so it runs in a worker thread, as the
+    matching does: every other request waits on the loop."""
+    import threading
+
+    import cowork.handlers.responses as responses
+
+    checked_on: list[int] = []
+    real_has_figures = responses.has_figures
+
+    def recording_has_figures(answer):
+        checked_on.append(threading.get_ident())
+        return real_has_figures(answer)
+
+    monkeypatch.setattr(responses, "has_figures", recording_has_figures)
+    _reading_earlier_answers(monkeypatch)
+
+    await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved={})
+
+    loop_thread = threading.get_ident()
+    assert len(checked_on) == 1
+    assert checked_on[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_without_figures_reads_no_earlier_answers(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    reads = _reading_earlier_answers(monkeypatch, _overtime_earlier_answer())
+    saved: dict = {}
+
+    await _produce_direct_answer(monkeypatch, text="Hi.", saved=saved)
+    response = await _routing_handler(monkeypatch)._handle_direct_response(
+        request=SimpleNamespace(stream=False),
+        conversation_id=_uuid4(),
+        turn_id=1,
+        original_content="Hello",
+        question="Hello",
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi."),
+    )
+
+    assert reads == []
+    assert response.model_dump(mode="json")["output"][0].get("figure_sources") is None
 
 
 # --- history view: tool rows become markers, not holes (ENG-1851) -----------
@@ -1341,7 +1629,7 @@ async def test_router_unavailable_keeps_model_attribution(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="opus"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: _Boom())
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: _Boom())
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -1588,6 +1876,7 @@ class _StreamProvider:
         self.gap = gap
         self.calls = []
         self.closed = False
+        self.read_to_end = False
 
     async def stream(self, **kwargs):
         import asyncio
@@ -1598,7 +1887,10 @@ class _StreamProvider:
             for i, event in enumerate(self.events):
                 if i and self.gap:
                     await asyncio.sleep(self.gap)
+                if isinstance(event, BaseException):
+                    raise event
                 yield event
+            self.read_to_end = True
         finally:
             self.closed = True
 
@@ -1723,6 +2015,102 @@ async def test_gate_total_budget_survives_events_that_decide_nothing(monkeypatch
         await routing._gate(_binding(noise), history=HISTORY)
 
 
+# --- usage log: a delegated gate stream is read to its end, off the decision path
+
+
+def _usage_log(monkeypatch, enabled):
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(routing, "get_app_settings", lambda: SimpleNamespace(usage_log=enabled))
+
+
+async def _drained():
+    import asyncio
+
+    import cowork.handlers.response_routing as routing
+
+    await asyncio.gather(*routing._drain_tasks)
+
+
+@pytest.mark.asyncio
+async def test_gate_cuts_a_delegated_stream_when_the_usage_log_is_off(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, False)
+    provider = _StreamProvider([_tool(), _text("args"), _complete()])
+    assert await routing._gate(_binding(provider), history=HISTORY) is None
+    assert provider.closed
+    assert not provider.read_to_end
+    assert not routing._drain_tasks
+
+
+@pytest.mark.asyncio
+async def test_gate_reads_a_delegated_stream_to_its_end_when_the_usage_log_is_on(monkeypatch):
+    """The provider records a call's usage from its last event, so the stream is
+    read to the end, but only after the decision is already returned."""
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, True)
+    provider = _StreamProvider([_tool(), _text("args"), _complete()], gap=0.05)
+    assert await routing._gate(_binding(provider), history=HISTORY) is None
+    assert not provider.read_to_end
+
+    await _drained()
+    assert provider.read_to_end
+    assert provider.closed
+
+
+@pytest.mark.asyncio
+async def test_gate_drain_stops_at_the_gate_deadline(monkeypatch, caplog):
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, True)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 0.1)
+    stuck = _StreamProvider([_tool(), _text("args"), _complete()], gap=1.0)
+    with caplog.at_level("INFO", logger=routing.__name__):
+        assert await routing._gate(_binding(stuck), history=HISTORY) is None
+        await _drained()
+
+    assert stuck.closed
+    assert not stuck.read_to_end
+    assert any("usage_drain_timeout" in r.getMessage() and "model=gate-model" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_gate_drain_failure_logs_the_error_class_not_its_text(monkeypatch, caplog):
+    import logging
+
+    import httpx
+    import openai
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, True)
+    private = "drain_private_request_marker"
+    error = openai.APIStatusError(
+        private,
+        response=httpx.Response(529, request=httpx.Request("POST", "https://example.com/" + private)),
+        body={"message": private},
+    )
+    failing = _StreamProvider([_tool(), error])
+    token = set_trace_context(TraceContext(session_id="conv-17"))
+    try:
+        with caplog.at_level(logging.WARNING, logger=routing.__name__):
+            assert await routing._gate(_binding(failing), history=HISTORY) is None
+            await _drained()
+    finally:
+        reset_trace_context(token)
+
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == (
+        "[gate] usage_drain_failed conversation=conv-17 model=gate-model "
+        "error=APIStatusError status=529")
+    assert record.exc_info is None
+    assert private not in repr(record.__dict__)
+
+
 # --- Done-when #5: the two paths can never both answer -----------------------
 
 
@@ -1743,7 +2131,7 @@ async def test_a_preamble_before_a_tool_call_delegates_and_says_nothing(monkeypa
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
@@ -1781,7 +2169,7 @@ async def test_no_delegated_route_ever_carries_text(monkeypatch, events, first_d
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     provider = _StreamProvider(events, first_delay=first_delay)
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
@@ -1801,7 +2189,7 @@ async def test_a_direct_decision_carries_the_whole_answer(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,

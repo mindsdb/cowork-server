@@ -239,3 +239,32 @@ def test_forget_sync_survives_a_redis_that_is_down(monkeypatch):
     monkeypatch.setattr(turn_index, "get_sync_redis", boom)
 
     turn_index.forget_turn_sync("c1")
+
+
+@pytest.mark.asyncio
+async def test_a_turns_owner_is_read_from_its_hash_as_a_typed_model(fake_redis):
+    await turn_index.record_turn("c1", turn_id=1, correlation_id="corr-1", org_id="o1", user_id="u1")
+    await turn_index.record_turn("c2", turn_id=1, correlation_id="corr-2", org_id=None, user_id=None)
+
+    assert turn_index.TurnOwner.from_index(await turn_index.get_turn("c1")) == turn_index.TurnOwner(
+        org_id="o1", user_id="u1"
+    )
+    # record_turn writes "" for a missing id, which reads back as None.
+    assert turn_index.TurnOwner.from_index(await turn_index.get_turn("c2")) == turn_index.TurnOwner(
+        org_id=None, user_id=None
+    )
+
+
+def test_the_owner_check_reads_the_typed_owner_and_fails_closed():
+    from cowork.api.v1.endpoints.responses import _owner_matches
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+    from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+
+    person = TenantScope(personal=True, org_id="o1", user_id="u1", personal_resources=ALL_PERSONAL_RESOURCES)
+    owner = turn_index.TurnOwner.from_index
+
+    assert _owner_matches(owner({"org_id": "o1", "user_id": "u1"}), person)
+    assert not _owner_matches(owner({"org_id": "o1", "user_id": "u2"}), person)
+    # A hash missing its user denies the real owner rather than opening up.
+    assert not _owner_matches(owner({"org_id": "o1"}), person)
+    assert _owner_matches(owner({}), LOCAL_SCOPE)
