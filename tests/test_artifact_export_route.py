@@ -701,6 +701,32 @@ def test_a_primary_that_names_a_symlink_loop_falls_back_like_the_card(
         assert _metadata(folder)["primary"] == "report.md"
 
 
+@pytest.mark.parametrize(
+    "hint", ["//203.0.113.5/share/x.md", "\\\\203.0.113.5\\share\\x.md"], ids=["slashes", "backslashes"]
+)
+def test_a_unc_primary_is_passed_over_before_any_file_call(client, local_artifact, monkeypatch, hint):
+    """On Windows, a UNC hint replaces the folder when joined onto it, and
+    resolving it opens a connection to that host with the user's credentials.
+    The export falls back to the card's own pick without resolving it."""
+    folder = local_artifact({"report.md": "# R\n"}, primary=hint)
+    resolved: list[str] = []
+    resolve = Path.resolve
+
+    def spy(self, *args, **kwargs):
+        resolved.append(str(self))
+        return resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", spy)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == "report.docx"
+    assert resolved, "the export should resolve its own paths through the spy"
+    assert [path for path in resolved if "203.0.113.5" in path] == []
+    assert _metadata(folder)["primary"] == "report.md"
+
+
 def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
     from cowork.db.scoped import get_scoped_session
     from cowork.services import product_permissions
