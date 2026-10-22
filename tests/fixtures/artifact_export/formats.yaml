@@ -56,6 +56,20 @@ cases:
   - id: generation-input
     source_name: prd.md
     expected: []
+  # As on the read: README.md and the generation inputs are content inside a
+  # subfolder, and only the store-owned names are refused at any depth.
+  - id: readme-in-a-subfolder
+    source_name: docs/README.md
+    expected: [html, docx]
+  - id: generation-input-in-a-subfolder
+    source_name: docs/prd.md
+    expected: [html, docx]
+  - id: store-owned-name-in-a-subfolder
+    source_name: docs/metadata.json/report.md
+    expected: []
+  - id: store-owned-name-casefolded-in-a-subfolder
+    source_name: docs/Metadata.JSON/report.md
+    expected: []
   - id: under-revisions
     source_name: .revisions/report.md
     expected: []

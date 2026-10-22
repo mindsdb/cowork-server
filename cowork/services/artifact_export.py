@@ -26,7 +26,6 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import anyio
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
 
 from cowork.common.paths import (
     O_NOFOLLOW,
@@ -75,12 +74,6 @@ _HTML_SOURCES = frozenset({".html", ".htm"})
 # would only be copied.
 _HTML_EXPORT_SOURCES = _MARKDOWN_SOURCES | {".txt"}
 _WORD_EXPORT_SOURCES = _HTML_EXPORT_SOURCES | _HTML_SOURCES
-# Store-owned files and the revision journal never export, compared casefolded
-# on every segment: on a case-insensitive volume ``Metadata.JSON`` opens
-# ``metadata.json``.
-_HOUSEKEEPING_NAMES = frozenset(
-    name.casefold() for name in (*NON_CONTENT_NAMES, REVISIONS_DIRNAME)
-)
 
 # The most of a source an export reads. A page carries its own markup and
 # styles, so HTML gets more room than Markdown or text.
@@ -113,10 +106,10 @@ _METADATA = "metadata.json"
 _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
 
-# Org mode offers no export format, and the route answers 403 there. On
-# hosted's pod limits, 1 CPU and 1 GiB, single exports within the org caps
-# held the event loop for 7 s (a ladder of Markdown code fences) or peaked
-# past 500 MiB (a 2 MiB Markdown table, a 10 MiB page of one-word paragraphs);
+# Org mode offers no export format, and the route answers 403 there. Measured
+# with docker --cpus=1 --memory=1g, single exports within the org caps held
+# the event loop for 7 s (a ladder of Markdown code fences) or peaked past
+# 500 MiB (a 2 MiB Markdown table, a 10 MiB page of one-word paragraphs);
 # scripts/measure_export_capacity.py holds the cases. A replica serves many
 # people at once, so org export waits until the conversion runs in a process
 # of its own that can be killed.
@@ -172,8 +165,6 @@ def export_formats(
     if is_backend or not can_edit:
         return []
     segments = source_name.replace("\\", "/").split("/")
-    if any(not segment or segment.casefold() in _HOUSEKEEPING_NAMES for segment in segments):
-        return []
     if not _read_takes_name(segments):
         return []
     suffix = PurePosixPath(segments[-1]).suffix.lower()
@@ -192,11 +183,15 @@ def _read_takes_name(segments: list[str]) -> bool:
 
     It refuses a name Windows would read as another file, such as ``aux.md``
     or ``notes:q3.md``, on every platform, and a path nested past its depth.
+    It refuses housekeeping names as the read does: any as the first segment,
+    and a store-owned one such as ``metadata.json`` at any depth, so
+    ``docs/README.md`` exports.
     """
     if len(segments) > artifact_files._MAX_PATH_PARTS:
         return False
     try:
         artifact_files._refuse_unsafe_parts(parts=tuple(segments))
+        artifact_files._refuse_housekeeping(parts=tuple(segments))
     except artifact_files.ArtifactFileRefused:
         return False
     return True
@@ -541,15 +536,25 @@ def _write_beside(
     itself, created the same way. The temporary name is always removed, as
     soon as the file has its own, so a failed export leaves no file behind.
     Returns the name.
+
+    Without a directory descriptor, as on Windows, each folder on the way is
+    opened by a joined path, so each gets the read's ``lstat`` checks. The
+    first refuses a link before the write opens through it. The second, just
+    before the file takes its name, refuses a walk that changed since. A
+    folder swapped for a link and back between the two is still followed,
+    as it is on the read.
     """
     source_name = parts[-1]
     stem = _output_stem(stem=PurePosixPath(source_name).stem, extension=extension)
+    checked: list[artifact_files._CheckedName] = []
     with ExitStack() as opened:
         parent = folder
         for requested in parts[:-1]:
-            parent = open_pinned_child(
-                parent, artifact_files._existing_draft_entry_name(parent, requested)
-            )
+            entry = artifact_files._existing_draft_entry_name(parent, requested)
+            seen = artifact_files._refuse_link_by_lstat(directory=parent, name=entry)
+            if seen is not None:
+                checked.append(seen)
+            parent = open_pinned_child(parent, entry)
             opened.callback(parent.close)
         temporary = f".cowork-export-{secrets.token_hex(12)}.tmp"
         fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
@@ -560,6 +565,7 @@ def _write_beside(
             finally:
                 os.close(fd)
             before_placing()
+            artifact_files._refuse_a_changed_walk(checked=checked)
             name = _place_temporary(
                 parent=parent,
                 temporary=temporary,

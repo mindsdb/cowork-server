@@ -25,10 +25,13 @@ import yaml
 from cowork.common.paths import PinnedDir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.schemas.artifact_export import OmittedReason
 from cowork.services import artifact_export, artifact_identity
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot
+from cowork.services.artifact_files import ArtifactFileRefused
 from cowork.services.artifacts import ProjectArtifacts
 from test_artifact_export_route import _snapshot, padded_png
+from test_artifact_files import _symlink
 from tests._no_fetch import no_fetch, recording_server
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
@@ -234,6 +237,54 @@ def test_a_parent_folder_swapped_for_a_link_mid_export_is_never_written_through(
     assert list(outside.iterdir()) == []
     assert [path.name for path in (folder / "docs-moved").iterdir()] == ["report.md"]
     assert sorted(path.name for path in folder.iterdir()) == ["docs", "docs-moved", "metadata.json"]
+
+
+def _swap_docs_for_a_link(*, folder: Path, outside: Path) -> None:
+    (folder / "docs").rename(folder / "docs-moved")
+    _symlink(link=folder / "docs", target=outside, directory=True)
+
+
+@pytest.mark.parametrize("swapped", ["before_the_write", "before_the_temporary_opens"])
+def test_without_a_directory_descriptor_a_parent_folder_swapped_for_a_link_is_never_written_through(
+    tmp_path, monkeypatch, swapped
+):
+    """The write Windows runs, where ``PinnedDir.fd`` is None and opens join paths.
+
+    The source's folder turns into a link to another folder while the
+    conversion runs, or after the write checked it and before the temporary
+    file opens. Either way the export is refused and leaves nothing outside
+    the artifact.
+    """
+    art = tmp_path / "art"
+    (art / "docs").mkdir(parents=True)
+    (art / "docs" / "report.md").write_text("# R\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(artifact_export, "O_NOFOLLOW", 0)
+    if swapped == "before_the_write":
+        _swap_docs_for_a_link(folder=art, outside=outside)
+    else:
+        real_dir_open = artifact_export.dir_open
+
+        def swapping_open(directory, name, flags, mode=0o777):
+            if name.startswith(".cowork-export-"):
+                _swap_docs_for_a_link(folder=art, outside=outside)
+            return real_dir_open(directory, name, flags, mode)
+
+        monkeypatch.setattr(artifact_export, "dir_open", swapping_open)
+
+    with pytest.raises(ArtifactFileRefused) as refused:
+        artifact_export._write_beside(
+            folder=PinnedDir(None, art),
+            parts=("docs", "report.md"),
+            extension=".docx",
+            data=b"export bytes",
+            before_placing=lambda: None,
+        )
+
+    assert refused.value.reason is OmittedReason.SYMLINK
+    assert list(outside.iterdir()) == []
+    assert [path.name for path in (art / "docs-moved").iterdir()] == ["report.md"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows keeps no permission bits beyond read-only")

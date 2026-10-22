@@ -100,6 +100,26 @@ cases:
     primary: README.md
     format: docx
     status: 422
+  - id: readme-in-a-subfolder-to-word
+    files:
+      docs/README.md: "# Setup\n"
+    primary: docs/README.md
+    format: docx
+    status: 200
+    written: docs/README.docx
+  - id: readme-in-a-subfolder-to-html
+    files:
+      docs/README.md: "# Setup\n"
+    primary: docs/README.md
+    format: html
+    status: 200
+    written: docs/README.html
+  - id: primary-under-a-store-owned-name-in-a-subfolder
+    files:
+      docs/metadata.json/report.md: "# Report\n"
+    primary: docs/metadata.json/report.md
+    format: docx
+    status: 422
   - id: primary-under-revisions
     files:
       .revisions/report.md: "# Old revision\n"
