@@ -11,6 +11,7 @@ from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
     BUDGET_SETTING_KEYS,
+    is_chosen_budget,
     default_turn_limits,
     reject_unknown_harness,
     UserSettings,
@@ -347,14 +348,15 @@ class SettingService:
             return field_val.value, validated
         return (str(field_val) if field_val is not None else value), validated
 
-    def _opt_in_with_budgets(self, keys) -> None:
-        """Saving a budget turns the limits switch on at that scope, unless the
-        switch is already stored there, or staged by the same write (an
-        explicit off stays off). Without this, a budget saved by a renderer
-        that predates the switch would be ignored until the next boot's
-        ``enable_limits_for_saved_budgets``. Call after staging the write's
-        rows: the lookup below sees them through autoflush."""
-        if not set(keys) & set(BUDGET_SETTING_KEYS):
+    def _opt_in_with_budgets(self, writes: dict[str, str]) -> None:
+        """Saving a chosen budget (``is_chosen_budget``) turns the limits
+        switch on at that scope, unless the switch is already stored there, or
+        staged by the same write (an explicit off stays off). Without this, a
+        budget saved by a renderer that predates the switch would be ignored
+        until the next boot's ``enable_limits_for_saved_budgets``. Call after
+        staging the write's rows: the lookup below sees them through
+        autoflush."""
+        if not any(k in BUDGET_SETTING_KEYS and is_chosen_budget(k, v) for k, v in writes.items()):
             return
         if self._own_row("limits_enabled") is None:
             self.session.add(self._new_row("limits_enabled", "True"))
@@ -365,7 +367,7 @@ class SettingService:
         self._require_write_target(key)
         try:
             self._write_row(key, store_val)
-            self._opt_in_with_budgets([key])
+            self._opt_in_with_budgets({key: store_val})
             self.session.commit()
         except Exception:
             self.session.rollback()
