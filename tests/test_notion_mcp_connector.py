@@ -208,7 +208,7 @@ class _FakeResponse:
 
 
 def test_revoke_posts_the_refresh_token_and_client_id_without_a_secret(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
     captured = {}
 
     def _fake_urlopen(request, timeout=10):
@@ -225,7 +225,7 @@ def test_revoke_posts_the_refresh_token_and_client_id_without_a_secret(monkeypat
 
 
 def test_revoke_failure_does_not_block_disconnect(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
 
     def _fail(request, timeout=10):
         raise OSError("connection reset")
