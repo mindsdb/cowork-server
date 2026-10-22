@@ -7,7 +7,7 @@ import re
 import stat
 import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -290,13 +290,20 @@ class MemoryStore:
 
     def delete(self, slot_id: MemorySlot | str) -> None:
         name = self._filename(slot_id)
-        try:
-            with self._root_fd(create=False) as root, self._writer_lock(root, name):
+        with ExitStack() as stack:
+            try:
+                root = stack.enter_context(self._root_fd(create=False))
+            except OSError:
+                return
+            # Outside the quiet return: a lock that cannot be taken must fail
+            # the delete, not report a slot cleared that compaction may restore.
+            stack.enter_context(self._writer_lock(root, name))
+            try:
                 st = dir_lstat(root, name)
                 if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
                     dir_unlink(root, name)
-        except OSError:
-            return
+            except OSError:
+                return
 
 
 class GlobalMemoryStore(MemoryStore):

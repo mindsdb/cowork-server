@@ -79,15 +79,21 @@ async def test_an_editor_save_during_compaction_is_not_replaced(tmp_path):
     assert store.read(MemorySlot.LESSONS) == "# Lessons\n- Typed in the editor\n"
 
 
-def test_a_link_at_the_lock_name_is_refused(tmp_path):
+@pytest.mark.parametrize("change", ["write", "delete"])
+def test_a_link_at_the_lock_name_is_refused(tmp_path, change):
     project = tmp_path / "project"
     memory = project / ".anton" / "memory"
     memory.mkdir(parents=True)
+    (memory / "rules.md").write_text("# Rules\n- Kept\n")
     victim = tmp_path / "victim"
     (memory / "rules.md.lock").symlink_to(victim)
+    store = ProjectMemoryStore(project)
 
     with pytest.raises(OSError):
-        ProjectMemoryStore(project).write(MemorySlot.RULES, "# Rules\n")
+        if change == "write":
+            store.write(MemorySlot.RULES, "# Rules\n")
+        else:
+            store.delete(MemorySlot.RULES)
 
     assert not victim.exists()
-    assert not (memory / "rules.md").exists()
+    assert (memory / "rules.md").read_text() == "# Rules\n- Kept\n"
