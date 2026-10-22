@@ -525,7 +525,7 @@ def _constant_options(*, call: ast.Call) -> dict[str, object]:
 
 
 def test_every_module_parsing_artifact_html_is_checked():
-    assert {"artifact_inline.py"} <= {path.name for path in LXML_MODULES}
+    assert {"artifact_inline.py", "docx_writer.py"} <= {path.name for path in LXML_MODULES}
 
 
 @pytest.mark.parametrize("path", LXML_MODULES, ids=[path.name for path in LXML_MODULES])
