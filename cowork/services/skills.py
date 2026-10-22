@@ -414,6 +414,31 @@ def link_turn_skills(
     return (*own.values(), *shared.values())
 
 
+def artifact_skill_dirs(
+    *, scope: TenantScope | None, project_name: str
+) -> tuple[Path, ...]:
+    """The folders of the asker's own skills that an artifact build follows
+    without a recall: part of anton's ``skills_artifact_roots``, beside the
+    host's and the managed folder's.
+
+    linked_turn_skills's selection, kept to the skills the asker may change
+    (SkillService.may_change): their whole store where skills are personal
+    and on the desktop, and only the ones they created where every person
+    reads one store. A skill another person shares is never among them: it
+    lives in its creator's store. anton follows a skill marked
+    ``applies_to: artifacts`` only when its folder, links resolved, sits
+    under one of these roots (SkillStore.list_for_artifacts), so another
+    person's text never steers the asker's build unasked.
+    """
+    service = SkillService(scope)
+    own: list[Path] = []
+    for turn_skill in linked_turn_skills(service=service, project_name=project_name):
+        skill = _skill_from_dir(turn_skill.path)
+        if skill is not None and service.may_change(skill):
+            own.append(turn_skill.path)
+    return tuple(own)
+
+
 def linked_turn_skills(
     *, service: SkillService, project_name: str | None
 ) -> list[TurnSkill]:
