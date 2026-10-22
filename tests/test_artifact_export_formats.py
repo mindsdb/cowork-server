@@ -26,7 +26,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.schemas.artifact_export import ExportPdfSettings
-from cowork.services import artifact_export
+from cowork.services import artifact_export, artifact_permissions
 from cowork.services import artifact_ownership as ownership
 from cowork.services.artifact_export import (
     ExportSource,
@@ -194,6 +194,37 @@ def test_the_local_workspace_response_carries_export_formats(tmp_path, local_mod
 
     assert response.status_code == 200, response.text
     assert response.json()["capabilities"]["exportFormats"] == ["html", "docx"]
+
+
+def test_the_workspace_response_decides_export_formats_where_artifact_capabilities_does(
+    tmp_path, local_mode, monkeypatch
+):
+    """The workspace response already holds its owner's capabilities, and adds
+    exportFormats through the helper artifact_capabilities() adds it with. A
+    change to how the list is decided then reaches both answers alike."""
+    source = _local_source(tmp_path)
+    artifact_id, folder = _write_artifact(
+        source.base, "report", {"report.md": "# R\n"}, type="document", primary="report.md"
+    )
+    monkeypatch.setattr(
+        workspace_ep,
+        "review_artifact_for_request",
+        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+    )
+    monkeypatch.setattr(artifact_permissions, "offered_export_formats", lambda **_kwargs: ["docx"])
+    from cowork.server import create_app
+
+    response = TestClient(create_app()).get(f"/api/v1/artifacts/workspace/local/{artifact_id}")
+    capabilities = artifact_capabilities(
+        SimpleNamespace(scope=LOCAL_SCOPE),
+        source,
+        "report",
+        export_source=ExportSource(source_name="report.md", is_backend=False),
+    )
+
+    assert response.status_code == 200, response.text
+    assert capabilities["exportFormats"] == ["docx"]
+    assert response.json()["capabilities"]["exportFormats"] == ["docx"]
 
 
 def test_the_workspace_response_offers_nothing_for_a_hard_linked_primary(
