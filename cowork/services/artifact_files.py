@@ -12,7 +12,10 @@ inside the folder can name another artifact's file.
 Windows has no ``dir_fd`` and no ``O_NOFOLLOW``, so ``PinnedDir.fd`` is None
 there and an open joins the name onto a path. There the segment rules are the
 guard, plus an ``lstat`` of every segment that refuses a link or a reparse
-point before anything opens through it.
+point before anything opens through it, and again once the file is open,
+which refuses a walk whose names changed in between. A folder swapped for a
+junction and back again within that window is still followed: only the
+opened handle's final path would show it.
 """
 from __future__ import annotations
 
@@ -114,6 +117,14 @@ class PinnedDraftFile(NamedTuple):
 class _OpenedFile(NamedTuple):
     fd: int
     file_stat: os.stat_result
+
+
+class _CheckedName(NamedTuple):
+    """A name the walk opened by a joined path, and the file its ``lstat`` saw."""
+
+    directory: PinnedDir
+    name: str
+    identity: tuple[int, int]  # (st_dev, st_ino)
 
 
 @dataclass
@@ -299,16 +310,18 @@ def _disk_name(*, directory: PinnedDir, requested: str, budget: _ScanBudget | No
 _NAME_SURROGATE_TAG = 0x20000000
 
 
-def _refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> None:
+def _refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> _CheckedName | None:
     """Without a directory descriptor, refuse a link before opening through it.
 
     ``lstat`` reports the link itself. A symlink is refused as one. A junction
     or mount point is a reparse point whose tag marks it a name surrogate, one
     that stands for another path. Other reparse points, such as cloud-sync
     placeholders and deduplicated files, are files in place and are read.
+    Returns what ``lstat`` saw, for ``_refuse_a_changed_walk``; with a
+    directory descriptor there is nothing to check, and it returns None.
     """
     if directory.fd is not None:
-        return
+        return None
     try:
         entry_stat = dir_lstat(directory, name)
     except OSError as exc:
@@ -318,6 +331,22 @@ def _refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> None:
     is_reparse_point = getattr(entry_stat, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     if is_reparse_point and getattr(entry_stat, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG:
         raise ArtifactFileRefused(OmittedReason.REPARSE_POINT, "link")
+    return _CheckedName(
+        directory=directory, name=name, identity=(entry_stat.st_dev, entry_stat.st_ino)
+    )
+
+
+def _refuse_a_changed_walk(*, checked: list[_CheckedName]) -> None:
+    """Once the file is open, refuse a walk whose names changed since their ``lstat``.
+
+    Each name was opened by a joined path after its ``lstat``, so a folder on
+    the way could have turned into a junction, or the file into a link, in
+    between. Every name must still be no link and the same file it was.
+    """
+    for entry in checked:
+        current = _refuse_link_by_lstat(directory=entry.directory, name=entry.name)
+        if current is None or current.identity != entry.identity:
+            raise ArtifactFileRefused(OmittedReason.MISSING, "changed during the walk")
 
 
 def _open_failure(*, directory: PinnedDir, name: str, exc: OSError) -> ArtifactFileRefused:
@@ -337,10 +366,14 @@ def _open_failure(*, directory: PinnedDir, name: str, exc: OSError) -> ArtifactF
     return ArtifactFileRefused(OmittedReason.MISSING, "cannot open")
 
 
-def _descend(*, directory: PinnedDir, name: str) -> PinnedDir:
-    """Open direct child directory *name*, returning a ``PinnedDir`` to close."""
-    _refuse_link_by_lstat(directory=directory, name=name)
-    if directory.fd is None:
+def _descend(*, directory: PinnedDir, name: str, checked: list[_CheckedName]) -> PinnedDir:
+    """Open direct child directory *name*, returning a ``PinnedDir`` to close.
+
+    Without a directory descriptor, what ``lstat`` saw joins *checked*.
+    """
+    seen = _refuse_link_by_lstat(directory=directory, name=name)
+    if seen is not None:
+        checked.append(seen)
         return open_pinned_child(directory, name)
     try:
         fd = dir_open(directory, name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
@@ -366,12 +399,14 @@ def _open_regular_file(
     if not parts:
         raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "empty path")
     _refuse_housekeeping(parts=parts)
+    checked: list[_CheckedName] = []
     current = folder
     try:
         for requested in parts[:-1]:
             child = _descend(
                 directory=current,
                 name=_disk_name(directory=current, requested=requested, budget=budget),
+                checked=checked,
             )
             # Swap before closing, so the finally below still closes the child
             # if closing the parent fails.
@@ -379,12 +414,15 @@ def _open_regular_file(
             if parent is not folder:
                 parent.close()
         name = _disk_name(directory=current, requested=parts[-1], budget=budget)
-        _refuse_link_by_lstat(directory=current, name=name)
+        seen = _refuse_link_by_lstat(directory=current, name=name)
+        if seen is not None:
+            checked.append(seen)
         try:
             fd = dir_open(current, name, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         except OSError as exc:
             raise _open_failure(directory=current, name=name, exc=exc) from exc
         resources.callback(os.close, fd)
+        _refuse_a_changed_walk(checked=checked)
     finally:
         if current is not folder:
             current.close()
