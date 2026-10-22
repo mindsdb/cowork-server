@@ -15,6 +15,7 @@ import html
 import json
 import os
 import secrets
+import stat
 from collections.abc import AsyncIterator, Callable
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -159,6 +160,8 @@ def export_formats(
     segments = source_name.replace("\\", "/").split("/")
     if any(not segment or segment.casefold() in _HOUSEKEEPING_NAMES for segment in segments):
         return []
+    if not _read_takes_name(segments):
+        return []
     suffix = PurePosixPath(segments[-1]).suffix.lower()
     formats: list[ExportFormat] = []
     if suffix in _HTML_EXPORT_SOURCES:
@@ -168,6 +171,21 @@ def export_formats(
         if pdf.engine == "render" and pdf.render_url is not None:
             formats.append("pdf")
     return formats
+
+
+def _read_takes_name(segments: list[str]) -> bool:
+    """Whether the export's pinned read takes a path of these segments, by text alone.
+
+    It refuses a name Windows would read as another file, such as ``aux.md``
+    or ``notes:q3.md``, on every platform, and a path nested past its depth.
+    """
+    if len(segments) > artifact_files._MAX_PATH_PARTS:
+        return False
+    try:
+        artifact_files._refuse_unsafe_parts(parts=tuple(segments))
+    except artifact_files.ArtifactFileRefused:
+        return False
+    return True
 
 
 def export_pdf_settings() -> ExportPdfSettings:
@@ -210,12 +228,27 @@ def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
 
 
 def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
-    """The export source of the artifact in *folder*: its primary file and its type."""
+    """The export source of the artifact in *folder*: its primary file and its type.
+
+    A primary the export's read refuses for what it is on disk names no
+    source, so no format is offered for it: a file that isn't regular, or one
+    with a second hard link, which a sync or backup tool can give it.
+    """
     parts = _primary_parts(folder=folder, metadata=metadata)
+    if parts is not None and not _single_link_file(folder.joinpath(*parts)):
+        parts = None
     return ExportSource(
         source_name="/".join(parts or ()),
         is_backend=is_backend_type(metadata.get("type")),
     )
+
+
+def _single_link_file(path: Path) -> bool:
+    try:
+        found = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(found.st_mode) and found.st_nlink == 1
 
 
 def card_export_source(card: dict) -> ExportSource:

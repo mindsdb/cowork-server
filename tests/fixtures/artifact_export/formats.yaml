@@ -65,6 +65,20 @@ cases:
   - id: windows-separators-under-revisions
     source_name: '.revisions\report.md'
     expected: []
+  # The export's read refuses a name Windows would read as another file,
+  # on every platform, so no format is offered for one.
+  - id: windows-device-name
+    source_name: aux.md
+    expected: []
+  - id: windows-device-name-in-a-subfolder
+    source_name: docs/nul/report.md
+    expected: []
+  - id: alternate-data-stream
+    source_name: "notes:q3.md"
+    expected: []
+  - id: trailing-space-in-a-subfolder
+    source_name: "docs /report.md"
+    expected: []
   - id: render-service-markdown
     source_name: report.md
     pdf: *render_service
