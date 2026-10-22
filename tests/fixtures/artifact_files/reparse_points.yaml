@@ -1,0 +1,12 @@
+# Walks without a directory descriptor, the way Windows runs them, where one
+# segment's lstat reports FILE_ATTRIBUTE_REPARSE_POINT. The test folder holds
+# `junction/secret.txt` and `sub/placeholder.png`. `reparse_name` is the
+# segment whose lstat reports the reparse point, and the walk must refuse it
+# before any open.
+
+- id: middle
+  parts: ["junction", "secret.txt"]
+  reparse_name: junction
+- id: leaf
+  parts: ["sub", "placeholder.png"]
+  reparse_name: placeholder.png
