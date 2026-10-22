@@ -279,11 +279,18 @@ def _disk_name(*, directory: PinnedDir, requested: str, budget: _ScanBudget | No
         raise ArtifactFileRefused(OmittedReason.MISSING, "no such entry") from exc
 
 
+# The reparse-tag bit Windows sets on a reparse point that stands for another
+# path (IsReparseTagNameSurrogate).
+_NAME_SURROGATE_TAG = 0x20000000
+
+
 def _refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> None:
     """Without a directory descriptor, refuse a link before opening through it.
 
-    ``lstat`` reports the link itself. A symlink is refused as one; a junction
-    or any other reparse point carries ``FILE_ATTRIBUTE_REPARSE_POINT``.
+    ``lstat`` reports the link itself. A symlink is refused as one. A junction
+    or mount point is a reparse point whose tag marks it a name surrogate, one
+    that stands for another path. Other reparse points, such as cloud-sync
+    placeholders and deduplicated files, are files in place and are read.
     """
     if directory.fd is not None:
         return
@@ -293,8 +300,9 @@ def _refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> None:
         raise ArtifactFileRefused(OmittedReason.MISSING, "no such entry") from exc
     if stat.S_ISLNK(entry_stat.st_mode):
         raise ArtifactFileRefused(OmittedReason.SYMLINK, "symlink")
-    if getattr(entry_stat, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-        raise ArtifactFileRefused(OmittedReason.REPARSE_POINT, "reparse point")
+    is_reparse_point = getattr(entry_stat, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if is_reparse_point and getattr(entry_stat, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG:
+        raise ArtifactFileRefused(OmittedReason.REPARSE_POINT, "link")
 
 
 def _open_failure(*, directory: PinnedDir, name: str, exc: OSError) -> ArtifactFileRefused:
@@ -418,8 +426,9 @@ def read_artifact_file_entry(
     Raises ``ArtifactFileRefused`` with the reason: a path that isn't plain
     names is ``TRAVERSAL``, a store-owned name is ``HOUSEKEEPING``, a symlink
     or a second hard link is ``SYMLINK``, a UNC or device path is
-    ``UNC_PATH``, a reparse point is ``REPARSE_POINT``, anything absent or not
-    a regular file is ``MISSING``, a file over *max_bytes* is ``TOO_LARGE``,
+    ``UNC_PATH``, a junction or other reparse point that stands for another
+    path is ``REPARSE_POINT``, anything absent or not a regular file is
+    ``MISSING``, a file over *max_bytes* is ``TOO_LARGE``,
     and a path over ``_MAX_PATH_PARTS`` segments or a walk that would read
     over ``_MAX_SCANNED_ENTRIES`` directory entries is ``BUDGET``. The read
     stops one byte past *max_bytes*, so a file that grows after the size

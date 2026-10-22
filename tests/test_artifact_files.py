@@ -311,7 +311,7 @@ def test_without_a_directory_descriptor_a_symlink_is_refused_before_any_open(
 
 
 @pytest.mark.parametrize("case", REPARSE_POINTS, ids=[case["id"] for case in REPARSE_POINTS])
-def test_without_a_directory_descriptor_a_reparse_point_is_refused_by_lstat_before_any_open(
+def test_without_a_directory_descriptor_only_a_link_is_refused_by_lstat_before_any_open(
     art, monkeypatch, case
 ):
     parts = tuple(case["parts"])
@@ -329,9 +329,13 @@ def test_without_a_directory_descriptor_a_reparse_point_is_refused_by_lstat_befo
         return SimpleNamespace(
             st_mode=found.st_mode,
             st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            st_reparse_tag=case["reparse_tag"],
         )
 
     monkeypatch.setattr(artifact_files, "dir_lstat", reparse_lstat)
+    if not case["refused"]:
+        assert read_artifact_file(folder=PinnedDir(None, art), parts=parts, max_bytes=1024) == PNG
+        return
     opened = _record_dir_opens(monkeypatch=monkeypatch)
 
     with pytest.raises(ArtifactFileRefused) as refused:
