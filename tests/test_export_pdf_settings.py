@@ -9,6 +9,7 @@ from pathlib import Path
 
 import dotenv
 import pytest
+import uvicorn
 import yaml
 from pydantic import BaseModel
 
@@ -184,17 +185,66 @@ def test_pdf_settings_written_through_settings_raw_offer_no_pdf_after_a_restart(
     finally:
         session.close()
 
-    # On the desktop the server is installed under COWORK_HOME, so the CLI's
-    # load_dotenv() finds <COWORK_HOME>/.env walking up from the package.
+    _cli_loads_dotenv(monkeypatch, env_path=env_path)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **_: None)
+    cli.main()
+
+    # The server read its PDF settings before the .env joined the environment...
+    assert get_export_pdf_settings().engine is None
+    # ...and the .env's PDF settings never stay there, so a process that reads
+    # them afresh offers no PDF either.
+    assert EXPORT_PDF_ENGINE_VAR not in os.environ
+    assert EXPORT_RENDER_URL_VAR not in os.environ
+    assert load_export_pdf_settings(environ=os.environ).engine is None
+
+
+def test_a_dotenv_that_sets_web_concurrency_still_serves_in_one_process(monkeypatch, tmp_path):
+    # uvicorn reads WEB_CONCURRENCY as it starts, after the .env joined the
+    # environment, and each worker process it starts reads the PDF settings
+    # afresh.
+    env_path = tmp_path / ".env"
+    env_path.write_text(PDF_LINES + "WEB_CONCURRENCY=2\n", encoding="utf-8")
+    monkeypatch.setenv("WEB_CONCURRENCY", "")
+    monkeypatch.delenv("WEB_CONCURRENCY")
+    _cli_loads_dotenv(monkeypatch, env_path=env_path)
+    configs: list[uvicorn.Config] = []
+    # uvicorn.run builds this Config, and starts worker processes when its count is over 1.
+    monkeypatch.setattr(
+        cli.uvicorn,
+        "run",
+        lambda app, **kwargs: configs.append(uvicorn.Config(app, **{**kwargs, "log_config": None})),
+    )
+
+    cli.main()
+
+    assert os.environ["WEB_CONCURRENCY"] == "2"
+    assert [config.workers for config in configs] == [1]
+
+
+def test_pdf_settings_the_server_started_with_stay_in_the_environment(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"{EXPORT_RENDER_URL_VAR}=http://127.0.0.1:9999\n", encoding="utf-8")
+    monkeypatch.setenv(EXPORT_PDF_ENGINE_VAR, "render")
+    monkeypatch.setenv(EXPORT_RENDER_URL_VAR, "http://127.0.0.1:9000")
+    _cli_loads_dotenv(monkeypatch, env_path=env_path)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **_: None)
+
+    cli.main()
+
+    assert (os.environ[EXPORT_PDF_ENGINE_VAR], os.environ[EXPORT_RENDER_URL_VAR]) == (
+        "render",
+        "http://127.0.0.1:9000",
+    )
+    assert str(get_export_pdf_settings().render_url) == "http://127.0.0.1:9000/"
+
+
+def _cli_loads_dotenv(monkeypatch: pytest.MonkeyPatch, *, env_path: Path) -> None:
+    """Make the CLI's load_dotenv() read ``env_path``.
+
+    On the desktop the server is installed under COWORK_HOME, so the CLI's
+    load_dotenv() finds <COWORK_HOME>/.env walking up from the package.
+    """
     real_load_dotenv = dotenv.load_dotenv
     monkeypatch.setattr(
         dotenv, "load_dotenv", lambda **kwargs: real_load_dotenv(dotenv_path=env_path, **kwargs)
     )
-    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **_: None)
-    cli.main()
-
-    # The .env reached the process environment, so reading it now would turn PDF on...
-    assert os.environ[EXPORT_PDF_ENGINE_VAR] == "render"
-    assert load_export_pdf_settings(environ=os.environ).engine == "render"
-    # ...but the server read its PDF settings before that, and offers none.
-    assert get_export_pdf_settings().engine is None
