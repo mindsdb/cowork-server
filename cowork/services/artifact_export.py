@@ -319,19 +319,35 @@ def _wrap_html_document(body_html: str, title: str) -> str:
     )
 
 
+def _primary_names_a_file(*, folder: PinnedDir, primary: object) -> bool:
+    """Whether metadata's *primary* names a file the card shows.
+
+    The card reads the hint through ``_pick_primary``; with no files to fall
+    back on, it returns a file only when the hint names one.
+    """
+    io_folder = _pinned_directory_path(folder)
+    if not isinstance(primary, str) or not primary or io_folder is None:
+        return False
+    return _pick_primary(io_folder, [], primary_hint=primary) is not None
+
+
 def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     """Record the primary the card shows when ``metadata.json`` names none.
 
     Without it, the new file could become the card's primary: the card picks an
     HTML file over Markdown, and otherwise the newest file. So it runs before
-    the new file takes its name. The primary is merged into the latest
-    document and written atomically, as ``ensure_full_id`` widens an id, and
-    the file's timestamps are put back because the artifact's content did not
-    change. If the export then fails, the record stays: it names the file the
-    card already shows. A primary that is already set is never changed.
+    the new file takes its name. A primary that names no file, such as one the
+    agent renamed, counts as none, because the card falls back the same way.
+    The primary is merged into the latest document and written atomically, as
+    ``ensure_full_id`` widens an id, and the file's timestamps are put back
+    because the artifact's content did not change. If the export then fails,
+    the record stays: it names the file the card already shows. A primary
+    that names a file is never changed.
     """
     latest = json.loads(_read_no_follow(folder, _METADATA))
-    if not isinstance(latest, dict) or latest.get("primary"):
+    if not isinstance(latest, dict) or _primary_names_a_file(
+        folder=folder, primary=latest.get("primary")
+    ):
         return
     before = dir_stat(folder, _METADATA, follow_symlinks=False)
     _atomic_json(folder, _METADATA, {**latest, "primary": primary})

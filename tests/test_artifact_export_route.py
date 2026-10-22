@@ -532,9 +532,9 @@ def test_exports_leave_the_card_primary_and_publish_state_alone(
 
 
 def test_a_recorded_primary_is_never_changed(client, local_artifact):
-    """A primary naming a file that no longer exists stays as it is: the
-    export follows the card's own fallback and writes no metadata."""
-    folder = local_artifact({"notes.md": "# N\n"}, primary="gone.md")
+    """A primary that names a file stays as it is, even where the card's own
+    fallback would pick another file, and the export writes no metadata."""
+    folder = local_artifact({"notes.md": "# N\n", "index.html": "<h1>I</h1>"}, primary="notes.md")
     metadata_before = (folder / "metadata.json").read_bytes()
 
     response = client.post(EXPORT_URL, json={"format": "html"})
@@ -542,6 +542,32 @@ def test_a_recorded_primary_is_never_changed(client, local_artifact):
     assert response.status_code == 200, response.text
     assert response.json()["filename"] == "notes.html"
     assert (folder / "metadata.json").read_bytes() == metadata_before
+
+
+@pytest.mark.parametrize(("export_format", "extension"), [("docx", ".docx"), ("html", ".html")])
+def test_a_primary_that_names_no_file_counts_as_unset(
+    client, local_artifact, export_format, extension
+):
+    """The agent renamed report.md to final.md, and metadata.json still names
+    report.md. The card shows final.md, and the export records it, so the new
+    file never takes the card over and Export stays offered."""
+    folder = local_artifact({"final.md": "# F\n"}, primary="report.md")
+    _published(folder, "final.md")
+    card_before = _card(folder)
+    assert card_before["path"] == str(folder / "final.md")
+
+    first = client.post(EXPORT_URL, json={"format": export_format})
+    time.sleep(0.01)
+    second = client.post(EXPORT_URL, json={"format": export_format})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert [first.json()["filename"], second.json()["filename"]] == [
+        f"final{extension}",
+        f"final (2){extension}",
+    ]
+    assert _card(folder) == card_before
+    assert _metadata(folder)["primary"] == "final.md"
 
 
 def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
