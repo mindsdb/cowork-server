@@ -19,7 +19,7 @@ import secrets
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import docx
 import lxml.html
@@ -69,6 +69,12 @@ _EMU_PER_INCH = 914_400
 _DEFAULT_DPI = 72
 
 _HTML_SPACE = re.compile("[ \t\n\r\f]+")
+# What RFC 3986 lets a URI hold as it is, beyond letters, digits and "-._~".
+# Every other character in a link target is percent-encoded, so a consumer
+# that checks a relationship's Target reads a valid URI.
+_URI_SAFE = "!#$%&'()*+,/:;=?@[]"
+# A "%" that starts no escape, which the encoding writes as "%25".
+_LONE_PERCENT = re.compile("%(?![0-9A-Fa-f]{2})")
 _LEADING_DIGITS = re.compile(r"\s*([0-9]+)")
 # python-docx writes each of these as its own element.
 _PRE_BREAKS = re.compile("[\n\t]")
@@ -994,7 +1000,7 @@ def _link_target(*, href: str | None) -> str | None:
         return None
     if parts.scheme != "mailto" and not parts.netloc:
         return None
-    return parts.geturl()
+    return quote(_LONE_PERCENT.sub("%25", parts.geturl()), safe=_URI_SAFE)
 
 
 def _image_bytes(*, src: str) -> bytes | None:
