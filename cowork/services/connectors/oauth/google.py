@@ -4,14 +4,12 @@ import base64
 import html as html_lib
 import json
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -24,6 +22,9 @@ from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry as spec_registry
 
 import logging as _logging
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
 _log = _logging.getLogger("cowork.oauth")
 
@@ -348,16 +349,16 @@ _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
 
 
 def _vault_for(connector_settings: ConnectorSettings, scope):
-    """The org's persisted connector vault.
+    """The scope's persisted connector vault, read for a revoke or catalogue.
 
-    Keyed per organization in org mode, the same as every other filesystem
-    store. Without the scope this resolved to the shared namespace root, so
-    one organization's OAuth tokens were read from, and revoked out of, a
-    directory holding every organization's.
+    The canonical persist.own_vault_for_scope, so the revoke read and the save
+    resolve the vault through one ConnectorSettings import and can never key it
+    differently. ``connector_settings`` is kept for the call sites; the path
+    comes from own_vault_for_scope, which reads the same vault_dir.
     """
-    from cowork.db.scoped import scoped_storage_root
+    from cowork.services.connectors.persist import own_vault_for_scope
 
-    return LocalDataVault(scoped_storage_root(Path(connector_settings.vault_dir), scope, store="data-vault"))
+    return own_vault_for_scope(scope)
 
 
 class OAuthService:
@@ -442,7 +443,10 @@ class OAuthService:
 
         return OAuthStartResponse(auth_url=auth_url, redirect_uri=redirect_uri, started_at=started_at, state=state)
 
-    def callback(self, service: str, code: str, state: str, error: str, settings: OAuthSettings) -> str:
+    def callback(self, service: str, code: str, state: str, error: str, settings: OAuthSettings,
+                 *, scope: "TenantScope | None") -> str:
+        """Finish a local sign-in started by ``start`` and save the connection
+        into ``scope``'s vault."""
         cfg = OAUTH_SERVICES[service]
         store = self._store(settings)
         service_label = service.replace("-", " ").title()
@@ -584,6 +588,7 @@ class OAuthService:
             connection_name = persist_connection(
                 cfg.engine, "browser_oauth_builtin", "", new_fields,
                 default_label=oauth_default_label(new_fields, cfg.engine),
+                scope=scope,
             )
         except HTTPException as exc:
             err_msg = str(exc.detail)

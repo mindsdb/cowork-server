@@ -24,7 +24,14 @@ from cowork.common.paths import (
     safe_join,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import (
+    ScopedSession,
+    TenantScope,
+    scoped_storage_root,
+    tenant_scope_required,
+    unsafe_unscoped_session,
+)
 from cowork.models.project import Project
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
 
@@ -85,6 +92,46 @@ def display_label(project: "Project") -> str:
     return getattr(project, "display_name", None) or project.name
 
 
+def _rename_rewrites_skill_store(scope: TenantScope) -> bool:
+    """Whether a project rename under ``scope`` rewrites the project names in
+    the scope's skill store.
+
+    Skills name their projects by name, and a name is unique only inside one
+    partition. Where skills stay shared while projects are each person's own,
+    one store's skill names every person's same-named project, so rewriting
+    it for one person's rename would take the skill from everyone else's: the
+    store is left alone, and the renamed project loses the skill until
+    someone scopes it again. Everywhere else the store a rename rewrites is
+    no wider than the project's own partition. With projects shared and
+    skills personal that is the renamer's own store, and other people's
+    skills keep the old project name.
+
+    A deployment that trusts identity headers decides from its own list, not
+    from the scope: the operator view (LOCAL_SCOPE) partitions nothing, yet
+    its rename of a base project would still rewrite the one shared store.
+    """
+    settings = get_app_settings()
+    if settings.trust_identity_headers:
+        personal = settings.personal_resources
+        return not (
+            PersonalResource.PROJECTS in personal and PersonalResource.SKILLS not in personal
+        )
+    return not (
+        scope.partitioned_for(PersonalResource.PROJECTS)
+        and not scope.partitioned_for(PersonalResource.SKILLS)
+    )
+
+
+def projects_root(*, scope: TenantScope | None) -> Path:
+    """The projects root for ``scope``: org- or person-keyed where projects
+    are partitioned, the unkeyed root otherwise. The one expression for the
+    projects store, so ProjectService's own root, the artifact scan and the
+    workspace-path resolver can never key it differently."""
+    return scoped_storage_root(
+        Path(get_app_settings().project.root_dir), scope, store="projects"
+    )
+
+
 class ProjectNotFoundError(ValueError):
     """The requested project is absent from the caller's scoped view."""
 
@@ -99,6 +146,14 @@ class ProjectNameLockBusyError(Exception):
 
 class ProjectPathNotAllowedError(ValueError):
     """A caller chose a project folder on a deployment that does not allow one."""
+
+
+class ProjectInUseError(Exception):
+    """Another person still has conversations or schedules in a shared project.
+
+    Not a `ValueError`, which the endpoints map to 400: the request is fine,
+    and the endpoint answers 409 until those rows are gone.
+    """
 
 
 @dataclass
@@ -123,12 +178,15 @@ class ProjectService:
         """The caller's default project, provisioned on demand.
 
         Desktop keeps the seeded GENERAL row, re-pointed when the projects root
-        has moved since it was seeded. Org mode gives each org its own row
-        and directory: one seeded id can't serve N tenants (the first org claimed
-        it, the rest got None → 404). Idempotent — called on every request.
+        has moved since it was seeded, and so does a personal scope that keeps
+        projects shared. Org mode gives each org its own row and directory, and
+        a personal scope that keeps projects per person gives each person's
+        partition its own: one seeded id can't serve N tenants (the first org
+        claimed it, the rest got None → 404). `uq_projects_default_per_org`
+        holds one per org_id. Idempotent — called on every request.
         """
         scope = self.session.scope
-        if not scope.org_mode or scope.org_id is None:
+        if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
             project = self.session.get(Project, GENERAL_PROJECT_ID)
             if project is not None:
                 # Defensive, and keyed off the deployment rather than this
@@ -319,11 +377,7 @@ class ProjectService:
         the same project name collided, and the second create hit an existing
         dir — a cross-org existence oracle.
         """
-        return scoped_storage_root(
-            Path(get_app_settings().project.root_dir),
-            self.session.scope,
-            store="projects",
-        )
+        return projects_root(scope=self.session.scope)
 
     # --- Symlink-safe filesystem ops on the projects root -------------------
     #
@@ -602,11 +656,24 @@ class ProjectService:
         distribution and rename all find projects by scanning that root, so
         they need this to know when to consult the row instead.
 
-        Always False in org mode. A folder can only be adopted on a local
-        deployment, so a path outside the org-keyed root there is a stale or
-        pre-org-keyed row -- `_repoint_if_stale`'s job, not a chosen folder.
+        Always False in org mode and inside a personal partition's projects.
+        A folder can only be adopted where projects are not partitioned, so a
+        path outside the partition-keyed root there is a stale or
+        pre-partition row -- `_repoint_if_stale`'s job, not a chosen folder.
+
+        False too for any row with an org_id, whatever the scope reading it.
+        Such a row was created in an org or a person's partition, where
+        adoption is refused (`_adopt_project_dir`), so the operator view
+        (LOCAL_SCOPE) sees its directory under that partition's own root, not
+        a folder somebody chose; reading it as one would list that person's
+        artifacts in the operator view's list
+        (`artifact_roots._sources_outside_the_projects_root`).
         """
-        if get_app_settings().tenancy_mode == "org" or self.session.scope.org_mode:
+        if (
+            get_app_settings().tenancy_mode == "org"
+            or self.session.scope.partitioned_for(PersonalResource.PROJECTS)
+            or project.org_id is not None
+        ):
             return False
         try:
             # `.parent` first, then resolve: `Path.resolve()` resolves the
@@ -643,9 +710,13 @@ class ProjectService:
 
         The tenancy refusal comes before any filesystem access on purpose: an
         org deployment does not run on the caller's machine, so statting a
-        path it chose would answer whether that server path exists.
+        path it chose would answer whether that server path exists. A
+        deployment that trusts identity headers refuses for the same reason,
+        whoever asks and whatever it keeps per person: a person's adopted
+        server folder would sit outside their projects root, and skill links
+        reach no adopted folder there (skill_links._external_project_dirs).
         """
-        if get_app_settings().tenancy_mode == "org":
+        if tenant_scope_required():
             raise ProjectPathNotAllowedError(
                 "Choosing a project folder is not available on this deployment"
             )
@@ -726,8 +797,11 @@ class ProjectService:
             self.session.add(project)
             self.session.commit()
 
-        # Skill symlink distribution is desktop-only (see SkillService).
-        if not self.session.scope.org_mode:
+        # Skill symlink distribution only runs where skills and projects stay
+        # unpartitioned (skill_links.links_apply_to; see SkillService).
+        from cowork.services.skill_links import links_apply_to
+
+        if links_apply_to(self.session.scope):
             try:
                 from cowork.services.skill_links import reconcile_project
                 from cowork.services.skills import SkillService
@@ -783,14 +857,15 @@ class ProjectService:
         old_path = Path(project.path)
         new_path = self._project_path(final_name)
         skill_service = SkillService(self.session.scope)
-        rewrites = (
-            skill_rewrites
-            if skill_rewrites is not None
-            else skill_service.prepare_project_reference_rewrites(
+        if not _rename_rewrites_skill_store(self.session.scope):
+            rewrites = []
+        elif skill_rewrites is not None:
+            rewrites = skill_rewrites
+        else:
+            rewrites = skill_service.prepare_project_reference_rewrites(
                 old_name,
                 final_name,
             )
-        )
         stage = ProjectRenameStage(
             project_id=project.id,
             old_name=old_name,
@@ -979,8 +1054,12 @@ class ProjectService:
         Separate from the commit so a caller holding the name lock can release
         it first. This walks every project row and writes a symlink per enabled
         skill, none of which needs the name reserved once the row is committed.
+        Skipped wherever skills or projects are partitioned
+        (skill_links.links_apply_to).
         """
-        if stage is None or self.session.scope.org_mode:
+        from cowork.services.skill_links import links_apply_to
+
+        if stage is None or not links_apply_to(self.session.scope):
             return
         # These links are derived desktop state, so a reconciliation failure
         # is logged after the canonical project/skill commit rather than
@@ -1043,6 +1122,7 @@ class ProjectService:
             return False
         if project.name == GENERAL_PROJECT:
             raise ValueError("Cannot delete the General project")
+        self._refuse_while_others_use(project_id)
         # Cascade to the project's conversations FIRST (ENG-701). Deleting a
         # project used to only rmtree its dir + drop the row, orphaning every
         # conversation in it — and their messages, events, task objects, and
@@ -1148,6 +1228,20 @@ class ProjectService:
                 conversation_stage,
                 cleanup_project_files=staged_path is None,
             )
+        try:
+            from cowork.services.memory import remove_project_memory_tiers
+
+            remove_project_memory_tiers(scope=self.session.scope, project_id=project_id)
+        except Exception:
+            # Committed already, like the tombstone below: a tier left behind
+            # goes with `cowork.ops.memory clear`, never with a retry. A
+            # person's tier left behind is listed nowhere; the deployment's
+            # stays in every person's Memories listing while memory is shared,
+            # until that clear.
+            logger.exception(
+                "Could not remove the deleted project's memory tiers",
+                extra=log_context(project_id=project_id),
+            )
         if staged_path is not None and staged_path.exists():
             try:
                 self._rmtree_in_root(staged_path)
@@ -1160,6 +1254,55 @@ class ProjectService:
                     staged_path,
                 )
         return True
+
+    def _refuse_while_others_use(self, project_id: UUID) -> None:
+        """Raise ProjectInUseError while this project holds a conversation or
+        schedule of another partition's.
+
+        A person's delete reaches only rows their scope can delete. The
+        scoped select misses another partition's conversations, which the
+        ``conversations.project_id`` foreign key then refuses on Postgres, or
+        which are left pointing at nothing on SQLite; and the schedules
+        cascade loads another partition's schedule, which the flush hook
+        refuses. This covers a shared project another person still uses, and a
+        personal project the operator view wrote into (a NULL-org row an
+        ``is_distinct_from`` catches). The read goes through the unscoped
+        session, since the scoped one can't see those rows.
+
+        The project row is locked FOR UPDATE first, in the delete's own
+        transaction, so a concurrent create of a schedule or conversation
+        under it blocks on the foreign key until this delete commits or rolls
+        back: without the lock that child row is created between the check and
+        the cascade and is silently removed by ON DELETE CASCADE.
+        """
+        scope = self.session.scope
+        if not scope.personal:
+            return
+        from cowork.models.conversation import Conversation
+        from cowork.models.schedule import Schedule
+
+        raw = unsafe_unscoped_session(self.session)
+        # FOR UPDATE, not FOR NO KEY UPDATE: a child insert's foreign-key check
+        # takes FOR KEY SHARE, which only FOR UPDATE conflicts with. SQLite
+        # drops it, so nothing changes there.
+        raw.execute(sa.select(Project.id).where(Project.id == project_id).with_for_update())
+        for model, resource in (
+            (Conversation, PersonalResource.CONVERSATIONS),
+            (Schedule, PersonalResource.SCHEDULES),
+        ):
+            if not scope.partitioned_for(resource):
+                continue
+            others = raw.execute(
+                sa.select(model.id)
+                .where(model.project_id == project_id)
+                .where(model.org_id.is_distinct_from(scope.org_id))
+                .limit(1)
+            ).first()
+            if others is not None:
+                raise ProjectInUseError(
+                    "Other people still have conversations or schedules in this "
+                    "project. It can be deleted once theirs are gone."
+                )
 
     def get_active_project(self) -> Project:
         project = self.session.exec(

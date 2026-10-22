@@ -491,6 +491,7 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         PublishOwnedByOtherUser,
+        PublishTooLarge,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -556,6 +557,10 @@ async def _sync_live_artifact(
     except PublishOwnedByOtherUser:
         # Repeats on every save of this artifact, so no traceback.
         logger.warning("Could not synchronize live artifact %s: another account owns its report", folder)
+        return False
+    except PublishTooLarge:
+        # Repeats on every save until the artifact shrinks, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
@@ -809,6 +814,7 @@ async def set_artifact_access(
     every turn, with the owner's selection in place of the first-publish default.
     """
     await require_product_permission(session.scope, "artifact.manage")
+    from cowork.services.publish import PublishRejected, PublisherUnavailable
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
@@ -866,9 +872,24 @@ async def set_artifact_access(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    # PublisherUnavailable and PublishRejected are RuntimeErrors, so they come first.
+    except PublisherUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except PublishRejected as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    except (RuntimeError, OSError) as exc:
+        # A local failure's text can name shared-storage paths, so only the log
+        # gets it. Not every such error passed publish_artifact's own log.
+        logger.warning("Could not change access for artifact %s", artifact_id, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Publishing failed. Try again in a moment.",
+        ) from exc
     finally:
         if not publish_abandoned:
             await run_in_threadpool(release, folder.parent, folder.name)
+        if key is not None and not publish_abandoned:
+            await key.revoke()
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")

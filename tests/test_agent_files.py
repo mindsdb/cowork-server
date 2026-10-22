@@ -24,7 +24,7 @@ from cowork.harnesses.anton_harness.agent_files import (
     conversation_attachments,
     read_conversation_attachments,
 )
-from cowork.harnesses.anton_harness.figure_sources import SourceKind, TurnStep, find_figure_sources
+from cowork.harnesses.anton_harness.figure_sources import SourceKind, ToolInput, TurnStep, find_figure_sources
 from cowork.services.files import FileService, attachment_purpose
 
 
@@ -508,7 +508,7 @@ class TestAFigureACloudPodReadsFromTheProjectsArtifacts:
             tool_use_id="toolu_read",
             tool_name="scratchpad",
             action="exec",
-            tool_input=json.dumps({"action": "exec", "name": "main", "code": code}),
+            tool_input=ToolInput.from_text(text=json.dumps({"action": "exec", "name": "main", "code": code})),
             content=json.dumps(asdict(Cell(
                 code=code, stdout="part site qty\nP100 S1 250\n", stderr="", error=None, description="",
             ))),

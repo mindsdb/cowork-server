@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -20,15 +21,22 @@ from anton.core.llm.provider import (
     ToolCall,
     damaged_tool_call_result,
 )
-from anton.core.session import _discarded_tool_call_events
-from anton.core.tools import web_tools
+from anton.core.mcp.client import McpSession
+from anton.core.mcp.names import namespaced_tool_name
+from anton.core.mcp.registry import discover_tool_defs
+from anton.core.session import ChatSession, _discarded_tool_call_events
+from anton.core.tools import tool_handlers, web_tools
 from anton.core.tools.registry import ToolOutcome
 from anton.core.utils.scratchpad import format_cell_result
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness import stream_formatter as stream_formatter_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory, format_responses_stream
+from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import step_stream_events
+from tests._hubspot_records import HUBSPOT_DEALS, SEARCH_DEALS
 
 
 async def _events(*items):
@@ -119,6 +127,25 @@ class TestFigureSourcesEvent:
         final = events[-1][1]["response"]
         assert final["status"] == "incomplete"
         assert final["incomplete_details"] == {"reason": "round_cap"}
+
+    @pytest.mark.parametrize(("limit", "number"), [("round_cap", "5"), ("spend_ceiling", "1,250,000")])
+    async def test_the_number_in_antons_limit_sentence_gets_no_mark(self, limit, number):
+        # The installed anton writes the sentence, so a reword there fails
+        # here. It reads only these four fields of the session.
+        limits = SimpleNamespace(
+            _max_tool_rounds=5, _round_cap_continued_rounds=0,
+            _max_turn_tokens=1_250_000, _spend_ceiling_continued_tokens=0,
+        )
+        sentence = ChatSession._limit_reached(limits, limit)
+        assert number in sentence
+
+        events = await _run(
+            *_read_stock_cell(),
+            StreamTextDelta(text=f"{sentence}.\n\nSite S1 holds 250 units."),
+            StreamTurnEnded(ended_by=limit),
+        )
+
+        assert [(f["text"], f["origin"]) for f in events[-2][1]["figures"]] == [("250", "step")]
 
     async def test_a_turn_that_handed_back_on_antons_failure_reply_gets_no_sources(self):
         events = await _run(
@@ -351,6 +378,30 @@ class TestStepsFromTheTurnsToolRows:
         assert (steps["toolu_web"]["kind"], steps["toolu_web"]["url"]) == ("web", "https://example.com/rates")
         assert (steps["toolu_file"]["kind"], steps["toolu_file"]["label"]) == ("file", "stock.csv")
 
+    async def test_a_memory_file_read_is_not_a_step_and_a_project_file_read_is(self):
+        memory = {"path": ".anton/memory/lessons.md"}
+        stock = {"path": "data/stock.csv"}
+        rows = [
+            *_tool_rows("toolu_mem", "read_text_file", memory, "Overtime costs 30 dollars an hour.\n"),
+            *_tool_rows("toolu_file", "read_text_file", stock, "part,site,qty\nP100,S1,250\n"),
+        ]
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost, and what is at S1?"),
+            *_tool_call("toolu_mem", "read_text_file", memory),
+            *_tool_call("toolu_file", "read_text_file", stock),
+            *_tool_done("toolu_mem", True),
+            *_tool_done("toolu_file", True),
+            StreamTextDelta(text="Overtime costs $30 an hour and S1 holds 250 units."),
+            TurnHistory(rows),
+        )
+
+        payload = _figures(events)
+        figures = _by_text(payload)
+        assert (figures["$30"]["origin"], figures["$30"]["sources"]) == ("none", [])
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_file", "page": None}]
+        assert [step["tool_use_id"] for step in payload["steps"]] == ["toolu_file"]
+
     async def test_a_streamed_scratchpad_result_stays_one_step(self):
         events = await _run_turn(
             TurnContext(question="What is at S1?"),
@@ -478,13 +529,17 @@ class TestStepsFromTheTurnsToolRows:
         step_stream_events({"step": "compacted", "message": "Context compacted"}),
     ], ids=["in-process", "cloud-pod"])
     @pytest.mark.parametrize("name", ["web_search", "web_fetch", "read_text_file"])
-    async def test_a_turn_that_compacted_leaves_a_figure_no_step_holds_unmarked(self, name: str, compacted: list):
-        """A turn that compacts its context mid-way sends no tool rows, so the
-        result of a tool anton runs itself is missing."""
+    async def test_a_compacted_turn_with_no_tool_rows_leaves_a_figure_no_step_holds_unmarked(
+        self, name: str, compacted: list,
+    ):
+        """A producer whose anton predates ChatSession.turn_messages sends no
+        tool rows for a turn that compacts mid-way, so the result of a tool
+        anton runs itself is missing."""
         events = await _run_turn(
             TurnContext(question="What does overtime cost, and what is at S1?"),
             *_read_stock_cell(),
             *_tool_call("toolu_evidence", name, {"query": "overtime rate", "url": "https://example.com/rates"}),
+            *_tool_done("toolu_evidence", True),
             *compacted,
             StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
         )
@@ -493,37 +548,74 @@ class TestStepsFromTheTurnsToolRows:
         assert "$42" not in figures
         assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
 
-    async def test_rows_missing_one_evidence_call_leave_a_figure_no_step_holds_unmarked(self):
+    @pytest.mark.parametrize("verdict", [
+        _tool_done("toolu_web", False),
+        _tool_done("toolu_web", None),
+        [],
+    ], ids=["failed", "no-verdict", "no-tool-done"])
+    async def test_a_compacted_turn_with_no_tool_rows_keeps_the_mark_when_its_web_call_did_not_succeed(
+        self, verdict: list,
+    ):
+        """The matcher counts a call of a tool anton runs itself as a step
+        only when its tool_done said ok=True, so the missing result of a call
+        that failed, gave no verdict or never ran hides no source."""
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost?"),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *verdict,
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Overtime costs $42 an hour and 17 shifts."),
+        )
+
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == {
+            "$42": "none", "17": "none",
+        }
+
+    @pytest.mark.parametrize("compacted", [
+        [StreamContextCompacted(message="Context compacted")],
+        step_stream_events({"step": "compacted", "message": "Context compacted"}),
+    ], ids=["in-process", "cloud-pod"])
+    async def test_a_compacted_turns_tool_rows_give_a_figure_no_step_holds_no_source(self, compacted: list):
+        """A turn's tool rows hold every call that ran, through a compaction
+        too, so a call they miss never ran: a figure no step holds has no
+        source."""
         events = await _run_turn(
             TurnContext(question="What does overtime cost, and what is at S1?"),
             *_tool_call("toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}),
             *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
             *_tool_done("toolu_file", True),
-            StreamContextCompacted(message="Context compacted"),
+            *compacted,
             StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
-            TurnHistory(_tool_rows(
+            TurnHistory(rows=[], read=_tool_rows(
                 "toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}, "part,site,qty\nP100,S1,250\n",
             )),
         )
 
         figures = _by_text(_figures(events))
-        assert "$42" not in figures
-        assert figures["250"]["origin"] == "step"
+        assert figures["$42"]["origin"] == "none"
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_file", "page": None}]
 
-    async def test_a_refused_evidence_call_in_the_rows_keeps_the_mark_on_a_figure_no_step_holds(self):
-        """The rows hold anton's own is_error answer to the call, so its
-        result is not missing."""
-        refused = ToolCall(id="toolu_web", name="web_fetch", input={}, parse_error="Expecting value: line 1 column 1")
+    @pytest.mark.parametrize(("path", "origins"), [
+        (".anton/memory/lessons.md", {"$30": "none", "250": "step"}),
+        ("docs/lessons.md", {"250": "step"}),
+    ], ids=["memory-file", "project-file"])
+    async def test_a_compacted_turn_with_no_tool_rows_that_read_only_a_memory_file_keeps_the_mark(
+        self, path: str, origins: dict[str, str],
+    ):
+        """A memory file read is never a step, so its missing row hides no
+        source. A missing read of any other file still may."""
+        lessons = {"path": path}
 
         events = await _run_turn(
-            TurnContext(question="What does overtime cost?"),
-            *_tool_call("toolu_web", "web_fetch", {}),
+            TurnContext(question="What does overtime cost, and what is at S1?"),
+            *_read_stock_cell(),
+            *_tool_call("toolu_lessons", "read_text_file", lessons),
+            *_tool_done("toolu_lessons", True),
             StreamContextCompacted(message="Context compacted"),
-            StreamTextDelta(text="Overtime costs $42 an hour."),
-            TurnHistory(_refused_rows(refused)),
+            StreamTextDelta(text="Overtime costs $30 an hour and S1 holds 250 units."),
         )
 
-        assert _by_text(_figures(events))["$42"]["origin"] == "none"
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == origins
 
     async def test_a_round_anton_threw_away_keeps_the_mark_on_a_figure_no_step_holds(self):
         """A round cut at max_tokens is thrown away whole and retried: none of
@@ -549,6 +641,50 @@ class TestStepsFromTheTurnsToolRows:
         figures = _by_text(_figures(events))
         assert figures["$42"]["origin"] == "none"
         assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
+
+    async def test_a_number_a_replayed_web_calls_query_states_is_only_echoed_by_its_results(self):
+        """The row's call reads with the text of its arguments, so a number
+        the query states and the results repeat is an echo, not a figure the
+        search found."""
+        query = {"query": "overtime rates 2024"}
+
+        events = await _run_turn(
+            TurnContext(question="What did overtime cost?"),
+            *_tool_call("toolu_search", "web_search", query),
+            *_tool_done("toolu_search", True),
+            StreamTextDelta(text="In 2024 overtime was $42."),
+            TurnHistory(_tool_rows("toolu_search", "web_search", query, "2024 overtime: $42 per hour")),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["2024"]["origin"] == "none"
+        assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_search", "page": None}]
+
+    async def test_a_replayed_calls_arguments_are_not_parsed_again(self, monkeypatch):
+        """A history row holds a call's arguments already parsed, so neither
+        the web call nor the cell that only the rows hold goes back through
+        the text parser."""
+        def never(_raw):
+            raise AssertionError("a replayed call's arguments were parsed from text")
+
+        monkeypatch.setattr(figure_sources_mod, "_leading_object", never)
+        rows = [
+            *_tool_rows("toolu_web", "web_fetch", {"url": "https://example.com/rates"}, "Overtime rate: $42 per hour"),
+            *_cell_rows("toolu_cell", code="print(5000 + 150)", stdout="5150\n", description="Count rows"),
+        ]
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost?"),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("toolu_web", True),
+            StreamTextDelta(text="Overtime costs $42 an hour across 5150 rows."),
+            TurnHistory(rows),
+        )
+
+        assert "response.figure_sources" in [event_type for event_type, _ in events]
+        figures = _by_text(_figures(events))
+        assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_web", "page": None}]
+        assert figures["5150"]["sources"] == [{"tool_use_id": "toolu_cell", "page": None}]
 
 
 class TestNativeEvidenceVerdicts:
@@ -621,18 +757,20 @@ class TestNativeEvidenceVerdicts:
 
         assert _by_text(_figures(events))[figure_text]["origin"] == ("step" if status == 200 else "none")
 
-    async def test_a_newer_native_file_error_cannot_source_its_line_count(self):
-        # read_text_file is absent from uv.lock's Anton cf923647. This is the
-        # newer producer contract, not an import that silently bumps the lock:
-        # anton/core/tools/tool_handlers.py, handle_read_text_file, at
-        # daa1fc8ac2ae5e49246856fbed225e04ca408660 returns this with ok=False.
+    async def test_a_native_file_error_cannot_source_its_line_count(self, tmp_path):
+        (tmp_path / "stock.csv").write_text("".join(f"row{i}\n" for i in range(42)))
         tool_input = {"path": "stock.csv", "start_line": 1000}
-        result = "Error: start_line 1000 is past the end of the file (42 lines)."
+        outcome = await tool_handlers.handle_read_text_file(
+            SimpleNamespace(_workspace=SimpleNamespace(base=tmp_path)), tool_input,
+        )
+        assert outcome.ok is False
+        assert "(42 lines)" in outcome.content
+
         events = await _run(
             *_tool_call("native", "read_text_file", tool_input),
-            *_tool_done("native", False),
+            *_tool_done("native", outcome.ok),
             StreamTextDelta(text="There are 42 units."),
-            TurnHistory(_tool_rows("native", "read_text_file", tool_input, result)),
+            TurnHistory(_tool_rows("native", "read_text_file", tool_input, outcome.content)),
         )
 
         assert _by_text(_figures(events))["42"]["origin"] == "none"
@@ -678,6 +816,120 @@ class TestNativeEvidenceVerdicts:
         )
 
         assert _by_text(_figures(events))["250"]["sources"] == [{"tool_use_id": "cell", "page": None}]
+
+
+def _hubspot_server(*, search_error: str | None) -> MCPServer:
+    """An in-process MCP server with two of HubSpot's tools, under their
+    HubSpot names. Its search fails with ``search_error`` when one is given,
+    the way HubSpot's server reports an API error inside the tool's result."""
+    server = MCPServer(name="hubspot")
+
+    @server.tool()
+    def search_crm_objects(objectType: str, limit: int = 10) -> str:
+        if search_error is not None:
+            raise ToolError(search_error)
+        return HUBSPOT_DEALS
+
+    @server.tool()
+    def tool_guidance() -> str:
+        return "search_crm_objects returns up to 200 records per call."
+
+    return server
+
+
+async def _connector_call(
+    tool: str, tool_input: dict, *, connection_name: str | None = None, search_error: str | None = None,
+) -> tuple[str, ToolOutcome]:
+    """A read-mode HubSpot connection's call of ``tool`` through anton's
+    connector wiring: the name anton registers the tool under, and the
+    outcome its handler returns."""
+    async with McpSession(server=_hubspot_server(search_error=search_error)) as session:
+        tool_defs = await discover_tool_defs(
+            session, engine="hubspot", access_mode="read", connection_name=connection_name,
+        )
+        [tool_def] = [tool_def for tool_def in tool_defs if tool_def.name.endswith(f"__{tool}")]
+        return tool_def.name, await tool_def.handler(None, tool_input)
+
+
+class TestConnectorToolVerdicts:
+    """A connector tool's result reaches the formatter only in the turn's tool
+    rows, which hold a failed call's error as an ordinary result. Only the
+    call's tool_done verdict tells the two apart."""
+
+    @pytest.mark.parametrize("cloud", [False, True], ids=["in-process", "cloud-pod"])
+    @pytest.mark.parametrize(("connection_name", "label"), [
+        (None, "hubspot: search_crm_objects"),
+        ("crm2", "hubspot (crm2): search_crm_objects"),
+    ], ids=["one-connection", "two-connections"])
+    async def test_a_connector_call_that_returned_records_sources_their_figures(
+        self, cloud: bool, connection_name: str | None, label: str,
+    ):
+        name, outcome = await _connector_call("search_crm_objects", SEARCH_DEALS, connection_name=connection_name)
+        assert outcome.ok is True
+
+        events = await _run(
+            *_tool_call("toolu_hs", name, SEARCH_DEALS),
+            *_tool_done("toolu_hs", outcome.ok, cloud=cloud),
+            StreamTextDelta(text="Acme's deal is $48,250."),
+            TurnHistory(_tool_rows("toolu_hs", name, SEARCH_DEALS, outcome.content)),
+        )
+
+        payload = _figures(events)
+        assert _by_text(payload)["$48,250"]["sources"] == [{"tool_use_id": "toolu_hs", "page": None}]
+        assert [(step["kind"], step["label"]) for step in payload["steps"]] == [("query", label)]
+
+    async def test_a_connector_call_that_failed_is_not_a_source(self):
+        name, outcome = await _connector_call(
+            "search_crm_objects", SEARCH_DEALS, search_error="HubSpot API request failed with status 500",
+        )
+        assert outcome.ok is False
+        assert "500" in outcome.content
+
+        events = await _run(
+            *_tool_call("toolu_hs", name, SEARCH_DEALS),
+            *_tool_done("toolu_hs", outcome.ok),
+            StreamTextDelta(text="Your pipeline has 500 open deals."),
+            TurnHistory(_tool_rows("toolu_hs", name, SEARCH_DEALS, outcome.content)),
+        )
+
+        assert _by_text(_figures(events))["500"]["origin"] == "none"
+        assert _figures(events)["steps"] == []
+
+    @pytest.mark.parametrize("cloud", [False, True], ids=["in-process", "cloud-pod"])
+    @pytest.mark.parametrize("verdict", [None, "absent"])
+    async def test_a_connector_call_without_a_success_verdict_is_not_a_source(self, cloud: bool, verdict):
+        name, outcome = await _connector_call("search_crm_objects", SEARCH_DEALS)
+        done = [] if verdict == "absent" else _tool_done("toolu_hs", verdict, cloud=cloud)
+
+        events = await _run(
+            *_tool_call("toolu_hs", name, SEARCH_DEALS),
+            *done,
+            StreamTextDelta(text="Acme's deal is $48,250."),
+            TurnHistory(_tool_rows("toolu_hs", name, SEARCH_DEALS, outcome.content)),
+        )
+
+        assert _by_text(_figures(events))["$48,250"]["origin"] == "none"
+
+    @pytest.mark.parametrize(("tool", "origins"), [
+        ("search_crm_objects", {"250": "step"}),
+        ("tool_guidance", {"$48,250": "none", "250": "step"}),
+    ], ids=["records", "docs"])
+    async def test_a_compacted_turn_with_no_tool_rows_hides_only_a_records_calls_figures(
+        self, tool: str, origins: dict[str, str],
+    ):
+        """A producer whose anton predates ChatSession.turn_messages sends no
+        tool rows for a turn that compacts mid-way. The missing result of a
+        call that returns records may hold a figure no step holds; a call
+        that returns HubSpot's docs holds none."""
+        events = await _run(
+            *_read_stock_cell(),
+            *_tool_call("toolu_hs", namespaced_tool_name("hubspot", tool), {}),
+            *_tool_done("toolu_hs", True),
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Acme's deal is $48,250 and S1 holds 250 units."),
+        )
+
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == origins
 
 
 def _earlier_cell(tool_use_id: str = "toolu_earlier") -> list[dict]:
@@ -792,20 +1044,32 @@ class TestStepsFromEarlierTurns:
         ]
 
     async def test_an_answer_with_no_figures_reads_no_history(self, monkeypatch):
+        """Nor does it parse the rows or the arguments the stream carried."""
         read: list = []
-        row_steps = stream_formatter_mod._row_steps
+        parsed: list[str] = []
+        read_rows = stream_formatter_mod.ToolRows.read
+        from_text = figure_sources_mod.ToolInput.from_text
 
-        def recording(rows):
+        def recording_rows(*, rows):
             read.append(rows)
-            return row_steps(rows)
+            return read_rows(rows=rows)
 
-        monkeypatch.setattr(stream_formatter_mod, "_row_steps", recording)
+        def recording_text(*, text):
+            parsed.append(text)
+            return from_text(text=text)
+
+        monkeypatch.setattr(stream_formatter_mod.ToolRows, "read", staticmethod(recording_rows))
+        monkeypatch.setattr(figure_sources_mod.ToolInput, "from_text", staticmethod(recording_text))
 
         events = await _run_turn(
-            TurnContext(question="Plot it.", history=_earlier_cell()), StreamTextDelta(text="Here is the chart."),
+            TurnContext(question="Plot it.", history=_earlier_cell()),
+            *_read_stock_cell(),
+            StreamTextDelta(text="Here is the chart."),
+            TurnHistory(_cell_rows("toolu_read", code="print(open('/workspace/stock.csv').read())", stdout="")),
         )
 
         assert read == []
+        assert parsed == []
         assert "response.figure_sources" not in [event_type for event_type, _ in events]
 
     async def test_a_turn_that_ran_no_cell_reads_no_history(self, monkeypatch):
@@ -824,6 +1088,65 @@ class TestStepsFromEarlierTurns:
 
         assert read == []
         assert _by_text(_figures(events))["250"]["origin"] == "none"
+
+
+def _earlier_answer(*figures: tuple[str, FigureOrigin]) -> EarlierAnswer:
+    """An earlier answer whose saved event lists these figures."""
+    return EarlierAnswer(figures=[
+        Figure(start=0, end=len(text), text=text, origin=origin) for text, origin in figures
+    ])
+
+
+class TestFiguresRepeatedFromEarlierAnswers:
+    async def test_the_event_marks_a_repeated_figure_and_names_no_step_for_it(self):
+        events = await _run_turn(
+            TurnContext(question="And now?", earlier_answers=(_earlier_answer(("4,600", FigureOrigin.step)),)),
+            StreamTextDelta(text="Up from 4,600."),
+        )
+
+        payload = _figures(events)
+        assert payload["figures"] == [
+            {"start": 8, "end": 13, "text": "4,600", "origin": "earlier_answer", "sources": []},
+        ]
+        assert payload["steps"] == []
+
+    async def test_a_compacted_turn_keeps_a_repeated_figures_mark(self):
+        """The turn compacted and no tool rows arrived for its web call, so a
+        figure no step holds is left out, but one an earlier answer gave keeps
+        its mark."""
+        events = await _run_turn(
+            TurnContext(
+                question="What does overtime cost?", earlier_answers=(_earlier_answer(("$42", FigureOrigin.step)),),
+            ),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("toolu_web", True),
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Overtime costs $42 an hour over 7 shifts."),
+        )
+
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == {
+            "$42": "earlier_answer",
+        }
+
+    async def test_a_failure_marking_repeated_figures_keeps_this_turns_sources(self, monkeypatch, caplog):
+        def broken(**_kwargs):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(stream_formatter_mod, "mark_repeated_figures", broken)
+
+        events = await _run_turn(
+            TurnContext(question="How many at S1?", earlier_answers=(_earlier_answer(("90", FigureOrigin.step)),)),
+            *_read_stock_cell(),
+            StreamTextDelta(text="S1 holds 250 units, against 4,600 last year."),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["250"]["origin"] == "step"
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
+        assert figures["4,600"]["origin"] == "none"
+        assert [
+            r for r in caplog.records if r.name == stream_formatter_mod.logger.name and r.levelname == "ERROR"
+        ]
 
 
 class TestQuestionText:
@@ -893,8 +1216,12 @@ class TestAnswersWithoutSources:
         ([], [StreamTextDelta(text="\n")]),
     ], ids=["whole-answer", "after-a-tool-round", "after-partial-text", "followed-by-a-blank-delta"])
     async def test_antons_failure_reply_gets_no_sources(self, before: list, after: list):
-        """anton streams its failure reply as one delta and ends the turn on
-        it, after whatever the turn streamed first."""
+        """A pod image or a local editable anton older than mindsdb/anton#569
+        streams its failure reply as one delta and ends the turn on it, after
+        whatever the turn streamed first. From #569 on, which the anton-agent
+        floor carries, the turn raises instead, so this check can go once the
+        pod image carries #569 and no local editable anton older than #569 is
+        in use."""
         events = await _run_turn(
             TurnContext(question="How many?"),
             *before,
@@ -1001,6 +1328,20 @@ class TestTheInProcessHandlerSavesTheSources:
         assert _by_text(persisted)["404"]["origin"] == "none"
         assert persisted["steps"] == []
 
+    async def test_the_saved_answer_carries_a_repeated_figures_mark(self):
+        frames, saved = await self._produce([
+            TurnContext(question="And S2?", earlier_answers=(_earlier_answer(("4,600", FigureOrigin.step)),)),
+            *_read_stock_cell(),
+            StreamTextDelta(text="S2 holds 90 units, against 4,600 last year."),
+        ])
+
+        [persisted] = [event for event in saved if event.get("type") == "response.figure_sources"]
+        assert persisted == _figures(_parse_sse(frames))
+        assert {text: figure["origin"] for text, figure in _by_text(persisted).items()} == {
+            "90": "step", "4,600": "earlier_answer",
+        }
+        assert _by_text(persisted)["4,600"]["sources"] == []
+
     async def test_the_answer_carries_them_with_the_setting_off(self):
         from cowork.common.settings.user_settings import UserSettings, use_turn_settings
         from cowork.db.scoped import LOCAL_SCOPE
@@ -1012,3 +1353,118 @@ class TestTheInProcessHandlerSavesTheSources:
 
         assert [event.get("type") for event in saved].count("response.figure_sources") == 1
         assert any(frame.startswith("event: response.figure_sources") for frame in frames)
+
+
+# The figure_sources frames of the turn _every_input_shape builds, compacted
+# with no tool rows and then whole.
+_EVERY_INPUT_SHAPE_FRAMES = Path(__file__).parent / "fixtures" / "figure_sources_every_input_shape.sse"
+
+
+async def _every_input_shape(*, compacted: bool) -> str:
+    """The response.figure_sources frame of one turn that crosses every shape
+    the formatter reads a step from: a streamed cell, a streamed cell whose
+    arguments were cut short, a streamed cell with no arguments, a cell that
+    calls a client an earlier cell built, web and file calls whose results
+    only the rows hold, a file read with no path, a web call with odd
+    arguments whose query states a number its results echo, an is_error
+    row, a web call whose tool_done said it failed, a cell only the rows
+    hold, junk rows, earlier turns' cells (one printed a figure the answer
+    repeats) beside junk history rows, and an evidence call no row holds.
+
+    The compacted turn is the one a producer whose anton predates
+    ChatSession.turn_messages sends: a compaction and no tool rows, so only
+    the figures a streamed cell holds keep a mark. The whole turn sends its
+    rows."""
+    load = "import pandas as pd\ndf = pd.read_csv('stock.csv')"
+    total = "print(df.qty.sum())"
+    history = [
+        {"role": "user", "content": "Load the stock."},
+        *_cell_rows("toolu_load", code=load, stdout=""),
+        *_cell_rows("toolu_old", code="print(80 * 101)", stdout="8080\n"),
+        {"role": "assistant", "content": "Loaded."},
+        {"content": 5},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "scratchpad", "input": {}}]},
+    ]
+    rows = [
+        *_tool_rows("toolu_web", "web_fetch", {"url": "https://example.com/rates"}, "Overtime rate: $42 per hour"),
+        *_tool_rows(
+            "toolu_file", "read_text_file", {"path": "/workspace/stock.csv"},
+            [{"type": "text", "text": "part,site,qty\nP100,S1,250\n"}, {"type": "image"}],
+        ),
+        *_tool_rows("toolu_nopath", "read_text_file", {"path": 5}, "notes: 33 lines"),
+        *_tool_rows(
+            "toolu_search", "web_search", {"url": None, "query": "overtime rates 2024"}, "18 results found for 2024",
+        ),
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_bad", "name": "web_fetch", "input": {"url": "https://x.example/"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_bad", "content": "rate 91", "is_error": True},
+        ]},
+        *_tool_rows("toolu_failed", "web_fetch", {"url": "https://down.example/"}, "Rate 64 per hour"),
+        *_cell_rows("toolu_rowcell", code="print(5000 + 150)", stdout="5150\n", logs="ok\n", description="Row cell"),
+    ]
+    read = [
+        *rows,
+        "junk",
+        {"role": "user", "content": [{"type": "tool_result"}]},
+        {"content": [{"type": "tool_use", "id": "z", "name": "web_fetch", "input": "nope"}]},
+    ]
+    sum_cell = asdict(Cell(code=total, stdout="340\n", stderr="", error=None, description="Sum stock"))
+    cut_cell = asdict(Cell(code="print(77 * 101)", stdout="7777\n", stderr="", error=None))
+    bare_cell = asdict(Cell(code="print(6 * 7 * 100)", stdout="4200\n", stderr="", error=None))
+    setup = "client = httpx.Client(base_url='https://erp.example.com')"
+    fetch = "print(client.get('/stock?token=synthetic-secret').text)"
+    setup_cell = asdict(Cell(code=setup, stdout="", stderr="", error=None, description="Open ERP client"))
+    fetch_cell = asdict(Cell(code=fetch, stdout="612\n", stderr="", error=None, description="Fetch stock"))
+    frames = [
+        chunk async for chunk in format_responses_stream(_events(
+            TurnContext(question="What is the total, the rate and S1?", history=history),
+            *_tool_call("toolu_sum", "scratchpad", {"action": "exec", "name": "main", "code": total}),
+            StreamToolResult(name="scratchpad", content=json.dumps(sum_cell), action="exec", id="toolu_sum"),
+            StreamToolUseStart(id="toolu_cut", name="scratchpad"),
+            StreamToolUseDelta(id="toolu_cut", json_delta='{"action": "exec", "name": "main", "co'),
+            StreamToolUseEnd(id="toolu_cut"),
+            StreamToolResult(name="scratchpad", content=json.dumps(cut_cell), action="exec", id="toolu_cut"),
+            StreamToolResult(name="scratchpad", content=json.dumps(bare_cell), action="exec", id="toolu_bare"),
+            *_tool_call("toolu_setup", "scratchpad", {"action": "exec", "name": "main", "code": setup}),
+            StreamToolResult(name="scratchpad", content=json.dumps(setup_cell), action="exec", id="toolu_setup"),
+            *_tool_call("toolu_fetch", "scratchpad", {"action": "exec", "name": "main", "code": fetch}),
+            StreamToolResult(name="scratchpad", content=json.dumps(fetch_cell), action="exec", id="toolu_fetch"),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("toolu_web", True),
+            *_tool_call("toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}),
+            *_tool_done("toolu_file", True),
+            *_tool_call("toolu_nopath", "read_text_file", {"path": 5}),
+            *_tool_done("toolu_nopath", True),
+            *_tool_call("toolu_search", "web_search", {"url": None, "query": "overtime rates 2024"}),
+            *_tool_done("toolu_search", True),
+            *_tool_call("toolu_bad", "web_fetch", {"url": "https://x.example/"}),
+            *_tool_done("toolu_bad", False),
+            *_tool_call("toolu_failed", "web_fetch", {"url": "https://down.example/"}),
+            *_tool_done("toolu_failed", False),
+            *_tool_call("toolu_lost", "web_fetch", {"url": "https://lost.example/"}),
+            *_tool_done("toolu_lost", True),
+            *([StreamContextCompacted(message="Context compacted")] if compacted else []),
+            StreamTextDelta(text=(
+                "340 units in all, 7777 checked, 4200 billed, 612 in the ERP, overtime $42 an hour, S1 holds 250, "
+                "5150 rows, 18 results for 2024, 33 lines, 64 on the down page, and 91 and 8080 elsewhere."
+            )),
+            *([] if compacted else [TurnHistory(rows, read=read)]),
+        ), model="test-model")
+    ]
+    return "".join(frame for frame in frames if frame.startswith("event: response.figure_sources\n"))
+
+
+class TestTheFigureSourcesEventIsUnchanged:
+    async def test_every_input_shape_gives_the_same_frames(self, monkeypatch):
+        """The frames are pinned byte for byte, so a change to how the
+        formatter reads its steps can't move a figure, a source or a step."""
+        from uuid import UUID
+
+        monkeypatch.setattr(stream_formatter_mod, "time", SimpleNamespace(time=lambda: 1_760_000_000.0))
+        monkeypatch.setattr(stream_formatter_mod, "uuid", SimpleNamespace(uuid4=lambda: UUID(int=0xABCDEF)))
+
+        frames = await _every_input_shape(compacted=True) + await _every_input_shape(compacted=False)
+
+        assert frames == _EVERY_INPUT_SHAPE_FRAMES.read_text()
