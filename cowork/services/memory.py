@@ -517,18 +517,19 @@ def apply_project_compaction(
     project_id: UUID,
     planned_root: Path,
     plans: list[tuple[MemorySlot, CompactionPlan]],
-) -> int:
+) -> bool:
     """Write compaction plans into a project's memory under the locks, author
-    check and audit an edit from the memory editor takes; returns how many slots
-    were rewritten.
+    check and audit an edit from the memory editor takes.
 
     A project renamed or deleted since the plan, a file changed since the plan,
-    or a slot this person may no longer change is skipped.
+    or a slot this person may no longer change is skipped. Returns False when a
+    slot was refused: its author changed during the model call, so the attempt
+    was not this person's to count.
     """
     from anton.core.memory.hippocampus import Hippocampus
 
     access = SharedResourceAccess(session, principal)
-    written = 0
+    refused = False
     for slot, plan in plans:
         try:
             with _project_slot_coordination(session, access, project_id, slot) as (_project, store, key):
@@ -540,6 +541,7 @@ def apply_project_compaction(
                     resource_exists=lambda: _slot_holds_content(store.read_state(slot)),
                 ) as attribution:
                     if attribution is not None and not access.can_change(attribution.created_by_id):
+                        refused = True
                         continue
                     before = store.read_state(slot)
                     if not plan.apply(Hippocampus(store.root)):
@@ -549,11 +551,10 @@ def apply_project_compaction(
                     except Exception:
                         _restore_project_slot(store, slot, before)
                         raise
-                    written += 1
         except (ValueError, HTTPException) as exc:
             # The project is gone, or the slot is gone or still being claimed.
             logger.info("memory-compaction: project %s slot skipped (%s)", slot.value, type(exc).__name__)
-    return written
+    return not refused
 
 
 class PersonMemoryResetError(ValueError):

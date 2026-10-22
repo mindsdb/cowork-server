@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import fakeredis.aioredis as fakeaioredis
 import pytest
 from anton.core.memory.hippocampus import Hippocampus
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.services import memory_compaction
@@ -27,6 +30,7 @@ class _Model:
 
     def __init__(self, answer=None) -> None:
         self.calls = 0
+        self.closed = False
         self._answer = answer
 
     async def generate_object_code(self, schema, *, system, messages, max_tokens):
@@ -34,6 +38,17 @@ class _Model:
         if self._answer is not None:
             await self._answer()
         return schema(keep=[1])
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _RedisDown:
+    def __getattr__(self, name):
+        async def fail(*args, **kwargs):
+            raise RedisConnectionError("down")
+
+        return fail
 
 
 @pytest.fixture()
@@ -86,6 +101,7 @@ async def test_a_due_tier_is_compacted_and_its_count_stored(world):
     assert world.mints[0]["workspace_id"] == "ws-1"
     assert await world.redis.get(COUNT_KEY) == "1"
     assert await world.redis.get(LOCK_KEY) is None
+    assert world.model.closed is True
 
 
 async def test_a_tier_that_is_not_due_mints_nothing(world):
@@ -250,3 +266,73 @@ async def test_a_stored_count_from_an_earlier_attempt_is_respected(world):
     await _compact(world)
 
     assert world.mints == []
+
+
+async def test_files_too_short_to_compact_mint_nothing(world):
+    _lessons(world.root, 5)
+
+    plans = await memory_compaction._plan_files(SCOPE, world.settings, world.root, SLOTS)
+
+    assert plans == []
+    assert world.mints == []
+
+
+async def test_an_attempt_finished_elsewhere_before_the_lock_is_not_repeated(world, monkeypatch):
+    """Another replica recorded its attempt between this one's check and its lock."""
+    _lessons(world.root, 25)
+    real_lock = memory_compaction.tier_lock
+
+    @asynccontextmanager
+    async def lock_after_the_other_replica(tier):
+        await record_attempt(tier, 25)
+        async with real_lock(tier) as held:
+            yield held
+
+    monkeypatch.setattr(memory_compaction, "tier_lock", lock_after_the_other_replica)
+    await _compact(world)
+
+    assert world.mints == []
+
+
+async def test_a_cancel_during_the_write_waits_for_it(world, monkeypatch):
+    """Shutdown must not return, nor free the lock, while the file is being replaced."""
+    hc = _lessons(world.root, 25)
+    started = threading.Event()
+    release = threading.Event()
+    real_apply = memory_compaction._apply_personal
+
+    def slow_apply(root, plans):
+        started.set()
+        release.wait(5)
+        real_apply(root, plans)
+
+    monkeypatch.setattr(memory_compaction, "_apply_personal", slow_apply)
+    task = asyncio.create_task(_compact(world))
+    await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.05)
+
+    assert not task.done()
+    assert await world.redis.get(LOCK_KEY) is not None
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(hc.get_lessons()) == 1
+    assert await world.redis.get(LOCK_KEY) is None
+
+
+async def test_redis_down_leaves_memory_alone(world, monkeypatch, caplog):
+    hc = _lessons(world.root, 25)
+    before = hc._lessons_path.read_bytes()
+    monkeypatch.setattr(memory_compaction, "get_redis", lambda: _RedisDown())
+    monkeypatch.setattr(memory_compaction, "GlobalMemoryStore", lambda scope: SimpleNamespace(root=world.root))
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.memory_compaction"):
+        await memory_compaction._compact_after_turn(
+            scope=SCOPE, principal=None, project_id=None, personal_entries=1, project_entries=0
+        )
+
+    assert world.mints == []
+    assert hc._lessons_path.read_bytes() == before
+    assert "ConnectionError" in caplog.text

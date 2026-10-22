@@ -25,7 +25,9 @@ from uuid import UUID, uuid4
 from anton.core.llm.client import LLMClient
 from anton.core.llm.openai import OpenAIProvider
 from anton.core.memory.cortex import (
+    COMPACTION_MIN_ENTRIES,
     COMPACTION_THRESHOLD,
+    CompactionInput,
     CompactionPlan,
     plan_compaction,
     read_compaction_input,
@@ -36,7 +38,7 @@ from redis.exceptions import WatchError
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import UserSettings, get_user_settings
 from cowork.db.scoped import TenantScope
-from cowork.db.units import run_db
+from cowork.db.units import run_db, run_to_completion
 from cowork.harnesses.memory.registry import SLOT_REGISTRY, MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.principal import Principal
@@ -61,7 +63,7 @@ _LOCK_TTL_SECONDS = COMPACTION_DEADLINE_SECONDS + 300
 _FILE_KINDS = ((MemorySlot.LESSONS, "lesson"), (MemorySlot.RULES, "rules"))
 
 # Held so a running compaction is not garbage collected; cancelled at shutdown,
-# which is safe because nothing is written before a plan is applied.
+# which waits for a write already under way.
 _compaction_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -175,13 +177,18 @@ async def _compact_after_turn(
     personal_entries: int,
     project_entries: int,
 ) -> None:
-    try:
-        if personal_entries and scope.user_id:
-            person = MemoryTier(org_id=scope.org_id, kind="person", owner_id=scope.user_id)
+    # Each tier on its own, so a failure in one leaves the other its attempt.
+    # Type name only: a provider or validation error can quote memory entries.
+    if personal_entries and scope.user_id:
+        person = MemoryTier(org_id=scope.org_id, kind="person", owner_id=scope.user_id)
+        try:
             await _compact_tier(
                 person, scope=scope, target=(GlobalMemoryStore(scope=scope).root, [s for s, _ in _FILE_KINDS])
             )
-        if project_entries and project_id is not None:
+        except Exception as exc:
+            logger.warning("memory-compaction: person tier stopped (%s)", type(exc).__name__)
+    if project_entries and project_id is not None:
+        try:
             target = await run_db(
                 partial(project_slots_to_compact, principal=principal, project_id=project_id),
                 scope=scope,
@@ -191,9 +198,8 @@ async def _compact_after_turn(
                 await _compact_tier(
                     project, scope=scope, target=target, principal=principal, project_id=project_id
                 )
-    except Exception as exc:
-        # Type name only: a provider or validation error can quote memory entries.
-        logger.warning("memory-compaction: stopped (%s)", type(exc).__name__)
+        except Exception as exc:
+            logger.warning("memory-compaction: project tier stopped (%s)", type(exc).__name__)
 
 
 async def _compact_tier(
@@ -211,18 +217,21 @@ async def _compact_tier(
     if not await is_due(tier, await asyncio.to_thread(_entry_count, root)):
         return
     async with tier_lock(tier) as held:
-        if not held:
+        # Asked again under the lock: another replica may have just finished.
+        if not held or not await is_due(tier, await asyncio.to_thread(_entry_count, root)):
             return
+        counted = True
         try:
             plans = await asyncio.wait_for(
                 _plan_files(scope, settings, root, slots), timeout=COMPACTION_DEADLINE_SECONDS
             )
             if plans:
-                await _apply(tier, scope, root, plans, principal=principal, project_id=project_id)
+                counted = await _apply(tier, scope, root, plans, principal=principal, project_id=project_id)
         except Exception as exc:
             logger.warning("memory-compaction: %s tier attempt failed (%s)", tier.kind, type(exc).__name__)
         # Not reached on a cancel: a shutdown mid-call does not use up the attempt.
-        await record_attempt(tier, await asyncio.to_thread(_entry_count, root))
+        if counted:
+            await record_attempt(tier, await asyncio.to_thread(_entry_count, root))
 
 
 def _entry_count(root: Path) -> int:
@@ -232,6 +241,17 @@ def _entry_count(root: Path) -> int:
 async def _plan_files(
     scope: TenantScope, settings: UserSettings, root: Path, slots: list[MemorySlot]
 ) -> list[tuple[MemorySlot, CompactionPlan]]:
+    sources: list[tuple[MemorySlot, CompactionInput]] = []
+    for slot, kind in _FILE_KINDS:
+        if slot not in slots:
+            continue
+        source = await asyncio.to_thread(
+            read_compaction_input, root / SLOT_REGISTRY[slot].filename, kind
+        )
+        if len(source.entries) >= COMPACTION_MIN_ENTRIES:
+            sources.append((slot, source))
+    if not sources:
+        return []
     # The same key and model a cloud turn of this person gets: minted for their
     # user, org and workspace, so the call is billed where their turns are.
     block = await _mint_llm_block(
@@ -250,17 +270,15 @@ async def _plan_files(
     llm = LLMClient(
         planning_provider=provider, planning_model=model, coding_provider=provider, coding_model=model
     )
-    plans: list[tuple[MemorySlot, CompactionPlan]] = []
-    for slot, kind in _FILE_KINDS:
-        if slot not in slots:
-            continue
-        source = await asyncio.to_thread(
-            read_compaction_input, root / SLOT_REGISTRY[slot].filename, kind
-        )
-        plan = await plan_compaction(llm, source)
-        if plan is not None:
-            plans.append((slot, plan))
-    return plans
+    try:
+        plans: list[tuple[MemorySlot, CompactionPlan]] = []
+        for slot, source in sources:
+            plan = await plan_compaction(llm, source)
+            if plan is not None:
+                plans.append((slot, plan))
+        return plans
+    finally:
+        await llm.aclose()
 
 
 async def _apply(
@@ -271,29 +289,31 @@ async def _apply(
     *,
     principal: Principal | None,
     project_id: UUID | None,
-) -> None:
-    # Shielded: a write already handed to its thread finishes either way, and
-    # the caller must not move on as if it had not.
+) -> bool:
+    """Write the plans; False when the attempt was not this person's to count.
+
+    A cancel waits for a write already under way, so neither shutdown nor the
+    lock release runs while it still writes.
+    """
     if tier.kind == "person":
-        await asyncio.shield(asyncio.to_thread(_apply_personal, root, plans))
-        return
-    await asyncio.shield(
-        run_db(
-            partial(
-                apply_project_compaction,
-                principal=principal,
-                project_id=project_id,
-                planned_root=root,
-                plans=plans,
-            ),
-            scope=scope,
-        )
+        await run_to_completion(asyncio.to_thread(_apply_personal, root, plans))
+        return True
+    return await run_db(
+        partial(
+            apply_project_compaction,
+            principal=principal,
+            project_id=project_id,
+            planned_root=root,
+            plans=plans,
+        ),
+        scope=scope,
     )
 
 
 def _apply_personal(root: Path, plans: list[tuple[MemorySlot, CompactionPlan]]) -> None:
     # A reset that removed the folder during the model call wins: writing
-    # now would bring the folder back.
+    # now would bring the folder back. One that lands after this check still
+    # wins: the file no longer matches the plan, so nothing is written.
     if not root.is_dir():
         return
     hippocampus = Hippocampus(root)

@@ -86,26 +86,27 @@ async def test_the_author_s_compaction_is_written_and_audited(org_engine, projec
     alice = _scoped(org_engine, ALICE)
     root, _ = project_slots_to_compact(alice, principal=_principal(ALICE), project_id=project.id)
 
-    written = apply_project_compaction(
+    counted = apply_project_compaction(
         alice, principal=_principal(ALICE), project_id=project.id, planned_root=root, plans=await _plan(root)
     )
 
-    assert written == 1
+    assert counted is True
     assert ProjectMemoryStore(project.path).read(MemorySlot.LESSONS) == "# Lessons\n- Fact number 0\n"
     actions = [(e.action, e.actor_id) for e in alice.exec(alice.select(SharedResourceMutation)).all()]
     assert ("update", ALICE) in actions
 
 
 async def test_another_member_cannot_apply_a_plan(org_engine, project):
+    """Refused, and not counted: the author's next turn still finds the tier due."""
     bob = _scoped(org_engine, BOB)
     root = ProjectMemoryStore(project.path).root
     plans = await _plan(root)
 
-    written = apply_project_compaction(
+    counted = apply_project_compaction(
         bob, principal=_principal(BOB), project_id=project.id, planned_root=root, plans=plans
     )
 
-    assert written == 0
+    assert counted is False
     assert ProjectMemoryStore(project.path).read(MemorySlot.LESSONS) == LESSONS + "\n"
 
 
@@ -114,11 +115,10 @@ async def test_a_project_renamed_during_the_model_call_is_skipped(org_engine, pr
     root, _ = project_slots_to_compact(alice, principal=_principal(ALICE), project_id=project.id)
     plans = await _plan(root)
 
-    written = apply_project_compaction(
+    apply_project_compaction(
         alice, principal=_principal(ALICE), project_id=project.id, planned_root=root.parent / "elsewhere", plans=plans
     )
 
-    assert written == 0
     assert ProjectMemoryStore(project.path).read(MemorySlot.LESSONS) == LESSONS + "\n"
 
 
@@ -128,11 +128,10 @@ async def test_a_project_deleted_during_the_model_call_is_skipped(org_engine, pr
     plans = await _plan(root)
     ProjectService(alice).delete_project(project.id)
 
-    written = apply_project_compaction(
+    apply_project_compaction(
         alice, principal=_principal(ALICE), project_id=project.id, planned_root=root, plans=plans
     )
 
-    assert written == 0
     assert not root.exists()
 
 
@@ -144,9 +143,8 @@ async def test_a_lesson_saved_during_the_model_call_survives(org_engine, project
         scope="project", category=MemorySlot.LESSONS, content=LESSONS + "\n- Late fact", project_id=project.id
     )
 
-    written = apply_project_compaction(
+    apply_project_compaction(
         alice, principal=_principal(ALICE), project_id=project.id, planned_root=root, plans=plans
     )
 
-    assert written == 0
     assert "Late fact" in ProjectMemoryStore(project.path).read(MemorySlot.LESSONS)
