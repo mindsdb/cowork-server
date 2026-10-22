@@ -121,7 +121,7 @@
   html: '<picture><source srcset="{outside}/x.webp 1x, y.webp 2x" type="image/webp"><img src="chart.png" alt="chart"></picture>'
   present: ['<img alt="chart" src="data:image/png;base64,']
   absent: ['picture', 'source', 'webp']
-  omitted: [[scheme, '{outside}/x.webp']]
+  omitted: [[scheme, '{outside}/x.webp'], [unsupported_type, y.webp]]
 
 - id: xmp-raw-text
   html: '<xmp><img src="{outside}/x" onerror="alert(1)"></xmp><p>kept</p>'
