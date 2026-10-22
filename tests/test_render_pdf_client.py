@@ -7,6 +7,7 @@ import gzip
 import io
 import json
 import logging
+import math
 import socket
 import sys
 import threading
@@ -29,6 +30,7 @@ import pytest
 import yaml
 from pypdf import PdfWriter
 from pypdf import _configuration as pypdf_configuration
+from pypdf.generic import create_string_object
 
 from pydantic import BaseModel
 
@@ -681,6 +683,55 @@ def test_a_stop_as_the_page_count_hook_comes_off_restores_the_previous_profile(m
     finally:
         sys.setprofile(outer)
     assert restored is previous
+
+
+class _ClockPastTheStopInsideLogging:
+    """A clock that reads past any stop while this thread holds logging's module lock.
+
+    Python 3.12's logging takes that lock and only then enters the ``try``
+    that releases it. A stop raised in between leaves the lock held, and every
+    later logging call in the process waits for it forever.
+    """
+
+    @staticmethod
+    def monotonic() -> float:
+        return math.inf if logging._lock._is_owned() else 0.0
+
+
+def test_a_page_count_never_stops_while_logging_holds_its_lock(monkeypatch):
+    # pypdf warns about the repeated key, and each pypdf warning takes
+    # logging's lock in logging.getLogger.
+    pdf = _pdf("<< /Type /Catalog /Pages 2 0 R /A 1 /A 1 >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", PAGE)
+    monkeypatch.setattr(render_pdf_client, "time", _ClockPastTheStopInsideLogging)
+    stopped: list[int] = []
+    pages = 0
+    left_held = 0
+
+    try:
+        pages = render_pdf_client._count_pages(pdf=pdf, max_pages=500, deadline=60.0)
+    except RenderPdfFailed as failure:
+        stopped.append(failure.status)
+    finally:
+        # Free a lock the count left held, so the rest of the run can log.
+        while logging._lock._is_owned():
+            logging._lock.release()
+            left_held += 1
+
+    assert left_held == 0
+    assert (pages, stopped) == (1, [])
+
+
+def test_the_page_count_hook_stops_only_as_a_pypdf_function_starts():
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(render_pdf_client._stop_after(stop_at=-math.inf))
+        # Past the stop, code outside pypdf still runs to its end...
+        logging.getLogger(__name__).isEnabledFor(logging.DEBUG)
+        # ...and pypdf stops as its next function starts.
+        with pytest.raises(render_pdf_client._PageCountStopped):
+            create_string_object("x")
+    finally:
+        sys.setprofile(previous)
 
 
 async def test_a_page_count_left_running_holds_off_the_next_export(monkeypatch):

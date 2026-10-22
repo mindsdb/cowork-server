@@ -256,10 +256,21 @@ class _PageCountStopped(BaseException):
 
 
 def _stop_after(*, stop_at: float) -> Callable[[FrameType, str, object], None]:
-    """A profile function that raises at the first event past ``stop_at``."""
+    """A profile function that raises as pypdf starts a function past ``stop_at``.
 
-    def profile(_frame: FrameType, _event: str, _arg: object) -> None:
-        if time.monotonic() > stop_at:
+    It raises only at the start of a pypdf function, before that function has
+    run any of its code. Anywhere else a stop can land between taking a lock
+    and the ``try`` that releases it. Python 3.12's logging takes its module
+    lock that way, and pypdf calls logging for each fault it works around, so
+    a stop there would leave the lock held and block every later logging call
+    in the process.
+    """
+
+    def profile(frame: FrameType, event: str, _arg: object) -> None:
+        if event != "call":
+            return
+        module = frame.f_globals.get("__name__", "")
+        if (module == "pypdf" or module.startswith("pypdf.")) and time.monotonic() > stop_at:
             raise _PageCountStopped
 
     return profile
@@ -271,18 +282,17 @@ def _count_pages(*, pdf: bytes, max_pages: int, deadline: float) -> int:
     pypdf parses a whole object in one call, and one hostile object can hold
     millions of entries, or an object stream thousands of objects. Nothing
     stops that call from outside, so a profile hook on this thread stops it
-    from inside: it raises at the first call pypdf makes past ``deadline`` (a
-    ``time.monotonic()`` value, answered 504) or past ``PAGE_COUNT_SECONDS``
-    of counting (answered 502). The hook slows pypdf down several times, which
-    a count of well under a second can afford.
+    from inside: it raises as pypdf starts its first function past
+    ``deadline`` (a ``time.monotonic()`` value, answered 504) or past
+    ``PAGE_COUNT_SECONDS`` of counting (answered 502). The hook slows pypdf
+    down several times, which a count of well under a second can afford.
     """
     stop_at = min(deadline, time.monotonic() + PAGE_COUNT_SECONDS)
     previous = sys.getprofile()
     sys.setprofile(_stop_after(stop_at=stop_at))
-    # The hook also sees the call that removes it, so a stop can come from the
-    # finally after the count is done. The outer try catches that stop too.
-    # Python turns off a hook that raises, and a stop raised at that call
-    # skips the restore, so the handler restores the previous hook.
+    # Python turns off a hook that raises, so the handler restores the
+    # previous hook. The outer try also catches a stop raised by the call
+    # that removes the hook, which would skip the restore in the finally.
     try:
         try:
             return _walk_page_tree(pdf=pdf, max_pages=max_pages, stop_at=stop_at)
