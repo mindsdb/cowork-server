@@ -501,15 +501,25 @@ def _write_beside(
     itself, created the same way. The temporary name is always removed, as
     soon as the file has its own, so a failed export leaves no file behind.
     Returns the name.
+
+    Without a directory descriptor, as on Windows, each folder on the way is
+    opened by a joined path, so each gets the read's ``lstat`` checks. The
+    first refuses a link before the write opens through it. The second, just
+    before the file takes its name, refuses a walk that changed since. A
+    folder swapped for a link and back between the two is still followed,
+    as it is on the read.
     """
     source_name = parts[-1]
     stem = _output_stem(stem=PurePosixPath(source_name).stem, extension=extension)
+    checked: list[artifact_files._CheckedName] = []
     with ExitStack() as opened:
         parent = folder
         for requested in parts[:-1]:
-            parent = open_pinned_child(
-                parent, artifact_files._existing_draft_entry_name(parent, requested)
-            )
+            entry = artifact_files._existing_draft_entry_name(parent, requested)
+            seen = artifact_files._refuse_link_by_lstat(directory=parent, name=entry)
+            if seen is not None:
+                checked.append(seen)
+            parent = open_pinned_child(parent, entry)
             opened.callback(parent.close)
         temporary = f".cowork-export-{secrets.token_hex(12)}.tmp"
         fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
@@ -520,6 +530,7 @@ def _write_beside(
             finally:
                 os.close(fd)
             before_placing()
+            artifact_files._refuse_a_changed_walk(checked=checked)
             name = _place_temporary(
                 parent=parent,
                 temporary=temporary,
