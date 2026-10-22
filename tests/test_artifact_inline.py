@@ -419,6 +419,34 @@ def test_a_segment_holding_a_colon_is_refused_before_the_file_walk(reference):
     assert refused.value.reason is OmittedReason.TRAVERSAL
 
 
+@pytest.mark.parametrize(
+    ("tag", "namespace", "name"),
+    [
+        ("p", artifact_inline._Namespace.HTML, "onclick"),
+        ("img", artifact_inline._Namespace.HTML, "onerror"),
+        ("rect", artifact_inline._Namespace.SVG, "onbegin"),
+        ("mi", artifact_inline._Namespace.MATH, "onload"),
+    ],
+)
+def test_an_event_handler_goes_even_where_an_allowlist_would_keep_it(
+    tag, namespace, name, monkeypatch
+):
+    """The allowlists drop every on* name today; this check must not lean on them."""
+    monkeypatch.setattr(artifact_inline, "_attribute_allowed", lambda **_: True)
+    inliner = artifact_inline._Inliner(
+        folder=None,
+        base_parts=(),
+        mode=InlineMode.PDF,
+        limits=_limits(),
+        deadline=time.monotonic() + artifact_inline.DEADLINE_SECONDS,
+    )
+
+    kept = inliner._kept_attribute(tag=tag, namespace=namespace, name=name, value="alert(1)")
+
+    assert kept is None
+    assert inliner._kept_attribute(tag=tag, namespace=namespace, name="title", value="t") == "t"
+
+
 def test_doctype_entities_and_dtd_load_nothing(artifact, outside):
     """libxml2's HTML parser reads no internal subset, so no entity resolves."""
     secret = (artifact.other / "secret.txt").as_uri()
