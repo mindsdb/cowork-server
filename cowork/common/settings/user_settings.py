@@ -819,9 +819,9 @@ class UserSettings(Settings):
     )
     # ── Advanced agent budgets ──
     # Overlaid onto AntonSettings per conversation (anton_harness.harness).
-    # The defaults are safety limits that a normal task never reaches, equal to
-    # anton's own; they come from app settings so a deployment can change them
-    # via env without touching per-user rows.
+    # The defaults are safety limits that a normal task never reaches, the
+    # values anton's own defaults move to; they come from app settings so a
+    # deployment can change them via env without touching per-user rows.
     max_tool_rounds: Annotated[int, ORG, PINNED] = Field(
         default_factory=lambda: get_app_settings().default_max_tool_rounds,
         ge=5,

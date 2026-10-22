@@ -1064,9 +1064,10 @@ class AppSettings(Settings):
     # env requires a process restart — "I changed the env and nothing happened"
     # means the old value is cached for the life of the process.
     #
-    # The defaults are safety limits for a turn that never finishes, equal to
-    # anton's own: 30 days of production had no runaway turn, and the largest
-    # legitimate one used 34.4M tokens, 171 tool rounds and 6 continuations.
+    # The defaults are safety limits for a turn that never finishes, the values
+    # anton's own defaults move to: 30 days of production had no runaway turn,
+    # and the largest legitimate one used 34.4M tokens, 171 tool rounds and 6
+    # continuations.
     # Users who want a tighter limit set their own.
     default_max_tool_rounds: int = Field(
         default=250,

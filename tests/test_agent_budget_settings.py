@@ -1,8 +1,8 @@
 """Agent budget settings (max_tool_rounds / max_continuations / max_turn_tokens).
 
-The defaults are safety limits for a turn that never finishes, equal to anton's
-own CoreSettings defaults; a normal task never reaches them, so it doesn't stop
-mid-task to ask "want me to continue?". The DB value is overlaid onto
+The defaults are safety limits for a turn that never finishes, the values
+anton's own CoreSettings defaults move to; a normal task never reaches them,
+so it doesn't stop mid-task to ask "want me to continue?". The DB value is overlaid onto
 AntonSettings per conversation, so it must round-trip the settings service as
 an int and reject junk that would break sessions.
 """
