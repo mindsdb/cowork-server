@@ -102,7 +102,12 @@
   html: '<video src="{outside}/v.mp4" poster="{outside}/poster.png"><source src="{outside}/s.mp4"><track src="{outside}/t.vtt">VIDEO-TEXT</video><audio src="a.mp3">AUDIO-TEXT</audio><p>kept</p>'
   present: ['<p>kept</p>']
   absent: ['video', 'audio', 'source', 'track', 'VIDEO-TEXT', 'AUDIO-TEXT']
-  omitted: [[scheme, '{outside}/v.mp4'], [scheme, '{outside}/poster.png'], [unsupported_type, a.mp3]]
+  omitted:
+    - [scheme, '{outside}/v.mp4']
+    - [scheme, '{outside}/poster.png']
+    - [scheme, '{outside}/s.mp4']
+    - [scheme, '{outside}/t.vtt']
+    - [unsupported_type, a.mp3]
 
 # A segment holding ':' names a Windows alternate data stream, so a load
 # nothing reads still records it as traversal.
@@ -137,6 +142,19 @@
   html: '<template><img src="{outside}/template.png"><p>TEMPLATE-TEXT</p></template><p>kept</p>'
   present: ['<p>kept</p>']
   absent: ['template', 'TEMPLATE-TEXT']
+  omitted: [[scheme, '{outside}/template.png']]
+
+# What a dropped element holds goes with it, and what it would have loaded
+# is listed, at any depth inside it.
+- id: loads-inside-dropped-elements
+  html: '<noscript><div><img src="photo.jpg" srcset="{outside}/2x.png 2x"></div></noscript><object data="x.swf"><img src="../other/secret.png"><a href="{outside}/link">not a load</a></object><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['noscript', 'object', 'photo', 'secret', 'not a load']
+  omitted:
+    - [unsupported_type, photo.jpg]
+    - [scheme, '{outside}/2x.png']
+    - [unsupported_type, x.swf]
+    - [traversal, ../other/secret.png]
 
 - id: textarea-raw-text
   html: '<textarea>&lt;/textarea&gt;&lt;img src=x onerror=alert(1)&gt;</textarea><p>kept</p>'
@@ -193,6 +211,7 @@
   html: '<svg><foreignObject width="10" height="10"><iframe src="{outside}/inside"></iframe><p>FOREIGN-TEXT</p></foreignObject></svg><p>kept</p>'
   present: ['<p>kept</p>']
   absent: ['foreignobject', 'FOREIGN-TEXT', 'iframe']
+  omitted: [[scheme, '{outside}/inside']]
 
 - id: svg-elements-that-load
   html: '<svg><image href="{outside}/image.png" width="1" height="1"/><filter id="f"><feImage href="photo.jpg"/></filter><rect filter="url(#f)"/></svg>'

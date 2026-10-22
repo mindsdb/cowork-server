@@ -475,6 +475,8 @@ class _Inliner:
     scripts_dropped: bool = False
     title_kept: bool = False
     truncated: bool = False
+    # Elements inside dropped subtrees scanned for what they would have loaded.
+    dropped_scanned: int = 0
     assets: dict[tuple[tuple[str, ...], _AssetKind], _Asset] = field(default_factory=dict)
     # Why each file that failed to read or type was refused, so a repeated
     # reference costs no second read. Only the reason is kept: a refusal's
@@ -558,6 +560,29 @@ class _Inliner:
                 frame.pending.extend(reversed(item))
             else:
                 frame.texts[-1].append(item.tail or "")
+                self._omit_dropped_loads(element=item, namespace=visit.namespace)
+
+    def _omit_dropped_loads(
+        self, *, element: lxml.html.HtmlElement, namespace: _Namespace
+    ) -> None:
+        """List what the elements inside a dropped element would have loaded.
+
+        The walk never visits them, so a ``<source>`` inside a ``<video>`` or
+        an ``<img>`` inside a ``<noscript>`` is found here. The scan stops
+        once ``omitted`` is full, past the node cap across every dropped
+        subtree, or past the deadline; the subtree goes either way.
+        """
+        stack = [(child, namespace) for child in reversed(element)]
+        while stack and len(self.omitted) < _MAX_OMITTED:
+            if self.dropped_scanned >= self.limits.max_nodes or self._out_of_time():
+                return
+            self.dropped_scanned += 1
+            node, node_namespace = stack.pop()
+            if not isinstance(node.tag, str):
+                continue
+            self._omit_loads(element=node, namespace=node_namespace)
+            inner = _child_namespace(tag=node.tag, namespace=node_namespace) or node_namespace
+            stack.extend((child, inner) for child in reversed(node))
 
     def _out_of_time(self) -> bool:
         """Whether the deadline has passed; once it has, the output is cut short."""

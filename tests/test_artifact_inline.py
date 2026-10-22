@@ -807,6 +807,19 @@ def test_a_source_parse_cut_short_by_libxml2_ends_with_the_note(artifact, outsid
     assert document.html.endswith(f"<p>{TRUNCATION_NOTE}</p></body></html>")
 
 
+def test_loads_inside_dropped_elements_are_listed_up_to_the_node_cap(artifact, outside):
+    images = "".join(f'<img src="{outside.url}/{index}.png">' for index in range(10))
+    html = f"<template>{images}</template><noscript>{images}</noscript><p>kept</p>".encode()
+    document = _guarded_inline(
+        artifact=artifact, server=outside, html=html, limits=_limits(max_nodes=12)
+    )
+    assert [entry.reference for entry in document.omitted] == [
+        f"{outside.url}/{index}.png" for index in (*range(10), 0, 1)
+    ]
+    assert "<p>kept</p>" in document.html
+    assert TRUNCATION_NOTE not in document.html
+
+
 def test_omitted_entries_cap_the_reference_at_200_characters(artifact, outside):
     reference = f"{outside.url}/{'a' * 500}.png"
     html = f'<img src="{reference}">'.encode()
