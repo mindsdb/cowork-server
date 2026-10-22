@@ -335,6 +335,26 @@ def test_a_failed_write_without_hard_links_leaves_nothing(client, local_artifact
     assert _snapshot(folder) == before
 
 
+@pytest.mark.parametrize("stem", ["a" * 250, "報" * 84], ids=["ascii-250-bytes", "cjk-252-bytes"])
+def test_a_source_name_near_the_name_limit_still_exports(client, local_artifact, stem):
+    """The stem plus " (2)" and the new extension would pass the 255-byte
+    name limit, so the stem is cut, the same way for every output name."""
+    folder = local_artifact({f"{stem}.md": "# R\n"}, primary=f"{stem}.md")
+
+    names = []
+    for _ in range(2):
+        response = client.post(EXPORT_URL, json={"format": "docx"})
+        assert response.status_code == 200, response.text
+        names.append(response.json()["filename"])
+
+    assert all(len(os.fsencode(name)) <= 255 for name in names)
+    cut = names[0].removesuffix(".docx")
+    assert names[1] == f"{cut} (2).docx"
+    assert stem.startswith(cut) and len(cut) < len(stem)
+    for name in names:
+        docx.Document(io.BytesIO((folder / name).read_bytes()))
+
+
 def test_an_html_export_of_markdown_writes_one_document_beside_it(client, local_artifact):
     source = "# Quarterly report\n\nRevenue *grew*.\n\n<script>alert(1)</script>\n"
     folder = local_artifact({"report.md": source}, primary="report.md")

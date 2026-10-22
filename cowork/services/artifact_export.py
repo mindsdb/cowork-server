@@ -86,6 +86,10 @@ INLINE_BUDGET_BYTES = 25 * 1024 * 1024
 ORG_INLINE_BUDGET_BYTES = 10 * 1024 * 1024
 # How many "name (n).ext" spellings an export tries before it gives up.
 _MAX_OUTPUT_NAMES = 100
+# The longest file name the volumes Cowork runs on all take: Linux allows 255
+# bytes, macOS 255 characters and Windows 255 UTF-16 units, and a name of 255
+# UTF-8 bytes fits each.
+_MAX_NAME_BYTES = 255
 # What link() answers on a volume with no hard links: ENOTSUP on macOS exFAT
 # and FAT32, and EPERM on Linux vfat. EOPNOTSUPP is ENOTSUP's other spelling.
 _NO_HARD_LINKS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM})
@@ -415,6 +419,18 @@ def _create_without_replacing(folder: PinnedDir, name: str, data: bytes) -> None
         raise
 
 
+def _output_stem(*, stem: str, extension: str) -> str:
+    """*stem*, cut so that every output name fits ``_MAX_NAME_BYTES``.
+
+    The longest output name is ``stem (100).ext``. The cut falls between
+    characters, never inside one.
+    """
+    room = _MAX_NAME_BYTES - len(os.fsencode(f" ({_MAX_OUTPUT_NAMES}){extension}"))
+    while len(os.fsencode(stem)) > room:
+        stem = stem[:-1]
+    return stem
+
+
 def _write_beside(
     *,
     folder: PinnedDir,
@@ -435,7 +451,7 @@ def _write_beside(
     Returns the name.
     """
     source_name = parts[-1]
-    stem = PurePosixPath(source_name).stem
+    stem = _output_stem(stem=PurePosixPath(source_name).stem, extension=extension)
     with ExitStack() as opened:
         parent = folder
         for requested in parts[:-1]:
