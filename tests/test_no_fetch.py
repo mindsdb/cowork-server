@@ -3,6 +3,7 @@ import ctypes
 import multiprocessing
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -24,6 +25,28 @@ def test_records_a_socket_connect():
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.connect(server.server_address)
         assert "socket.connect" in _events(recorder)
+        assert server.hits() == [""]
+
+
+def _sockaddr_in(*, host: str, port: int) -> bytes:
+    """A C ``struct sockaddr_in``; BSD and macOS open it with a length byte."""
+    rest = struct.pack("!H", port) + socket.inet_aton(host) + bytes(8)
+    if sys.platform == "darwin" or "bsd" in sys.platform:
+        return bytes([16, socket.AF_INET]) + rest
+    return struct.pack("=H", socket.AF_INET) + rest
+
+
+@pytest.mark.skipif(os.name == "nt", reason="calls the C library's connect() directly")
+def test_the_recording_server_sees_a_native_connect_the_audit_hook_misses():
+    """What the server check is for: a connection made from C raises no audit event."""
+    libc = ctypes.CDLL(None, use_errno=True)  # loaded before the guard, which records a load
+    with recording_server() as server:
+        address = _sockaddr_in(host=server.server_name, port=server.server_port)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with no_fetch() as recorder:
+                result = libc.connect(sock.fileno(), address, len(address))
+        assert result == 0, os.strerror(ctypes.get_errno())
+        assert recorder.calls == []
         assert server.hits() == [""]
 
 
