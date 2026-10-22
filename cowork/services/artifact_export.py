@@ -94,10 +94,10 @@ _METADATA = "metadata.json"
 _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
 
-# Org mode offers no export format, and the route answers 403 there. On
-# hosted's pod limits, 1 CPU and 1 GiB, single exports within the org caps
-# held the event loop for 7 s (a ladder of Markdown code fences) or peaked
-# past 500 MiB (a 2 MiB Markdown table, a 10 MiB page of one-word paragraphs);
+# Org mode offers no export format, and the route answers 403 there. Measured
+# with docker --cpus=1 --memory=1g, single exports within the org caps held
+# the event loop for 7 s (a ladder of Markdown code fences) or peaked past
+# 500 MiB (a 2 MiB Markdown table, a 10 MiB page of one-word paragraphs);
 # scripts/measure_export_capacity.py holds the cases. A replica serves many
 # people at once, so org export waits until the conversion runs in a process
 # of its own that can be killed.

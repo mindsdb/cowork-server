@@ -21,7 +21,7 @@ The cases cover ordinary reports at the org caps (10 MiB inline budget, 10 MiB
 HTML and 2 MiB Markdown read bounds), the heaviest HTML the caps allow, and
 Markdown shapes that slow Python-Markdown down much faster than their size.
 
-Run it on hosted's pod limits, with the repository mounted read-only:
+Run it with 1 CPU and 1 GiB of memory, with the repository mounted read-only:
 
     docker run --rm --cpus=1 --memory=1g -v "$PWD":/src:ro -w /src \\
       -e UV_PROJECT_ENVIRONMENT=/opt/venv -e PYTHONPATH=/src \\
