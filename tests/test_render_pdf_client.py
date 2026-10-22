@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 import tracemalloc
+import warnings
 import zlib
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ import httpx
 import pytest
 import yaml
 from pypdf import PdfWriter
+from pypdf import _configuration as pypdf_configuration
 
 from pydantic import BaseModel
 
@@ -802,6 +804,40 @@ async def test_an_object_stream_past_the_decode_cap_answers_502_without_parsing_
     started = time.monotonic()
     assert await _status(client=_client(handler=_answering(pdf=pdf))) == 502
     assert time.monotonic() - started < 2
+
+
+def test_an_object_stream_past_the_inflate_cap_answers_502_in_a_new_thread():
+    # The page tree is fine: only the padding after the page takes the stream
+    # past the cap, and pypdf's own cap of 75 MB would read the one page and
+    # return the PDF. A new thread starts without any limit a context variable
+    # holds in another thread.
+    pdf = _packed_pdf(kids=1, body=PAGE + " " * (render_pdf_client.PYPDF_STREAM_CAP + MIB))
+    failures: list[RenderPdfFailed] = []
+
+    def count() -> None:
+        try:
+            render_pdf_client._read_pdf(answer=_answer(pdf=pdf), max_pages=500, deadline=time.monotonic() + 60)
+        except RenderPdfFailed as failure:
+            failures.append(failure)
+
+    thread = threading.Thread(target=count)
+    thread.start()
+    thread.join(timeout=30)
+
+    assert [(failure.status, "LimitReachedError" in str(failure)) for failure in failures] == [(502, True)]
+
+
+def test_counting_pages_sets_no_deprecated_pypdf_limit(monkeypatch):
+    # pypdf warns about each deprecated limit only once per process.
+    monkeypatch.setattr(pypdf_configuration, "WARNED_LEGACY_OVERWRITES", set())
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        render_pdf_client._read_pdf(
+            answer=_answer(pdf=FIXTURE_PDF), max_pages=500, deadline=time.monotonic() + 60
+        )
+
+    assert [str(warning.message) for warning in caught if issubclass(warning.category, DeprecationWarning)] == []
 
 
 async def test_an_encrypted_pdf_answers_502():

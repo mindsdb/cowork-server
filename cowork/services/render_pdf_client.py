@@ -35,9 +35,8 @@ from types import FrameType
 from typing import Literal
 
 import httpx
-import pypdf.filters
 from pydantic import ValidationError
-from pypdf import PdfReader
+from pypdf import Configuration, PdfReader, apply_configuration
 from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 
 from cowork.schemas.artifact_export import ExportPdfSettings, RenderPdfRequest, RenderPdfResult
@@ -51,14 +50,17 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 # pypdf inflates each stream it reads up to 75 MB. Counting pages inflates only
 # object streams and cross-reference streams, which a render service keeps far
-# smaller, and this client is the only pypdf user in the server's process
-# (agent cells run in child processes). A lower cap bounds what one hostile
-# stream costs; past it, pypdf raises and the export answers 502.
+# smaller. A lower cap bounds what one hostile stream costs; past it, pypdf
+# raises and the export answers 502. pypdf reads its limits from a context
+# variable, which a new thread starts without, so _read_pdf applies them
+# around each count, in whatever thread runs it.
 PYPDF_STREAM_CAP = 8 * 1024 * 1024
-pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH = PYPDF_STREAM_CAP
-pypdf.filters.LZW_MAX_OUTPUT_LENGTH = PYPDF_STREAM_CAP
-pypdf.filters.RUN_LENGTH_MAX_OUTPUT_LENGTH = PYPDF_STREAM_CAP
-pypdf.filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH = PYPDF_STREAM_CAP
+_PYPDF_LIMITS = Configuration(
+    zlib_maximum_output_length=PYPDF_STREAM_CAP,
+    lzw_maximum_output_length=PYPDF_STREAM_CAP,
+    run_length_maximum_output_length=PYPDF_STREAM_CAP,
+    array_based_stream_maximum_output_length=PYPDF_STREAM_CAP,
+)
 
 # The render service stops a print job 30 s after it starts. A retry after a
 # 503 is worth sending only while the budget left covers that whole job; with
@@ -221,7 +223,8 @@ def _read_pdf(*, answer: bytes, max_pages: int, deadline: float) -> bytes:
         raise RenderPdfFailed(status=504, reason=_NO_PDF_IN_TIME)
     try:
         pdf = _decode_pdf(answer=answer)
-        pages = _count_pages(pdf=pdf, max_pages=max_pages, deadline=deadline)
+        with apply_configuration(_PYPDF_LIMITS):
+            pages = _count_pages(pdf=pdf, max_pages=max_pages, deadline=deadline)
     finally:
         _READ_LOCK.release()
     if pages > max_pages:
