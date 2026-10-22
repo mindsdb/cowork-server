@@ -1,8 +1,9 @@
 """scripts/measure_export_capacity.py measures RSS the way a replica holds it.
 
-A replica has the whole server imported before it exports anything, so a case
-reads its baseline with ``cowork.server`` imported, and before it builds the
-artifact, whose source and images the build holds in memory once.
+A replica imports the whole server and warms its agent runtime before it
+reports ready, so a case does both before it reads its baseline, and reads it
+before it builds the artifact, whose source and images the build holds in
+memory once.
 """
 from __future__ import annotations
 
@@ -42,17 +43,24 @@ def test_a_case_reads_its_baseline_before_it_builds_the_artifact(monkeypatch):
     assert (row.baseline_rss_mib, row.peak_rss_mib, row.rss_added_mib) == (200.0, 260.0, 60.0)
 
 
-def test_the_baseline_is_read_with_the_server_imported():
+def test_the_baseline_is_read_with_the_server_imported_and_its_agent_runtime_warmed():
+    # The warm-up swallows import failures, so the probe checks sys.modules.
     probe = (
         "import sys\n"
         "from scripts import measure_export_capacity as capacity\n"
-        "before = 'cowork.server' in sys.modules\n"
+        "before = set(sys.modules)\n"
         "capacity._replica_baseline_mib()\n"
-        "print(before, 'cowork.server' in sys.modules)\n"
+        "after = set(sys.modules)\n"
+        "import cowork.server\n"
+        "runtime = cowork.server.AGENT_RUNTIME_MODULES\n"
+        "print('cowork.server' in before, 'cowork.server' in after)\n"
+        "print(all(n in before for n in runtime), all(n in after for n in runtime))\n"
     )
 
     finished = subprocess.run(
         [sys.executable, "-c", probe], cwd=ROOT, capture_output=True, text=True, check=True
     )
 
-    assert finished.stdout.split() == ["False", "True"]
+    server, runtime = finished.stdout.strip().splitlines()[-2:]
+    assert server.split() == ["False", "True"]
+    assert runtime.split() == ["False", "True"]

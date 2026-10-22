@@ -8,9 +8,10 @@ back every few milliseconds, but one long C call such as a regex match holds
 it, and that shows up as one long wake-up.
 
 Every case runs in its own process, so each case's peak RSS is its own. A
-replica has the whole server imported before it exports anything, so each
-case imports ``cowork.server`` and reads its baseline before it builds the
-artifact. Peak RSS is then what a replica would peak at, and RSS added counts
+replica imports the whole server and warms its agent runtime before it
+reports ready, so each case does both before it reads its baseline, and
+reads it before it builds the artifact. Peak RSS is then what a replica peaks
+at before its database and caches, which only add more. RSS added counts
 building the case as well as the export, so it errs high. A case still
 running at its time budget stops itself and reports the longest stall it saw.
 Only a single stall past the grace period keeps it from doing that; the
@@ -268,9 +269,11 @@ def _peak_rss_mib() -> float:
 
 
 def _replica_baseline_mib() -> float:
-    """Peak RSS with the whole server imported, as a replica holds it before any export."""
-    import cowork.server  # noqa: F401
+    """Peak RSS with the server imported and its agent runtime warmed, as a
+    replica holds it once it reports ready."""
+    import cowork.server
 
+    cowork.server._warm_agent_runtime()
     return _peak_rss_mib()
 
 
