@@ -723,6 +723,22 @@ def test_total_budget_counts_spliced_css(artifact, outside):
     assert ".more" not in document.html
 
 
+def test_the_budget_counts_a_spliced_stylesheet_as_read_not_as_escaped(tmp_path):
+    """Each "<" becomes four characters in the output, but costs one byte of the budget."""
+    folder = tmp_path / "art"
+    folder.mkdir()
+    sheet = b'p::after{content:"' + b"<" * 1000 + b'"}'
+    (folder / "angles.css").write_bytes(sheet)
+    document = _inline(
+        artifact=Artifact(folder=folder, other=folder),
+        html=b'<style>@import "angles.css";</style>',
+        limits=_limits(max_total_bytes=len(sheet)),
+    )
+    assert document.omitted == []
+    assert document.inlined_bytes == len(sheet)
+    assert document.html.count("\\3c ") == 1000
+
+
 def test_node_cap_drops_the_rest_of_the_tree_and_says_so(artifact, outside):
     html = "".join(f"<p>para {index}</p>" for index in range(100)).encode()
     limits = _limits(max_nodes=20)
