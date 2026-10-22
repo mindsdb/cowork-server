@@ -72,10 +72,12 @@ def publish_calls(monkeypatch):
 
 @pytest.fixture
 def publish_context(monkeypatch):
+    """Org publish endpoint and a turn key; yields the list of revoke calls."""
     monkeypatch.setattr(
         "cowork.services.artifact_autopublish._publish_url",
         lambda scope: "https://api.staging.mindshub.ai",
     )
+    revoked = []
 
     class FakeKey:
         def __init__(self, *a, **kw):
@@ -84,10 +86,37 @@ def publish_context(monkeypatch):
         async def get(self):
             return "turnkey-1"
 
+        async def revoke(self):
+            revoked.append(True)
+
     monkeypatch.setattr("cowork.services.artifact_publish_key.PublishKey", FakeKey)
+    return revoked
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("granted_product_permissions")]
+
+
+def _upload_service_answers(monkeypatch, status: int, reason: str, body: bytes) -> None:
+    """The real publish path runs, and the upload service answers `status`."""
+    import io
+    from urllib.error import HTTPError
+
+    def reject(*args, **kwargs):
+        raise HTTPError("https://publish.example/upload", status, reason, {}, io.BytesIO(body))
+
+    monkeypatch.setattr("anton.publisher.publish", reject)
+    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity.publish_authorization_key",
+        lambda *args: "owner/artifact",
+    )
+
+
+def _lock_is_free(folder) -> bool:
+    free = artifact_locks.acquire(folder.parent, folder.name, ttl_s=60)
+    if free:
+        artifact_locks.release(folder.parent, folder.name)
+    return free
 
 
 async def test_setting_access_republishes_with_the_chosen_audience(
@@ -181,21 +210,11 @@ async def test_share_preserves_mint_failure_after_waiting_for_publish_lock(
 async def test_share_preserves_authority_failure_from_the_artifact_consumer(
     as_owner, publish_context, monkeypatch, status,
 ):
-    import io
-    from urllib.error import HTTPError
-
-    body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
-
-    def reject(*args, **kwargs):
-        raise HTTPError("https://publish.example/upload", status, "Rejected", {},
-                        io.BytesIO(json.dumps(body).encode()))
-
-    monkeypatch.setattr("anton.publisher.publish", reject)
-    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
-    monkeypatch.setattr(
-        "cowork.services.artifact_authorization_identity.publish_authorization_key",
-        lambda *args: "owner/artifact",
+    body = (
+        {"code": "permission_denied"} if status == 403
+        else {"error": "Auth unavailable", "code": "auth_unavailable"}
     )
+    _upload_service_answers(monkeypatch, status, "Rejected", json.dumps(body).encode())
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
             "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
@@ -239,6 +258,9 @@ async def test_access_is_not_changed_when_no_publish_credential_is_available(
 
         async def get(self):
             return ""
+
+        async def revoke(self):
+            pass
 
     monkeypatch.setattr("cowork.services.artifact_publish_key.PublishKey", NoKey)
 
@@ -329,3 +351,136 @@ async def test_share_of_a_report_owned_by_another_account_is_409(as_owner, publi
     assert not (as_owner / ".published.json").exists()
     assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
     artifact_locks.release(as_owner.parent, as_owner.name)
+
+
+async def test_share_reports_an_unmarked_upload_503_as_the_service_being_unavailable(
+    as_owner, publish_context, monkeypatch,
+):
+    _upload_service_answers(monkeypatch, 503, "Service Unavailable", b'{"error": "Service Unavailable"}')
+    with pytest.raises(HTTPException) as error:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert error.value.status_code == 503
+    assert error.value.detail == {
+        "code": "publish_unavailable",
+        "message": "The publishing service is temporarily unavailable. Try again in a moment.",
+    }
+    assert not (as_owner / ".published.json").exists()
+    assert _lock_is_free(as_owner)
+
+
+async def test_a_too_large_artifact_is_413_with_its_code(as_owner, publish_context, monkeypatch):
+    _upload_service_answers(monkeypatch, 413, "Payload Too Large", b'{"message": "Request Too Long"}')
+    with pytest.raises(HTTPException) as error:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert error.value.status_code == 413
+    assert error.value.detail == {
+        "code": "artifact_too_large",
+        "message": "This artifact is too large to publish. Remove or shrink large files in it, such as PDFs or images.",
+    }
+    assert not (as_owner / ".published.json").exists()
+    assert _lock_is_free(as_owner)
+
+
+async def test_a_rejected_publish_shows_the_upload_service_text(as_owner, publish_context, monkeypatch):
+    from cowork.services.publish import PublishRejected
+
+    def reject(*args, **kwargs):
+        raise PublishRejected("Publishing failed: This organization is archived or still being provisioned.")
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", reject)
+    with pytest.raises(HTTPException) as error:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert error.value.status_code == 502
+    assert error.value.detail == "Publishing failed: This organization is archived or still being provisioned."
+    assert _lock_is_free(as_owner)
+
+
+@pytest.mark.parametrize("local_error", [
+    RuntimeError("Publishing failed: [Errno 2] No such file: '/data/org-1/proj/x.pdf'"),
+    PermissionError("[Errno 13] Permission denied: '/data/org-1/proj/.published.json'"),
+])
+async def test_a_local_publish_failure_hides_its_text_but_logs_it(
+    as_owner, publish_context, monkeypatch, caplog, local_error,
+):
+    import logging
+
+    def fail(*args, **kwargs):
+        raise local_error
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", fail)
+    with caplog.at_level(logging.WARNING, logger=aw.logger.name):
+        with pytest.raises(HTTPException) as error:
+            await aw.set_artifact_access(
+                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            )
+    assert error.value.status_code == 502
+    assert error.value.detail == "Publishing failed. Try again in a moment."
+    record = next(r for r in caplog.records if "Could not change access for artifact" in r.getMessage())
+    assert record.exc_info is not None
+    assert _lock_is_free(as_owner)
+
+
+async def test_a_missing_publisher_is_503(as_owner, publish_context, monkeypatch):
+    from cowork.services.publish import PublisherUnavailable
+
+    def fail(*args, **kwargs):
+        raise PublisherUnavailable("Anton publisher is unavailable")
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", fail)
+    with pytest.raises(HTTPException) as error:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert error.value.status_code == 503
+    assert error.value.detail == "Anton publisher is unavailable"
+
+
+async def test_the_turn_key_is_revoked_after_a_share(as_owner, publish_calls, publish_context):
+    await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+    )
+    assert publish_context == [True]
+
+
+async def test_the_turn_key_is_revoked_after_a_failed_share(as_owner, publish_context, monkeypatch):
+    from cowork.services.publish import PublishRejected
+
+    def reject(*args, **kwargs):
+        raise PublishRejected("Publishing failed: nope")
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", reject)
+    with pytest.raises(HTTPException):
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert publish_context == [True]
+
+
+async def test_the_turn_key_is_kept_while_a_timed_out_publish_still_runs(
+    as_owner, publish_context, monkeypatch,
+):
+    import threading
+
+    finish = threading.Event()
+
+    def slow(*args, **kwargs):
+        finish.wait(5)
+        return {"status": "ok", "url": "https://view.example/r/1"}
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", slow)
+    monkeypatch.setattr(aw, "_LIVE_PUBLISH_TIMEOUT_S", 0.05)
+    try:
+        with pytest.raises(HTTPException) as error:
+            await aw.set_artifact_access(
+                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            )
+    finally:
+        finish.set()
+    assert error.value.detail == "Publishing timed out. Try again in a moment."
+    assert publish_context == []

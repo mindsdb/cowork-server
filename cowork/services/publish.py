@@ -68,13 +68,20 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
+class _CodedRefusal(HTTPException):
+    """An HTTPException whose detail is `{"code", "message"}`: clients match on the code."""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(status_code, detail={"code": code, "message": message})
+
+
 # The upload service's 409 for a report that belongs to another account; the
 # renderer matches on the code.
 OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
 OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
 
 
-class PublishOwnedByOtherUser(HTTPException):
+class PublishOwnedByOtherUser(_CodedRefusal):
     """The upload service refused the publish: another account owns this report.
 
     An HTTPException, like ProductPermissionDenied, so any route that lets it
@@ -83,28 +90,123 @@ class PublishOwnedByOtherUser(HTTPException):
     """
 
     def __init__(self) -> None:
-        super().__init__(
-            409, detail={"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE},
-        )
+        super().__init__(409, OWNED_BY_OTHER_USER_CODE, OWNED_BY_OTHER_USER_MESSAGE)
 
 
-def raise_publish_permission_error(exc: Exception) -> None:
-    """Preserve the artifact consumer's explicit authority result through wrappers."""
+# The upload service's 413: the bundle is over its request size limit.
+ARTIFACT_TOO_LARGE_CODE = "artifact_too_large"
+ARTIFACT_TOO_LARGE_MESSAGE = (
+    "This artifact is too large to publish. "
+    "Remove or shrink large files in it, such as PDFs or images."
+)
+# Any 503 from the upload service other than an auth outage.
+UPLOAD_UNAVAILABLE_CODE = "publish_unavailable"
+UPLOAD_UNAVAILABLE_MESSAGE = "The publishing service is temporarily unavailable. Try again in a moment."
+
+
+class PublishTooLarge(_CodedRefusal):
+    """The upload service refused the bundle as too large.
+
+    The same files are refused on every retry, so callers report it instead
+    of retrying.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(413, ARTIFACT_TOO_LARGE_CODE, ARTIFACT_TOO_LARGE_MESSAGE)
+
+
+class UploadServiceUnavailable(_CodedRefusal):
+    """The upload service answered 503 without marking it as an auth outage."""
+
+    def __init__(self) -> None:
+        super().__init__(503, UPLOAD_UNAVAILABLE_CODE, UPLOAD_UNAVAILABLE_MESSAGE)
+
+
+class PublishRejected(RuntimeError):
+    """A publish failure whose text is safe to show the user.
+
+    A plain RuntimeError from `publish_artifact` can carry local detail such as
+    a shared-storage path, so org routes show this type's text and hide the
+    other's.
+    """
+
+
+class UploadError(NamedTuple):
+    """An upload-service answer `classify_upload_error` left to its caller."""
+
+    status: int
+    code: str | None
+    error: str | None
+
+
+def _read_http_error_body(exc: Exception) -> tuple[str, str | None, str | None]:
+    """(body, code, error) of an HTTPError, from a single read.
+
+    A second `read()` returns nothing, so every consumer goes through here once.
+    Any failure to read gives an empty body rather than replacing `exc`.
+    """
+    try:
+        body = exc.read(65_536).decode("utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        return "", None, None
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return body, None, None
+    if not isinstance(payload, dict):
+        return body, None, None
+    code = payload.get("code")
+    error = payload.get("error")
+    if not isinstance(error, str) and getattr(exc, "code", None) == 429:
+        # API Gateway's throttling text. Its other `message` answers, such as
+        # "Missing Authentication Token" for a wrong URL, would mislead.
+        error = payload.get("message")
+    return (
+        body,
+        code if isinstance(code, str) else None,
+        error if isinstance(error, str) else None,
+    )
+
+
+def classify_upload_error(exc: Exception) -> UploadError | None:
+    """Raise the typed error for an upload-service refusal, or return it for wording.
+
+    413 is too large. A 503 is an auth outage only when the service says so
+    (`auth_unavailable`); any other 503 is the upload service itself. A 403 is
+    a denial only with `permission_denied`. Every other HTTP answer comes back
+    as an UploadError; a failure that got no HTTP answer returns None.
+    """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
-    if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
+    if isinstance(
+        exc,
+        (ProductPermissionDenied, ProductPermissionUnavailable, PublishTooLarge, UploadServiceUnavailable),
+    ):
         raise exc
     if not isinstance(exc, urllib.error.HTTPError):
-        return
-    if exc.code == 503:
-        raise ProductPermissionUnavailable() from exc
-    if exc.code == 403:
-        try:
-            body = json.loads(exc.read(65_536))
-        except (OSError, ValueError):
-            return
-        if isinstance(body, dict) and body.get("code") == "permission_denied":
-            raise ProductPermissionDenied() from exc
+        return None
+    status = exc.code
+    body, code, error = _read_http_error_body(exc)
+    typed: HTTPException | None = None
+    if status == 413:
+        typed = PublishTooLarge()
+    elif status == 503:
+        typed = ProductPermissionUnavailable() if code == "auth_unavailable" else UploadServiceUnavailable()
+    elif status == 403 and code == "permission_denied":
+        typed = ProductPermissionDenied()
+    if typed is None:
+        return UploadError(status, code, error)
+    # A typed refusal leaves publish_artifact before its own failure log.
+    logger.warning("Publish service answered HTTP %s code=%s body=%r", status, code, body[:200])
+    raise typed from exc
+
+
+def _clip(text: str) -> str:
+    """Server text short enough to show, keeping the end where pip names the cause."""
+    head, tail, gap = 100, 400, " … "
+    if len(text) <= head + len(gap) + tail:
+        return text
+    return f"{text[:head]}{gap}{text[-tail:]}"
 
 
 #: The files the publish store holds: its state, and the temporary file a
@@ -524,7 +626,7 @@ def publish_artifact(
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
-        from anton.publisher import ArtifactOwnedByOtherUserError, publish
+        from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked, publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
@@ -597,18 +699,28 @@ def publish_artifact(
         # report_id for another account.
         raise PublishOwnedByOtherUser() from exc
     except Exception as exc:
-        raise_publish_permission_error(exc)
+        upload_error = classify_upload_error(exc)
         logger.exception("Publishing failed")
+        # A 401's text ("Invalid token") says less than the credentials advice below.
+        if (
+            upload_error is not None
+            and upload_error.error
+            and 400 <= upload_error.status < 500
+            and upload_error.status != 401
+        ):
+            raise PublishRejected(f"Publishing failed: {_clip(upload_error.error)}") from exc
         # Only network/HTTP failures get the "Connection failed" framing — a
         # gateway timeout (e.g. a fullstack artifact whose deps take too long
-        # to install remotely, ENG-1547/ENG-1580) or a server-side 5xx reads
-        # very differently to the user than an auth rejection, but neither
-        # applies to a local failure (e.g. reading the artifact's files to
-        # zip it) that happened before any request went out. urllib.error
-        # HTTPError is a URLError subclass, so this covers both.
+        # to install remotely) or a server-side 5xx reads very differently to
+        # the user than an auth rejection, but neither applies to a local
+        # failure (e.g. reading the artifact's files to zip it) that happened
+        # before any request went out. urllib.error HTTPError is a URLError
+        # subclass, so this covers both.
         if isinstance(exc, urllib.error.URLError):
             headline, advice = describe_minds_connection_error(exc)
-            raise RuntimeError(f"Publishing failed. {headline} {advice}") from exc
+            raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
+        if isinstance(exc, StatePublishBlocked):
+            raise PublishRejected(f"Publishing failed: {exc}") from exc
         raise RuntimeError(f"Publishing failed: {exc}") from exc
     finally:
         if md_tmp_dir is not None:
@@ -772,7 +884,7 @@ def unpublish_artifact(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
-        raise_publish_permission_error(exc)
+        classify_upload_error(exc)
         msg = str(exc) or "Unpublishing failed."
         if "404" in msg or "not found" in msg.lower():
             # Already gone upstream, OR still alive under another owner's prefix
@@ -889,12 +1001,8 @@ def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> ResolvedR
 
 def _publisher_http_detail(exc: Exception) -> str:
     """Best-effort human message from an upstream HTTPError JSON body."""
-    body = ""
-    try:
-        body = exc.read().decode()  # type: ignore[attr-defined]
-        return json.loads(body).get("error") or body or str(exc)
-    except Exception:
-        return body or str(exc)
+    body, _code, error = _read_http_error_body(exc)
+    return error or body or str(exc)
 
 
 def list_versions(raw_path: str, *, scope: TenantScope | None) -> dict:

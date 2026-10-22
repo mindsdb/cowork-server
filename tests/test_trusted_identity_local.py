@@ -14,6 +14,7 @@ A shared project another person still works in is never deleted under them.
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -165,7 +166,7 @@ async def _memory_warnings_at_start(monkeypatch, caplog) -> list[str]:
         for record in caplog.records
         if record.name == "cowork.common.logger"
         and record.levelno == logging.WARNING
-        and record.getMessage().startswith("memory: ")
+        and record.getMessage().startswith("COWORK_PERSONAL_RESOURCES ")
     ]
 
 
@@ -183,12 +184,17 @@ async def test_the_start_warns_that_memory_is_shared(
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     trusted.setenv("MEMORY_ENABLED", enabled)
     get_app_settings.cache_clear()
-    owned_logger("cowork.common.logger", level=logging.WARNING)
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    owned = owned_logger("cowork.common.logger", level=logging.WARNING)
 
-    [warning] = await _memory_warnings_at_start(monkeypatch, caplog)
+    await _memory_warnings_at_start(monkeypatch, caplog)
 
-    assert says in warning and never not in warning
-    assert warning.endswith(f"({tmp_path / 'memory'})")
+    [warning] = [json.loads(line) for line in owned.stream.getvalue().splitlines()]
+    assert warning["logger"] == "cowork.common.logger"
+    assert warning["log_level"] == "WARNING"
+    assert warning["operation"] == "lifespan"
+    assert says in warning["message"] and never not in warning["message"]
+    assert str(tmp_path / "memory") not in owned.stream.getvalue()
 
 
 @pytest.mark.parametrize("enabled", ["true", "false"])
