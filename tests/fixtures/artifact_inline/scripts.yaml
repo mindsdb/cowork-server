@@ -83,6 +83,13 @@
   scripts_dropped: true
   omitted: [[unsupported_type, app.js], [scheme, '{outside}/x.js'], [traversal, ../other/app.js]]
 
+# An SVG script loads from href, so a dropped one lists that too.
+- id: svg-script-href-is-listed
+  html: '<svg><script href="{outside}/a.js"></script><script xlink:href="b.js"></script></svg><p>kept</p>'
+  absent: ['<script', 'a.js', 'b.js']
+  scripts_dropped: true
+  omitted: [[scheme, '{outside}/a.js'], [unsupported_type, b.js]]
+
 - id: every-other-script-source-in-pdf
   modes: [pdf]
   html: >-

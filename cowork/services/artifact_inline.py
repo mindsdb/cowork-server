@@ -642,7 +642,8 @@ class _Inliner:
         libxml2 reads every script as raw text, but a browser reads a script
         inside SVG or MathML as markup, where it can build elements, such as
         an image with an outside source, that this walk never sees. Every
-        script that goes lists its ``src`` in ``omitted``.
+        script that goes lists its ``src`` in ``omitted``, and an SVG script
+        its ``href`` too.
         """
         src = element.attrib.pop("src", None)
         if self.mode is InlineMode.PDF and namespace is _Namespace.HTML:
@@ -656,6 +657,7 @@ class _Inliner:
                 return _Visit(_Action.KEEP, namespace)
         if src is not None:
             self._omit_unloaded(reference=src)
+        self._omit_loads(element=element, namespace=namespace)
         self.scripts_dropped = True
         return _Visit(_Action.DROP, namespace)
 
