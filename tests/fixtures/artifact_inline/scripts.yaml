@@ -74,6 +74,14 @@
   modes: [html, word]
   absent: ['<script', 'jsdelivr']
   scripts_dropped: true
+  omitted: [[scheme, 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js']]
+
+- id: script-sources-outside-pdf
+  html: '<script src="app.js"></script><script src="{outside}/x.js"></script><svg><script src="../other/app.js"></script></svg><p>kept</p>'
+  modes: [html, word]
+  absent: ['<script', 'app.js', '{outside}']
+  scripts_dropped: true
+  omitted: [[unsupported_type, app.js], [scheme, '{outside}/x.js'], [traversal, ../other/app.js]]
 
 - id: every-other-script-source-in-pdf
   modes: [pdf]

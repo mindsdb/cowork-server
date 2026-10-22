@@ -605,21 +605,21 @@ class _Inliner:
 
         libxml2 reads every script as raw text, but a browser reads a script
         inside SVG or MathML as markup, where it can build elements, such as
-        an image with an outside source, that this walk never sees.
+        an image with an outside source, that this walk never sees. Every
+        script that goes lists its ``src`` in ``omitted``.
         """
-        if self.mode is InlineMode.PDF:
-            src = element.attrib.pop("src", None)
-            if namespace is _Namespace.HTML:
-                if src is None and _inline_script_is_stable(text=element.text or ""):
-                    self._sanitize_attributes(element=element, namespace=namespace)
-                    return _Visit(_Action.KEEP, namespace)
-                if src is not None and _PINNED_CDN_SCRIPT.fullmatch(src):
-                    element.text = None
-                    self._sanitize_attributes(element=element, namespace=namespace)
-                    element.set("src", src)
-                    return _Visit(_Action.KEEP, namespace)
-            if src is not None:
-                self._omit_unloaded(reference=src)
+        src = element.attrib.pop("src", None)
+        if self.mode is InlineMode.PDF and namespace is _Namespace.HTML:
+            if src is None and _inline_script_is_stable(text=element.text or ""):
+                self._sanitize_attributes(element=element, namespace=namespace)
+                return _Visit(_Action.KEEP, namespace)
+            if src is not None and _PINNED_CDN_SCRIPT.fullmatch(src):
+                element.text = None
+                self._sanitize_attributes(element=element, namespace=namespace)
+                element.set("src", src)
+                return _Visit(_Action.KEEP, namespace)
+        if src is not None:
+            self._omit_unloaded(reference=src)
         self.scripts_dropped = True
         return _Visit(_Action.DROP, namespace)
 
