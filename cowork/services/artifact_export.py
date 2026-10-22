@@ -9,6 +9,7 @@ source, under a name nothing else holds, so an export never replaces a file.
 
 from __future__ import annotations
 
+import errno
 import html
 import json
 import os
@@ -85,6 +86,9 @@ INLINE_BUDGET_BYTES = 25 * 1024 * 1024
 ORG_INLINE_BUDGET_BYTES = 10 * 1024 * 1024
 # How many "name (n).ext" spellings an export tries before it gives up.
 _MAX_OUTPUT_NAMES = 100
+# What link() answers on a volume with no hard links: ENOTSUP on macOS exFAT
+# and FAT32, and EPERM on Linux vfat. EOPNOTSUPP is ENOTSUP's other spelling.
+_NO_HARD_LINKS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM})
 
 _OUTPUT_EXTENSIONS: dict[ExportFormat, str] = {"html": ".html", "docx": ".docx"}
 _METADATA = "metadata.json"
@@ -372,6 +376,28 @@ def _link_without_replacing(folder: PinnedDir, source_name: str, destination_nam
         os.rename(folder.path / source_name, folder.path / destination_name)
 
 
+def _create_without_replacing(folder: PinnedDir, name: str, data: bytes) -> None:
+    """Write *data* to a new file at *name*, refusing one that already exists.
+
+    For a volume with no hard links, such as exFAT or FAT32. ``O_EXCL |
+    O_NOFOLLOW`` refuses any existing entry, a symlink included, as a link
+    does. Unlike a link, the file shows at its name while it is written, so a
+    failed write removes it.
+    """
+    fd = dir_open(folder, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
+    try:
+        try:
+            _write_all(fd, data)
+        finally:
+            os.close(fd)
+    except BaseException:
+        try:
+            dir_unlink(folder, name)
+        except OSError:
+            pass
+        raise
+
+
 def _write_beside(
     *,
     folder: PinnedDir,
@@ -385,9 +411,11 @@ def _write_beside(
     The names run ``report.docx``, ``report (2).docx``, ``report (3).docx``,
     and never the source's own name. The bytes go to a temporary file created
     with ``O_EXCL | O_NOFOLLOW``, which then takes the free name without
-    replacing anything; the temporary name is always removed, as soon as the
-    file has its own. Then *after_placing* runs; if it raises, the new file
-    is removed too, so a failed export leaves nothing behind. Returns the name.
+    replacing anything; on a volume with no hard links the bytes are written
+    to the free name itself, created the same way. The temporary name is
+    always removed, as soon as the file has its own. Then *after_placing*
+    runs; if it raises, the new file is removed too, so a failed export
+    leaves nothing behind. Returns the name.
     """
     source_name = parts[-1]
     stem = PurePosixPath(source_name).stem
@@ -406,7 +434,12 @@ def _write_beside(
             finally:
                 os.close(fd)
             name = _place_temporary(
-                parent=parent, temporary=temporary, stem=stem, extension=extension, source_name=source_name
+                parent=parent,
+                temporary=temporary,
+                stem=stem,
+                extension=extension,
+                source_name=source_name,
+                data=data,
             )
         finally:
             try:
@@ -425,15 +458,28 @@ def _write_beside(
 
 
 def _place_temporary(
-    *, parent: PinnedDir, temporary: str, stem: str, extension: str, source_name: str
+    *, parent: PinnedDir, temporary: str, stem: str, extension: str, source_name: str, data: bytes
 ) -> str:
-    """Give *temporary* the first free output name and return that name."""
+    """Give *temporary* the first free output name and return that name.
+
+    Where the volume refuses a hard link, *data* is written to the free name
+    directly instead, still never over an existing entry.
+    """
+    link = True
     for number in range(1, _MAX_OUTPUT_NAMES + 1):
         name = f"{stem}{extension}" if number == 1 else f"{stem} ({number}){extension}"
         if name.casefold() == source_name.casefold():
             continue
         try:
-            _link_without_replacing(parent, temporary, name)
+            if link:
+                try:
+                    _link_without_replacing(parent, temporary, name)
+                    return name
+                except OSError as exc:
+                    if exc.errno not in _NO_HARD_LINKS:
+                        raise
+                    link = False
+            _create_without_replacing(parent, name, data)
         except FileExistsError:
             continue
         return name

@@ -8,6 +8,7 @@ would run under the local scope and prove nothing about who may export.
 """
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -234,6 +235,76 @@ def test_a_hard_link_at_the_output_name_is_never_written_through(client, local_a
     assert response.json()["filename"] == "report (2).html"
     assert victim.read_bytes() == b"victim bytes"
     assert (folder / "report.html").stat().st_ino == victim.stat().st_ino
+
+
+def _no_hard_links(code: int):
+    """Make link() fail the way a volume without hard links fails it."""
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(code, os.strerror(code))
+
+    return refuse
+
+
+@pytest.mark.parametrize(
+    "code", [errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM], ids=["ENOTSUP", "EOPNOTSUPP", "EPERM"]
+)
+@pytest.mark.parametrize("planted", ["symlink", "dangling-symlink", "file"])
+def test_a_volume_without_hard_links_still_exports_and_replaces_nothing(
+    client, local_artifact, tmp_path, monkeypatch, code, planted
+):
+    """exFAT and FAT32 refuse link(): the export writes the free name directly,
+    and an entry planted at the first name is still never written through."""
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    victim = tmp_path / "victim.docx"
+    if planted == "file":
+        (folder / "report.docx").write_bytes(b"old bytes")
+    else:
+        if planted == "symlink":
+            victim.write_bytes(b"victim bytes")
+        (folder / "report.docx").symlink_to(victim)
+    before = _snapshot(folder)
+    monkeypatch.setattr(os, "link", _no_hard_links(code))
+
+    first = client.post(EXPORT_URL, json={"format": "docx"})
+    second = client.post(EXPORT_URL, json={"format": "html"})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["filename"] == "report (2).docx"
+    assert second.json()["filename"] == "report.html"
+    after = _snapshot(folder)
+    assert set(after) - set(before) == {"report (2).docx", "report.html"}
+    assert {key: after[key] for key in before} == before
+    if planted == "symlink":
+        assert victim.read_bytes() == b"victim bytes"
+    elif planted == "dangling-symlink":
+        assert not victim.exists()
+    docx.Document(io.BytesIO((folder / "report (2).docx").read_bytes()))
+    _assert_reloads(folder / "report.html", "html")
+
+
+def test_a_failed_write_without_hard_links_leaves_nothing(client, local_artifact, monkeypatch):
+    folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
+    before = _snapshot(folder)
+    monkeypatch.setattr(os, "link", _no_hard_links(errno.ENOTSUP))
+    written = artifact_export._write_all
+    calls: list[int] = []
+
+    def full_disk(fd, data):
+        # The temporary file is written first, then the output name.
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        written(fd, data)
+
+    monkeypatch.setattr(artifact_export, "_write_all", full_disk)
+
+    response = client.post(EXPORT_URL, json={"format": "docx"})
+
+    assert response.status_code == 500, response.text
+    assert len(calls) == 2
+    assert _snapshot(folder) == before
 
 
 def test_an_html_export_of_markdown_writes_one_document_beside_it(client, local_artifact):
