@@ -17,6 +17,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISH_STAGING = ROOT / ".github/workflows/publish-staging.yml"
 CHECK_WHEELS = ROOT / "scripts/check_wheels_available.sh"
+WHEELS_AVAILABLE = ROOT / ".github/workflows/wheels-available.yml"
 
 PIN_STEP = "Select anton-agent from the reviewed lock"
 WAIT_STEP = "Wait until uv resolves the pinned anton-agent rc"
@@ -30,13 +31,14 @@ exit 1
 """
 
 
-def _publish_steps() -> list[dict]:
-    workflow = yaml.safe_load(PUBLISH_STAGING.read_text(encoding="utf-8"))
-    return workflow["jobs"]["publish"]["steps"]
+def _publish_steps(workflow_path=PUBLISH_STAGING) -> list[dict]:
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = "publish" if workflow_path == PUBLISH_STAGING else "wheels-available"
+    return workflow["jobs"][job]["steps"]
 
 
-def _step(name: str) -> dict:
-    return next(step for step in _publish_steps() if step.get("name") == name)
+def _step(name: str, workflow_path=PUBLISH_STAGING) -> dict:
+    return next(step for step in _publish_steps(workflow_path) if step.get("name") == name)
 
 
 def _stub(bin_dir: Path, name: str, body: str) -> None:
@@ -62,7 +64,7 @@ def _run(
 
 
 def _run_wait_step(
-    tmp_path: Path, *, uv_failures: int
+    tmp_path: Path, *, uv_failures: int, workflow_path=PUBLISH_STAGING
 ) -> tuple[subprocess.CompletedProcess, list[str], list[str]]:
     """Run the wait step as Actions runs it, with uv failing `uv_failures` times."""
     bin_dir = tmp_path / "bin"
@@ -82,7 +84,7 @@ echo "anton-agent=={RC}"
     _stub(bin_dir, "sleep", f'echo "$1" >> "{log}/sleep"\n')
 
     script = tmp_path / "step.sh"
-    script.write_text(_step(WAIT_STEP)["run"], encoding="utf-8")
+    script.write_text(_step(WAIT_STEP, workflow_path)["run"], encoding="utf-8")
     # `bash -e {0}` is the shell Actions uses for a `run:` with no `shell:`.
     result = _run(tmp_path, ["bash", "-e", str(script)], {"ANTON_RC": RC})
 
@@ -93,8 +95,9 @@ echo "anton-agent=={RC}"
     return result, lines("uv"), lines("sleep")
 
 
+@pytest.mark.parametrize("workflow_path", [PUBLISH_STAGING, WHEELS_AVAILABLE])
 @pytest.mark.parametrize("version", [RC, "2.26.10.21.1"])
-def test_release_selects_reviewed_anton_without_reading_latest(tmp_path, version):
+def test_release_selects_reviewed_anton_without_reading_latest(tmp_path, version, workflow_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _stub(bin_dir, "curl", "echo 'must not select a new release from PyPI' >&2; exit 99\n")
@@ -103,7 +106,7 @@ def test_release_selects_reviewed_anton_without_reading_latest(tmp_path, version
     )
     output = tmp_path / "output"
     output.touch()
-    pin = next(step for step in _publish_steps() if step.get("id") == "pin")
+    pin = next(step for step in _publish_steps(workflow_path) if step.get("id") == "pin")
     result = _run(tmp_path, ["bash", "-e", "-c", pin["run"]], {"GITHUB_OUTPUT": str(output)})
     assert result.returncode == 0, result.stderr
     assert f"anton-agent=={version}" in result.stdout
@@ -126,8 +129,9 @@ def test_the_rc_wait_runs_between_the_pin_and_the_build():
     assert wait["env"] == {"ANTON_RC": "${{ steps.pin.outputs.rc }}"}
 
 
-def test_the_rc_wait_retries_until_uv_resolves_the_pin(tmp_path):
-    result, uv_calls, sleeps = _run_wait_step(tmp_path, uv_failures=2)
+@pytest.mark.parametrize("workflow_path", [PUBLISH_STAGING, WHEELS_AVAILABLE])
+def test_the_rc_wait_retries_until_uv_resolves_the_pin(tmp_path, workflow_path):
+    result, uv_calls, sleeps = _run_wait_step(tmp_path, uv_failures=2, workflow_path=workflow_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(uv_calls) == 3
@@ -142,8 +146,9 @@ def test_the_rc_wait_retries_until_uv_resolves_the_pin(tmp_path):
     assert f"uv resolves anton-agent=={RC}" in result.stdout
 
 
-def test_the_rc_wait_gives_up_with_uvs_error(tmp_path):
-    result, uv_calls, sleeps = _run_wait_step(tmp_path, uv_failures=1000)
+@pytest.mark.parametrize("workflow_path", [PUBLISH_STAGING, WHEELS_AVAILABLE])
+def test_the_rc_wait_gives_up_with_uvs_error(tmp_path, workflow_path):
+    result, uv_calls, sleeps = _run_wait_step(tmp_path, uv_failures=1000, workflow_path=workflow_path)
 
     assert result.returncode == 1
     assert len(uv_calls) == 30
@@ -208,3 +213,18 @@ def test_both_publishers_check_the_built_artifact_before_upload(tmp_path, filena
     (dist / "second.whl").touch()
     result = _run(tmp_path, ["bash", "-c", step["run"]], {})
     assert result.returncode != 0
+
+
+def test_selected_rc_wait_precedes_the_first_constrained_wheel_resolution():
+    workflow = yaml.safe_load(PUBLISH_STAGING.read_text())
+    assert "wheels-available" in workflow["jobs"]["release"]["needs"]
+    assert "wheels-available" in workflow["jobs"]["publish"]["needs"]
+    gate = yaml.safe_load(WHEELS_AVAILABLE.read_text())["jobs"]["wheels-available"]
+    steps = gate["steps"]
+    names = [step.get("name") for step in steps]
+    check = "Check every shipped platform resolves to versions with wheels"
+    assert names.index(PIN_STEP) < names.index(WAIT_STEP) < names.index(check)
+    pin = next(step for step in steps if step.get("name") == PIN_STEP)
+    wait = next(step for step in steps if step.get("name") == WAIT_STEP)
+    assert pin["if"] == "!inputs.floating"
+    assert wait["if"] == "steps.pin.outputs.rc != ''"

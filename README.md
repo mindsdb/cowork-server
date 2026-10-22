@@ -39,7 +39,7 @@ Review both the lock and export diffs, run the release checks, and publish a new
 
 Cowork's release installer consumes the contract from the selected wheel or Git commit. Direct `pip install` and `uv tool install cowork-server` still resolve the public library compatibility ranges; they do not automatically consume this export. For a standalone server with this repository's reviewed selection, check out a reviewed release tag and run `uv sync --locked --no-dev`, then `uv run --locked --no-dev cowork-server`.
 
-The eight platform/Python wheel checks use release constraints. The weekly `--floating` check separately probes the public compatibility ranges and never rewrites the release lock. Build backends, the Python interpreter and operating-system packages are separate inputs; this policy fixes the application dependency selection, not every byte of an image.
+The eight platform/Python wheel checks use release constraints. When the lock selects an Anton release candidate, the required wheel gate waits for that exact version to reach PyPI's Simple index before resolving it; the publish runner repeats the wait before building. The weekly `--floating` check separately probes the public compatibility ranges and never rewrites the release lock. Build backends, the Python interpreter and operating-system packages are separate inputs; this policy fixes the application dependency selection, not every byte of an image.
 
 ## Development
 
