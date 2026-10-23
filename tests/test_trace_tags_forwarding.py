@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
-from cowork.harnesses.anton_harness.harness import AntonHarness
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession
 
 
 class _SessionWithTraceKwargs:
@@ -47,9 +47,10 @@ def _run_harness(monkeypatch, session):
     monkeypatch.setattr(autopublish, "autopublish_project_artifacts", _no_autopublish)
 
     async def _fake_build(
-        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None
+        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
+        tool_messages=False,
     ):
-        return session, None, None
+        return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
 

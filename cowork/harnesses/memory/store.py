@@ -3,33 +3,61 @@ This module defines the memory stores for canonical slot files on disk.
 """
 
 import os
+import re
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 from cowork.common.paths import (
     PinnedDir,
     O_NOFOLLOW,
     dir_lstat,
     dir_open,
+    dir_scandir,
     dir_unlink,
     opened_subdir_nofollow,
     pinned_dir,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import TenantScope, scoped_user_storage_root
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope, scoped_user_storage_root
+from cowork.harnesses.memory.policy import memory_shared
 from cowork.harnesses.memory.registry import MemorySlot, SLOT_REGISTRY
 
 PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
+
+# Inside a global tier, on a deployment that trusts identity headers: one
+# folder per project that tier has memory for (NestedProjectMemoryStore).
+PROJECT_TIERS_DIRNAME = "projects"
+
+# The filesystem store name for memory, shared so every reference keys it the
+# same (scoped_user_storage_root here and remove_project_memory_tiers).
+MEMORY_STORE = "memory"
 
 # Every slot filename is a fixed, hardcoded value in the registry; a slot id is a
 # validated `MemorySlot` enum. `_filename` re-checks the resolved name against
 # this closed set (and rejects any separator) so the value reaching os.open /
 # os.unlink is provably one of a handful of constants, never attacker-shaped.
 _KNOWN_SLOT_FILENAMES = frozenset(spec.filename for spec in SLOT_REGISTRY.values())
+
+
+def _undo_text_mode_double_cr(text: str) -> str:
+    """Collapse the ``\\r\\r\\n`` that Windows slots got before ENG-2950.
+
+    Slot descriptors were opened in CRT text mode then: the text layer wrote
+    CRLF and the CRT added another CR. The old text-mode read hid the extra
+    CR; binary descriptors expose it, and universal newlines would read every
+    line break as two. The sequence is never written on purpose, so reading it
+    back as CRLF restores what the old read returned.
+    """
+    return text.replace("\r\r\n", "\r\n")
+
+
+_LINE_BREAK = re.compile(r"\r\r\n|\r\n|\r")
 
 
 @dataclass(frozen=True)
@@ -110,8 +138,11 @@ class MemoryStore:
         try:
             with self._root_fd(create=False) as root:
                 sfd = dir_open(root, name, os.O_RDONLY | O_NOFOLLOW)
-                with open(sfd, encoding="utf-8") as f:
-                    return f.read()
+                with open(sfd, encoding="utf-8", newline="") as f:
+                    raw = f.read()
+            # Universal newlines, as ``newline=None`` would have applied, with
+            # the legacy \r\r\n read as one break (see _undo_text_mode_double_cr).
+            return _LINE_BREAK.sub("\n", raw)
         except OSError:
             # Missing dir/file, or a symlink squatting the slot (O_NOFOLLOW ->
             # ELOOP): no readable slot content.
@@ -132,7 +163,7 @@ class MemoryStore:
                 # compensation snapshot. ``newline=None`` would translate
                 # CRLF to LF before ``restore_exact`` can put it back.
                 with open(sfd, encoding="utf-8", newline="") as f:
-                    return True, f.read()
+                    return True, _undo_text_mode_double_cr(f.read())
         except FileNotFoundError:
             return False, ""
 
@@ -254,7 +285,7 @@ class GlobalMemoryStore(MemoryStore):
             if root is not None
             else Path(get_app_settings().memory.root_dir).expanduser()
         )
-        super().__init__(scoped_user_storage_root(base, scope, store="memory"))
+        super().__init__(scoped_user_storage_root(base, scope, store=MEMORY_STORE))
 
     def list_slots(self) -> list[MemorySlot]:
         return list(SLOT_REGISTRY.keys())
@@ -279,3 +310,121 @@ class ProjectMemoryStore(MemoryStore):
             raise ValueError(
                 f"{slot_id.value} is not supported for project-scoped memory."
             )
+
+
+class NestedProjectMemoryStore(ProjectMemoryStore):
+    """A project tier inside a global tier: ``<global tier>/projects/<project id>/``.
+
+    On a deployment that trusts identity headers a person's project memory
+    never sits in the project's ``.anton/memory``, which the agent's code can
+    write: it lives under the person's own global tier where memory is per
+    person, and under the deployment's where it is shared
+    (project_memory_store). The walk from the global tier down is O_NOFOLLOW,
+    as for a project's own store: the agent's code runs as the server's user
+    and could plant a link in that chain.
+    """
+
+    def __init__(self, *, global_root: Path, project_id: UUID | str) -> None:
+        self._global_root = Path(global_root)
+        tail = (PROJECT_TIERS_DIRNAME, str(UUID(str(project_id))))
+        MemoryStore.__init__(
+            self,
+            self._global_root.joinpath(*tail),
+            nofollow_base=self._global_root,
+            nofollow_tail=tail,
+        )
+
+    @contextmanager
+    def _root_fd(self, *, create: bool) -> Iterator[PinnedDir]:
+        # The global tier is created on first use, like the store above it.
+        if create:
+            self._global_root.mkdir(parents=True, exist_ok=True)
+        with super()._root_fd(create=create) as d:
+            yield d
+
+
+def reads_deployment_tiers(*, scope: TenantScope) -> bool:
+    """Whether ``scope`` reads the deployment's own memory tiers rather than one
+    person's: only where COWORK_PERSONAL_RESOURCES leaves out memory
+    (memory_shared), which makes those tiers one store that every scope there
+    reads, the operator view included. Where memory is per person the operator
+    view keeps each project's ``.anton/memory``, as on the desktop."""
+    return memory_shared() and not scope.partitioned_for(PersonalResource.MEMORY)
+
+
+def deployment_memory_store() -> GlobalMemoryStore:
+    """The deployment's own global tier, the operator view's, which holds the
+    deployment's project tiers in ``projects/``."""
+    return GlobalMemoryStore(scope=LOCAL_SCOPE)
+
+
+def deployment_memory_root() -> Path:
+    """Where the deployment's own global tier is (deployment_memory_store)."""
+    return deployment_memory_store().root
+
+
+def project_tier_ids(*, global_root: Path) -> list[UUID]:
+    """The ids of the project tiers in ``global_root``'s ``projects/`` folder.
+
+    Only a real folder named by a canonical UUID counts; anything else there,
+    a link included, is skipped. The walk into ``projects/`` refuses a link in
+    its place and raises. An empty list when the folder is missing.
+    """
+    try:
+        with (
+            opened_subdir_nofollow(global_root, PROJECT_TIERS_DIRNAME) as projects,
+            dir_scandir(projects) as entries,
+        ):
+            names = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
+    except FileNotFoundError:
+        return []
+    ids: list[UUID] = []
+    for name in names:
+        try:
+            project_id = UUID(name)
+        except ValueError:
+            continue
+        if str(project_id) == name:
+            ids.append(project_id)
+    return sorted(ids, key=str)
+
+
+def nested_project_memory_store(
+    *, scope: TenantScope | None, project_id: UUID | str
+) -> NestedProjectMemoryStore:
+    """The project tier for ``project_id`` inside ``scope``'s global tier.
+
+    The one place that builds such a tier: project_memory_store calls it when
+    a project row is at hand, and the shared listing and the operator's print
+    call it with a tier id alone.
+    """
+    return NestedProjectMemoryStore(
+        global_root=GlobalMemoryStore(scope=scope).root, project_id=project_id
+    )
+
+
+def project_memory_store(
+    *, scope: TenantScope | None, project_path: Path, project_id: UUID | str
+) -> ProjectMemoryStore:
+    """The project tier ``scope`` reads and writes for one project row.
+
+    On a deployment that trusts identity headers a person's tier sits inside a
+    global tier (nested_project_memory_store): their own where memory is per
+    person, whether or not their projects are personal, and the deployment's
+    where memory is shared, for every scope there, the operator view included
+    (reads_deployment_tiers). Everyone else keeps the project's
+    ``.anton/memory``: the operator view where memory is per person, hosted
+    org mode (shared per project there) and the desktop. The one resolver for
+    the in-process turn, the memory API and a person's reset, so they can
+    never disagree on where project memory is. A remote turn keeps memory in
+    the project's own folder and is refused where identity headers are trusted
+    (cowork.server.create_app), so it never reaches these tiers; the tier
+    deletion (remove_project_memory_tiers) derives its own paths from the same
+    user_store_segments layout.
+    """
+    if scope is not None and (
+        (scope.personal and scope.partitioned_for(PersonalResource.MEMORY))
+        or reads_deployment_tiers(scope=scope)
+    ):
+        return nested_project_memory_store(scope=scope, project_id=project_id)
+    return ProjectMemoryStore(Path(project_path))

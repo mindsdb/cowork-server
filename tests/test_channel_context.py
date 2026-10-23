@@ -1,6 +1,6 @@
 """ENG-591: channel turns get support-mode prompt guidance.
 
-The desktop suffix lead must stay byte-identical (it participates in anton's
+The UI suffix lead must stay byte-identical (it participates in anton's
 cache-stable prompt prefix); channel turns swap in chat/support guidance plus
 optional per-binding operator instructions.
 """
@@ -11,15 +11,16 @@ from types import SimpleNamespace
 
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
-from cowork.harnesses.anton_harness.harness import AntonHarness, _turn_style_context
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession, _turn_style_context
 from cowork.harnesses.base import ChannelContext
 
-DESKTOP_LEAD = (
-    "The Anton CoWork desktop UI displays progress, tool usage, and actions "
-    "as separate structured activity rows. Keep assistant text focused on the "
-    "user-facing answer; do not narrate internal work with status phrases like "
-    "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-    "is itself the final answer the user needs. "
+UI_LEAD = (
+    "The Cowork UI displays progress, tool usage, and actions "
+    "as separate structured activity rows, so do not narrate each step "
+    "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
+    "open your reply with one short sentence telling the user what you are "
+    "about to do; after that, keep assistant text focused on the user-facing "
+    "answer. "
     "Files you create as artifacts appear automatically in the Live Artifacts "
     "panel beside the chat, where the user previews them and uses the Download "
     "control (and Open, on desktop). When a file is ready, tell the user it is "
@@ -35,8 +36,17 @@ DESKTOP_LEAD = (
 )
 
 
-def test_desktop_lead_is_byte_stable():
-    assert _turn_style_context(None) == DESKTOP_LEAD
+def test_ui_lead_is_byte_stable():
+    assert _turn_style_context(None) == UI_LEAD
+
+
+def test_desktop_lead_asks_for_an_opening_sentence_not_step_narration():
+    """The user sees text within seconds of asking, without a running commentary:
+    one sentence of intent before tool work, no "let me check" narration after it."""
+    text = _turn_style_context(None)
+    assert "open your reply with one short sentence" in text
+    assert "do not narrate each step" in text
+    assert "Keep assistant text focused" not in text  # the old line forbade the opening sentence too
 
 
 def test_desktop_lead_names_artifact_retrieval_path():
@@ -99,10 +109,11 @@ def test_stream_response_forwards_channel_context(monkeypatch):
     received = {}
 
     async def _fake_build(
-        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None
+        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
+        tool_messages=False,
     ):
         received["channel_context"] = channel_context
-        return _FakeSession(), None, None
+        return BuiltChatSession(session=_FakeSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

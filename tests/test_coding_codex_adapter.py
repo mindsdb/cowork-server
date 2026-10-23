@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -266,6 +267,7 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch)
             developer_instructions="Use the project playbook.",
             session_id="task-123",
             cowork_root="/cowork-data",
+            project_linked=True,
         ),
         Path("/workspace"),
         "http://127.0.0.1:26866/api/v1/coding/inference",
@@ -290,6 +292,21 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch)
     assert launch.thread_params["developerInstructions"] == "Use the project playbook."
     assert launch.thread_params["approvalPolicy"] == launch.approval_policy
     assert launch.thread_params["sandbox"] == "workspace-write"
+
+
+def test_codex_folder_task_without_a_project_launches_no_integration_mcp_server() -> None:
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(
+            model="gpt",
+            permission_mode=PermissionMode.workspace,
+            session_id="task-123",
+            cowork_root="/cowork-data",
+        ),
+        Path("/workspace"),
+        "http://127.0.0.1:26866/api/v1/coding/inference",
+    )
+
+    assert not any(item.startswith("mcp_servers.") for item in launch.config_overrides)
 
 
 def test_codex_auto_compact_threshold_can_be_tuned_for_runtime_verification(monkeypatch) -> None:
@@ -609,6 +626,7 @@ def _cancellable_session(client) -> codex_module.CodexEngineSession:
     engine_session = object.__new__(codex_module.CodexEngineSession)
     engine_session._client = client
     engine_session._session_id = "session-1"
+    engine_session._catalog_resources = contextlib.ExitStack()
     engine_session._cancel_watchdogs = {}
     engine_session._cancel_lock = codex_module.threading.Lock()
     engine_session._goal_states = {}

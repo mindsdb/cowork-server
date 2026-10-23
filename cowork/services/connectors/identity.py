@@ -139,6 +139,12 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     *subtitle* source only. Returns None when there's nothing meaningful —
     the caller then falls back to the slug.
 
+    The ``user_label`` contract for connections saved through
+    ``persist_connection``: ``_user_label`` holds only a name a person gave the
+    connection, or an OAuth account name captured at connect time, never the
+    engine id. anton's ``connect_datasource`` tool still defaults it to the
+    engine id, so a stored ``_user_label`` can repeat the title.
+
     ``account_name`` is checked first only for ``SYNTHETIC_ACCOUNT_EMAIL_ENGINES``
     (supabase/linear/posthog): their ``account_email`` is a synthetic
     placeholder, not a real email/display value, so the human org/workspace
@@ -267,6 +273,9 @@ def is_same_account(existing_record: dict | None, payload: dict, secure_keys: li
     """
     if not existing_record:
         return False
+    # A secret the stored record holds but this save omits is still a secret,
+    # not an identity field that makes the same account look different.
+    secure_keys = sorted(set(secure_keys or []) | set(existing_record.get("secure_keys") or []))
     return _nonsecret_identity(existing_record.get("fields", {}), secure_keys) == \
         _nonsecret_identity(payload, secure_keys)
 

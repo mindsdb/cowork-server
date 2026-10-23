@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
+from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.coding.connector_capabilities import (
     ConnectorCapability,
@@ -65,6 +66,7 @@ from cowork.coding.inference_proxy import (
     proxy_inference,
 )
 from cowork.coding.integrations import DeveloperIntegrationService
+from cowork.coding.repository_discovery import GitHubRepositoryPage
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PlaybookConfigureRequest,
@@ -72,6 +74,7 @@ from cowork.coding.project_models import (
     ProjectActionPage,
     ProjectActionRunRequest,
     ProjectActionRunResponse,
+    ProjectCommandRefresh,
     ProjectCreateRequest,
     ProjectFolder,
     ProjectPage,
@@ -119,8 +122,11 @@ from cowork.services.skills import CodeSkillService
 # whole credential this surface has. Declared on the router rather than per
 # route because it REFUSES — the 106 routes below inherit a check, so a new
 # one added here is closed until someone opens it, which is the opposite of
-# what inheriting OpenByDesign did.
-router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly))])
+# what inheriting OpenByDesign did. Under the code sandbox the whole surface
+# answers 403 (refuse_code_mode_in_sandbox).
+router = APIRouter(
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(refuse_code_mode_in_sandbox)]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -164,6 +170,15 @@ def _integration_service(scope: ScopeDep):
 
 
 IntegrationsDep = Annotated[DeveloperIntegrationService, Depends(_integration_service)]
+
+
+@router.get("/github/repositories", response_model=GitHubRepositoryPage)
+def list_github_repositories(
+    integrations: IntegrationsDep,
+    connection_name: Annotated[str, Query(min_length=1, max_length=512)],
+    page: Annotated[int, Query(ge=1, le=10_000)] = 1,
+):
+    return _call(integrations.repositories, connection_name, page)
 
 
 def _http_error(exc: Exception) -> HTTPException:
@@ -792,6 +807,11 @@ def run_project_action(
 @router.get("/sessions/{session_id}/project-actions", response_model=ProjectActionPage)
 def project_actions(session_id: str):
     return _call(_service().project_action_page, session_id)
+
+
+@router.post("/sessions/{session_id}/project-commands/refresh", response_model=ProjectCommandRefresh)
+def refresh_project_commands(session_id: str):
+    return _call(_service().refresh_project_commands, session_id)
 
 
 @router.post("/sessions/{session_id}/terminals", response_model=TerminalTabState)

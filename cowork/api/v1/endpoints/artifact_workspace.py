@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
 from cowork.common.paths import (
@@ -25,6 +26,7 @@ from cowork.common.paths import (
     dir_open,
     dir_scandir,
     open_pinned_child,
+    read_bounded,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
@@ -69,13 +71,8 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
-_PRIVATE_DRAFT_ENTRIES = {
-    ".revisions",
-    ".published.json",
-    "metadata.json",
-    "README.md",
-    "backend.log",
-}
+# Matched against the first path component of a draft request.
+_PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 
 def _attachment_disposition(filename: str) -> str:
@@ -268,9 +265,9 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         parts = _relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
-    # The journal only, matching the inner gate, and at any depth rather than
-    # just the first component. The private-listing set is a different
-    # question: it hides README.md, which is a source the service itself picks.
+    # Only the journal (any depth), like the inner gate: the private-listing
+    # set is not rejected because `metadata.primary` or an explicit path may
+    # legitimately name README.md or prd.md as the editable source.
     if JOURNAL_DIRNAME in parts:
         raise HTTPException(status_code=422, detail="Invalid artifact source path")
     folder_name = _artifact_folder_component(source, folder)
@@ -351,11 +348,19 @@ def _draft_stream(
     *,
     extra_headers: dict[str, str] | None = None,
 ):
-    """Stream bytes from the pinned descriptor and close every held handle."""
+    """Stream at most *size* bytes from the pinned descriptor and close every
+    held handle.
+
+    No ``Content-Length``: the agent may still be writing the file, and a
+    length taken from ``fstat`` would then disagree with the bytes read, which
+    the browser reports as ``ERR_CONTENT_LENGTH_MISMATCH`` (ENG-2950). Chunked
+    transfer sends exactly what the descriptor yields. *size* (the ``fstat``
+    size at authorization) still bounds the body, so a file that keeps growing
+    cannot keep the response open.
+    """
     def chunks():
         try:
-            while chunk := os.read(fd, 1 << 16):
-                yield chunk
+            yield from read_bounded(fd, size)
         finally:
             resources.close()
 
@@ -363,11 +368,7 @@ def _draft_stream(
         chunks(),
         resources=resources,
         media_type=media_type,
-        headers={
-            **_DRAFT_RESPONSE_HEADERS,
-            **(extra_headers or {}),
-            "Content-Length": str(size),
-        },
+        headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
 
 
@@ -489,6 +490,7 @@ async def _sync_live_artifact(
     the artifact's modified state visible for a manual retry.
     """
     from cowork.services.publish import (
+        PublishOwnedByOtherUser,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -551,6 +553,10 @@ async def _sync_live_artifact(
     except asyncio.CancelledError:
         publish_abandoned = publish_started
         raise
+    except PublishOwnedByOtherUser:
+        # Repeats on every save of this artifact, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: another account owns its report", folder)
+        return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
         return False

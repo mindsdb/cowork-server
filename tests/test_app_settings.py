@@ -22,6 +22,20 @@ def test_app_settings_reads_cowork_listen_port(monkeypatch):
     assert settings.port == 9999
 
 
+def test_app_settings_reads_cowork_publish_token(monkeypatch):
+    monkeypatch.setenv("COWORK_PUBLISH_TOKEN", "mdb_publish_token")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.publish_token.get_secret_value() == "mdb_publish_token"
+
+
+def test_app_settings_publish_token_defaults_to_unset(monkeypatch):
+    monkeypatch.delenv("COWORK_PUBLISH_TOKEN", raising=False)
+
+    assert AppSettings(_env_file=None).publish_token is None
+
+
 def test_app_settings_rejects_invalid_cowork_listen_port(monkeypatch):
     monkeypatch.setenv("COWORK_LISTEN_PORT", "invalid")
     with pytest.raises(ValidationError):
@@ -355,3 +369,36 @@ def test_identity_enforce_audit_must_be_asked_for_by_name(monkeypatch):
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "off")
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+def test_openai_compatible_api_defaults_to_chat_completions(monkeypatch):
+    monkeypatch.delenv("COWORK_OPENAI_COMPATIBLE_API", raising=False)
+
+    assert AppSettings(_env_file=None).openai_compatible_api == "chat_completions"
+
+
+def test_openai_compatible_api_reads_its_cowork_variable(monkeypatch):
+    monkeypatch.setenv("COWORK_OPENAI_COMPATIBLE_API", "responses")
+
+    assert AppSettings(_env_file=None).openai_compatible_api == "responses"
+
+
+@pytest.mark.parametrize("value", ["", "Responses", "true"])
+def test_openai_compatible_api_rejects_any_other_value(monkeypatch, value):
+    # A typo stops the server at start instead of leaving the agent on chat
+    # completions while the deployment believes it switched.
+    monkeypatch.setenv("COWORK_OPENAI_COMPATIBLE_API", value)
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), (" ON ", True), ("", False), ("0", False), ("enabled", False)],
+)
+def test_usage_log_reads_its_variable_as_anton_does(monkeypatch, value, expected):
+    # A blank line in a desktop .env must not stop the server from starting.
+    monkeypatch.setenv("ANTON_USAGE_LOG", value)
+
+    assert AppSettings(_env_file=None).usage_log is expected

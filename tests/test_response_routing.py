@@ -51,12 +51,15 @@ def _response(*, content="", tool_calls=None, stop_reason="end_turn"):
 
 
 def test_handler_defers_anton_harness_initialization(monkeypatch):
+    """Building the handler reads nothing: the harness name comes from the
+    settings handle() reads in its first database unit, and Anton is built
+    only once a turn is delegated."""
     import cowork.handlers.responses as responses
 
     monkeypatch.setattr(
         responses,
         "get_user_settings",
-        lambda scope: SimpleNamespace(harness="anton"),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("settings read at construction")),
     )
     monkeypatch.setattr(
         responses,
@@ -64,7 +67,7 @@ def test_handler_defers_anton_harness_initialization(monkeypatch):
         lambda name: (_ for _ in ()).throw(AssertionError("Anton must be lazy")),
     )
 
-    handler = ResponsesHandler(session=object())
+    handler = ResponsesHandler()
 
     assert handler.harness is None
 
@@ -84,7 +87,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
 
     decision = await decide_route(
@@ -118,7 +121,7 @@ async def test_ineligible_request_shapes_delegate_without_router_call(
 ):
     import cowork.handlers.response_routing as routing
 
-    monkeypatch.setattr(routing, "build_llm_client", lambda: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: (_ for _ in ()).throw(AssertionError()))
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -156,7 +159,7 @@ async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch)
             resolved_gate_model="mindshub_air",
         ),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(routing, "_gate", fake_gate)
 
     decision = await decide_route(
@@ -180,7 +183,7 @@ async def test_router_decline_delegates(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: client)
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: client)
     monkeypatch.setattr(
         routing,
         "_gate",
@@ -207,7 +210,7 @@ async def test_router_error_fails_open_to_anton(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -233,7 +236,7 @@ async def test_slow_gate_times_out_and_fails_open(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
     monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.02)
 
     decision = await decide_route(
@@ -262,14 +265,9 @@ def test_sse_frames_use_real_newlines():
 
 
 def _routing_handler(monkeypatch):
-    import cowork.handlers.responses as responses
-
-    monkeypatch.setattr(
-        responses,
-        "get_user_settings",
-        lambda scope: SimpleNamespace(harness="anton"),
-    )
-    return ResponsesHandler(session=object())
+    handler = ResponsesHandler()
+    handler.harness_name = "anton"  # handle() sets it from the turn's settings
+    return handler
 
 
 @pytest.mark.asyncio
@@ -281,11 +279,6 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
     sentinel_scope = object()
     handler.scope = sentinel_scope
 
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
     seen = {}
 
     async def fake_decide_route(**kwargs):
@@ -296,6 +289,7 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
 
     decision, turn_llm = await handler._route_request(
         conversation_id=None,
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -314,11 +308,6 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
     from cowork.handlers import jev_shadow
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
     async def fake_decide_route(**_kwargs):
         return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
 
@@ -331,6 +320,7 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
 
     decision, _turn_llm = await handler._route_request(
         conversation_id=None,
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -346,6 +336,7 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
 
     decision, _turn_llm = await handler._route_request(
         conversation_id=None,
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -371,11 +362,6 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
 
     monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
@@ -410,6 +396,7 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
 
     await handler._route_request(
         conversation_id="conv-1",
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -456,11 +443,6 @@ async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypat
     # turn the probe on or off here and only the field default decides.
     monkeypatch.setattr(responses, "TurnQueueSettings", functools.partial(TurnQueueSettings, _env_file=None))
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
@@ -492,6 +474,7 @@ async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypat
 
     decision, _turn_llm = await handler._route_request(
         conversation_id="conv-1",
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -509,11 +492,6 @@ async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypa
     from anton.core.llm.tracing import get_trace_context
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
     seen = {}
 
     async def fake_decide_route(**_kwargs):
@@ -524,6 +502,7 @@ async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypa
 
     await handler._route_request(
         conversation_id="conv-1",
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -545,11 +524,6 @@ async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch)
     from cowork.handlers import jev_shadow
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
 
     async def fast_decide_route(**_kwargs):
         return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
@@ -565,6 +539,7 @@ async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch)
     started = time.monotonic()
     decision, _turn_llm = await handler._route_request(
         conversation_id=None,
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -595,11 +570,6 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
     leaked_key = "sk-" + "a" * 30
     rows = [Message(conversation_id=cid, role=Role.user, content=f"my key is {leaked_key}")]
 
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: rows),
-    )
     seen = {}
 
     async def fake_decide_route(**kwargs):
@@ -611,6 +581,7 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
     current_key = "sk-" + "b" * 30
     await handler._route_request(
         conversation_id=cid,
+        gate_rows=rows,
         harness_input=[{"type": "text", "text": f"and my other key is {current_key}"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -623,6 +594,98 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
 
 
 @pytest.mark.asyncio
+async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A datasource password has no API-key shape, so only its registered
+    value can redact it. Covers the scrub given the registration; the call
+    site is pinned by test_handle_registers_vault_secrets_before_routing."""
+    from uuid import uuid4
+
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+    import cowork.handlers.responses as responses
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    handler = _routing_handler(monkeypatch)
+    await register_vault_secrets(handler.scope)
+
+    cid = uuid4()
+    rows = [Message(conversation_id=cid, role=Role.user, content="the password is hunter2xyz")]
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id=cid,
+        gate_rows=rows,
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    blob = str(seen["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
+@pytest.mark.asyncio
+async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
+    """The gate scrubs history inside _route_request, so the vault's secrets
+    must be registered before it runs, not later in _build_chat_session."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+    calls = []
+
+    async def fake_register(scope):
+        calls.append(("register", scope))
+
+    monkeypatch.setattr(responses, "register_vault_secrets", fake_register)
+
+    class _StopHere(Exception):
+        pass
+
+    async def fake_route_request(**kwargs):
+        calls.append(("route_request", None))
+        raise _StopHere
+
+    handler._route_request = fake_route_request
+
+    with pytest.raises(_StopHere):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id)))
+
+    assert calls == [("register", handler.scope), ("route_request", None)]
+
+
+@pytest.mark.asyncio
 async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeypatch):
     """ENG-1851: the composer's per-conversation pick drives Anton's turn, not
     the gate. `_route_request` no longer accepts or forwards it."""
@@ -631,11 +694,6 @@ async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeyp
     import cowork.handlers.responses as responses
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
     seen = {}
 
     async def fake_decide_route(**kwargs):
@@ -646,6 +704,7 @@ async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeyp
 
     await handler._route_request(
         conversation_id=None,
+        gate_rows=[],
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
         has_disabled_connections=False,
@@ -657,22 +716,43 @@ async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeyp
 
 @pytest.mark.asyncio
 async def test_ineligible_route_skips_the_history_query(monkeypatch):
+    """A turn the gate cannot route never reads the gate's history: the
+    request's unit skips it, and the gate answers from the shape alone."""
+    from functools import partial
+
     import cowork.handlers.responses as responses
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import run_db
+    from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.conversations import ConversationService
+
+    class _NoHistory(ConversationService):
+        def get_ordered_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
+
+        def get_recent_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: (_ for _ in ()).throw(AssertionError("must not touch the DB")),
-    )
+    monkeypatch.setattr(responses, "ConversationService", _NoHistory)
 
+    start = await run_db(
+        partial(
+            handler._read_turn_start,
+            request=ResponsesRequest(input="Hello"),
+            has_disabled_connections=True,
+        ),
+        scope=LOCAL_SCOPE,
+    )
     decision, turn_llm = await handler._route_request(
-        conversation_id=None,
-        harness_input=[{"type": "text", "text": "Hello"}],
+        conversation_id=start.conversation_id,
+        harness_input=start.harness_input,
+        gate_rows=start.gate_rows,
         has_attachments=True,
         has_disabled_connections=False,
     )
 
+    assert start.gate_rows == []
     assert decision.route == DELEGATED_AGENTIC
     assert decision.reason == "attachments_present"
     assert turn_llm is None
@@ -687,21 +767,98 @@ async def test_history_query_failure_fails_open(monkeypatch):
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            get_ordered_messages=lambda _cid: (_ for _ in ()).throw(RuntimeError("db down")),
+            get_recent_messages=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db down")),
         ),
     )
+    rolled_back = []
 
+    rows = handler._read_gate_rows(
+        SimpleNamespace(rollback=lambda: rolled_back.append(True)), conversation_id=None,
+    )
     decision, turn_llm = await handler._route_request(
         conversation_id=None,
         harness_input=[{"type": "text", "text": "Hello"}],
+        gate_rows=rows,
         has_attachments=False,
         has_disabled_connections=False,
     )
 
+    assert rows is None
+    assert rolled_back == [True]
     assert decision.route == DELEGATED_AGENTIC
     assert decision.reason == "router_unavailable"
     assert decision.fallback is True
     assert turn_llm is None
+
+
+@pytest.mark.asyncio
+async def test_turn_start_counts_every_stored_row(monkeypatch):
+    """turn_id names the turn's stream buffer, and boot recovery indexes the
+    stored rows with it, so it counts every row: hidden tool rows and a
+    stranded pending question too. The gate reads the tail of the replayed
+    history. Neither read loads every stored row to get there."""
+    from functools import partial
+
+    from sqlalchemy import event
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.session import get_engine
+    from cowork.db.units import run_db
+    from cowork.handlers.response_routing import _MAX_HISTORY_MESSAGES
+    from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.conversations import ConversationService
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    tool_rows = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]},
+    ]
+
+    def seed(session):
+        service = ConversationService(session)
+        conversation = service.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+        for turn in range(6):
+            service.save_user_message(conversation.id, f"question {turn}")
+            service.save_assistant_turn(conversation.id, f"answer {turn}", [], tool_rows=tool_rows)
+        service.save_user_message(conversation.id, "stranded", pending=True)
+        return conversation.id
+
+    def read_back(session, *, conversation_id):
+        service = ConversationService(session)
+        stored = service.get_ordered_messages(conversation_id, include_pending=True)
+        replayed = service.get_ordered_messages(conversation_id)
+        tail = [m.id for m in replayed if m.role in {"user", "assistant"}][-_MAX_HISTORY_MESSAGES:]
+        return len(stored), tail
+
+    conversation_id = await run_db(seed, scope=LOCAL_SCOPE)
+    handler = _routing_handler(monkeypatch)
+    engine = get_engine(get_app_settings().database.uri)
+    statements: list[str] = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        start = await run_db(
+            partial(
+                handler._read_turn_start,
+                request=ResponsesRequest(input="Hello", conversation=str(conversation_id)),
+                has_disabled_connections=False,
+            ),
+            scope=LOCAL_SCOPE,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    stored, tail = await run_db(partial(read_back, conversation_id=conversation_id), scope=LOCAL_SCOPE)
+
+    assert start.turn_id == stored == 6 * 4 + 1
+    assert [m.id for m in start.gate_rows] == tail
+    assert len(tail) == _MAX_HISTORY_MESSAGES
+    message_reads = [s for s in statements if "FROM messages" in s]
+    assert message_reads
+    assert [s for s in message_reads if "count(" not in s and "LIMIT" not in s] == []
 
 
 @pytest.mark.asyncio
@@ -714,7 +871,7 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
     )
     monkeypatch.setattr(
         routing, "build_llm_client",
-        lambda: (_ for _ in ()).throw(AssertionError("client must not build")),
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("client must not build")),
     )
     provider = _Client(_response(content="Hi there."))
 
@@ -734,6 +891,12 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch):
+    import json
+
+    import httpx2 as httpx
+    import openai
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
     import cowork.handlers.responses as responses
     import cowork.turnqueue.producer as producer
     from cowork.common.settings.user_settings import Provider
@@ -741,7 +904,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -752,8 +915,28 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
             hub_workspace_id="ws-1",
         ),
     )
-    block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+    block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "https://llm.mdb.ai/v1"}
     minted = {}
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        chunk = {
+            "id": "chatcmpl-router", "object": "chat.completion.chunk", "created": 0,
+            "model": "mindshub_air",
+            "choices": [{"index": 0, "delta": {"content": "Hello."}, "finish_reason": "stop"}],
+        }
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    real_client = openai.AsyncOpenAI
+    monkeypatch.setattr(
+        openai, "AsyncOpenAI",
+        lambda **kwargs: real_client(http_client=http_client, max_retries=0, **kwargs),
+    )
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
@@ -762,12 +945,31 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
 
     monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
 
-    binding, turn_llm = await handler._router_binding()
+    trace_token = set_trace_context(TraceContext(session_id="conv-router"))
+    try:
+        binding, turn_llm = await handler._router_binding()
+        decision = await decide_route(
+            history=[{"role": "user", "content": "Hello"}],
+            has_non_text_input=False,
+            has_attachments=False,
+            has_disabled_connections=False,
+            binding=binding,
+        )
+    finally:
+        reset_trace_context(trace_token)
+        await http_client.aclose()
 
     assert binding is not None
     assert binding.label == "minds_cloud"
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
+    assert decision.route == DIRECT_CONTEXT
+    assert len(requests) == 1
+    assert requests[0].headers["Langfuse-Session-Id"] == "conv-router"
+    # Exercise the installed Anton: assigning the attribute alone also passes
+    # with an older dependency that never reads it when building headers.
+    metadata = json.loads(requests[0].headers["Langfuse-Metadata"])
+    assert metadata["role"] == "router"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
     # The routing gate's own pre-mint must carry the caller's picked workspace
     # too — this key is what a delegated remote turn ends up reusing as its
@@ -785,7 +987,7 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -810,6 +1012,48 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_are_on(monkeypatch):
+    """With the flag on the gate's mint returns the prefix as well, and the turn
+    context carries it; dropping it would fail every hosted datasource turn."""
+    from unittest.mock import AsyncMock
+
+    import cowork.handlers.responses as responses
+    import cowork.turnqueue.producer as producer
+    from cowork.common.settings.user_settings import Provider
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses, "TurnQueueSettings",
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=True),
+    )
+    monkeypatch.setattr(
+        responses, "get_user_settings",
+        lambda scope: SimpleNamespace(
+            resolved_router_provider=Provider.MINDS_CLOUD,
+            resolved_router_model="kimi",
+            resolved_gate_model="mindshub_air",
+            hub_workspace_id="ws-picked",
+        ),
+    )
+    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "http://gw/v1"}
+    minted = {}
+
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+        minted["workspace_id"] = workspace_id
+        return block, "mdb_gate"
+
+    monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", fake_mint)
+    monkeypatch.setattr(producer, "_mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
+
+    _, turn_llm = await handler._router_binding()
+
+    assert turn_llm["llm"] == block
+    assert turn_llm["turn_key_id"] == "mdb_gate"
+    # The workspace a person picked binds the key whether or not datasources are on.
+    assert minted["workspace_id"] == "ws-picked"
+
+
+@pytest.mark.asyncio
 async def test_router_binding_absent_outside_remote_backend(monkeypatch):
     import cowork.handlers.responses as responses
 
@@ -830,7 +1074,6 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
 
     handler = _routing_handler(monkeypatch)
     calls = []
-    monkeypatch.setattr(responses, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(responses, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(
         responses,
@@ -860,9 +1103,10 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
     )
 
     await handler._produce_direct(
-        lifecycle=SimpleNamespace(discarded=False),
+        lifecycle=responses.TurnLifecycle(),
         conv_id=conv_id,
         original_content="Hello",
+        question="Hello",
         route=route,
         buffer=buffer,
     )
@@ -879,31 +1123,82 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
 
 
 @pytest.mark.asyncio
-async def test_streaming_direct_response_registers_its_shared_redis_buffer(monkeypatch):
-    from uuid import UUID
+async def test_produce_direct_answers_a_full_pool_with_a_timed_retry(monkeypatch):
+    """A direct answer that cannot be saved because the pool freed no
+    connection in time ends with server_busy and the wait, not anton_error."""
+    import json
+    from uuid import uuid4 as _uuid4
 
     import cowork.handlers.responses as responses
+    from cowork.db.units import DatabaseBusy
 
     handler = _routing_handler(monkeypatch)
-    handler.scoped = SimpleNamespace(
-        scope=SimpleNamespace(org_id="org-1", user_id="user-1"),
+
+    def no_free_connection(*args, **kwargs):
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(save_user_message=no_free_connection),
     )
-    buffer = SimpleNamespace()
-    handle = SimpleNamespace(buffer=buffer)
-    recorded = {}
 
-    async def fake_start(**kwargs):
-        kwargs["producer_coro"].close()
-        return handle
+    class _Buffer:
+        def __init__(self):
+            self.frames = []
+            self.closed = None
+            self.is_closed = False
 
-    async def fake_record(conversation_id, **kwargs):
-        recorded["conversation_id"] = conversation_id
-        recorded.update(kwargs)
+        async def append(self, kind, record):
+            self.frames.append(record["sse"])
 
-    monkeypatch.setattr(responses, "new_buffer", lambda _cid, _turn_id: buffer)
-    monkeypatch.setattr(responses.registry, "start", fake_start)
-    monkeypatch.setattr(responses, "get_backend", lambda: "redis")
-    monkeypatch.setattr(responses, "record_turn", fake_record)
+        async def close(self, reason):
+            self.closed = reason
+            self.is_closed = True
+
+    buffer = _Buffer()
+
+    await handler._produce_direct(
+        lifecycle=responses.TurnLifecycle(),
+        conv_id=_uuid4(),
+        original_content="Hello",
+        question="Hello",
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi."),
+        buffer=buffer,
+    )
+
+    assert buffer.closed == "error"
+    (frame,) = buffer.frames
+    payload = json.loads(frame.split("data: ", 1)[1])
+    assert payload["code"] == "server_busy"
+    assert payload["error"] == "Cowork is busy. Try again in about 5 seconds."
+    assert payload["retry_after"] == 5
+    assert payload["retry_at"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_streaming_direct_response_registers_its_shared_redis_buffer(monkeypatch):
+    import asyncio
+    from uuid import UUID
+    import fakeredis.aioredis
+
+    import cowork.handlers.responses as responses
+    from cowork.streaming import buffer as buffer_mod, cancellation, turn_index
+    from cowork.streaming.registry import RunRegistry
+
+    handler = _routing_handler(monkeypatch)
+    handler.scope = SimpleNamespace(org_id="org-1", user_id="user-1")
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    for module in (buffer_mod, cancellation, turn_index):
+        monkeypatch.setattr(module, "get_redis", lambda: redis)
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+    runs = RunRegistry()
+    monkeypatch.setattr(responses, "registry", runs)
+
+    async def held_producer(**kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(handler, "_produce_direct", held_producer)
     conversation_id = UUID("d27d3533-2e4e-4021-bb5a-6e238245974c")
 
     await handler._handle_direct_response(
@@ -911,6 +1206,7 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
         conversation_id=conversation_id,
         turn_id=3,
         original_content="Hello",
+        question="Hello",
         route=RouteDecision(
             route=DIRECT_CONTEXT,
             reason="router_direct_response",
@@ -919,11 +1215,297 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
         ),
     )
 
-    assert recorded["conversation_id"] == str(conversation_id)
-    assert recorded["turn_id"] == 3
-    assert recorded["correlation_id"].startswith("direct-")
-    assert recorded["org_id"] == "org-1"
-    assert recorded["user_id"] == "user-1"
+    try:
+        recorded = await turn_index.get_turn(str(conversation_id))
+        assert recorded["turn_id"] == "3"
+        assert recorded["run_id"] == handler.last_run_handle.run_id
+        assert recorded["correlation_id"] == handler.last_run_handle.lifecycle.identity.correlation_id
+        assert recorded["org_id"] == "org-1"
+        assert recorded["user_id"] == "user-1"
+    finally:
+        await asyncio.sleep(0)  # start the bounded producer before shutdown
+        await runs.shutdown()
+
+
+# --- a direct answer's figure sources ------------------------------------------
+
+_OVERTIME_QUESTION = "What does an hour of overtime cost over 2 shifts?"
+_OVERTIME_ANSWER = "About $30 an hour, so $60 over 2 shifts."
+
+
+def _saving_conversation_service(monkeypatch, saved: dict):
+    from uuid import uuid4 as _uuid4
+
+    import cowork.handlers.responses as responses
+
+    def save_assistant_turn(cid, text, events, harness=None):
+        saved["events"] = events
+        return SimpleNamespace(id=_uuid4())
+
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            save_user_message=lambda cid, content, pending=False: SimpleNamespace(id=_uuid4()),
+            save_assistant_turn=save_assistant_turn,
+        ),
+    )
+
+
+class _DirectBuffer:
+    def __init__(self):
+        self.frames = []
+        self.closed = None
+        self.is_closed = False
+
+    async def append(self, kind, record):
+        self.frames.append(record["sse"])
+
+    async def close(self, reason):
+        self.closed = reason
+        self.is_closed = True
+
+    def events(self) -> list[dict]:
+        import json
+
+        return [json.loads(frame.split("data: ", 1)[1]) for frame in self.frames]
+
+
+def _reading_earlier_answers(monkeypatch, *answers) -> list[tuple]:
+    """Replace the earlier answers' read with one that finds ``answers``, and
+    return the (conversation_id, scope) of each read it is asked for."""
+    import cowork.handlers.responses as responses
+
+    reads: list[tuple] = []
+
+    async def read_earlier_answers(*, conversation_id, scope):
+        reads.append((conversation_id, scope))
+        return answers
+
+    monkeypatch.setattr(responses, "read_earlier_answers", read_earlier_answers)
+    return reads
+
+
+async def _produce_direct_answer(
+    monkeypatch, *, text: str, saved: dict, conv_id=None, handler: ResponsesHandler | None = None,
+) -> _DirectBuffer:
+    from uuid import uuid4 as _uuid4
+
+    import cowork.handlers.responses as responses
+
+    handler = handler or _routing_handler(monkeypatch)
+    _saving_conversation_service(monkeypatch, saved)
+    buffer = _DirectBuffer()
+    await handler._produce_direct(
+        lifecycle=responses.TurnLifecycle(),
+        conv_id=conv_id or _uuid4(),
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=text),
+        buffer=buffer,
+    )
+    return buffer
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_carries_its_figure_sources_live_and_saved(monkeypatch):
+    saved: dict = {}
+    _reading_earlier_answers(monkeypatch)
+
+    buffer = await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved=saved)
+
+    events = buffer.events()
+    assert [e["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.memory_read", "response.figure_sources",
+        "response.completed",
+    ]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4, 5]
+    sources = events[3]
+    assert sources["item_id"] == events[1]["item_id"]
+    assert sources["steps"] == []
+    assert {f["text"]: f["origin"] for f in sources["figures"]} == {"$30": "none", "$60": "none", "2": "question"}
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.figure_sources", "response.completed",
+    ]
+    assert saved["events"][2] == sources
+    assert buffer.closed == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_without_figures_streams_as_before(monkeypatch):
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(monkeypatch, text="Hi.", saved=saved)
+
+    events = buffer.events()
+    assert [e["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4]
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    # It runs no agent, so it reads no learned memory.
+    assert events[2] == {"type": "response.memory_read", "sequence_number": 3, "read": False, "entries": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_matcher_failure_leaves_the_direct_answer_whole(monkeypatch, caplog):
+    import cowork.harnesses.anton_harness.stream_formatter as formatter
+
+    def broken(**_kwargs):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(formatter, "find_figure_sources", broken)
+    _reading_earlier_answers(monkeypatch)
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved=saved)
+
+    assert [e["type"] for e in buffer.events()] == [
+        "response.created", "response.output_text.delta", "response.memory_read", "response.completed",
+    ]
+    assert buffer.closed == "completed"
+    assert [r for r in caplog.records if r.name == formatter.logger.name and r.levelname == "ERROR"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_direct_answer_returns_and_saves_its_figure_sources(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    saved: dict = {}
+    _saving_conversation_service(monkeypatch, saved)
+    _reading_earlier_answers(monkeypatch)
+
+    response = await handler._handle_direct_response(
+        request=SimpleNamespace(stream=False),
+        conversation_id=_uuid4(),
+        turn_id=1,
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=_OVERTIME_ANSWER),
+    )
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert {f["text"]: f["origin"] for f in output["figure_sources"]["figures"]} == {
+        "$30": "none", "$60": "none", "2": "question",
+    }
+    [saved_sources] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
+    assert saved_sources["figures"] == output["figure_sources"]["figures"]
+    # The order a streamed direct answer sends them in.
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.memory_read", "response.figure_sources", "response.completed",
+    ]
+    assert [e for e in saved["events"] if e["type"] == "response.memory_read"] == [
+        {"type": "response.memory_read", "read": False, "entries": 0}
+    ]
+
+
+def _overtime_earlier_answer():
+    """An earlier answer that read the overtime rate, $30, from a step."""
+    from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
+
+    return EarlierAnswer(figures=[Figure(start=0, end=3, text="$30", origin=FigureOrigin.step)])
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_marks_a_figure_an_earlier_answer_gave(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = _uuid4()
+    reads = _reading_earlier_answers(monkeypatch, _overtime_earlier_answer())
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(
+        monkeypatch, text=_OVERTIME_ANSWER, saved=saved, conv_id=conv_id, handler=handler,
+    )
+
+    [live] = [e for e in buffer.events() if e["type"] == "response.figure_sources"]
+    assert {f["text"]: f["origin"] for f in live["figures"]} == {
+        "$30": "earlier_answer", "$60": "none", "2": "question",
+    }
+    assert [f["sources"] for f in live["figures"]] == [[], [], []]
+    assert live["steps"] == []
+    [persisted] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
+    assert persisted == live
+    assert reads == [(conv_id, handler.scope)]
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_direct_answer_marks_a_figure_an_earlier_answer_gave(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = _uuid4()
+    saved: dict = {}
+    _saving_conversation_service(monkeypatch, saved)
+    reads = _reading_earlier_answers(monkeypatch, _overtime_earlier_answer())
+
+    response = await handler._handle_direct_response(
+        request=SimpleNamespace(stream=False),
+        conversation_id=conv_id,
+        turn_id=1,
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=_OVERTIME_ANSWER),
+    )
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert {f["text"]: f["origin"] for f in output["figure_sources"]["figures"]} == {
+        "$30": "earlier_answer", "$60": "none", "2": "question",
+    }
+    [persisted] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
+    assert persisted["figures"] == output["figure_sources"]["figures"]
+    assert reads == [(conv_id, handler.scope)]
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_checks_for_figures_off_the_event_loop(monkeypatch):
+    """The figure check parses the whole answer, which takes tens of
+    milliseconds on a long one, so it runs in a worker thread, as the
+    matching does: every other request waits on the loop."""
+    import threading
+
+    import cowork.handlers.responses as responses
+
+    checked_on: list[int] = []
+    real_has_figures = responses.has_figures
+
+    def recording_has_figures(answer):
+        checked_on.append(threading.get_ident())
+        return real_has_figures(answer)
+
+    monkeypatch.setattr(responses, "has_figures", recording_has_figures)
+    _reading_earlier_answers(monkeypatch)
+
+    await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved={})
+
+    loop_thread = threading.get_ident()
+    assert len(checked_on) == 1
+    assert checked_on[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_without_figures_reads_no_earlier_answers(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    reads = _reading_earlier_answers(monkeypatch, _overtime_earlier_answer())
+    saved: dict = {}
+
+    await _produce_direct_answer(monkeypatch, text="Hi.", saved=saved)
+    response = await _routing_handler(monkeypatch)._handle_direct_response(
+        request=SimpleNamespace(stream=False),
+        conversation_id=_uuid4(),
+        turn_id=1,
+        original_content="Hello",
+        question="Hello",
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi."),
+    )
+
+    assert reads == []
+    assert response.model_dump(mode="json")["output"][0].get("figure_sources") is None
 
 
 # --- history view: tool rows become markers, not holes (ENG-1851) -----------
@@ -1047,7 +1629,7 @@ async def test_router_unavailable_keeps_model_attribution(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="opus"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: _Boom())
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: _Boom())
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -1062,6 +1644,209 @@ async def test_router_unavailable_keeps_model_attribution(monkeypatch):
     assert decision.provider == "minds_cloud"
     assert decision.model == "opus"
 
+
+# --- a failed gate call names its error in the log --------------------------
+
+
+def _router_on_an_endpoint_answering(monkeypatch, status: int, error: dict):
+    """A real anton router provider whose endpoint answers every request with
+    ``status`` and ``{"error": error}``. The answer comes through the openai
+    SDK's own HTTP layer, so the SDK builds the error the gate catches."""
+    import httpx
+    import openai
+    from anton.core.llm.openai import OpenAIProvider
+
+    real_client = openai.AsyncOpenAI
+
+    def _client(**kwargs):
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(status, json={"error": error})
+        )
+        return real_client(
+            http_client=httpx.AsyncClient(transport=transport), max_retries=0, **kwargs
+        )
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _client)
+    return OpenAIProvider(api_key="sk-router-key", base_url="https://api.openai.com/v1")
+
+
+async def _route_on(provider):
+    return await decide_route(
+        history=[{"role": "user", "content": "Make an HTML artifact with a bar chart."}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=RouterBinding(provider=provider, model="gpt-6-luna", label="openai_compatible"),
+    )
+
+
+def _gate_warnings(caplog):
+    import logging
+
+    return [
+        r for r in caplog.records
+        if r.name == "cowork.handlers.response_routing" and r.levelno == logging.WARNING
+    ]
+
+
+@pytest.mark.asyncio
+async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog):
+    """OpenAI refuses the gate's function tool on chat completions when the
+    router model reasons. The [gate] line names that refusal by class and
+    status. Provider text can quote the request or echo a credential."""
+    import logging
+
+    from anton.core.llm import provider as anton_provider
+
+    echoed_key = "sk-test-a1b2c3d4e5f6"
+    message = (
+        "Function tools with reasoning_effort are not supported for gpt-6-luna in "
+        "/v1/chat/completions. To use function tools, use /v1/responses or set "
+        f"reasoning_effort to 'none'. Key: {echoed_key}"
+    )
+    provider = _router_on_an_endpoint_answering(monkeypatch, 400, {
+        "message": message,
+        "type": "invalid_request_error",
+        "param": "reasoning_effort",
+        "code": None,
+    })
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="cowork.handlers.response_routing"):
+            decision = await _route_on(provider)
+    finally:
+        await provider.aclose()
+
+    # Nothing about the error rides on the decision, which feeds trace metadata.
+    assert decision == RouteDecision(
+        route=DELEGATED_AGENTIC,
+        reason="router_unavailable",
+        provider="openai_compatible",
+        model="gpt-6-luna",
+        fallback=True,
+    )
+    (record,) = _gate_warnings(caplog)
+    line = record.getMessage()
+    assert line.startswith("[gate] reason=router_unavailable ")
+    expected_error = (
+        "RequestRefusedError" if hasattr(anton_provider, "RequestRefusedError") else "BadRequestError"
+    )
+    assert f"error={expected_error}" in line
+    assert "status=400" in line
+    assert "type=" not in line
+    assert "param=" not in line
+    assert "code=" not in line
+    assert echoed_key not in line
+    assert "Function tools" not in line
+    assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_router_unavailable_keeps_only_status_under_a_status_bearing_wrapper(monkeypatch, caplog):
+    """A wrapper can retain HTTP status while its cause holds private body fields."""
+    import logging
+
+    import httpx
+    import openai
+
+    from cowork.handlers import response_routing as routing
+
+    class RequestRefusedError(Exception):
+        status_code = 400
+        code = "parameter_refused"
+
+    secret = "sk-test-provider-message"
+    sdk_error = openai.BadRequestError(
+        f"Function tools with reasoning_effort are not supported. Key: {secret}",
+        response=httpx.Response(
+            400, request=httpx.Request("POST", "https://example.com/v1/chat/completions")
+        ),
+        body={
+            "type": secret + "-type",
+            "code": secret + "-code",
+            "param": secret + "-param",
+        },
+    )
+
+    async def failed_gate(*args, **kwargs):
+        raise RequestRefusedError(f"Refused request: {secret}") from sdk_error
+
+    monkeypatch.setattr(routing, "_gate", failed_gate)
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.response_routing"):
+        decision = await _route_on(None)
+
+    assert decision.reason == "router_unavailable"
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == (
+        "[gate] reason=router_unavailable error=RequestRefusedError status=400"
+    )
+    assert secret not in repr(record.__dict__)
+    assert record.args == ("RequestRefusedError", 400)
+    assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [True, 99, 600, "400", "private_status_marker", None])
+async def test_router_unavailable_drops_arbitrary_status_and_provider_body_fields(monkeypatch, caplog, status):
+    import logging
+
+    import httpx
+    import openai
+
+    from cowork.handlers import response_routing as routing
+
+    private = "router_private_request_marker"
+    error = openai.BadRequestError(
+        private,
+        response=httpx.Response(400, request=httpx.Request("POST", "https://example.com/" + private)),
+        body={"type": private, "code": private, "param": private},
+    )
+    error.status_code = status
+
+    async def failed_gate(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(routing, "_gate", failed_gate)
+    with caplog.at_level(logging.WARNING, logger=routing.__name__):
+        decision = await _route_on(None)
+
+    assert decision.reason == "router_unavailable"
+    assert decision.fallback is True
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == "[gate] reason=router_unavailable error=BadRequestError status=unknown"
+    assert record.args == ("BadRequestError", "unknown")
+    assert record.exc_info is None
+    assert private not in repr(record.__dict__)
+    assert "private_status_marker" not in repr(record.__dict__)
+    assert error.status_code == status
+    assert error.body == {"type": private, "code": private, "param": private}
+
+
+@pytest.mark.asyncio
+async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeypatch, caplog):
+    """anton raises its own error from the SDK's for the statuses it names, so
+    the line reads only the status from that cause. Here,
+    an Azure deployment that doesn't exist."""
+    import logging
+
+    provider = _router_on_an_endpoint_answering(monkeypatch, 404, {
+        "code": "DeploymentNotFound",
+        "message": "The API deployment for this resource does not exist.",
+    })
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="cowork.handlers.response_routing"):
+            decision = await _route_on(provider)
+    finally:
+        await provider.aclose()
+
+    assert decision.reason == "router_unavailable"
+    (record,) = _gate_warnings(caplog)
+    line = record.getMessage()
+    assert "error=NotFoundError" not in line  # the class is anton's, not the SDK's
+    assert "status=404" in line
+    assert "code=" not in line
+    assert "does not exist" not in line
 
 
 # --- the streamed gate: budget the decision, not the answer (ENG-1851) -------
@@ -1091,6 +1876,7 @@ class _StreamProvider:
         self.gap = gap
         self.calls = []
         self.closed = False
+        self.read_to_end = False
 
     async def stream(self, **kwargs):
         import asyncio
@@ -1101,7 +1887,10 @@ class _StreamProvider:
             for i, event in enumerate(self.events):
                 if i and self.gap:
                     await asyncio.sleep(self.gap)
+                if isinstance(event, BaseException):
+                    raise event
                 yield event
+            self.read_to_end = True
         finally:
             self.closed = True
 
@@ -1226,6 +2015,102 @@ async def test_gate_total_budget_survives_events_that_decide_nothing(monkeypatch
         await routing._gate(_binding(noise), history=HISTORY)
 
 
+# --- usage log: a delegated gate stream is read to its end, off the decision path
+
+
+def _usage_log(monkeypatch, enabled):
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(routing, "get_app_settings", lambda: SimpleNamespace(usage_log=enabled))
+
+
+async def _drained():
+    import asyncio
+
+    import cowork.handlers.response_routing as routing
+
+    await asyncio.gather(*routing._drain_tasks)
+
+
+@pytest.mark.asyncio
+async def test_gate_cuts_a_delegated_stream_when_the_usage_log_is_off(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, False)
+    provider = _StreamProvider([_tool(), _text("args"), _complete()])
+    assert await routing._gate(_binding(provider), history=HISTORY) is None
+    assert provider.closed
+    assert not provider.read_to_end
+    assert not routing._drain_tasks
+
+
+@pytest.mark.asyncio
+async def test_gate_reads_a_delegated_stream_to_its_end_when_the_usage_log_is_on(monkeypatch):
+    """The provider records a call's usage from its last event, so the stream is
+    read to the end, but only after the decision is already returned."""
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, True)
+    provider = _StreamProvider([_tool(), _text("args"), _complete()], gap=0.05)
+    assert await routing._gate(_binding(provider), history=HISTORY) is None
+    assert not provider.read_to_end
+
+    await _drained()
+    assert provider.read_to_end
+    assert provider.closed
+
+
+@pytest.mark.asyncio
+async def test_gate_drain_stops_at_the_gate_deadline(monkeypatch, caplog):
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, True)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 0.1)
+    stuck = _StreamProvider([_tool(), _text("args"), _complete()], gap=1.0)
+    with caplog.at_level("INFO", logger=routing.__name__):
+        assert await routing._gate(_binding(stuck), history=HISTORY) is None
+        await _drained()
+
+    assert stuck.closed
+    assert not stuck.read_to_end
+    assert any("usage_drain_timeout" in r.getMessage() and "model=gate-model" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_gate_drain_failure_logs_the_error_class_not_its_text(monkeypatch, caplog):
+    import logging
+
+    import httpx
+    import openai
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, True)
+    private = "drain_private_request_marker"
+    error = openai.APIStatusError(
+        private,
+        response=httpx.Response(529, request=httpx.Request("POST", "https://example.com/" + private)),
+        body={"message": private},
+    )
+    failing = _StreamProvider([_tool(), error])
+    token = set_trace_context(TraceContext(session_id="conv-17"))
+    try:
+        with caplog.at_level(logging.WARNING, logger=routing.__name__):
+            assert await routing._gate(_binding(failing), history=HISTORY) is None
+            await _drained()
+    finally:
+        reset_trace_context(token)
+
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == (
+        "[gate] usage_drain_failed conversation=conv-17 model=gate-model "
+        "error=APIStatusError status=529")
+    assert record.exc_info is None
+    assert private not in repr(record.__dict__)
+
+
 # --- Done-when #5: the two paths can never both answer -----------------------
 
 
@@ -1246,7 +2131,7 @@ async def test_a_preamble_before_a_tool_call_delegates_and_says_nothing(monkeypa
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
@@ -1284,7 +2169,7 @@ async def test_no_delegated_route_ever_carries_text(monkeypatch, events, first_d
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
     provider = _StreamProvider(events, first_delay=first_delay)
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
@@ -1304,7 +2189,7 @@ async def test_a_direct_decision_carries_the_whole_answer(monkeypatch):
         "get_user_settings",
         lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
     )
-    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
 
     decision = await decide_route(
         history=HISTORY, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
@@ -1722,3 +2607,178 @@ async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delega
     assert decision.text == ""
     assert decision.fallback is False
     assert decision.model == "gate-model"
+
+
+# --- a follow-up to tool work delegates without a gate call (S2) -------------
+
+
+def _tool_turn(prompt="pull the sales table", result="rows: 1204", answer="Pulled 1,204 rows."):
+    return [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "..."}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": result}]},
+        {"role": "assistant", "content": answer},
+    ]
+
+
+def _no_gate(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    async def gate_must_not_run(binding, *, history):
+        raise AssertionError("the gate must not be called")
+
+    monkeypatch.setattr(routing, "_gate", gate_must_not_run)
+    monkeypatch.setattr(routing, "_settings_binding", lambda: (_ for _ in ()).throw(AssertionError("no binding needed")))
+
+
+async def _route(history):
+    return await decide_route(history=history, has_non_text_input=False,
+                              has_attachments=False, has_disabled_connections=False)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_to_tool_work_delegates_without_gate_call(monkeypatch):
+    _no_gate(monkeypatch)
+    decision = await _route(_tool_turn() + [{"role": "user", "content": "Add a short summary above the detail."}])
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "prior_turn_ran_tools"
+    assert not decision.fallback and decision.text == ""
+
+
+@pytest.mark.asyncio
+async def test_follow_up_in_another_language_delegates_too(monkeypatch):
+    _no_gate(monkeypatch)
+    decision = await _route(_tool_turn() + [{"role": "user", "content": "Ajoute un résumé, s'il te plaît."}])
+    assert decision.reason == "prior_turn_ran_tools"
+
+
+@pytest.mark.asyncio
+async def test_plain_previous_turn_still_reaches_the_gate(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    seen = []
+
+    async def fake_gate(binding, *, history):
+        seen.append(history)
+        return "Hello!"
+
+    monkeypatch.setattr(routing, "_gate", fake_gate)
+    monkeypatch.setattr(routing, "_settings_binding", lambda: RouterBinding(provider=object(), model="m", label="x"))
+    # Tool work two turns ago, then a plain exchange: only the turn right before the prompt counts.
+    history = _tool_turn() + [
+        {"role": "user", "content": "thanks"},
+        {"role": "assistant", "content": "You're welcome."},
+        {"role": "user", "content": "hi again"},
+    ]
+    decision = await _route(history)
+    assert decision.route == DIRECT_CONTEXT and seen
+
+
+def test_prior_turn_ran_tools_shapes():
+    from cowork.handlers.response_routing import prior_turn_ran_tools
+
+    prompt = {"role": "user", "content": "next"}
+    assert prior_turn_ran_tools(_tool_turn() + [prompt])
+    assert not prior_turn_ran_tools([{"role": "user", "content": "hi"}])
+    assert not prior_turn_ran_tools([{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, prompt])
+    # A bounded window that starts inside a long tool loop still sees the work.
+    assert prior_turn_ran_tools(_tool_turn()[2:] + [prompt])
+    # Mixed text and tool_use in one assistant row.
+    assert prior_turn_ran_tools([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "text", "text": "Checking."},
+                                          {"type": "tool_use", "id": "t", "name": "web_search", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]},
+        {"role": "assistant", "content": "Done."},
+        prompt,
+    ])
+    # System rows and unknown blocks are ignored.
+    assert not prior_turn_ran_tools([
+        {"role": "system", "content": [{"type": "tool_use"}]},
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": [{"type": "unknown"}]}, prompt,
+    ])
+
+
+@pytest.mark.asyncio
+async def test_persisted_tool_rows_delegate_end_to_end(monkeypatch):
+    """Rows exactly as persisted, through `to_openai_message` (what `_route_request` sends)."""
+    from uuid import uuid4
+
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+
+    _no_gate(monkeypatch)
+    cid = uuid4()
+    rows = [
+        Message(conversation_id=cid, role=Role.user, content="pull the sales table"),
+        Message(conversation_id=cid, role=Role.assistant, content=[
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "..."}},
+        ]),
+        Message(conversation_id=cid, role=Role.user, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "rows: 1204"},
+        ]),
+        Message(conversation_id=cid, role=Role.assistant, content="Pulled 1,204 rows."),
+    ]
+    history = [m.to_openai_message().model_dump() for m in rows]
+    history.append({"role": "user", "content": "now chart it"})
+    decision = await _route(history)
+    assert decision.reason == "prior_turn_ran_tools"
+
+
+# --- a request that names a concrete file delegates without a gate call -------
+
+
+def _gate_spy(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    seen = []
+
+    async def fake_gate(binding, *, history):
+        seen.append(history)
+        return "Hello!"
+
+    monkeypatch.setattr(routing, "_gate", fake_gate)
+    monkeypatch.setattr(routing, "_settings_binding", lambda: RouterBinding(provider=object(), model="m", label="x"))
+    return seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", [
+    "Summarise source.json for me.",
+    "Is Q3_forecast.xlsx up to date?",
+    "Compare data/orders.csv with the last run",
+    "Make report.html easier to read.",
+])
+async def test_naming_a_file_delegates_without_gate_call(monkeypatch, prompt):
+    _no_gate(monkeypatch)
+    decision = await _route([{"role": "user", "content": prompt}])
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "explicit_file_context"
+    assert not decision.fallback and decision.text == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", [
+    "What is a .csv file?",
+    "Explain the difference between HTML and Markdown.",
+    "Use JSON or YAML for config?",
+])
+async def test_talking_about_file_types_still_reaches_the_gate(monkeypatch, prompt):
+    seen = _gate_spy(monkeypatch)
+    decision = await _route([{"role": "user", "content": prompt}])
+    assert decision.route == DIRECT_CONTEXT and seen
+
+
+@pytest.mark.asyncio
+async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
+    seen = _gate_spy(monkeypatch)
+    history = [
+        {"role": "user", "content": "What does notes.md usually hold?"},
+        {"role": "assistant", "content": "Usually free-form notes."},
+        {"role": "user", "content": "thanks!"},
+    ]
+    decision = await _route(history)
+    assert decision.route == DIRECT_CONTEXT and seen

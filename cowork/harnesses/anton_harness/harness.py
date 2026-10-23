@@ -1,24 +1,68 @@
+import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from functools import partial
 import inspect
 import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import TYPE_CHECKING, NamedTuple
+from uuid import UUID
+
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
-from cowork.common.chat_session import build_chat_session
+from cowork.code_sandbox import (
+    build_cell_sandbox,
+    code_sandbox_on,
+    refuse_a_linked_project,
+    refuse_planted_links,
+    shared_files_dir,
+)
+from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
-from cowork.common.logger import get_logger
-from cowork.common.paths import cowork_home, pod_local_only
+from cowork.common.logger import get_logger, log_context
+from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
+from cowork.common.settings.user_settings import current_settings_scope
+from cowork.deployment_identity import identity_for_turn, learned_memory_scope
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
+from cowork.db.units import run_db, run_to_completion, unit_session
+from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
+from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
+from cowork.harnesses.memory.policy import memory_policy
+from cowork.harnesses.memory.turn_layout import (
+    TurnMemoryLayout,
+    empty_turn_memory,
+    person_turn_memory,
+)
+from cowork.harnesses.anton_harness.stream_formatter import (
+    ArtifactCreated,
+    SkillCreated,
+    TurnContext,
+    TurnHistory,
+    TurnMemoryRead,
+    format_responses_stream,
+)
+from cowork.managed import managed_folder
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
-from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
+from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.specs._registry import registry
+from cowork.services.conversations import read_earlier_answers
 from cowork.services.projects import display_label
+from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
+from cowork.services.skills import link_turn_skills, reads_shared_skills
+from cowork.streaming.liveness import ModelWaitTicker
+
+if TYPE_CHECKING:
+    from anton.core.session import ChatSession
+
+    from cowork.services.conversations import ReplayHistory
 
 
 logger = get_logger(__name__)
@@ -27,17 +71,12 @@ logger = get_logger(__name__)
 def _anton_mcp_wiring():
     """anton's MCP wiring module, or ``None`` when the installed anton predates it.
 
-    cowork-server pins anton from a git branch, but its *published* floor
-    (``anton-agent>=2.26.8.23.1``) still resolves builds with no
-    ``anton.core.mcp`` package — the MCP client (ENG-1816) reaches anton's
-    ``main`` on its own release cadence, so there is a real window where a
-    perfectly valid dependency lacks it.
-
-    Importing it unconditionally turns that window into an ImportError on the
-    session-construction path, i.e. every turn fails, not just the MCP ones.
-    Same reasoning and same shape as ``services/providers.py``'s
-    ``router_provider`` gate and ``handlers/turn_errors.py``'s deliberate
-    refusal to import a type this repo can be deployed ahead of.
+    Every anton this server can start with has the ``anton.core.mcp`` package
+    (the MCP client, ENG-1816): it predates the
+    ``anton.core.artifacts.internal_files`` constants the server imports at
+    startup. So the ``None`` branch serves only an anton too old to start this
+    server. Same shape as ``services/providers.py``'s ``router_provider`` gate:
+    a missing capability degrades the feature instead of raising.
     """
     try:
         from anton.core.mcp import wiring
@@ -50,17 +89,76 @@ def _anton_mcp_wiring():
     return wiring
 
 
+#: Skills this harness ships for its own tools, read-only: the first of
+#: anton's extra skill roots on every turn.
+HOST_SKILLS_DIR = Path(__file__).parent / "skills"
+
+
 def _vault_scratch_dir() -> Path:
-    """Where the temporary filtered data-vault directory is staged when a
-    turn disables one or more connections (see ``_build_chat_session``).
+    """Where a turn's temporary folder is staged when it needs one: the
+    empty memory tiers of a turn with no person, and the links to the
+    operator's managed skills and to the skills others share with the asker
+    (see ``_new_turn_scratch_dir``).
 
     Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
     EFS storage by pod_local_only (see its docstring), because this directory
     carries no org_id segment: left on cowork_home() it would put every
-    organization's temporary vault contents under the same shared, readable
+    organization's temporary turn files under the same shared, readable
     location.
     """
     return pod_local_only(cowork_home() / "tmp", "tmp")
+
+
+def _new_turn_scratch_dir() -> Path:
+    """A fresh per-turn folder under ``_vault_scratch_dir()``.
+
+    ``_build_chat_session`` returns it, and ``stream_response`` removes it, with
+    everything under it, when the turn ends.
+    """
+    base = _vault_scratch_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="cowork-turn-", dir=base))
+
+
+class BuiltChatSession(NamedTuple):
+    """One in-process turn, as ``_build_chat_session`` builds it."""
+
+    session: "ChatSession"
+    # The turn's scratch folder (_new_turn_scratch_dir), which stream_response
+    # removes when the turn ends, or None when the turn made none.
+    turn_scratch_dir: Path | None
+    # What _persist_history_compaction needs to map this turn's compaction
+    # onto the saved messages (_seed_history); None with history compaction off.
+    seed_info: dict | None
+    # The turn's TurnMemoryLayout.learns: False when its tiers are two empty
+    # scratch folders, so it reads and writes nobody's learned memory.
+    learns: bool
+
+
+def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
+    """The turn's Cortex over its two learned tiers.
+
+    The one place an in-process turn builds its Cortex, so the operator's
+    read-only managed memory layer joins the turn here: every turn with a
+    managed folder gets its rules and lessons, a turn with no person included.
+    The argument is passed directly, never through supported_kwargs: create_app
+    refuses a managed folder on an anton without it (cortex_takes_managed_layer),
+    and a dropped layer would silently lose the operator's rules.
+    """
+    from anton.core.memory.cortex import Cortex
+    from anton.core.memory.hippocampus import Hippocampus
+
+    managed = managed_folder()
+    managed_layer = (
+        {} if managed is None else {"managed_hc": Hippocampus(managed.memory_dir)}
+    )
+    return Cortex(
+        global_hc=Hippocampus(layout.global_dir),
+        project_hc=Hippocampus(layout.project_dir),
+        mode=mode,
+        llm_client=llm_client,
+        **managed_layer,
+    )
 
 
 #: Settings copied from the Cowork DB onto anton's own settings object, in
@@ -90,10 +188,11 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
 
     Returns the attrs actually applied, so a caller or test can assert on it.
 
-    **The skew guard is the load-bearing part.** anton is pinned as a git dep on
-    ``branch = "main"`` (see ``[tool.uv.sources]``), so cowork-server can ship a
-    setting whose field has only reached anton's ``staging`` — it arrives on
-    main at the weekly release, not when the anton PR merges. pydantic raises
+    **The skew guard is the load-bearing part.** uv.lock pins anton to a
+    release, and a PyPI-channel install takes any release at or above the
+    floor in ``pyproject.toml``, so cowork-server can ship a setting whose
+    field has only reached anton's ``staging`` — it arrives on main at the
+    weekly release, not when the anton PR merges. pydantic raises
     ``ValueError: "AntonSettings" object has no field "x"`` on setattr of an
     unknown field, and this runs on EVERY session build, so an unguarded overlay
     turns a one-week ordering gap into a total agent outage rather than a
@@ -159,8 +258,11 @@ def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
     """
     if get_app_settings().tenancy_mode == "org":
         return {}
-    # This server pins anton to a moving rev, so degrade rather than raise:
-    # an absent overlay costs the project's .env, raising costs every turn.
+    # Workspace.load_env predates the anton.core.artifacts.internal_files
+    # constants the server imports at startup, so every anton this server can
+    # start with has it, and this guard serves only an anton too old to start
+    # this server. It degrades rather than raises: an absent overlay costs the
+    # project's .env, raising costs every turn.
     loader = getattr(workspace, "load_env", None)
     if loader is None:
         logger.warning("installed anton has no Workspace.load_env; no project .env overlay")
@@ -173,17 +275,63 @@ def _load_workspace_env_if_safe(workspace) -> dict[str, str]:
 
 
 def _apply_overlay_fallback(workspace, overlay: dict[str, str], overlay_kwargs: dict) -> bool:
-    """Load the project .env the old way when the pinned anton cannot carry it.
+    """Load the project .env the old way when the installed anton cannot carry it.
 
     Returns whether it applied. Extracted so the fallback is testable without
     constructing a full ChatSession, like the org-mode guard above. Gated on a
     non-empty overlay, which org mode never produces, so the untrusted shared
-    .env is not reachable from here.
+    .env is not reachable from here. Refused under the code sandbox: the
+    project's .env is the agent's to write, and loading it into this
+    process's own environment would hand the agent's lines to the server.
     """
     if not (overlay and not overlay_kwargs):
         return False
+    if code_sandbox_on():
+        raise RuntimeError(
+            "The installed anton can't carry the project's .env to its scratchpad, "
+            "and loading it into the server's own environment is refused under "
+            "COWORK_CODE_SANDBOX=landlock."
+        )
     workspace.apply_env_to_process()
     return True
+
+
+def _make_project_folder(base: Path, folder: Path, *, sandboxed: bool) -> None:
+    """Create ``folder``, one of the server's own folders in the project at
+    ``base`` (its ``skills/`` and ``.anton/*``).
+
+    Under the code sandbox the project is the agent's to write and this
+    process isn't locked, so a link planted below ``base`` raises OSError
+    instead of being followed (makedirs_below_nofollow). Off, the folder is
+    made the plain way, as on the desktop, where a project may link these
+    folders on purpose.
+    """
+    if sandboxed:
+        makedirs_below_nofollow(base, target=folder)
+    else:
+        folder.mkdir(parents=True, exist_ok=True)
+
+
+def _inside_project(base: Path, *, folder: Path) -> Path:
+    """``folder``, the agent's context folder (anton's context_dir, which
+    ANTON_CONTEXT_DIR sets), written below the project at ``base`` so
+    _make_project_folder makes it without following links. anton resolves
+    the folder against the resolved project, so a folder below ``base``
+    resolved counts as inside too.
+
+    The harness calls it under the code sandbox, where the server makes no
+    folder of its own outside the project: a folder outside it raises
+    RuntimeError naming the setting.
+    """
+    folder = Path(os.path.abspath(folder))
+    for root in (Path(os.path.abspath(base)), Path(os.path.realpath(base))):
+        if folder.is_relative_to(root):
+            return base / folder.relative_to(root)
+    raise RuntimeError(
+        f"The agent's context folder {folder} is outside the project {base}, and under "
+        "COWORK_CODE_SANDBOX=landlock the server makes its folders only inside the "
+        "project. Unset ANTON_CONTEXT_DIR, or set it to a folder inside the project."
+    )
 
 
 settings = AntonHarnessSettings()
@@ -218,9 +366,11 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     two must agree byte for byte. Desktop and SaaS read the same `messages`
     table, so a divergence would not fail here — it would surface as an invalid
     tool_use -> tool_result sequence many turns later, in whichever path did not
-    write the row. anton owns the implementation (ENG-1808); the slicing and the
-    compaction/cancel guards stay on this side, which is the only side that
-    knows whether a turn ended cleanly.
+    write the row. anton owns the implementation (ENG-1808) and the turn's
+    messages (`ChatSession.turn_messages`). The cancel guard stays on this
+    side, which is the only side that knows whether a turn ended cleanly, and
+    so does the choice to store no rows for a turn that compacted
+    (`_captured_turn_history`).
 
     Imported inside the function, like every other anton import in this file.
     `anton.cloud_turn.__init__` re-exports the pod entrypoint's contract and
@@ -234,14 +384,101 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     return split_turn_into_rows(history_slice)
 
 
-def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
-    disabled_keys = {(d["engine"], d["name"]) for d in disabled_connections}
-    filtered = LocalDataVault(temp_dir)
-    for conn in source_vault.list_connections():
-        if (conn["engine"], conn["name"]) not in disabled_keys:
-            creds = source_vault.load(conn["engine"], conn["name"]) or {}
-            filtered.save(conn["engine"], conn["name"], creds)
-    return filtered
+def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, compacted: bool) -> TurnHistory | None:
+    """The tool block-rows of a turn that completed cleanly, or None when it
+    has none.
+
+    They come from `ChatSession.turn_messages()`, which holds every message
+    the turn appended, those a mid-turn compaction or hard truncation folded
+    out of `session.history` included. A turn that compacted ran near or over
+    the model's context window, and rows this process captures have no size
+    cap (`reject_unreplayable_tool_rows` in cowork/handlers/_turn_history.py),
+    so its rows are read and not stored: the formatter finds the answer's
+    figures in them, and the next turn replays this one as text only. A turn
+    that did not compact stores its rows.
+
+    An anton without `turn_messages` (a local editable anton older than
+    mindsdb/anton#585) gets the slice of `session.history` past `seed_len`,
+    and no rows after a compaction: the compaction replaced the list, so the
+    slice could drop rows or keep a tool_result whose tool_use was folded
+    away. A session with neither
+    `turn_messages` nor `history` has no rows.
+    """
+    if hasattr(session, "turn_messages"):
+        turn_slice = session.turn_messages()
+    elif seed_len is not None and not compacted:
+        turn_slice = session.history[seed_len:]
+    else:
+        return None
+    # Drop this turn's user input (and anything before the first assistant
+    # message) so the slice starts where the model replied.
+    while turn_slice and (
+        not isinstance(turn_slice[0], dict)
+        or turn_slice[0].get("role") != "assistant"
+    ):
+        turn_slice = turn_slice[1:]
+    rows = _split_turn_into_rows(turn_slice)
+    if not rows:
+        return None
+    return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
+
+
+def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead | None:
+    """What the turn's prompt held from learned memory, or None before anton
+    has built the prompt (ChatSession.memory_read stays None until then) and
+    on an anton build, or a test double, without ChatSession.memory_read.
+
+    ``learns`` is the turn's memory layout's (BuiltChatSession.learns). A
+    layout that may not learn hands anton two empty scratch tiers, so the turn
+    read nobody's learned memory, whatever anton reports for them.
+    """
+    read = getattr(session, "memory_read", None)
+    if read is None:
+        return None
+    return TurnMemoryRead(read=read.learned and learns, entries=read.entries)
+
+
+def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
+    """Prompt text naming the Google-Picker-granted Drive files, or "".
+
+    A plain files.list()/files.search() call does NOT return these files (the
+    google_drive connector's drive.file scope only covers files the app
+    created itself, plus these specifically granted ones), so the agent has
+    to be told about them by name. The general Drive API rules
+    (supportsAllDrives, corpora) are not here: they apply to every Drive
+    connection and come from google_drive.json's usage_notes.
+    """
+    if not picked_by_connection:
+        return ""
+
+    def _describe(f: dict, conn_name: str) -> str:
+        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
+        resource_key = f.get("resourceKey") or f.get("resource_key")
+        if resource_key:
+            line += f", resourceKey: {resource_key}"
+        return line + ")"
+
+    picked_lines = [
+        _describe(f, conn_name)
+        for conn_name, files in picked_by_connection.items()
+        for f in files
+    ]
+    return (
+        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
+        "access to via the Google Picker, which a plain files.list()/files.search() call "
+        "will NOT return (the google_drive connector's scope only covers files this app "
+        "created itself, plus these specifically granted ones):\n"
+        + "\n".join(picked_lines)
+        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
+        "include every file above IN ADDITION to whatever files.list()/files.search() "
+        "returns — do not report only the API call's results. To read one of these "
+        "files' content, call files.get(fileId=...) directly with its id above; do not "
+        "expect it to appear in a files.list() response first. If a file above has a "
+        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
+        "even though access was actually granted — either add header "
+        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
+        "resourceKey=<resourceKey> as a query parameter."
+    )
 
 
 def _turn_style_context(channel: ChannelContext | None) -> str:
@@ -249,20 +486,21 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     support-chat guidance for channel turns.
 
     Both branches name how a finished file reaches the user: the channel branch
-    says "I'm sending the file", the desktop branch points at the Live Artifacts
-    panel. Without the desktop half, anton pasted the artifact's local path as a
+    says "I'm sending the file", the UI branch points at the Live Artifacts
+    panel. Without the UI half, anton pasted the artifact's local path as a
     markdown link — inert in chat (ENG-1636).
 
-    The desktop branch is asserted byte-for-byte by test_channel_context.py
+    The UI branch is asserted byte-for-byte by test_channel_context.py
     (cache-stable prompt prefix) — change both together.
     """
     if channel is None:
         return (
-            "The Anton CoWork desktop UI displays progress, tool usage, and actions "
-            "as separate structured activity rows. Keep assistant text focused on the "
-            "user-facing answer; do not narrate internal work with status phrases like "
-            "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-            "is itself the final answer the user needs. "
+            "The Cowork UI displays progress, tool usage, and actions "
+            "as separate structured activity rows, so do not narrate each step "
+            "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
+            "open your reply with one short sentence telling the user what you are "
+            "about to do; after that, keep assistant text focused on the user-facing "
+            "answer. "
             "Files you create as artifacts appear automatically in the Live Artifacts "
             "panel beside the chat, where the user previews them and uses the Download "
             "control (and Open, on desktop). When a file is ready, tell the user it is "
@@ -310,6 +548,32 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     )
 
 
+_PROJECT_FILE_READ_RULE = (
+    "You can read, search, extract from and analyse any of these project files without asking. "
+)
+
+
+def _project_file_actions_rule(act_first: bool) -> str:
+    """When the agent must ask before acting on project files.
+
+    Follows the "Act first, ask later" setting: a blanket ask-first rule here
+    outweighs anton's act-first discipline, which sits earlier in the prompt,
+    and the agent then asks before writing a file the user asked it to create.
+    Reading never needs permission, whatever the setting.
+    """
+    if not act_first:
+        return (
+            _PROJECT_FILE_READ_RULE
+            + "Ask the user for permission before you create, change, move or delete any of these files. "
+        )
+    return (
+        _PROJECT_FILE_READ_RULE
+        + "Create the files the user asks for and change the files they ask you to change "
+        "without asking for permission first. "
+        "Ask the user before deleting files or overwriting files they did not ask you to change. "
+    )
+
+
 # How a file the agent cannot reach gets to it. Stated on EVERY turn, not
 # just turns that have attachments — the project context above tells the agent
 # what it may not access and used to say nothing about how access is granted,
@@ -327,8 +591,145 @@ _ATTACHMENT_AFFORDANCE = (
     "files that are neither in the project nor attached."
 )
 
+# The same rule under the code sandbox, where the shared folder every person's
+# agent reads and changes (cowork.code_sandbox.shared_files_dir) is a third
+# way in.
+_SANDBOXED_ATTACHMENT_AFFORDANCE = (
+    " Files reach you in exactly three ways: they are already in the project "
+    "directory above, the user attaches them to this conversation, or they are "
+    "in the shared folder at `{shared}`. If the user refers to a file you cannot "
+    "find in any of these places, ask them to attach it to the conversation, "
+    "which is how they grant you access. Do not ask them to type or paste a "
+    "filesystem path; you are not permitted to read files that are not in the "
+    "project, attached, or in the shared folder."
+)
 
-def _conversation_attachment_context(conversation) -> str:
+
+def _attachment_affordance() -> str:
+    """How a file the agent cannot reach gets to it: _ATTACHMENT_AFFORDANCE,
+    or under the code sandbox _SANDBOXED_ATTACHMENT_AFFORDANCE."""
+    if not code_sandbox_on():
+        return _ATTACHMENT_AFFORDANCE
+    return _SANDBOXED_ATTACHMENT_AFFORDANCE.format(shared=shared_files_dir())
+
+
+# What the agent may reach beside the project, in the project context.
+_OTHER_FILES_RULE = (
+    "The only other files that you are allowed to access are any items that are attached to the conversation. "
+    "Access to any files not attached to the conversation or located outside the project is strictly forbidden. "
+)
+
+
+def _other_files_rule(*, sandboxed: bool) -> str:
+    """_OTHER_FILES_RULE, or under the code sandbox the same rule with the
+    shared folder allowed, named, and said to be every person's agent's."""
+    if not sandboxed:
+        return _OTHER_FILES_RULE
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation, "
+        f"and the files in the shared folder at `{shared_files_dir()}`. "
+        "Every person's agent on this deployment can read and change the shared folder: use it to hand files "
+        "to other people, never put anything private there, and read and write it in the scratchpad. "
+        "Access to any other files outside the project is strictly forbidden. "
+    )
+
+
+# What the agent hears about long-running services under the code sandbox, in
+# place of the full-stack artifact and `launch_backend`, which anton refuses
+# there.
+_SANDBOXED_BACKENDS_RULE = (
+    "App backends are off on this deployment because your code runs in a sandbox, so never "
+    "build a full-stack artifact or call `launch_backend`; build static artifacts instead."
+)
+
+
+def _units_scope() -> TenantScope:
+    """The scope a turn's own database units run under: the one its settings
+    resolve against (use_settings_scope). stream_response runs only in local
+    mode, where an unbound scope is LOCAL_SCOPE, as get_user_settings has it."""
+    return current_settings_scope() or LOCAL_SCOPE
+
+
+@dataclass(frozen=True)
+class _AttachedFile:
+    """An attachment's stored path and file name, as a database unit read them."""
+
+    path: str
+    filename: str
+
+
+def _attached_files(session: ScopedSession, *, conversation_id: UUID) -> list[_AttachedFile]:
+    from cowork.services.files import FileService, attachment_purpose
+
+    rows = FileService(session).list_file_rows(purpose=attachment_purpose(str(conversation_id)))
+    return [_AttachedFile(path=row.path or "", filename=row.filename) for row in rows]
+
+
+def _replay_history(session: ScopedSession, *, conversation_id: UUID) -> "ReplayHistory":
+    from cowork.services.conversations import ConversationService
+
+    return ConversationService(session).get_replay_history(
+        conversation_id, event_roles=SCRATCHPAD_REPLAY_ROLES,
+    )
+
+
+def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list[dict]:
+    from cowork.services.conversations import ConversationService
+
+    return ConversationService(session).archived_messages(conversation_id)
+
+
+async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[_AttachedFile] | None:
+    """The conversation's attachments, read in a database unit, or None when
+    they could not be looked up.
+
+    ``scope`` is the turn's bound scope (use_settings_scope), never one derived
+    from the row. No scope on a partitioned deployment (tenant_scope_required)
+    is an invariant violation, and so is a conversation of another org or
+    person, wherever the scope partitions conversations: both log and list
+    nothing. The check keys on conversations, not files: a conversation shared
+    across persons carries no org_id, while each person's attachments to it
+    are still filtered by the files partition in the read below. A failed read
+    logs too. A wait for a connection that runs out is the turn's failure, not
+    a missing listing, so it propagates.
+    """
+    try:
+        if scope is None:
+            if tenant_scope_required():
+                logger.warning(
+                    "attachments: no tenant scope is bound on a partitioned deployment; "
+                    "listing skipped (conversation %s)", conversation.id,
+                )
+                return None
+            scope = LOCAL_SCOPE
+        if (
+            scope.partitioned_for(PersonalResource.CONVERSATIONS)
+            and conversation.org_id != scope.org_id
+        ):
+            logger.warning(
+                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
+                conversation.id, conversation.org_id, scope.org_id,
+            )
+            return None
+        return await run_db(partial(_attached_files, conversation_id=conversation.id), scope=scope)
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        # Never crash a turn over attachment context — but don't fail
+        # silently either. A swallowed error here is indistinguishable from
+        # "no attachments", which is exactly how the agent ends up telling
+        # the user no files were uploaded (the Cyberdeck bug this helper
+        # exists to fix). Log it so the failure is diagnosable.
+        logger.warning(
+            "Failed to build conversation attachment context; "
+            "the agent will not see attached files this turn",
+            exc_info=True,
+            extra=log_context(conversation_id=getattr(conversation, "id", None)),
+        )
+        return None
+
+
+async def _conversation_attachment_context(conversation, *, scope: TenantScope | None) -> str:
     """Prompt fragment telling the agent which files are attached to this
     conversation, and how the user can attach more.
 
@@ -338,100 +739,58 @@ def _conversation_attachment_context(conversation) -> str:
     files were uploaded (the Cyberdeck bug). Handing it the exact paths lets
     it read them on demand on any turn — not just the turn they arrived on.
 
-    Never returns "": every turn carries ``_ATTACHMENT_AFFORDANCE`` so the
+    Never returns "": every turn carries ``_attachment_affordance()`` so the
     agent always knows attaching is the route to a file it cannot reach
     (ENG-1357). Two distinct outcomes, and the distinction is load-bearing:
 
     * **Known-empty** (no rows, or none still on disk) — say so, and name
       attachment as the remedy.
-    * **Unknown** (detached session, no tenant scope, org mismatch, or a
-      swallowed exception) — emit the affordance ALONE. Asserting "no files
-      are attached" here would turn a failure to look into a confident false
-      negative, which is the Cyberdeck bug in the other direction: the user
-      attached a file and the agent flatly denies it exists.
+    * **Unknown** (no tenant scope in org mode, org mismatch, or a failed
+      read; see _read_attachments): emit the affordance ALONE. Asserting
+      "no files are attached" here would turn a failure to look into a
+      confident false negative, which is the Cyberdeck bug in the other
+      direction: the user attached a file and the agent flatly denies it
+      exists.
     """
-    try:
-        from sqlalchemy.orm import object_session
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
-        from cowork.services.files import FileService, attachment_purpose
+    return _attachment_context_for(
+        await _read_attachments(conversation, scope=scope), conversation=conversation,
+    )
 
-        db_session = object_session(conversation)
-        if db_session is None:
-            return _ATTACHMENT_AFFORDANCE
-        # Re-wrap with the ORIGINAL scope the conversation was loaded under —
-        # never derived from the row itself. No recorded scope in org mode is
-        # an invariant violation: log it and list nothing.
-        scope = scope_of_session(db_session)
-        if scope is None:
-            if get_app_settings().tenancy_mode == "org":
-                logger.warning(
-                    "attachments: session carries no tenant scope in org mode — "
-                    "listing skipped (conversation %s)", conversation.id,
-                )
-                return _ATTACHMENT_AFFORDANCE
-            scope = LOCAL_SCOPE
-        if scope.org_mode and conversation.org_id != scope.org_id:
-            logger.warning(
-                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
-                conversation.id, conversation.org_id, scope.org_id,
-            )
-            return _ATTACHMENT_AFFORDANCE
-        rows = FileService(ScopedSession(db_session, scope)).list_file_rows(
-            purpose=attachment_purpose(str(conversation.id))
-        )
-        # Only list files that still exist on disk — a row whose file was
-        # deleted would otherwise hand the agent a dead path to chase.
-        # Resolve one row at a time: a single bad row (e.g. a path the OS
-        # rejects) must not abort the whole list and hide every OTHER
-        # attachment — skip the bad one and keep going.
-        attached: list[str] = []
-        for r in rows:
-            try:
-                path = getattr(r, "path", "")
-                if path and Path(path).exists():
-                    attached.append(f"  - {r.path}  ({r.filename})")
-            except Exception:
-                logger.warning(
-                    "Skipping unresolvable attachment row (file id=%s) while "
-                    "building context for conversation %s",
-                    getattr(r, "id", "<unknown>"),
-                    getattr(conversation, "id", "<unknown>"),
-                    exc_info=True,
-                )
-        if not attached:
-            return (
-                " No files are currently attached to this conversation."
-                + _ATTACHMENT_AFFORDANCE
-            )
-        return (
-            " The user has attached the following files to THIS conversation. "
-            "They live OUTSIDE the project directory, so a project-only scan will "
-            "miss them — read them directly from these absolute paths whenever the "
-            "user refers to uploaded or reference materials, and never report them "
-            "missing just because they aren't in the project folder:\n"
-            + "\n".join(attached)
-        )
-    except Exception:
-        # Never crash a turn over attachment context — but don't fail
-        # silently either. A swallowed error here is indistinguishable from
-        # "no attachments", which is exactly how the agent ends up telling
-        # the user no files were uploaded (the Cyberdeck bug this helper
-        # exists to fix). Log it so the failure is diagnosable; the agent
-        # still degrades gracefully to "".
+
+def _attachment_context_for(rows: list[_AttachedFile] | None, *, conversation) -> str:
+    """``_conversation_attachment_context`` for rows already read: None is a
+    listing that could not be read."""
+    if rows is None:
+        return _attachment_affordance()
+    # Only list files that still exist on disk — a row whose file was
+    # deleted would otherwise hand the agent a dead path to chase.
+    # Resolve one row at a time: a single bad row (e.g. a path the OS
+    # rejects) must not abort the whole list and hide every OTHER
+    # attachment — skip the bad one and keep going.
+    attached: list[str] = []
+    for row in rows:
         try:
-            # A broken session state can make even attribute access raise —
-            # the log line must never re-crash the handler it protects.
-            conv_id = getattr(conversation, "id", "<unknown>")
+            if row.path and Path(row.path).exists():
+                attached.append(f"  - {row.path}  ({row.filename})")
         except Exception:
-            conv_id = "<unknown>"
-        logger.warning(
-            "Failed to build conversation attachment context for conversation %s; "
-            "the agent will not see attached files this turn",
-            conv_id,
-            exc_info=True,
+            logger.warning(
+                "Skipping unresolvable attachment %r while building context for conversation %s",
+                row.filename, getattr(conversation, "id", "<unknown>"),
+                exc_info=True,
+            )
+    if not attached:
+        return (
+            " No files are currently attached to this conversation."
+            + _attachment_affordance()
         )
-        return _ATTACHMENT_AFFORDANCE
+    return (
+        " The user has attached the following files to THIS conversation. "
+        "They live OUTSIDE the project directory, so a project-only scan will "
+        "miss them — read them directly from these absolute paths whenever the "
+        "user refers to uploaded or reference materials, and never report them "
+        "missing just because they aren't in the project folder:\n"
+        + "\n".join(attached)
+    )
 
 
 @register
@@ -460,6 +819,9 @@ class AntonHarness:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
+        tool_messages: bool = False,
+        # Keeps the turn alive while a model call is quiet (see HarnessProvider).
+        model_wait: ModelWaitTicker | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -481,7 +843,7 @@ class AntonHarness:
                 "Turns must run on the remote worker in this deployment; "
                 "in-process execution is disabled."
             )
-        temp_vault_dir: Path | None = None
+        turn_scratch_dir: Path | None = None
         # Attribute + surface any artifact this turn created or edited. Anton's
         # artifact tools record what they touch as they run
         # (ChatSession.artifacts_touched), and that set — not a bare diff of the
@@ -492,7 +854,8 @@ class AntonHarness:
         # still taken, to tell CREATED from EDITED within that set.
         from cowork.services.task_objects import (
             finalize_turn_skill_drafts,
-            index_turn_artifacts,
+            record_new_artifacts,
+            turn_artifact_changes,
             publish_and_card_turn_artifacts,
             snapshot_artifact_state,
             snapshot_skill_drafts,
@@ -507,11 +870,15 @@ class AntonHarness:
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
-        # Same reason: the card carries the project name to the client, and reading
-        # the relation after the turn could hit an expired session.
-        # The artifact card's label, sent beside project_id which carries the
-        # identity - so this is a display value (ENG-1676).
-        conv_project_name = display_label(conversation.project)
+        # Same reason: reading the relation after the turn could hit an expired
+        # session, so both of the card's project values are read now. The label
+        # is what the card shows, beside project_id which carries the identity
+        # (ENG-1676). The name addresses the card's serve URL, because
+        # serve_artifact_file (GET /api/v1/artifacts/serve/{project_name}/...)
+        # resolves that segment by name, through
+        # services.artifacts._project_artifacts_base.
+        conv_project_label = display_label(conversation.project)
+        conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -524,89 +891,154 @@ class AntonHarness:
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
         turn_scope = None
-        turn_rows: list[dict] | None = None
+        turn_history: TurnHistory | None = None
+        memory_read: TurnMemoryRead | None = None
         session = None
         seed_info: dict | None = None
+
+        async def record_turn_cleanup():
+            nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            if session is not None and seed_info is not None and getattr(session, "last_compaction", None) is not None:
+                # Best-effort: a missing compaction does not lose the answer.
+                try:
+                    await run_db(
+                        lambda db: self._persist_history_compaction(
+                            conversation, session, seed_info, database_session=db,
+                        ),
+                        scope=_units_scope(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to persist history compaction",
+                        extra=log_context(conversation_id=conv_id),
+                    )
+            try:
+                changes = turn_artifact_changes(
+                    conversation_id=conv_id,
+                    artifacts_base=artifacts_base,
+                    before=before_slugs,
+                    before_mtimes=before_mtimes,
+                    tracked_new=getattr(session, "artifacts_touched", None),
+                    tracked_edits=getattr(session, "artifacts_touched", None),
+                )
+                new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
+                if new_slugs:
+                    await run_db(
+                        partial(
+                            record_new_artifacts,
+                            conversation_id=conv_id,
+                            project_id=conv_project_id,
+                            slugs=new_slugs,
+                            creator=getattr(conversation, "created_by", None),
+                        ),
+                        scope=turn_scope,
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not index artifacts created this turn",
+                    exc_info=True,
+                    extra=log_context(
+                        conversation_id=conv_id, project_id=conv_project_id, artifact_slugs=new_slugs or None,
+                    ),
+                )
+            skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
+
         try:
-            session, temp_vault_dir, seed_info = await self._build_chat_session(
+            built = await self._build_chat_session(
                 conversation,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
+                tool_messages=tool_messages,
             )
-            # Length of the seeded history — everything anton appends past this
-            # index is this turn's block-messages (tool_use / tool_result / text).
-            # Guarded: an anton build (or test double) without `.history` simply
-            # skips capture and falls back to text-only replay.
+            session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
+            if model_wait is not None:
+                model_wait.attach(session=session)
+            # Length of the seeded history, for an anton without
+            # `turn_messages`: everything it appends past this index is this
+            # turn's block-messages (tool_use / tool_result / text) until a
+            # compaction replaces the list (_captured_turn_history). Guarded
+            # for that fallback slice only: an anton build (or test double)
+            # with neither `turn_messages` nor `.history` skips capture and
+            # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
-            compacted = False  # set if anton summarizes history mid-turn
+            compacted = False  # set if anton compacts or hard-truncates history mid-turn
             # Forward trace annotations only if the installed anton's
-            # turn_stream accepts them. Deployed cowork-server resolves anton
-            # from PyPI/main, which may predate the trace-tags kwargs (anton
-            # #218); gating keeps those builds working — tags simply don't flow
-            # until the anton floor is bumped — instead of raising TypeError.
+            # turn_stream accepts them. Every anton this server can start with
+            # does (anton #218 predates the anton.core.artifacts.internal_files
+            # constants the server imports at startup), so the gate serves only
+            # an anton too old to start this server.
             turn_kwargs: dict = {}
             _turn_params = inspect.signature(session.turn_stream).parameters
             if "trace_tags" in _turn_params:
                 turn_kwargs["trace_tags"] = trace_tags
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
-            async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
-                # Under context pressure anton summarizes history mid-turn,
-                # reassigning session.history and invalidating seed_len.
-                if type(event).__name__ == "StreamContextCompacted":
-                    compacted = True
-                yield event
-            # Turn completed cleanly: capture its tool block-rows for
-            # persistence. Skipped on cancel/error (the block below never runs),
-            # so a partial turn falls back to text-only replay and anton's own
-            # dangling-tool_use sealing keeps its in-memory history valid.
-            #
-            # Also skipped after a mid-turn compaction: seed_len no longer marks
-            # this turn's start, so slicing could drop rows or surface an orphan
-            # tool_result (its tool_use summarized away) → invalid replay. Text-
-            # only replay stays valid, so degrade to it.
-            if seed_len is not None and not compacted:
-                turn_slice = session.history[seed_len:]
-                while turn_slice and (
-                    not isinstance(turn_slice[0], dict)
-                    or turn_slice[0].get("role") != "assistant"
-                ):
-                    turn_slice = turn_slice[1:]
-                turn_rows = _split_turn_into_rows(turn_slice) or None
+            yield TurnContext(
+                question=prompt_text(input),
+                files=AgentFiles.on_this_server(
+                    project_path,
+                    project_id=conv_project_id,
+                    attachments=await read_conversation_attachments(conversation_id=conv_id, scope=_units_scope()),
+                ),
+                # A copy: the session appends this turn to its own list.
+                history=list(getattr(session, "history", ())),
+                # Read from the saved answers, since the session's history is
+                # what anton seeds the model with, not the figures' events.
+                earlier_answers=await read_earlier_answers(conversation_id=conv_id, scope=_units_scope()),
+            )
+            # The turn's record of the learned memory it read goes out once,
+            # with the first event after anton builds the prompt, which it does
+            # before its first model call. A turn that fails or is stopped after
+            # anton builds its prompt carries it too.
+            try:
+                async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
+                    # Under context pressure anton summarizes or hard-truncates
+                    # history mid-turn, replacing session.history, and says so
+                    # with this event.
+                    if type(event).__name__ == "StreamContextCompacted":
+                        compacted = True
+                    yield event
+                    if memory_read is None:
+                        memory_read = _turn_memory_read(session=session, learns=built.learns)
+                        if memory_read is not None:
+                            yield memory_read
+            except (Exception, asyncio.CancelledError):
+                # A turn that fails or is stopped after anton builds its prompt,
+                # before any event after it: the stop usually lands on the first
+                # model call. The yield doesn't absorb the cancel, since the
+                # bare raise sends it on once the consumer asks for the next
+                # event. GeneratorExit isn't caught: a yield during aclose()
+                # raises RuntimeError.
+                if memory_read is None:
+                    memory_read = _turn_memory_read(session=session, learns=built.learns)
+                    if memory_read is not None:
+                        yield memory_read
+                raise
+            # A turn that built its prompt and sent no event after it.
+            if memory_read is None:
+                memory_read = _turn_memory_read(session=session, learns=built.learns)
+                if memory_read is not None:
+                    yield memory_read
+            # Turn completed cleanly: capture its tool block-rows. Skipped on
+            # cancel/error (this line never runs), so a partial turn falls
+            # back to text-only replay and anton's own dangling-tool_use
+            # sealing keeps its in-memory history valid. A turn that compacted
+            # hands its rows to the formatter and stores none.
+            turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
         finally:
-            if temp_vault_dir:
-                shutil.rmtree(temp_vault_dir, ignore_errors=True)
-            if session is not None and seed_info is not None:
-                # Best-effort — must never mask the turn's real outcome.
-                try:
-                    self._persist_history_compaction(conversation, session, seed_info)
-                except Exception:
-                    logger.exception(
-                        "[anton_harness] failed to persist history compaction for conversation %s",
-                        conv_id,
-                    )
-            # One dir diff → index the new artifacts and work out what this turn
-            # touched. Runs on every exit (success, error, cancel), so an artifact
-            # is always indexed. Synchronous by design: an `await` here would be
-            # skipped on cancellation, so anything awaited would silently not run.
-            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
-                conversation, conv_id, conv_project_id, artifacts_base,
-                before_slugs, before_mtimes,
-                # Anton reports both: `create_artifact` and `open_artifact`
-                # (the only way to get a path to write into) both record, so
-                # the same set bounds created AND edited. Read defensively —
-                # on an early failure `session` is None, and an anton build
-                # predating the field has no `artifacts_touched`; both degrade
-                # to the pre-existing diff-only behaviour rather than dropping
-                # the turn's cards entirely.
-                tracked_new=getattr(session, "artifacts_touched", None),
-                tracked_edits=getattr(session, "artifacts_touched", None),
-            )
-            skill_drafts = finalize_turn_skill_drafts(
-                project_path, before_drafts, before_strays,
-            )
+            if model_wait is not None:
+                model_wait.detach()
+            if turn_scratch_dir:
+                shutil.rmtree(turn_scratch_dir, ignore_errors=True)
+            if session is not None:
+                # Before the steps below, so none of them raising can skip it.
+                # Scheduled rather than awaited; see close_session_scratchpads.
+                close_session_scratchpads(session, owner=f"conversation {conv_id}")
+            # Every exit records its artifacts. Repeated Stop/shutdown cancels
+            # wait for this step, while each database wait runs off the loop.
+            await run_to_completion(record_turn_cleanup())
         # Autopublish and cards live in the normal-completion path, matching what
         # cards already did: on Stop/cancel neither runs, and the next turn in this
         # project heals it (if there is one — an abandoned conversation never does).
@@ -619,13 +1051,14 @@ class AntonHarness:
             scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
+            project_label=conv_project_label,
         )
         for card in cards:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
-        if turn_rows:
-            yield TurnHistory(turn_rows)
+        if turn_history is not None:
+            yield turn_history
 
     @staticmethod
     def _stamp_message(m) -> dict:
@@ -716,12 +1149,10 @@ class AntonHarness:
         """The archive-search tool for this turn, or None when there is nothing
         to search (ENG-735).
 
-        Withheld in three cases:
+        Withheld in two cases:
         - no summary saved yet — the whole history is still replayed, so the
           tool's description and prompt would be dead prompt weight
         - compaction switched off — nothing will ever be archived
-        - the conversation is detached from its DB session, so the archive
-          cannot be read at all
 
         The DB stays on this side of the boundary: the tool receives a callable
         that returns the archive, so its handler holds no session and the
@@ -732,22 +1163,18 @@ class AntonHarness:
         if not conversation.history_summary_cutoff_id:
             return None
 
-        from sqlalchemy.orm import object_session
-
-        from cowork.db.scoped import adopt_scoped_session
-        from cowork.services.conversations import ConversationService
-
         from .tools import build_cowork_recall_history_tool
 
-        db_session = object_session(conversation)
-        if db_session is None:
-            return None
+        conversation_id = conversation.id
+        scope = _units_scope()
+
         # Read per call, not here: most turns never call the tool, and the
-        # archive only changes when a compaction lands at turn end.
-        service = ConversationService(adopt_scoped_session(db_session))
-        return build_cowork_recall_history_tool(
-            lambda: service.archived_messages(conversation.id)
-        )
+        # archive only changes when a compaction lands at turn end. Each call
+        # is its own unit, so no connection is held while the agent works.
+        async def load_archive() -> list[dict]:
+            return await run_db(partial(_archived_messages, conversation_id=conversation_id), scope=scope)
+
+        return build_cowork_recall_history_tool(load_archive)
 
     @staticmethod
     def compaction_cutoff_index(seed_info: dict, covered_through: int, total: int) -> int | None:
@@ -770,7 +1197,10 @@ class AntonHarness:
         return idx if 0 <= idx < total else None
 
     @staticmethod
-    def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
+    def _persist_history_compaction(
+        conversation: Conversation, session, seed_info: dict,
+        *, database_session: ScopedSession | None = None,
+    ) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
 
         `getattr` (not `session.last_compaction` directly): an anton build
@@ -786,16 +1216,17 @@ class AntonHarness:
         )
         if idx is None:
             return
-        from sqlalchemy.orm import object_session
-        from cowork.db.scoped import adopt_scoped_session
         from cowork.services.conversations import ConversationService
 
-        db_session = object_session(conversation)
-        if db_session is None:
+        if database_session is not None:
+            ConversationService(database_session).update_history_compaction(
+                conversation.id, compaction["summary"], ordered_messages[idx].id,
+            )
             return
-        ConversationService(adopt_scoped_session(db_session)).update_history_compaction(
-            conversation.id, compaction["summary"], ordered_messages[idx].id,
-        )
+        with unit_session(scope=_units_scope()) as session:
+            ConversationService(session).update_history_compaction(
+                conversation.id, compaction["summary"], ordered_messages[idx].id,
+            )
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -821,29 +1252,29 @@ class AntonHarness:
         reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
-    ):
+        tool_messages: bool = False,
+    ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
-        from anton.core.memory.cortex import Cortex
         # from anton.core.memory.episodes import EpisodicMemory
-        from anton.core.memory.hippocampus import Hippocampus
         from anton.core.session import ChatSessionConfig, SystemPromptContext
         # from anton.memory.history_store import HistoryStore
-        from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
         # Cowork override — anton's stock PUBLISH_TOOL prints to a Rich
         # Console and pops a webbrowser, both of which die in the FastAPI
         # process. The wrapper exposes the same schema to the LLM but
         # routes through a server-aware handler.
         from .tools import (
+            build_cowork_connect_datasource_tool,
             build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             build_cowork_create_skill_draft_tool,
         )
+        CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
@@ -864,21 +1295,31 @@ class AntonHarness:
         # provider, model, memory flags, etc.) so the DB is the single
         # source of truth — no .env reload needed.
         from cowork.common.settings.user_settings import get_user_settings
+        from cowork.services.providers import web_tool_kwargs_for
         from pydantic import SecretStr
 
         anton_settings = AntonSettings()
         anton_settings.resolve_workspace(str(base))
 
+        # Under the code sandbox, a project reached through a link is refused
+        # before the server writes into it, and the server's own folders in
+        # it never follow a link (_make_project_folder).
+        sandboxed = code_sandbox_on()
+        if sandboxed:
+            refuse_a_linked_project(base)
+
         # Per-project skills
         project_skills_dir = base / "skills"
-        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        _make_project_folder(base, project_skills_dir, sandboxed=sandboxed)
         anton_settings.skills_root = project_skills_dir
 
         # Host skills: read-only, they back
         # the deferred tool bundles (e.g. `connect-datasource` unlocks the
-        # interactive connection tools). Path relative to this module.
-        host_skills_dir = Path(__file__).parent / "skills"
-        anton_settings.skills_extra_roots = [host_skills_dir]
+        # interactive connection tools). The operator's managed skills follow
+        # them, so a host skill keeps its name, and a person's turn adds the
+        # skills others share with them after those (both linked into the
+        # turn's scratch folder below).
+        anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
@@ -914,7 +1355,13 @@ class AntonHarness:
             anton_settings.router_model = router_model
 
         workspace = Workspace(base)
-        workspace.initialize()
+        if sandboxed:
+            # .anton, .anton/memory, anton.md and .env never follow a link.
+            # Passed directly, never through supported_kwargs: create_app
+            # refuses the sandbox on an anton without it (_anton_sandbox_gap).
+            workspace.initialize(refuse_links=True)
+        else:
+            workspace.initialize()
         workspace_env_overlay = _load_workspace_env_if_safe(workspace)
 
         overlay_kwargs = supported_kwargs(
@@ -932,80 +1379,95 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
-        # Skills the agent builds stage here (sibling of artifacts, under the
-        # off-limits .anton/) — never the live skills store, so a built skill is
-        # surfaced as a draft card rather than auto-saved.
+        # Skills the agent builds stage here, a sibling of artifacts and the one
+        # .anton/ folder besides the artifacts the agent writes in. It is never
+        # the live skills store, so a built skill is surfaced as a draft card
+        # rather than auto-saved.
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
+        if sandboxed:
+            context_dir = _inside_project(base, folder=context_dir)
         episodes_dir = anton_dir / "episodes"
-        project_memory_dir = anton_dir / "memory"
-        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
-            directory.mkdir(parents=True, exist_ok=True)
+        # On a deployment that trusts identity headers the project's
+        # .anton/memory is never this turn's project tier (person_turn_memory);
+        # anton's Workspace above still creates it, empty.
+        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir):
+            _make_project_folder(base, directory, sandboxed=sandboxed)
 
-        llm_client = self._build_llm_client(effort=reasoning_effort, model=model)
+        llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
         _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
-        from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import current_settings_scope
-        from cowork.db.scoped import scoped_user_storage_root
 
-        # Per-(org, user) via the turn's ambient scope — the in-process harness
-        # must read/write the same global-scope memory the /memory API serves.
-        global_memory_dir = scoped_user_storage_root(
-            Path(get_app_settings().memory.root_dir).expanduser(),
-            current_settings_scope(),
-            store="memory",
-        )
-        global_memory_dir.mkdir(parents=True, exist_ok=True)
-        cortex = Cortex(
-            global_hc=Hippocampus(global_memory_dir),
-            project_hc=Hippocampus(project_memory_dir),
-            mode=anton_settings.memory_mode if anton_settings.memory_enabled else "off",
-            llm_client=llm_client,
-        )
         # TODO: Is episodic memory required given that we are handling history outside of the harness?
         # episodic = EpisodicMemory(episodes_dir, enabled=settings.episodic_memory)
         # episodic.resume_session(conversation_id)
         # history_store = HistoryStore(episodes_dir)
         # initial_history = history_store.load(conversation_id)
 
+        # What the conversation has stored, each read in a database unit of its
+        # own, before anything below opens a connector: no pooled connection is
+        # held past these reads, and the conversation may be detached.
+        #
         # Conversation-attached uploads land in the files dir
         # (.cowork/files/<uuid>/<name>), OUTSIDE the project directory — so
         # the agent must be told their exact paths or it scans only the
         # project root and wrongly reports "no files uploaded" (Cyberdeck bug).
-        attachment_context = _conversation_attachment_context(conversation)
+        # Read once: the prompt lists them, and the code sandbox grants their
+        # folders read-only.
+        attachment_rows = await _read_attachments(conversation, scope=current_settings_scope())
+        attachment_context = _attachment_context_for(attachment_rows, conversation=conversation)
+        # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
+        # the bare `conversation.messages` relationship is unordered and would
+        # scramble a turn's tool_use/tool_result block-rows. The same unit
+        # reads the stored scratchpad events the cells below are rebuilt from,
+        # and only those.
+        history = await run_db(
+            partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
+        )
+        ordered_messages = history.messages
 
+        # App backends are refused under the code sandbox (`sandboxed`), so
+        # the agent is never told to build one.
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
-            f"You are operating in the project {display_label(conversation.project)}."
-            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
-            "They are off limits. Do not mention the .anton/ directory in your responses."
-            "You can perform operations on these files via the scratchpad."
-            "You can freely read any of these project files."
-            "If you need to perform any actions on these files, ask the user for permission first."
-            "The only other files that you are allowed to access are any items that are attached to the conversation."
-            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
-            "ALWAYS use the scratchpad to interact with files."
+            f"You are operating in the project {display_label(conversation.project)}. "
+            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory "
+            f"(the artifacts under `{str(artifacts_dir)}` and the skill drafts under `{str(skill_drafts_dir)}` "
+            "are the exceptions). "
+            "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
+            "You can perform operations on these files via the scratchpad. "
+            + _project_file_actions_rule(anton_settings.act_first)
+            + _other_files_rule(sandboxed=sandboxed)
+            + "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
+            # Each turn's scratchpad processes are killed when the turn ends
+            # (close_session_scratchpads), with their whole process group.
+            " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
+            "variables carry over to the next turn, running servers do not. "
+            + (
+                _SANDBOXED_BACKENDS_RULE
+                if sandboxed
+                else "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+            )
             + attachment_context
         )
         output_context = (
-            # Artifacts now live in their own visible folder at the
-            # project root (`<base>/artifacts/<slug>/...`), one folder
-            # per output. The agent never picks the folder name itself
+            # Artifacts live under `<base>/.anton/artifacts/<slug>/`, one
+            # folder per output. The agent never picks the folder name itself
             # — it calls `create_artifact` to claim one, then writes
             # files into the absolute path the tool returns. Provenance
             # (which conversation, which turns) is tracked server-side
             # and stamped into each folder's metadata.json + README.md
             # automatically.
-            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, fullstack apps, etc.) live under `{str(artifacts_dir)}/`. "
+            f"User-facing artifacts (HTML dashboards, CSVs, PDFs, datasets, {'' if sandboxed else 'fullstack apps, '}etc.) live under `{str(artifacts_dir)}/`. "
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
-            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find its slug, "
-            "then `open_artifact(slug)` to get the path again.\n"
+            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find it; its folder is `<root>/<slug>`. "
+            "Read the files you will change with `read_text_file`.\n"
             "  3. Use absolute paths from a scratchpad cell so the file always lands in the right place: "
             "`with open(f\"{path}/dashboard.html\", \"w\") as f: ...`\n"
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
@@ -1028,19 +1490,28 @@ class AntonHarness:
             "The staged skill surfaces as a card the user explicitly saves or downloads; it is not saved until they do."
         )
 
-        from cowork.common.settings.app_settings import get_app_settings
-
-        # When connections are disabled, a temporary data vault is created because within Anton,
-        # the vault is used to inject a prompt related to the connected data sources.
+        # When connections are disabled, the turn reads its vault through a
+        # FilteredDataVault that hides them, because anton lists the vault's
+        # connections in the prompt and in the agent's environment.
         data_vault = None
-        temp_vault_dir: Path | None = None
+        turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
-            source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+            from cowork.services.connectors.layered_vault import FilteredDataVault
+            from cowork.services.connectors.persist import turn_vault_for_scope
+
+            # The asker's own connections, with the operator's managed ones
+            # over them and the ones others share with the asker after them,
+            # from the turn's bound scope (use_settings_scope), never the
+            # operator view _units_scope falls back to: an unbound turn on a
+            # partitioned deployment is refused here rather than handed the
+            # base vault. A connection the agent saves through it lands in
+            # the asker's own vault, stamped with its creator.
+            source_vault = turn_vault_for_scope(current_settings_scope())
             if disabled_connections:
-                _tmp_base = _vault_scratch_dir()
-                _tmp_base.mkdir(parents=True, exist_ok=True)
-                temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
-                data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
+                data_vault = FilteredDataVault(
+                    source=source_vault,
+                    hidden=frozenset((d["engine"], d["name"]) for d in disabled_connections),
+                )
             else:
                 data_vault = source_vault
             # Registers this turn's DS_* names and values for scrubbing, and
@@ -1060,103 +1531,38 @@ class AntonHarness:
         # unfiltered connection list for every other connector.
         #
         # Capability-gated on the installed anton, the same way
-        # services/providers.py gates ENG-648's router kwargs: this repo's
-        # published floor (anton-agent>=2.26.8.23.1) still resolves builds
-        # that predate the MCP client, and promoting it to anton's `main` is
-        # a separate release step (ENG-1816). An unguarded import would turn
-        # that window into a failure on EVERY turn, not just MCP ones.
+        # services/providers.py gates ENG-648's router kwargs. Every anton
+        # this server can start with ships the MCP client (ENG-1816): it
+        # predates the anton.core.artifacts.internal_files constants the
+        # server imports at startup. So the gate serves only an anton too old
+        # to start this server.
+        # This turn's connections, listed once for MCP discovery and the usage notes.
+        vault_connections = data_vault.list_connections() if data_vault is not None else []
         mcp_tool_defs: list = []
         mcp_sessions: list = []
         mcp_wiring = _anton_mcp_wiring() if data_vault is not None else None
         if mcp_wiring is not None:
             mcp_tool_defs, mcp_sessions = await mcp_wiring.discover_mcp_tools_async(
-                data_vault, data_vault.list_connections()
+                data_vault, vault_connections
             )
 
         try:
-            # TODO: Add guidance for integrations
-
-            # Google Drive's google_drive connector uses the drive.file OAuth
-            # scope, which only covers files the app created itself, plus files
-            # the user explicitly granted access to via the Google Picker
-            # (persisted as a `_picked_files` vault field — see
-            # cowork/services/connectors/connections.py). A plain
-            # files.list()/files.search() call does NOT return the latter, so
-            # without calling them out by name here the agent has no way to
-            # know they're reachable at all — the scratchpad's env carries only the
-            # raw JSON, which isn't enough for the agent to notice or act on.
-            #
-            # Parsing `_picked_files` and applying the project-scoping rule is
-            # connector logic, not agent logic, so it lives in
-            # ConnectionsService.picked_files_by_project().
+            # Google Drive: Picker-granted files are per-project connection data
+            # (ConnectionsService.picked_files_by_project), so they are rendered
+            # here rather than from the connector spec.
             integration_guidance = ""
-            picked_by_connection: dict[str, list[dict]] = {}
+            connector_usage_notes: dict[str, str] = {}
             if data_vault is not None:
-                picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
-
-                if picked_by_connection:
-                    def _describe(f: dict, conn_name: str) -> str:
-                        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
-                        resource_key = f.get("resourceKey") or f.get("resource_key")
-                        if resource_key:
-                            line += f", resourceKey: {resource_key}"
-                        return line + ")"
-
-                    picked_lines = [
-                        _describe(f, conn_name)
-                        for conn_name, files in picked_by_connection.items()
-                        for f in files
-                    ]
-                    integration_guidance = (
-                        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
-                        "access to via the Google Picker, which a plain files.list()/files.search() call "
-                        "will NOT return (the google_drive connector's scope only covers files this app "
-                        "created itself, plus these specifically granted ones):\n"
-                        + "\n".join(picked_lines)
-                        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
-                        "include every file above IN ADDITION to whatever files.list()/files.search() "
-                        "returns — do not report only the API call's results. To read one of these "
-                        "files' content, call files.get(fileId=...) directly with its id above; do not "
-                        "expect it to appear in a files.list() response first. If a file above has a "
-                        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
-                        "even though access was actually granted — either add header "
-                        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
-                        "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
-                        "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
-                        "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
-                        "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
-                        "include both params on any Drive API call touching these files; they're no-ops "
-                        "for regular files, so there's no downside to always sending them. CRITICAL: when "
-                        "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
-                        "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
-                        "by this connector's restricted OAuth grant and will return files across the user's "
-                        "entire Google account that this app was never actually given access to. Omit "
-                        "corpora entirely (or use corpora='user') — combined with "
-                        "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
-                        "surfaces every file this app can legitimately see, Shared Drive items included."
-                    )
-
-            # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
-            # the bare `conversation.messages`
-            # relationship is unordered and would scramble a turn's tool_use/tool_result
-            # block-rows. Ordering needs the DB session, so the conversation must be
-            # attached — callers always pass an attached instance; fail fast rather
-            # than silently fall back to a scrambled, replay-breaking history.
-            from sqlalchemy.orm import object_session
-            from cowork.db.scoped import adopt_scoped_session
-            from cowork.services.conversations import ConversationService
-
-            db_session = object_session(conversation)
-            if db_session is None:
-                raise RuntimeError(
-                    f"Conversation {conversation.id} is detached from its Session; "
-                    "cannot resolve ordered history for replay."
+                integration_guidance = _picked_files_guidance(
+                    service.picked_files_by_project(data_vault, conversation.project.name)
                 )
-            ordered_messages = ConversationService(
-                adopt_scoped_session(db_session)
-            ).get_ordered_messages(conversation.id)
+                # Agent-facing API notes for this turn's connected engines.
+                # `data_vault` is already filtered by `disabled_connections`.
+                connector_usage_notes = registry.usage_notes_for(
+                    c["engine"] for c in vault_connections
+                )
 
-            cells = extract_scratchpad_cells_from_message_events(ordered_messages)
+            cells = extract_scratchpad_cells(history.events)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
             replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
@@ -1174,11 +1580,152 @@ class AntonHarness:
                 initial_history = [self._stamp_message(m) for m in replayable]
                 seed_info = None
 
+            # The memory of the person who asked: their own tiers, or the
+            # deployment's shared ones, read through the same resolvers as the
+            # /memory API. A turn with no person on a trusted-identity
+            # deployment, and every turn there while memory is off, gets two
+            # empty tiers in its scratch folder, memory off and no background
+            # passes, so it reads and writes nobody's memory. The layout is
+            # picked before any real tier's folder is made or read.
+            memory_state = memory_policy(memory_enabled=anton_settings.memory_enabled)
+            memory_off = memory_state.off
+            memory_layout: TurnMemoryLayout | None = None
+            if not memory_off:
+                memory_layout = person_turn_memory(
+                    scope=current_settings_scope(),
+                    project_path=base,
+                    project_id=conversation.project_id,
+                )
+                if memory_layout is None:
+                    logger.warning(
+                        "memory: conversation %s has no person; the turn reads no "
+                        "learned memory and writes none",
+                        conversation.id,
+                    )
+            if memory_layout is None:
+                if turn_scratch_dir is None:
+                    turn_scratch_dir = _new_turn_scratch_dir()
+                memory_layout = empty_turn_memory(turn_scratch_dir / "memory")
+            if not memory_off:
+                # anton's Hippocampus writes the tiers by path, so under the code
+                # sandbox a link or hard-linked file that agent code left in one,
+                # the person's own or the shared store, fails the turn instead of
+                # being written through. With memory off the turn has only the
+                # empty tiers in its scratch folder and uses no stored tier.
+                for tier in (memory_layout.global_dir, memory_layout.project_dir):
+                    refuse_planted_links(tier)
+            memory_layout.global_dir.mkdir(parents=True, exist_ok=True)
+            memory_layout.project_dir.mkdir(parents=True, exist_ok=True)
+            cortex = _turn_cortex(
+                layout=memory_layout,
+                mode=(
+                    anton_settings.memory_mode
+                    if anton_settings.memory_enabled and memory_layout.learns
+                    else "off"
+                ),
+                llm_client=llm_client,
+            )
+
+            # The operator's managed skills: each readable folder
+            # (ManagedFolder.skill_dirs) linked into the turn's scratch folder,
+            # which anton reads as the read-only root after the host skills.
+            # anton drops a whole root's skills when it can't stat one folder
+            # in it, so the turn never hands it the managed folder itself: a
+            # managed skill the server can't read is left out alone, and the
+            # asker's own, the host's and the shared skills still load. The
+            # turn's own skills folder, which anton ranks above every
+            # read-only root, never links a slug the managed folder reserves
+            # (linked_turn_skills), and neither do the fan-outs into projects
+            # (reconcile_skill_links, reconcile_project).
+            managed = managed_folder()
+            managed_skill_dirs: dict[str, Path] = {}
+            if managed is not None:
+                if turn_scratch_dir is None:
+                    turn_scratch_dir = _new_turn_scratch_dir()
+                managed_skills_dir = turn_scratch_dir / "managed-skills"
+                managed_skill_dirs = managed.skill_dirs()
+                sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed_skill_dirs)
+                anton_settings.skills_extra_roots = [
+                    *anton_settings.skills_extra_roots,
+                    managed_skills_dir,
+                ]
+
+            # Skills. Where nothing fans links into this turn's project
+            # (skill_links.links_apply_to), the turn links its own from the
+            # asker's store, builtins seeded first. A project that is the
+            # asker's alone takes them in its skills folder; a shared project's
+            # folder is every person's at once, so the turn's scratch folder
+            # takes them instead. The skills others share with the asker are
+            # linked into the scratch folder too, which anton reads as its last
+            # host root: read-only, after the managed skills.
+            turn_scope = current_settings_scope()
+            # The folders a sandboxed cell reads beside its project: every
+            # read-only skill root, each linked skill's own folder (the
+            # managed ones included, since Landlock checks where a link
+            # resolves), and each attachment's folder.
+            read_only_dirs: list[Path] = list(managed_skill_dirs.values())
+            if links_apply_to(turn_scope):
+                # The project's skills/ holds links into the one shared store.
+                read_only_dirs.append(Path(get_app_settings().skill.root_dir))
+            else:
+                if turn_scope is not None and turn_scope.partitioned_for(
+                    PersonalResource.PROJECTS
+                ):
+                    turn_skills_dir = project_skills_dir
+                else:
+                    if turn_scratch_dir is None:
+                        turn_scratch_dir = _new_turn_scratch_dir()
+                    turn_skills_dir = turn_scratch_dir / "skills"
+                shared_skills_dir = None
+                if reads_shared_skills(turn_scope):
+                    if turn_scratch_dir is None:
+                        turn_scratch_dir = _new_turn_scratch_dir()
+                    shared_skills_dir = turn_scratch_dir / "shared-skills"
+                    anton_settings.skills_extra_roots = [
+                        *anton_settings.skills_extra_roots,
+                        shared_skills_dir,
+                    ]
+                read_only_dirs += link_turn_skills(
+                    scope=turn_scope,
+                    project_name=conversation.project.name,
+                    skills_dir=turn_skills_dir,
+                    shared_skills_dir=shared_skills_dir,
+                )
+                if turn_skills_dir != project_skills_dir:
+                    read_only_dirs.append(turn_skills_dir)
+                anton_settings.skills_root = turn_skills_dir
+            read_only_dirs += anton_settings.skills_extra_roots
+            read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
+            # None with the sandbox off, and then not passed at all. Built in a
+            # worker thread: it lists every person's partition and opens the
+            # session's folders, file work that would otherwise hold the event
+            # loop and every request on it. to_thread copies the context, so
+            # the settings scope still applies there.
+            cell_sandbox = await asyncio.to_thread(
+                build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
+            )
+
+            deployment = identity_for_turn()
+            deployment_kwargs = {} if deployment is None else {
+                "deployment_identity": deployment,
+                "learned_memory_scope": learned_memory_scope(
+                    off=memory_state.off,
+                    learns=memory_layout.learns,
+                    shared=memory_state.shared,
+                ),
+            }
+
             config = ChatSessionConfig(
                 llm_client=llm_client,
+                **deployment_kwargs,
                 settings=anton_settings,
                 self_awareness=self_awareness,
                 cortex=cortex,
+                # A turn that may not learn runs no end-of-turn memory pass
+                # either. Passed directly, as _turn_cortex passes managed_hc:
+                # every anton the floor admits has the field, and a dropped
+                # one would silently bring the memory passes back.
+                background_memory=memory_layout.learns,
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
@@ -1192,6 +1739,10 @@ class AntonHarness:
                 ),
                 workspace=workspace,
                 data_vault=data_vault,
+                # Dropped, not raised, on an anton that predates the field: the
+                # uv.lock pin and the anton-agent floor must include it, or the
+                # Drive API rules are lost.
+                **supported_kwargs(ChatSessionConfig, connector_usage_notes=connector_usage_notes),
                 **overlay_kwargs,
                 initial_history=initial_history,
                 # history_store=history_store,
@@ -1207,13 +1758,29 @@ class AntonHarness:
                 **surface_kwarg(ChatSessionConfig),
                 # WHO the user is, so anton keys `turn_completed` on the account
                 # rather than the machine (ENG-2121). Opaque ids from the held
-                # MindsHub JWT only; {} when there is none or the pinned anton
-                # predates the fields.
+                # MindsHub JWT only; {} when there is none or the installed
+                # anton predates the fields.
                 **account_kwargs(ChatSessionConfig),
+                # This harness rebuilds the session every message, so the verifier
+                # latch has to outlive it or a persistent failure diagnoses each time.
+                **supported_kwargs(ChatSessionConfig, shared_verifier_latch=True),
+                # Whether the client renders a tool's message to the user (the
+                # brief when the agent acts first); without it the tool hands
+                # the content to the agent. Dropped by an anton without the field.
+                **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
-                web_search_enabled=anton_settings.web_search_enabled,
-                web_fetch_enabled=anton_settings.web_fetch_enabled,
+                # The operator's own ANTON_WEB_SEARCH_ENABLED / ANTON_WEB_FETCH_ENABLED
+                # are the base; web_tool_kwargs_for's forced-off override (hosted web
+                # search bypassing the egress gateway on the Responses API) wins over
+                # it, since that is a security constraint, not a preference — the
+                # client above uses this same settings snapshot either way, even if
+                # settings change mid-build.
+                **{
+                    "web_search_enabled": anton_settings.web_search_enabled,
+                    "web_fetch_enabled": anton_settings.web_fetch_enabled,
+                    **web_tool_kwargs_for(user.resolved_planning_provider),
+                },
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".
@@ -1236,6 +1803,10 @@ class AntonHarness:
                 # also rejects this kwarg — passing it there is a TypeError
                 # that takes down every turn.
                 **({"mcp_sessions": mcp_sessions} if mcp_wiring is not None else {}),
+                # Passed directly, never through supported_kwargs: create_app
+                # refuses the sandbox on an anton without the field, and a
+                # dropped policy would run every cell unlocked.
+                **({"cell_sandbox": cell_sandbox} if cell_sandbox is not None else {}),
                 cells=cells
             )
             # Not `ChatSession(config)` directly: every construction of anton's
@@ -1246,15 +1817,23 @@ class AntonHarness:
             # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
             # call under cowork/ as a new, unreviewed execution site.
             session = build_chat_session(config)
-            return session, temp_vault_dir, seed_info
+            return BuiltChatSession(
+                session=session,
+                turn_scratch_dir=turn_scratch_dir,
+                seed_info=seed_info,
+                learns=memory_layout.learns,
+            )
         except Exception:
+            # The turn never starts, so nothing else removes its scratch folder.
+            if turn_scratch_dir is not None:
+                shutil.rmtree(turn_scratch_dir, ignore_errors=True)
             # Mirrors anton's own build_cloud_chat_session fix (ENG-1816
             # code review): ChatSession.close() is what closes mcp_sessions,
             # so a failure ANYWHERE below MCP discovery — not just
             # build_chat_session's own construction — would otherwise leak
             # every MCP transport this turn opened (found in review: the
-            # original narrower try/except here missed object_session()/
-            # _seed_history() raising before build_chat_session is ever called).
+            # original narrower try/except here missed _seed_history() raising
+            # before build_chat_session is ever called).
             # A non-empty mcp_sessions implies mcp_wiring resolved above, so
             # no second import and no second capability check is needed here.
             if mcp_sessions:
@@ -1262,6 +1841,6 @@ class AntonHarness:
             raise
 
     @staticmethod
-    def _build_llm_client(effort: str | None = None, *, model: str | None = None):
+    def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client(effort_override=effort, model_override=model)
+        return build_llm_client(effort_override=effort, model_override=model, settings=settings)

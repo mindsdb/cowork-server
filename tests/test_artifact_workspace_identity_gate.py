@@ -101,6 +101,7 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
             return [SimpleNamespace(id=server_id)]
 
     monkeypatch.setattr("cowork.services.projects.ProjectService", Projects)
+    monkeypatch.setattr(artifact_scope, "_refuse_a_persons_project_in_the_operator_view", lambda *_args: None)
     monkeypatch.setattr(
         artifact_scope,
         "artifacts_sources_for_project",
@@ -110,6 +111,25 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
     assert artifact_scope._sources_for_project_ref(object(), request_ref) == []
     assert seen == [server_id]
     assert seen[0] is server_id
+
+
+def test_the_desktop_reads_no_row_for_the_operator_view_check(monkeypatch):
+    """The desktop has no operator view and no person's project, so the
+    operator-view check returns before it reads the project row."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    get_app_settings.cache_clear()
+
+    class Projects:
+        session = SimpleNamespace(scope=LOCAL_SCOPE)
+
+        def get_project(self, _project_id):
+            raise AssertionError("the desktop must not read the project row")
+
+    try:
+        artifact_scope._refuse_a_persons_project_in_the_operator_view(Projects(), UUID(int=1))
+    finally:
+        get_app_settings.cache_clear()
 
 
 # ── ?download=1 is read at the route boundary (ENG-2044) ─────────────────────
@@ -463,12 +483,12 @@ def test_symlinks_and_missing_entries_are_not_found_before_the_service(
 
 
 @pytest.fixture
-def readme_backed_artifact(tmp_path, monkeypatch):
-    """An artifact whose editable source is the one the service picks itself.
+def reported_source_artifact(request, tmp_path, monkeypatch):
+    """An artifact whose editable source is the one the service reports itself.
 
-    `metadata["primary"]` is optional, and without it `resolve_source` takes
-    the sorted-first editable file. `README.md` sorts ahead of any lowercase
-    name, so it is the source the GET reports for artifacts like this one.
+    Parametrized with the metadata. Without `primary`, `resolve_source` takes
+    the sorted-first editable content file, skipping the store's private
+    names; with `primary` it may name one of those (`README.md`, `prd.md`).
     """
     from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
     from cowork.services.artifacts import ProjectArtifacts
@@ -478,12 +498,13 @@ def readme_backed_artifact(tmp_path, monkeypatch):
     folder = base / "brief"
     folder.mkdir(parents=True)
     (folder / "README.md").write_text("# readme\n", encoding="utf-8")
+    (folder / "prd.md").write_text("# prd\n", encoding="utf-8")
     (folder / "index.html").write_text("<h1>x</h1>\n", encoding="utf-8")
     source = ProjectArtifacts(
         base=base, project_id=None, project_name="project",
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
-    metadata = {"type": "file"}
+    metadata = dict(request.param)
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
         lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
@@ -491,7 +512,16 @@ def readme_backed_artifact(tmp_path, monkeypatch):
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
 
-def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client):
+@pytest.mark.parametrize(
+    ("reported_source_artifact", "expected_path"),
+    [
+        ({"type": "file"}, "index.html"),
+        ({"type": "file", "primary": "README.md"}, "README.md"),
+        ({"type": "file", "primary": "prd.md"}, "prd.md"),
+    ],
+    indirect=["reported_source_artifact"],
+)
+def test_the_path_a_get_reports_can_be_saved_back(reported_source_artifact, expected_path, client):
     """The round trip a client actually performs: read, then save what it read.
 
     The selector must accept every path the service is willing to report. A
@@ -501,7 +531,7 @@ def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client
     read = client.get(_WORKSPACE_URL)
     assert read.status_code == 200, read.text
     reported = read.json()["path"]
-    assert reported == "README.md"
+    assert reported == expected_path
 
     saved = client.put(_WORKSPACE_URL, json={
         "content": "# edited\n",
@@ -510,7 +540,7 @@ def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client
     })
 
     assert saved.status_code == 200, saved.text
-    assert (readme_backed_artifact.folder / "README.md").read_text() == "# edited\n"
+    assert (reported_source_artifact.folder / expected_path).read_text() == "# edited\n"
 
 
 def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
@@ -729,3 +759,40 @@ def test_a_folder_outside_the_sources_base_is_refused(editable_artifact, tmp_pat
         )
 
     assert refused.value.status_code == 404
+
+
+@pytest.fixture
+def served_html_app(tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "app"
+    folder.mkdir(parents=True)
+    (folder / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    (folder / "prd.md").write_text("# PRD", encoding="utf-8")
+    (folder / ".anton_state.db").write_bytes(b"SQLite format 3\x00")
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    monkeypatch.setattr(
+        workspace_ep, "review_artifact_for_request",
+        lambda *_args: (source, folder, {"type": "html-app"}, True),
+    )
+    return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.parametrize("name", ["prd.md", ".anton_state.db"])
+def test_draft_route_hides_non_content_files(client, served_html_app, name):
+    """Generation inputs and STATE files are not readable through a draft."""
+    res = client.get(f"{served_html_app}/{name}")
+
+    assert res.status_code == 404, res.text
+
+
+def test_draft_route_still_serves_content(client, served_html_app):
+    res = client.get(f"{served_html_app}/index.html")
+
+    assert res.status_code == 200, res.text

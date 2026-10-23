@@ -1,5 +1,7 @@
 """CLI entry points for cowork server and developer setup commands."""
 
+from pathlib import Path
+
 import uvicorn
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -27,7 +29,7 @@ def main() -> None:
         host=host,
         port=port,
         reload=False,
-        log_level="info",
+        log_config=str(Path(__file__).with_name("logging.json")),
         timeout_graceful_shutdown=SHUTDOWN_GRACE_SECONDS,
     )
 

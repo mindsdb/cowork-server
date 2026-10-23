@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -20,6 +21,7 @@ from cowork.coding.contracts import (
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.workspace_key import managed_key
+from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -103,6 +105,18 @@ def _truncate_at_file_boundary(patch: Path, limit: int) -> int:
     return kept
 
 
+def _platform_config_args() -> tuple[str, ...]:
+    """Per-invocation Git config the host platform needs.
+
+    Windows paths are limited to 260 characters unless Git opts in, and deep
+    dependency trees in a task worktree routinely exceed that. Passing it per
+    command avoids editing the user's repository or global config.
+    """
+    if sys.platform == "win32":
+        return ("-c", "core.longpaths=true")
+    return ()
+
+
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
@@ -145,7 +159,7 @@ class GitRunner:
             # such as ``ext`` at the execution boundary.
             child_environment["GIT_ALLOW_PROTOCOL"] = ALLOWED_GIT_PROTOCOLS
             result = subprocess.run(
-                ["git", *args],
+                ["git", *_platform_config_args(), *args],
                 # The directory is an explicit desktop capability selected by
                 # the user and validated above. Git is fixed, arguments are an
                 # argv array, and shell execution is disabled.
@@ -219,6 +233,14 @@ class WorkspaceManager:
                 else None
             ),
         )
+
+    def check_source(self, raw_path: str, allow_direct_folder: bool) -> None:
+        """Reject a task folder ``prepare`` would refuse, without its slower Git status work."""
+        path = self._resolve_existing(raw_path)
+        if path is None or not path.is_dir():
+            raise WorkspaceError("Choose an existing local folder")
+        if not allow_direct_folder and self._git_root(path) is None:
+            raise WorkspaceError("Local folder isolation was not enabled for this request")
 
     def prepare(
         self,
@@ -895,8 +917,7 @@ class WorkspaceManager:
             if before.st_size > MAX_TEXT_DIFF_BYTES:
                 return DiffFile(path=rel_path, status="??", patch="Binary or large new file", binary=True)
 
-            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(path, flags)
+            descriptor = open_fd(path, os.O_RDONLY | O_NOFOLLOW)
             with os.fdopen(descriptor, "rb") as handle:
                 opened = os.fstat(handle.fileno())
                 # On platforms without O_NOFOLLOW, also refuse a path swapped

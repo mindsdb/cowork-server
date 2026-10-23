@@ -33,6 +33,14 @@ _IS_WINDOWS = os.name == "nt"
 # 0 there drops a defence that has nothing left to defend. See ``PinnedDir``.
 O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+# Windows returns a CRT text-mode descriptor from ``os.open`` unless
+# ``O_BINARY`` is set: reads turn CRLF into LF and stop at 0x1A, writes turn
+# LF into CRLF. The built-in ``open()`` always sets it; raw descriptors get it
+# from ``open_fd`` (ENG-2950). 0 on POSIX, where there is no text mode.
+O_BINARY = getattr(os, "O_BINARY", 0)
+# ``O_NONBLOCK`` is POSIX-only too. An open with it never waits on a FIFO at
+# the path; Windows has no FIFOs a path can name, so 0 there loses nothing.
+O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 def cowork_home() -> Path:
@@ -112,11 +120,40 @@ class PinnedDir:
             os.close(self.fd)
 
 
+def open_fd(
+    path: str | os.PathLike,
+    flags: int,
+    mode: int = 0o777,
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    """``os.open`` for a regular file, always in binary mode.
+
+    Every raw ``os.open`` of a regular file in cowork-server goes through
+    here, so bytes read and written through the descriptor match the bytes on
+    disk on every platform.
+    """
+    return os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
+
+
+def read_bounded(fd: int, size: int, chunk_size: int = 1 << 16) -> Iterator[bytes]:
+    """Yield at most *size* bytes from *fd*, stopping early at EOF.
+
+    *size* is the ``fstat`` size taken when the descriptor was authorized: a
+    file that grows afterwards is served as it was, one that shrinks ends
+    early, and neither can make the read run on (ENG-2950).
+    """
+    remaining = size
+    while remaining > 0 and (chunk := os.read(fd, min(remaining, chunk_size))):
+        remaining -= len(chunk)
+        yield chunk
+
+
 def dir_open(d: PinnedDir, name: str, flags: int, mode: int = 0o777) -> int:
-    """``os.open`` a child of *d*, returning a file descriptor."""
+    """``os.open`` a child of *d*, returning a binary file descriptor."""
     if d.fd is not None:
-        return os.open(name, flags, mode, dir_fd=d.fd)
-    return os.open(d.path / name, flags, mode)
+        return open_fd(name, flags, mode, dir_fd=d.fd)
+    return open_fd(d.path / name, flags, mode)
 
 
 def dir_lstat(d: PinnedDir, name: str) -> os.stat_result:
@@ -340,6 +377,30 @@ def opened_subdir_nofollow(
         yield PinnedDir(fd, base.joinpath(*names))
     finally:
         os.close(fd)
+
+
+def makedirs_below_nofollow(base: Path, *, target: Path) -> None:
+    """``target.mkdir(parents=True, exist_ok=True)``, refusing a symlink below
+    *base*.
+
+    For folders the server creates inside a folder the agent's code can
+    write, such as a project's ``skills/`` and ``.anton/artifacts/``: every
+    component from *base* down to *target* is created and opened with
+    ``O_NOFOLLOW`` (``opened_subdir_nofollow``), so a planted link raises
+    ``OSError`` instead of sending the server's mkdir elsewhere. *base* itself
+    is trusted and created normally. A *target* outside *base* is created the
+    plain way.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        parts = target.relative_to(base).parts
+    except ValueError:
+        parts = ("..",)
+    if ".." in parts:
+        target.mkdir(parents=True, exist_ok=True)
+        return
+    with opened_subdir_nofollow(base, *parts, create=True):
+        pass
 
 
 def safe_join(base: Path | str, *parts: str) -> Path:
