@@ -420,6 +420,8 @@ dependencies = [
     { name = "htmldocx" },
     { name = "httpx" },
     { name = "markdown" },
+    { name = "microsoft-teams-api", marker = "sys_platform == 'linux'" },
+    { name = "msal", marker = "sys_platform == 'linux'" },
     { name = "openai-codex" },
     { name = "pillow" },
     { name = "psutil" },
@@ -470,6 +472,8 @@ requires-dist = [
     { name = "htmldocx", specifier = ">=0.0.6" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "markdown", specifier = ">=3.7" },
+    { name = "microsoft-teams-api", marker = "sys_platform == 'linux'", specifier = ">=2.1.1" },
+    { name = "msal", marker = "sys_platform == 'linux'", specifier = ">=1.37.0" },
     { name = "openai-codex", specifier = "==0.147.0" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "psutil", specifier = ">=7.0" },
@@ -509,7 +513,7 @@ resolution-markers = [
     "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "cffi", marker = "platform_machine == 'x86_64' and platform_python_implementation != 'PyPy' and sys_platform == 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/12/45/870e7f4bef50e5f53b9f51d4428aee5290eedf58ba443f16b1ebb7ab8e66/cryptography-48.0.1.tar.gz", hash = "sha256:266f4ee051abb2f725b74ef8072b521ce1feacf685a3364fa6a6b45548db791a", size = 832989, upload-time = "2026-06-09T22:32:31.8Z" }
 wheels = [
@@ -526,7 +530,7 @@ resolution-markers = [
     "(python_full_version < '3.13' and platform_machine != 'x86_64') or (python_full_version < '3.13' and sys_platform != 'darwin')",
 ]
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "cffi", marker = "(platform_machine != 'x86_64' and platform_python_implementation != 'PyPy') or (platform_python_implementation != 'PyPy' and sys_platform != 'darwin')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/de/41/6cbdcf9142d00fe82836fbb51e503e58088575cf7a0fe1dbff6695bf0840/cryptography-50.0.0.tar.gz", hash = "sha256:eeac2acb5a20ed25e0ad6d1df9891a520b78b404266b6d11778f25d5d691a6c9", size = 880201, upload-time = "2026-07-31T14:25:10.11Z" }
 wheels = [
@@ -1077,6 +1081,57 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
+name = "microsoft-teams-api"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "microsoft-teams-cards", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "microsoft-teams-common", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "opentelemetry-api", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "pydantic", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "pyjwt", extra = ["crypto"], marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/ab/cd8e78d3aa2bde791493aae7477ac2be92a44284d52838c91784f6e94cd4/microsoft_teams_api-2.1.1.tar.gz", hash = "sha256:b477006fc070d5315edd2042736c78cf52f5008167d9662804b7a0c5f07ac780", size = 64496, upload-time = "2026-10-16T22:45:57.842Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/dc/94accf394b6c74f343d415ee359b9aa846943e470963bbf5844a757773e0/microsoft_teams_api-2.1.1-py3-none-any.whl", hash = "sha256:795602d6abc97e4dca334f2478fc0b07968fcc78f3aa5718e2d42fdd8f94dad6", size = 174477, upload-time = "2026-10-16T22:46:05.193Z" },
+]
+
+[[package]]
+name = "microsoft-teams-cards"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7f/cd/bae4f1057b75f1531a095567c02db31c1aff1e835237fa64c095d5a06921/microsoft_teams_cards-2.1.1.tar.gz", hash = "sha256:22add69316354320fbea1ac31e7069c07ff920b01579d515f1778e52d9f56c75", size = 27853, upload-time = "2026-10-16T22:46:00.876Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/41/34/9c5ac7581f081c23ea49572c0f25da35bacd8ba114e1342542d6eaed7009/microsoft_teams_cards-2.1.1-py3-none-any.whl", hash = "sha256:5308d7f651b320be53b50b6ef9f9fa26710e69d894c21fe4c691d64c19636dd0", size = 29520, upload-time = "2026-10-16T22:46:08.202Z" },
+]
+
+[[package]]
+name = "microsoft-teams-common"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/58/13/dad758a38c1a1e30a26b11be6a0aa1d593b82f3d77ff4092e6fad836deb0/microsoft_teams_common-2.1.1.tar.gz", hash = "sha256:506857ffcc1deadc0212ba9c633ae0d0052b5c702ae908f06485c9657d652f55", size = 12073, upload-time = "2026-10-16T22:46:01.72Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/12/2d/1618a54efd738cb8ed32fa0673b987caf091ab3e12a4bb881cc1a146b0dc/microsoft_teams_common-2.1.1-py3-none-any.whl", hash = "sha256:12b9866feaf41896b887189a7995d2923875db18c876db2a9afb8622a23f2ab8", size = 17733, upload-time = "2026-10-16T22:46:09.128Z" },
+]
+
+[[package]]
+name = "msal"
+version = "1.39.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography", version = "50.0.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "pyjwt", extra = ["crypto"], marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "requests", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bb/85/747d28986a44b715cc51cf57aa021c8fd94e9614064261ceec77320e8b0b/msal-1.39.0.tar.gz", hash = "sha256:6ab7de335e6d7f5717e2c7e1dbf86e4dda2f6acf3c56773b78dc53ebc6395b5f", size = 205360, upload-time = "2026-09-17T16:07:45.1Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/32/178457385925ce301c7b3232bd85665d4df57da39568b62dcfc74031873f/msal-1.39.0-py3-none-any.whl", hash = "sha256:2d2577886906cd7293850dffa2da29119966c213bfc6ec0cecf8bf7621e1ca77", size = 131629, upload-time = "2026-09-17T16:07:46.722Z" },
 ]
 
 [[package]]
