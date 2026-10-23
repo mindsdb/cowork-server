@@ -1416,3 +1416,199 @@ def test_agent_repair_prompt_says_how_to_find_the_artifact(artifact):
     # The desktop chat reads `Label: value` lines of this prompt into a card;
     # the hint must not look like one.
     assert ":" not in hint.split(" ", 1)[0]
+
+
+def _refresh(folder, text, *, schedule_id="schedule-1", conversation_id="run-1"):
+    (folder / "brief.md").write_text(text, encoding="utf-8")
+    return capture_agent_revision(
+        folder, conversation_id=conversation_id, schedule_id=schedule_id
+    )
+
+
+def test_consecutive_scheduled_refreshes_replace_the_head(artifact):
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)["revision"]
+
+    first = _refresh(folder, "# Data 1\n")
+    second = _refresh(folder, "# Data 2\n", conversation_id="run-2")
+
+    history = list_revisions(folder)
+    assert [r["id"] for r in history] == [second["id"], initial["id"]]
+    assert second["id"] != first["id"]
+    assert second["number"] == first["number"]
+    assert second["baseRevisionId"] == initial["id"]
+    assert second["scheduleId"] == "schedule-1"
+    assert second["actor"] == {"kind": "agent", "id": None}
+    assert second["conversationId"] == "run-2"
+    # The artifact shows the latest data, and the replaced content is gone.
+    assert current_source(folder, metadata, artifact_id)["content"] == "# Data 2\n"
+    assert revision_with_content(folder, second["id"])["content"] == "# Data 2\n"
+    with pytest.raises(FileNotFoundError):
+        revision_with_content(folder, first["id"])
+    blobs = {p.name for p in (folder / ".revisions" / "blobs").iterdir()}
+    assert first["contentHash"] not in blobs
+
+
+def test_frequent_refreshes_do_not_push_out_earlier_edits(artifact, monkeypatch):
+    folder, metadata, artifact_id = artifact
+    monkeypatch.setattr(revision_service, "MAX_REVISIONS", 5)
+    initial = current_source(folder, metadata, artifact_id)["revision"]
+    edited = save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content="# Owner edit\n",
+        expected_revision_id=initial["id"],
+    )["revision"]
+
+    # A day of 15-minute refreshes.
+    for run in range(96):
+        _refresh(folder, f"# Data {run}\n", conversation_id=f"run-{run}")
+
+    ids = [r["id"] for r in list_revisions(folder)]
+    assert len(ids) == 3
+    assert ids[1:] == [edited["id"], initial["id"]]
+    assert current_source(folder, metadata, artifact_id)["content"] == "# Data 95\n"
+
+
+def test_a_person_save_between_refreshes_makes_the_next_refresh_append(artifact):
+    folder, metadata, artifact_id = artifact
+    first = _refresh(folder, "# Data 1\n")
+    saved = save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content="# Data 1 with a note\n",
+        expected_revision_id=first["id"],
+    )["revision"]
+
+    after_save = _refresh(folder, "# Data 2 with a note\n")
+    again = _refresh(folder, "# Data 3 with a note\n")
+
+    ids = [r["id"] for r in list_revisions(folder)]
+    assert ids[:3] == [again["id"], saved["id"], first["id"]]
+    assert after_save["baseRevisionId"] == saved["id"]
+
+
+@pytest.mark.parametrize("conversation_id", ["run-1", "another-conversation"])
+def test_a_chat_edit_between_refreshes_makes_the_next_refresh_append(
+    artifact, conversation_id
+):
+    """Includes a person chatting in the scheduled run's own conversation:
+    that turn was not started by the scheduler, so it is an ordinary edit."""
+    folder, _metadata, _artifact_id = artifact
+    first = _refresh(folder, "# Data 1\n")
+    (folder / "brief.md").write_text("# Data 1, chart in blue\n", encoding="utf-8")
+    chat = capture_agent_revision(folder, conversation_id=conversation_id)
+    refreshed = _refresh(folder, "# Data 2, chart in blue\n")
+
+    assert "scheduleId" not in chat
+    assert chat["summary"] == "Agent updated artifact"
+    ids = [r["id"] for r in list_revisions(folder)]
+    assert ids[:3] == [refreshed["id"], chat["id"], first["id"]]
+
+
+def test_another_schedule_does_not_replace_a_refresh(artifact):
+    folder, _metadata, _artifact_id = artifact
+    first = _refresh(folder, "# Data 1\n")
+    other = _refresh(folder, "# Other data\n", schedule_id="schedule-2")
+
+    ids = [r["id"] for r in list_revisions(folder)]
+    assert ids[:2] == [other["id"], first["id"]]
+
+
+def test_a_comment_on_the_head_makes_the_next_refresh_append(artifact):
+    folder, _metadata, _artifact_id = artifact
+    first = _refresh(folder, "# Data 1\n")
+    (folder / ".revisions" / "comments.json").write_text(
+        json.dumps([{"id": "thread-1", "payload": {"revision_id": first["id"]}}]),
+        encoding="utf-8",
+    )
+
+    refreshed = _refresh(folder, "# Data 2\n")
+    again = _refresh(folder, "# Data 3\n")
+
+    ids = [r["id"] for r in list_revisions(folder)]
+    assert ids[:2] == [again["id"], first["id"]]
+    assert refreshed["id"] != first["id"]
+    assert revision_with_content(folder, first["id"])["content"] == "# Data 1\n"
+
+
+def test_an_unreadable_comment_journal_keeps_the_head(artifact):
+    folder, _metadata, _artifact_id = artifact
+    first = _refresh(folder, "# Data 1\n")
+    (folder / ".revisions" / "comments.json").write_text("{not json", encoding="utf-8")
+
+    refreshed = _refresh(folder, "# Data 2\n")
+
+    assert [r["id"] for r in list_revisions(folder)][:2] == [refreshed["id"], first["id"]]
+
+
+def test_a_pending_repair_on_the_head_makes_the_next_refresh_append(artifact):
+    folder, metadata, artifact_id = artifact
+    first = _refresh(folder, "# Data 1\n")
+    current_source(folder, metadata, artifact_id)
+    create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=first["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "The totals look wrong"}],
+        conversation_id="repair-conversation",
+    )
+
+    refreshed = _refresh(folder, "# Data 2\n")
+
+    assert [r["id"] for r in list_revisions(folder)][:2] == [refreshed["id"], first["id"]]
+    assert revision_with_content(folder, first["id"])["content"] == "# Data 1\n"
+
+
+def test_an_editor_holding_a_replaced_head_gets_a_conflict(artifact):
+    """Replacing mints a new id, so a save based on the old refresh cannot
+    silently overwrite the newer data."""
+    folder, metadata, artifact_id = artifact
+    first = _refresh(folder, "# Data 1\n")
+    _refresh(folder, "# Data 2\n")
+
+    with pytest.raises(RevisionConflict):
+        save_source(
+            folder,
+            metadata,
+            artifact_id,
+            content="# Edited from stale data\n",
+            expected_revision_id=first["id"],
+        )
+    assert current_source(folder, metadata, artifact_id)["content"] == "# Data 2\n"
+
+
+def test_turn_artifact_changes_passes_the_schedule_to_the_revision(tmp_path):
+    from cowork.services.task_objects import snapshot_artifact_state, turn_artifact_changes
+
+    base = tmp_path / "artifacts"
+    folder = base / "dash"
+    folder.mkdir(parents=True)
+    (folder / "metadata.json").write_text(
+        json.dumps({"id": "a1b2c3d4", "slug": "dash", "primary": "index.html"}),
+        encoding="utf-8",
+    )
+    (folder / "index.html").write_text("<p>0</p>", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="setup")
+
+    for run in (1, 2):
+        before, mtimes = snapshot_artifact_state(base)
+        mtimes["dash"] -= 1
+        (folder / "index.html").write_text(f"<p>{run}</p>", encoding="utf-8")
+        turn_artifact_changes(
+            conversation_id=f"run-{run}",
+            artifacts_base=base,
+            before=before,
+            before_mtimes=mtimes,
+            schedule_id="schedule-1",
+        )
+
+    history = list_revisions(folder)
+    assert len(history) == 2
+    assert history[0]["scheduleId"] == "schedule-1"
+    assert revision_with_content(folder, history[0]["id"])["content"] == "<p>2</p>"

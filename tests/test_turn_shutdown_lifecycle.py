@@ -55,6 +55,7 @@ def _streaming_handler(monkeypatch, saved: dict, started: asyncio.Event):
     """A handler whose turn is mid-stream (a real delta already sent) when
     cancelled — the shape a shutdown actually interrupts."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:

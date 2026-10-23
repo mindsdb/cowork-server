@@ -108,6 +108,7 @@ class _Harness:
         self, *, conversation, input, model=None, reasoning_effort=None,
         disabled_connections=None, trace_tags=None, trace_metadata=None,
         channel_context=None, tool_messages=False, model_wait=None,
+        schedule_id=None,
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)
@@ -133,6 +134,7 @@ class _Harness:
 
 def _handler(monkeypatch, saved: dict, harness: _Harness):
     handler = object.__new__(responses_mod.ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:

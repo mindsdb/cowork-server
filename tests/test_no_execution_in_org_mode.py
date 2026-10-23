@@ -458,6 +458,7 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
     responses_mod.ConversationService = _FakeConversationService
     try:
         handler = object.__new__(ResponsesHandler)
+        handler.schedule_id = None
         from cowork.db.scoped import TenantScope
         handler.scope = TenantScope(org_mode=True, org_id="org-fixture", user_id="user-fixture")
         handler.principal = None

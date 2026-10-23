@@ -401,7 +401,9 @@ async def execute_schedule(
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
-            stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+            stream = await ResponsesHandler(
+                principal=scheduled.principal, interactive=False, schedule_id=str(schedule_id),
+            ).handle(request)
             async for _ in stream:
                 pass
 

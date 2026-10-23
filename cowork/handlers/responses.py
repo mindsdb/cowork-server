@@ -616,7 +616,13 @@ def _start_first_take(
 
 
 class ResponsesHandler:
-    def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        principal: Principal | None = None,
+        interactive: bool = True,
+        schedule_id: str | None = None,
+    ) -> None:
         self.principal = principal
         self.scope = scope_from_principal(principal)
         # The harness this turn runs: the request's own pick or the stored
@@ -629,6 +635,10 @@ class ResponsesHandler:
         self.last_run_handle: RunHandle | None = None
         # Whether a person is watching this turn and can answer ask_user cards.
         self.interactive = interactive
+        # The schedule whose run this turn is. Set by the scheduler only, not
+        # read from the request or the conversation: a person chatting in a
+        # run's conversation makes ordinary edits.
+        self.schedule_id = schedule_id
         # The instant first take, started beside the gate by
         # _route_request and handed to the turn's producer if it delegates.
         self.first_take: FirstTake | None = None
@@ -843,6 +853,7 @@ class ResponsesHandler:
                     disabled_connections=disabled,
                     trace_tags=request.trace_tags,
                     trace_metadata=trace_metadata,
+                    schedule_id=self.schedule_id,
                 )
                 return await self._collect(stream, start.conversation_id, request.model, original_content)
 
@@ -1966,6 +1977,7 @@ class ResponsesHandler:
                     # whose provenance names this conversation are its own.
                     attribute_by_provenance=True,
                     completed_cleanly=completed_cleanly,
+                    schedule_id=self.schedule_id,
                 )
             except Exception:
                 logger.warning(
@@ -2614,6 +2626,7 @@ class ResponsesHandler:
                 # tool's message to the user, as on the remote path.
                 tool_messages=True,
                 model_wait=model_wait,
+                schedule_id=self.schedule_id,
             )
             event_count = 0
             completed_frame: str | None = None

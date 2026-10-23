@@ -82,6 +82,10 @@ class HarnessProvider(Protocol):
         # the turn alive while a model call is quiet; other harnesses accept
         # and ignore it.
         model_wait: "ModelWaitTicker | None" = None,
+        # Set only on a turn the scheduler started, never from the request,
+        # since people keep chatting in a scheduled run's conversation. A
+        # harness that records artifact revisions attributes them to it.
+        schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
         ...
 

@@ -221,7 +221,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -299,7 +299,7 @@ def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -350,7 +350,7 @@ def test_execute_schedule_passes_pinned_model_through(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -413,9 +413,10 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch, grante
     captured: dict = {}
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             captured["principal"] = principal
             captured["interactive"] = interactive
+            captured["schedule_id"] = schedule_id
 
         async def handle(self, request):
             async def _gen():
@@ -457,6 +458,9 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch, grante
         # Nobody is watching a scheduled run to answer an ask_user card, so the
         # handler must be built non-interactive regardless of ask_user_enabled.
         assert captured["interactive"] is False
+        # The turn itself carries which schedule started it, so its artifact
+        # edits refresh that schedule's revision rather than adding one.
+        assert captured["schedule_id"] == str(schedule_id)
 
         # The conversation was created under the owning org, not as an invisible
         # NULL-org row.
@@ -646,7 +650,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -808,7 +812,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -887,7 +891,7 @@ def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch, gra
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             seen["principal"] = principal
 
         async def handle(self, request):
