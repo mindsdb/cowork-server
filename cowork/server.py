@@ -30,6 +30,7 @@ from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.draft_host.listener import start_draft_listener, stop_draft_listener
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
@@ -255,9 +256,14 @@ async def lifespan(app: FastAPI):
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
         )
+    # The draft-preview host's own port (COWORK_DRAFT_PORT); None when unset.
+    app.state.draft_listener = await start_draft_listener()
     try:
         yield
     finally:
+        # First, so no draft request is still reading files or the database
+        # while the steps below close them.
+        await stop_draft_listener(getattr(app.state, "draft_listener", None))
         from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client

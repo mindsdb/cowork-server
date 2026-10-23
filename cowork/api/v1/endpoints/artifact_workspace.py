@@ -390,6 +390,75 @@ class _PinnedDraftResponse(StreamingResponse):
             self._resources.close()
 
 
+def _draft_selectors(project_ref: str, artifact_id: str) -> tuple[str, str]:
+    """The project and artifact selectors a draft route resolves with.
+
+    Parse before taking basename so a path ending in a valid UUID is rejected,
+    never silently accepted. Keep the recognized sanitizer at this filesystem
+    boundary; SAST does not model the UUID dependency or catalog lookup.
+    """
+    if project_ref == "local":
+        project_selector = "local"
+    else:
+        try:
+            project_selector = os.path.basename(str(UUID(project_ref)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            ) from exc
+    try:
+        artifact_selector = os.path.basename(UUID(artifact_id).hex)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact identity",
+        ) from exc
+    return project_selector, artifact_selector
+
+
+def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
+    """Validate a draft file path against the artifact it is read from.
+
+    Shared by the authenticated ``/drafts`` route, the draft-link route and the
+    draft host (cowork/draft_host/app.py), so all three refuse the same paths:
+    400 for a path that is not a plain relative one, 404 for the private
+    entries and, in a full-stack artifact, anything outside its public subtree.
+    """
+    try:
+        parts = _relative_file_parts(rel_path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact path",
+        ) from exc
+    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
+    if str(metadata.get("type") or "").startswith("fullstack-"):
+        try:
+            primary_parts = _relative_file_parts(
+                str(metadata.get("primary") or "static/index.html")
+            )
+        except ValueError:
+            primary_parts = ()
+        public_parts = primary_parts[:-1]
+        if not public_parts:
+            # A full-stack artifact needs a distinct public subtree. Serving its
+            # root would let a reviewer guess backend.py or credential-bearing
+            # runtime files. The dedicated runtime can handle legacy root-level
+            # apps; the private source preview must stay fail-closed.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Artifact file not found",
+            )
+        if parts[:len(public_parts)] != public_parts:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Artifact file not found",
+            )
+    return parts
+
+
 def _artifact_id_from_path(artifact_id: UUID) -> str:
     """The identity gate for every route in this file.
 
@@ -1204,60 +1273,11 @@ async def serve_private_draft(
     call still controls the outcome through the keyword argument, since its
     bare ``request`` carries no query string of its own.
     """
-    # Parse before taking basename so a path ending in a valid UUID is rejected,
-    # never silently accepted. Keep the recognized sanitizer at this filesystem
-    # boundary; SAST does not model the UUID dependency or catalog lookup.
-    if project_ref == "local":
-        project_selector = "local"
-    else:
-        try:
-            project_selector = os.path.basename(str(UUID(project_ref)))
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid project",
-            ) from exc
-    try:
-        artifact_selector = os.path.basename(UUID(artifact_id).hex)
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid artifact identity",
-        ) from exc
+    project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_selector, artifact_selector
     )
-    try:
-        parts = _relative_file_parts(rel_path)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid artifact path",
-        ) from exc
-    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
-    if str(metadata.get("type") or "").startswith("fullstack-"):
-        try:
-            primary_parts = _relative_file_parts(
-                str(metadata.get("primary") or "static/index.html")
-            )
-        except ValueError:
-            primary_parts = ()
-        public_parts = primary_parts[:-1]
-        if not public_parts:
-            # A full-stack artifact needs a distinct public subtree. Serving its
-            # root would let a reviewer guess backend.py or credential-bearing
-            # runtime files. The dedicated runtime can handle legacy root-level
-            # apps; the private source preview must stay fail-closed.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Artifact file not found",
-            )
-        if parts[:len(public_parts)] != public_parts:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Artifact file not found",
-            )
+    parts = _draft_file_parts(rel_path, metadata)
 
     download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
