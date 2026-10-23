@@ -193,6 +193,7 @@ class _FakeUserSettings:
 
 
 class _FakeAppSettings:
+    tenancy_mode = "local"
     publish_token = None
 
     class connector:  # noqa: N801

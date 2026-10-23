@@ -49,7 +49,7 @@ def pinged(monkeypatch):
     """Capture what would have been sent, instead of sending it."""
     seen: list[dict] = []
 
-    async def _fake_ping(providers):
+    async def _fake_ping(providers, **_kwargs):
         seen.extend(providers)
         return ProviderPingResults(
             statuses={p.get("type"): "ok" for p in providers},
@@ -443,7 +443,7 @@ def pinged_with_a_fuse_denial(monkeypatch):
     """ping_providers answers minds-cloud with the free-Air fuse, others ok."""
     seen: list[dict] = []
 
-    async def _fake_ping(providers):
+    async def _fake_ping(providers, **_kwargs):
         seen.extend(providers)
         denials = {
             p.get("type"): GatewayDenial(
@@ -519,3 +519,75 @@ def test_the_reasons_reach_the_wire_in_camel_case(monkeypatch, pinged_with_a_fus
         "minds-cloud": {"code": "free_air_daily_spend_fuse_exceeded", "resetAt": _FUSE_RESET_AT},
     }
     assert body["providerStatus"] == {"minds-cloud": "fail", "anthropic": "ok"}
+
+
+# ── the local "MindsHub configured" gate reaches ping_providers ──
+
+
+def test_no_minds_key_computes_hub_not_configured_for_the_ping(monkeypatch):
+    _deployment(monkeypatch, minds_api_key=None)
+    captured: dict = {}
+
+    async def _fake_ping(providers, **kwargs):
+        captured.update(kwargs)
+        return ProviderPingResults(statuses={}, details={}, denials={})
+
+    monkeypatch.setattr(settings_endpoint, "ping_providers", _fake_ping)
+
+    _test_providers([{"type": "minds-cloud", "apiKey": "typed-key"}])
+
+    assert captured["minds_hub_configured"] is False
+
+
+def test_a_stored_minds_key_computes_hub_configured_for_the_ping(stored, monkeypatch):
+    captured: dict = {}
+
+    async def _fake_ping(providers, **kwargs):
+        captured.update(kwargs)
+        return ProviderPingResults(statuses={}, details={}, denials={})
+
+    monkeypatch.setattr(settings_endpoint, "ping_providers", _fake_ping)
+
+    _test_providers([{"type": "minds-cloud", "apiKey": "***", "mindsUrl": STORED_MINDS_URL}])
+
+    assert captured["minds_hub_configured"] is True
+
+
+def _validate_provider(**fields):
+    body = settings_endpoint._ValidateProviderBody(
+        provider=fields.pop("provider", "minds"),
+        api_key=fields.pop("api_key", "typed-key"),
+        **fields,
+    )
+    return asyncio.run(
+        settings_endpoint.validate_provider_endpoint(body, session=None, scope=LOCAL_SCOPE)
+    )
+
+
+def test_validate_provider_computes_hub_not_configured_without_a_minds_key(monkeypatch):
+    _deployment(monkeypatch, minds_api_key=None)
+    captured: dict = {}
+
+    async def _fake_validate(provider, api_key, base_url, model, **kwargs):
+        captured.update(kwargs)
+        return {"ok": False, "error": "missing MindsHub URL"}
+
+    monkeypatch.setattr(settings_endpoint, "validate_provider_svc", _fake_validate)
+
+    _validate_provider()
+
+    assert captured["minds_hub_configured"] is False
+
+
+def test_validate_provider_computes_hub_configured_with_a_stored_minds_key(stored, monkeypatch):
+    captured: dict = {}
+
+    async def _fake_validate(provider, api_key, base_url, model, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(settings_endpoint, "validate_provider_svc", _fake_validate)
+
+    _validate_provider()
+
+    assert captured["minds_hub_configured"] is True

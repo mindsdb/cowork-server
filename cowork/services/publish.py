@@ -355,11 +355,29 @@ def desktop_artifact_and_base(
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
+def _missing_publish_key_message(action: str) -> str:
+    """The right refusal message for an empty key from ``_resolve_publish_endpoint``.
+
+    Two different situations both come back as an empty key: no provider is
+    configured at all, or ``ANTON_PUBLISH_API_KEY`` is set but names no
+    explicit publish URL (``_resolve_publish_endpoint`` refuses rather than
+    falling back to a MindsDB host there). Reporting the second as "configure
+    your API key" would tell an operator who already set the key to do the one
+    thing they already did.
+    """
+    if get_app_settings().tenancy_mode == "local" and os.environ.get("ANTON_PUBLISH_API_KEY", "").strip():
+        return (
+            "ANTON_PUBLISH_API_KEY is set, but no publish URL is configured "
+            "(set ANTON_PUBLISH_URL, or the publish URL in Settings)"
+        )
+    return f"Configure your provider API key in Settings {action}"
+
+
 def desktop_publish_credential() -> tuple[str, str]:
     """(api_key, publish_url) from the active provider, for the desktop path."""
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if not api_key:
-        raise ValueError("Configure your provider API key in Settings before publishing")
+        raise ValueError(_missing_publish_key_message("before publishing"))
     return api_key, publish_url
 
 
@@ -419,12 +437,22 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     authenticates with that provider's own key — so pointing the provider at
     dev/staging publishes there too. api key is "" when the chosen provider has none.
 
+    ``ANTON_PUBLISH_API_KEY`` (local mode only, same gate ``UserSettings`` itself
+    reads env under) overrides all of that: a self-hosted install publishes with
+    its own key against an explicit publish URL only, never against a host
+    derived from the active provider — that host can be a MindsDB one, and this
+    key must never reach it. No explicit URL (``ANTON_PUBLISH_URL`` or the
+    ``publish_url`` setting) means no publish target to trust, so this refuses
+    ("", "") rather than falling back to the derived host. Org mode never reads
+    this: a cluster env var must not reach every tenant's publish flow.
+
     A non-blank ``COWORK_PUBLISH_TOKEN`` (AppSettings.publish_token) replaces
-    that key on every provider. A self-hosted publisher then never takes the
-    model key, which the agent's code holds as its own OPENAI_API_KEY on a
-    MindsHub endpoint. Under COWORK_CODE_SANDBOX=landlock, anton's launcher
-    passes no COWORK_* name to the agent's code (`anton.core.backends.sandbox`),
-    so the token stays out of it too.
+    the provider-derived key on every provider, when ``ANTON_PUBLISH_API_KEY``
+    is not set. A self-hosted publisher then never takes the model key, which
+    the agent's code holds as its own OPENAI_API_KEY on a MindsHub endpoint.
+    Under COWORK_CODE_SANDBOX=landlock, anton's launcher passes no COWORK_*
+    name to the agent's code (`anton.core.backends.sandbox`), so the token
+    stays out of it too.
 
     Resolution order for the publish base URL (first non-empty wins):
       1. ``ANTON_PUBLISH_URL`` env var — an operator/dev override that trumps
@@ -436,6 +464,15 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     A result on the retired 4nton.ai host becomes the prod publish host
     (`normalize_publish_url`): a saved setting may still name it.
     """
+    if get_app_settings().tenancy_mode == "local":
+        publish_api_key = os.environ.get("ANTON_PUBLISH_API_KEY", "").strip()
+    else:
+        publish_api_key = ""
+    env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
+    if publish_api_key:
+        explicit_url = env_publish_url or settings.publish_url or ""
+        return (explicit_url, publish_api_key) if explicit_url else ("", "")
+
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
         endpoint = settings.openai_base_url
@@ -443,7 +480,6 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
     api_key = _secret_str(get_app_settings().publish_token).strip() or api_key
-    env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
     publish_url = normalize_publish_url(
         env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
     )
@@ -1014,7 +1050,7 @@ def list_versions(raw_path: str, *, scope: TenantScope | None) -> dict:
     settings = get_user_settings()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
-        raise ValueError("Configure your provider API key in Settings to view versions")
+        raise ValueError(_missing_publish_key_message("to view versions"))
 
     report_id = _resolve_report_id(raw_path, scope=scope).report_id
 
@@ -1070,7 +1106,7 @@ def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> d
     settings = get_user_settings()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
-        raise ValueError("Configure your provider API key in Settings before rolling back")
+        raise ValueError(_missing_publish_key_message("before rolling back"))
 
     report = _resolve_report_id(raw_path, scope=scope)
     published_json, published_key, report_id = report.published_json, report.published_key, report.report_id

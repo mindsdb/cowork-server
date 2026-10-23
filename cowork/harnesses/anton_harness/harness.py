@@ -1770,10 +1770,17 @@ class AntonHarness:
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
-                # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
-                # puts planning on the Responses API. The client above uses
-                # this same settings snapshot, even if settings change mid-build.
-                **web_tool_kwargs_for(user.resolved_planning_provider),
+                # The operator's own ANTON_WEB_SEARCH_ENABLED / ANTON_WEB_FETCH_ENABLED
+                # are the base; web_tool_kwargs_for's forced-off override (hosted web
+                # search bypassing the egress gateway on the Responses API) wins over
+                # it, since that is a security constraint, not a preference — the
+                # client above uses this same settings snapshot either way, even if
+                # settings change mid-build.
+                **{
+                    "web_search_enabled": anton_settings.web_search_enabled,
+                    "web_fetch_enabled": anton_settings.web_fetch_enabled,
+                    **web_tool_kwargs_for(user.resolved_planning_provider),
+                },
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".

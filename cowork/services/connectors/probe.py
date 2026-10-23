@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
+from anton.config.settings import AntonSettings
 from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
 from anton.core.utils.scratchpad import scratchpad_action
 from cowork.build_info import surface_kwarg
@@ -577,6 +578,15 @@ class CredentialProbe:
             handler=self._request_extra_field,
         )
 
+        # Env-derived, same as the harness's own build: the probe is a real
+        # agent turn (it runs a `ChatSession`), so it must honor an operator's
+        # ANTON_WEB_SEARCH_ENABLED / ANTON_WEB_FETCH_ENABLED the same as a
+        # user turn, not silently default both to on. Merged with
+        # self.web_tool_kwargs below, whose forced-off override (hosted web
+        # search bypassing the egress gateway on the Responses API) wins over
+        # it, since that is a security constraint, not a preference.
+        anton_settings = AntonSettings()
+
         config = ChatSessionConfig(
             llm_client=self.llm_client,
             data_vault=data_vault,
@@ -613,10 +623,15 @@ class CredentialProbe:
                 REPORT_FAILURE_TOOL,
                 REQUEST_EXTRA_FIELD_TOOL,
             ],
-            # The same planning role as a UI turn, so the same rule: hosted web
-            # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning
-            # on the Responses API.
-            **self.web_tool_kwargs,
+            # The operator's own ANTON_WEB_SEARCH_ENABLED / ANTON_WEB_FETCH_ENABLED
+            # are the base; self.web_tool_kwargs's forced-off override (hosted web
+            # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning on
+            # the Responses API) wins over it, same precedence as the harness.
+            **{
+                "web_search_enabled": anton_settings.web_search_enabled,
+                "web_fetch_enabled": anton_settings.web_fetch_enabled,
+                **self.web_tool_kwargs,
+            },
             # Passed directly, as the turn passes it: a dropped policy would
             # run the probe's cells unlocked.
             **({"cell_sandbox": self.cell_sandbox} if self.cell_sandbox is not None else {}),
