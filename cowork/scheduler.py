@@ -16,6 +16,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.datetime_utils import ensure_utc
 from cowork.common.logger import get_logger, log_context
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import (
     SYSTEM_SCOPE,
     MissingTenantScopeError,
@@ -51,12 +52,6 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 _POLL_INTERVAL_SECONDS = 30
-# Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
-# must not keep its ScheduleRun in `running` forever — that would block the
-# schedule from ever firing again. On timeout the turn is stopped and the run
-# recorded as interrupted. The registry's idle watchdog only bounds a turn
-# that stops making progress; this bounds one that keeps going.
-_MAX_RUN_DURATION_SECONDS = 600
 # A turn that runs in a pod is already bounded by scratchpad-controller's
 # hard_turn_timeout_seconds, counted from when the controller takes the job
 # and including the pod's start. The run's own bound sits above that by the
@@ -70,7 +65,7 @@ _REMOTE_SETUP_MARGIN_SECONDS = 300
 # and an outcome never recorded leaves its occurrence held until its lease
 # lapses. Each try already waits POOL_TIMEOUT for a connection; the pause
 # between tries only keeps a refusal that comes back at once from spinning.
-_BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
+_BOOKKEEPING_DEADLINE_SECONDS = 600
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 # A cron occurrence gets this many attempts before it settles failed, with
 # these pauses before the second and later attempts. Only an attempt that
@@ -939,9 +934,9 @@ async def _execute_attempt(
         async for _ in stream:
             pass
 
+    limit = _run_duration_limit()
     timed_out = False
     lost_track = False
-    limit = _run_duration_limit()
     try:
         taken_back = await asyncio.wait_for(_drain_unless(_drain(), lease_lost), timeout=limit)
     except asyncio.TimeoutError:
@@ -1005,13 +1000,22 @@ async def _drain_unless(drain, lost: asyncio.Event | None) -> bool:
     return False
 
 
-def _run_duration_limit() -> float:
-    """How long a run may take before it is stopped. On the remote backend,
-    longer than the controller's own bound on the turn, so a turn that used
-    its whole budget ends on the controller's terms, not cut short here."""
+def _run_duration_limit() -> int:
+    """How long a run may take before it is stopped, in seconds.
+
+    A hung agent (stuck tool call, wedged stream) must not keep its
+    ScheduleRun in `running` forever — that would block the schedule from
+    ever firing again. On timeout the turn is stopped and the run recorded as
+    interrupted. The registry's idle watchdog only bounds a turn that stops
+    making progress; this bounds one that keeps going. On the remote backend
+    it is also longer than the controller's own bound on the turn, so a turn
+    that used its whole budget ends on the controller's terms, not cut short
+    here.
+    """
+    limit = get_app_settings().scheduled_run_max_seconds
     if remote_backend():
-        return max(_MAX_RUN_DURATION_SECONDS, _REMOTE_TURN_BUDGET_SECONDS + _REMOTE_SETUP_MARGIN_SECONDS)
-    return _MAX_RUN_DURATION_SECONDS
+        return max(limit, _REMOTE_TURN_BUDGET_SECONDS + _REMOTE_SETUP_MARGIN_SECONDS)
+    return limit
 
 
 async def _stop_turn(conversation_id: str, *, run_id: UUID, schedule_id: UUID) -> None:
@@ -1051,9 +1055,9 @@ async def _stop_turn(conversation_id: str, *, run_id: UUID, schedule_id: UUID) -
         await asyncio.sleep(_REMOTE_STOP_GRACE_SECONDS)
 
 
-def _duration_error() -> str:
+def _duration_error(limit: int) -> str:
     return (
-        f"Run exceeded the {int(_run_duration_limit() // 60)}-minute limit and was stopped. "
+        f"Run exceeded the {int(limit // 60)}-minute limit and was stopped. "
         "Some of its actions may have completed — open the run to check before running it again."
     )
 
@@ -1090,7 +1094,7 @@ def _classify(evidence: _TurnEvidence, *, timed_out: bool) -> _AttemptEnd:
     """What the turn's ending says about whether it acted, and what to tell
     the user: the turn's own failure text when it gave one."""
     if timed_out:
-        return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_duration_error())
+        return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_duration_error(_run_duration_limit()))
     reason = evidence.reason
     if reason == "completed":
         return _AttemptEnd(outcome=AttemptOutcome.completed)
