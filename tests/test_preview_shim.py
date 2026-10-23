@@ -7,6 +7,12 @@ before the shim runs is exactly the failure this exists to prevent.
 
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
+
+import pytest
+
 from cowork.services.preview_shim import SHIM_JS, _script_tag, inject_shim
 
 
@@ -64,3 +70,72 @@ def test_line_offset_matches_the_lines_the_injection_adds():
 def test_reporter_is_installed_before_the_storage_guard():
     # Diagnostics must survive a real origin, where the storage half returns early.
     assert SHIM_JS.index("addEventListener('error'") < SHIM_JS.index("nativeStorageWorks")
+
+
+def test_every_reported_url_field_goes_through_the_one_cut():
+    # On the draft host the document sits under /_t/<token>/. A field that
+    # skipped the cut would carry the token into the agent's repair prompt.
+    assert r"\/_t\/[^\/?#]+\/" in SHIM_JS
+    for field in (
+        "file = local(file);",
+        "message: local(ev.message),",
+        "stack: ev.error && ev.error.stack ? local(ev.error.stack) : ''",
+        "var url = local(node.src || node.href || '');",
+        "message: 'Unhandled promise rejection: ' + local(message),",
+        "stack: reason && reason.stack ? local(reason.stack) : ''",
+        "blockedURI: local(ev.blockedURI)",
+    ):
+        assert field in SHIM_JS, field
+    assert "String(ev.error.stack)" not in SHIM_JS
+    assert "String(ev.blockedURI" not in SHIM_JS
+
+
+# The cut itself, run in node on real addresses: the string checks above only
+# show where it is applied. CI runners have node; without it the tests skip.
+TOKEN = "v1.eyJhcnQiOiI0NCJ9.QNm0tQAs4c7pfMfsflQzCy1joIUTm9Y8nZLLRckRVt4"
+DRAFT = f"https://draft-staging.mindshub.co/_t/{TOKEN}/"
+LOOPBACK = "http://127.0.0.1:26866/api/v1/artifacts/preview-asset/abc123/"
+
+
+def _cut(href: str, values: list) -> list[str]:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    start = SHIM_JS.index("  var HREF = ")
+    end = SHIM_JS.index("  function post(")
+    script = (
+        f"var window = {{location: {{href: {json.dumps(href)}}}}};\n"
+        + SHIM_JS[start:end]
+        + f"\nprocess.stdout.write(JSON.stringify({json.dumps(values)}.map(local)));\n"
+    )
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+def test_the_token_root_is_cut_even_above_a_nested_primary():
+    stack = f"Error: x\n    at f ({DRAFT}static/app.js:1:2)\n    at {DRAFT}pages/index.html?__antonComments=1:9:3"
+    assert _cut(f"{DRAFT}pages/index.html?__antonComments=1", [f"{DRAFT}static/x.png", stack, "inline", None]) == [
+        "static/x.png",
+        "Error: x\n    at f (static/app.js:1:2)\n    at pages/index.html?__antonComments=1:9:3",
+        "inline",
+        "",
+    ]
+
+
+def test_a_desktop_document_keeps_its_folder_cut():
+    assert _cut(f"{LOOPBACK}index.html", [f"{LOOPBACK}static/app.js", "https://cdn.example/x.js"]) == [
+        "static/app.js",
+        "https://cdn.example/x.js",
+    ]
+
+
+def test_a_slash_in_the_query_or_hash_does_not_move_the_folder():
+    assert _cut(f"{LOOPBACK}index.html?next=/a/b", [f"{LOOPBACK}static/app.js"]) == ["static/app.js"]
+    assert _cut(f"{LOOPBACK}index.html#/route/x", [f"{LOOPBACK}static/app.js"]) == ["static/app.js"]
+
+
+def test_srcdoc_cuts_nothing():
+    assert _cut("about:srcdoc", ["about:srcdoc", "https://cdn.example/x.js"]) == [
+        "about:srcdoc",
+        "https://cdn.example/x.js",
+    ]
