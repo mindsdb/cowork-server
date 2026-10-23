@@ -56,7 +56,7 @@ from cowork.services.connectors.specs._registry import registry
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.projects import display_label
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
-from cowork.services.skills import link_turn_skills, reads_shared_skills
+from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -1694,6 +1694,15 @@ class AntonHarness:
                 if turn_skills_dir != project_skills_dir:
                     read_only_dirs.append(turn_skills_dir)
                 anton_settings.skills_root = turn_skills_dir
+            # The skills an artifact build follows without a recall (anton's
+            # SkillStore.list_for_artifacts): the host's, the managed folder's
+            # and the asker's own, never one another person shares, whose text
+            # would otherwise steer every build the asker runs.
+            anton_settings.skills_artifact_roots = [
+                HOST_SKILLS_DIR,
+                *managed_skill_dirs.values(),
+                *artifact_skill_dirs(scope=turn_scope, project_name=conversation.project.name),
+            ]
             read_only_dirs += anton_settings.skills_extra_roots
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
             # None with the sandbox off, and then not passed at all. Built in a
