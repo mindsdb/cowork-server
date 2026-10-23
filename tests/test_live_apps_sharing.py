@@ -636,7 +636,8 @@ def test_only_the_owner_stops_a_share(people):
 def test_a_moved_conversation_takes_its_apps_shares_and_launches_along(people, tmp_path, monkeypatch):
     """Moving a conversation to another project moves its app's folder; its
     share, the received mark and the launch records follow, so recipients
-    still list it and its card keeps its state."""
+    still list it and its card keeps its state. Its running launch stops as
+    moved, since anton finds a running app by its folder."""
     from sqlmodel import Session, select
 
     from cowork.db.scoped import ScopedSession
@@ -698,7 +699,13 @@ def test_a_moved_conversation_takes_its_apps_shares_and_launches_along(people, t
     assert listed["shareId"] == share["shareId"]
     with Session(engine) as raw:
         assert raw.exec(select(LiveAppShare.project_id)).all() == [dest_id]
-        assert raw.exec(select(LiveAppLaunchRecord.project_id)).all() == [dest_id]
+        (record,) = raw.exec(select(LiveAppLaunchRecord)).all()
+        assert (record.project_id, record.state, record.stop_reason, record.stop_noticed) == (
+            dest_id,
+            "stopped",
+            "moved",
+            False,
+        )
         assert raw.exec(select(LiveAppCopy.project_id)).all() == [dest_id]
 
 

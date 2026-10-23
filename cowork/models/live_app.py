@@ -24,15 +24,19 @@ EMAIL_MAX_LENGTH = 254
 
 #: Why a launch stopped: the slot's report (idle, max_time, app_exited,
 #: terminated), anton's claim of the slot (replaced, relaunched, or
-#: launch_failed when the launch that claimed it didn't finish), or a slot
-#: found no longer running it with no report (lost).
+#: launch_failed when the launch that claimed it didn't finish), a slot
+#: found no longer running it with no report (lost), or a move of its
+#: conversation to another project, which anton no longer finds it under
+#: (moved).
 StopReason = Literal[
-    "idle", "max_time", "app_exited", "terminated", "replaced", "relaunched", "launch_failed", "lost"
+    "idle", "max_time", "app_exited", "terminated", "replaced", "relaunched", "launch_failed", "lost", "moved"
 ]
 
 #: The stop reasons a person is shown: a relaunch keeps the app, so it is
 #: never shown as a stop.
-ShownStopReason = Literal["idle", "max_time", "app_exited", "terminated", "replaced", "launch_failed", "lost"]
+ShownStopReason = Literal[
+    "idle", "max_time", "app_exited", "terminated", "replaced", "launch_failed", "lost", "moved"
+]
 
 
 class LiveAppLaunchRecord(BaseSQLModel, table=True):

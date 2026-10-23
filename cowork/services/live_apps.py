@@ -31,13 +31,14 @@ import html
 import logging
 import os
 import re
+import ssl
 import stat
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import partial
+from functools import cache, partial
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from uuid import UUID
@@ -219,19 +220,29 @@ class CoworkLiveAppHost:
     async def launched(self, launch: LiveAppLaunch) -> None:
         self._launching[launch.slot] = launch.boot_id
         lost_at = await _slot_boot_time(launch.slot, boot_id=launch.boot_id)
-        await run_db(
-            partial(
-                _start_record,
-                launch=launch,
-                launcher=self._person,
-                project_id=self._project_id,
-                claimed=self._claimed.get(launch.slot),
-                lost_at=lost_at,
-            ),
-            scope=SYSTEM_SCOPE,
-        )
+        try:
+            await run_db(
+                partial(
+                    _start_record,
+                    launch=launch,
+                    launcher=self._person,
+                    project_id=self._project_id,
+                    claimed=self._claimed.get(launch.slot),
+                    lost_at=lost_at,
+                ),
+                scope=SYSTEM_SCOPE,
+            )
+        except asyncio.CancelledError:
+            # anton resets the slot whenever launched raises, but calls
+            # launch_failed only after a claim. A first launch into a free
+            # slot has none, so a Stop that lands once the record is written
+            # would leave it running until a later check finds it lost.
+            if launch.slot not in self._claimed:
+                await run_to_completion(self.launch_failed(launch.slot))
+            raise
         # Only once the record is written: a launched that raises, or that a
-        # Stop ends, leaves both for launch_failed, which anton calls next.
+        # Stop ends, leaves both for launch_failed, which anton calls next
+        # after a claim, and the handler above calls without one.
         self._claimed.pop(launch.slot, None)
         self._launching.pop(launch.slot, None)
 
@@ -476,18 +487,25 @@ def _launched_by(session: ScopedSession, *, slot: int) -> _LaunchedBy | None:
     return _LaunchedBy(user_id=record.launcher_user_id, email=record.launcher_email, boot_id=record.boot_id)
 
 
+@cache
+def _ssl_context() -> ssl.SSLContext:
+    # trust_env=False on the client stops httpx reading SSL_CERT_FILE and
+    # SSL_CERT_DIR, so the context reads them itself, for a viewer-login on a
+    # private CA. Built once: loading the CA bundle blocks the event loop, and
+    # the edge asks the access route on every request to an app.
+    return httpx.create_ssl_context(trust_env=True)
+
+
 def _http_client() -> httpx.AsyncClient:
     # trust_env=False: viewer-login and the slots are sibling containers on
     # internal networks, never behind a proxy a deployment may set, which
     # would otherwise get the visitor's cookie and the launch token. A client
     # per check keeps no viewer-login cookie from one visitor to the next.
-    # trust_env=False also stops httpx reading SSL_CERT_FILE and SSL_CERT_DIR,
-    # so the context reads them itself, for a viewer-login on a private CA.
     return httpx.AsyncClient(
         timeout=ACCESS_TIMEOUT_SECONDS,
         follow_redirects=False,
         trust_env=False,
-        verify=httpx.create_ssl_context(trust_env=True),
+        verify=_ssl_context(),
     )
 
 
@@ -738,6 +756,7 @@ def stop_reason_text(reason: StopReason | None, *, limit_hours: float | None) ->
         "relaunched": "you relaunched it",
         "launch_failed": "a launch of yours into its slot didn't start",
         "lost": "its app slot restarted",
+        "moved": "its conversation moved to another project",
     }
     return None if reason is None else texts[reason]
 
@@ -1667,7 +1686,12 @@ def follow_moved_app(
     project ``source_project_id`` to its new home after a conversation move
     took its folder there: its shares, its received mark and its launches,
     so recipients still list it and its card keeps its state. Rows already
-    at the new address belong to a folder that is gone there, so they go."""
+    at the new address belong to a folder that is gone there, so they go.
+
+    A launch still running stops as ``moved``: anton finds a running app by
+    its folder, which the move changed, so it would no longer relaunch it
+    after an edit, and a relaunch would take a second slot. The stop closes
+    the old address and tells the person on their next turn."""
     keyed = (
         (LiveAppShare, LiveAppShare.owner_partition_id),
         (LiveAppCopy, LiveAppCopy.partition_id),
@@ -1690,6 +1714,8 @@ def follow_moved_app(
             row.project_id = dest_project_id
             row.slug = new_slug
             session.add(row)
+            if isinstance(row, LiveAppLaunchRecord) and row.state == "running":
+                _stop(session, row, reason="moved")
 
 
 def shared_text(value: str) -> str:

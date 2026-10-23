@@ -842,6 +842,54 @@ def test_a_relaunch_stopped_once_its_record_is_written_is_told_as_failed(service
     assert (entry["state"], entry["stopReason"]) == ("stopped", "launch_failed")
 
 
+def test_a_first_launch_stopped_once_its_record_is_written_is_told_as_failed(services, monkeypatch):
+    """A first launch into a free slot claims nothing, so anton calls no
+    launch_failed after a Stop that lands as launched's write commits:
+    launched calls it itself, and the record stops as a failed launch, not
+    as a slot that restarted."""
+    host = _host(ALICE)
+    real_run_db = live_apps.run_db
+
+    async def commit_then_stop(unit, *, scope):
+        result = await real_run_db(unit, scope=scope)
+        if unit.func is live_apps._start_record:
+            raise asyncio.CancelledError
+        return result
+
+    async def first_launch_stopped_after_its_record() -> None:
+        with monkeypatch.context() as patched:
+            patched.setattr(live_apps, "run_db", commit_then_stop)
+            with pytest.raises(asyncio.CancelledError):
+                await host.launched(_launch_model(1, "dash", BOOT_1))
+
+    asyncio.run(first_launch_stopped_after_its_record())
+
+    (record,) = _records(1)
+    assert (record.state, record.stop_reason, record.stop_noticed) == ("stopped", "launch_failed", False)
+
+
+def test_the_access_checks_build_the_tls_context_once(monkeypatch):
+    """The edge asks the access route on every request to an app, and loading
+    the CA bundle blocks the event loop, so every check's client shares one
+    context."""
+    built = []
+    real = httpx.create_ssl_context
+
+    def counted(**kwargs):
+        built.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(httpx, "create_ssl_context", counted)
+    live_apps._ssl_context.cache_clear()
+    try:
+        clients = [live_apps._http_client() for _ in range(3)]
+        for client in clients:
+            asyncio.run(client.aclose())
+    finally:
+        live_apps._ssl_context.cache_clear()
+    assert built == [{"trust_env": True}]
+
+
 def test_a_launch_into_a_freed_slot_dates_the_earlier_apps_loss_by_the_slots_boot(services):
     """A's app ended unreported when slot 1 restarted; B's launch there later
     stamps A's lost stop at that restart, not at B's launch."""
