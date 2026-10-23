@@ -283,13 +283,22 @@ def _sandbox_warnings(caplog) -> list[str]:
 
 
 def test_shared_projects_start_with_a_warning(stack, owned_logger, caplog):
-    stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_PROJECTS)
+    stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_PROJECTS.replace("connections,", ""))
     owned_logger("cowork.code_sandbox", level=logging.WARNING)
     get_app_settings.cache_clear()
     cowork_server.create_app()
     (warning,) = _sandbox_warnings(caplog)
     assert "projects are left off COWORK_PERSONAL_RESOURCES" in warning
     assert "venvs and saved cell state" in warning
+
+
+def test_private_connections_with_shared_project_execution_refuse_before_kernel_probe(stack):
+    stack.setenv("COWORK_PERSONAL_RESOURCES", SHARED_PROJECTS)
+    stack.setattr(code_sandbox, "_probe_abi", _never)
+    message = _refusal()
+    assert "private connections require personal projects" in message
+    assert "COWORK_PERSONAL_RESOURCES" in message
+    assert "venvs and saved cell state" in message
 
 
 def test_personal_projects_start_without_the_warning(stack, owned_logger, caplog):

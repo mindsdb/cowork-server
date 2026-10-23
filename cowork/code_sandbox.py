@@ -632,7 +632,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
 
     Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
     headers with the sandbox off; and with ``landlock``, org tenancy, remote
-    turns, an anton without the launcher or whose policy model refuses this
+    turns, private connections with shared projects, an anton without the launcher or whose policy model refuses this
     server's policy, a kernel below the Landlock floor, a link at one of
     cowork-home's own entries (_COWORK_HOME_ENTRIES), or a self-test that
     can't confirm a denied path is denied. Then creates the shared folder.
@@ -658,6 +658,17 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "COWORK_CODE_SANDBOX=landlock is not supported with COWORK_TURN_BACKEND=remote: "
             "remote workers start agent code without the launcher. Leave "
             "COWORK_TURN_BACKEND unset to run turns in this process."
+        )
+    if (
+        settings.trust_identity_headers
+        and PersonalResource.CONNECTIONS in settings.personal_resources
+        and PersonalResource.PROJECTS not in settings.personal_resources
+    ):
+        raise RuntimeError(
+            "With COWORK_TRUST_IDENTITY_HEADERS, private connections require personal projects: "
+            "shared project venvs and saved cell state can run one person's code with another "
+            "person's connections. Add projects to COWORK_PERSONAL_RESOURCES before starting. "
+            "Preserve any shared project files before changing their storage namespace."
         )
     gap = _anton_sandbox_gap()
     if gap is not None:
