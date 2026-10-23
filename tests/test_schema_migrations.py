@@ -287,6 +287,39 @@ def test_task_objects_downgrade_guards_missing_table(tmp_path, monkeypatch):
     assert _alembic_version(db_path) == "c4e7a1b9d2f0"
 
 
+def test_conversation_folders_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "conversation-folders.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "conversation_folders")
+
+    _downgrade_to(engine, uri, "3e4b5f7586d3")
+
+    assert not _has_table(db_path, "conversation_folders")
+    assert _alembic_version(db_path) == "3e4b5f7586d3"
+
+
+def test_conversation_folders_downgrade_guards_missing_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "conversation-folders-missing.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE conversation_folders"))
+
+    _downgrade_to(engine, uri, "3e4b5f7586d3")
+
+    assert _alembic_version(db_path) == "3e4b5f7586d3"
+
+
 def test_shared_resource_audit_upgrade_and_downgrade(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()

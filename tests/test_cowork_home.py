@@ -412,6 +412,9 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
             "_probe_tmp_dir",
             "pod_local_only(cowork_home() / 'tmp', 'tmp')",
         ),
+        # A refusal root, not a store: no working folder may overlap any of
+        # Cowork's data, whichever organization's stores sit under it.
+        ("cowork/services/conversation_folders.py", "_store_roots.raw", "cowork_home()"),
         # The code sandbox runs only with COWORK_CODE_SANDBOX=landlock, on a
         # self-hosted Linux stack, never on the desktop that switches
         # organizations. Its stores are keyed per person by scoped_storage_root.
