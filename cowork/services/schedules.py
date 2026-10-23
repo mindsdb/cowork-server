@@ -589,6 +589,37 @@ class ScheduleRunService:
             for row in rows
         }
 
+    def schedules_for_conversations(self, conversation_ids: list[UUID]) -> dict[UUID, UUID]:
+        """The schedule each of these conversations is a run of, for the
+        conversations that are runs: ``{conversation_id: schedule_id}``.
+
+        One indexed lookup for the conversations a page returns, however long
+        the schedules' history. Limited to schedules the caller owns, as the
+        conversations themselves are.
+        """
+        if not conversation_ids:
+            return {}
+        stmt = (
+            sa.select(ScheduleRun.conversation_id, ScheduleRun.schedule_id)
+            .join(Schedule, Schedule.id == ScheduleRun.schedule_id)
+            .where(ScheduleRun.conversation_id.in_(conversation_ids))  # type: ignore[union-attr]
+        )
+        scope = self.session.scope
+        if scope.org_mode:
+            stmt = stmt.where(Schedule.org_id == scope.org_id, Schedule.created_by == scope.user_id)
+        return {row[0]: row[1] for row in unsafe_unscoped_session(self.session).execute(stmt)}
+
+    def run_counts(self, schedule_ids: list[UUID]) -> dict[UUID, int]:
+        """How many runs each schedule has had, over its whole history."""
+        if not schedule_ids:
+            return {}
+        rows = unsafe_unscoped_session(self.session).execute(
+            sa.select(ScheduleRun.schedule_id, sa.func.count())
+            .where(ScheduleRun.schedule_id.in_(schedule_ids))  # type: ignore[attr-defined]
+            .group_by(ScheduleRun.schedule_id)
+        ).all()
+        return {row[0]: row[1] for row in rows}
+
     def last_finished(self, schedule_id: UUID) -> ScheduleRun | None:
         """The schedule's most recent run that has ended, manual or cron."""
         return self.session.exec(

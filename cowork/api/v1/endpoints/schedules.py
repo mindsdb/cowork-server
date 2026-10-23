@@ -60,7 +60,10 @@ def _last_run(schedule_id, scoped) -> dict | None:
 @router.get("/")
 def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
     schedules = ScheduleService(scoped).list_schedules(project_id=project_id)
-    return {"schedules": [_serialize(s, scoped) for s in schedules]}
+    # Which conversations are a schedule's runs comes with the conversations
+    # (scheduled_id), so this poll does not grow with each schedule's history.
+    counts = ScheduleRunService(scoped).run_counts([s.id for s in schedules])
+    return {"schedules": [{**_serialize(s, scoped), "runCount": counts.get(s.id, 0)} for s in schedules]}
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
