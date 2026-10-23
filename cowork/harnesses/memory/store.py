@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -46,6 +47,16 @@ MEMORY_STORE = "memory"
 # this closed set (and rejects any separator) so the value reaching os.open /
 # os.unlink is provably one of a handful of constants, never attacker-shaped.
 _KNOWN_SLOT_FILENAMES = frozenset(spec.filename for spec in SLOT_REGISTRY.values())
+
+# A compaction holds a slot's writer lock only for one file replace. A holder
+# that keeps it longer is stuck (a hung NFS client), and the editor's caller
+# holds a database lock while it waits.
+MEMORY_SLOT_LOCK_TIMEOUT = 5.0
+_LOCK_RETRY_SECONDS = 0.05
+
+
+class MemorySlotBusyError(TimeoutError):
+    """A memory slot's writer lock was not free within MEMORY_SLOT_LOCK_TIMEOUT."""
 
 
 def _undo_text_mode_double_cr(text: str) -> str:
@@ -239,7 +250,17 @@ class MemoryStore:
             0o600,
         )
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + MEMORY_SLOT_LOCK_TIMEOUT
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise MemorySlotBusyError(
+                            "This memory is being rewritten; try again in a moment"
+                        ) from None
+                    time.sleep(_LOCK_RETRY_SECONDS)
             yield
         finally:
             os.close(lock_fd)

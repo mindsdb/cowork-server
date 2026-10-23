@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.session import get_open_session
+from cowork.harnesses.memory.store import MemorySlotBusyError
 from cowork.principal import Principal, get_principal
 from cowork.schemas.memory import (
     MemoryDeleteRequest,
@@ -61,6 +62,8 @@ def update_memory(
                 content=body.content,
                 project_id=body.project_id,
             )
+    except MemorySlotBusyError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     except UnicodeError as e:
         # A slot whose stored bytes do not decode is a broken shared resource,
         # not a bad request. UnicodeDecodeError is a ValueError, so without this
@@ -87,6 +90,8 @@ def delete_memory(
                 category=body.category,
                 project_id=body.project_id,
             )
+    except MemorySlotBusyError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"ok": True}

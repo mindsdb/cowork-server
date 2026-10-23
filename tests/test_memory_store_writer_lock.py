@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import sys
 import threading
+from contextlib import contextmanager
 
 import pytest
 from anton.core.memory.cortex import plan_compaction, read_compaction_input
+from fastapi import HTTPException
 from anton.core.memory.hippocampus import Hippocampus
 
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.harnesses.memory.store import GlobalMemoryStore, ProjectMemoryStore
+from cowork.api.v1.endpoints import memory as memory_endpoints
+from cowork.harnesses.memory import store as store_mod
+from cowork.harnesses.memory.store import GlobalMemoryStore, MemorySlotBusyError, ProjectMemoryStore
+from cowork.schemas.memory import MemoryDeleteRequest, MemoryUpdateRequest
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="the writer lock is a no-op without fcntl"
@@ -97,3 +102,46 @@ def test_a_link_at_the_lock_name_is_refused(tmp_path, change):
 
     assert not victim.exists()
     assert (memory / "rules.md").read_text() == "# Rules\n- Kept\n"
+
+
+@pytest.mark.parametrize("change", ["write", "delete"])
+def test_a_lock_held_too_long_fails_the_change(tmp_path, monkeypatch, change):
+    """A stuck holder must not hold the editor's worker, and its database lock, forever."""
+    monkeypatch.setattr(store_mod, "MEMORY_SLOT_LOCK_TIMEOUT", 0.1)
+    store = GlobalMemoryStore(root=tmp_path)
+    store.write(MemorySlot.RULES, "# Rules\n- Kept\n")
+    hc = Hippocampus(store.root)
+
+    with hc._file_lock(hc._rules_path), pytest.raises(MemorySlotBusyError):
+        if change == "write":
+            store.write(MemorySlot.RULES, "# Rules\n")
+        else:
+            store.delete(MemorySlot.RULES)
+
+    assert store.read(MemorySlot.RULES) == "# Rules\n- Kept\n"
+
+
+class _BusyService:
+    def update_memory_sync(self, **kwargs):
+        raise MemorySlotBusyError("busy")
+
+    delete_memory_sync = update_memory_sync
+
+
+@pytest.mark.parametrize("call", ["update", "delete"])
+def test_a_busy_slot_answers_503(monkeypatch, call):
+    monkeypatch.setattr(memory_endpoints, "_memory_service", lambda scope, principal: _busy())
+    with pytest.raises(HTTPException) as raised:
+        if call == "update":
+            memory_endpoints.update_memory(
+                MemoryUpdateRequest(scope="global", category="rules", content="# Rules\n"), None, None
+            )
+        else:
+            memory_endpoints.delete_memory(MemoryDeleteRequest(scope="global", category="rules"), None, None)
+
+    assert raised.value.status_code == 503
+
+
+@contextmanager
+def _busy():
+    yield _BusyService()
