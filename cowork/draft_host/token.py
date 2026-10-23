@@ -99,7 +99,7 @@ def verify_draft_token(
         raise DraftTokenError("malformed")
     try:
         claims = json.loads(_b64decode(parts[1]))
-    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+    except (binascii.Error, UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise DraftTokenError("malformed") from exc
     if not isinstance(claims, dict):
         raise DraftTokenError("malformed")

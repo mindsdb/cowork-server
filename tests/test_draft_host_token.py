@@ -108,12 +108,24 @@ def test_an_unknown_kid_is_refused_and_a_rotation_keeps_both_keys():
         "v1.!!!!.sig",
         "v1." + _b64(b"not json") + ".sig",
         "v1." + _b64(b"[1, 2]") + ".sig",
+        "v1." + _b64(b"[" * 3000) + ".sig",
         "v1.a.b.c",
         "v1." + "a" * 5000 + ".sig",
     ],
 )
 def test_malformed_tokens_are_refused(token):
     assert _reason(token) == "malformed"
+
+
+def test_a_payload_that_exhausts_the_json_parser_is_malformed(monkeypatch):
+    # How deep json.loads can nest before RecursionError depends on the
+    # interpreter build, so the parser is made to fail the way it does there.
+    def too_deep(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("cowork.draft_host.token.json.loads", too_deep)
+
+    assert _reason("v1." + _b64(b"[]") + ".sig") == "malformed"
 
 
 def test_a_signed_token_without_an_identity_is_refused():
