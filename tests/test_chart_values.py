@@ -141,3 +141,30 @@ def test_no_env_name_is_declared_twice_per_environment(base, env_values):
     names = [entry.name for entry in base + _env(env_values)]
     duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
     assert not duplicates, f"{env_values.name} renders {duplicates} more than once with values.yaml"
+
+
+@pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
+def test_the_draft_port_is_the_draft_listener_wherever_a_draft_host_is_routed(base, env_values):
+    """The draft Ingress, the Service port it targets, the container port and
+    COWORK_DRAFT_PORT are one port, and the Service sends it to the container
+    port named draft, never to the API's. The listener binds
+    COWORK_SERVER_HOST, not the command's --host. Any drift answers 502 or
+    puts the API app behind the draft host."""
+    entries = base + _env(env_values)
+    deployment = {**_deployment(BASE), **_deployment(env_values)}
+    port = next((entry.value for entry in entries if entry.name == "COWORK_DRAFT_PORT"), None)
+    secondary = deployment.get("ingress_secondary") or {}
+    if port is None and not secondary.get("enabled"):
+        pytest.skip(f"{env_values.name} routes no draft host")
+    assert port is not None, f"{env_values.name} routes a draft host but sets no COWORK_DRAFT_PORT"
+    assert secondary.get("enabled") is True, f"{env_values.name} sets COWORK_DRAFT_PORT but routes no draft host"
+    assert _entry(entries, "COWORK_SERVER_HOST").value == "0.0.0.0"
+    container = {p["name"]: p["containerPort"] for p in deployment.get("additionalPorts") or []}
+    service = {p["name"]: p for p in (deployment.get("service") or {}).get("additionalPorts") or []}
+    paths = [path for host in secondary.get("hosts") or [] for path in host.get("paths") or []]
+    assert container.get("draft") == int(port), env_values.name
+    assert service.get("draft", {}).get("port") == int(port), env_values.name
+    assert service["draft"].get("targetPort") in ("draft", int(port)), env_values.name
+    assert paths and {(p["path"], p["serviceName"], p["servicePort"]) for p in paths} == {
+        ("/_t/", deployment["name"], int(port))
+    }, env_values.name

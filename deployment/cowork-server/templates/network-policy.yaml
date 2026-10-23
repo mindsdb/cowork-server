@@ -85,6 +85,12 @@ spec:
           # cannot drift: a policy naming a port nothing serves drops every
           # legitimate request while `helm template` stays clean.
           port: {{ .Values.networkPolicy.port | default .Values.deployment.service.targetPort }}
+        # The container's extra ports (the draft-preview listener), from the
+        # list the subchart renders them from, so these cannot drift either.
+{{- range .Values.deployment.additionalPorts }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .containerPort }}
+{{- end }}
 {{- end }}
 {{- with .Values.networkPolicy.nodeCidrs }}
     # (b) The nodes. Liveness and readiness probes come from the kubelet, so no
