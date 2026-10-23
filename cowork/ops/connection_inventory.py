@@ -4,7 +4,7 @@ This enumerates storage, not a tester's connection picker. Visibility describes
 the configured sharing policy; notes identify managed/name-prefix overrides.
 Only metadata crosses the output boundary. Reads are bounded and descriptor
 relative, and errors never include record contents or validation inputs. One
-person's listing opens no other person's records.
+person's listing opens no record in another person's partition.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from cowork.common.paths import (
     pinned_dir,
     read_bounded,
 )
+from cowork.code_sandbox import PlantedLinkError, refuse_planted_links
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE
@@ -174,23 +175,30 @@ def _personal_records(root: Path, *, only: str | None = None) -> dict[str, list[
 
 
 def _shared_filenames(root: Path, partitions: Iterable[str]) -> set[tuple[str, str]]:
-    """The vault filenames in ``partitions``, read from their listings alone.
+    """The record filenames in ``partitions``' vaults, read from their listings alone.
 
     One person's listing still needs to know which other people's shares
     reach a stored record, for the precedence notes on their own rows, but
-    it opens none of those records: a malformed or linked one can't fail it,
-    and no other person's fields load. A vault the pinned walk refuses shares
-    nothing, as _shared_sources leaves it out at runtime. Registry partition
-    ids are canonical UUIDs (SharedEntry), so each is one child name.
+    it opens none of those records: a malformed one can't fail it, and no
+    other person's fields load. A vault refuse_planted_links refuses (a link,
+    or a file with two names, in it or on the way to it) shares nothing, as
+    _shared_sources leaves it out at runtime; a missing one shares nothing
+    too. Any other read error refuses the command. Registry partition ids are
+    canonical UUIDs (SharedEntry), so each is one child name.
     """
     found = set()
     try:
         with pinned_dir(root, nofollow_base=True) as d:
             for partition in sorted(set(partitions)):
                 try:
+                    refuse_planted_links(root / partition / "data-vault")
                     with _partition_vault(d, partition) as vault, dir_scandir(vault) as entries:
-                        found.update((partition, entry.name) for entry in entries if not entry.name.endswith(".tmp"))
-                except OSError:
+                        found.update(
+                            (partition, entry.name)
+                            for entry in entries
+                            if entry.is_file(follow_symlinks=False) and not entry.name.endswith(".tmp")
+                        )
+                except (PlantedLinkError, FileNotFoundError):
                     continue
     except FileNotFoundError:
         pass

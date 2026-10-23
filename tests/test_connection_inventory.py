@@ -10,6 +10,7 @@ from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.ops import Person
 from cowork.ops import connections as connections_ops
 from cowork.ops.connection_inventory import MAX_RECORD_BYTES
 from cowork.services.connectors.persist import own_vault_for_scope, vault_for_scope
@@ -80,6 +81,10 @@ def test_base_records_stay_the_operator_views_while_audit_serves_it(stack, tmp_p
     assert [(row["engine"], row["name"]) for row in vault_for_scope(LOCAL_SCOPE).list_connections()] == [("postgres", "old-team")]
     [row] = _list(capsys)["connections"]
     assert (row["origin"], row["visibility"]) == ("base", visibility)
+    # A managed connection of the same DS_ prefix hides it from the operator view.
+    LocalDataVault(stack.vault_dir).save("postgres", "old_team", {"PASSWORD": SECRET})
+    [row] = [row for row in _list(capsys)["connections"] if row["origin"] == "base"]
+    assert row["notes"] == (["hidden-by-managed-prefix"] if visibility == "operator" else [])
 
 
 def test_inventory_marks_managed_prefix_override_and_same_vault_collision(stack, capsys):
@@ -229,6 +234,28 @@ def test_one_persons_listing_opens_no_other_persons_records(stack, tmp_path, mon
     # The full inventory still refuses what it can't read safely.
     status, out, err = _run(connections_ops.main, ["list"], capsys)
     assert status == 1 and out == "" and SECRET not in err
+
+
+@pytest.mark.parametrize("kind", ["hardlink", "symlink"])
+def test_a_planted_link_leaves_that_partitions_shares_out_of_another_persons_notes(stack, tmp_path, capsys, kind):
+    # Runtime drops every share of a vault holding a link (refuse_planted_links),
+    # so a third person reads Bob's warehouse, not Alice's earlier one.
+    _save(ALICE)
+    vault_for_scope(personal_scope(BOB)).save("postgres", "warehouse", {"PASSWORD": "bobs-password"})
+    stack.shared_dir.mkdir(exist_ok=True)
+    stack.shared_connections_file.write_text(json.dumps([
+        {"user_id": person.user_id, "partition_id": person.partition_id, "engine": "postgres", "name": "warehouse"}
+        for person in (ALICE, BOB)
+    ]))
+    alices_vault = tmp_path / "shared" / ALICE.partition_id / "data-vault"
+    if kind == "hardlink":
+        os.link(alices_vault / "postgres-warehouse", tmp_path / "second-name")
+    else:
+        (alices_vault / "postgres-elsewhere").symlink_to(tmp_path / "elsewhere")
+    third = Person(organization_id=ALICE.organization_id, user_id="33333333-3333-4333-8333-333333333333")
+    assert vault_for_scope(personal_scope(third)).load("postgres", "warehouse")["PASSWORD"] == "bobs-password"
+    [bobs] = [row for row in _list(capsys, BOB)["connections"] if row["origin"] == "personal"]
+    assert "earlier-share-takes-priority-for-other-recipients" not in bobs["notes"]
 
 
 def test_one_persons_listing_keeps_the_full_inventorys_rows_and_notes(stack, capsys):
