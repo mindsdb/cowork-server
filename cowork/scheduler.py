@@ -917,7 +917,9 @@ async def _execute_attempt(
         # backend's per-tenant key mint) run in org mode with no request in
         # flight. The handler opens its own short sessions. A raise here comes
         # before the turn's producer exists, so nothing has acted yet.
-        stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+        stream = await ResponsesHandler(
+            principal=scheduled.principal, interactive=False, schedule_id=str(schedule_id),
+        ).handle(request)
     except Exception as exc:
         error = str(exc) or type(exc).__name__
         # The ids travel as record attributes: a database error's sanitized

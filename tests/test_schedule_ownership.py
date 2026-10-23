@@ -504,7 +504,7 @@ class _Producer:
         producer = self
 
         class Handler:
-            def __init__(self, *, principal=None, interactive=True):
+            def __init__(self, *, principal=None, interactive=True, schedule_id=None):
                 pass
 
             async def handle(self, request):

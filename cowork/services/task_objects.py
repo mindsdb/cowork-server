@@ -476,6 +476,7 @@ def turn_artifact_changes(
     tracked_edits: set[str] | None = None,
     attribute_by_provenance: bool = False,
     completed_cleanly: bool = True,
+    schedule_id: str | None = None,
 ) -> ArtifactChanges:
     """What the turn created and touched, from the directory as it stands now
     against ``before``, with an agent revision captured for every touched
@@ -512,6 +513,9 @@ def turn_artifact_changes(
     conversation (`artifact_ownership.turn_created_slugs`), and, when the turn
     did not complete cleanly, also if it has no provenance yet. Ignored when
     `tracked_new` is given.
+
+    `schedule_id` marks a turn the scheduler started, so its edits refresh
+    the schedule's previous revision (capture_agent_revision).
     """
     from cowork.services.artifacts import content_mtime_ns
     from cowork.services.artifact_revisions import (
@@ -544,7 +548,9 @@ def turn_artifact_changes(
         except OSError:
             continue
     for slug in touched:
-        capture_agent_revision(base / slug, conversation_id=str(conversation_id))
+        capture_agent_revision(
+            base / slug, conversation_id=str(conversation_id), schedule_id=schedule_id
+        )
     # A repair turn that makes no source change must still leave the
     # polling state. Check only artifacts with a handoff explicitly bound
     # to this conversation; unrelated queued work is never consumed.

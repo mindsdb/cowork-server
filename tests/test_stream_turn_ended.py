@@ -67,6 +67,8 @@ def _collect_handler():
     from cowork.handlers.responses import ResponsesHandler
 
     handler = object.__new__(ResponsesHandler)
+
+    handler.schedule_id = None
     handler.principal = None
 
     class _Harness:

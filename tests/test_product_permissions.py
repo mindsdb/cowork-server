@@ -121,6 +121,7 @@ async def test_response_denial_precedes_router_harness_and_persistence(
     run_db = AsyncMock(side_effect=AssertionError("No database work"))
     monkeypatch.setattr(responses, "run_db", run_db)
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.scope = ORG
     handler._router_binding = AsyncMock(
         side_effect=AssertionError("Router must not run")
@@ -278,6 +279,7 @@ async def test_model_selection_cannot_bypass_admission(monkeypatch, model):
 
     authority(monkeypatch, body={"allowed": False})
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.scope = ORG
     with pytest.raises(permissions.ProductPermissionDenied):
         await handler.handle(ResponsesRequest(input="Run", model=model))

@@ -85,6 +85,10 @@ class HarnessProvider(Protocol):
         # False when nobody is there to answer, as in a scheduled run. A
         # harness withholds tools that need the user's confirmation then.
         interactive: bool = True,
+        # Set only on a turn the scheduler started, never from the request,
+        # since people keep chatting in a scheduled run's conversation. A
+        # harness that records artifact revisions attributes them to it.
+        schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
         ...
 

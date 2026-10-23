@@ -879,6 +879,8 @@ class AntonHarness:
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
         interactive: bool = True,
+        # The scheduler's own turn (see HarnessProvider).
+        schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -993,6 +995,7 @@ class AntonHarness:
                     before_mtimes=before_mtimes,
                     tracked_new=getattr(session, "artifacts_touched", None),
                     tracked_edits=getattr(session, "artifacts_touched", None),
+                    schedule_id=schedule_id,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
                 if new_slugs:

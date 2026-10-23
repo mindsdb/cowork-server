@@ -68,6 +68,7 @@ def _blocked_handler(
     lands and then raises the cancel on, as the anton harness does with a
     turn's memory record."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:
