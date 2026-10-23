@@ -242,13 +242,16 @@ def _seconds_since(stamp: Any, now: float) -> float:
         return float("inf")
 
 
-def _new_session(by: str, turn: str | None, stamp: str) -> dict[str, Any]:
-    return {"by": by, "turn": turn, "started": stamp, "last": stamp}
+def _new_session(by: str, turn: str | None, stamp: str, own: dict[str, Any] | None = None) -> dict[str, Any]:
+    session: dict[str, Any] = {"by": by, "turn": turn, "started": stamp, "last": stamp}
+    if own is not None:
+        session["own"] = own
+    return session
 
 
 def _session_ends(session: dict[str, Any] | None, *, by: str, turn: str | None, now: float) -> bool:
     """Whether a write by ``by`` (in agent reply ``turn``) starts a session rather than continuing ``session``."""
-    if session is None or session.get("by") != by:
+    if session is None or session.get("by") != by or "own" in session:
         return True
     if by == "agent":
         return session.get("turn") != turn
@@ -271,6 +274,7 @@ def _keep_version(folder: Path, doc: Doc, session: dict[str, Any] | None) -> Non
                              "title": doc.get("title", ""), "bytes": len(payload)}
     if made.get("first"):
         entry["first"] = True  # the doc as first written, not what's left once older versions are let go
+    entry.update(made.get("own") or {})
     index.append(entry)
     dropped = len(index) - _versions_kept(hist, index)
     for old in index[:dropped]:
@@ -281,17 +285,20 @@ def _keep_version(folder: Path, doc: Doc, session: dict[str, Any] | None) -> Non
     atomic_write(hist / "index.json", json.dumps(index[dropped:]).encode("utf-8"))
 
 
-def _record_write(folder: Path, current: Doc, *, by: str, turn: str | None) -> None:
+def _record_write(folder: Path, current: Doc, *, by: str, turn: str | None,
+                  own: dict[str, Any] | None) -> None:
     """Continue the editing session for a write that replaces ``current``, or start one.
 
-    Starting one first keeps ``current`` as the version the previous session left.
+    Starting one first keeps ``current`` as the version the previous session
+    left. A write that is a version of its own (``own``) always starts one,
+    and the next write after it does too.
     """
     now = time.time()
     session = open_session(folder)
-    if _session_ends(session, by=by, turn=turn, now=now):
+    if own is not None or _session_ends(session, by=by, turn=turn, now=now):
         if current["rev"] > 0:
             _keep_version(folder, current, session)
-        session = _new_session(by, turn, _stamp(now))
+        session = _new_session(by, turn, _stamp(now), own)
     else:
         session["last"] = _stamp(now)
     _write_session(folder, session)
@@ -354,15 +361,17 @@ def mutate_doc(
     *,
     by: str,
     turn: str | None = None,
+    own_version: dict[str, Any] | None = None,
     after: Callable[[Doc], None] | None = None,
 ) -> tuple[Doc, T]:
     """Read, change, write — under the doc's lock. ``change`` returns (new doc, result).
 
     Each write continues its editing session or starts the next, which keeps
     the doc as the last session left it (``_record_write``); ``turn`` names
-    the agent reply a write is part of. ``after`` runs on the new doc once it
-    is written, still under the lock: the page rendered from it can't be
-    overtaken by an older one.
+    the agent reply a write is part of. ``own_version``: this write is a
+    version of its own (a restore), kept with these fields. ``after`` runs on
+    the new doc once it is written, still under the lock: the page rendered
+    from it can't be overtaken by an older one.
     """
     path = doc_file(folder)
     with _lock_for(path):
@@ -374,7 +383,7 @@ def mutate_doc(
         normalize_doc(new_doc)  # refuses a change that would write a doc that no longer loads
         payload = _encode(new_doc)
         try:
-            _record_write(folder, current, by=by, turn=turn)
+            _record_write(folder, current, by=by, turn=turn, own=own_version)
         except OSError:
             # History is a safety net; never fail the edit over it.
             logger.warning("could not keep a version of %s", folder, exc_info=True)
