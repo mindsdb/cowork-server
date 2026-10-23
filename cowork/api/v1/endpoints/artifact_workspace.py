@@ -46,6 +46,7 @@ from cowork.services.artifact_export import (
     org_export_refused,
     primary_export_source,
 )
+from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.services.artifact_revisions import (
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
@@ -605,6 +606,14 @@ _EXPORT_REFUSAL_STATUS = {
     ExportRefusal.NOT_FOUND: status.HTTP_404_NOT_FOUND,
     ExportRefusal.BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
 }
+# What the route says for each status a failed PDF export answers with.
+_PDF_FAILURE_DETAIL = {
+    413: "This file can't be exported.",
+    422: "This file can't be exported.",
+    502: "Couldn't export this file.",
+    503: "PDF export is busy; try again.",
+    504: "PDF export took too long.",
+}
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/export")
@@ -614,15 +623,16 @@ async def export_workspace_artifact(
     body: ExportRequest,
     session: ScopedSessionDep,
 ) -> ExportResult:
-    """Export the artifact's primary file as a new HTML or Word file beside it.
+    """Export the artifact's primary file as a new HTML, Word or PDF file beside it.
 
     One route for every tenancy, checked the way a source edit is: the caller
     needs ``artifact.manage`` and must own the artifact, and both checks run
     before the format is read, so a caller who may not export gets 403 or 404
     whatever they ask for. While org export is off, the owner gets 403 too,
     after those checks, so a caller with no grant still gets 404. A busy
-    server answers 429 at once. The conversion runs in a worker thread, and
-    only a 200 leaves a file behind.
+    server answers 429 at once. The conversion runs in a worker thread, a PDF
+    that doesn't come back answers the render client's status, and only a
+    200 leaves a file behind.
     """
     await require_product_permission(session.scope, "artifact.manage")
     source, folder, metadata, capabilities = _owner_workspace(
@@ -635,7 +645,7 @@ async def export_workspace_artifact(
         )
     folder_name = _artifact_folder_component(source, folder)
     try:
-        async with export_slot(scope=session.scope):
+        async with export_slot(scope=session.scope, export_format=body.format):
             return await run_in_threadpool(
                 export_primary_file,
                 source=source,
@@ -648,6 +658,12 @@ async def export_workspace_artifact(
     except ExportRefused as exc:
         raise HTTPException(
             status_code=_EXPORT_REFUSAL_STATUS[exc.refusal], detail=str(exc)
+        ) from exc
+    except RenderPdfFailed as exc:
+        # The reason never quotes the render service, so it is safe to log.
+        logger.info("PDF export failed for %s: %s", artifact_id, exc)
+        raise HTTPException(
+            status_code=exc.status, detail=_PDF_FAILURE_DETAIL[exc.status]
         ) from exc
     except Exception as exc:
         logger.warning(

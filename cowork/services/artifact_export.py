@@ -1,10 +1,12 @@
-"""Export a document artifact's primary file to HTML or Word, beside the source.
+"""Export a document artifact's primary file to HTML, Word or PDF, beside the source.
 
 The export reads the primary through the pinned artifact folder, bounded by
 size. Markdown and text become HTML first. ``inline_artifact_html`` then makes
 the document self-contained: it keeps only files from the artifact's own folder
-and never reaches the network. The result is written as a new file next to the
-source, under a name nothing else holds, so an export never replaces a file.
+and never reaches the network. A PDF comes from the render service the process
+environment names, and from nothing else. The result is written as a new file
+next to the source, under a name nothing else holds, so an export never
+replaces a file.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from cowork.common.paths import (
     dir_unlink,
     open_pinned_child,
 )
+from cowork.common.settings.app_settings import get_export_pdf_settings
 from cowork.schemas.artifact_export import (
     ExportFormat,
     ExportPdfSettings,
@@ -59,6 +62,7 @@ from cowork.services.artifacts import (
 )
 from cowork.services.docx_writer import write_docx
 from cowork.services.markdown_render import MarkdownRefused, render_markdown
+from cowork.services.render_pdf_client import RenderServicePdf, pdf_request
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
@@ -81,6 +85,9 @@ TEXT_SOURCE_MAX_BYTES = 512 * 1024
 # from small replicas, so it embeds less.
 INLINE_BUDGET_BYTES = 25 * 1024 * 1024
 ORG_INLINE_BUDGET_BYTES = 10 * 1024 * 1024
+# A PDF's document travels to the render service as base64 inside JSON, so it
+# embeds less.
+PDF_INLINE_BUDGET_BYTES = 5 * 1024 * 1024
 # How many "name (n).ext" spellings an export tries before it gives up.
 _MAX_OUTPUT_NAMES = 100
 # The longest file name the volumes Cowork runs on all take: Linux allows 255
@@ -91,7 +98,12 @@ _MAX_NAME_BYTES = 255
 # and FAT32, and EPERM on Linux vfat. EOPNOTSUPP is ENOTSUP's other spelling.
 _NO_HARD_LINKS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM})
 
-_OUTPUT_EXTENSIONS: dict[ExportFormat, str] = {"html": ".html", "docx": ".docx"}
+_OUTPUT_EXTENSIONS: dict[ExportFormat, str] = {"html": ".html", "docx": ".docx", "pdf": ".pdf"}
+_INLINE_MODES: dict[ExportFormat, InlineMode] = {
+    "html": InlineMode.HTML,
+    "docx": InlineMode.WORD,
+    "pdf": InlineMode.PDF,
+}
 _METADATA = "metadata.json"
 _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
@@ -107,10 +119,12 @@ _NOT_OFFERED = "This file can't be exported to that format."
 # of its own that can be killed.
 ORG_EXPORT_ENABLED = False
 
-# HTML and Word export share one conversion at a time, and each user and each
-# organization one export at a time. Both hold per process, so every replica
-# admits its own. Nothing waits for a slot: a busy server answers at once.
+# HTML and Word export share one conversion at a time, PDF export has its own,
+# and each user and each organization runs one export at a time. All of them
+# hold per process, so every replica admits its own. Nothing waits for a slot:
+# a busy server answers at once.
 _conversion_limiter = anyio.CapacityLimiter(1)
+_pdf_limiter = anyio.CapacityLimiter(1)
 _running_jobs: set[str] = set()
 
 
@@ -188,8 +202,12 @@ def _read_takes_name(segments: list[str]) -> bool:
 
 
 def export_pdf_settings() -> ExportPdfSettings:
-    """The PDF settings exports run with. No engine is set, so no format list offers PDF."""
-    return ExportPdfSettings(engine=None, render_url=None)
+    """The PDF settings exports run with, read once from the process environment.
+
+    Only a deployment that sets ``COWORK_EXPORT_PDF_ENGINE=render`` and a render
+    service URL there offers PDF.
+    """
+    return get_export_pdf_settings()
 
 
 def org_export_refused(*, org_mode: bool) -> bool:
@@ -272,19 +290,24 @@ def _job_keys(scope: TenantScope | None) -> frozenset[str]:
         keys.add(f"user:{scope.user_id}")
     if scope.org_id:
         keys.add(f"org:{scope.org_id}")
-    return frozenset(keys)
+    # A deployment that names no person, such as the desktop app, serves one,
+    # so its exports run one at a time too, whatever their format.
+    return frozenset(keys or {"local"})
 
 
 @asynccontextmanager
-async def export_slot(*, scope: TenantScope | None) -> AsyncIterator[None]:
+async def export_slot(
+    *, scope: TenantScope | None, export_format: ExportFormat
+) -> AsyncIterator[None]:
     """Admit one export now, or raise ``ExportRefused`` as busy. Nothing waits."""
     keys = _job_keys(scope)
     if keys & _running_jobs:
         raise ExportRefused(ExportRefusal.BUSY, _BUSY)
+    limiter = _pdf_limiter if export_format == "pdf" else _conversion_limiter
     # Its own borrower, so the token is this job's whichever task holds it.
     borrower = object()
     try:
-        _conversion_limiter.acquire_on_behalf_of_nowait(borrower)
+        limiter.acquire_on_behalf_of_nowait(borrower)
     except anyio.WouldBlock as exc:
         raise ExportRefused(ExportRefusal.BUSY, _BUSY) from exc
     _running_jobs.update(keys)
@@ -292,7 +315,24 @@ async def export_slot(*, scope: TenantScope | None) -> AsyncIterator[None]:
         yield
     finally:
         _running_jobs.difference_update(keys)
-        _conversion_limiter.release_on_behalf_of(borrower)
+        limiter.release_on_behalf_of(borrower)
+
+
+def _pdf_client() -> RenderServicePdf:
+    return RenderServicePdf(settings=export_pdf_settings())
+
+
+def _render_pdf(*, source_name: str, html: str) -> bytes:
+    """The PDF of the inlined *html*, from the render service.
+
+    Blocking, like the rest of the export: it runs in the export's worker
+    thread and hands the async render call to the event loop, so the thread
+    waits while the loop does the network I/O. ``RenderPdfFailed`` carries
+    the status the route answers.
+    """
+    request = pdf_request(source_name=source_name, html=html)
+    client = _pdf_client()
+    return anyio.from_thread.run(lambda: client.render(request=request))
 
 
 def _read_source(*, folder: PinnedDir, parts: tuple[str, ...], suffix: str) -> bytes:
@@ -603,10 +643,12 @@ def export_primary_file(
 ) -> ExportResult:
     """Export the artifact's primary file, writing the result beside it.
 
-    Blocking: the route runs it in a worker thread. Raises ``ExportRefused``
+    Blocking: the route runs it in an anyio worker thread (``run_in_threadpool``),
+    which a PDF export needs to reach the event loop. Raises ``ExportRefused``
     for a format the artifact doesn't offer, a source over its size bound,
     Markdown that ``render_markdown`` refuses or a source that can't be
-    opened, and writes nothing then.
+    opened, and ``RenderPdfFailed`` when no usable PDF came back, and writes
+    nothing then.
     """
     org_mode = _org_mode()
     with opened_artifact_folder(source, folder_name) as folder:
@@ -628,17 +670,21 @@ def export_primary_file(
         suffix = PurePosixPath(parts[-1]).suffix.lower()
         title = PurePosixPath(parts[-1]).stem
         data = _read_source(folder=folder, parts=parts, suffix=suffix)
+        if export_format == "pdf":
+            budget = PDF_INLINE_BUDGET_BYTES
+        else:
+            budget = ORG_INLINE_BUDGET_BYTES if org_mode else INLINE_BUDGET_BYTES
         inlined = inline_artifact_html(
             html=_source_html(data=data, suffix=suffix, title=title),
             folder=folder,
             base_parts=parts[:-1],
-            mode=InlineMode.WORD if export_format == "docx" else InlineMode.HTML,
-            limits=InlineLimits(
-                max_total_bytes=ORG_INLINE_BUDGET_BYTES if org_mode else INLINE_BUDGET_BYTES
-            ),
+            mode=_INLINE_MODES[export_format],
+            limits=InlineLimits(max_total_bytes=budget),
         )
         if export_format == "docx":
             output = write_docx(document=inlined, title=title)
+        elif export_format == "pdf":
+            output = _render_pdf(source_name=parts[-1], html=inlined.html)
         else:
             output = _html_export(inlined.html)
         name = _write_beside(
