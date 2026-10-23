@@ -5,12 +5,14 @@ app is absent from the draft port; only a request to that port can.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import io
 import json
 import logging
 import signal
 import socket
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -20,6 +22,7 @@ from cowork.common.structured_logging import console_handler, make_formatter
 from cowork.draft_host import app as draft_app_module
 from cowork.draft_host.app import create_draft_app
 from cowork.draft_host.listener import (
+    DraftListener,
     serve_draft_app,
     start_draft_listener,
     stop_draft_listener,
@@ -217,6 +220,49 @@ async def test_the_draft_port_access_line_never_carries_the_token(draft_env, mon
     assert token not in text
     lines = [json.loads(line) for line in text.splitlines() if line.startswith("{")]
     assert any(line.get("event") == "http_access" and line.get("status_code") == 401 for line in lines)
+
+
+def _stop_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event", None) == "draft_host_stopped"]
+
+
+async def test_a_listener_that_stops_by_itself_is_logged(draft_env, caplog):
+    listener = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
+
+    with caplog.at_level("ERROR", logger="cowork.draft_host.listener"):
+        # Ends the server without going through stop(), as a failure would.
+        listener.server.should_exit = True
+        await listener.task
+        await asyncio.sleep(0)
+
+    [record] = _stop_records(caplog)
+    assert record.levelno == logging.ERROR
+    assert json.loads(make_formatter().format(record))["message"] == "Draft host stopped"
+
+
+async def test_a_crashed_listener_is_logged_with_its_error_type(caplog):
+    async def crash():
+        raise RuntimeError("the draft server broke")
+
+    listener = DraftListener(SimpleNamespace(should_exit=False), asyncio.create_task(crash()))
+
+    with caplog.at_level("ERROR", logger="cowork.draft_host.listener"):
+        with pytest.raises(RuntimeError):
+            await listener.task
+        await asyncio.sleep(0)
+
+    [record] = _stop_records(caplog)
+    assert json.loads(make_formatter().format(record))["error_type"] == "RuntimeError"
+
+
+async def test_a_deliberate_stop_is_not_logged_as_a_failure(draft_env, caplog):
+    listener = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
+
+    with caplog.at_level("INFO", logger="cowork.draft_host.listener"):
+        await listener.stop()
+        await asyncio.sleep(0)
+
+    assert _stop_records(caplog) == []
 
 
 async def test_a_failed_stop_is_logged_and_shutdown_goes_on(caplog):

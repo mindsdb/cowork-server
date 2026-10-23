@@ -46,6 +46,15 @@ class DraftListener:
     def __init__(self, server: uvicorn.Server, task: asyncio.Task) -> None:
         self.server = server
         self.task = task
+        self._stopping = False
+        task.add_done_callback(self._log_unplanned_stop)
+
+    def _log_unplanned_stop(self, task: asyncio.Task) -> None:
+        """Say so when the server ends without stop(): the pod would otherwise
+        keep serving the API with its draft port closed and nothing in the log."""
+        if self._stopping or task.cancelled():
+            return
+        logger.error("Draft host stopped", extra={"event": "draft_host_stopped"}, exc_info=task.exception())
 
     @property
     def port(self) -> int:
@@ -53,6 +62,7 @@ class DraftListener:
         return self.server.servers[0].sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
+        self._stopping = True
         self.server.should_exit = True
         await self.task
 
