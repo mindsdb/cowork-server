@@ -5,7 +5,7 @@ import asyncio
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from threading import Event
+from threading import Event, get_ident
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -195,6 +195,53 @@ def test_simultaneous_first_publish_records_one_tester_before_the_other_uploads(
         with pytest.raises(publish.PublishOwnedByOtherUser):
             bob.result(timeout=5)
     assert len(publisher.uploads) == 1
+
+
+def test_update_keeps_another_pages_record_written_after_its_publish(publisher, monkeypatch):
+    page = publisher.page()
+    publisher.send(page)
+    other = page.with_name("other.html")
+    other.write_text("<html><body>another tester's page</body></html>")
+    monkeypatch.setattr(publish, "desktop_artifact_and_base", lambda raw, *, scope: publish.DesktopArtifact(page, page.parent.parent))
+    monkeypatch.setattr(publish, "desktop_publish_credential", lambda: ("test-key", publisher.endpoint))
+    content_mtime = publish._content_mtime
+    ready, writer_finished = Event(), Event()
+    update_thread = None
+    mtime_reads = 0
+
+    def interleaved_mtime(path):
+        nonlocal mtime_reads
+        if get_ident() == update_thread:
+            mtime_reads += 1
+            if mtime_reads == 2:
+                # The publish already saved its mtime under the folder lock.
+                # A second refresh has read the map outside that lock: let a
+                # different page publish before the stale map can be saved.
+                ready.set()
+                assert writer_finished.wait(5)
+        return content_mtime(path)
+
+    def update():
+        nonlocal update_thread
+        update_thread = get_ident()
+        try:
+            return publish.update_artifact(str(page), scope=ALICE)
+        finally:
+            ready.set()
+
+    monkeypatch.setattr(publish, "_content_mtime", interleaved_mtime)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        updating = pool.submit(update)
+        try:
+            assert ready.wait(5)
+            second = publisher.send(other, BOB)
+        finally:
+            writer_finished.set()
+        updating.result(timeout=5)
+
+    published = json.loads((page.parent / ".published.json").read_text())
+    assert page.name in published
+    assert published[other.name]["report_id"] == second["result"]["report_id"]
 
 
 @pytest.mark.parametrize("operation", ["publish", "delete"])

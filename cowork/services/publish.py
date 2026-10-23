@@ -964,38 +964,21 @@ def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
     `publish_artifact` reuses the stored report_id (→ the lambda mints a new
     version at the same URL), but it would reset access to public if handed no
     access object. So reconstruct the prior access from `.published.json` and
-    pass it through. After republish, refresh `published_mtime` so the badge
-    clears. Raises FileNotFoundError when there's nothing published to update.
+    pass it through. The publish also refreshes `published_mtime` under its
+    folder lock. Raises FileNotFoundError when there's nothing published to update.
     """
     # Path first, credential later: an artifact with nothing published must
     # report that, not "configure your API key".
     found = desktop_artifact_and_base(raw_path, scope=scope)
     artifact, artifacts_base = found.artifact, found.artifacts_base
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
-        artifact, container_dirs=[artifacts_base]
-    )
-    published_json = published_dir / ".published.json"
     access = published_artifact_access(artifact, artifacts_base=artifacts_base)
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
     api_key, publish_url = desktop_publish_credential()
-    result = publish_artifact(
+    return publish_artifact(
         artifact, artifacts_base=artifacts_base, api_key=api_key,
         publish_url=publish_url, access=access, scope=scope,
     )
-
-    # Refresh the mtime snapshot so the cheap gate clears the `modified` badge.
-    try:
-        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
-        fresh_entry = fresh_map.get(published_key)
-        if isinstance(fresh_entry, dict):
-            fresh_entry["published_mtime"] = _content_mtime(published_dir)
-            fresh_map[published_key] = fresh_entry
-            _write_published_map(published_json, fresh_map)
-    except Exception:
-        logger.warning("Could not refresh publish mtime for %s", published_dir, exc_info=True)
-
-    return result
 
 
 def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> ResolvedReport:
