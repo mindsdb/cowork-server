@@ -170,6 +170,10 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 # interpolated into a bogus hostname like api.<garbage>.mindshub.ai.
 _KNOWN_ENV_SLUGS = ("staging", "dev")
 
+# A draft-link token is readable by the artifact's own script and by anyone who
+# can read an access log, so a short signing secret could be brute-forced offline.
+_DRAFT_KEY_MIN_CHARS = 32
+
 
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
@@ -999,7 +1003,8 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DRAFT_LINK_KEYS"),
         description=(
             "Draft-link signing keys as a JSON map {kid: secret}, from the "
-            "mindsdb-secrets Secret. Two kids can be live during a rotation."
+            "mindsdb-secrets Secret. Two kids can be live during a rotation. "
+            "A secret shorter than 32 characters is ignored."
         ),
     )  # COWORK_DRAFT_LINK_KEYS
     draft_link_kid: str = Field(
@@ -1044,7 +1049,10 @@ class AppSettings(Settings):
         )
 
     def draft_link_keyring(self) -> dict[str, str]:
-        """COWORK_DRAFT_LINK_KEYS parsed; an unreadable value is no keys at all."""
+        """COWORK_DRAFT_LINK_KEYS parsed; an unreadable value is no keys at all.
+
+        A secret shorter than 32 characters is dropped like a non-string one.
+        """
         raw = self.draft_link_keys.strip()
         if not raw:
             return {}
@@ -1057,7 +1065,10 @@ class AppSettings(Settings):
         return {
             kid: secret
             for kid, secret in parsed.items()
-            if isinstance(kid, str) and kid and isinstance(secret, str) and secret
+            if isinstance(kid, str)
+            and kid
+            and isinstance(secret, str)
+            and len(secret) >= _DRAFT_KEY_MIN_CHARS
         }
 
     def draft_links_enabled(self) -> bool:

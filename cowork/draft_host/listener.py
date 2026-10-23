@@ -94,7 +94,8 @@ async def start_draft_listener() -> DraftListener | None:
         logger.warning(
             "draft_host: COWORK_DRAFT_PORT is set, but org tenancy, COWORK_DRAFT_HOSTS, "
             "COWORK_DRAFT_ORIGIN, COWORK_WEB_ORIGIN or the COWORK_DRAFT_LINK_KID key is "
-            "missing; the draft host answers 404 and previews stay on srcdoc",
+            "missing or shorter than 32 characters; the draft host answers 404 and "
+            "previews stay on srcdoc",
             extra={"event": "draft_host_misconfigured"},
         )
     # Imported here: app.py pulls in the API endpoint modules.

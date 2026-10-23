@@ -7,11 +7,13 @@ import pytest
 
 from cowork.common.settings.app_settings import AppSettings, default_draft_env_label
 
+from draft_host_support import KEYS
+
 CONFIGURED = {
     "COWORK_TENANCY_MODE": "org",
     "COWORK_DRAFT_HOSTS": "draft-staging.artifacts.test",
     "COWORK_DRAFT_ORIGIN": "https://draft-staging.artifacts.test",
-    "COWORK_DRAFT_LINK_KEYS": json.dumps({"k1": "draft-secret"}),
+    "COWORK_DRAFT_LINK_KEYS": json.dumps(KEYS),
     "COWORK_DRAFT_LINK_KID": "k1",
     "COWORK_WEB_ORIGIN": "https://cowork.staging.mindshub.ai",
     "COWORK_DRAFT_PORT": "9011",
@@ -29,7 +31,7 @@ def test_all_six_values_in_org_mode_turn_draft_links_on(configured):
 
     assert settings.draft_links_enabled() is True
     assert settings.draft_host_names() == frozenset({"draft-staging.artifacts.test"})
-    assert settings.draft_link_keyring() == {"k1": "draft-secret"}
+    assert settings.draft_link_keyring() == KEYS
     assert settings.draft_port == 9011
 
 
@@ -72,11 +74,28 @@ def test_host_names_are_normalized(monkeypatch):
 
 
 def test_the_keyring_drops_entries_that_are_not_strings(monkeypatch):
+    secret = "a" * 32
     monkeypatch.setenv(
-        "COWORK_DRAFT_LINK_KEYS", json.dumps({"k1": "a", "k2": 5, "": "b", "k3": ""})
+        "COWORK_DRAFT_LINK_KEYS", json.dumps({"k1": secret, "k2": 5, "": secret, "k3": ""})
     )
 
-    assert AppSettings().draft_link_keyring() == {"k1": "a"}
+    assert AppSettings().draft_link_keyring() == {"k1": secret}
+
+
+def test_the_keyring_drops_secrets_shorter_than_32_characters(monkeypatch):
+    # The token is readable by the artifact's own script and by anyone who can
+    # read an access log, so a short secret could be brute-forced offline.
+    monkeypatch.setenv(
+        "COWORK_DRAFT_LINK_KEYS", json.dumps({"short": "a" * 31, "exact": "b" * 32, "long": "c" * 64})
+    )
+
+    assert AppSettings().draft_link_keyring() == {"exact": "b" * 32, "long": "c" * 64}
+
+
+def test_a_short_secret_for_the_active_kid_leaves_draft_links_off(configured, monkeypatch):
+    monkeypatch.setenv("COWORK_DRAFT_LINK_KEYS", json.dumps({"k1": "a" * 31}))
+
+    assert AppSettings().draft_links_enabled() is False
 
 
 @pytest.mark.parametrize(
