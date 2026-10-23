@@ -29,6 +29,7 @@ OAUTH_SERVICES: dict[str, OAuthServiceConfig] = {
     "github": OAuthServiceConfig(engine="github"),
     "supabase": OAuthServiceConfig(engine="supabase"),
     "posthog": OAuthServiceConfig(engine="posthog"),
+    "figma": OAuthServiceConfig(engine="figma"),
     # HubSpot's method id is "mcp", not `browser_oauth_builtin`, so the local
     # `_oauth_config_for()` finds nothing and `start()`/`callback()` 500 here.
     # That path is unused: desktop runs PKCE in Electron and only needs
