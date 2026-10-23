@@ -5,12 +5,15 @@ This module defines the memory stores for canonical slot files on disk.
 import os
 import re
 import stat
+import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
+
+from anton.core.memory.hippocampus import writer_lock_name
 
 from cowork.common.paths import (
     PinnedDir,
@@ -214,9 +217,36 @@ class MemoryStore:
         with self._root_fd(create=False) as root:
             return dir_lstat(root, name)
 
+    @staticmethod
+    @contextmanager
+    def _writer_lock(root: PinnedDir, name: str) -> Iterator[None]:
+        """Hold the lock anton's Hippocampus takes before it rewrites or appends
+        to slot ``name``, so a background compaction can neither replace this
+        write nor bring back what this delete removed."""
+        if sys.platform == "win32":
+            # No fcntl here, and anton's own lock is a no-op on Windows too.
+            yield
+            return
+        # Imported here: the desktop sidecar also runs on Windows.
+        import fcntl
+
+        # O_NOFOLLOW as for the slot itself. Opened for writing because flock
+        # on NFS (EFS) is emulated with a write lock, which needs a writable fd.
+        lock_fd = dir_open(
+            root,
+            writer_lock_name(name),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(lock_fd)
+
     def write(self, slot_id: MemorySlot | str, content: str) -> None:
         name = self._filename(slot_id)
-        with self._root_fd(create=True) as root:
+        with self._root_fd(create=True) as root, self._writer_lock(root, name):
             # O_NOFOLLOW refuses a symlink squatting the slot name (writing
             # through it would land in another org); a real slot file opens
             # normally and is truncated.
@@ -248,7 +278,7 @@ class MemoryStore:
             return
         name = self._filename(slot_id)
         payload = content.encode("utf-8") if isinstance(content, str) else content
-        with self._root_fd(create=True) as root:
+        with self._root_fd(create=True) as root, self._writer_lock(root, name):
             sfd = dir_open(
                 root,
                 name,
@@ -260,13 +290,20 @@ class MemoryStore:
 
     def delete(self, slot_id: MemorySlot | str) -> None:
         name = self._filename(slot_id)
-        try:
-            with self._root_fd(create=False) as root:
+        with ExitStack() as stack:
+            try:
+                root = stack.enter_context(self._root_fd(create=False))
+            except OSError:
+                return
+            # Outside the quiet return: a lock that cannot be taken must fail
+            # the delete, not report a slot cleared that compaction may restore.
+            stack.enter_context(self._writer_lock(root, name))
+            try:
                 st = dir_lstat(root, name)
                 if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
                     dir_unlink(root, name)
-        except OSError:
-            return
+            except OSError:
+                return
 
 
 class GlobalMemoryStore(MemoryStore):

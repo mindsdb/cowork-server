@@ -686,6 +686,110 @@ def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
     ]
 
 
+def test_persist_turn_memory_reports_where_the_entries_went(monkeypatch):
+    import cowork.services.shared_resources as shared_resources
+    from cowork.services.memory import TurnMemoryWrite
+
+    project_id = uuid4()
+    conversation = SimpleNamespace(project_id=project_id)
+    project = SimpleNamespace(id=project_id, path="/projects/one")
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return conversation
+
+    class FakeSession:
+        scope = _FakeScope()
+
+        def get(self, model, ident):
+            return project
+
+        def refresh(self, row):
+            pass
+
+    class FakeAccess:
+        def __init__(self, session, principal):
+            pass
+
+        @contextmanager
+        def coordination_lock(self, kind, key):
+            yield
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "apply_turn_memory", lambda scope, path, entries, **kwargs: 2)
+    monkeypatch.setattr(shared_resources, "SharedResourceAccess", FakeAccess)
+
+    entries = [
+        {"text": "Reply briefly", "kind": "always", "scope": "global"},
+        {"text": "Use the shared style", "kind": "always", "scope": "project"},
+        {"text": "not a memory"},
+    ]
+    written = ResponsesHandler._persist_turn_memory(FakeSession(), uuid4(), entries, object())
+
+    assert written == TurnMemoryWrite(project_id=project_id, personal=1, project=1)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_a_saved_turn_memory_starts_compaction_only_when_switched_on(monkeypatch, enabled):
+    from cowork.services.memory import TurnMemoryWrite
+
+    monkeypatch.setenv("COWORK_TURN_MEMORY_COMPACTION_ENABLED", "true" if enabled else "false")
+    handler = _remote_handler(monkeypatch, {})
+    project_id = uuid4()
+    monkeypatch.setattr(
+        ResponsesHandler,
+        "_persist_turn_memory",
+        staticmethod(lambda session, conv_id, entries, principal: TurnMemoryWrite(project_id, 2, 1)),
+    )
+    started = []
+    monkeypatch.setattr(responses_mod, "start_compaction", lambda **kwargs: started.append(kwargs))
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_memory", {"entries": [{"text": "remember"}]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    if not enabled:
+        assert started == []
+        return
+    assert len(started) == 1
+    assert started[0]["principal"] is handler.principal
+    assert started[0]["project_id"] == project_id
+    assert (started[0]["personal_entries"], started[0]["project_entries"]) == (2, 1)
+
+
+async def test_a_failed_memory_save_starts_no_compaction(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_MEMORY_COMPACTION_ENABLED", "true")
+    handler = _remote_handler(monkeypatch, {})
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_turn_memory", staticmethod(lambda session, conv_id, entries, principal: None),
+    )
+    started = []
+    monkeypatch.setattr(responses_mod, "start_compaction", lambda **kwargs: started.append(kwargs))
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_memory", {"entries": [{"text": "remember"}]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert started == []
+
+
 def _units_on_the_test_database(monkeypatch, *, scope=None):
     """The real units, each in a worker thread on the test database, for a
     test that needs a unit to block or a cancel to wait for one. They run in

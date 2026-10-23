@@ -263,6 +263,7 @@ async def lifespan(app: FastAPI):
         from cowork.common.http_client import close_proxy_client
         from cowork.coding.inference_proxy import close_inference_client
         from cowork.services.artifacts import shutdown_launched_backends
+        from cowork.services.memory_compaction import cancel_compactions
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
         from cowork.streaming.registry import registry
@@ -278,6 +279,7 @@ async def lifespan(app: FastAPI):
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        await cancel_compactions()
         # After both turn drains above: each turn they unwound has queued the
         # close of its scratchpad processes, and those must finish before the
         # event loop stops.

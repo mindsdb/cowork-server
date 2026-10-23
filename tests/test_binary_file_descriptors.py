@@ -16,7 +16,7 @@ import pytest
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.api.v1.endpoints import project_files as project_files_ep
 from cowork.common import paths
-from cowork.harnesses.memory.registry import MemorySlot
+from cowork.harnesses.memory.registry import SLOT_REGISTRY, MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.services import files as files_service
 from cowork.services.artifacts import ProjectArtifacts
@@ -183,8 +183,7 @@ def test_stage_attachment_replaces_a_text_mode_copy(tmp_path):
 def _memory_slot_with_bytes(root: Path, payload: bytes) -> GlobalMemoryStore:
     store = GlobalMemoryStore(root=root)
     store.write(MemorySlot.RULES, "placeholder")
-    (slot_file,) = [entry for entry in root.iterdir() if entry.is_file()]
-    slot_file.write_bytes(payload)
+    (root / SLOT_REGISTRY[MemorySlot.RULES].filename).write_bytes(payload)
     return store
 
 
