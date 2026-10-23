@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.coding.questions import PendingQuestion
@@ -31,6 +31,19 @@ class WorkspaceKind(str, Enum):
     git_worktree = "git_worktree"
     local_copy = "local_copy"
     direct_folder = "direct_folder"
+
+
+class WorkspaceMode(str, Enum):
+    """How a task's workspace relates to the user's folder.
+
+    The mode is the user's choice; ``WorkspaceKind`` is what preparation
+    produced for it. ``in_place`` works in the user's own folder and maps to
+    ``direct_folder``; ``worktree`` isolates the task and maps to
+    ``git_worktree`` or, for a folder without Git, ``local_copy``.
+    """
+
+    in_place = "in_place"
+    worktree = "worktree"
 
 
 class PermissionMode(str, Enum):
@@ -399,6 +412,9 @@ class CodingSession(BaseModel):
     source_path: str
     workspace_path: str
     workspace_kind: WorkspaceKind
+    # ``None`` identifies tasks created before the mode was recorded; they
+    # were all isolated, so treat them as ``worktree``.
+    workspace_mode: WorkspaceMode | None = None
     workspaces: list[TaskWorkspace] = Field(default_factory=list)
     repository_root: str | None = None
     base_revision: str | None = None
@@ -529,7 +545,15 @@ class SessionCreateRequest(BaseModel):
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list, max_length=16)
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
-    allow_direct_folder: bool = False
+    # ``None`` lets the server choose from the project and the computer.
+    workspace_mode: WorkspaceMode | None = None
+    # Lets an isolated task on a folder without Git copy that folder. Older
+    # clients send it as ``allow_direct_folder``, a name from before tasks
+    # could run in the folder itself.
+    allow_folder_copy: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("allow_folder_copy", "allow_direct_folder"),
+    )
     source_contexts: list[SourceContext] = Field(default_factory=list, max_length=12)
 
     @model_validator(mode="after")
