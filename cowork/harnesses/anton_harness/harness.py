@@ -878,6 +878,7 @@ class AntonHarness:
         tool_messages: bool = False,
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
+        interactive: bool = True,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1023,6 +1024,7 @@ class AntonHarness:
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                interactive=interactive,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1326,6 +1328,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
+        interactive: bool = True,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1390,6 +1393,7 @@ class AntonHarness:
             build_cowork_request_credentials_tool,
             build_cowork_create_skill_draft_tool,
         )
+        from .schedule_tools import build_schedule_tools
         CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
@@ -1441,6 +1445,16 @@ class AntonHarness:
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
+        elicitor = build_elicitor(str(conversation.id))
+        # Every change to a scheduled task waits on a card the user confirms,
+        # so the tools exist only where someone can: not in a scheduled run
+        # (a task must not rewrite itself unattended), a channel bot, or a
+        # deployment with questions off.
+        schedule_tools = (
+            build_schedule_tools(project_id=conversation.project_id)
+            if interactive and elicitor is not None and channel_context is None
+            else []
+        )
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -1888,7 +1902,7 @@ class AntonHarness:
                 initial_history=initial_history,
                 # history_store=history_store,
                 session_id=str(conversation.id),
-                elicitor=build_elicitor(str(conversation.id)),
+                elicitor=elicitor,
                 # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
                 # are attributed to the active harness. self.id == "anton".
                 harness=self.id,
@@ -1929,6 +1943,7 @@ class AntonHarness:
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
+                    *schedule_tools,
                     *mcp_tool_defs,
                 ],
                 # Same gate as the discovery call above, not a second one:
