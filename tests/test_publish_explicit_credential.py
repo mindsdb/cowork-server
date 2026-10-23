@@ -259,7 +259,10 @@ def test_unpublish_preserves_authority_status_and_the_publish_record(artifact, m
     (folder / ".published.json").write_text(json.dumps(record))
 
     def reject(*args, **kwargs):
-        body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+        body = (
+            {"code": "permission_denied"} if status == 403
+            else {"error": "Auth unavailable", "code": "auth_unavailable"}
+        )
         raise HTTPError("https://publish.example/delete/rid", status, "Rejected", {},
                         io.BytesIO(json.dumps(body).encode()))
 
@@ -288,7 +291,7 @@ def test_agent_publish_tool_wrapper_still_works(artifact, monkeypatch):
     )
     monkeypatch.setattr(
         p, "desktop_publish_context",
-        lambda raw, session=None: (
+        lambda raw, *, scope, session=None: (
             folder, base, "desktop-key", "https://api.staging.mindshub.ai"
         ),
     )

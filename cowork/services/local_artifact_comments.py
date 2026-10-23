@@ -18,6 +18,7 @@ from cowork.services.artifact_identity import (
     artifact_key,
     resolve_artifact_folder,
 )
+from cowork.db.scoped import TenantScope
 from cowork.services.artifact_lock import artifact_lock
 from cowork.services.artifact_roots import artifacts_sources_for_desktop_paths
 
@@ -37,14 +38,23 @@ def _now() -> str:
 
 
 class LocalArtifactComments:
-    """Small atomic journal with the same response shape as inference comments."""
+    """Small atomic journal with the same response shape as inference comments.
+
+    The artifact is found only among ``scope``'s artifacts roots, so another
+    person's artifact id answers 404.
+    """
 
     def __init__(
-        self, artifact_id: str, session: "ScopedSession | None" = None
+        self,
+        artifact_id: str,
+        *,
+        scope: TenantScope | None,
+        session: ScopedSession | None = None,
     ) -> None:
         try:
             _, folder, _ = resolve_artifact_folder(
-                artifacts_sources_for_desktop_paths(session), artifact_id
+                artifacts_sources_for_desktop_paths(scope=scope, session=session),
+                artifact_id,
             )
         except ArtifactIdentityConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -233,9 +243,11 @@ async def handle_local_comments(
     request: Request,
     artifact_id: str,
     subpath: str,
-    session: "ScopedSession | None" = None,
+    *,
+    scope: TenantScope | None,
+    session: ScopedSession | None = None,
 ):
-    service = LocalArtifactComments(artifact_id, session)
+    service = LocalArtifactComments(artifact_id, scope=scope, session=session)
     parts = [part for part in subpath.split("/") if part]
     method = request.method.upper()
     try:
@@ -268,9 +280,9 @@ async def handle_local_comments(
 
 
 def local_comments_stream(
-    artifact_id: str, session: "ScopedSession | None" = None
+    artifact_id: str, *, scope: TenantScope | None, session: ScopedSession | None = None
 ) -> StreamingResponse:
-    service = LocalArtifactComments(artifact_id, session)
+    service = LocalArtifactComments(artifact_id, scope=scope, session=session)
 
     async def events():
         previous = {

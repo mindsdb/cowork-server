@@ -36,7 +36,7 @@ def test_desktop_project_path_keeps_local_card_addressing(tmp_path, monkeypatch)
         project_name=project.name,
     )
     monkeypatch.setattr(
-        artifacts, "artifacts_sources_for_desktop_paths", lambda session=None: [source]
+        artifacts, "artifacts_sources_for_desktop_paths", lambda *, scope, session=None: [source]
     )
 
     cards = artifacts._desktop_artifacts_for_project_path(
@@ -115,7 +115,7 @@ def test_local_comments_id_is_canonical_before_identity_lookup(monkeypatch):
     seen = {}
     monkeypatch.setattr(comments, "_org_mode", lambda: False)
     monkeypatch.setattr(
-        comments, "artifacts_sources_for_desktop_paths", lambda _session=None: []
+        comments, "artifacts_sources_for_desktop_paths", lambda *, scope, session=None: []
     )
 
     def resolve(_sources, artifact_id):
@@ -187,12 +187,16 @@ async def test_status_path_only_selects_a_server_built_card(tmp_path, monkeypatc
         root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        artifacts, "artifacts_sources_for_desktop_paths", lambda session=None: [source]
+        artifacts, "artifacts_sources_for_desktop_paths", lambda *, scope, session=None: [source]
     )
 
-    result = await artifacts.artifact_status(None, path=str(primary))
-    outside = await artifacts.artifact_status(None, path=str(tmp_path / "outside"))
-    missing_child = await artifacts.artifact_status(None, path=str(folder / "does-not-exist"))
+    result = await artifacts.artifact_status(scope=LOCAL_SCOPE, session=None, path=str(primary))
+    outside = await artifacts.artifact_status(
+        scope=LOCAL_SCOPE, session=None, path=str(tmp_path / "outside")
+    )
+    missing_child = await artifacts.artifact_status(
+        scope=LOCAL_SCOPE, session=None, path=str(folder / "does-not-exist")
+    )
 
     assert result["publishedUrl"] == "https://example.test/artifact"
     assert result["modified"] is False
@@ -229,10 +233,10 @@ async def test_status_lookup_preserves_published_loose_files(tmp_path, monkeypat
         root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        artifacts, "artifacts_sources_for_desktop_paths", lambda session=None: [source]
+        artifacts, "artifacts_sources_for_desktop_paths", lambda *, scope, session=None: [source]
     )
 
-    result = await artifacts.artifact_status(None, path=str(loose))
+    result = await artifacts.artifact_status(scope=LOCAL_SCOPE, session=None, path=str(loose))
 
     assert result["publishedUrl"] == "https://example.test/legacy"
     assert result["accessMode"] == "password"

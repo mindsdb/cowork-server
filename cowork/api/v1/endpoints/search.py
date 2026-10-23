@@ -19,9 +19,8 @@ from cowork.services.schedules import ScheduleService
 # (MissingTenantScopeError -> 401, cowork/db/scoped.py) whenever org mode has
 # no org in scope. Declaring it too makes the requirement visible to a route
 # walker instead of something only discoverable by reading scoped.py. (The
-# artifact listing is a separate, desktop-only filesystem scan that resolves
-# empty in org mode by construction — see _projects_root's docstring in
-# cowork/services/artifacts.py — so it needs nothing of its own.)
+# artifact listing is a separate, desktop-only filesystem scan of the caller's
+# own projects root; org mode skips it explicitly below.)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
@@ -81,8 +80,16 @@ async def search_cowork(
                 "score": score,
             })
 
-    # Artifacts
-    for artifact in _list_artifacts(_desktop_sources(scoped)):
+    # Artifacts: the caller's own projects root (a person's partition where
+    # projects are personal) and the folders they chose. Hosted search has
+    # never listed artifacts, and the scan of an org's projects root would
+    # start to, so org mode skips it.
+    artifacts = (
+        []
+        if scoped.scope.org_mode
+        else _list_artifacts(_desktop_sources(scope=scoped.scope, session=scoped))
+    )
+    for artifact in artifacts:
         text = " ".join([
             artifact.get("title") or "",
             artifact.get("description") or "",

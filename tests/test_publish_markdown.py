@@ -66,10 +66,12 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, is_fullstack
     )
     monkeypatch.setattr(
         publish, "get_app_settings",
-        lambda: SimpleNamespace(connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))),
+        lambda: SimpleNamespace(
+            tenancy_mode="local", connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))
+        ),
     )
     monkeypatch.setattr(
-        publish, "resolve_artifact_path", lambda raw, allow_dir=True, session=None: target
+        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True: target
     )
     monkeypatch.setattr(
         publish, "_resolve_publish_target",

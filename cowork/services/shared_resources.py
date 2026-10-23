@@ -343,7 +343,20 @@ class SharedResourceAccess:
         fallback_creator_id: str | None = None,
         fallback_modified_at: datetime | None = None,
     ) -> ResourceAttribution:
-        row = self._find(kind, key) if self.org_mode else None
+        if not self.org_mode:
+            # Nobody else's authorship to report. Outside org mode no claim row
+            # exists, and the only ids a fallback can carry are the caller's
+            # own (creator_id answers actor_id there, built-ins included) or
+            # the creator of a row in the caller's own partition. Principal
+            # carries no email on a trusted-identity deployment, so naming
+            # either would render as "Another member". The desktop has no
+            # actor at all, so it reports none either way.
+            return ResourceAttribution(
+                created_by=None,
+                last_modified_by=None,
+                last_modified_at=fallback_modified_at,
+            )
+        row = self._find(kind, key)
         if row is not None:
             if row.pending_claim_token:
                 return ResourceAttribution(

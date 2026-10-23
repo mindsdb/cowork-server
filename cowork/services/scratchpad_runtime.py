@@ -15,14 +15,35 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
+
+from cowork.code_sandbox import refuse_a_missing_policy
+
+if TYPE_CHECKING:
+    from anton.core.backends.sandbox import CellSandbox
 
 
 MAX_PADS = int(os.environ.get("ANTON_SERVER_MAX_PADS", "5"))
 
 
-_pads: dict[str, object] = {}  # name -> LocalScratchpadRuntime
+# Keyed by resolved workspace, then by pad name. An artifact's slug names its
+# pad, and a slug is unique only inside one project: two people's projects can
+# each hold `sales-dashboard`. A registry keyed by name alone handed the second
+# project the first one's runtime, so its requirements installed into, and its
+# backend ran from, a venv inside the other project's folder. MAX_PADS caps
+# each workspace on its own for the same reason.
+_pads: dict[Path, dict[str, _CachedPad]] = {}  # workspace -> name -> pad
 last_activity: float = time.time()
+
+
+class _CachedPad(NamedTuple):
+    """A registered pad and the code-sandbox policy it was built with
+    (cowork.code_sandbox.build_cell_sandbox), None with the sandbox off. The
+    policy binds when the pad starts, so a later caller asking for the same
+    pad under another policy is refused rather than handed this one."""
+
+    runtime: object  # LocalScratchpadRuntime
+    cell_sandbox: CellSandbox | None
 
 
 def _touch_activity() -> None:
@@ -106,12 +127,14 @@ def _resolve_coding(
 def _make_runtime(
     name: str,
     *,
-    workspace_path: Optional[str],
+    workspace: Path,
     coding_provider: str,
     coding_model: str,
     coding_api_key: str,
     coding_base_url: str,
+    cell_sandbox: CellSandbox | None = None,
 ):
+    refuse_a_missing_policy(cell_sandbox, site="a backend pool's scratchpad")
     from anton.core.backends.local import LocalScratchpadRuntime
 
     return LocalScratchpadRuntime(
@@ -120,13 +143,16 @@ def _make_runtime(
         coding_model=coding_model,
         coding_api_key=coding_api_key,
         coding_base_url=coding_base_url,
-        workspace_path=_resolve_workspace(workspace_path),
+        workspace_path=workspace,
+        # Passed only when set, so with the sandbox off the call is today's.
+        **({} if cell_sandbox is None else {"cell_sandbox": cell_sandbox}),
     )
 
 
-def get(name: str):
+def get(name: str, *, workspace_path: Optional[str] = None):
     _touch_activity()
-    return _pads.get(name)
+    cached = _pads.get(_resolve_workspace(workspace_path), {}).get(name)
+    return None if cached is None else cached.runtime
 
 
 def get_or_create(
@@ -137,11 +163,21 @@ def get_or_create(
     coding_model: str = "",
     coding_api_key: str = "",
     coding_base_url: str = "",
+    cell_sandbox: CellSandbox | None = None,
 ):
+    refuse_a_missing_policy(cell_sandbox, site="a backend pool's scratchpad")
     _touch_activity()
-    if name in _pads:
-        return _pads[name]
-    if len(_pads) >= MAX_PADS:
+    workspace = _resolve_workspace(workspace_path)
+    pads = _pads.setdefault(workspace, {})
+    cached = pads.get(name)
+    if cached is not None:
+        if cached.cell_sandbox != cell_sandbox:
+            raise RuntimeError(
+                f"Scratchpad {name!r} in {workspace} runs under another code-sandbox "
+                "policy than this caller's; close it before starting it under this one."
+            )
+        return cached.runtime
+    if len(pads) >= MAX_PADS:
         raise RuntimeError(
             f"Maximum concurrent scratchpads ({MAX_PADS}) reached. "
             f"Close an existing pad first."
@@ -154,31 +190,32 @@ def get_or_create(
     )
     pad = _make_runtime(
         name,
-        workspace_path=workspace_path,
+        workspace=workspace,
         coding_provider=provider,
         coding_model=model,
         coding_api_key=api_key,
         coding_base_url=base_url,
+        cell_sandbox=cell_sandbox,
     )
-    _pads[name] = pad
+    pads[name] = _CachedPad(pad, cell_sandbox)
     return pad
 
 
-def remove(name: str) -> None:
-    _pads.pop(name, None)
+def remove(name: str, *, workspace_path: Optional[str] = None) -> None:
+    _pads.get(_resolve_workspace(workspace_path), {}).pop(name, None)
 
 
-def list_pads() -> list[str]:
-    return list(_pads.keys())
+def list_pads(*, workspace_path: Optional[str] = None) -> list[str]:
+    return list(_pads.get(_resolve_workspace(workspace_path), {}))
 
 
 async def close_all() -> None:
-    for name in list(_pads):
-        try:
-            pad = _pads[name]
-            await pad.close()
-        except Exception:
-            pass
+    for pads in list(_pads.values()):
+        for cached in list(pads.values()):
+            try:
+                await cached.runtime.close()
+            except Exception:
+                pass
     _pads.clear()
 
 
@@ -191,9 +228,10 @@ class WorkspaceScopedPool:
     — fast no-op when the deterministic disk path
     (`<workspace>/.anton/scratchpad-venvs/<name>/`) already exists,
     full `uv venv` / `python -m venv` creation when it doesn't. The
-    runtime is registered in the module-level pool so subsequent
-    `get_or_create` calls (e.g. for `install_packages`) reuse the same
-    instance.
+    runtime is registered in the module-level pool under this workspace,
+    so subsequent `get_or_create` calls (e.g. for `install_packages`)
+    reuse the same instance, and a same-named pad of another workspace
+    is never handed out here.
 
     Note: anton's `_ensure_venv` is a private sync method that returns
     None and populates `_venv_python` on success. We touch both
@@ -201,17 +239,28 @@ class WorkspaceScopedPool:
     using `start()` would be heavier (spawns the scratchpad subprocess)
     and unnecessary — `launch_artifact_backend` only needs the path
     to the venv's python binary.
+
+    `cell_sandbox` is the policy (cowork.code_sandbox.build_cell_sandbox)
+    every pad of this pool runs under, None with the sandbox off. anton's
+    `launch_artifact_backend` reads it off the pool and refuses a backend
+    when it is set.
     """
 
-    def __init__(self, workspace_path: str):
+    def __init__(self, workspace_path: str, *, cell_sandbox: CellSandbox | None = None):
         self._workspace_path = workspace_path
+        self.cell_sandbox = cell_sandbox
 
     async def venv_python(self, name: str) -> Optional[str]:
-        pad = get_or_create(name, workspace_path=self._workspace_path)
+        pad = self._pad(name)
         # Off-thread because `_ensure_venv` may shell out to `uv venv` /
         # `python -m venv` on first call (cold-start cost is seconds).
         await asyncio.to_thread(pad._ensure_venv)
         return pad._venv_python
 
     async def get_or_create(self, name: str):
-        return get_or_create(name, workspace_path=self._workspace_path)
+        return self._pad(name)
+
+    def _pad(self, name: str):
+        return get_or_create(
+            name, workspace_path=self._workspace_path, cell_sandbox=self.cell_sandbox
+        )

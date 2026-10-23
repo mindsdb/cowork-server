@@ -499,12 +499,13 @@ def test_a_fullstack_backend_can_launch_from_a_chosen_folder(
     _adopt(client, folder, "routes-fullstack")
 
     monkeypatch.setattr(artifacts_service, "_probe_port", lambda port, **kw: False)
+    monkeypatch.setattr(artifacts_service, "_LAUNCHED_BACKENDS", {})
 
     pool_roots: list[str] = []
     launched: list[Path] = []
 
     class _Pool:
-        def __init__(self, root: str) -> None:
+        def __init__(self, root: str, **_kwargs) -> None:
             pool_roots.append(root)
 
     async def _launch(
@@ -543,7 +544,7 @@ def test_the_agent_publish_tool_resolves_a_chosen_folder(
 
     seen = {}
 
-    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, access=None):
+    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, access=None, scope=None):
         seen["artifact"] = Path(artifact)
         seen["base"] = Path(artifacts_base)
         return {"view_url": "https://4nton.ai/a/uuid-tool"}
@@ -580,7 +581,30 @@ def test_the_agent_publish_tool_opens_no_session_in_org_mode(monkeypatch):
     )
 
     try:
-        with tools._desktop_scope() as scope:
-            assert scope is None
+        with tools._desktop_scope(None) as session:
+            assert session is None
+    finally:
+        get_app_settings.cache_clear()
+
+
+def test_the_agent_publish_tool_opens_no_operator_session_for_an_unbound_turn(monkeypatch):
+    """Where identity headers are trusted, LOCAL_SCOPE is the operator view of
+    every person's rows, so a turn with no bound scope must not fall back to it."""
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db import session as db_session
+    from cowork.harnesses.anton_harness import tools
+
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    get_app_settings.cache_clear()
+    monkeypatch.setattr(
+        db_session,
+        "get_open_session",
+        lambda *a, **kw: pytest.fail("an unbound turn opened an operator session"),
+    )
+
+    try:
+        assert get_app_settings().trust_identity_headers
+        with tools._desktop_scope(None) as session:
+            assert session is None
     finally:
         get_app_settings.cache_clear()

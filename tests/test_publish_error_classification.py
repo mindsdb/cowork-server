@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import publish
-from cowork.services.publish import PublisherUnavailable
+from cowork.services.publish import PublisherUnavailable, PublishOwnedByOtherUser
 
 
 def _client() -> TestClient:
@@ -39,7 +39,9 @@ def _patch_context():
     exception-mapping tests below must get past that step to reach `_publish`."""
     return patch.object(
         publish_ep, "_desktop_context",
-        lambda raw, session=None: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
+        lambda raw, *, scope, session=None: (
+            Path(raw), Path(raw).parent, "key", "https://4nton.ai"
+        ),
     )
 
 
@@ -67,6 +69,22 @@ def test_upstream_runtime_error_always_maps_to_502(exc):
     assert res.json()["detail"] == str(exc)
 
 
+@pytest.mark.parametrize("route, target", [
+    ("/api/v1/publish/", "_publish"),
+    ("/api/v1/publish/update", "_update"),
+])
+def test_a_report_owned_by_another_account_is_409_with_its_code(route, target):
+    """An HTTPException passes the RuntimeError -> 502 ladder untouched, so the
+    client gets the code it matches on instead of a 502."""
+    with _patch_context(), patch.object(publish_ep, target, side_effect=PublishOwnedByOtherUser()):
+        res = _client().post(route, json={"path": "/some/art"})
+    assert res.status_code == 409
+    assert res.json()["detail"] == {
+        "code": "artifact_owned_by_other_user",
+        "message": "This artifact was published by another owner.",
+    }
+
+
 def test_publisher_unavailable_maps_to_503():
     """The local "a publish dependency didn't import" case is still a 503,
     now via the exception type instead of message sniffing."""
@@ -91,10 +109,12 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, publish_side
     )
     monkeypatch.setattr(
         publish, "get_app_settings",
-        lambda: SimpleNamespace(connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))),
+        lambda: SimpleNamespace(
+            tenancy_mode="local", connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))
+        ),
     )
     monkeypatch.setattr(
-        publish, "resolve_artifact_path", lambda raw, allow_dir=True, session=None: target
+        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True: target
     )
     monkeypatch.setattr(
         publish, "_resolve_publish_target",
@@ -160,3 +180,116 @@ def test_an_unconfirmed_publisher_403_is_not_a_permission_denial(tmp_path, monke
     with pytest.raises(RuntimeError) as error:
         publish.publish_artifact(page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
     assert "HTTP 403" in str(error.value)
+
+
+def _upstream(status: int, body, reason: str = "Rejected") -> urllib.error.HTTPError:
+    import io
+    import json
+
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return urllib.error.HTTPError("https://publish.example/upload", status, reason, {}, io.BytesIO(raw))
+
+
+def _publish_failing_with(tmp_path, monkeypatch, exc):
+    page = tmp_path / "report.html"
+    page.write_text("<html></html>")
+    _wire_publish(monkeypatch, tmp_path, page, "report.html", publish_side_effect=exc)
+    return lambda: publish.publish_artifact(
+        page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai",
+    )
+
+
+def test_a_413_is_too_large_not_a_runtime_error(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(413, {"message": "Request Too Long"}, "Payload Too Large"),
+    )
+    with pytest.raises(publish.PublishTooLarge):
+        run()
+
+
+def test_a_4xx_shows_the_upload_service_text(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(
+        403, {"code": "organization_inactive", "error": "This organization is archived or still being provisioned."},
+    ))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: This organization is archived or still being provisioned."
+
+
+def test_a_401_keeps_the_credentials_advice_instead_of_the_server_text(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(401, {"error": "Invalid token"}, "Unauthorized"))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    msg = str(error.value)
+    assert "Invalid token" not in msg
+    assert "invalid or expired credentials" in msg
+
+
+def test_long_server_text_keeps_its_end_where_pip_names_the_cause(tmp_path, monkeypatch):
+    text = "pip install failed: " + "x" * 1000 + " ERROR: No matching distribution found for foo"
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(400, {"error": text}))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    msg = str(error.value)
+    assert msg.startswith("Publishing failed: pip install failed: ")
+    assert msg.endswith("ERROR: No matching distribution found for foo")
+    assert " … " in msg
+    assert len(msg) == len("Publishing failed: ") + 100 + len(" … ") + 400
+
+
+def test_a_5xx_without_server_text_is_framed_as_a_connection_failure(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, _upstream(500, b"boom", "Internal Server Error"))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "Connection failed (HTTP 500" in str(error.value)
+
+
+def test_a_blocked_state_publish_is_shown_to_the_user(tmp_path, monkeypatch):
+    from anton.publisher import StatePublishBlocked
+
+    blocked = StatePublishBlocked("Collections ['notes'] exist in the published version")
+    run = _publish_failing_with(tmp_path, monkeypatch, blocked)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: Collections ['notes'] exist in the published version"
+
+
+def test_a_local_failure_stays_a_plain_runtime_error(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, FileNotFoundError("/data/org-1/proj/missing.js"))
+    with pytest.raises(RuntimeError) as error:
+        run()
+    assert not isinstance(error.value, publish.PublishRejected)
+    assert str(error.value) == "Publishing failed: /data/org-1/proj/missing.js"
+
+
+def test_clip_keeps_short_text_and_the_end_of_long_text():
+    assert publish._clip("a" * 500) == "a" * 500
+    # Up to the clipped length itself, clipping would only lose text.
+    assert publish._clip("a" * 503) == "a" * 503
+    assert publish._clip("H" * 100 + "M" * 4 + "T" * 400) == "H" * 100 + " … " + "T" * 400
+
+
+def test_a_connection_failure_without_an_http_answer_is_shown_to_the_user(tmp_path, monkeypatch):
+    run = _publish_failing_with(tmp_path, monkeypatch, urllib.error.URLError(ConnectionRefusedError()))
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value).startswith("Publishing failed. Connection failed")
+
+
+def test_a_throttled_publish_shows_the_gateway_text(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(429, {"message": "Too Many Requests"}, "Too Many Requests"),
+    )
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: Too Many Requests"
+
+
+def test_a_missing_gateway_route_keeps_the_wrong_endpoint_advice(tmp_path, monkeypatch):
+    run = _publish_failing_with(
+        tmp_path, monkeypatch, _upstream(403, {"message": "Missing Authentication Token"}, "Forbidden"),
+    )
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "Missing Authentication Token" not in str(error.value)
+    assert "wrong server/endpoint" in str(error.value)

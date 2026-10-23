@@ -147,7 +147,7 @@ def test_a_path_inside_an_adopted_folder_resolves_with_a_session(engine, tmp_pat
     primary.write_text("<html></html>")
     ProjectService(_scoped(engine)).create_project("notes", path=folder)
 
-    resolved = resolve_artifact_path(str(primary), session=_scoped(engine))
+    resolved = resolve_artifact_path(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine))
     assert resolved == primary.resolve()
 
 
@@ -165,7 +165,7 @@ def test_the_same_path_is_refused_without_a_session(engine, tmp_path):
     ProjectService(_scoped(engine)).create_project("notes", path=folder)
 
     with pytest.raises(FileNotFoundError):
-        resolve_artifact_path(str(primary))
+        resolve_artifact_path(str(primary), scope=LOCAL_SCOPE)
 
 
 def test_the_artifact_root_climb_stops_at_an_adopted_container(engine, tmp_path):
@@ -187,7 +187,7 @@ def test_the_artifact_root_climb_stops_at_an_adopted_container(engine, tmp_path)
     primary.write_text("<html></html>")
     ProjectService(_scoped(engine)).create_project("notes", path=folder)
 
-    root = _artifact_root_for(primary, session=_scoped(engine))
+    root = _artifact_root_for(primary, scope=LOCAL_SCOPE, session=_scoped(engine))
     assert root == loose.resolve()
     assert root != folder.resolve()
 
@@ -203,7 +203,7 @@ def test_the_serve_url_uses_the_row_name(projects_root, tmp_path):
     target = base / "report" / "index.html"
     target.write_text("<p>x</p>")
 
-    url = serve_url_for(target, artifacts_base=base, project_name="notes-2")
+    url = serve_url_for(target, artifacts_base=base, project_name="notes-2", scope=LOCAL_SCOPE)
     assert url == "/api/v1/artifacts/serve/notes-2/report/index.html"
 
 
@@ -361,7 +361,7 @@ def test_published_state_still_returns_the_blank_default_when_the_database_error
     (artifact / "metadata.json").write_text("{}")
     ProjectService(_scoped(engine)).create_project("notes", path=folder)
 
-    def _locked(_session=None):
+    def _locked(*, scope, session=None):
         raise RuntimeError("database is locked")
 
     # Patched in `publish`, which binds the name at import; patching it in
@@ -370,12 +370,12 @@ def test_published_state_still_returns_the_blank_default_when_the_database_error
     monkeypatch.setattr(publish_service, "_artifact_dirs_for_scope", _locked)
 
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
-        assert published_state(str(primary), _scoped(engine)) == {
+        assert published_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == {
             "report_id": "",
             "url": "",
             "published": False,
         }
-        assert published_owner_state(str(primary), _scoped(engine)) == {}
+        assert published_owner_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == {}
 
     # Blank is what the contract promises, but an outage must not be silent:
     # without this it is indistinguishable from an artifact that is simply
@@ -404,18 +404,18 @@ def test_published_state_reads_the_artifact_roots_once(engine, tmp_path, monkeyp
     (artifact / ".published.json").write_text(json.dumps({"index.html": entry}))
     ProjectService(_scoped(engine)).create_project("notes", path=folder)
 
-    def _second_read(_session=None):
+    def _second_read(*, scope, session=None):
         raise RuntimeError("database is locked")
 
     # Only the binding `resolve_artifact_path` would use; `publish` keeps its own.
     monkeypatch.setattr(artifacts_service, "_artifact_dirs_for_scope", _second_read)
 
-    assert published_state(str(primary), _scoped(engine)) == {
+    assert published_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == {
         "report_id": "uuid-once",
         "url": "https://4nton.ai/a/uuid-once",
         "published": True,
     }
-    assert published_owner_state(str(primary), _scoped(engine)) == entry
+    assert published_owner_state(str(primary), scope=LOCAL_SCOPE, session=_scoped(engine)) == entry
 
 
 def test_a_relative_path_in_two_roots_is_reported_as_ambiguous(engine, tmp_path):
@@ -440,9 +440,9 @@ def test_a_relative_path_in_two_roots_is_reported_as_ambiguous(engine, tmp_path)
     ProjectService(_scoped(engine)).create_project("old-work", path=adopted)
 
     with pytest.raises(ValueError, match="multiple project artifact roots"):
-        resolve_artifact_path("dash/index.html", session=_scoped(engine))
+        resolve_artifact_path("dash/index.html", scope=LOCAL_SCOPE, session=_scoped(engine))
 
     # Without the adopted root in play the same relative path still resolves.
-    assert resolve_artifact_path("dash/index.html") == (
+    assert resolve_artifact_path("dash/index.html", scope=LOCAL_SCOPE) == (
         allocated_dash / "index.html"
     ).resolve()

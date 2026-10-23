@@ -525,7 +525,10 @@ async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
 
     def unpublish(*args, **kwargs):
         assert stage == "unpublish", "Mint denial must stop before unpublishing"
-        body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+        body = (
+            {"code": "permission_denied"} if status == 403
+            else {"error": "Auth unavailable", "code": "auth_unavailable"}
+        )
         raise HTTPError("https://publish.example/delete/rid", status, "Rejected", {},
                         io.BytesIO(json.dumps(body).encode()))
 
@@ -535,6 +538,38 @@ async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
     with pytest.raises(error_type) as error:
         await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
     assert error.value.status_code == status
+    assert (folder / "index.html").read_text() == "<html></html>"
+    assert json.loads((folder / ".published.json").read_text()) == record
+
+
+async def test_delete_keeps_artifact_files_when_the_upload_service_is_unavailable(
+    session, tmp_path, org_mode, monkeypatch,
+):
+    import io
+    from urllib.error import HTTPError
+    from cowork.services.publish import UploadServiceUnavailable
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="publish-down", org_id=ORG_A, slug="dash"
+    )
+    record = {"index.html": {"report_id": "rid", "published": True}}
+    (folder / ".published.json").write_text(json.dumps(record))
+
+    async def mint(**kwargs):
+        return "artifact-key"
+
+    async def revoke(*args, **kwargs):
+        return True
+
+    def unpublish(*args, **kwargs):
+        raise HTTPError("https://publish.example/delete/rid", 503, "Service Unavailable", {},
+                        io.BytesIO(b"Service Unavailable"))
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", mint)
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    monkeypatch.setattr("anton.publisher.unpublish", unpublish)
+    with pytest.raises(UploadServiceUnavailable):
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
     assert (folder / "index.html").read_text() == "<html></html>"
     assert json.loads((folder / ".published.json").read_text()) == record
 
@@ -808,7 +843,7 @@ async def test_desktop_project_path_narrows_to_that_project(
 
     monkeypatch.setattr(
         ep, "artifacts_sources_for_desktop_paths",
-        lambda _session=None: [
+        lambda *, scope, session=None: [
             ep_artifacts.ProjectArtifacts(
                 base=p / ".anton" / "artifacts", project_id=None, project_name=p.name,
             )
@@ -829,7 +864,7 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
     _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="dash")
     monkeypatch.setattr(
         ep, "artifacts_sources_for_desktop_paths",
-        lambda _session=None: [
+        lambda *, scope, session=None: [
             ep_artifacts.ProjectArtifacts(
                 base=(tmp_path / "local" / "mine") / ".anton" / "artifacts",
                 project_id=None, project_name="mine",

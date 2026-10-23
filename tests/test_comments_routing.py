@@ -24,13 +24,15 @@ def artifact(tmp_path: Path, monkeypatch):
 
     state: dict = {"entry": {}}
     monkeypatch.setattr(
-        router, "artifacts_sources_for_desktop_paths", lambda _session=None: []
+        router, "artifacts_sources_for_desktop_paths", lambda *, scope, session=None: []
     )
     monkeypatch.setattr(
         router, "resolve_artifact_folder", lambda _sources, _aid: (object(), folder, {})
     )
     monkeypatch.setattr(
-        router, "published_owner_state", lambda _path, _session=None: state["entry"]
+        router,
+        "published_owner_state",
+        lambda _path, *, scope, session=None: state["entry"],
     )
     monkeypatch.setattr(router, "_org_mode", lambda: False)
     return state

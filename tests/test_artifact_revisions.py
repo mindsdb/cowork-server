@@ -1392,3 +1392,27 @@ def test_auto_pick_skips_a_symlinked_source(tmp_path):
 
     assert rel == "b.html"
     assert target.name == "b.html"
+
+
+def test_agent_repair_prompt_says_how_to_find_the_artifact(artifact):
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Fix the title"}],
+        conversation_id="conversation-1",
+    )
+
+    lines = requested["prompt"].splitlines()
+    source = next(i for i, line in enumerate(lines) if line.startswith("Source path: "))
+    hint = lines[source + 1]
+    assert "`list_artifacts`" in hint and "`match`" in hint
+    # The desktop chat reads `Label: value` lines of this prompt into a card;
+    # the hint must not look like one.
+    assert ":" not in hint.split(" ", 1)[0]
