@@ -686,6 +686,90 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reason", "fallback"),
+    [
+        ("provider", "router_unavailable", True),
+        ("timeout", "router_timeout", True),
+        ("binding", "router_unavailable", True),
+        ("no_model", "router_model_unavailable", True),
+        ("history", "router_unavailable", True),
+        (None, "router_declined_direct_response", False),
+    ],
+)
+async def test_handle_logs_every_router_fallback_at_default_level(
+    monkeypatch, caplog, failure, reason, fallback,
+):
+    """Exercise the request boundary, including failures before the gate runs."""
+    import logging
+    from uuid import uuid4
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    private = "private-provider-response-and-prompt"
+
+    def history(*_args, **_kwargs):
+        if failure == "history":
+            raise RuntimeError(private)
+        return []
+
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
+            message_count=lambda _conversation: 0,
+            get_recent_messages=history,
+        ),
+    )
+    binding = RouterBinding(provider=object(), model="router-model", label="openai_compatible")
+
+    async def resolve_binding():
+        if failure == "binding":
+            raise RuntimeError(private)
+        return (None if failure == "no_model" else binding), None
+
+    async def gate(_binding, *, history):
+        if failure == "provider":
+            raise RuntimeError(private)
+        if failure == "timeout":
+            raise TimeoutError
+        return None
+
+    monkeypatch.setattr(handler, "_router_binding", resolve_binding)
+    monkeypatch.setattr(routing, "_settings_binding", lambda: None)
+    monkeypatch.setattr(routing, "_gate", gate)
+    monkeypatch.setattr(responses, "_spawn_jev_shadow_probe", lambda **kwargs: None)
+
+    class StopBeforeAgent(Exception):
+        pass
+
+    def stop_before_agent():
+        raise StopBeforeAgent
+
+    monkeypatch.setattr(handler, "_get_harness", stop_before_agent)
+    with caplog.at_level(logging.INFO, logger=responses.__name__):
+        with pytest.raises(StopBeforeAgent):
+            await handler.handle(
+                ResponsesRequest(input="Hello", conversation=str(conv_id), stream=False)
+            )
+
+    (record,) = [
+        row for row in caplog.records
+        if row.name == responses.__name__ and row.getMessage().startswith("[responses] route=")
+    ]
+    assert record.levelno == (logging.WARNING if fallback else logging.INFO)
+    assert f"route={DELEGATED_AGENTIC} reason={reason} fallback={fallback}" in record.getMessage()
+    assert f"conversation={conv_id}" in record.getMessage()
+    assert private not in record.getMessage()
+    assert record.exc_info is None
+
+
+@pytest.mark.asyncio
 async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeypatch):
     """ENG-1851: the composer's per-conversation pick drives Anton's turn, not
     the gate. `_route_request` no longer accepts or forwards it."""
