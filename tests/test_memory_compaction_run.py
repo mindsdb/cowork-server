@@ -13,6 +13,7 @@ import pytest
 from anton.core.memory.hippocampus import Hippocampus
 from redis.exceptions import ConnectionError as RedisConnectionError
 
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.services import memory_compaction
 from cowork.services.memory_compaction import MemoryTier, record_attempt
@@ -23,6 +24,7 @@ PERSON = MemoryTier(org_id="org-1", kind="person", owner_id="user-1")
 SLOTS = [MemorySlot.LESSONS, MemorySlot.RULES]
 COUNT_KEY = "cowork:memory-compaction:count:org-1:person:user-1"
 LOCK_KEY = "cowork:memory-compaction:lock:org-1:person:user-1"
+TURN = "6f1c2a9e-0000-4000-8000-000000000001"
 
 
 class _Model:
@@ -87,7 +89,9 @@ def _lessons(root, count: int) -> Hippocampus:
 
 
 async def _compact(world) -> None:
-    await memory_compaction._compact_tier(PERSON, scope=SCOPE, target=(world.root, SLOTS))
+    await memory_compaction._compact_tier(
+        PERSON, scope=SCOPE, turn_correlation_id=TURN, target=(world.root, SLOTS)
+    )
 
 
 async def test_a_due_tier_is_compacted_and_its_count_stored(world):
@@ -99,6 +103,8 @@ async def test_a_due_tier_is_compacted_and_its_count_stored(world):
     assert world.mints[0]["user_id"] == "user-1"
     assert world.mints[0]["org_id"] == "org-1"
     assert world.mints[0]["workspace_id"] == "ws-1"
+    assert world.mints[0]["correlation_id"].startswith(f"{TURN}:compact-")
+    assert len(world.mints[0]["correlation_id"]) <= 59
     assert await world.redis.get(COUNT_KEY) == "1"
     assert await world.redis.get(LOCK_KEY) is None
     assert world.model.closed is True
@@ -158,7 +164,7 @@ async def test_a_failed_mint_keeps_the_file_and_counts_the_attempt(world, monkey
 async def test_the_deadline_stops_a_slow_model(world, monkeypatch):
     hc = _lessons(world.root, 25)
     before = hc._lessons_path.read_bytes()
-    monkeypatch.setattr(memory_compaction, "COMPACTION_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(memory_compaction, "compaction_deadline_seconds", lambda settings: 0.05)
 
     async def hang():
         await asyncio.sleep(5)
@@ -249,7 +255,12 @@ async def test_start_compaction_returns_before_the_model_answers(world, monkeypa
     world.model = _Model(answer=held)
     monkeypatch.setattr(memory_compaction, "GlobalMemoryStore", lambda scope: SimpleNamespace(root=world.root))
     memory_compaction.start_compaction(
-        scope=SCOPE, principal=None, project_id=None, personal_entries=1, project_entries=0
+        scope=SCOPE,
+        principal=None,
+        turn_correlation_id=TURN,
+        project_id=None,
+        personal_entries=1,
+        project_entries=0,
     )
     await reached.wait()
     assert len(memory_compaction._compaction_tasks) == 1
@@ -271,7 +282,9 @@ async def test_a_stored_count_from_an_earlier_attempt_is_respected(world):
 async def test_files_too_short_to_compact_mint_nothing(world):
     _lessons(world.root, 5)
 
-    plans = await memory_compaction._plan_files(SCOPE, world.settings, world.root, SLOTS)
+    plans = await memory_compaction._plan_files(
+        SCOPE, world.settings, TurnQueueSettings(), TURN, world.root, SLOTS
+    )
 
     assert plans == []
     assert world.mints == []
@@ -330,9 +343,30 @@ async def test_redis_down_leaves_memory_alone(world, monkeypatch, caplog):
 
     with caplog.at_level(logging.WARNING, logger="cowork.services.memory_compaction"):
         await memory_compaction._compact_after_turn(
-            scope=SCOPE, principal=None, project_id=None, personal_entries=1, project_entries=0
+            scope=SCOPE,
+            principal=None,
+            turn_correlation_id=TURN,
+            project_id=None,
+            personal_entries=1,
+            project_entries=0,
         )
 
     assert world.mints == []
     assert hc._lessons_path.read_bytes() == before
     assert "ConnectionError" in caplog.text
+    assert "org=org-1 owner=user-1" in caplog.text
+    assert TURN in caplog.text
+
+
+async def test_a_lesson_saved_during_the_model_call_does_not_use_up_the_attempt(world):
+    """Nothing was written, so the next save tries again instead of waiting for ten more."""
+    hc = _lessons(world.root, 25)
+
+    async def save():
+        hc.encode_lesson("Saved by another conversation", topic="late")
+
+    world.model = _Model(answer=save)
+    await _compact(world)
+
+    assert len(hc.get_lessons()) == 26
+    assert await world.redis.get(COUNT_KEY) is None

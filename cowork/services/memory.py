@@ -522,14 +522,13 @@ def apply_project_compaction(
     check and audit an edit from the memory editor takes.
 
     A project renamed or deleted since the plan, a file changed since the plan,
-    or a slot this person may no longer change is skipped. Returns False when a
-    slot was refused: its author changed during the model call, so the attempt
-    was not this person's to count.
+    or a slot this person may no longer change is skipped. Returns whether any
+    slot was rewritten.
     """
     from anton.core.memory.hippocampus import Hippocampus
 
     access = SharedResourceAccess(session, principal)
-    refused = False
+    written = False
     for slot, plan in plans:
         try:
             with _project_slot_coordination(session, access, project_id, slot) as (_project, store, key):
@@ -541,7 +540,6 @@ def apply_project_compaction(
                     resource_exists=lambda: _slot_holds_content(store.read_state(slot)),
                 ) as attribution:
                     if attribution is not None and not access.can_change(attribution.created_by_id):
-                        refused = True
                         continue
                     before = store.read_state(slot)
                     if not plan.apply(Hippocampus(store.root)):
@@ -551,10 +549,11 @@ def apply_project_compaction(
                     except Exception:
                         _restore_project_slot(store, slot, before)
                         raise
+                    written = True
         except (ValueError, HTTPException) as exc:
             # The project is gone, or the slot is gone or still being claimed.
             logger.info("memory-compaction: project %s slot skipped (%s)", slot.value, type(exc).__name__)
-    return not refused
+    return written
 
 
 class PersonMemoryResetError(ValueError):

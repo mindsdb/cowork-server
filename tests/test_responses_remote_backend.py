@@ -764,6 +764,7 @@ async def test_a_saved_turn_memory_starts_compaction_only_when_switched_on(monke
     assert started[0]["principal"] is handler.principal
     assert started[0]["project_id"] == project_id
     assert (started[0]["personal_entries"], started[0]["project_entries"]) == (2, 1)
+    assert started[0]["turn_correlation_id"]
 
 
 async def test_a_failed_memory_save_starts_no_compaction(monkeypatch):

@@ -4,6 +4,7 @@ from __future__ import annotations
 import fakeredis.aioredis as fakeaioredis
 import pytest
 
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.services import memory_compaction
 from cowork.services.memory_compaction import MemoryTier, is_due, record_attempt, tier_lock
 
@@ -68,7 +69,7 @@ async def test_only_one_holder_of_a_tier_lock(redis_client):
 async def test_the_lock_expires_if_its_holder_dies(redis_client):
     async with tier_lock(PERSON):
         ttl = await redis_client.ttl("cowork:memory-compaction:lock:org-1:person:user-1")
-    assert ttl > memory_compaction.COMPACTION_DEADLINE_SECONDS
+    assert ttl > memory_compaction.compaction_deadline_seconds(TurnQueueSettings())
 
 
 async def test_a_late_release_leaves_the_next_holder_alone(redis_client):
@@ -77,3 +78,8 @@ async def test_a_late_release_leaves_the_next_holder_alone(redis_client):
     async with tier_lock(PERSON):
         await redis_client.set(key, "the-next-attempt")
     assert await redis_client.get(key) == "the-next-attempt"
+
+
+def test_the_deadline_leaves_the_turn_key_a_margin():
+    settings = TurnQueueSettings(turn_key_ttl_seconds=1200)
+    assert memory_compaction.compaction_deadline_seconds(settings) == 1080

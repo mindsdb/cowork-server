@@ -1925,6 +1925,7 @@ class ResponsesHandler:
                 start_compaction(
                     scope=scope,
                     principal=self.principal,
+                    turn_correlation_id=corr,
                     project_id=written.project_id,
                     personal_entries=written.personal,
                     project_entries=written.project,
