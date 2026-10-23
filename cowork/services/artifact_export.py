@@ -76,9 +76,11 @@ _HTML_EXPORT_SOURCES = _MARKDOWN_SOURCES | {".txt"}
 _WORD_EXPORT_SOURCES = _HTML_EXPORT_SOURCES | _HTML_SOURCES
 
 # The most of a source an export reads. A page carries its own markup and
-# styles, so HTML gets more room than Markdown or text.
+# styles, so HTML gets more room than Markdown or text. Python-Markdown's slow
+# shapes cost more than their size grows, so a smaller Markdown bound shortens
+# the longest stall a source can cause; agent-written reports stay far below it.
 HTML_SOURCE_MAX_BYTES = 10 * 1024 * 1024
-TEXT_SOURCE_MAX_BYTES = 2 * 1024 * 1024
+TEXT_SOURCE_MAX_BYTES = 512 * 1024
 # The inliner's budget for everything it embeds. Org mode serves many people
 # from small replicas, so it embeds less.
 INLINE_BUDGET_BYTES = 25 * 1024 * 1024
@@ -107,9 +109,11 @@ _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
 
 # Org mode offers no export format, and the route answers 403 there. Measured
-# with docker --cpus=1 --memory=1g, single exports within the org caps held
-# the event loop for 7 s (a ladder of Markdown code fences) or peaked past
-# 500 MiB (a 2 MiB Markdown table, a 10 MiB page of one-word paragraphs);
+# with docker --cpus=1 --memory=1g from a server's own baseline, single exports
+# within the org caps peak past 300 MiB: a 10 MiB page of one-word paragraphs
+# past 500 MiB, and a 512 KiB Markdown table or a report with five 2 MiB
+# images at 330 to 350 MiB. Short unclosed code fences still stall the event
+# loop for seconds and grow faster than their size;
 # scripts/measure_export_capacity.py holds the cases. A replica serves many
 # people at once, so org export waits until the conversion runs in a process
 # of its own that can be killed.

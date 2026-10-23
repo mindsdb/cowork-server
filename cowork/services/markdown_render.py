@@ -22,7 +22,7 @@ from markdown.util import ETX, STX
 # The longest run of backticks or tildes a fence may open with. Python-Markdown
 # looks for each unclosed fence's closer through the rest of the document, so
 # a ladder of ever-longer fences, which no real document needs, holds the
-# whole process for about a minute at the 2 MiB read bound. The cap refuses
+# whole process for about a minute in 2 MiB of Markdown. The cap refuses
 # only the ladder: an unclosed fence of any length still makes that search,
 # so many short unclosed fences still stall a conversion.
 MAX_FENCE_LENGTH = 32
