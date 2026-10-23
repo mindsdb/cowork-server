@@ -155,6 +155,11 @@ dependencies = [
     # it in transitively with lower bounds that still allow 2.13.
     "pyjwt>=2.15.0",
     "structlog==26.1.0",
+    # Teams channel (cowork/channels/teams_client.py). Linux only: Teams runs
+    # only on a server Cowork, so desktop installs don't need them. A main
+    # dependency rather than an extra because the server image installs none.
+    "microsoft-teams-api>=2.1.1; sys_platform == 'linux'",
+    "msal>=1.37.0; sys_platform == 'linux'",
 ]
 
 [project.urls]

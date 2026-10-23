@@ -427,6 +427,18 @@ mcp-types==2.2.0 \
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
     --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
+microsoft-teams-api==2.1.1 ; sys_platform == 'linux' \
+    --hash=sha256:795602d6abc97e4dca334f2478fc0b07968fcc78f3aa5718e2d42fdd8f94dad6 \
+    --hash=sha256:b477006fc070d5315edd2042736c78cf52f5008167d9662804b7a0c5f07ac780
+microsoft-teams-cards==2.1.1 ; sys_platform == 'linux' \
+    --hash=sha256:22add69316354320fbea1ac31e7069c07ff920b01579d515f1778e52d9f56c75 \
+    --hash=sha256:5308d7f651b320be53b50b6ef9f9fa26710e69d894c21fe4c691d64c19636dd0
+microsoft-teams-common==2.1.1 ; sys_platform == 'linux' \
+    --hash=sha256:12b9866feaf41896b887189a7995d2923875db18c876db2a9afb8622a23f2ab8 \
+    --hash=sha256:506857ffcc1deadc0212ba9c633ae0d0052b5c702ae908f06485c9657d652f55
+msal==1.39.0 ; sys_platform == 'linux' \
+    --hash=sha256:2d2577886906cd7293850dffa2da29119966c213bfc6ec0cecf8bf7621e1ca77 \
+    --hash=sha256:6ab7de335e6d7f5717e2c7e1dbf86e4dda2f6acf3c56773b78dc53ebc6395b5f
 multidict==6.7.1 \
     --hash=sha256:03ede2a6ffbe8ef936b92cb4529f27f42be7f56afcdab5ab739cd5f27fb1cbf9 \
     --hash=sha256:0b4c48648d7649c9335cf1927a8b87fa692de3dcb15faa676c6a6f1f1aabda43 \
