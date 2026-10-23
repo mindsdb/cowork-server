@@ -9,6 +9,7 @@ import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.ops import connections as connections_ops
 from cowork.ops.connection_inventory import MAX_RECORD_BYTES
 from cowork.services.connectors.persist import own_vault_for_scope, vault_for_scope
@@ -67,6 +68,18 @@ def test_inventory_retains_unstamped_orphan_spaces_and_marks_inactive_personal_s
     result = _list(capsys)
     assert result["personal_connections"] is False
     assert [(r["origin"], r["visibility"]) for r in result["connections"]] == [("base", "shared"), ("personal", "inactive")]
+
+
+@pytest.mark.parametrize(("enforce", "visibility"), [("enforce", "inactive"), ("audit", "operator")])
+def test_base_records_stay_the_operator_views_while_audit_serves_it(stack, tmp_path, monkeypatch, capsys, enforce, visibility):
+    # A request with no identity pair is the operator view on LOCAL_SCOPE, which
+    # reads the base vault; only audit lets such a request through.
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", enforce)
+    get_app_settings.cache_clear()
+    LocalDataVault(tmp_path / "home" / "data-vault").save("postgres", "old-team", {"PASSWORD": SECRET})
+    assert [(row["engine"], row["name"]) for row in vault_for_scope(LOCAL_SCOPE).list_connections()] == [("postgres", "old-team")]
+    [row] = _list(capsys)["connections"]
+    assert (row["origin"], row["visibility"]) == ("base", visibility)
 
 
 def test_inventory_marks_managed_prefix_override_and_same_vault_collision(stack, capsys):
@@ -186,6 +199,54 @@ def test_distinct_shared_names_report_prefix_collisions_across_partitions(stack,
     rows = _list(capsys)["connections"]
     assert len(rows) == 2
     assert all("shared-prefix-collision-for-other-recipients" in row["notes"] for row in rows)
+
+
+@pytest.mark.parametrize("kind", ["invalid-json", "hardlink", "linked-partition"])
+def test_one_persons_listing_opens_no_other_persons_records(stack, tmp_path, monkeypatch, capsys, kind):
+    from cowork.ops import connection_inventory as inventory
+
+    _save(ALICE)
+    path = Path(_save(BOB))
+    if kind == "invalid-json":
+        path.write_text(SECRET)
+    elif kind == "hardlink":
+        os.link(path, tmp_path / "second-name")
+    else:
+        partition = tmp_path / "shared" / BOB.partition_id
+        partition.rename(tmp_path / "elsewhere")
+        partition.symlink_to(tmp_path / "elsewhere")
+    opened = []
+    real_read = inventory._read
+
+    def recording_read(d, name, *, limit):
+        opened.append(d.path)
+        return real_read(d, name, limit=limit)
+
+    monkeypatch.setattr(inventory, "_read", recording_read)
+    rows = _list(capsys, ALICE)["connections"]
+    assert [(row["partition_id"], row["name"]) for row in rows] == [(ALICE.partition_id, "warehouse")]
+    assert opened and not any(BOB.partition_id in str(folder) for folder in opened)
+    # The full inventory still refuses what it can't read safely.
+    status, out, err = _run(connections_ops.main, ["list"], capsys)
+    assert status == 1 and out == "" and SECRET not in err
+
+
+def test_one_persons_listing_keeps_the_full_inventorys_rows_and_notes(stack, capsys):
+    shares = [(ALICE, "warehouse"), (BOB, "warehouse"), (ALICE, "team-db"), (BOB, "team_db")]
+    for person, name in shares:
+        _save(person, name)
+    stack.shared_dir.mkdir(exist_ok=True)
+    stack.shared_connections_file.write_text(json.dumps([
+        {"user_id": SUB_A, "partition_id": ALICE.partition_id, "engine": "postgres", "name": "gone"},
+        *({"user_id": person.user_id, "partition_id": person.partition_id, "engine": "postgres", "name": name}
+          for person, name in shares),
+    ]))
+    full = _list(capsys)["connections"]
+    # Bob's notes depend on Alice's live shares, which his listing never opens.
+    [bobs] = [row for row in full if row["user_id"] == SUB_B and row["name"] == "warehouse"]
+    assert "earlier-share-takes-priority-for-other-recipients" in bobs["notes"]
+    for person in (ALICE, BOB):
+        assert _list(capsys, person)["connections"] == [row for row in full if row["partition_id"] in {None, person.partition_id}]
 
 
 @pytest.mark.parametrize("kind", ["invalid-json", "invalid-creator", "invalid-fields", "wrong-name", "symlink", "hardlink", "fifo", "directory", "oversized"])

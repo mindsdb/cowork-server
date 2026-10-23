@@ -21,11 +21,31 @@ The server starts on `http://127.0.0.1:26866`. Confirm with:
 curl http://127.0.0.1:26866/api/v1/health/
 ```
 
+## Reviewed release dependencies
+
+`uv.lock` is the runtime selection for this repository. CI, Docker and release smoke tests refuse a stale lock. `cowork/release-requirements.txt` is its generated runtime export, with environment markers and artifact hashes. Every wheel and source distribution carries that exact file; publishing checks both artifacts against the lock.
+
+The release workflow selects Anton from `uv.lock`. Publishing a newer Anton alone does not change this server release. To move a dependency deliberately:
+
+```sh
+uv lock --upgrade-package anton-agent
+python scripts/release_contract.py
+uv sync --locked --group dev
+bash scripts/check_wheels_available.sh
+make test/unit
+```
+
+Review both the lock and export diffs, run the release checks, and publish a new server release. Change a declared compatibility constraint first when the intended version is outside it. Use the same process for any other dependency. Do not run a general upgrade while preparing a source-only release.
+
+Cowork's release installer consumes the contract from the selected wheel or Git commit. Direct `pip install` and `uv tool install cowork-server` still resolve the public library compatibility ranges; they do not automatically consume this export. For a standalone server with this repository's reviewed selection, check out a reviewed release tag and run `uv sync --locked --no-dev`, then `uv run --locked --no-dev cowork-server`.
+
+The eight platform/Python wheel checks use release constraints. When the lock selects an Anton release candidate, the required wheel gate waits for that exact version to reach PyPI's Simple index before resolving it; the publish runner repeats the wait before building. The weekly `--floating` check separately probes the public compatibility ranges and never rewrites the release lock. Build backends, the Python interpreter and operating-system packages are separate inputs; this policy fixes the application dependency selection, not every byte of an image.
+
 ## Development
 
 ```sh
 # Run from source (auto-manages virtualenv + deps)
-uv run cowork-server
+uv run --locked cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
@@ -35,7 +55,7 @@ cowork-server imports anton's artifact folder constants (`anton.core.artifacts.i
 ### Dev setup helper
 
 ```sh
-uv run cowork-dev-setup
+uv run --locked cowork-dev-setup
 ```
 
 Initializes the database and validates configuration.
@@ -43,7 +63,7 @@ Initializes the database and validates configuration.
 ### Testing
 
 ```sh
-uv run pytest
+uv run --locked pytest
 ```
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
@@ -1065,17 +1085,17 @@ On a deployment that trusts identity headers, an operator with a shell where cow
 | `python -m cowork.ops.skills share ... --skill <slug>` | Shares the person's skill `<slug>` with everyone, read-only, on their behalf: adds it to `<COWORK_SHARED_DIR>/shared/skills.json`. Nothing is copied: everyone else reads the skill live from the person's store, and the person still edits, disables and deletes it, but can't rename it until it is hidden. They can hide it again from their Skills page. It runs the checks and prints the refusal texts of a share from the Skills page ([Sharing one skill with everyone](#sharing-one-skill-with-everyone)), plus "User `<sub>` has no skill named `<slug>`." for a skill the person doesn't have and "Skill `<slug>` of user `<sub>` is already shared." for one already shared. |
 | `python -m cowork.ops.skills unshare ... --skill <slug>` | Removes the person's entry for `<slug>` from `<COWORK_SHARED_DIR>/shared/skills.json`, whether or not the skill still exists, so it also clears the entry of an account the identity provider no longer holds. The person's skill stays theirs, in their store. Refused when the person shares no skill by that name. |
 | `python -m cowork.ops.skills snapshot ... [--project <name>]` | Lists the skills the person's agent sees in a project (`general` unless named), the skills others share with them included, with where each comes from (`own`, `host`, `managed`, `shared` or `anton`), and prints one `sha256`: the sha256 of the lines `<sha256 of the file>  <slug>/<path in the skill>`, one per file of each skill, sorted by slug and path, as `sha256sum` prints them. Every file the agent can read counts, helper scripts and reference files included; a skill's `stats.json`, hidden files and links don't. A shared skill's lines hash the files in its creator's store, so the digest changes when its creator edits it. |
-| `python -m cowork.ops.connections list [--organization-id <id> --user-id <sub>]` | Read-only JSON inventory of stored connection metadata on a POSIX trusted-identity local deployment. Without the pair, includes every stored partition, even deleted accounts; with it, selects that partition plus managed and base stores. Reports engine, name, creator when recorded, partition, origin, visibility and override notes. No credentials, hosts or fields are printed. Inactive stores and stale shares remain visible. Linked, non-regular, malformed or oversized records refuse the whole command without printing record contents. |
+| `python -m cowork.ops.connections list [--organization-id <id> --user-id <sub>]` | Read-only JSON inventory of stored connection metadata on a POSIX trusted-identity local deployment. Without the pair, includes every stored partition, even deleted accounts; with it, selects that partition plus managed and base stores, and opens no other partition's records. Reports engine, name, creator when recorded, partition, origin, visibility and override notes. No credentials, hosts or fields are printed. Inactive stores and stale shares remain visible. Linked, non-regular, malformed or oversized records it opens refuse the whole command without printing record contents. |
 | `python -m cowork.ops.connections share ... --name <name> [--engine <engine>] --managed-dir <folder>` | Shares the person's saved connection named `<name>` with everyone, read-only: adds it to `<folder>/shared/connections.json`, where `<folder>` is the managed folder, writable by the caller. Nothing is copied: everyone else reads the connection live from the person's vault, and the person still changes it. Names are unique per engine only: one Google account connected to Gmail and to Calendar saves two connections under one name, and `--engine` picks one. Refused where `COWORK_PERSONAL_RESOURCES` leaves connections shared, when the person has no connection by that name, or more than one and no `--engine` (the message names `--engine`), when it is already shared, when someone else already shares one of that engine and name, when the managed `data-vault/` holds one, and when the registry is malformed, which the command never rewrites. |
 | `python -m cowork.ops.connections unshare ... --name <name> [--engine <engine>] --managed-dir <folder>` | Removes the person's connection named `<name>` from `<folder>/shared/connections.json`. The person's connection stays theirs, in their vault. Refused when the person shares none by that name, and when they share it for more than one engine and no `--engine` is given. |
 
 ### Connection inventory and cutover
 
-The inventory describes stored connections, not one person's picker. `visibility` is `private`, `shared`, `inactive` or `stale`. `shared_as` lists the registry's engine/name pairs that reach each stored connection. Names such as `sales.db` and `sales_db` reach the same vault file, so an older share remains active after such an update; `registry-name-alias` marks this case. The `notes` identify managed-prefix overrides, same-vault and shared-layer prefix collisions, recipient-owned overrides and duplicate registry entries, using the registered names for shared-layer precedence. Managed connections take priority over personal and shared entries. Two names that normalize to the same `DS_*` prefix can conflict even when their spellings differ.
+The inventory describes stored connections, not one person's picker. `visibility` is `private`, `shared`, `operator`, `inactive` or `stale`. `operator` marks a base-vault record while connections are personal and `COWORK_IDENTITY_ENFORCE` is `audit`: no person reads it, but a request with no identity pair is the operator view, which reads and changes it. `inactive` means nothing reads the store: the base vault under `enforce`, and personal vaults while connections are shared. `shared_as` lists the registry's engine/name pairs that reach each stored connection. Names such as `sales.db` and `sales_db` reach the same vault file, so an older share remains active after such an update; `registry-name-alias` marks this case. The `notes` identify managed-prefix overrides, same-vault and shared-layer prefix collisions, recipient-owned overrides and duplicate registry entries, using the registered names for shared-layer precedence. Managed connections take priority over personal and shared entries. Two names that normalize to the same `DS_*` prefix can conflict even when their spellings differ.
 
-Adding `connections` to `COWORK_PERSONAL_RESOURCES` switches readers to personal vaults. It leaves old base-vault records stored but unread by testers. Preserve explicitly chosen team connections in the managed vault, or have their owners recreate and share them. Do not copy private connections to every person. Enable `projects` too and preserve needed shared-project files before changing that namespace. The new startup refusal deliberately prevents private connections alongside legacy shared executable state; removing that guard does not make such a configuration safe.
+Adding `connections` to `COWORK_PERSONAL_RESOURCES` switches readers to personal vaults. It leaves old base-vault records stored but unread by testers; under `audit`, the operator view still reads them. Preserve explicitly chosen team connections in the managed vault, or have their owners recreate and share them. Do not copy private connections to every person. Enable `projects` too and preserve needed shared-project files before changing that namespace. The new startup refusal deliberately prevents private connections alongside legacy shared executable state; removing that guard does not make such a configuration safe.
 
-The inventory reads up to 1 MiB per record or registry and follows no partition, vault or record links. It never creates a missing store. Run it between connector changes for a stable operator review; it is not a transactional snapshot. A missing creator stamp is `null`, while the stored partition still identifies the space. The command does not infer current identity-provider membership.
+The inventory reads up to 1 MiB per record or registry and follows no partition, vault or record links. It never creates a missing store. Run it between connector changes for a stable operator review; it is not a transactional snapshot. A missing creator stamp is `null`, while the stored partition still identifies the space. One person's listing reads only that partition's records; for other people's shares it reads only the vault's file names, so a bad record elsewhere doesn't fail it, and the full listing is the check for every store. The command does not infer current identity-provider membership.
 
 ## Docs
 
@@ -1086,3 +1106,10 @@ The inventory reads up to 1 MiB per record or registry and follows no partition,
 ## License
 
 See [LICENSE](LICENSE).
+
+## Diagnostics
+
+See [structured logging](docs/structured-logging.md) for defaults, troubleshooting
+overrides, retained evidence streams and rollout requirements.
+Shared-memory startup warnings state whether turns learn into the shared store
+or leave it unread, without logging its private path.

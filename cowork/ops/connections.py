@@ -42,6 +42,7 @@ from cowork.ops import (
     read_registry,
     run_operator_command,
 )
+from cowork.ops.connection_inventory import connection_inventory
 from cowork.services.connectors.persist import own_vault_for_scope
 
 # How the refusal of a name in two engines says to pick one, for this module
@@ -157,8 +158,6 @@ def main(argv: list[str] | None = None) -> int:
         add_registry_stdout_argument(action)
     arguments = parser.parse_args(argv)
     if arguments.action == "list":
-        from cowork.ops.connection_inventory import connection_inventory
-
         if (arguments.organization_id is None) != (arguments.user_id is None):
             parser.error("list takes both --organization-id and --user-id, or neither for all spaces")
         person = None if arguments.user_id is None else person_from_arguments(arguments)

@@ -3,7 +3,8 @@
 This enumerates storage, not a tester's connection picker. Visibility describes
 the configured sharing policy; notes identify managed/name-prefix overrides.
 Only metadata crosses the output boundary. Reads are bounded and descriptor
-relative, and errors never include record contents or validation inputs.
+relative, and errors never include record contents or validation inputs. One
+person's listing opens no other person's records.
 """
 
 from __future__ import annotations
@@ -11,7 +12,8 @@ from __future__ import annotations
 import os
 import stat
 from collections import Counter, defaultdict
-from contextlib import ExitStack
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -67,7 +69,7 @@ class ConnectionInventoryRow(BaseModel):
     origin: Literal["managed", "base", "personal", "registry"]
     user_id: str | None = None
     partition_id: str | None = None
-    visibility: Literal["private", "shared", "inactive", "stale"]
+    visibility: Literal["private", "shared", "operator", "inactive", "stale"]
     shared_as: tuple[ConnectionName, ...] = ()
     notes: tuple[str, ...] = ()
 
@@ -135,13 +137,26 @@ def _root_records(path: Path, *, required: bool = False) -> list[RecordMetadata]
         return []
 
 
-def _personal_records(root: Path) -> dict[str, list[RecordMetadata]]:
+@contextmanager
+def _partition_vault(d: PinnedDir, partition: str) -> Iterator[PinnedDir]:
+    with ExitStack() as opened:
+        child = open_pinned_child(d, partition)
+        opened.callback(child.close)
+        vault = open_pinned_child(child, "data-vault")
+        opened.callback(vault.close)
+        yield vault
+
+
+def _personal_records(root: Path, *, only: str | None = None) -> dict[str, list[RecordMetadata]]:
+    """Every partition's records, or only the ``only`` partition's."""
     result = {}
     try:
         with pinned_dir(root, nofollow_base=True) as d:
             with dir_scandir(d) as entries:
                 names = sorted(entry.name for entry in entries)
             for name in names:
+                if only is not None and name != only:
+                    continue
                 try:
                     canonical = str(UUID(name))
                 except ValueError:
@@ -149,17 +164,37 @@ def _personal_records(root: Path) -> dict[str, list[RecordMetadata]]:
                 if canonical != name:
                     raise OperatorCommandError("Connection inventory found a noncanonical partition id.")
                 try:
-                    with ExitStack() as opened:
-                        partition = open_pinned_child(d, name)
-                        opened.callback(partition.close)
-                        vault = open_pinned_child(partition, "data-vault")
-                        opened.callback(vault.close)
+                    with _partition_vault(d, name) as vault:
                         result[name] = _records(vault)
                 except FileNotFoundError:
                     continue
     except FileNotFoundError:
         pass
     return result
+
+
+def _shared_filenames(root: Path, partitions: Iterable[str]) -> set[tuple[str, str]]:
+    """The vault filenames in ``partitions``, read from their listings alone.
+
+    One person's listing still needs to know which other people's shares
+    reach a stored record, for the precedence notes on their own rows, but
+    it opens none of those records: a malformed or linked one can't fail it,
+    and no other person's fields load. A vault the pinned walk refuses shares
+    nothing, as _shared_sources leaves it out at runtime. Registry partition
+    ids are canonical UUIDs (SharedEntry), so each is one child name.
+    """
+    found = set()
+    try:
+        with pinned_dir(root, nofollow_base=True) as d:
+            for partition in sorted(set(partitions)):
+                try:
+                    with _partition_vault(d, partition) as vault, dir_scandir(vault) as entries:
+                        found.update((partition, entry.name) for entry in entries if not entry.name.endswith(".tmp"))
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return found
 
 
 def _registry(root: Path) -> SharedConnections:
@@ -182,18 +217,31 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
     No Keycloak lookup is needed for the complete inventory, so spaces whose
     accounts have been deleted remain visible by partition id. A legacy
     record without a creator stamp keeps user_id null instead of guessing.
+    With ``person``, only that partition's records are read; other people's
+    shares are matched by filename (_shared_filenames).
     """
     require_trusted_identity()
     settings = get_app_settings()
     if settings.tenancy_mode != "local" or os.name != "posix":
         raise OperatorCommandError("Connection inventory requires a POSIX local trusted-identity deployment.")
     personal = PersonalResource.CONNECTIONS in settings.personal_resources
+    # With connections personal, no person reads the base vault. Under audit,
+    # a request with no identity pair is still the operator view on
+    # LOCAL_SCOPE, which reads and changes it, so those records aren't inactive.
+    base_visibility = ("operator" if settings.identity_enforce == "audit" else "inactive") if personal else "shared"
     managed = managed_folder()
+    shared_root = Path(settings.storage.shared_root)
     try:
         registry = SharedConnections(()) if managed is None else _registry(managed.root)
         managed_records = [] if managed is None else _root_records(managed.vault_dir, required=True)
         base_records = _root_records(own_vault_root(LOCAL_SCOPE))
-        partitions = _personal_records(Path(settings.storage.shared_root))
+        if person is None:
+            partitions = _personal_records(shared_root)
+            stored = set()
+        else:
+            partitions = _personal_records(shared_root, only=person.partition_id)
+            others = {entry.partition_id for entry in registry.root} - {person.partition_id}
+            stored = _shared_filenames(shared_root, others)
     except OSError:
         raise OperatorCommandError(
             "Connection inventory cannot read a store: check permissions and remove linked or non-directory paths."
@@ -205,12 +253,11 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
             rows.append(ConnectionInventoryRow(
                 engine=record.engine, name=record.name, origin=origin,
                 user_id=None if record.creator is None else str(record.creator),
-                visibility="inactive" if origin == "base" and personal else "shared",
+                visibility=base_visibility if origin == "base" else "shared",
             ))
     shares: dict[tuple[str, str], list[SharedConnection]] = defaultdict(list)
     for entry in registry.root:
         shares[entry.partition_id, _vault_filename(entry.engine, entry.name)].append(entry)
-    stored = set()
     for partition, records in partitions.items():
         for record in records:
             key = (partition, _vault_filename(record.engine, record.name))
@@ -251,7 +298,7 @@ def connection_inventory(*, person: Person | None = None) -> ConnectionInventory
     result = []
     for row in rows:
         notes = list(row.notes)
-        if row.visibility in {"private", "shared"}:
+        if row.visibility in {"private", "shared", "operator"}:
             if row.origin != "managed" and row.prefix in managed_prefixes:
                 notes.append("hidden-by-managed-prefix")
             if counts[row.origin, row.partition_id, row.prefix] > 1:
