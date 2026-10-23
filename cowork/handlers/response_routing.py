@@ -567,14 +567,24 @@ def _text_history(history: list[dict]) -> list[dict]:
     return result
 
 
-def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_disabled_connections: bool) -> str | None:
-    """Return a deterministic delegation reason for unsupported turn shapes."""
+def ineligible_reason(
+    *, has_non_text_input: bool, has_attachments: bool, has_disabled_connections: bool, has_doc: bool = False,
+) -> str | None:
+    """Return a deterministic delegation reason for unsupported turn shapes.
+
+    `has_doc`: the turn was sent with a doc open (its view context) or asks
+    for its answer as a doc. Either way the answer belongs in the doc, which
+    only the agent's doc tools can read and write; a direct reply would put
+    the rewrite in the chat and leave the doc as it was.
+    """
     if has_non_text_input:
         return "non_text_input"
     if has_attachments:
         return "attachments_present"
     if has_disabled_connections:
         return "connection_context_present"
+    if has_doc:
+        return "doc_context_present"
     return None
 
 

@@ -2782,3 +2782,109 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     ]
     decision = await _route(history)
     assert decision.route == DIRECT_CONTEXT and seen
+
+
+@pytest.mark.parametrize("request_extra", [
+    {"doc_context": {"artifactId": "a" * 32, "title": "Plan", "mode": "edit",
+                     "selection": {"blockIds": ["b_12345678"], "quote": "The checkout change needs a security review."}}},
+    {"output": "doc"},
+])
+@pytest.mark.asyncio
+async def test_a_turn_about_a_doc_goes_to_the_agent_not_the_gate(monkeypatch, request_extra):
+    """"Make this more concise" on a selection must edit the doc. Answered
+    directly, the rewrite landed in the chat and the doc stayed as it was."""
+    from functools import partial
+
+    import cowork.handlers.responses as responses
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import run_db
+    from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.conversations import ConversationService
+
+    class _NoHistory(ConversationService):
+        def get_ordered_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
+
+        def get_recent_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(responses, "ConversationService", _NoHistory)
+    request = ResponsesRequest(input="Make this more concise.", **request_extra)
+
+    start = await run_db(
+        partial(handler._read_turn_start, request=request, has_disabled_connections=False),
+        scope=LOCAL_SCOPE,
+    )
+    decision, turn_llm = await handler._route_request(
+        conversation_id=start.conversation_id,
+        harness_input=start.harness_input,
+        gate_rows=start.gate_rows,
+        has_attachments=False,
+        has_disabled_connections=False,
+        has_doc=responses._turn_has_doc(request),
+    )
+
+    assert start.gate_rows == []
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "doc_context_present"
+    assert turn_llm is None
+
+
+def test_a_message_carries_the_open_doc_and_the_output_choice_ahead_of_the_words_typed():
+    from types import SimpleNamespace
+
+    from cowork.docs.prompt import DOC_OUTPUT_NOTE
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.schemas.responses import ResponsesRequest
+
+    request = ResponsesRequest(
+        input="Make the risks section shorter",
+        doc_context={"artifactId": "33e65fe7f08743aba742e888db31ae1a", "tab": "t_1", "rev": 7,
+                     "selection": {"blockIds": ["b_1"], "quote": "GA slips"}},
+        output="doc",
+    )
+    texts = [b["text"] for b in ResponsesHandler._build_harness_input(SimpleNamespace(), request, session=None)]
+    assert texts[0].startswith("<doc-view-context>") and '"quote": "GA slips"' in texts[0]
+    assert texts[1] == DOC_OUTPUT_NOTE
+    assert texts[2] == "Make the risks section shorter"
+
+
+@pytest.mark.parametrize("request_extra", [
+    {"doc_context": {"artifactId": "a" * 32, "title": "Plan", "mode": "edit",
+                     "selection": {"blockIds": ["b_12345678"], "quote": "GA slips"}}},
+    {"output": "doc"},
+])
+def test_a_remote_turn_is_answered_without_the_open_doc_or_the_output_choice(monkeypatch, request_extra):
+    """The worker pod has no doc tools: the blocks would have the model call tools it doesn't have.
+    Dropped, the turn is any other turn, the gate's to answer as well."""
+    from types import SimpleNamespace
+
+    import cowork.handlers.responses as responses
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.schemas.responses import ResponsesRequest
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    remote = ResponsesRequest(input="Make the risks section shorter", stream=True, **request_extra)
+    texts = [b["text"] for b in ResponsesHandler._build_harness_input(SimpleNamespace(), remote, session=None)]
+    assert texts == ["Make the risks section shorter"]
+    assert responses._turn_has_doc(remote) is False
+
+    # A non-streaming turn runs in this process whatever the backend, doc tools and all.
+    here = ResponsesRequest(input="Make the risks section shorter", stream=False, **request_extra)
+    assert len(ResponsesHandler._build_harness_input(SimpleNamespace(), here, session=None)) == 2
+    assert responses._turn_has_doc(here) is True
+
+
+def test_a_new_conversation_is_titled_by_what_the_person_typed():
+    from cowork.docs.prompt import DOC_OUTPUT_NOTE, doc_context_block
+    from cowork.handlers.responses import _title_text
+
+    blocks = [
+        {"type": "text", "text": doc_context_block({"artifactId": "a" * 32, "title": "Plan", "mode": "edit"})},
+        {"type": "text", "text": DOC_OUTPUT_NOTE},
+        {"type": "text", "text": "Give me three tips for a good team retro."},
+    ]
+    assert _title_text(blocks) == "Give me three tips for a good team retro."
+    # Nothing typed but the context: still a title, not an empty row.
+    assert _title_text(blocks[:1]).startswith("<doc-view-context>")

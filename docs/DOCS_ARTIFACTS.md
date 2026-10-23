@@ -1,8 +1,8 @@
 # Docs: structured document artifacts
 
-A doc is a living document the agent and the person write together: tabs of typed blocks with stable ids, modelled on Claude's Docs artifacts.
+A doc is a living document the agent and the person write together. It opens beside the chat. The agent writes it section by section while the person watches, and the person types in it, picks statuses in its tables, and selects a passage to ask the agent to change. It is modelled on Claude's Docs artifacts.
 
-The code is in `cowork/docs/`, and the HTTP API is in `cowork/api/v1/endpoints/docs.py`. The renderer side lives in the cowork repo under `src/renderer/cowork/components/doc/`.
+The code is in `cowork/docs/`, the agent tools are in `cowork/harnesses/anton_harness/doc_tools.py`, and the HTTP API is in `cowork/api/v1/endpoints/docs.py`. The renderer side lives in the cowork repo under `src/renderer/cowork/components/doc/`.
 
 The modules depend in one direction, each on those above it:
 
@@ -15,7 +15,7 @@ The modules depend in one direction, each on those above it:
 | `store` | The doc file in its artifact folder: the lock, atomic writes, one kept version per editing session |
 | `hub` | In-process fan-out of changes to the editors and chats watching |
 | `service` | Create and apply (rendering the page under the doc's lock), and `announce` |
-| `export` | Downloads |
+| `prompt`, `export` | What the agent is told; downloads |
 
 The package uses the services; they never import its behaviour, and know a doc only by its files (`store`'s names).
 
@@ -95,6 +95,26 @@ Everything is under `/api/v1/docs` and addressed like the artifact workspace rou
 | GET | `/{project}/{artifact}/export?format=md\|html\|docx\|pdf` | Download. PDF and Word are refused where several people share the server: their converters fetch the doc's web images from it. |
 | GET | `/events?conversation_id=` | SSE `doc.created` / `doc.updated` for docs the agent touches in that conversation |
 
+`POST /api/v1/responses` takes three optional fields:
+
+- `docs: true`: the client shows docs, so the agent may write them. Without it (or one of the two below, which imply it) the turn has no doc tools.
+- `doc_context`: the doc, tab and selection open beside the chat, plus an "Edit with agent" `request`. It is handed to the agent as a `<doc-view-context>` block ahead of the message.
+- `output: "doc"`: the composer's "Write it as a doc" choice.
+
+## Agent tools
+
+`create_doc`, `read_doc`, `edit_doc` and `list_docs` are registered for in-process turns (desktop and local) whose client shows docs (`docs: true`). `create_doc` carries the system-prompt section (`cowork/docs/prompt.py`: `DOC_PROMPT`), which covers:
+
+- when to write a doc;
+- the outline-then-fill workflow with `{{pending: …}}` blocks;
+- the Markdown dialect: tables, `chart` and `metrics` fences, callouts and chips;
+- how to shape content;
+- how to edit safely with `if_rev` and the doc view context.
+
+Each handler streams one progress line, for example "Writing “Risks”", so the call shows as a step in the chat. Results are plain text built for a model: an outline of block ids, what was written, and the pending sections still to fill.
+
+Turns that run on a remote worker (org mode) do not get these tools yet, so they are not handed `doc_context` or the Output: Doc note either: such a turn is answered like any other. Moving the engine and tools into anton and adding them to the cloud allowlist is the follow-up that brings docs there.
+
 ## Working on it
 
 Tests, in `tests/`:
@@ -103,5 +123,8 @@ Tests, in `tests/`:
 - `test_docs_ops.py`: the edit operations and the stale guard.
 - `test_docs_store.py`: the write path, editing sessions and their versions, and the hub.
 - `test_docs_endpoints.py`: the HTTP API.
+- `test_docs_tools.py`: the agent's tools.
 
 By hand: run the app against a server with a throwaway `COWORK_HOME` (never your own `~/.cowork`). The editor's tests sit beside it in the cowork repo, under `src/renderer/cowork/components/doc/`.
+
+Model-in-the-loop check: give a model only `DOC_PROMPT` and the tool schemas, and let it call the real handlers.

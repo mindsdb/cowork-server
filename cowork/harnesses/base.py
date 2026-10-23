@@ -82,6 +82,10 @@ class HarnessProvider(Protocol):
         # the turn alive while a model call is quiet; other harnesses accept
         # and ignore it.
         model_wait: "ModelWaitTicker | None" = None,
+        # True only for a client that shows docs (ResponsesRequest.docs): a
+        # harness with doc tools registers them then. Others accept and
+        # ignore it.
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         ...
 

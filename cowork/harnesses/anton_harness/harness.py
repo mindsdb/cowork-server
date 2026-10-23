@@ -822,6 +822,7 @@ class AntonHarness:
         tool_messages: bool = False,
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -951,6 +952,7 @@ class AntonHarness:
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                docs=docs,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1253,8 +1255,14 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
+        docs: bool = False,
     ) -> BuiltChatSession:
-        """Build the same core runtime the Anton CLI uses, scoped to one project."""
+        """Build the same core runtime the Anton CLI uses, scoped to one project.
+
+        ``docs``: the client shows docs, so the doc tools are registered, and
+        with them ``create_doc``'s prompt section (DOC_PROMPT). Without it the
+        agent never hears of docs and writes none the client can't show.
+        """
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
@@ -1280,6 +1288,14 @@ class AntonHarness:
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         CREATE_SKILL_DRAFT_TOOL = build_cowork_create_skill_draft_tool()
+        from .doc_tools import DocToolContext, build_doc_tools
+        DOC_TOOLS = build_doc_tools(DocToolContext(
+            artifacts_base=Path(conversation.project.path) / ".anton" / "artifacts",
+            conversation_id=str(conversation.id),
+            project_id=str(conversation.project_id) if conversation.project_id else None,
+            project_name=conversation.project.name,
+            project_label=display_label(conversation.project),
+        )) if docs else []
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -1785,6 +1801,7 @@ class AntonHarness:
                     REQUEST_CREDENTIALS_TOOL,
                     LABEL_CONNECTION_TOOL,
                     CREATE_SKILL_DRAFT_TOOL,
+                    *DOC_TOOLS,
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
