@@ -94,6 +94,16 @@ def _to_docx(body_html: str, dest: Path) -> None:
     document.save(str(dest))
 
 
+def pdf_from_html(body_html: str, title: str, dest: Path) -> None:
+    """Body markup to a PDF at ``dest``, converted as ``export_artifact`` converts."""
+    _to_pdf(_wrap_html_document(body_html, title), dest)
+
+
+def docx_from_html(body_html: str, dest: Path) -> None:
+    """Body markup to a Word file at ``dest``, converted as ``export_artifact`` converts."""
+    _to_docx(body_html, dest)
+
+
 def export_artifact(source_path: Path, fmt: str) -> Path:
     """Convert `source_path` to `fmt`, writing the result beside the source.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 
 from cowork.principal import Principal, can_manage_org
+from cowork.services.product_permissions import has_product_permission
 
 _OWNER_ONLY = "Only the artifact owner can change this draft"
 _OWNER_UNKNOWN = "Artifact owner is unknown"
@@ -81,3 +82,17 @@ def may_delete_ownerless_artifact(
 
         resolution = resolve_artifact_owner(session, source, slug)
     return resolution.unknown
+
+
+async def current_capabilities(session, capabilities: dict) -> dict:
+    """``capabilities`` narrowed to what the caller's product permissions allow right now."""
+    if not capabilities["canEdit"]:
+        return capabilities
+    can_edit = await has_product_permission(session.scope, "artifact.manage")
+    can_execute = await has_product_permission(session.scope, "product.execute")
+    return {
+        **capabilities,
+        "canEdit": can_edit,
+        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canResolveComments": capabilities["canResolveComments"] and can_edit,
+    }

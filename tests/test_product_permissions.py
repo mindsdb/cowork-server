@@ -403,20 +403,20 @@ async def test_artifact_parent_paths_continue_after_a_current_grant(monkeypatch,
 async def test_artifact_capabilities_reflect_current_role_and_execution(
     monkeypatch, can_edit, can_execute
 ):
-    from cowork.api.v1.endpoints import artifact_workspace
+    from cowork.services import artifact_permissions
 
     async def allowed(scope, permission):
         assert scope is ORG
         return can_edit if permission == "artifact.manage" else can_execute
 
-    monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+    monkeypatch.setattr(artifact_permissions, "has_product_permission", allowed)
     original = {
         "canEdit": True,
         "canAddressWithAgent": True,
         "canResolveComments": True,
         "canPreview": True,
     }
-    actual = await artifact_workspace._current_capabilities(
+    actual = await artifact_permissions.current_capabilities(
         SimpleNamespace(scope=ORG), original
     )
     assert actual == {
@@ -429,7 +429,7 @@ async def test_artifact_capabilities_reflect_current_role_and_execution(
 
 
 async def test_artifact_role_permissions_never_elevate_a_reviewer(monkeypatch):
-    from cowork.api.v1.endpoints import artifact_workspace
+    from cowork.services import artifact_permissions
 
     call = authority(monkeypatch, body={"allowed": True})
     original = {
@@ -439,7 +439,7 @@ async def test_artifact_role_permissions_never_elevate_a_reviewer(monkeypatch):
         "canPreview": True,
     }
     assert (
-        await artifact_workspace._current_capabilities(
+        await artifact_permissions.current_capabilities(
             SimpleNamespace(scope=ORG), original
         )
         == original
@@ -553,7 +553,7 @@ async def test_invalid_or_timed_out_permission_response_is_unavailable(
 async def test_a_role_grant_does_not_override_narrow_artifact_operation_flags(
     monkeypatch,
 ):
-    from cowork.api.v1.endpoints import artifact_workspace
+    from cowork.services import artifact_permissions
 
     authority(monkeypatch, body={"allowed": True})
     narrow = {
@@ -562,7 +562,7 @@ async def test_a_role_grant_does_not_override_narrow_artifact_operation_flags(
         "canResolveComments": False,
     }
     assert (
-        await artifact_workspace._current_capabilities(
+        await artifact_permissions.current_capabilities(
             SimpleNamespace(scope=ORG), narrow
         )
         == narrow

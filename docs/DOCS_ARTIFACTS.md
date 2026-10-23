@@ -2,7 +2,7 @@
 
 A doc is a living document the agent and the person write together: tabs of typed blocks with stable ids, modelled on Claude's Docs artifacts.
 
-The code is in `cowork/docs/`.
+The code is in `cowork/docs/`, and the HTTP API is in `cowork/api/v1/endpoints/docs.py`. The renderer side lives in the cowork repo under `src/renderer/cowork/components/doc/`.
 
 The modules depend in one direction, each on those above it:
 
@@ -15,6 +15,9 @@ The modules depend in one direction, each on those above it:
 | `store` | The doc file in its artifact folder: the lock, atomic writes, one kept version per editing session |
 | `hub` | In-process fan-out of changes to the editors and chats watching |
 | `service` | Create and apply (rendering the page under the doc's lock), and `announce` |
+| `export` | Downloads |
+
+The package uses the services; they never import its behaviour, and know a doc only by its files (`store`'s names).
 
 ## The format
 
@@ -61,11 +64,11 @@ A doc is an ordinary anton artifact folder:
 <project>/.anton/artifacts/<slug>/
   metadata.json            type "document", primary "doc.cdoc.json"
   doc.cdoc.json            the doc (schema cowork.doc/1)
-  doc.html                 its page, rendered after every write
+  doc.html                 its page, rendered after every write (what sharing publishes)
   .revisions/doc-history/  kept versions, index.json, and open.json (the session writing now)
 ```
 
-The artifacts library, provenance and delete therefore work unchanged.
+The artifacts library, cards, provenance and delete therefore work unchanged. `card_for_folder` marks the card `kind: "Doc"` and `format: "doc"`, which is how the renderer knows to open the doc editor.
 
 ## One write path
 
@@ -79,6 +82,19 @@ Callers then announce the change (`service.announce`) on the in-process hub (`co
 
 Every write lands at once, like a Google Doc's: there is no save step and no versions to manage.
 
+## HTTP API
+
+Everything is under `/api/v1/docs` and addressed like the artifact workspace routes. Reads need review access; writes need `artifact.manage` and ownership.
+
+| Method | Path | What |
+| --- | --- | --- |
+| POST | `/` | Create a doc the person starts: `{projectId, title, markdown?}` |
+| GET | `/{project}/{artifact}` | `{doc, card, capabilities, originConversationId}`; the card (with the share's access) for the owner only |
+| POST | `/{project}/{artifact}/ops` | `{ops, tab?, ifRev?, clientId?}` → `{doc, rev, results, touched, removed}`; 409 for `stale` |
+| GET | `/{project}/{artifact}/events` | SSE `doc.updated` with the doc. Also catches writes from other processes by watching the file. |
+| GET | `/{project}/{artifact}/export?format=md\|html\|docx\|pdf` | Download. PDF and Word are refused where several people share the server: their converters fetch the doc's web images from it. |
+| GET | `/events?conversation_id=` | SSE `doc.created` / `doc.updated` for docs the agent touches in that conversation |
+
 ## Working on it
 
 Tests, in `tests/`:
@@ -86,3 +102,6 @@ Tests, in `tests/`:
 - `test_docs_format.py`: the model, Markdown and rendering.
 - `test_docs_ops.py`: the edit operations and the stale guard.
 - `test_docs_store.py`: the write path, editing sessions and their versions, and the hub.
+- `test_docs_endpoints.py`: the HTTP API.
+
+By hand: run the app against a server with a throwaway `COWORK_HOME` (never your own `~/.cowork`). The editor's tests sit beside it in the cowork repo, under `src/renderer/cowork/components/doc/`.
