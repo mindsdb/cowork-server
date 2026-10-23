@@ -164,9 +164,17 @@ async def test_the_configured_port_is_served(draft_env, monkeypatch):
     assert response.headers["content-security-policy"] == DRAFT_CSP
 
 
-async def test_a_half_configured_draft_host_is_reported_at_boot(draft_env, monkeypatch, caplog):
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("COWORK_DRAFT_LINK_KID", "missing"),
+        ("COWORK_DRAFT_LINK_KEYS", json.dumps({"k1": "too-short"})),
+    ],
+    ids=["unknown-kid", "short-secret"],
+)
+async def test_a_half_configured_draft_host_is_reported_at_boot(draft_env, monkeypatch, caplog, name, value):
     monkeypatch.setenv("COWORK_DRAFT_PORT", str(_free_port()))
-    monkeypatch.setenv("COWORK_DRAFT_LINK_KID", "missing")
+    monkeypatch.setenv(name, value)
     get_app_settings.cache_clear()
 
     with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):

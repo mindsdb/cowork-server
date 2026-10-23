@@ -1079,7 +1079,7 @@ Environment variables fall into these groups:
 | `COWORK_DRAFT_PORT` | `0` (off) | Org mode. Port of the draft-preview listener: a second server in this process that serves only signed draft links, on the address in `COWORK_SERVER_HOST`. Links are issued (by the API) and served (by this listener) only with `COWORK_TENANCY_MODE=org` and all six draft values set; otherwise the listener answers 404 and web previews stay on `srcdoc`. `/health` reports which one as `draft_links`. |
 | `COWORK_DRAFT_HOSTS` | unset | Comma-separated host names of the draft host (e.g. `draft.mindshub.co`). The listener answers 404 to any other `Host`. |
 | `COWORK_DRAFT_ORIGIN` | unset | Origin draft links point at, e.g. `https://draft.mindshub.co`. |
-| `COWORK_DRAFT_LINK_KEYS` | unset | Draft-link signing keys as JSON `{kid: secret}`, from the `mindsdb-secrets` Secret. Two kids can be live during a rotation. A pod reads it at start. |
+| `COWORK_DRAFT_LINK_KEYS` | unset | Draft-link signing keys as JSON `{kid: secret}`, from the `mindsdb-secrets` Secret. Two kids can be live during a rotation. A secret shorter than 32 characters is ignored. A pod reads it at start. |
 | `COWORK_DRAFT_LINK_KID` | unset | The kid in `COWORK_DRAFT_LINK_KEYS` that signs new draft links. |
 | `COWORK_WEB_ORIGIN` | unset | Origin of the cowork web app, e.g. `https://cowork.mindshub.ai`: the only page allowed to frame a draft (CSP `frame-ancestors`). |
 | `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |

@@ -16,7 +16,8 @@ PROJECT = "33333333-3333-4333-8333-333333333333"
 ARTIFACT = "44444444444444444444444444444444"
 DRAFT_HOST = "draft-staging.artifacts.test"
 WEB_ORIGIN = "https://cowork.staging.mindshub.ai"
-KEYS = {"k1": "draft-secret"}
+# At least 32 characters: draft_link_keyring() drops anything shorter.
+KEYS = {"k1": "draft-secret-0123456789-abcdefghijklmnop"}
 DOC = "<html><head></head><body>draft body</body></html>"
 # What a browser frame sends. Sec-Fetch-Site is the one the host requires.
 FETCH = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe"}
@@ -52,7 +53,11 @@ def draft_token(**overrides) -> str:
 
 
 def sign_claims(claims: dict, secret: str = "draft-secret") -> str:
-    """The token wire format written out independently of the module under test."""
+    """The token wire format written out independently of the module under test.
+
+    The default is the short key the token tests sign with. A test that goes
+    through the keyring passes ``KEYS["k1"]``.
+    """
 
     def b64(raw: bytes) -> str:
         return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")

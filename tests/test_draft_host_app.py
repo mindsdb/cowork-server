@@ -30,6 +30,7 @@ from draft_host_support import (
     DRAFT_CSP,
     DRAFT_HOST,
     FETCH,
+    KEYS,
     ORG,
     PROJECT,
     USER,
@@ -191,7 +192,7 @@ def test_a_token_for_another_purpose_is_refused(client, seen):
     published = sign_claims({
         "p": "published", "env": "staging", "sub": USER, "org": ORG, "proj": PROJECT,
         "art": ARTIFACT, "exp": int(time.time()) + 600, "kid": "k1",
-    })
+    }, KEYS["k1"])
 
     response = client.get(f"/_t/{published}/index.html", headers=FETCH)
 
