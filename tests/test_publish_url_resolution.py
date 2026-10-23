@@ -108,7 +108,9 @@ def _provider_settings(openai_base_url: str):
 
 def _publish_token(monkeypatch, token: SecretStr | None) -> None:
     """AppSettings.publish_token, which COWORK_PUBLISH_TOKEN sets; get_app_settings is cached."""
-    monkeypatch.setattr(publish, "get_app_settings", lambda: SimpleNamespace(publish_token=token))
+    monkeypatch.setattr(
+        publish, "get_app_settings", lambda: SimpleNamespace(publish_token=token, tenancy_mode="local")
+    )
 
 
 @pytest.mark.parametrize("openai_base_url", [MINDSHUB, ROUTED], ids=["mindshub", "routed"])

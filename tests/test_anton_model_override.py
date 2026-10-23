@@ -153,7 +153,7 @@ async def test_web_flags_from_anton_settings_reach_the_session_config(monkeypatc
     with get_open_session() as db:
         service = ConversationService(ScopedSession(db, LOCAL_SCOPE))
         conversation = service.create_conversation(topic="WEB-FLAGS")
-        config, _, _ = await harness.AntonHarness()._build_chat_session(conversation, model=None)
+        config = (await harness.AntonHarness()._build_chat_session(conversation, model=None)).session
 
     assert config.web_fetch_enabled is False
     assert config.web_search_enabled is True  # unset flag keeps its default
