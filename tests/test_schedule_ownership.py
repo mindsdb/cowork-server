@@ -455,6 +455,32 @@ def test_a_turn_stopped_for_its_duration_is_interrupted_whatever_it_shows():
     assert end.retryable is False
 
 
+def test_the_run_duration_limit_is_set_per_deployment(monkeypatch):
+    import cowork.scheduler as scheduler
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_SCHEDULED_RUN_MAX_SECONDS", "2700")
+    get_app_settings.cache_clear()
+    try:
+        end = scheduler._classify(scheduler._TurnEvidence(reason="interrupted", acted=False), timed_out=True)
+        assert scheduler._run_duration_limit() == 2700
+        assert "45-minute limit" in end.error
+    finally:
+        monkeypatch.delenv("COWORK_SCHEDULED_RUN_MAX_SECONDS")
+        get_app_settings.cache_clear()
+
+
+@pytest.mark.parametrize("bad", ["60", "100000"])
+def test_the_run_duration_limit_rejects_values_that_defeat_it(monkeypatch, bad):
+    from pydantic import ValidationError
+
+    from cowork.common.settings.app_settings import AppSettings
+
+    monkeypatch.setenv("COWORK_SCHEDULED_RUN_MAX_SECONDS", bad)
+    with pytest.raises(ValidationError):
+        AppSettings()
+
+
 # --- Through the scheduler, with a real detached producer -------------------
 
 
@@ -580,7 +606,7 @@ def test_an_overrunning_turn_is_stopped_before_its_schedule_is_free_again(
     scheduler = fast_scheduler
     producer = _Producer(tmp_path, endless=True, teardown=0.5)
     monkeypatch.setattr(responses_mod, "ResponsesHandler", producer.handler())
-    monkeypatch.setattr(scheduler, "_MAX_RUN_DURATION_SECONDS", 0.3)
+    monkeypatch.setattr(scheduler, "_run_duration_limit", lambda: 0.3)
     schedule_id = _app_schedule()
     claims_while_stopping: list[UUID | None] = []
 
@@ -618,7 +644,7 @@ def test_a_turn_that_ignores_its_stop_holds_the_schedule_until_it_ends(tmp_path,
     scheduler = fast_scheduler
     producer = _Producer(tmp_path, endless=True, teardown=1.0)
     monkeypatch.setattr(responses_mod, "ResponsesHandler", producer.handler())
-    monkeypatch.setattr(scheduler, "_MAX_RUN_DURATION_SECONDS", 0.2)
+    monkeypatch.setattr(scheduler, "_run_duration_limit", lambda: 0.2)
     monkeypatch.setattr(scheduler, "_STOP_GRACE_SECONDS", 0.1)
     schedule_id = _app_schedule()
 
