@@ -72,9 +72,11 @@ _HTML_EXPORT_SOURCES = _MARKDOWN_SOURCES | {".txt"}
 _WORD_EXPORT_SOURCES = _HTML_EXPORT_SOURCES | _HTML_SOURCES
 
 # The most of a source an export reads. A page carries its own markup and
-# styles, so HTML gets more room than Markdown or text.
+# styles, so HTML gets more room than Markdown or text. Python-Markdown's slow
+# shapes cost more than their size grows, so a smaller Markdown bound shortens
+# the longest stall a source can cause; agent-written reports stay far below it.
 HTML_SOURCE_MAX_BYTES = 10 * 1024 * 1024
-TEXT_SOURCE_MAX_BYTES = 2 * 1024 * 1024
+TEXT_SOURCE_MAX_BYTES = 512 * 1024
 # The inliner's budget for everything it embeds. Org mode serves many people
 # from small replicas, so it embeds less.
 INLINE_BUDGET_BYTES = 25 * 1024 * 1024

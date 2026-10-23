@@ -442,9 +442,9 @@ def test_a_large_html_export_is_written_whole(client, local_artifact):
     [
         ("page.html", 10 * MIB + 1),
         ("page.htm", 10 * MIB + 1),
-        ("report.md", 2 * MIB + 1),
-        ("report.markdown", 2 * MIB + 1),
-        ("notes.txt", 2 * MIB + 1),
+        ("report.md", 512 * 1024 + 1),
+        ("report.markdown", 512 * 1024 + 1),
+        ("notes.txt", 512 * 1024 + 1),
     ],
 )
 def test_a_source_over_its_read_bound_answers_413_and_writes_nothing(
@@ -460,7 +460,7 @@ def test_a_source_over_its_read_bound_answers_413_and_writes_nothing(
 
 
 def test_a_markdown_source_at_its_read_bound_still_exports(client, local_artifact):
-    local_artifact({"report.md": b"a" * (2 * MIB)}, primary="report.md")
+    local_artifact({"report.md": b"a" * (512 * 1024)}, primary="report.md")
 
     response = client.post(EXPORT_URL, json={"format": "html"})
 
