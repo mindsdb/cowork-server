@@ -196,7 +196,7 @@ def refused_for_shutdown(monkeypatch, caplog, due_schedule):
     import cowork.handlers.responses as responses_mod
 
     class ClosedRegistryHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -338,7 +338,7 @@ async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_st
     streaming = asyncio.Event()
 
     class MidTurnHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
