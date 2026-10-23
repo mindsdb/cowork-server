@@ -1276,6 +1276,7 @@ class TestTheInProcessHandlerSavesTheSources:
             id="anton", formatter=staticmethod(format_responses_stream), stream_response=stream_response,
         )
         handler = object.__new__(ResponsesHandler)
+        handler.schedule_id = None
         handler.principal = None
         handler.harness = harness
         frames: list[str] = []

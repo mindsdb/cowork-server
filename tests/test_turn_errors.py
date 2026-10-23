@@ -337,6 +337,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
     """A ResponsesHandler whose formatter yields one frame then raises —
     built without __init__ so no DB/harness setup is needed."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = None  # __init__ bypassed; local-mode producer scope
 
     async def _formatter(stream, model, event_sink):
@@ -345,7 +346,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None,
+        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None, schedule_id=None,
     ):
         if False:
             yield
