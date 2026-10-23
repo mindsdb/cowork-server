@@ -1256,10 +1256,10 @@ async def test_a_scheduler_poll_that_finds_the_pool_held_never_stalls_the_loop(
     assert any("no free database connection" in r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.parametrize("refused", ["_record_turn_outcome", "_finish_run"])
+@pytest.mark.parametrize("refused", ["_record_attempt_end"])
 async def test_a_scheduled_runs_last_writes_land_after_the_pool_refuses_them(monkeypatch, refused):
-    """The pool is full at the moment a cron run records how its turn went,
-    or finishes the run. The refused write tries again, so the run still ends
+    """The pool is full at the moment a cron run records how its turn went.
+    The refused write tries again, so the run still ends
     as a success, its slot moves on and is not run a second time, and no run
     is left `running` to stop the schedule firing."""
     monkeypatch.setattr(scheduler, "_BOOKKEEPING_RETRY_PAUSE_SECONDS", 0, raising=False)

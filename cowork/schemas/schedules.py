@@ -53,6 +53,36 @@ class RunStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class OccurrenceStatus(str, Enum):
+    active = "active"
+    success = "success"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class AttemptOutcome(str, Enum):
+    """What is known about an attempt's execution when it ended.
+
+    Only ``failed_before_execution`` is proof the agent did nothing, so it is
+    the only failure that may be tried again automatically. Every other
+    failure keeps its output for review and is not replayed.
+    """
+
+    completed = "completed"
+    # Failed before the agent could act: setup, permission, or a turn whose
+    # stream shows nothing but its start and its failure.
+    failed_before_execution = "failed_before_execution"
+    # Failed after the agent may have acted.
+    failed_during_execution = "failed_during_execution"
+    # Stopped by the scheduler's duration bound, or its process went away,
+    # after the agent may have acted.
+    interrupted = "interrupted"
+    # Stopped by the user.
+    cancelled = "cancelled"
+    # No terminal record says how the turn ended.
+    uncertain = "uncertain"
+
+
 class ScheduleCreateRequest(CamelRequest):
     title: str
     prompt: str
@@ -92,6 +122,8 @@ class ScheduleResponse(CamelResponse):
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
+    # Also filled by the endpoints: when a failed run will be tried again.
+    retry_at: datetime | None = None
     created_at: datetime | None
     modified_at: datetime | None
 
@@ -106,4 +138,9 @@ class ScheduleRunResponse(CamelResponse):
     error: str | None
     conversation_id: UUID | None
     is_manual: bool
+    occurrence_id: UUID | None = None
+    attempt: int | None = None
+    outcome: AttemptOutcome | None = None
+    execution_started_at: datetime | None = None
+    stop_requested_at: datetime | None = None
     created_at: datetime | None

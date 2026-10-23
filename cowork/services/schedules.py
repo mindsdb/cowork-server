@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from uuid import UUID
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -9,8 +12,8 @@ from sqlalchemy.exc import IntegrityError
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
-from cowork.models.schedule import Schedule, ScheduleRun
-from cowork.schemas.schedules import RunStatus
+from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun
+from cowork.schemas.schedules import AttemptOutcome, OccurrenceStatus, RunStatus
 
 
 class ScheduleService:
@@ -305,9 +308,44 @@ class ScheduleRunService:
         self.session.refresh(run)
         return run
 
+    def end_run(
+        self,
+        run_id: UUID,
+        *,
+        status: RunStatus,
+        error: str | None,
+        outcome: AttemptOutcome,
+        conversation_id: UUID | None = None,
+    ) -> bool:
+        """Stage the end of a run that is still ``running``. False, writing
+        nothing, when it has already ended: a reaper ended it while its
+        holder was out of touch, and that record stands. The caller commits."""
+        run = self.session.get(ScheduleRun, run_id)
+        if run is None:
+            return False
+        now = datetime.now(timezone.utc)
+        values: dict = dict(
+            finished_at=now,
+            duration_ms=int((now - _utc(run.started_at)).total_seconds() * 1000),
+            status=status,
+            error=error,
+            outcome=outcome,
+        )
+        if conversation_id is not None:
+            values["conversation_id"] = self.still_exists(conversation_id)
+        result = unsafe_unscoped_session(self.session).execute(
+            sa.update(ScheduleRun)
+            .where(ScheduleRun.id == run_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
     def reap_orphaned_runs(
         self,
         error: str = "Run orphaned by a server restart before it completed.",
+        started_before: datetime | None = None,
     ) -> int:
         """Mark every run still in ``running`` as ``failed``.
 
@@ -316,10 +354,19 @@ class ScheduleRunService:
         with a running run, a single stale row wedges that schedule
         permanently. Called once on boot to release those runs. Returns the
         number of runs reaped.
+
+        ``started_before`` limits it to runs that began before then, and
+        leaves runs that belong to an occurrence to the scheduler's lease
+        reaper. Where other processes share the database, a run newer than
+        that may still be live on one of them, and an occurrence's run is live
+        for as long as its holder renews the lease, however old it is.
         """
-        runs = self.session.exec(
-            self.session.select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
-        ).all()
+        query = self.session.select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
+        if started_before is not None:
+            query = query.where(ScheduleRun.started_at < started_before).where(
+                ScheduleRun.occurrence_id.is_(None)  # type: ignore[union-attr]
+            )
+        runs = self.session.exec(query).all()
         now = datetime.now(timezone.utc)
         for run in runs:
             started_at = (
@@ -331,7 +378,19 @@ class ScheduleRunService:
             run.duration_ms = int((now - started_at).total_seconds() * 1000)
             run.status = RunStatus.failed
             run.error = error
+            run.outcome = (
+                AttemptOutcome.interrupted
+                if run.execution_started_at is not None
+                else AttemptOutcome.failed_before_execution
+            )
             self.session.add(run)
+            # Settle the occurrence too, without a retry: a run cut off by a
+            # quit may be resumed days later, and replaying a stale slot then
+            # would surprise more than it helps.
+            if run.occurrence_id is not None:
+                ScheduleOccurrenceService(self.session).settle(
+                    run.occurrence_id, OccurrenceStatus.failed, error=error
+                )
         self.session.commit()
         return len(runs)
 
@@ -350,3 +409,389 @@ class ScheduleRunService:
                 .limit(limit)
             ).all()
         )
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class StartedAttempt:
+    """An attempt this caller now holds: the token makes every later write
+    by it conditional on still holding the occurrence."""
+
+    run_id: UUID
+    schedule_id: UUID
+    number: int
+    token: str
+
+
+@dataclass(frozen=True)
+class ExpiredLease:
+    occurrence_id: UUID
+    schedule_id: UUID
+    token: str | None
+
+
+class Settlement(str, Enum):
+    """Where an attempt's end left its occurrence."""
+
+    retry_scheduled = "retry_scheduled"
+    settled = "settled"
+    # The caller no longer held the occurrence: it was reaped or settled
+    # elsewhere, and nothing was written.
+    lost = "lost"
+
+
+def _new_token() -> str:
+    return str(uuid4())
+
+
+class ScheduleOccurrenceService:
+    """Claims, attempts and settles schedule occurrences.
+
+    Runs on the scheduler's unscoped session: an occurrence has no org column
+    and is only ever reached through its schedule, which the scheduler has
+    already resolved.
+
+    Every change to an active occurrence is a conditional UPDATE: on its
+    attempt count when an attempt starts, and on its lease token afterwards.
+    Two pollers, a reaper and a late-finishing holder can each read the same
+    row, but only the first write whose condition still holds lands; the rest
+    change nothing and learn they lost. Postgres re-checks the condition after
+    waiting for a concurrent writer's row lock; SQLite serializes writers.
+    """
+
+    def __init__(self, session: ScopedSession) -> None:
+        self.session = session
+
+    def _update(self, stmt) -> bool:
+        """Run a conditional UPDATE that targets one row; True when it landed."""
+        result = unsafe_unscoped_session(self.session).execute(
+            stmt.execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    def _active(self, occurrence_id: UUID, token: str | None = None):
+        conditions = [
+            ScheduleOccurrence.id == occurrence_id,
+            ScheduleOccurrence.status == OccurrenceStatus.active,
+        ]
+        if token is not None:
+            conditions.append(ScheduleOccurrence.lease_token == token)
+        return sa.update(ScheduleOccurrence).where(*conditions)
+
+    def claim(
+        self,
+        schedule_id: UUID,
+        *,
+        occurrence_key: str,
+        trigger_source: str,
+        scheduled_for: datetime,
+        max_attempts: int,
+        lease_seconds: float,
+    ) -> ScheduleOccurrence | None:
+        """Insert the occurrence and commit it with whatever the caller staged.
+
+        Returns None when the key was already claimed or the schedule already
+        has an active occurrence; the caller's staged changes are rolled back
+        with the losing insert, so a slot advanced alongside a failed claim
+        stays where the winner left it.
+
+        The claim holds a lease from the start, so an occurrence whose process
+        dies before its first attempt is reaped like one that died mid-run.
+        """
+        now = datetime.now(timezone.utc)
+        occurrence = ScheduleOccurrence(
+            schedule_id=schedule_id,
+            occurrence_key=occurrence_key,
+            trigger_source=trigger_source,
+            scheduled_for=scheduled_for,
+            status=OccurrenceStatus.active,
+            max_attempts=max_attempts,
+            next_attempt_at=now,
+            lease_expires_at=now + timedelta(seconds=lease_seconds),
+            lease_token=_new_token(),
+        )
+        self.session.add(occurrence)
+        try:
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            return None
+        self.session.refresh(occurrence)
+        return occurrence
+
+    def get(self, occurrence_id: UUID) -> ScheduleOccurrence | None:
+        return self.session.get(ScheduleOccurrence, occurrence_id)
+
+    def _read(self, occurrence_id: UUID):
+        """The occurrence's row as the database holds it now, not as an
+        earlier read left it in this session."""
+        return unsafe_unscoped_session(self.session).execute(
+            sa.select(ScheduleOccurrence.__table__).where(ScheduleOccurrence.id == occurrence_id)
+        ).mappings().first()
+
+    def pending_retry_at(self, schedule_id: UUID) -> datetime | None:
+        """When the schedule's active occurrence will try again, or None when
+        nothing is waiting to retry (idle, or an attempt is running)."""
+        occurrence = self.session.exec(
+            self.session.select(ScheduleOccurrence)
+            .where(ScheduleOccurrence.schedule_id == schedule_id)
+            .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+            .where(ScheduleOccurrence.attempts > 0)
+            .where(ScheduleOccurrence.next_attempt_at.is_not(None))  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+        return _utc(occurrence.next_attempt_at) if occurrence else None
+
+    def has_active(self, schedule_id: UUID) -> bool:
+        return self.session.exec(
+            self.session.select(ScheduleOccurrence)
+            .where(ScheduleOccurrence.schedule_id == schedule_id)
+            .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+            .limit(1)
+        ).first() is not None
+
+    def start_attempt(
+        self, occurrence_id: UUID, *, is_manual: bool, lease_seconds: float
+    ) -> StartedAttempt | None:
+        """Take the occurrence and record its next attempt, or None when there
+        is none to start: the occurrence settled, an attempt is already
+        running, its retry is not due yet, or another poller took it first."""
+        row = self._read(occurrence_id)
+        now = datetime.now(timezone.utc)
+        if (
+            row is None
+            or row["status"] != OccurrenceStatus.active
+            or row["next_attempt_at"] is None
+            or _utc(row["next_attempt_at"]) > now
+        ):
+            return None
+        number = row["attempts"] + 1
+        token = _new_token()
+        took = self._update(
+            self._active(occurrence_id)
+            .where(ScheduleOccurrence.attempts == row["attempts"])
+            .where(ScheduleOccurrence.next_attempt_at.is_not(None))  # type: ignore[union-attr]
+            .where(ScheduleOccurrence.next_attempt_at <= now)  # type: ignore[operator]
+            .values(
+                attempts=number,
+                next_attempt_at=None,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                lease_token=token,
+            )
+        )
+        if not took:
+            self.session.rollback()
+            return None
+        run = ScheduleRun(
+            schedule_id=row["schedule_id"],
+            started_at=now,
+            status=RunStatus.running,
+            is_manual=is_manual,
+            occurrence_id=occurrence_id,
+            attempt=number,
+        )
+        self.session.add(run)
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # (occurrence_id, attempt) is taken: another poller won the race.
+            self.session.rollback()
+            return None
+        return StartedAttempt(run_id=run.id, schedule_id=row["schedule_id"], number=number, token=token)
+
+    def renew(self, occurrence_id: UUID, token: str, *, lease_seconds: float) -> bool:
+        """Extend the holder's lease. False when it no longer holds it."""
+        renewed = self._update(
+            self._active(occurrence_id, token).values(
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
+            )
+        )
+        self.session.commit()
+        return renewed
+
+    def begin_execution(self, attempt: StartedAttempt, occurrence_id: UUID, *, lease_seconds: float) -> bool:
+        """Record that the attempt is about to hand its turn to the agent, and
+        renew its lease, in one commit. False, writing nothing, when the
+        attempt no longer holds its occurrence: it must not run then, because
+        whoever took the occurrence may be starting another attempt."""
+        now = datetime.now(timezone.utc)
+        held = self._update(
+            self._active(occurrence_id, attempt.token).values(
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+        )
+        if not held:
+            self.session.rollback()
+            return False
+        self._update(
+            sa.update(ScheduleRun)
+            .where(ScheduleRun.id == attempt.run_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .values(execution_started_at=now)
+        )
+        self.session.commit()
+        return True
+
+    def request_stop(self, run_id: UUID) -> None:
+        self._update(
+            sa.update(ScheduleRun)
+            .where(ScheduleRun.id == run_id)
+            .where(ScheduleRun.stop_requested_at.is_(None))  # type: ignore[union-attr]
+            .values(stop_requested_at=datetime.now(timezone.utc))
+        )
+        self.session.commit()
+
+    def end_attempt(
+        self,
+        occurrence_id: UUID,
+        token: str,
+        *,
+        outcome: AttemptOutcome,
+        error: str | None,
+        retry_delay: float | None,
+    ) -> Settlement:
+        """Stage where a finished attempt leaves its occurrence. The caller
+        commits.
+
+        Only an attempt that failed before execution, with attempts left and
+        a ``retry_delay``, is tried again; every other ending settles the
+        occurrence. Nothing is written when the caller no longer holds it.
+        """
+        row = self._read(occurrence_id)
+        if row is None:
+            return Settlement.lost
+        retry = (
+            outcome == AttemptOutcome.failed_before_execution
+            and retry_delay is not None
+            and row["attempts"] < row["max_attempts"]
+        )
+        stmt = self._active(occurrence_id, token)
+        if retry:
+            landed = self._update(stmt.values(
+                error=error,
+                lease_token=None,
+                lease_expires_at=None,
+                next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=retry_delay),
+            ))
+            return Settlement.retry_scheduled if landed else Settlement.lost
+        landed = self._update(stmt.values(**_settled(_occurrence_status(outcome), error)))
+        return Settlement.settled if landed else Settlement.lost
+
+    def settle(self, occurrence_id: UUID, status: str, *, error: str | None = None) -> bool:
+        """Settle an active occurrence whoever holds it. Only for a process
+        that knows no one else can: the desktop's boot, before its scheduler
+        starts. The caller commits."""
+        return self._update(self._active(occurrence_id).values(**_settled(status, error)))
+
+    def ready_for_attempt(self, now: datetime) -> list[UUID]:
+        """Cron occurrences whose next attempt is due, oldest first. A manual
+        occurrence is started by the request that claimed it, never here."""
+        return list(
+            self.session.exec(
+                self.session.select(ScheduleOccurrence.id)
+                .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+                .where(ScheduleOccurrence.trigger_source != "manual")
+                .where(ScheduleOccurrence.next_attempt_at.is_not(None))  # type: ignore[union-attr]
+                .where(ScheduleOccurrence.next_attempt_at <= now)  # type: ignore[operator]
+                .order_by(ScheduleOccurrence.next_attempt_at)  # type: ignore[arg-type]
+            ).all()
+        )
+
+    def expired_leases(self, now: datetime) -> list[ExpiredLease]:
+        """Active occurrences that outlived their lease: the process holding
+        them died before or during an attempt, or stopped renewing it. An
+        occurrence waiting for a retry holds no lease."""
+        rows = unsafe_unscoped_session(self.session).execute(
+            sa.select(
+                ScheduleOccurrence.id, ScheduleOccurrence.schedule_id, ScheduleOccurrence.lease_token,
+            )
+            .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+            .where(ScheduleOccurrence.lease_expires_at.is_not(None))  # type: ignore[union-attr]
+            .where(ScheduleOccurrence.lease_expires_at < now)  # type: ignore[operator]
+        ).all()
+        return [ExpiredLease(occurrence_id=r[0], schedule_id=r[1], token=r[2]) for r in rows]
+
+    def reap(
+        self, lease: ExpiredLease, *, now: datetime, error: str, retry_delay: Callable[[int], float],
+    ) -> Settlement:
+        """Take back an occurrence whose holder stopped renewing it, in one
+        commit with its running attempt.
+
+        Lands only while the lease is still the expired one this caller saw:
+        a holder that renewed, started an attempt or settled in between keeps
+        it. An attempt that never reached the agent is tried again; one that
+        did may have acted, so its occurrence settles without a replay.
+        """
+        run = self.running_attempt(lease.occurrence_id)
+        executed = run is not None and run.execution_started_at is not None
+        row = self._read(lease.occurrence_id)
+        if row is None:
+            return Settlement.lost
+        outcome = AttemptOutcome.interrupted if executed else AttemptOutcome.failed_before_execution
+        stmt = (
+            self._active(lease.occurrence_id)
+            .where(ScheduleOccurrence.lease_expires_at < now)  # type: ignore[operator]
+            .where(
+                ScheduleOccurrence.lease_token == lease.token
+                if lease.token is not None
+                else ScheduleOccurrence.lease_token.is_(None)  # type: ignore[union-attr]
+            )
+        )
+        # A manual occurrence is only ever started by the request that
+        # claimed it, so a retry of one would wait forever.
+        retry = (
+            not executed
+            and row["trigger_source"] != "manual"
+            and row["attempts"] < row["max_attempts"]
+        )
+        if retry:
+            values = dict(
+                error=error, lease_token=None, lease_expires_at=None,
+                next_attempt_at=now + timedelta(seconds=retry_delay(row["attempts"])),
+            )
+        else:
+            values = _settled(OccurrenceStatus.failed, error)
+        if not self._update(stmt.values(**values)):
+            self.session.rollback()
+            return Settlement.lost
+        if run is not None:
+            self._update(
+                sa.update(ScheduleRun)
+                .where(ScheduleRun.id == run.id)
+                .where(ScheduleRun.status == RunStatus.running)
+                .values(status=RunStatus.failed, error=error, finished_at=now, outcome=outcome)
+            )
+        self.session.commit()
+        return Settlement.retry_scheduled if retry else Settlement.settled
+
+    def running_attempt(self, occurrence_id: UUID) -> ScheduleRun | None:
+        return self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.occurrence_id == occurrence_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .limit(1)
+        ).first()
+
+
+def _occurrence_status(outcome: AttemptOutcome) -> OccurrenceStatus:
+    if outcome == AttemptOutcome.completed:
+        return OccurrenceStatus.success
+    if outcome == AttemptOutcome.cancelled:
+        return OccurrenceStatus.cancelled
+    return OccurrenceStatus.failed
+
+
+def _settled(status: str, error: str | None) -> dict:
+    return dict(
+        status=status,
+        error=error,
+        next_attempt_at=None,
+        lease_expires_at=None,
+        lease_token=None,
+        settled_at=datetime.now(timezone.utc),
+    )
