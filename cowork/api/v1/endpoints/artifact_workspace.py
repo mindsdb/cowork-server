@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-import ntpath
 import os
 import stat
 from contextlib import ExitStack
@@ -21,10 +20,7 @@ from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
 from cowork.common.paths import (
-    O_NOFOLLOW,
     dir_lstat,
-    dir_open,
-    dir_scandir,
     open_pinned_child,
     read_bounded,
 )
@@ -36,6 +32,7 @@ from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
 )
+from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.artifact_revisions import (
@@ -71,7 +68,9 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
-# Matched against the first path component of a draft request.
+# Matched against the first path component of a draft request. The file
+# walk refuses them there casefolded too, and the store-owned ones at any
+# depth (`artifact_files._refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 
@@ -105,133 +104,20 @@ def _attachment_disposition(filename: str) -> str:
     )
 
 
-def _relative_file_parts(value: str) -> tuple[str, ...]:
-    """Split an untrusted relative path into safe, single components.
-
-    The returned strings are passed to descriptor-relative opens; no
-    request-derived string is ever joined onto an absolute filesystem path.
-    Treat backslashes as separators too so the validation has the same meaning
-    on the Windows desktop and the Linux service.
-    """
-    if not value or "\x00" in value:
-        raise ValueError("invalid path")
-    normalized = value.replace("\\", "/")
-    if normalized.startswith("/") or ntpath.splitdrive(normalized)[0]:
-        raise ValueError("invalid path")
-    parts = tuple(normalized.split("/"))
-    if not parts or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError("invalid path")
-    return parts
-
-
 def _artifact_folder_component(source, folder: Path) -> str:
-    """Return the direct child of ``source.base`` selected by resolution.
+    """Return the direct child of ``source.base`` selected by resolution, or 404.
 
-    Identity lookup indexes a resolved artifacts root, so a normal result can
-    be parented by either the declared root or its resolved spelling. Anything
-    else must not be translated to ``folder.name``: doing so could turn a grant
-    for one resolved folder into a same-named folder under another source.
+    ``artifact_files.artifact_folder_name`` holds the rule: a folder whose
+    parent is not the source's base is refused, so a grant for one resolved
+    folder can't select a same-named folder under another source.
     """
-    base = Path(source.base)
     try:
-        parents = {base, base.resolve(strict=False)}
-    except OSError as exc:
+        return artifact_files.artifact_folder_name(source=source, folder=folder)
+    except artifact_files.ArtifactFileRefused as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Artifact file not found",
         ) from exc
-    if folder.parent not in parents:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artifact file not found",
-        )
-    name = folder.name
-    if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artifact file not found",
-        )
-    return name
-
-
-def _existing_draft_entry_name(
-    directory, requested: str, *, native_case: bool = False
-) -> str:
-    """Return the pinned directory's own name for a request selector.
-
-    Validation makes ``requested`` a single component, but it still originated
-    in an HTTP path.  Compare it with entries already discovered below the
-    pinned directory and return ``DirEntry.name`` so no request-derived string
-    is ever supplied to ``openat``.  A replacement after the scan remains safe:
-    the subsequent descriptor-relative open uses ``O_NOFOLLOW``.
-
-    ``native_case`` also accepts a spelling the filesystem itself accepts. It
-    exists because ``resolve_source`` opens by path and so inherits the
-    volume's own case rules, and a boundary stricter than the gate behind it
-    makes a reported source unsaveable. The filesystem decides, never the
-    platform: the requested spelling has to name the same inode as the entry,
-    which on a case-sensitive volume it cannot. The name returned is still the
-    one the scan produced.
-    """
-    insensitive_matches: list[str] = []
-    with dir_scandir(directory) as entries:
-        for entry in entries:
-            if entry.name == requested:
-                return entry.name
-            if native_case and entry.name.lower() == requested.lower():
-                insensitive_matches.append(entry.name)
-    # Ambiguous only on a case-sensitive volume, where the exact match above
-    # is the only correct answer anyway.
-    if len(insensitive_matches) == 1:
-        if _names_one_inode(directory, requested, insensitive_matches[0]):
-            return insensitive_matches[0]
-    raise FileNotFoundError(requested)
-
-
-def _names_one_inode(directory, requested: str, discovered: str) -> bool:
-    """Whether the filesystem resolves both spellings to the same file.
-
-    Neither stat follows a link, so a symlink whose name differs only in case
-    from a real entry compares unequal and is refused rather than matched.
-    """
-    try:
-        probe = dir_lstat(directory, requested)
-        found = dir_lstat(directory, discovered)
-    except OSError:
-        return False
-    return (probe.st_dev, probe.st_ino) == (found.st_dev, found.st_ino)
-
-
-def _open_pinned_draft_file(source, folder: Path, parts: tuple[str, ...]):
-    """Open one regular draft file without following any writable symlink.
-
-    Authorization chose ``source`` and ``folder`` before this call. The source
-    retains its server-owned anchor, and ``opened_artifact_folder`` walks from
-    that anchor to the artifact with ``O_NOFOLLOW`` on every component. The
-    request path is then walked the same way. Returning the ``ExitStack`` keeps
-    every descriptor alive until the response has consumed the final file.
-    """
-    folder_name = _artifact_folder_component(source, folder)
-    resources = ExitStack()
-    try:
-        current = resources.enter_context(opened_artifact_folder(source, folder_name))
-        for requested in parts[:-1]:
-            disk_name = _existing_draft_entry_name(current, requested)
-            current = open_pinned_child(current, disk_name)
-            resources.callback(current.close)
-        disk_name = _existing_draft_entry_name(current, parts[-1])
-        fd = dir_open(current, disk_name, os.O_RDONLY | O_NOFOLLOW)
-        resources.callback(os.close, fd)
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise OSError("draft target is not a regular file")
-    except (OSError, ValueError) as exc:
-        resources.close()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artifact file not found",
-        ) from exc
-    return resources, fd, file_stat
 
 
 def _editable_source_selector(source, folder: Path, requested: str | None) -> str | None:
@@ -262,7 +148,7 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     if requested is None or not requested.strip():
         return None
     try:
-        parts = _relative_file_parts(requested.strip())
+        parts = artifact_files._relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
     # Only the journal (any depth), like the inner gate: the private-listing
@@ -276,11 +162,15 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         with ExitStack() as resources:
             current = resources.enter_context(opened_artifact_folder(source, folder_name))
             for part in parts[:-1]:
-                disk_name = _existing_draft_entry_name(current, part, native_case=True)
+                disk_name = artifact_files._existing_draft_entry_name(
+                    current, part, native_case=True
+                )
                 current = open_pinned_child(current, disk_name)
                 resources.callback(current.close)
                 disk_parts.append(disk_name)
-            disk_name = _existing_draft_entry_name(current, parts[-1], native_case=True)
+            disk_name = artifact_files._existing_draft_entry_name(
+                current, parts[-1], native_case=True
+            )
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
                 raise OSError("draft source is not a regular file")
             disk_parts.append(disk_name)
@@ -1228,7 +1118,7 @@ async def serve_private_draft(
         session, project_selector, artifact_selector
     )
     try:
-        parts = _relative_file_parts(rel_path)
+        parts = artifact_files._relative_file_parts(rel_path)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1238,7 +1128,7 @@ async def serve_private_draft(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     if str(metadata.get("type") or "").startswith("fullstack-"):
         try:
-            primary_parts = _relative_file_parts(
+            primary_parts = artifact_files._relative_file_parts(
                 str(metadata.get("primary") or "static/index.html")
             )
         except ValueError:
@@ -1261,7 +1151,15 @@ async def serve_private_draft(
 
     download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
-    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
+    try:
+        resources, fd, file_stat = artifact_files._open_pinned_draft_file(
+            source, folder, parts
+        )
+    except artifact_files.ArtifactFileRefused as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact file not found",
+        ) from exc
     try:
         if not download and media_type == "text/html":
             resp = await run_in_threadpool(

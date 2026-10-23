@@ -1,0 +1,30 @@
+# libxml2 log entries, as each version writes them, and whether each means
+# the parser stopped and dropped the rest of the document.
+- id: resource-limit-2-12-and-later
+  type_name: ERR_RESOURCE_LIMIT
+  message: "Excessive depth in document: 256, use XML_PARSE_HUGE option"
+  stopped: true
+- id: depth-2-11
+  type_name: ERR_INTERNAL_ERROR
+  message: "Excessive depth in document: 256 use XML_PARSE_HUGE option"
+  stopped: true
+- id: huge-text-node-2-11
+  type_name: ERR_NO_MEMORY
+  message: "xmlSAX2Characters: huge text node"
+  stopped: true
+- id: huge-attribute-2-11
+  type_name: ERR_ATTRIBUTE_NOT_FINISHED
+  message: "attribute value too long"
+  stopped: true
+- id: unfinished-attribute
+  type_name: ERR_ATTRIBUTE_NOT_FINISHED
+  message: 'AttValue: " expected'
+  stopped: false
+- id: invalid-character-reference
+  type_name: ERR_INVALID_CHAR
+  message: "htmlParseCharRef: invalid xmlChar value 3"
+  stopped: false
+- id: unknown-tag
+  type_name: HTML_UNKNOWN_TAG
+  message: "Tag portal invalid"
+  stopped: false
