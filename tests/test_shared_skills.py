@@ -1368,3 +1368,31 @@ async def test_in_one_shared_store_a_build_follows_only_the_askers_own(all_share
         followed = _followed_by_artifact_builds(turn.config.settings)
         assert "bobs-charts" in followed
         assert "alices-charts" not in followed
+
+
+async def test_a_turn_with_no_person_follows_no_persons_skill(all_shared, managed_dir, monkeypatch, stores):
+    """A channel's turn or a shared schedule's runs in the operator view,
+    which is no operator in a turn (turn_changer_for): it owns no stored
+    skill, so it follows the managed folder's and not Alice's."""
+    SkillService(ALICE_SHARED).create_skill("alices-charts", "Use only ECharts.")
+    store = SkillService(ALICE_SHARED).root
+    _mark_for_artifacts(store / "alices-charts")
+    (managed_dir.skills_dir / "gateway-rules").mkdir()
+    (managed_dir.skills_dir / "gateway-rules" / "SKILL.md").write_text(
+        _skill_md("gateway-rules", "Call only the endpoints listed here.")
+    )
+    _mark_for_artifacts(managed_dir.skills_dir / "gateway-rules")
+
+    def link_into_project(project_dir: Path) -> None:
+        # The link reconcile_project gives each project of the one store.
+        (project_dir / "skills").mkdir(exist_ok=True)
+        (project_dir / "skills" / "alices-charts").symlink_to(store / "alices-charts", target_is_directory=True)
+
+    async with built_turn(
+        monkeypatch=monkeypatch, tmp_path=stores, scope=LOCAL_SCOPE, before_build=link_into_project
+    ) as turn:
+        settings = turn.config.settings
+        assert "alices-charts" in [p.name for p in Path(settings.skills_root).iterdir()]
+        followed = _followed_by_artifact_builds(settings)
+        assert "alices-charts" not in followed
+        assert "gateway-rules" in followed

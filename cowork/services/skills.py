@@ -34,7 +34,7 @@ from cowork.common.paths import (
     safe_join,
 )
 from cowork.common.settings import get_app_settings
-from cowork.creators import changer_for
+from cowork.creators import changer_for, turn_changer_for
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, scope_for_identity, scoped_storage_root
 from cowork.managed import (
@@ -421,20 +421,23 @@ def artifact_skill_dirs(
     without a recall: part of anton's ``skills_artifact_roots``, beside the
     host's and the managed folder's.
 
-    linked_turn_skills's selection, kept to the skills the asker may change
-    (SkillService.may_change): their whole store where skills are personal
-    and on the desktop, and only the ones they created where every person
-    reads one store. A skill another person shares is never among them: it
-    lives in its creator's store. anton follows a skill marked
-    ``applies_to: artifacts`` only when its folder, links resolved, sits
-    under one of these roots (SkillStore.list_for_artifacts), so another
-    person's text never steers the asker's build unasked.
+    linked_turn_skills's selection, kept to the skills the turn may change
+    (cowork.creators.turn_changer_for): the asker's whole store where skills
+    are personal and on the desktop, only the ones they created where every
+    person reads one store, and none there for a turn with no person, such
+    as a channel's or a shared schedule's, which is no operator. A skill
+    another person shares is never among them: it lives in its creator's
+    store. anton follows a skill marked ``applies_to: artifacts`` only when
+    its folder, links resolved, sits under one of these roots
+    (SkillStore.list_for_artifacts), so another person's text never steers
+    the asker's build unasked.
     """
     service = SkillService(scope)
+    changer = turn_changer_for(scope, resource=PersonalResource.SKILLS)
     own: list[Path] = []
     for turn_skill in linked_turn_skills(service=service, project_name=project_name):
         skill = _skill_from_dir(turn_skill.path)
-        if skill is not None and service.may_change(skill):
+        if skill is not None and (changer is None or changer.may_change(skill.created_by)):
             own.append(turn_skill.path)
     return tuple(own)
 
