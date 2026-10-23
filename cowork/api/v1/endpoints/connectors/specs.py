@@ -14,6 +14,7 @@ from cowork.schemas.connectors import (
     MatchResponse,
 )
 from cowork.services.connectors.oauth import auth_proxy
+from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.specs._registry import registry
 
 router = APIRouter()
@@ -51,7 +52,12 @@ async def list_connector_specs(
     # org-mode save path) is a desktop concept. auth's catalogue is the
     # same allow-list list_connections already trusts.
     catalogue = await auth_proxy.proxy_catalogue(request, OAuthSettings())
+    # It is not the only source. That catalogue is the OAuth one and knows
+    # nothing about databases, so a connector this deployment has enabled as a
+    # cloud datasource reaches the list from the capability policy instead.
+    # Read, never written: OAuth's own allow-list is unchanged.
     allowed_ids = {item["id"] for item in catalogue.get("items", [])}
+    allowed_ids |= load_datasource_capabilities().available_connector_ids()
     if not include_unavailable:
         return [c for c in connectors if c.id in allowed_ids]
     return [
