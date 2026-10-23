@@ -122,6 +122,27 @@ def test_the_token_root_is_cut_even_above_a_nested_primary():
     ]
 
 
+def test_a_token_root_without_its_origin_is_cut_on_the_draft_host():
+    # A page's own error text can carry location.pathname, which starts at /_t/.
+    path = f"/_t/{TOKEN}/"
+    stack = f"Error: x\n    at f ({path}static/app.js:1:2)"
+    assert _cut(
+        f"{DRAFT}pages/index.html",
+        [f"bad {path}pages/index.html", f"two {path}a and {path}b", stack, f"/_t/{TOKEN}"],
+    ) == [
+        "bad pages/index.html",
+        "two a and b",
+        "Error: x\n    at f (static/app.js:1:2)",
+        f"/_t/{TOKEN}",
+    ]
+
+
+def test_a_token_path_in_text_is_left_alone_off_the_draft_host():
+    text = f"bad /_t/{TOKEN}/index.html"
+    assert _cut(f"{LOOPBACK}index.html", [text]) == [text]
+    assert _cut("about:srcdoc", [text]) == [text]
+
+
 def test_a_desktop_document_keeps_its_folder_cut():
     assert _cut(f"{LOOPBACK}index.html", [f"{LOOPBACK}static/app.js", "https://cdn.example/x.js"]) == [
         "static/app.js",

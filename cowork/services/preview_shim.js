@@ -30,19 +30,23 @@
   var sent = 0;
   /* A report names what the agent can open, and never a draft link's token.
      On the draft host the document sits under /_t/<token>/, so everything up
-     to and including that segment goes; anywhere else the document's own
-     folder does (a desktop draft's loopback path). about:srcdoc has no folder,
-     and nothing is cut there. */
+     to and including that segment goes, and so does the same segment without
+     its origin (a page's own message can carry location.pathname); anywhere
+     else the document's own folder goes (a desktop draft's loopback path).
+     about:srcdoc has no folder, and nothing is cut there. */
   var HREF = String(window.location.href);
   var TOKEN_ROOT = /^[^?#]*?\/_t\/[^\/?#]+\//.exec(HREF);
   /* The folder comes from the path alone: a query or hash such as
      ?next=/a or #/route would otherwise move it. */
   var PATH_ONLY = HREF.split(/[?#]/)[0];
   var BASE = TOKEN_ROOT ? TOKEN_ROOT[0] : PATH_ONLY.slice(0, PATH_ONLY.lastIndexOf('/') + 1);
+  var TOKEN_PATH = TOKEN_ROOT ? /(?:https?:\/\/[^\/\s]+)?\/_t\/[^\/?#\s]+\//g : null;
 
   function local(value) {
     var text = String(value || '');
-    return BASE ? text.split(BASE).join('') : text;
+    if (!BASE) return text;
+    text = text.split(BASE).join('');
+    return TOKEN_PATH ? text.replace(TOKEN_PATH, '') : text;
   }
 
   function post(payload) {
