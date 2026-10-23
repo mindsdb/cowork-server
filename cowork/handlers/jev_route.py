@@ -71,10 +71,18 @@ JEV_ROUTE_TAG = "cowork-gate"
 
 @dataclass(frozen=True)
 class JevTarget:
-    """Where to ask: a MindsHub inference base URL (incl. /v1) and its key."""
+    """Where to ask: the decision endpoint's full URL and its key.
 
-    base_url: str
+    Full, not a base URL: hosts serve the same body at different paths
+    (MindsHub ``/v1/decisions``, TypeSafe ``/v1/systemone``)."""
+
+    url: str
     api_key: str
+
+    @classmethod
+    def mindshub(cls, base_url: str, api_key: str) -> "JevTarget":
+        """MindsHub's endpoint under its inference base URL (incl. /v1)."""
+        return cls(url=f"{base_url.rstrip('/')}/decisions", api_key=api_key)
 
 
 @dataclass(frozen=True)
@@ -172,7 +180,7 @@ async def decide(
         async with asyncio.timeout(timeout_seconds):
             async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 response = await client.post(
-                    f"{target.base_url.rstrip('/')}/decisions",
+                    target.url,
                     headers={**_trace_headers(), "Authorization": f"Bearer {target.api_key}"},
                     json=payload,
                 )

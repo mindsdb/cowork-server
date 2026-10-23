@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
@@ -22,6 +22,7 @@ from cowork.common.logger import exception_http_status
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.deployment_identity import identity_for_turn
+from cowork.handlers.jev_route import JevRoute
 from cowork.services.providers import build_llm_client
 
 
@@ -505,11 +506,13 @@ class RouteDecision:
     reason: str
     provider: str | None = None
     model: str | None = None
-    # A direct answer, complete.  Empty on every delegated route: the gate's
-    # answer and Anton's are mutually exclusive by construction, since a
-    # delegated turn never reaches `_handle_direct_response`.
+    # The LLM gate's direct answer, complete.  Empty on every delegated route,
+    # and on a direct route Jev decided: there the user's own model writes the
+    # answer afterwards (`direct_answer`), and may still delegate.
     text: str = ""
     fallback: bool = False
+    # Jev's probability of a direct answer, when Jev decided.
+    p_direct: float | None = None
 
 
 def _condense_content(content) -> str | None:
@@ -542,8 +545,16 @@ def _condense_content(content) -> str | None:
     return "\n".join(p for p in parts if p)
 
 
-def _text_history(history: list[dict]) -> list[dict]:
-    """Return a bounded, text-only, role-alternating history for the gate."""
+def _text_history(
+    history: list[dict],
+    *,
+    max_messages: int = _MAX_HISTORY_MESSAGES,
+    max_chars: int = _MAX_MESSAGE_CHARS,
+) -> list[dict]:
+    """Return a bounded, text-only, role-alternating history for the gate.
+
+    The bounds default to the gate's; the direct answer passes wider ones,
+    since recalling what an earlier reply said is the job it is routed for."""
     result: list[dict] = []
     for message in history:
         role = message.get("role")
@@ -555,13 +566,13 @@ def _text_history(history: list[dict]) -> list[dict]:
         content = content.strip()
         if not content:
             continue
-        if len(content) > _MAX_MESSAGE_CHARS:
-            content = content[:_MAX_MESSAGE_CHARS - 17] + "\n[… truncated …]"
+        if len(content) > max_chars:
+            content = content[:max_chars - 17] + "\n[… truncated …]"
         if result and result[-1]["role"] == role:
             result[-1]["content"] += "\n" + content
         else:
             result.append({"role": role, "content": content})
-    result = result[-_MAX_HISTORY_MESSAGES:]
+    result = result[-max_messages:]
     while result and result[0]["role"] != "user":
         result.pop(0)
     return result
@@ -637,8 +648,14 @@ async def decide_route(
     has_disabled_connections: bool,
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
+    jev: Callable[[list[dict]], Awaitable[JevRoute]] | None = None,
 ) -> RouteDecision:
-    """Choose a direct answer or safe delegation on the gate's own model.
+    """Choose a direct answer or safe delegation.
+
+    With `jev` (turns that answer on MindsHub), Jev decides and the direct
+    answer is written afterwards by the user's own model, so a direct route
+    carries no text. Otherwise the LLM gate decides and answers in one call on
+    the gate's own model.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -660,12 +677,31 @@ async def decide_route(
     if explicit_file_context(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="explicit_file_context")
 
-    if prior_turn_ran_tools(history):
+    # Jev reads the tool markers itself: a follow-up to tool work goes direct
+    # when the reply's facts are in visible text (the dashboard recall case),
+    # and to the agent when they are only in omitted tool output. The LLM gate
+    # keeps the structural rule, which it was measured with.
+    if jev is None and prior_turn_ran_tools(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
 
     messages = _text_history(history)
     if not messages:
         return RouteDecision(route=DELEGATED_AGENTIC, reason="no_routable_history")
+
+    if jev is not None:
+        result = await jev(messages)
+        if result.error:
+            return RouteDecision(
+                route=DELEGATED_AGENTIC, reason=f"jev_{result.error}", provider="jev",
+                model=result.model or None, fallback=True,
+            )
+        return RouteDecision(
+            route=DIRECT_CONTEXT if result.direct else DELEGATED_AGENTIC,
+            reason="jev_direct" if result.direct else "jev_needs_agent",
+            provider="jev",
+            model=result.model or None,
+            p_direct=result.p_direct,
+        )
 
     try:
         if binding is None:

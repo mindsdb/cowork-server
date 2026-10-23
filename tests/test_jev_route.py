@@ -6,7 +6,7 @@ import pytest
 
 from cowork.handlers import jev_route
 
-TARGET = jev_route.JevTarget(base_url="https://minds.example/v1/", api_key="turn-key")
+TARGET = jev_route.JevTarget.mindshub("https://minds.example/v1/", "turn-key")
 MESSAGES = [
     {"role": "user", "content": "Build a dashboard of our 2025 sales."},
     {"role": "assistant", "content": "[ran tool: query_datasource]\nRevenue was $4.81M."},
