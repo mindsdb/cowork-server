@@ -19,7 +19,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -95,6 +95,37 @@ class JevRoute:
     model: str = ""
     # Empty on a usable answer; otherwise why the turn delegates by default.
     error: str = ""
+
+
+GateMode = Literal["own", "jev", "off", "llm"]
+
+
+def own_decision_target(settings) -> "JevTarget | None":
+    """The organization's own decision model, when both its URL and key are set."""
+    key = settings.decision_model_api_key
+    key = key.get_secret_value() if key is not None else ""
+    url = (settings.decision_model_url or "").strip()
+    return JevTarget(url=url, api_key=key) if key and url else None
+
+
+def gate_mode(settings) -> GateMode:
+    """Which gate decides a turn, from settings alone. One source for the turn
+    handler and for the settings response, so the UI shows what turns do.
+
+    - "own": the organization's own decision model, for any provider.
+      Configuring it is the opt-in, so the Jev opt-out does not apply.
+    - "jev": Jev on MindsHub, for turns that answer on MindsHub.
+    - "off": the organization turned Jev on MindsHub off and has no decision
+      model of its own: MindsHub turns run the agent.
+    - "llm": the LLM gate, for turns that answer on other providers.
+    """
+    from cowork.common.settings.user_settings import Provider
+
+    if own_decision_target(settings) is not None:
+        return "own"
+    if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
+        return "llm"
+    return "jev" if settings.jev_decisions_enabled else "off"
 
 
 def _elapsed_ms(started: float) -> int:

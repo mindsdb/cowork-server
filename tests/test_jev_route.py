@@ -218,3 +218,35 @@ async def test_decide_never_sends_turn_id(monkeypatch):
 @pytest.mark.asyncio
 async def test_decide_outside_a_turn_sends_only_its_credential(monkeypatch):
     assert await _decide_headers(monkeypatch, None) == {"Authorization": "Bearer turn-key"}
+
+
+def _user(**fields):
+    from cowork.common.settings.user_settings import UserSettings
+
+    return UserSettings.model_validate(fields)
+
+
+@pytest.mark.parametrize(("fields", "mode"), [
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k"}, "jev"),
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k", "jev_decisions_enabled": False}, "off"),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k"}, "llm"),
+    # The org's own decision model routes any provider, and the Jev opt-out
+    # does not apply to it.
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k",
+      "decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_model_api_key": "own"}, "own"),
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k", "jev_decisions_enabled": False,
+      "decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_model_api_key": "own"}, "own"),
+    # Half configured is not configured.
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k",
+      "decision_model_url": "https://api.typesafe.ai/v1/systemone"}, "llm"),
+])
+def test_gate_mode(fields, mode):
+    assert jev_route.gate_mode(_user(**fields)) == mode
+
+
+def test_own_decision_target_unwraps_the_key_and_trims_the_url():
+    settings = _user(decision_model_url=" https://api.typesafe.ai/v1/systemone ", decision_model_api_key="own-key")
+
+    assert jev_route.own_decision_target(settings) == jev_route.JevTarget(
+        url="https://api.typesafe.ai/v1/systemone", api_key="own-key",
+    )

@@ -1164,18 +1164,14 @@ class ResponsesHandler:
         with no key to ask Jev with, keep the LLM gate."""
         settings = get_user_settings(self.scope)
         queue_settings = TurnQueueSettings()
-        own_key = (
-            settings.decision_model_api_key.get_secret_value()
-            if settings.decision_model_api_key is not None else ""
-        )
-        own_url = (settings.decision_model_url or "").strip()
-        if own_key and own_url:
-            target = jev_route.JevTarget(url=own_url, api_key=own_key)
-            model = settings.decision_model or queue_settings.jev_route_model
-        elif settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
+        mode = jev_route.gate_mode(settings)
+        if mode == "llm":
             return None
-        elif not settings.jev_decisions_enabled:
+        if mode == "off":
             return "off"
+        if mode == "own":
+            target = jev_route.own_decision_target(settings)
+            model = settings.decision_model or queue_settings.jev_route_model
         else:
             block = (turn_llm or {}).get("llm") or {}
             if block.get("base_url") and block.get("api_key"):
