@@ -76,7 +76,7 @@ FORBIDDEN_BYTES = (SENTINEL, HOUSEKEEPING_MARKER)
 
 # The read bounds and inline budgets the export route uses.
 HTML_READ_BOUND = 10 * 1024 * 1024
-MARKDOWN_READ_BOUND = 2 * 1024 * 1024
+MARKDOWN_READ_BOUND = 512 * 1024
 INLINE_BUDGETS = {
     InlineMode.HTML: 25 * 1024 * 1024,
     InlineMode.WORD: 25 * 1024 * 1024,
