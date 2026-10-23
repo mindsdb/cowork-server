@@ -1094,6 +1094,17 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TURN_TOKENS
+    # Wall-clock cap on one scheduled run, past which the scheduler stops its
+    # turn. The step and token budgets above bound how much work a run does;
+    # this only catches a run that keeps going without ever finishing, so it
+    # sits well above how long real runs take.
+    scheduled_run_max_seconds: int = Field(
+        default=1800,
+        ge=300,
+        le=86_400,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUN_MAX_SECONDS"),
+        description="Longest a scheduled run may take before it is stopped.",
+    )  # COWORK_SCHEDULED_RUN_MAX_SECONDS
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*

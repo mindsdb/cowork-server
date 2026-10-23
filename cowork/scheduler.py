@@ -14,6 +14,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.datetime_utils import ensure_utc
 from cowork.common.logger import get_logger, log_context
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import (
     SYSTEM_SCOPE,
     MissingTenantScopeError,
@@ -43,18 +44,12 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 _POLL_INTERVAL_SECONDS = 30
-# Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
-# must not keep its ScheduleRun in `running` forever — that would block the
-# schedule from ever firing again. On timeout the turn is stopped and the run
-# recorded as interrupted. The registry's idle watchdog only bounds a turn
-# that stops making progress; this bounds one that keeps going.
-_MAX_RUN_DURATION_SECONDS = 600
 # How long a run's last writes keep asking for a database connection while
 # the pool is full. They must land: a run left at `running` reads as busy,
 # and an outcome never recorded leaves its occurrence held until its lease
 # lapses. Each try already waits POOL_TIMEOUT for a connection; the pause
 # between tries only keeps a refusal that comes back at once from spinning.
-_BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
+_BOOKKEEPING_DEADLINE_SECONDS = 600
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 # A cron occurrence gets this many attempts before it settles failed, with
 # these pauses before the second and later attempts. Only an attempt that
@@ -772,14 +767,15 @@ async def _execute_attempt(
         async for _ in stream:
             pass
 
+    limit = _run_duration_limit()
     timed_out = False
     lost_track = False
     try:
-        await asyncio.wait_for(_drain(), timeout=_MAX_RUN_DURATION_SECONDS)
+        await asyncio.wait_for(_drain(), timeout=limit)
     except asyncio.TimeoutError:
         timed_out = True
         logger.warning(
-            "Scheduled run exceeded %ss; stopping it", _MAX_RUN_DURATION_SECONDS,
+            "Scheduled run exceeded %ss; stopping it", limit,
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
     except Exception:
@@ -800,6 +796,18 @@ async def _execute_attempt(
     # is recorded as success.
     evidence = await _turn_evidence(str(conversation_id))
     return _classify(evidence, timed_out=timed_out), conversation_id
+
+
+def _run_duration_limit() -> int:
+    """Upper bound on a single run, in seconds.
+
+    A hung agent (stuck tool call, wedged stream) must not keep its
+    ScheduleRun in `running` forever — that would block the schedule from
+    ever firing again. On timeout the turn is stopped and the run recorded as
+    interrupted. The registry's idle watchdog only bounds a turn that stops
+    making progress; this bounds one that keeps going.
+    """
+    return get_app_settings().scheduled_run_max_seconds
 
 
 async def _stop_turn(conversation_id: str, *, run_id: UUID, schedule_id: UUID) -> None:
@@ -839,10 +847,12 @@ async def _stop_turn(conversation_id: str, *, run_id: UUID, schedule_id: UUID) -
         await asyncio.sleep(_REMOTE_STOP_GRACE_SECONDS)
 
 
-_DURATION_ERROR = (
-    f"Run exceeded the {_MAX_RUN_DURATION_SECONDS // 60}-minute limit and was stopped. "
-    "Some of its actions may have completed — open the run to check before running it again."
-)
+def _duration_error(limit: int) -> str:
+    return (
+        f"Run exceeded the {limit // 60}-minute limit and was stopped. "
+        "Some of its actions may have completed — open the run to check before running it again."
+    )
+
 _INTERRUPTED_ERROR = (
     "Run was interrupted before it finished. Some of its actions may have completed — "
     "open the run to check before running it again."
@@ -858,7 +868,7 @@ _UNCERTAIN_ERROR = (
 def _classify(evidence: _TurnEvidence, *, timed_out: bool) -> _AttemptEnd:
     """What the turn's ending says about whether it acted."""
     if timed_out:
-        return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_DURATION_ERROR)
+        return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_duration_error(_run_duration_limit()))
     reason = evidence.reason
     if reason == "completed":
         return _AttemptEnd(outcome=AttemptOutcome.completed)
