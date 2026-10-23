@@ -645,7 +645,9 @@ def publish_artifact(
         previous = published_map.get(published_key)
         report_id = previous.get("report_id") if isinstance(previous, dict) else None
         if ownership is not None:
-            report_id = ownership.checked_report_id(report_id)
+            report_id = ownership.checked_report_id(
+                report_id, url=previous.get("url") if isinstance(previous, dict) else "",
+            )
             if report_id is None:
                 previous = None
 
@@ -741,7 +743,17 @@ def publish_artifact(
         view_url = result.get("view_url", "")
         returned_report_id = result.get("report_id", "")
         if ownership is not None:
-            ownership.record(returned_report_id)
+            try:
+                ownership.record(returned_report_id)
+            except Exception:
+                if report_id is None:
+                    # A new page went live with no record and no local entry;
+                    # keep the orphaned_publish prefix.
+                    logger.warning(
+                        "orphaned_publish identifier=%s url=%s reason=owner_record_failed",
+                        returned_report_id, view_url,
+                    )
+                raise
         if returned_report_id:
             history_item = {
                 "artifact": str(publish_target),
@@ -885,7 +897,10 @@ def unpublish_artifact(
         if isinstance(entry, dict):
             identifier = entry.get("report_id") or entry.get("last_md5") or None
         if ownership is not None:
-            identifier = ownership.checked_report_id(entry.get("report_id") if isinstance(entry, dict) else None)
+            identifier = ownership.checked_report_id(
+                entry.get("report_id") if isinstance(entry, dict) else None,
+                url=entry.get("url", "") if isinstance(entry, dict) else "",
+            )
             if identifier is None:
                 published_map.pop(published_key, None)
                 _write_published_map(published_json, published_map)

@@ -1,4 +1,8 @@
-"""Immutable ownership of pages served by a deployment's shared publisher."""
+"""Ownership of pages served by a deployment's shared publisher.
+
+A record's owner never changes. Its source path follows only a folder move
+the server itself makes (published_page_ownership.rekey_published_page_paths).
+"""
 import sqlalchemy as sa
 from sqlmodel import Field
 

@@ -54,12 +54,12 @@ def store(personal_deployment, monkeypatch, tmp_path):
     monkeypatch.setattr(backfill, "list_published", listing)
 
     class Store:
-        def page(self, *, trust="project", report_id=None, partition=None, user=None):
+        def page(self, *, trust="project", report_id=None, partition=None, user=None, nested=False):
             partition, user = partition or str(uuid4()), user or str(uuid4())
             report_id = report_id or uuid4().hex
             url = f"https://viewer.example/view/{report_id}/"
             project_path = tmp_path / "shared" / partition / "projects" / uuid4().hex
-            target = project_path / ".anton" / "artifacts" / "page" / "index.html"
+            target = project_path / ".anton" / "artifacts" / "page" / ("site" if nested else "") / "index.html"
             target.parent.mkdir(parents=True)
             target.write_text("<html>Before the ownership upgrade</html>")
             with Session(engine) as session:
@@ -245,6 +245,96 @@ def test_failed_flush_rolls_back_imports_and_sentinel_then_restart_retries(store
     assert store.rows() == [] and store.sentinel() is None
     assert store.run().recorded == 2
     assert len(store.rows()) == 2 and store.sentinel() is not None
+
+
+def test_another_folder_naming_the_page_blocks_the_import(store):
+    page = store.page()
+    # The first publisher's folder, whose history row rotated out of the 100 kept.
+    first = store.root / "shared" / str(uuid4()) / "projects" / uuid4().hex
+    folder = first / ".anton" / "artifacts" / "page"
+    folder.mkdir(parents=True)
+    (folder / "index.html").write_text("<html>The first publisher's page</html>")
+    (folder / ".published.json").write_text(json.dumps({"index.html": {"report_id": page.report_id, "published": True}}))
+    with Session(store.engine) as session:
+        session.add(Project(name=uuid4().hex, path=str(first), org_id=str(uuid4()), created_by=str(uuid4())))
+        session.commit()
+    assert store.run() == backfill.BackfillSummary(recorded=0, unknown=1)
+    assert store.rows() == [] and store.calls == []
+    assert store.sentinel() is not None
+
+
+def _other_folder(store):
+    """An artifact folder in another tester's project, registered like any other."""
+    project = store.root / "shared" / str(uuid4()) / "projects" / uuid4().hex
+    folder = project / ".anton" / "artifacts" / "page"
+    folder.mkdir(parents=True)
+    with Session(store.engine) as session:
+        session.add(Project(name=uuid4().hex, path=str(project), org_id=str(uuid4()), created_by=str(uuid4())))
+        session.commit()
+    return folder
+
+
+@pytest.mark.parametrize("record", ["nul_key", "self_loop", "deep", "oversized", "not_json"])
+def test_an_unreadable_record_elsewhere_is_skipped_without_breaking_the_pass(store, record):
+    page = store.page()
+    folder = _other_folder(store)
+    path = folder / ".published.json"
+    if record == "nul_key":
+        path.write_text(json.dumps({"a\u0000b": {"report_id": page.report_id}}))
+    elif record == "self_loop":
+        (folder / "loop").symlink_to(folder / "loop")
+        path.write_text(json.dumps({"loop": {"report_id": page.report_id}}))
+    elif record == "deep":
+        path.write_text("[" * 200_000)
+    elif record == "oversized":
+        path.write_text(json.dumps({"index.html": {"report_id": page.report_id, "pad": "x" * backfill._MAX_RECORD_BYTES}}))
+    else:
+        path.write_text("{not json")
+    assert store.run().recorded == 1
+    assert store.sentinel() is not None
+
+
+def test_a_page_published_from_a_subfolder_stays_unclaimed(store):
+    store.page(nested=True)
+    assert store.run() == backfill.BackfillSummary(recorded=0, unknown=1)
+    assert store.rows() == [] and store.calls == []
+
+
+def test_a_linked_publish_record_elsewhere_is_not_read(store):
+    page = store.page()
+    first = store.root / "shared" / str(uuid4()) / "projects" / uuid4().hex
+    folder = first / ".anton" / "artifacts" / "page"
+    folder.mkdir(parents=True)
+    (folder / ".published.json").symlink_to(page.target.parent / ".published.json")
+    with Session(store.engine) as session:
+        session.add(Project(name=uuid4().hex, path=str(first), org_id=str(uuid4()), created_by=str(uuid4())))
+        session.commit()
+    assert store.run().recorded == 1
+
+
+def test_a_backfilled_owner_keeps_the_link_and_another_tester_is_refused(store, monkeypatch):
+    page = store.page()
+    assert store.run().recorded == 1
+    monkeypatch.setattr(published_page_ownership, "get_engine", lambda uri: store.engine)
+    monkeypatch.setattr(publish, "vault_for_scope", lambda scope: object())
+    uploads = []
+
+    def upload(path, **kwargs):
+        uploads.append(kwargs)
+        return {"report_id": kwargs["report_id"] or uuid4().hex, "view_url": page.url, "md5": "after-upgrade"}
+
+    monkeypatch.setattr("anton.publisher.publish", upload)
+    owner = TenantScope(personal=True, org_id=page.partition, user_id=page.user,
+                        personal_resources=frozenset({PersonalResource.PROJECTS}))
+    other = TenantScope(personal=True, org_id=str(uuid4()), user_id=str(uuid4()),
+                        personal_resources=frozenset({PersonalResource.PROJECTS}))
+    base = page.target.parent.parent
+    with pytest.raises(publish.PublishOwnedByOtherUser):
+        publish.publish_artifact(page.target, artifacts_base=base, api_key="test-publish-key", publish_url=ENDPOINT, scope=other)
+    assert uploads == []
+    result = publish.publish_artifact(page.target, artifacts_base=base, api_key="test-publish-key", publish_url=ENDPOINT, scope=owner)
+    assert uploads[-1]["report_id"] == page.report_id
+    assert result["url"] == page.url
 
 
 def test_no_history_finishes_without_contacting_the_publisher(store):

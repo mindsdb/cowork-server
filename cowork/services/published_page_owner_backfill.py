@@ -12,6 +12,7 @@ from uuid import UUID
 
 from anton.publisher import list_published
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
 from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, cowork_home, dir_open, opened_subdir_nofollow
@@ -23,12 +24,19 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.published_page import PublishedPageOwner
 from cowork.models.setting import Setting
+from cowork.services.artifacts import is_publish_record_name
 from cowork.services.publish import _resolve_publish_endpoint
-from cowork.services.published_page_ownership import find_owner, protects_publisher, publisher_key
+from cowork.services.published_page_ownership import (
+    BACKFILL_SENTINEL_KEY,
+    find_owner,
+    protects_publisher,
+    publisher_key,
+)
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS, _DatabaseResourceLocks, _process_lock
 
-SENTINEL_KEY = "_published_page_owner_backfill_v1"
+SENTINEL_KEY = BACKFILL_SENTINEL_KEY
 _LOCK_ID = ("global", "published_page", SENTINEL_KEY)
+_MAX_RECORD_BYTES = 1024 * 1024
 
 
 class PublishedPageBackfillUnavailable(RuntimeError):
@@ -123,7 +131,9 @@ def _artifact_path(row: _HistoryRow, projects: list[Path]) -> str | None:
     for project in projects:
         try:
             relative = target.relative_to(project / ".anton" / "artifacts")
-            if not relative.parts:
+            # A loose page or one directly in an artifact folder: _published_pages
+            # reads the records that could refuse it, and no deeper ones.
+            if not relative.parts or len(relative.parts) > 2:
                 continue
             with opened_subdir_nofollow(project.parent, project.name, ".anton", "artifacts", *relative.parts[:-1]) as folder:
                 fd = dir_open(folder, relative.name, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
@@ -173,7 +183,64 @@ def _candidates(session: Session) -> tuple[dict[str, _Claim], set[str]]:
             else:
                 claims[report_id].add(_Claim(next(iter(owners)), artifact, row.url))
     blocked.update(report_id for report_id, matches in claims.items() if len(matches) != 1)
-    return {report_id: next(iter(matches)) for report_id, matches in claims.items() if report_id not in blocked}, blocked
+    chosen = {report_id: next(iter(matches)) for report_id, matches in claims.items() if report_id not in blocked}
+    if chosen:
+        # Another folder naming the page means two artifacts once pointed at
+        # it, and history that rotated out may have named the first of them.
+        for project_path in session.exec(select(Project.path)).all():
+            for report_id, source in _published_pages(Path(project_path)):
+                claim = chosen.get(report_id)
+                if claim is not None and source != claim.artifact_path:
+                    blocked.add(report_id)
+    return {report_id: claim for report_id, claim in chosen.items() if report_id not in blocked}, blocked
+
+
+def _published_pages(project: Path) -> list[tuple[str, str]]:
+    """List (page id, resolved source) from a project's artifact publish records.
+
+    Evidence that can only refuse a claim: a planted entry costs that page its
+    import, never grants one. Reads the artifacts root's record (loose pages)
+    and each direct artifact folder's without following a link. Agents write
+    these files, so a record or entry that cannot be read is skipped.
+    """
+    parts = (project.name, ".anton", "artifacts")
+    try:
+        with opened_subdir_nofollow(project.parent, *parts) as root:
+            names = os.listdir(root.fd if root.fd is not None else root.path)
+    except OSError:
+        return []
+    pages: list[tuple[str, str]] = []
+    for folder in [(), *((name,) for name in names)]:
+        try:
+            pages.extend(_published_record(project.parent, *parts, *folder))
+        except Exception:
+            continue
+    return pages
+
+
+def _published_record(base: Path, *names: str) -> list[tuple[str, str]]:
+    with opened_subdir_nofollow(base, *names) as pinned:
+        fd = dir_open(pinned, ".published.json", os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                return []
+            raw = source.read(_MAX_RECORD_BYTES + 1)
+        folder = pinned.path
+    if len(raw) > _MAX_RECORD_BYTES:
+        return []
+    record = json.loads(raw)
+    if not isinstance(record, dict):
+        return []
+    pages: list[tuple[str, str]] = []
+    for name, entry in record.items():
+        report_id = entry.get("report_id") if isinstance(entry, dict) else None
+        if not isinstance(report_id, str) or not report_id or not is_publish_record_name(name):
+            continue
+        try:
+            pages.append((report_id, str((folder / name).resolve())))
+        except (OSError, RuntimeError):
+            continue
+    return pages
 
 
 def _inventory(api_key: str, publish_url: str) -> dict[str, set[str]]:
@@ -214,7 +281,15 @@ def run_published_page_owner_backfill(engine=None) -> BackfillSummary | None:
                 if not protects_publisher(publish_url):
                     return None
                 publisher = publisher_key(publish_url)
-                candidates, unknown = _candidates(session)
+                try:
+                    candidates, unknown = _candidates(session)
+                except (PublishedPageBackfillUnavailable, SQLAlchemyError):
+                    raise
+                except Exception:
+                    # History and publish records are files agents can write.
+                    raise PublishedPageBackfillUnavailable(
+                        "Published page ownership backfill could not read publish history."
+                    ) from None
                 candidates = {report_id: claim for report_id, claim in candidates.items()
                               if find_owner(session, publisher, report_id) is None}
                 if candidates and not api_key:
