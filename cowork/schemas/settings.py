@@ -23,6 +23,9 @@ class SettingResponse(BaseModel):
     is_set: bool
     value: str | None
     options: list[str] | None = None
+    # The value in force when nothing is stored; set for the turn budgets only,
+    # so Settings can show the safety limits while the limits switch is off.
+    default: str | None = None
 
 
 class ProviderProbeCard(CamelRequest):
