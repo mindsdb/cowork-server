@@ -75,14 +75,14 @@ class _CodedRefusal(HTTPException):
         super().__init__(status_code, detail={"code": code, "message": message})
 
 
-# The upload service's 409 for a report that belongs to another account; the
+# A local ownership check or the upload service refuses another account's page; the
 # renderer matches on the code.
 OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
 OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
 
 
 class PublishOwnedByOtherUser(_CodedRefusal):
-    """The upload service refused the publish: another account owns this report.
+    """A local check or the upload service refused another account's report.
 
     An HTTPException, like ProductPermissionDenied, so any route that lets it
     through answers 409 with the code. Nobody retries it with a fresh
@@ -630,160 +630,171 @@ def publish_artifact(
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    published_json = published_dir / ".published.json"
-    published_map: dict[str, Any] = {}
-    if published_json.is_file():
+    from cowork.services.published_page_ownership import publication_owner
+
+    with publication_owner(
+        publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
+    ) as ownership:
+        published_json = published_dir / ".published.json"
+        published_map: dict[str, Any] = {}
+        if published_json.is_file():
+            try:
+                published_map = json.loads(published_json.read_text(encoding="utf-8"))
+            except Exception:
+                published_map = {}
+        previous = published_map.get(published_key)
+        report_id = previous.get("report_id") if isinstance(previous, dict) else None
+        if ownership is not None:
+            report_id = ownership.checked_report_id(report_id)
+            if report_id is None:
+                previous = None
+
+        # Resolve the effective access (mode + version) from the request and the
+        # prior publish. Versions bump only when the password / restricted list
+        # changed so previously issued viewer grants invalidate.
+        effective_access, pwd_version, access_version, owner_side = _resolve_access(password, access, previous)
+
+        # One identity spans private drafts, published versions, and comments. A
+        # legacy loose file has no metadata and keeps the service-generated key.
+        canonical_artifact_key: str | None = None
+        if (published_dir / "metadata.json").is_file():
+            from cowork.services.artifact_identity import artifact_key, ensure_full_id
+
+            artifact_id, _metadata = ensure_full_id(published_dir)
+            if scope is not None and scope.org_mode:
+                from cowork.services.artifact_authorization_identity import publish_authorization_key
+
+                canonical_artifact_key = publish_authorization_key(
+                    artifact_id, artifacts_base, published_dir.name, project_id, scope
+                )
+            else:
+                canonical_artifact_key = artifact_key(artifact_id)
+
+        # Markdown is rendered to a throwaway index.html that we hand to the
+        # publisher; `.html` and fullstack publish their real target directly.
+        # `publish_target` stays the original artifact so the registry, history,
+        # and unpublish all key off the file the user actually sees.
+        publish_source = publish_target
+        md_tmp_dir: tempfile.TemporaryDirectory | None = None
+        if not is_fullstack and publish_target.suffix.lower() == ".md":
+            md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
+            publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+
+        ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
         try:
-            published_map = json.loads(published_json.read_text(encoding="utf-8"))
-        except Exception:
-            published_map = {}
-    previous = published_map.get(published_key)
-    report_id = previous.get("report_id") if isinstance(previous, dict) else None
-
-    # Resolve the effective access (mode + version) from the request and the
-    # prior publish. Versions bump only when the password / restricted list
-    # changed so previously issued viewer grants invalidate.
-    effective_access, pwd_version, access_version, owner_side = _resolve_access(password, access, previous)
-
-    # One identity spans private drafts, published versions, and comments. A
-    # legacy loose file has no metadata and keeps the service-generated key.
-    canonical_artifact_key: str | None = None
-    if (published_dir / "metadata.json").is_file():
-        from cowork.services.artifact_identity import artifact_key, ensure_full_id
-
-        artifact_id, _metadata = ensure_full_id(published_dir)
-        if scope is not None and scope.org_mode:
-            from cowork.services.artifact_authorization_identity import publish_authorization_key
-
-            canonical_artifact_key = publish_authorization_key(
-                artifact_id, artifacts_base, published_dir.name, project_id, scope
+            result = publish(
+                publish_source,
+                api_key=api_key,
+                report_id=report_id,
+                publish_url=publish_url,
+                ssl_verify=ssl_verify,
+                access=effective_access,
+                access_version=access_version,
+                pwd_version=pwd_version,
+                artifact_key=canonical_artifact_key,
+                # Resolve datasource secrets from cowork's own vault
+                # (`~/.cowork/data-vault`), not anton's default
+                # (`~/.anton/data_vault`) — otherwise secrets are missed and
+                # the published artifact has no DB connection in the cloud.
+                # Org-keyed: the persisted vault is per organization, and an
+                # unscoped lookup would resolve to the shared namespace root.
+                vault=vault_for_scope(scope),
+                # While the password is unchanged anton re-sends the hash stored
+                # here, so a content-only re-publish keeps viewers' password grants.
+                previous_access=previous if isinstance(previous, dict) else None,
             )
-        else:
-            canonical_artifact_key = artifact_key(artifact_id)
+        except ArtifactOwnedByOtherUserError as exc:
+            # Not a failure to log or wrap: the upload service holds this
+            # report_id for another account.
+            raise PublishOwnedByOtherUser() from exc
+        except Exception as exc:
+            upload_error = classify_upload_error(exc)
+            logger.exception("Publishing failed")
+            # A 401's text ("Invalid token") says less than the credentials advice below.
+            if (
+                upload_error is not None
+                and upload_error.error
+                and 400 <= upload_error.status < 500
+                and upload_error.status != 401
+            ):
+                raise PublishRejected(f"Publishing failed: {_clip(upload_error.error)}") from exc
+            # Only network/HTTP failures get the "Connection failed" framing — a
+            # gateway timeout (e.g. a fullstack artifact whose deps take too long
+            # to install remotely) or a server-side 5xx reads very differently to
+            # the user than an auth rejection, but neither applies to a local
+            # failure (e.g. reading the artifact's files to zip it) that happened
+            # before any request went out. urllib.error HTTPError is a URLError
+            # subclass, so this covers both.
+            if isinstance(exc, urllib.error.URLError):
+                headline, advice = describe_minds_connection_error(exc)
+                raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
+            if isinstance(exc, StatePublishBlocked):
+                raise PublishRejected(f"Publishing failed: {exc}") from exc
+            raise RuntimeError(f"Publishing failed: {exc}") from exc
+        finally:
+            if md_tmp_dir is not None:
+                md_tmp_dir.cleanup()
 
-    # Markdown is rendered to a throwaway index.html that we hand to the
-    # publisher; `.html` and fullstack publish their real target directly.
-    # `publish_target` stays the original artifact so the registry, history,
-    # and unpublish all key off the file the user actually sees.
-    publish_source = publish_target
-    md_tmp_dir: tempfile.TemporaryDirectory | None = None
-    if not is_fullstack and publish_target.suffix.lower() == ".md":
-        md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
-        publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+        # Owner-side state for the next publish, stored in the entry below and
+        # never part of the response.
+        password_hash = result.pop("password_hash", None)
+        view_url = result.get("view_url", "")
+        returned_report_id = result.get("report_id", "")
+        if ownership is not None:
+            ownership.record(returned_report_id)
+        if returned_report_id:
+            history_item = {
+                "artifact": str(publish_target),
+                "artifactName": published_key,
+                "url": view_url,
+                "reportId": returned_report_id,
+                "publishedAt": _utc_now_iso(),
+            }
+            # Owner-side only — .published.json never enters the bundle. `owner_side`
+            # carries `mode` (+ `access_password`/`pwd_version` for password, or
+            # `emails`/`org_allowed`/`access_version` for restricted), and always
+            # `requires_password` for back-compat with older readers. Password mode
+            # also keeps the `password_hash` anton sent, handed back as
+            # `previous_access` on the next publish.
+            entry: dict[str, Any] = {
+                "report_id": returned_report_id,
+                "url": view_url,
+                # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
+                # so the comments panel can key threads after an app restart.
+                "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
+                # The lambda's raw echo, or "" from an older lambda that sends none.
+                # Decides which scope the published page uses for comments; see
+                # services/comments_scope. Deliberately NOT merged with the field
+                # above, whose canonical fallback would read as an echo.
+                "lambda_artifact_key": _lambda_artifact_key(result),
+                "last_md5": result.get("md5", ""),
+                # Snapshot of the artifact's content mtime at publish time — the
+                # cheap gate for the `modified` badge (see card_for_folder). Uses
+                # the SAME basis as the card's `mtime` so the comparison is exact.
+                "published_mtime": _content_mtime(published_dir),
+                "published": True,
+                **owner_side,
+            }
+            if password_hash:
+                entry["password_hash"] = password_hash
+            published_map[published_key] = entry
+            _write_published_map(published_json, published_map)
+            state = _load_state(scope=scope)
+            state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
+            _save_state(state, scope=scope)
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
-    try:
-        result = publish(
-            publish_source,
-            api_key=api_key,
-            report_id=report_id,
-            publish_url=publish_url,
-            ssl_verify=ssl_verify,
-            access=effective_access,
-            access_version=access_version,
-            pwd_version=pwd_version,
-            artifact_key=canonical_artifact_key,
-            # Resolve datasource secrets from cowork's own vault
-            # (`~/.cowork/data-vault`), not anton's default
-            # (`~/.anton/data_vault`) — otherwise secrets are missed and
-            # the published artifact has no DB connection in the cloud.
-            # Org-keyed: the persisted vault is per organization, and an
-            # unscoped lookup would resolve to the shared namespace root.
-            vault=vault_for_scope(scope),
-            # While the password is unchanged anton re-sends the hash stored
-            # here, so a content-only re-publish keeps viewers' password grants.
-            previous_access=previous if isinstance(previous, dict) else None,
-        )
-    except ArtifactOwnedByOtherUserError as exc:
-        # Not a failure to log or wrap: the upload service holds this
-        # report_id for another account.
-        raise PublishOwnedByOtherUser() from exc
-    except Exception as exc:
-        upload_error = classify_upload_error(exc)
-        logger.exception("Publishing failed")
-        # A 401's text ("Invalid token") says less than the credentials advice below.
-        if (
-            upload_error is not None
-            and upload_error.error
-            and 400 <= upload_error.status < 500
-            and upload_error.status != 401
-        ):
-            raise PublishRejected(f"Publishing failed: {_clip(upload_error.error)}") from exc
-        # Only network/HTTP failures get the "Connection failed" framing — a
-        # gateway timeout (e.g. a fullstack artifact whose deps take too long
-        # to install remotely) or a server-side 5xx reads very differently to
-        # the user than an auth rejection, but neither applies to a local
-        # failure (e.g. reading the artifact's files to zip it) that happened
-        # before any request went out. urllib.error HTTPError is a URLError
-        # subclass, so this covers both.
-        if isinstance(exc, urllib.error.URLError):
-            headline, advice = describe_minds_connection_error(exc)
-            raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
-        if isinstance(exc, StatePublishBlocked):
-            raise PublishRejected(f"Publishing failed: {exc}") from exc
-        raise RuntimeError(f"Publishing failed: {exc}") from exc
-    finally:
-        if md_tmp_dir is not None:
-            md_tmp_dir.cleanup()
-
-    # Owner-side state for the next publish, stored in the entry below and
-    # never part of the response.
-    password_hash = result.pop("password_hash", None)
-    view_url = result.get("view_url", "")
-    returned_report_id = result.get("report_id", "")
-    if returned_report_id:
-        history_item = {
-            "artifact": str(publish_target),
-            "artifactName": published_key,
+        return {
+            "status": "ok",
             "url": view_url,
-            "reportId": returned_report_id,
-            "publishedAt": _utc_now_iso(),
+            "accessMode": owner_side.get("mode", "public"),
+            "accessProtected": bool(owner_side.get("requires_password")),
+            "accessEmails": owner_side.get("emails", []),
+            "orgAllowed": bool(owner_side.get("org_allowed")),
+            "ownerOnly": bool(owner_side.get("owner_only")),
+            # Composite comments scope for the panel (Plan 5).
+            "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
+            "result": {k: v for k, v in result.items() if k != "file_payload"},
         }
-        # Owner-side only — .published.json never enters the bundle. `owner_side`
-        # carries `mode` (+ `access_password`/`pwd_version` for password, or
-        # `emails`/`org_allowed`/`access_version` for restricted), and always
-        # `requires_password` for back-compat with older readers. Password mode
-        # also keeps the `password_hash` anton sent, handed back as
-        # `previous_access` on the next publish.
-        entry: dict[str, Any] = {
-            "report_id": returned_report_id,
-            "url": view_url,
-            # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
-            # so the comments panel can key threads after an app restart.
-            "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
-            # The lambda's raw echo, or "" from an older lambda that sends none.
-            # Decides which scope the published page uses for comments; see
-            # services/comments_scope. Deliberately NOT merged with the field
-            # above, whose canonical fallback would read as an echo.
-            "lambda_artifact_key": _lambda_artifact_key(result),
-            "last_md5": result.get("md5", ""),
-            # Snapshot of the artifact's content mtime at publish time — the
-            # cheap gate for the `modified` badge (see card_for_folder). Uses
-            # the SAME basis as the card's `mtime` so the comparison is exact.
-            "published_mtime": _content_mtime(published_dir),
-            "published": True,
-            **owner_side,
-        }
-        if password_hash:
-            entry["password_hash"] = password_hash
-        published_map[published_key] = entry
-        _write_published_map(published_json, published_map)
-        state = _load_state(scope=scope)
-        state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
-        _save_state(state, scope=scope)
-
-    return {
-        "status": "ok",
-        "url": view_url,
-        "accessMode": owner_side.get("mode", "public"),
-        "accessProtected": bool(owner_side.get("requires_password")),
-        "accessEmails": owner_side.get("emails", []),
-        "orgAllowed": bool(owner_side.get("org_allowed")),
-        "ownerOnly": bool(owner_side.get("owner_only")),
-        # Composite comments scope for the panel (Plan 5).
-        "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
-        "result": {k: v for k, v in result.items() if k != "file_payload"},
-    }
 
 
 def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
@@ -836,7 +847,8 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
 
 
 def unpublish_artifact(
-    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str,
+    scope: TenantScope | None = None,
 ) -> dict:
     """Soft-delete a published artifact: drop it upstream, keep `report_id`.
 
@@ -854,61 +866,72 @@ def unpublish_artifact(
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    published_json = published_dir / ".published.json"
-    if not published_json.is_file():
-        raise FileNotFoundError("Artifact has no publish record")
+    from cowork.services.published_page_ownership import publication_owner
 
-    try:
-        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError("Could not read publish record") from exc
+    with publication_owner(
+        _publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
+    ) as ownership:
+        published_json = published_dir / ".published.json"
+        if not published_json.is_file():
+            raise FileNotFoundError("Artifact has no publish record")
 
-    entry = published_map.get(published_key)
-    identifier = None
-    if isinstance(entry, dict):
-        identifier = entry.get("report_id") or entry.get("last_md5") or None
-    if not identifier:
-        raise FileNotFoundError("No published version on file")
+        try:
+            published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError("Could not read publish record") from exc
 
-    try:
-        from anton.publisher import unpublish
-    except Exception as exc:
-        raise PublisherUnavailable("Anton publisher is unavailable") from exc
+        entry = published_map.get(published_key)
+        identifier = None
+        if isinstance(entry, dict):
+            identifier = entry.get("report_id") or entry.get("last_md5") or None
+        if ownership is not None:
+            identifier = ownership.checked_report_id(entry.get("report_id") if isinstance(entry, dict) else None)
+            if identifier is None:
+                published_map.pop(published_key, None)
+                _write_published_map(published_json, published_map)
+                return {"status": "ok"}
+        if not identifier:
+            raise FileNotFoundError("No published version on file")
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
-    try:
-        unpublish(
-            identifier,
-            api_key=api_key,
-            publish_url=publish_url,
-            ssl_verify=ssl_verify,
-        )
-    except Exception as exc:
-        classify_upload_error(exc)
-        msg = str(exc) or "Unpublishing failed."
-        if "404" in msg or "not found" in msg.lower():
-            # Already gone upstream, OR still alive under another owner's prefix
-            # and now unreachable — see the docstring. cowork-server has no
-            # metrics backend, so this structured log line IS the metric; keep
-            # the `orphaned_publish` prefix stable.
-            logger.warning(
-                "orphaned_publish identifier=%s url=%s reason=unpublish_404",
+        try:
+            from anton.publisher import unpublish
+        except Exception as exc:
+            raise PublisherUnavailable("Anton publisher is unavailable") from exc
+
+        ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+        try:
+            unpublish(
                 identifier,
-                entry.get("url", "") if isinstance(entry, dict) else "",
+                api_key=api_key,
+                publish_url=publish_url,
+                ssl_verify=ssl_verify,
             )
-        else:
-            logger.exception("Unpublishing failed (identifier=%s)", identifier)
-            raise RuntimeError(f"Unpublishing failed: {msg}") from exc
+        except Exception as exc:
+            classify_upload_error(exc)
+            msg = str(exc) or "Unpublishing failed."
+            if "404" in msg or "not found" in msg.lower():
+                # Already gone upstream, OR still alive under another owner's prefix
+                # and now unreachable — see the docstring. cowork-server has no
+                # metrics backend, so this structured log line IS the metric; keep
+                # the `orphaned_publish` prefix stable.
+                logger.warning(
+                    "orphaned_publish identifier=%s url=%s reason=unpublish_404",
+                    identifier,
+                    entry.get("url", "") if isinstance(entry, dict) else "",
+                )
+            else:
+                logger.exception("Unpublishing failed (identifier=%s)", identifier)
+                raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
-    # Soft-delete: keep report_id (and url) so a later re-publish reuses the
-    # same public URL. Only flip `published` off so readers stop showing it as
-    # live. The backend object is gone, but lambda re-mints at the same id when
-    # we resend report_id on the next publish.
-    if isinstance(entry, dict):
-        entry["published"] = False
-        published_map[published_key] = entry
-        _write_published_map(published_json, published_map)
-    return {"status": "ok"}
+        # Soft-delete: keep report_id (and url) so a later re-publish reuses the
+        # same public URL. Only flip `published` off so readers stop showing it as
+        # live. The backend object is gone, but lambda re-mints at the same id when
+        # we resend report_id on the next publish.
+        if isinstance(entry, dict):
+            entry["published"] = False
+            published_map[published_key] = entry
+            _write_published_map(published_json, published_map)
+        return {"status": "ok"}
 
 
 def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:

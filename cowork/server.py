@@ -169,6 +169,10 @@ async def lifespan(app: FastAPI):
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    # Ownership recovery must finish before the first request can mint a page.
+    from cowork.services.published_page_owner_backfill import run_published_page_owner_backfill
+
+    await asyncio.to_thread(run_published_page_owner_backfill)
     # After the clear, since resolving MEMORY_ENABLED where memory is shared
     # loads the stored settings.
     try:
