@@ -393,7 +393,15 @@ def _pick_primary(
     preserve_folder_path: bool = False,
 ) -> Path | None:
     """The "open this" file for an artifact card."""
-    if primary_hint:
+    # The hint is agent-written. Two leading separators make it a UNC or
+    # device path, which replaces the folder in the join below, and on Windows
+    # even resolving one can send the user's credentials to another host. So
+    # such a hint is passed over before any file call.
+    if (
+        isinstance(primary_hint, str)
+        and primary_hint
+        and not primary_hint.replace("\\", "/").startswith("//")
+    ):
         try:
             candidate = folder / primary_hint
             target = candidate.resolve()
@@ -403,7 +411,8 @@ def _pick_primary(
                 # Keep that stable descriptor path rather than returning the
                 # resolved, swappable storage name after the containment check.
                 return candidate if preserve_folder_path else target
-        except (ValueError, OSError):
+        # Python 3.12's resolve() raises RuntimeError for a symlink loop.
+        except (ValueError, OSError, RuntimeError):
             pass
     if not files:
         return None
@@ -1181,6 +1190,19 @@ def reveal_in_file_manager(path: Path) -> None:
 # ─── Public API ───────────────────────────────────────────────────
 
 
+def draft_url_for(*, project_id: str | None, artifact_id: str, rel_path: str) -> str:
+    """The authenticated draft URL of one file inside an artifact folder.
+
+    The project segment is ``project_id``, or ``local`` for a root no project
+    row names. ``rel_path`` is "/"-separated and relative to the artifact folder.
+    """
+    project_ref = project_id or "local"
+    return (
+        f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
+        f"{quote(artifact_id)}/{quote(rel_path, safe='/')}"
+    )
+
+
 @dataclass(frozen=True)
 class _PreparedArtifactCard:
     """Pure card result plus the inputs needed for its modified badge."""
@@ -1308,7 +1330,6 @@ def _prepare_artifact_card(
     # fork when an artifact is re-published under a different report URL.
     card["artifactKey"] = artifact_key(artifact_id)
     if primary is not None:
-        project_ref = project_id or "local"
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
         # the URL path so an absolute primary hint cannot fail on that alias.
@@ -1324,9 +1345,8 @@ def _prepare_artifact_card(
         except ValueError:
             logger.warning("Artifact primary resolves outside its folder: %s", folder)
         else:
-            card["draftUrl"] = (
-                f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
-                f"{quote(artifact_id)}/{quote(rel, safe='/')}"
+            card["draftUrl"] = draft_url_for(
+                project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
     if _org_mode():
         # Dropped at the single card builder so inline chat cards are covered
