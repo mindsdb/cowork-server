@@ -18,7 +18,7 @@ Only a single stall past the grace period keeps it from doing that; the
 parent then kills it and reports the grace as a lower bound.
 
 The cases cover ordinary reports at the org caps (10 MiB inline budget, 10 MiB
-HTML and 2 MiB Markdown read bounds), the heaviest HTML the caps allow, and
+HTML and 512 KiB Markdown read bounds), the heaviest HTML the caps allow, and
 Markdown shapes that slow Python-Markdown down much faster than their size.
 
 Run it with 1 CPU and 1 GiB of memory, with the repository mounted read-only:
@@ -55,7 +55,7 @@ from pydantic import BaseModel
 MIB = 1024 * 1024
 # Just under the export's read bounds, so every case is one the route accepts.
 HTML_BYTES = 10 * MIB - 4096
-MARKDOWN_BYTES = 2 * MIB - 4096
+MARKDOWN_BYTES = 512 * 1024 - 4096
 # Just under the inliner's 2 MiB per-asset cap.
 IMAGE_BYTES = 2 * MIB - 4096
 WATCH_INTERVAL_SECONDS = 0.01
@@ -170,7 +170,7 @@ CASES: dict[str, Case] = {
             _with_images(folder, count=5),
             _write(folder, "report.md", _report_markdown(target_bytes=MARKDOWN_BYTES, images=5)),
         ),
-        note="2 MiB report, five 2 MiB images (the inline budget)",
+        note="512 KiB report, five 2 MiB images (the inline budget)",
     ),
     "md-report-small": Case(
         primary="report.md",
@@ -236,12 +236,12 @@ CASES: dict[str, Case] = {
     ),
     "md-paragraphs": _markdown_case(
         lambda: _sized(unit="A plain sentence of ordinary report text.\n\n", target_bytes=MARKDOWN_BYTES),
-        "2 MiB of plain paragraphs",
+        "512 KiB of plain paragraphs",
     ),
     "md-table": _markdown_case(
         lambda: "| a | b | c |\n|---|---|---|\n"
         + _sized(unit="| 1 | 2 | 3 |\n", target_bytes=MARKDOWN_BYTES - 64),
-        "2 MiB table",
+        "512 KiB table",
     ),
     "md-headings": _markdown_case(
         lambda: _sized(unit="# a\n\n", target_bytes=256 * 1024),
