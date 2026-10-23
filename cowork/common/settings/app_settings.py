@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -220,6 +221,21 @@ def default_turn_minds_api_host() -> str:
     if ns.startswith("pr-"):
         return f"https://api-{ns}.dev.mindshub.ai"
     return default_minds_api_host()
+
+
+def default_draft_env_label() -> str:
+    """The environment a draft-preview token is issued for and accepted in.
+
+    The same split as ``default_turn_minds_api_host``, as a label: a per-PR env
+    by its namespace (they all run ENV=development and likely share dev's draft
+    key, so the namespace is what tells them apart), otherwise the ENV slug,
+    and ``prod`` for everything else. Read from the downward API, never from a
+    request.
+    """
+    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
+    if ns.startswith("pr-"):
+        return ns
+    return _env_slug() or "prod"
 
 
 def default_minds_auth_host() -> str:
@@ -1003,6 +1019,100 @@ class AppSettings(Settings):
             "Defaults off so deploying protocol support cannot expose it."
         ),
     )
+    # Draft-preview links. Org web only. All six values together turn the
+    # signed draft links on; any one missing leaves previews on the srcdoc
+    # path (see draft_links_enabled).
+    draft_hosts: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_HOSTS"),
+        description=(
+            "Comma-separated host names of the draft-preview host (e.g. "
+            "draft.mindshub.co). The draft listener answers 404 to any other "
+            "Host. Empty (default) serves no draft host."
+        ),
+    )  # COWORK_DRAFT_HOSTS
+    draft_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_ORIGIN"),
+        description="Origin draft links point at, e.g. https://draft.mindshub.co.",
+    )  # COWORK_DRAFT_ORIGIN
+    draft_link_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KEYS"),
+        description=(
+            "Draft-link signing keys as a JSON map {kid: secret}, from the "
+            "mindsdb-secrets Secret. Two kids can be live during a rotation."
+        ),
+    )  # COWORK_DRAFT_LINK_KEYS
+    draft_link_kid: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KID"),
+        description="The kid in COWORK_DRAFT_LINK_KEYS that signs new draft links.",
+    )  # COWORK_DRAFT_LINK_KID
+    web_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_WEB_ORIGIN"),
+        description=(
+            "Origin of the cowork web app, e.g. https://cowork.mindshub.ai: the "
+            "only page allowed to frame a draft (CSP frame-ancestors)."
+        ),
+    )  # COWORK_WEB_ORIGIN
+    draft_port: int = Field(
+        default=0,
+        ge=0,
+        le=65535,
+        validation_alias=AliasChoices("COWORK_DRAFT_PORT"),
+        description=(
+            "Port of the draft listener: a second server in this process that "
+            "serves only the draft sub-app, so the draft Ingress, which routes "
+            "to this port alone, can never reach the API app. 0 (default) "
+            "starts no listener."
+        ),
+    )  # COWORK_DRAFT_PORT
+
+    @field_validator("draft_port", mode="before")
+    @classmethod
+    def _empty_draft_port_is_off(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return 0
+        return v
+
+    def draft_host_names(self) -> frozenset[str]:
+        """COWORK_DRAFT_HOSTS as lower-case host names, without a trailing dot."""
+        return frozenset(
+            name.strip().lower().rstrip(".")
+            for name in self.draft_hosts.split(",")
+            if name.strip()
+        )
+
+    def draft_link_keyring(self) -> dict[str, str]:
+        """COWORK_DRAFT_LINK_KEYS parsed; an unreadable value is no keys at all."""
+        raw = self.draft_link_keys.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            kid: secret
+            for kid, secret in parsed.items()
+            if isinstance(kid, str) and kid and isinstance(secret, str) and secret
+        }
+
+    def draft_links_enabled(self) -> bool:
+        """Whether this server issues and serves signed draft links."""
+        return (
+            self.tenancy_mode == "org"
+            and bool(self.draft_host_names())
+            and self.draft_origin.startswith(("https://", "http://"))
+            and bool(self.web_origin)
+            and self.draft_link_kid in self.draft_link_keyring()
+            and self.draft_port > 0
+        )
+
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(
