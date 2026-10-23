@@ -59,7 +59,8 @@ from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
-from cowork.streaming.liveness import ModelWaitTicker
+from cowork.streaming import liveness
+from cowork.streaming.liveness import MODEL_WAIT_PHASE, WORKER_ALIVE_PHASE, ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity
 from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
@@ -2154,6 +2155,8 @@ class ResponsesHandler:
             # its compacted step comes for both, its compaction reply for a
             # summary. Both arrive before the history frame.
             compacted = False
+            # When the pod last sent this turn anything but a liveness relay.
+            quiet_since = time.monotonic()
 
             async for kind, data in stream_remote_replies(
                 conversation_id=str(conv_id),
@@ -2183,6 +2186,18 @@ class ResponsesHandler:
                 # own request in turnqueue/remote_turn.py and leave it off.
                 tool_messages=True,
             ):
+                if kind == "progress" and data.get("phase") == WORKER_ALIVE_PHASE:
+                    # The controller relays on a timer, busy or not. Shown
+                    # only after a quiet stretch, as the model_wait frame the
+                    # UI and the idle watchdog already count as activity, so
+                    # it never flashes "Still working" while text streams.
+                    if time.monotonic() - quiet_since >= liveness.MODEL_WAIT_TICK_SECONDS:
+                        quiet_since = time.monotonic()
+                        # The UI shows the message, or "Waiting for the model"
+                        # without one, which a long cell is not doing.
+                        yield StreamTaskProgress(phase=MODEL_WAIT_PHASE, message=liveness.MODEL_WAIT_LABEL)
+                    continue
+                quiet_since = time.monotonic()
                 if kind == "progress" and data.get("phase") == "workspace_authorized":
                     if turn_artifacts is not None:
                         turn_artifacts.writes_allowed = data.get("workspace_mode") == "persistent"

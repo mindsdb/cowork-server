@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 # The progress phase anton, the cloud pod and the cowork UI agree on.
 MODEL_WAIT_PHASE = "model_wait"
+# The progress phase scratchpad-controller relays while a web turn's pod is
+# busy but writes nothing (a long cell, a hung tool). It reaches the UI as a
+# model_wait frame, so it resets the same idle bounds.
+WORKER_ALIVE_PHASE = "worker_alive"
 MODEL_WAIT_LABEL = "Still working"
 
 # How long the buffer must stay quiet before a frame goes out, and how often
