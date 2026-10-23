@@ -8,6 +8,7 @@ while the app password is masked.
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -24,6 +25,7 @@ from cowork.services.connectors.identity import (
     spec_secret_fields,
 )
 from cowork.services.connectors.persist import (
+    KeptSecretMovedError,
     persist_connection,
     set_connection_label,
 )
@@ -225,21 +227,21 @@ class TestKeepSentinel:
         # The real password is preserved — NOT the literal sentinel.
         assert vault.load("gmail", "Inbox")["app_password"] == "REALPW"
 
-    def test_edit_changing_identity_still_updates_named_record(self, tmp_path):
+    def test_edit_changing_identity_with_a_kept_secret_is_refused(self, tmp_path):
         vault = LocalDataVault(tmp_path)
         _save(
             vault, "gmail", "app-password", "Inbox",
             {"email": "a@x.com", "app_password": "PW"},
         )
-        # Edit changes the email but keeps the password (sentinel) → updates the
-        # SAME record in place (an edit targets the named connection), not a suffix.
-        _save(
-            vault, "gmail", "app-password", "Inbox",
-            {"email": "b@x.com", "app_password": VAULT_KEEP_SENTINEL},
-        )
+        # The stored password belongs to a@x.com, so it is not reused for another account.
+        with pytest.raises(KeptSecretMovedError):
+            _save(
+                vault, "gmail", "app-password", "Inbox",
+                {"email": "b@x.com", "app_password": VAULT_KEEP_SENTINEL},
+            )
         assert len(vault.list_connections()) == 1
         rec = vault.load("gmail", "Inbox")
-        assert rec["email"] == "b@x.com" and rec["app_password"] == "PW"
+        assert rec["email"] == "a@x.com" and rec["app_password"] == "PW"
 
 
 class TestGetMaskingFallback:

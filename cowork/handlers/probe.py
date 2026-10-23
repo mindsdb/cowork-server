@@ -5,8 +5,8 @@ import logging
 import shutil
 import tempfile
 import uuid
-from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -19,10 +19,17 @@ from cowork.common.logger import log_context
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.responses import Role
+from cowork.services.connectors.connections import ConnectionsService, KeptValuesRefused
+from cowork.services.connectors.databricks_genie import (
+    GenieConnectionError,
+    is_genie_method,
+    save_genie_connection,
+)
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
+from cowork.services.connectors.vault_secrets import kept_secret_scrubber
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, unsafe_unscoped_session
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
 from cowork.services.conversations import ConversationService
@@ -51,6 +58,32 @@ def _extract_connection_label_fields(credentials: dict) -> tuple[str, str]:
     user_label = str(raw_user_label or raw_user_label_underscore).strip()
 
     return label, user_label
+
+
+def _redact_secrets(value: Any, *, scrub: Callable[[str], str] | None) -> Any:
+    """``value`` with every string in it passed through ``scrub``.
+
+    Walks strings, lists, dicts and ProbeOutcome, the shapes a probe event or
+    verdict carries, and returns other values as they are. Without ``scrub``
+    ``value`` is returned unchanged. Pure; it never logs a value.
+    """
+    if scrub is None:
+        return value
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, dict):
+        return {key: _redact_secrets(item, scrub=scrub) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_secrets(item, scrub=scrub) for item in value]
+    if isinstance(value, ProbeOutcome):
+        return replace(
+            value,
+            summary=_redact_secrets(value.summary, scrub=scrub),
+            error=_redact_secrets(value.error, scrub=scrub),
+            follow_up=_redact_secrets(value.follow_up, scrub=scrub),
+            extra_fields=_redact_secrets(value.extra_fields, scrub=scrub),
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -308,6 +341,67 @@ class ProbeHandler:
                 yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
                 return
 
+            # Genie's check is fixed and needs no model, so it runs before the
+            # workspace and LLM client are built.
+            if is_genie_method(connector_id, method):
+                yield _patch_delta({
+                    "form_id": form_id,
+                    "_is_probing": True,
+                    "status_text": "Checking Databricks Genie…",
+                    "form_error": None,
+                })
+                try:
+                    saved = await save_genie_connection(
+                        self.scope, credentials, name,
+                        label=connection_label, user_label=connection_user_label,
+                    )
+                except GenieConnectionError as exc:
+                    yield _delta(f"{exc.message}\n")
+                    yield _patch_delta({
+                        "form_id": form_id,
+                        "status_text": None,
+                        "_is_probing": False,
+                        "form_error": exc.message,
+                        "_is_success": False,
+                    })
+                    yield await _completed(db_conversation_id, {"status": "retry"})
+                    return
+                summary = f"Connected to Databricks Genie on {saved.host}."
+                yield _delta(f"{summary}\n")
+                yield _patch_delta({
+                    "form_id": form_id,
+                    "title": f"Connected — {saved.slug}",
+                    "subtitle": summary,
+                    "status_text": None,
+                    "form_error": None,
+                    "_is_probing": False,
+                    "_is_success": True,
+                })
+                yield await _completed(db_conversation_id, {"status": "success", "user_label": saved.user_label})
+                return
+
+            # The probe checks kept secrets with their stored values; the save
+            # still gets the sentinels, which mark it as an edit in place.
+            try:
+                checked = ConnectionsService(self.scope).values_for_check(
+                    connector_id, name, credentials, method=method
+                )
+            except KeptValuesRefused as exc:
+                yield _delta(f"{exc.message}\n")
+                yield _patch_delta({
+                    "form_id": form_id,
+                    "status_text": None,
+                    "_is_probing": False,
+                    "form_error": exc.message,
+                    "_is_success": False,
+                })
+                yield await _completed(db_conversation_id, {"status": "retry"})
+                return
+            check_credentials = checked.credentials
+            # The user did not type a kept secret, so nothing the probe streams may show it.
+            scrub = kept_secret_scrubber(checked.kept_secrets) if checked.kept_secrets else None
+            redact = partial(_redact_secrets, scrub=scrub)
+
             # Probe path: build workspace + LLM client
             cell_sandbox = None
             try:
@@ -373,7 +467,7 @@ class ProbeHandler:
 
             probe = CredentialProbe(
                 engine=connector_id,
-                credentials=credentials,
+                credentials=check_credentials,
                 llm_client=llm_client,
                 workspace=workspace,
                 form_spec=form_spec,
@@ -384,6 +478,7 @@ class ProbeHandler:
             )
             try:
                 async for kind, payload in probe.run():
+                    payload = redact(payload)
                     if kind == "text":
                         yield _delta(payload)
                     elif kind == "status":
@@ -445,10 +540,11 @@ class ProbeHandler:
                         final_outcome = payload
                         break
             except Exception as exc:
-                logger.exception("Probe iteration failed")
+                # The class only: the message and traceback can hold the probe's secrets or a provider's reply.
+                logger.error("Probe iteration failed (%s)", type(exc).__name__)
                 final_outcome = ProbeOutcome(
                     status="failure",
-                    error=f"Probe runner crashed: {exc}",
+                    error=redact(f"Probe runner crashed: {exc}"),
                     follow_up="Try resubmitting; if it persists, restart the app.",
                 )
 
@@ -470,9 +566,11 @@ class ProbeHandler:
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
                 except Exception as exc:
-                    logger.exception("Vault save failed despite probe success")
+                    # The class only: a vault error can quote the record, stored secrets included.
+                    logger.error("Vault save failed despite probe success (%s)", type(exc).__name__)
                     final_outcome.status = "failure"
                     final_outcome.error = f"Probe succeeded but save failed: {exc}"
+            final_outcome = redact(final_outcome)
 
             if final_outcome.status == "success":
                 summary = final_outcome.summary or "Connection works."

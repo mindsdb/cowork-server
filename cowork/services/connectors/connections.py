@@ -1,19 +1,50 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
 from cowork.services.connectors.identity import (
+    KEPT_SECRET_MOVED,
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
+    keeps_secret_for_another_account,
+    kept_secret_keys,
+    resolve_keep_sentinels,
 )
-from cowork.services.connectors.layered_vault import CREATED_BY_FIELD, LayeredDataVault
+from cowork.services.connectors.layered_vault import (
+    CREATED_BY_FIELD,
+    SHARED_CONNECTION_REFUSAL,
+    LayeredDataVault,
+)
 from cowork.services.connectors.persist import own_vault_root, vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.vault_lock import discard_lock, lock_for
+
+KEPT_VALUES_NOT_FOUND = (
+    "The saved connection this edit keeps values from was not found. "
+    "Enter its secrets again and try again."
+)
+
+
+class KeptValuesRefused(Exception):
+    """An edit's kept values can't be read for a check; ``message`` is the fixed text the form shows."""
+
+    def __init__(self, message: str) -> None:
+        """Keep ``message`` as both the error text and its ``message`` attribute."""
+        super().__init__(message)
+        self.message = message
+
+
+@dataclass(frozen=True)
+class ValuesForCheck:
+    """An edit's values for a connection check, and the stored secret values it kept."""
+
+    credentials: dict
+    kept_secrets: tuple[str, ...]
 
 
 class ConnectionsService:
@@ -115,11 +146,12 @@ class ConnectionsService:
         fields: dict = dict(record.get("fields") or {})
         # Mask secrets. Prefer the record's explicit secure_keys; fall back to the
         # name heuristic so records saved before secure_keys was persisted don't
-        # leak their secret values through this endpoint.
+        # leak their secret values through this endpoint. A `_` name hides a
+        # field from the agent's environment, not from this mask.
         secure_keys = record.get("secure_keys")
         masked_keys: list[str] = []
         for key in list(fields):
-            if not key.startswith("_") and is_secret_key(key, secure_keys):
+            if is_secret_key(key, secure_keys):
                 fields[key] = _SENTINEL
                 masked_keys.append(key)
 
@@ -130,12 +162,12 @@ class ConnectionsService:
         # the old code echoed `_label`. `fields` is echoed back to the
         # frontend as the raw credential-field map (masked secrets aside);
         # `_user_label`/`_label` are bookkeeping, not credentials, and the
-        # mask loop above skips `_`-prefixed keys entirely (only
-        # `_connector_id`/`_method` are popped today) — leaving them in would
-        # ship two internal keys to the client as if they were unknown form
-        # fields, and if the edit form ever echoed them back unchanged on
-        # save, `persist_connection` would pop `user_label` from `credentials`
-        # again and treat it as an explicit value, closing an unintended loop.
+        # mask loop above leaves them unmasked (only `_connector_id`/`_method`
+        # are popped today) — leaving them in would ship two internal keys to
+        # the client as if they were unknown form fields, and if the edit form
+        # ever echoed them back unchanged on save, `persist_connection` would
+        # pop `user_label` from `credentials` again and treat it as an
+        # explicit value, closing an unintended loop.
         fields.pop("_user_label", None)
         fields.pop("_label", None)
         # Who created it is the vault's bookkeeping, not a credential field.
@@ -153,6 +185,42 @@ class ConnectionsService:
             secure_keys=masked_keys,
             managed=not self._can_change_in(vault, engine, name),
             shared=self._is_shared_in(vault, engine, name),
+        )
+
+    def values_for_check(
+        self, engine: str, name: str, credentials: dict, *, method: str | None = None
+    ) -> ValuesForCheck:
+        """The values a connection check runs with for an edit submit.
+
+        ``credentials`` are the submitted values, where each value the edit
+        form kept arrives as the keep sentinel. Without a sentinel they are
+        returned unchanged with no kept secrets, and the vault is not read.
+        Otherwise each sentinel is resolved against the record named ``name``
+        the way persist_connection resolves it (resolve_keep_sentinels), and
+        the stored values of the kept secret fields are returned beside them.
+        Raises KeptValuesRefused with KEPT_VALUES_NOT_FOUND when there is no
+        such record, with SHARED_CONNECTION_REFUSAL when the caller can't
+        change it, and with KEPT_SECRET_MOVED when a secret is kept while the
+        other identity fields differ from the record, as persist_connection
+        refuses it. So a stored secret never reaches a check it would not be
+        saved with. Reads the vault; writes nothing.
+        """
+        if _SENTINEL not in credentials.values():
+            return ValuesForCheck(credentials=credentials, kept_secrets=())
+        slug = (name or "").strip()
+        vault = self._vault()
+        record = self._read_record(vault, engine, slug) if slug else None
+        if record is None:
+            raise KeptValuesRefused(KEPT_VALUES_NOT_FOUND)
+        if not self._can_change_in(vault, engine, slug):
+            raise KeptValuesRefused(SHARED_CONNECTION_REFUSAL)
+        if keeps_secret_for_another_account(credentials, record, engine, method):
+            raise KeptValuesRefused(KEPT_SECRET_MOVED)
+        resolved, _ = resolve_keep_sentinels(credentials, record)
+        kept = kept_secret_keys(credentials, record, engine, method)
+        return ValuesForCheck(
+            credentials=resolved,
+            kept_secrets=tuple(str(resolved[key]) for key in kept if resolved.get(key)),
         )
 
     def runtime_fields(self, engine: str, name: str) -> dict | None:

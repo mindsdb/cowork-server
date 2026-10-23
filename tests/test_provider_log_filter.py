@@ -280,7 +280,10 @@ async def test_real_probe_handler_keeps_sse_outcome_but_sanitizes_iteration_erro
     assert PRIVATE in "".join(events)  # Client outcome is deliberately unchanged.
     completed = json.loads(events[-1].split("data: ", 1)[1])
     assert completed["response"]["status"] == "retry"
-    _assert_safe(caplog, logged.logger.name)
+    [record] = [r for r in caplog.records if r.name == logged.logger.name and r.levelno == logging.ERROR]
+    assert record.getMessage() == "Probe iteration failed (BadRequestError)"
+    assert record.exc_info is None
+    assert PRIVATE not in repr(record.__dict__)
     assert PRIVATE not in logged.output()
 
 

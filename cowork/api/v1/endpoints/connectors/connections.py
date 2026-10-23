@@ -28,7 +28,7 @@ from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
-from cowork.services.connectors.persist import persist_connection, vault_for_scope
+from cowork.services.connectors.persist import KeptSecretMovedError, persist_connection, vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -205,6 +205,8 @@ def _persist_direct_connection(
         # A derived name that lands on a connection the caller can't change:
         # create_app's handler answers it with 403, not the 500 below.
         raise
+    except KeptSecretMovedError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.message) from exc
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
