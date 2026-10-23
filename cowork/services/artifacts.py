@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import quote
 
 from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
-from cowork.docs.store import DOC_HTML, is_doc_primary
+from cowork.docs.store import DOC_FILENAME, DOC_HTML, is_doc_primary
+from cowork.services import share_hooks
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -999,6 +1000,21 @@ def _unpublish_identifier(
         raise RuntimeError(f"Unpublishing failed: {message}") from exc
 
 
+def _drop_shared_doc(folder: PinnedDir, record: dict) -> None:
+    """A shared doc is being deleted: its live copy in MindsHub goes with its page."""
+    hooks = share_hooks.registered()
+    try:
+        doc_stat = dir_stat(folder, DOC_FILENAME, follow_symlinks=False)
+    except OSError:
+        return
+    if hooks is None or not stat.S_ISREG(doc_stat.st_mode):
+        return
+    try:
+        hooks.after_unshare(record, None)
+    except Exception:
+        logger.warning("could not take down the live copy of a deleted doc", exc_info=True)
+
+
 def _unpublish_pinned_folder(
     folder: PinnedDir, *, api_key: str, publish_url: str
 ) -> None:
@@ -1039,6 +1055,8 @@ def _unpublish_pinned_folder(
         _unpublish_identifier(
             str(identifier), entry, api_key=api_key, publish_url=publish_url
         )
+        if name == DOC_HTML:
+            _drop_shared_doc(folder, dict(entry))
         entry["published"] = False
         published_map[name] = entry
         # Match the historical partial-progress behavior: if a later remote

@@ -332,10 +332,14 @@ def list_history(folder: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------- writes
 
 
-def write_html(folder: Path, doc: Doc) -> None:
-    """Refresh doc.html from the doc. Best-effort: the doc file is the truth."""
+def write_html(folder: Path, doc: Doc, *, editor: bool = False) -> None:
+    """Refresh doc.html from the doc. Best-effort: the doc file is the truth.
+
+    ``editor``: the page loads the owner's editor from files beside it (see
+    ``cowork.docs.page_editor``), which only a shared doc carries.
+    """
     try:
-        atomic_write(folder / DOC_HTML, doc_html(doc).encode("utf-8"))
+        atomic_write(folder / DOC_HTML, doc_html(doc, editor=editor).encode("utf-8"))
     except Exception:  # noqa: BLE001 - a page that failed to render must not fail the edit
         logger.warning("could not render %s", folder / DOC_HTML, exc_info=True)
 

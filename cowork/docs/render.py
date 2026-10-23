@@ -531,8 +531,14 @@ def export_body_html(doc: Doc) -> str:
     return "\n".join(parts)
 
 
-def doc_html(doc: Doc) -> str:
-    """The doc as a standalone page (doc.html): what opens in a browser and what sharing publishes."""
+def doc_html(doc: Doc, *, editor: bool = False) -> str:
+    """The doc as a standalone page (doc.html): what opens in a browser and what sharing publishes.
+
+    ``editor``: load the owner's editor from the files beside the page. The
+    script decides at load whether this visitor is the owner; everyone else
+    keeps this page. The stylesheet is only prefetched here: it is applied for
+    the owner alone, and naming it is what puts it in the published bundle.
+    """
     multi = len(doc["tabs"]) > 1
     sections = []
     for n, tab in enumerate(doc["tabs"]):
@@ -544,11 +550,13 @@ def doc_html(doc: Doc) -> str:
             f"<a href='#tab-{n + 1}'>{html.escape(t['title'])}</a>" for n, t in enumerate(doc["tabs"])) + "</nav>"
     updated = (doc.get("updated_at") or "")[:10]
     meta = f"<p class='meta'>Updated {html.escape(_date_label(updated))}</p>" if updated else ""
+    head_extra = "<link rel='prefetch' href='doc-editor.css' as='style'>" if editor else ""
+    body_extra = "<script defer src='doc-editor.js'></script>" if editor else ""
     return (
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<title>{html.escape(doc['title'])}</title><style>{PAGE_CSS}</style></head><body>"
+        f"<title>{html.escape(doc['title'])}</title><style>{PAGE_CSS}</style>{head_extra}</head><body>"
         f"<main class='page'><h1 class='page-title'>{html.escape(doc['title'])}</h1>{meta}{nav}"
         + "".join(sections)
-        + "<footer>Made with MindsHub Cowork</footer></main></body></html>"
+        + f"<footer>Made with MindsHub Cowork</footer></main>{body_extra}</body></html>"
     )

@@ -25,9 +25,9 @@ class Debouncer:
         self._lock = threading.Lock()
         self._waiting: dict[str, threading.Timer] = {}
 
-    def schedule(self, key: str, fn: Callable[[], None]) -> None:
+    def schedule(self, key: str, fn: Callable[[], None], *, delay: float | None = None) -> None:
         ctx = contextvars.copy_context()
-        timer = threading.Timer(self.delay, self._fire, args=(key, ctx, fn))
+        timer = threading.Timer(self.delay if delay is None else delay, self._fire, args=(key, ctx, fn))
         timer.daemon = True
         with self._lock:
             old = self._waiting.get(key)
@@ -47,6 +47,12 @@ class Debouncer:
             ctx.run(fn)
         except Exception:  # noqa: BLE001 - see the class docstring
             logger.warning("%s failed for %s", self.what, key, exc_info=True)
+
+    def cancel(self, key: str) -> None:
+        with self._lock:
+            timer = self._waiting.pop(key, None)
+        if timer is not None:
+            timer.cancel()
 
     def cancel_all(self) -> None:
         with self._lock:

@@ -12,17 +12,18 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from . import page_editor
 from .hub import conv_topic, doc_topic, hub
 from .model import Doc, DocError
 from .ops import apply_ops, build_new_doc
-from .store import NewDoc, create_doc_folder, mutate_doc, with_doc, write_html
+from .store import NewDoc, create_doc_folder, mutate_doc, with_doc
 
 logger = logging.getLogger(__name__)
 
 
 def render_page(folder: Path, doc: Doc) -> None:
-    """Rewrite the doc's page (doc.html) from ``doc``."""
-    write_html(folder, doc)
+    """Rewrite the doc's page (doc.html) from ``doc``, with the owner's editor while it is shared."""
+    page_editor.render_page(folder, doc)
 
 
 def refresh_page(folder: Path) -> None:

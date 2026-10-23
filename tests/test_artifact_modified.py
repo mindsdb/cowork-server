@@ -376,7 +376,7 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
             publish_mod, "desktop_publish_credential", lambda: ("key", "https://4nton.ai")
         ))
         stack.enter_context(patch.object(
-            publish_mod, "publish_artifact", lambda *args, **kwargs: {"status": "ok"}
+            publish_mod, "_publish_bundle", lambda *args, **kwargs: {"status": "ok"}
         ))
         publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 

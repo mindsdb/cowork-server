@@ -2,5 +2,5 @@
 
 See docs/DOCS_ARTIFACTS.md for the modules, which depend in one direction:
 ``model`` → ``markdown`` → ``ops`` / ``render`` / ``changes`` → ``store`` → ``hub`` →
-``sharing`` → ``service`` → ``history`` / ``republish`` → ``sync``.
+``sharing`` → ``page_editor`` → ``service`` → ``history`` / ``republish`` / ``cloud`` → ``sync``.
 """
