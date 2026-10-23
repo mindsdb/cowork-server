@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
+from sqlmodel import Session
 from starlette.testclient import TestClient
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
@@ -18,7 +19,10 @@ from cowork.draft_host import app as draft_app_module
 from cowork.draft_host.app import create_draft_app
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, verify_draft_token
 from cowork.server import create_app
+from cowork.services.artifact_draft_review import disable_draft_review
+from cowork.services.artifact_identity import ensure_full_id
 
+import test_artifacts_api_tenancy as tenancy
 from draft_host_support import (
     ARTIFACT,
     DRAFT_HOST,
@@ -31,6 +35,7 @@ from draft_host_support import (
     fake_review,
     make_artifact,
 )
+from test_artifacts_api_tenancy import session  # noqa: F401  (fixture)
 
 IDENTITY = {"X-User-Id": USER, "X-Organization-Id": ORG}
 DASHED_ARTIFACT = str(UUID(ARTIFACT))
@@ -189,3 +194,61 @@ def test_health_says_no_draft_links_while_any_value_is_missing(draft_env, monkey
 
     assert TestClient(create_app()).get("/api/v1/health/").json()["draft_links"] is False
 
+
+
+# The tests above stub review_artifact_for_request. These do not: they pin that
+# the draft host asks the real review on every request, so a grant that is
+# withdrawn stops a link that was issued while it stood.
+
+
+@pytest.fixture
+def real_review(draft_env, granted_product_permissions):
+    """Draft links on and role checks granted; the review itself is not stubbed."""
+
+
+def _on_the_draft_host(url: str) -> str:
+    return url.removeprefix(f"https://{DRAFT_HOST}")
+
+
+async def _issue_link(row, artifact_id, scoped) -> str:
+    response = await workspace_ep.create_draft_link(str(row.id), artifact_id, scoped)
+    assert response.status_code == 200, response.body
+    return json.loads(response.body)["url"]
+
+
+async def test_an_owner_link_opens_through_the_real_review(session, tmp_path, real_review):
+    row, folder = tenancy._project_with_artifact(session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug="dash")
+    artifact_id, _ = ensure_full_id(folder)
+    url = await _issue_link(row, artifact_id, tenancy._scoped(session, tenancy.ORG_A))
+    draft = TestClient(create_draft_app(), base_url=f"https://{DRAFT_HOST}")
+
+    response = draft.get(_on_the_draft_host(url), headers=FETCH)
+
+    assert response.status_code == 200, response.text
+
+
+async def test_a_reviewer_link_stops_opening_when_the_grant_is_withdrawn(
+    session, tmp_path, real_review, monkeypatch
+):
+    row, folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch)
+    with Session(session.get_bind()) as reviewer_session:
+        reviewer = tenancy._scoped(reviewer_session, tenancy.ORG_A, tenancy.USER_A2)
+        url = await _issue_link(row, card["id"], reviewer)
+    draft = TestClient(create_draft_app(), base_url=f"https://{DRAFT_HOST}")
+    assert draft.get(_on_the_draft_host(url), headers=FETCH).status_code == 200
+
+    assert disable_draft_review(folder) is True
+
+    assert draft.get(_on_the_draft_host(url), headers=FETCH).status_code == 404
+
+
+async def test_a_co_member_without_a_grant_gets_no_link(session, tmp_path, real_review):
+    row, folder = tenancy._project_with_artifact(session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug="dash")
+    artifact_id, _ = ensure_full_id(folder)
+
+    with Session(session.get_bind()) as other_session:
+        other = tenancy._scoped(other_session, tenancy.ORG_A, tenancy.USER_A2)
+        with pytest.raises(HTTPException) as refused:
+            await workspace_ep.create_draft_link(str(row.id), artifact_id, other)
+
+    assert refused.value.status_code == 404
