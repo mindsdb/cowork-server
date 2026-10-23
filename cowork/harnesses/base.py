@@ -82,6 +82,9 @@ class HarnessProvider(Protocol):
         # the turn alive while a model call is quiet; other harnesses accept
         # and ignore it.
         model_wait: "ModelWaitTicker | None" = None,
+        # False when nobody is there to answer, as in a scheduled run. A
+        # harness withholds tools that need the user's confirmation then.
+        interactive: bool = True,
     ) -> AsyncIterator[str]:
         ...
 
