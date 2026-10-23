@@ -209,7 +209,7 @@ def test_download_is_refused_on_this_host(client, seen, query):
 
 @pytest.mark.parametrize(
     "path",
-    ["/", "/index.html", "/api/v1/health/", "/api/v1/artifacts/", "/_t", "/_t/", "/x/_t/tok/index.html"],
+    ["/", "/index.html", "/api/v1/health/", "/api/v1/artifacts/", "/_t", "/_t/", "/_t/tok", "/x/_t/tok/index.html"],
 )
 def test_every_other_path_is_404(client, seen, path):
     response = client.get(path, headers=FETCH)

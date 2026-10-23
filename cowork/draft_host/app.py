@@ -285,7 +285,11 @@ class _DraftApp(Starlette):
 
 def create_draft_app() -> Starlette:
     """The draft host: ``GET/HEAD /_t/{token}/{rel_path}``, 404 for anything else."""
-    return _DraftApp(
+    app = _DraftApp(
         routes=[_NamedRoute(DRAFT_ROUTE, _serve_draft, methods=["GET", "HEAD"])],
         middleware=[Middleware(_DraftHeadersMiddleware)],
     )
+    # No slash redirects: the router would answer ``/_t/<token>`` with a 307
+    # to the client's Host before the route runs, skipping its Host check.
+    app.router.redirect_slashes = False
+    return app
