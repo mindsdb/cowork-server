@@ -168,27 +168,46 @@ def _trusted_roots() -> list[Path]:
     ]
 
 
-def _anchored(path: Path) -> _Anchored | None:
+class _TrustedRoots:
+    """Configured roots resolved for one policy build, never descendant grants."""
+
+    def __init__(self) -> None:
+        self.resolved = {root: _real(root) for root in dict.fromkeys(_trusted_roots())}
+        self.forms = tuple(
+            (Path(os.path.normcase(form)).parts, real)
+            for root, real in self.resolved.items()
+            for form in dict.fromkeys((Path(os.path.abspath(root)), real))
+        )
+
+    def real(self, path: Path) -> Path:
+        """Reuse only configured roots; other paths still resolve where requested."""
+        if path in self.resolved:
+            return self.resolved[path]
+        return _real(path)
+
+
+def _anchored(path: Path, *, roots: _TrustedRoots | None = None) -> _Anchored | None:
     """``path`` below the outermost trusted root that holds it, the one that
     leaves the most names to check, or None when no trusted root holds it (an
     adopted project folder, the packaged and managed skills). Each root is
     compared as written and as resolved, since a project's stored path is
     resolved (safe_join)."""
     lexical = Path(os.path.abspath(path))
+    parts = lexical.parts
+    matched_parts = Path(os.path.normcase(lexical)).parts
     best: _Anchored | None = None
-    for root in _trusted_roots():
-        real = _real(root)
-        for form in (Path(os.path.abspath(root)), real):
-            try:
-                names = lexical.relative_to(form).parts
-            except ValueError:
-                continue
-            if best is None or len(names) > len(best.names):
-                best = _Anchored(real, names)
+    for form, real in (roots if roots is not None else _TrustedRoots()).forms:
+        if matched_parts[:len(form)] != form:
+            continue
+        names = parts[len(form):]
+        if best is None or len(names) > len(best.names):
+            best = _Anchored(real, names)
     return best
 
 
-def _granted_dir(path: Path, *, create: bool = False, missing_ok: bool = False) -> Path:
+def _granted_dir(
+    path: Path, *, create: bool = False, missing_ok: bool = False, roots: _TrustedRoots | None = None,
+) -> Path:
     """``path`` as the policy grants it: absolute, normalized, with every
     link resolved.
 
@@ -200,7 +219,7 @@ def _granted_dir(path: Path, *, create: bool = False, missing_ok: bool = False) 
     folder (ELOOP or ENOTDIR), and FileNotFoundError when one is missing,
     unless ``missing_ok``: the launcher skips a missing optional grant.
     """
-    anchored = _anchored(path)
+    anchored = _anchored(path, roots=roots)
     if anchored is None:
         return _real(path)
     if create:
@@ -219,11 +238,11 @@ def _granted_dir(path: Path, *, create: bool = False, missing_ok: bool = False) 
 _LINK_ERRNOS = frozenset({errno.ELOOP, errno.ENOTDIR})
 
 
-def _required_dir(path: Path, *, create: bool = False) -> Path:
+def _required_dir(path: Path, *, create: bool = False, roots: _TrustedRoots | None = None) -> Path:
     """``_granted_dir`` for a folder the session can't run without. A link
     on the way refuses the session with an OSError that names the folder."""
     try:
-        return _granted_dir(path, create=create)
+        return _granted_dir(path, create=create, roots=roots)
     except OSError as error:
         if error.errno not in _LINK_ERRNOS:
             raise
@@ -235,14 +254,14 @@ def _required_dir(path: Path, *, create: bool = False) -> Path:
         ) from error
 
 
-def _read_only_dirs(paths: Iterable[Path]) -> tuple[Path, ...]:
+def _read_only_dirs(paths: Iterable[Path], *, roots: _TrustedRoots | None = None) -> tuple[Path, ...]:
     """The read-only grants for ``paths``, each once. A folder behind a link,
     or that isn't a folder, is left out and logged: granting it would grant
     where the link points, maybe another person's folder."""
     granted: dict[Path, None] = {}
     for path in paths:
         try:
-            granted[_granted_dir(path, missing_ok=True)] = None
+            granted[_granted_dir(path, missing_ok=True, roots=roots)] = None
         except OSError as error:
             logger.warning(
                 "code sandbox: not granting %s, a folder on the way is a link or not a folder (%s)",
@@ -252,12 +271,12 @@ def _read_only_dirs(paths: Iterable[Path]) -> tuple[Path, ...]:
     return tuple(granted)
 
 
-def _private_dir(root: Path, *, name: str) -> Path:
+def _private_dir(root: Path, *, name: str, roots: _TrustedRoots | None = None) -> Path:
     """``root/name``, created when missing, as the policy grants it. Opened
     from the shared root (cowork-home for the operator view) without following
     links, so a link at the partition, ``sandbox/`` or ``name`` refuses the
     session instead of handing the cell where it points."""
-    return _required_dir(root / name, create=True)
+    return _required_dir(root / name, create=True, roots=roots)
 
 
 def refuse_a_linked_project(project_dir: Path) -> None:
@@ -402,12 +421,12 @@ def _resolved_entry(entry: os.DirEntry[str], *, real_root: Path) -> Path:
     return real_root / entry.name
 
 
-def _partition_roots(shared_root: Path) -> list[_Partition]:
+def _partition_roots(shared_root: Path, *, roots: _TrustedRoots | None = None) -> list[_Partition]:
     """Every person's partition folder: the children of the shared root named
     by a partition id (cowork.principal.personal_partition_id, a UUID), each
     resolved once. The shared root is resolved once for all of them, and only
     a partition that is a link is resolved on its own (``_resolved_entry``)."""
-    real_root = _real(shared_root)
+    real_root = roots.real(shared_root) if roots is not None else _real(shared_root)
     try:
         with os.scandir(real_root) as scanned:
             entries = list(scanned)
@@ -424,16 +443,19 @@ def _partition_roots(shared_root: Path) -> list[_Partition]:
     return partitions
 
 
-def _forbidden_roots(settings: AppSettings, *, partitions: list[_Partition]) -> tuple[Path, ...]:
+def _forbidden_roots(
+    settings: AppSettings, *, partitions: list[_Partition], roots: _TrustedRoots | None = None,
+) -> tuple[Path, ...]:
     """The folders no grant may equal or contain, each resolved and named
     once: cowork-home, the shared root, its ``shared/`` folder, every
     partition (resolved by _partition_roots), and the managed folder."""
     shared_root = Path(settings.storage.shared_root)
-    roots = [_real(root) for root in (cowork_home(), shared_root, shared_root / "shared")]
-    roots += [partition.real for partition in partitions]
+    real = roots.real if roots is not None else _real
+    forbidden = [real(root) for root in (cowork_home(), shared_root, shared_root / "shared")]
+    forbidden += [partition.real for partition in partitions]
     if settings.managed_dir is not None:
-        roots.append(_real(settings.managed_dir))
-    return tuple(dict.fromkeys(roots))
+        forbidden.append(real(settings.managed_dir))
+    return tuple(dict.fromkeys(forbidden))
 
 
 def _other_partitions(
@@ -497,14 +519,15 @@ def build_cell_sandbox(
     if settings.code_sandbox != "landlock":
         return None
     root = _sandbox_root(scope)
-    partitions = _partition_roots(Path(settings.storage.shared_root))
+    roots = _TrustedRoots()
+    partitions = _partition_roots(Path(settings.storage.shared_root), roots=roots)
     return _cell_sandbox(
-        project_dir=_required_dir(project_dir),
-        home_dir=_private_dir(root, name="home"),
-        tmp_dir=_private_dir(root, name="tmp"),
-        shared_dir=_required_dir(shared_files_dir(), create=True),
-        read_only_dirs=_read_only_dirs(read_only_dirs),
-        forbidden_roots=_forbidden_roots(settings, partitions=partitions),
+        project_dir=_required_dir(project_dir, roots=roots),
+        home_dir=_private_dir(root, name="home", roots=roots),
+        tmp_dir=_private_dir(root, name="tmp", roots=roots),
+        shared_dir=_required_dir(shared_files_dir(), create=True, roots=roots),
+        read_only_dirs=_read_only_dirs(read_only_dirs, roots=roots),
+        forbidden_roots=_forbidden_roots(settings, partitions=partitions, roots=roots),
         other_partitions=_other_partitions(scope, partitions=partitions),
     )
 
@@ -609,7 +632,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
 
     Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
     headers with the sandbox off; and with ``landlock``, org tenancy, remote
-    turns, an anton without the launcher or whose policy model refuses this
+    turns, private connections with shared projects, an anton without the launcher or whose policy model refuses this
     server's policy, a kernel below the Landlock floor, a link at one of
     cowork-home's own entries (_COWORK_HOME_ENTRIES), or a self-test that
     can't confirm a denied path is denied. Then creates the shared folder.
@@ -635,6 +658,17 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "COWORK_CODE_SANDBOX=landlock is not supported with COWORK_TURN_BACKEND=remote: "
             "remote workers start agent code without the launcher. Leave "
             "COWORK_TURN_BACKEND unset to run turns in this process."
+        )
+    if (
+        settings.trust_identity_headers
+        and PersonalResource.CONNECTIONS in settings.personal_resources
+        and PersonalResource.PROJECTS not in settings.personal_resources
+    ):
+        raise RuntimeError(
+            "With COWORK_TRUST_IDENTITY_HEADERS, private connections require personal projects: "
+            "shared project venvs and saved cell state can run one person's code with another "
+            "person's connections. Add projects to COWORK_PERSONAL_RESOURCES before starting. "
+            "Preserve any shared project files before changing their storage namespace."
         )
     gap = _anton_sandbox_gap()
     if gap is not None:
