@@ -98,6 +98,17 @@ class PortAllocator:
             return False
 
 
+def is_git_workspace(workspace: TaskWorkspace) -> bool:
+    """Whether review, branch and commit actions can run in this task folder.
+
+    An in-place folder is the user's own repository, recorded with the commit
+    the task started from.
+    """
+    return workspace.workspace_kind == WorkspaceKind.git_worktree or (
+        workspace.workspace_kind == WorkspaceKind.direct_folder and workspace.base_revision is not None
+    )
+
+
 class ProjectCommandRunner:
     """Execute structured project commands without platform shell parsing."""
 
@@ -219,6 +230,54 @@ class ProjectWorkspaceManager:
                         self.rollback_task_branch(workspace)
                 self.ports.release(session_id)
                 raise
+
+    def in_place_roots(self, project: CodeProject) -> list[tuple[ProjectFolder, Path]]:
+        """Each project folder and the repository an in-place task would work in.
+
+        In place means the user's own checkouts, so every resource needs one
+        on this computer, in a Git repository with a commit; nothing is cloned.
+        """
+        roots: list[tuple[ProjectFolder, Path]] = []
+        for resource in project.resources:
+            if isinstance(resource, RepositoryResource) and not (
+                resource.local_path and Path(resource.local_path).expanduser().is_dir()
+            ):
+                raise WorkspaceError(
+                    f"{resource.name} has no checkout on this computer to work in; choose Worktree"
+                )
+            folder = resource_folder(resource)
+            try:
+                root = self.workspaces.in_place_root(folder.path)
+            except WorkspaceError as exc:
+                raise WorkspaceError(f"{folder.name}: {exc}") from exc
+            roots.append((folder, root))
+        if len({root for _, root in roots}) != len(roots):
+            raise WorkspaceError("Two project folders are in the same repository, so they cannot both work in place; choose Worktree")
+        return roots
+
+    def prepare_in_place(self, session_id: str, project: CodeProject) -> PreparedProjectWorkspace:
+        """Point every project folder at the user's own repository.
+
+        No worktree, copy or task branch is made: the task works on whatever
+        branch each checkout is on, and review compares against where it was.
+        """
+        with self._lock:
+            prepared: list[TaskWorkspace] = []
+            for folder, root in self.in_place_roots(project):
+                item = self.workspaces.prepare_in_place(str(root))
+                prepared.append(TaskWorkspace(
+                    folder_id=folder.id,
+                    folder_name=folder.name,
+                    source_path=str(item.source_path),
+                    workspace_path=str(item.workspace_path),
+                    workspace_kind=item.kind,
+                    repository_root=str(item.repository_root) if item.repository_root else None,
+                    base_revision=item.base_revision,
+                    base_branch=self.workspaces.inspect(str(root)).branch,
+                    source_dirty=item.source_dirty,
+                ))
+            ports = self.ports.allocate(session_id, project.environment.port_names)
+            return PreparedProjectWorkspace(primary=prepared[0], workspaces=tuple(prepared), ports=ports)
 
     def rollback_task_branch(self, workspace: TaskWorkspace) -> None:
         """Delete only our still-unmodified branch after failed preparation."""
@@ -476,7 +535,7 @@ class ProjectWorkspaceManager:
         ]
 
     def commit(self, workspaces: list[TaskWorkspace], message: str) -> list[GitState]:
-        repositories = [workspace for workspace in workspaces if workspace.workspace_kind == WorkspaceKind.git_worktree]
+        repositories = [workspace for workspace in workspaces if is_git_workspace(workspace)]
         # A missing author identity would fail every repository; ask for it
         # before touching any of them rather than after a rolled-back attempt.
         for workspace in repositories:
@@ -484,9 +543,7 @@ class ProjectWorkspaceManager:
         states: list[GitState] = []
         checkpoints: list[tuple[TaskWorkspace, str]] = []
         try:
-            for workspace in workspaces:
-                if workspace.workspace_kind != WorkspaceKind.git_worktree:
-                    continue
+            for workspace in repositories:
                 state = self.workspaces.git_state(workspace.source_path, workspace.workspace_path)
                 if state.dirty:
                     checkpoint = self.workspaces.commit_checkpoint(workspace.workspace_path)
