@@ -166,8 +166,9 @@ def _handle_missed_runs(session) -> None:
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:
     """Service principal for a scheduled run, derived from the schedule row.
 
-    Delegates to `service_principal_for` from the scoped module, which handles
-    the org vs. local mode logic. The custom error message below wraps it with
+    Delegates to `service_principal_for` from the scoped module, which decides
+    whether schedules are partitioned (org mode, or personal schedules on a
+    trusted-identity deployment). The custom error message below wraps it with
     schedule-specific context.
     """
     from cowork.db.scoped import service_principal_for
@@ -177,7 +178,7 @@ def _principal_for_schedule(schedule: Schedule) -> Principal | None:
     except MissingTenantScopeError:
         raise MissingTenantScopeError(
             f"schedule {schedule.id} is missing org_id/created_by; "
-            "cannot resolve a service principal to run it in org mode"
+            "cannot resolve a service principal to run it as its creator"
         )
 
 
@@ -262,7 +263,7 @@ def _record_turn_outcome(
     outcome = _RunOutcome()
     if reason == "cancelled":
         outcome = _RunOutcome(status=RunStatus.cancelled)
-        logger.info(f"Schedule {schedule_id} run was cancelled")
+        logger.info("Schedule run cancelled", extra={"event": "schedule_cancelled", "schedule_id": schedule_id})
     elif reason is not None and reason != "completed":
         outcome = _RunOutcome(
             status=RunStatus.failed,
@@ -327,7 +328,8 @@ async def _until_it_lands(unit: Callable[[ScopedSession], T], *, schedule_id: UU
             if loop.time() >= deadline:
                 raise
             logger.warning(
-                f"Schedule {schedule_id}: no database connection freed to record its run; trying again"
+                "No database connection freed to record scheduled run; trying again",
+                extra=log_context(schedule_id=schedule_id)
             )
             await asyncio.sleep(_BOOKKEEPING_RETRY_PAUSE_SECONDS)
 
@@ -358,7 +360,8 @@ async def execute_schedule(
         # Nothing was written, so nothing is left at `running`: a cron slot
         # stays due and the next poll starts it.
         logger.warning(
-            f"Schedule {schedule_id}: no database connection freed to start its run; it did not run"
+            "No database connection freed to start scheduled run",
+            extra=log_context(schedule_id=schedule_id)
         )
         return
 
@@ -473,7 +476,8 @@ async def _turn_terminal_reason(conversation_id: str) -> str | None:
                 return str(rec.data.get("reason") or "") or None
     except Exception:
         logger.exception(
-            f"Could not read terminal state for conversation {conversation_id}"
+            "Could not read conversation terminal state",
+            extra=log_context(conversation_id=conversation_id)
         )
     return None
 
@@ -514,8 +518,8 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
             continue
         if _ran_recently(s, run_service, now):
             logger.info(
-                f"Schedule {s.id}: skipping due slot — a successful run "
-                "finished within the freshness window"
+                "Skipping schedule slot after a recent successful run",
+                extra=log_context(schedule_id=s.id)
             )
             _advance_next_run_at(s, session)
             skipped = True

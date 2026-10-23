@@ -281,10 +281,10 @@ def test_the_console_formatter_renders_the_request_context(monkeypatch, rich_log
             setattr(rec, key, value)
         return rec
 
-    assert "[Req:corr-abc]" in formatter.format(record(request_id="corr-abc"))
+    assert json.loads(formatter.format(record(request_id="corr-abc")))["request_id"] == "corr-abc"
     # The same formatter still has to render the records that carry no id,
     # which is nearly all of them.
-    assert "[Req:" not in formatter.format(record())
+    assert "request_id" not in json.loads(formatter.format(record()))
 
 
 # --- the direct-answer producer -------------------------------------------
@@ -294,7 +294,7 @@ def test_the_console_formatter_renders_the_request_context(monkeypatch, rich_log
 # same nothing-to-quote problem the delegated paths had fixed.
 #
 # The id is NOT minted inside the producer: the caller already mints one for
-# `record_turn`, and the turn index exists so a replica can find the turn by
+# the turn's identity, and the turn index exists so a replica can find the turn by
 # that id. Two ids would give the user a Reference that matches the log line
 # and nothing in the index.
 
@@ -343,7 +343,7 @@ def _failed_frames(buffer) -> list[dict]:
 
 @pytest.mark.asyncio
 async def test_direct_turn_failure_quotes_the_id_the_turn_index_holds(monkeypatch, caplog):
-    """The frame, the log record and `record_turn` all carry ONE id."""
+    """The frame, the log record and the turn index all carry ONE id."""
     from cowork.handlers.response_routing import DIRECT_CONTEXT, RouteDecision
 
     def _boom(conv_id, text, events, harness=None):
@@ -354,17 +354,14 @@ async def test_direct_turn_failure_quotes_the_id_the_turn_index_holds(monkeypatc
     recorded: dict = {}
 
     async def fake_start(**kwargs):
+        # registry.start records this identity in the turn index on Redis.
+        recorded["correlation_id"] = kwargs["lifecycle"].identity.correlation_id
         # Run the producer for real instead of discarding it; the failure
         # branch is the whole point.
         await kwargs["produce"](buffer)
         return SimpleNamespace(buffer=buffer)
 
-    async def fake_record(conversation_id, **kwargs):
-        recorded.update(kwargs)
-
     monkeypatch.setattr(responses_mod.registry, "start", fake_start)
-    monkeypatch.setattr(responses_mod, "get_backend", lambda: "redis")
-    monkeypatch.setattr(responses_mod, "record_turn", fake_record)
 
     conv_id = UUID("d27d3533-2e4e-4021-bb5a-6e238245974c")
     with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
@@ -373,6 +370,7 @@ async def test_direct_turn_failure_quotes_the_id_the_turn_index_holds(monkeypatc
             conversation_id=conv_id,
             turn_id=3,
             original_content="Hello",
+            question="Hello",
             route=RouteDecision(
                 route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.",
             ),
@@ -408,6 +406,7 @@ async def test_direct_turn_seal_quotes_the_same_id(monkeypatch):
             lifecycle=SimpleNamespace(discarded=False),
             conv_id=UUID("d27d3533-2e4e-4021-bb5a-6e238245974c"),
             original_content="Hello",
+            question="Hello",
             route=RouteDecision(
                 route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.",
             ),
@@ -452,6 +451,7 @@ async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypa
             conversation_id=UUID("d27d3533-2e4e-4021-bb5a-6e238245974c"),
             turn_id=1,
             original_content="Hello",
+            question="Hello",
             route=RouteDecision(
                 route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.",
             ),
@@ -463,6 +463,6 @@ async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypa
     assert caught.value.detail["code"] == "anton_error"
     quoted = caught.value.detail["request_id"]
     assert quoted.startswith("direct-")
-    # This half never calls record_turn, so the log line is the ONLY place the
+    # This half never reaches the turn index, so the log line is the ONLY place the
     # quoted Reference resolves. Pin it on the record, not just in the text.
     assert [r for r in caplog.records if getattr(r, "request_id", None) == quoted]
