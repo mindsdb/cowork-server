@@ -869,6 +869,16 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "model": gate_settings.resolved_gate_model,
         "followsRouterPick": gate_provider is Provider.OPENAI_COMPATIBLE,
     }
+    # Which gate decides turns now (jev_route.gate_mode, the function turns
+    # use), so Settings can show the decision-model section and say what it
+    # does. `gate` above stays for UIs that predate this; they ship OTA apart
+    # from this server.
+    from cowork.handlers.jev_route import gate_mode
+
+    routing = {
+        "mode": gate_mode(gate_settings),
+        "routerProvider": gate["provider"],
+    }
 
     return {
         "recommendedModels": recommended,
@@ -880,6 +890,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "modelProviders": model_providers,
         "modelFamilies": model_families,
         "gate": gate,
+        "routing": routing,
     }
 
 

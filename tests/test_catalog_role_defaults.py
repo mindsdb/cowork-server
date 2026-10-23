@@ -687,6 +687,24 @@ def test_the_row_is_told_which_model_gates(monkeypatch):
     assert payload["gate"]["model"] == payload["recommendedPair"]["minds-cloud"][2]
 
 
+def test_settings_are_told_which_gate_decides_turns(monkeypatch):
+    """`routing` states the gate turns use (jev_route.gate_mode), so the
+    decision-model section shows what actually happens."""
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "sonnet", "haiku", "kimi"],
+        enabled={"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True},
+        role_defaults={"planning": "sonnet", "coding": "haiku", "router": "kimi"},
+    )
+
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["routing"] == {"mode": "jev", "routerProvider": "minds-cloud"}
+    # Kept for UIs that predate `routing`.
+    assert "gate" in payload
+
+
 def test_the_gate_model_is_availability_adjusted_like_resolution_is(monkeypatch):
     _stub_listing(
         monkeypatch,

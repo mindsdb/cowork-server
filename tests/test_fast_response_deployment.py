@@ -26,8 +26,6 @@ def isolated_identity(monkeypatch):
     for name in ("COWORK_DEPLOYMENT_KIND", "COWORK_DEPLOYMENT_BRAND_FILE"):
         monkeypatch.delenv(name, raising=False)
     get_app_settings.cache_clear()
-    # The shadow probe is unrelated to the user-visible gate response.
-    monkeypatch.setattr(responses, "_spawn_jev_shadow_probe", lambda *args, **kwargs: None)
     yield
     get_app_settings.cache_clear()
 

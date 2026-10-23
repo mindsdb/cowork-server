@@ -596,29 +596,29 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
-    jev_shadow_enabled: bool = Field(
-        default=False,
-        description=(
-            "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
-            "purely for latency/agreement comparison. Never used to route; logged only. "
-            "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
-            "'remote'. Off by default: the call runs on the turn's own minted key and "
-            "sends the turn's text history as state. Jev is zero-priced, so it charges no "
-            "wallet, but on an unfunded org every turn draws that org's free Jev allowance "
-            "in the background, and a refused call shows up only as the "
-            "'jev_error=http_<status>' field of the '[jev-shadow]' warning that "
-            "responses._spawn_jev_shadow_probe logs."
-        ),
-    )  # COWORK_TURN_JEV_SHADOW_ENABLED
-    jev_shadow_model: str = Field(
+    jev_route_model: str = Field(
         default="jev",
-        description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
-    )  # COWORK_TURN_JEV_SHADOW_MODEL
-    jev_shadow_timeout_seconds: float = Field(
+        description="MindsHub catalog alias of the Jev model the route gate asks ('/v1/decisions').",
+    )  # COWORK_TURN_JEV_ROUTE_MODEL
+    jev_route_timeout_seconds: float = Field(
         default=3.0,
         gt=0,
-        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
-    )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
+        description=(
+            "Hard wall-clock timeout for the route gate's Jev call (enforced via asyncio.timeout, "
+            "not just httpx's own per-phase timeout). Past it the turn delegates. The call sits "
+            "ahead of every MindsHub turn: the eval measured p95 about 1.4s, and single live "
+            "calls reached 2.0s, so a 2s budget would quietly send direct turns to the agent."
+        ),
+    )  # COWORK_TURN_JEV_ROUTE_TIMEOUT_SECONDS
+    jev_route_min_p_direct: float = Field(
+        default=0.5,
+        ge=0,
+        le=1,
+        description=(
+            "Jev's probability of a direct answer needed to answer directly. Low on purpose: the "
+            "direct model can still delegate. See scripts/eval_jev_route before raising it."
+        ),
+    )  # COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT
     minds_coding_model: str = Field(
         default="",
         description=(

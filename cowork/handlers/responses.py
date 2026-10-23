@@ -4,8 +4,8 @@ import asyncio
 import base64
 import json
 import time
-from collections.abc import AsyncGenerator, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import cache, partial
 from pathlib import Path
@@ -25,19 +25,19 @@ from cowork.common.settings.user_settings import (
     UserSettings,
     get_user_settings,
     provider_api_key,
+    provider_api_key_str,
     use_settings_scope,
     use_turn_settings,
 )
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
-from cowork.handlers import jev_shadow
+from cowork.handlers import direct_answer, jev_route
+from cowork.services.providers import build_llm_client, minds_chat_base_url
 from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
-    _MAX_HISTORY_MESSAGES,
     _settings_binding,
-    _text_history,
     RouteDecision,
     RouterBinding,
     decide_route,
@@ -133,39 +133,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Strong references for fire-and-forget probe tasks: asyncio holds only a weak
-# reference to a task once nothing else does, so a bare `create_task` result
-# that's dropped can be garbage-collected mid-flight. Discarded on completion
-# via the done-callback below.
-_jev_shadow_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_jev_shadow_probe(
-    *, conversation_id: UUID, correlation_id: str | None, messages: list[dict],
-    llm_block: dict | None, settings: TurnQueueSettings,
-) -> None:
-    """Runs `jev_shadow.probe` detached from the request path and logs its
-    own result. Never awaited by the caller, so a slow or hung probe cannot
-    delay the turn it's shadowing.
-
-    `create_task` copies the caller's context, so the probe runs under the
-    gate's anton TraceContext and `jev_shadow` attributes its Langfuse trace to
-    the same conversation and correlation_id."""
-
-    async def _run() -> None:
-        jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
-        if jev_result is None:
-            return
-        fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
-        logger.warning(
-            "[jev-shadow] conversation=%s correlation_id=%s %s", conversation_id, correlation_id, fields,
-        )
-
-    task = asyncio.create_task(_run())
-    _jev_shadow_tasks.add(task)
-    task.add_done_callback(_jev_shadow_tasks.discard)
-
-
 class _RemoteTurnFailed(Exception):
     """Terminal turn_failed reply; payload rides the enclosing scope."""
 
@@ -174,6 +141,14 @@ class _RemoteTurnFailed(Exception):
 # this module synthesizes when a turn is stopped while a question is on screen.
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
+
+#: Trace metadata for a turn Jev routed direct that went to the agent after
+#: all: the user's model delegated, or could not be reached. Counting these
+#: is how a wrong direct route shows up in traces.
+_DIRECT_DELEGATED_METADATA = {
+    "response_route": DELEGATED_AGENTIC,
+    "response_route_reason": "direct_answer_delegated",
+}
 
 #: A direct answer from the routing gate runs no agent, so it reads no learned
 #: memory. It sends and saves the record an agent turn does, in the same shape
@@ -383,7 +358,7 @@ class _TurnStart:
     conversation_id: UUID
     turn_id: int
     # The gate's history: user and assistant rows, oldest first, at most
-    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape skips the gate, and
+    # direct_answer.MAX_HISTORY_MESSAGES. Empty when the turn's shape skips the gate, and
     # None when the read failed, which sends the turn to the agent.
     gate_rows: list[Message] | None
 
@@ -421,6 +396,19 @@ class _DirectTurn:
 
     user_message_id: UUID
     assistant_message_id: UUID | None
+
+
+def _routing_history(gate_rows: list[Message], harness_input: list[dict]) -> list[dict]:
+    """The gate's and the direct answer's history: the read rows, then the
+    turn's own prompt.
+
+    Scrubbed of credentials: this history bypasses the normal turn's
+    _scrub_user_input/_stamp_message pass. Its DS_* values were registered by
+    handle(), not _build_chat_session. Scrubbed on the loop, after that
+    registration, never inside the unit."""
+    history = [scrubbed_openai_dump(m) for m in gate_rows]
+    history.append({"role": "user", "content": scrub_credentials(prompt_text(harness_input))})
+    return history
 
 
 def _conversation_for_harness(session: ScopedSession, *, conversation_id: UUID) -> Conversation:
@@ -728,7 +716,8 @@ class ResponsesHandler:
                 first_take.cancel()
                 first_take = None
 
-            if route.route == DIRECT_CONTEXT:
+            if route.route == DIRECT_CONTEXT and route.text:
+                # The LLM gate decided and answered in one call.
                 return await self._handle_direct_response(
                     request=request,
                     conversation_id=start.conversation_id,
@@ -738,7 +727,31 @@ class ResponsesHandler:
                     route=route,
                 )
 
-            harness = self._get_harness()
+            # Jev decided the turn goes direct: the user's own model writes the
+            # answer, and can still hand the turn to the agent, so the agent's
+            # path below stays ready. None when it routes to the agent.
+            answer_binding: RouterBinding | None = None
+            answer_history: list[dict] = []
+            if route.route == DIRECT_CONTEXT:
+                answer_binding = self._answer_binding(model=request.model, turn_llm=turn_llm)
+                answer_history = _routing_history(start.gate_rows or [], start.harness_input)
+                if answer_binding is not None and not request.stream:
+                    text = await direct_answer.complete_answer(answer_binding, history=answer_history)
+                    if text is not None:
+                        return await self._handle_direct_response(
+                            request=request,
+                            conversation_id=start.conversation_id,
+                            turn_id=start.turn_id,
+                            original_content=original_content,
+                            question=prompt_text(start.harness_input),
+                            route=replace(route, text=text, model=answer_binding.model),
+                        )
+                    answer_binding = None
+                if answer_binding is None:
+                    trace_metadata = {**trace_metadata, **_DIRECT_DELEGATED_METADATA}
+
+            # Built lazily on a direct answer: it may never need the agent.
+            harness = None if answer_binding is not None else self._get_harness()
 
             if request.stream:
                 # Detached + resumable. The agent run executes in a background
@@ -764,7 +777,7 @@ class ResponsesHandler:
                     remote=TurnQueueSettings().is_remote,
                 ))
 
-                def produce(buffer: StreamBuffer):
+                def delegated(buffer: StreamBuffer, metadata: dict[str, str]):
                     return self._select_producer(
                         lifecycle=lifecycle,
                         conv_id=start.conversation_id,
@@ -774,13 +787,29 @@ class ResponsesHandler:
                         reasoning_effort=request.reasoning_effort,
                         disabled=disabled,
                         harness_name=self.harness_name,
-                        harness_id=getattr(harness, "id", None),
+                        harness_id=getattr(harness or self._get_harness(), "id", None),
                         buffer=buffer,
                         turn_id=start.turn_id,
                         trace_tags=request.trace_tags,
-                        trace_metadata=trace_metadata,
+                        trace_metadata=metadata,
                         turn_llm=turn_llm,
                         first_take=first_take,
+                    )
+
+                def produce(buffer: StreamBuffer):
+                    if answer_binding is None:
+                        return delegated(buffer, trace_metadata)
+                    return self._produce_answer(
+                        lifecycle=lifecycle,
+                        conv_id=start.conversation_id,
+                        original_content=original_content,
+                        question=prompt_text(start.harness_input),
+                        route=route,
+                        binding=answer_binding,
+                        history=answer_history,
+                        trace_metadata=trace_metadata,
+                        buffer=buffer,
+                        delegate=lambda: delegated(buffer, {**trace_metadata, **_DIRECT_DELEGATED_METADATA}),
                     )
 
                 try:
@@ -959,13 +988,15 @@ class ResponsesHandler:
 
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
-        """The rows decide_route can use: user and assistant messages, at most
-        _MAX_HISTORY_MESSAGES, so neither the read nor scrubbing pays for the
-        whole conversation. None when the read fails: routing failures send the
-        turn to the agent rather than failing it."""
+        """The rows decide_route and the direct answer can use: user and
+        assistant messages, at most the direct answer's window (the gate reads
+        the newest _MAX_HISTORY_MESSAGES of its text), so neither the read nor
+        scrubbing pays for the whole conversation. None when the read fails:
+        routing failures send the turn to the agent rather than failing it."""
         try:
             return ConversationService(session).get_recent_messages(
-                conversation_id, roles=(Role.user, Role.assistant), limit=_MAX_HISTORY_MESSAGES,
+                conversation_id, roles=(Role.user, Role.assistant),
+                limit=direct_answer.MAX_HISTORY_MESSAGES,
             )
         except PoolTimeoutError:
             raise
@@ -1018,15 +1049,7 @@ class ResponsesHandler:
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
         try:
-            # Scrub credentials: this history bypasses the normal turn's
-            # _scrub_user_input/_stamp_message pass. Its DS_* values were
-            # registered by handle(), not _build_chat_session. Scrubbed here on
-            # the loop, after that registration, never inside the unit.
-            history = [scrubbed_openai_dump(m) for m in gate_rows]
-            history.append({
-                "role": "user",
-                "content": scrub_credentials(prompt_text(harness_input)),
-            })
+            history = _routing_history(gate_rows, harness_input)
             # The gate's LLM call is the only one a direct turn makes, and it
             # is made outside any ChatSession — so without a trace context it
             # reaches MindsHub anonymous, and a direct turn leaves no trace to
@@ -1081,17 +1104,23 @@ class ResponsesHandler:
                             **({"correlation_id": correlation_id} if correlation_id else {}),
                         },
                     ))
-                    turn_queue_settings = TurnQueueSettings()
-
                     gate_started = time.monotonic()
-                    decision = await decide_route(
-                        history=history,
-                        has_non_text_input=has_non_text_input,
-                        has_attachments=has_attachments,
-                        has_disabled_connections=has_disabled_connections,
-                        binding=binding,
-                        binding_factory=binding_for_turn,
-                    )
+                    jev = self._jev_gate(turn_llm)
+                    if jev == "off":
+                        # The organization opted out of Jev: no fast path on
+                        # MindsHub, and no LLM gate in its place, so every
+                        # turn runs the agent.
+                        decision = RouteDecision(route=DELEGATED_AGENTIC, reason="jev_disabled")
+                    else:
+                        decision = await decide_route(
+                            history=history,
+                            has_non_text_input=has_non_text_input,
+                            has_attachments=has_attachments,
+                            has_disabled_connections=has_disabled_connections,
+                            binding=binding,
+                            binding_factory=binding_for_turn,
+                            jev=jev,
+                        )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
                     # WARNING (app_settings.py's own default too), so an info-level
@@ -1100,20 +1129,10 @@ class ResponsesHandler:
                     # across 8 real requests until this was bumped.
                     logger.warning(
                         "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
-                        "provider=%s model=%s gate_ms=%d",
+                        "provider=%s model=%s gate_ms=%d p_direct=%s",
                         conversation_id, correlation_id, decision.route, decision.reason,
                         decision.provider, decision.model, gate_ms,
-                    )
-                    # Detached on purpose: awaiting this (even via asyncio.gather)
-                    # would make a ready gate decision wait for Jev, exactly the
-                    # thing a *shadow* probe must never do. Logs on its own once
-                    # it finishes; never read by anything on the request path.
-                    _spawn_jev_shadow_probe(
-                        conversation_id=conversation_id,
-                        correlation_id=correlation_id,
-                        messages=_text_history(history),
-                        llm_block=(turn_llm or {}).get("llm"),
-                        settings=turn_queue_settings,
+                        "-" if decision.p_direct is None else f"{decision.p_direct:.3f}",
                     )
             finally:
                 if trace_token is not None:
@@ -1131,6 +1150,77 @@ class ResponsesHandler:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
+
+    def _jev_gate(self, turn_llm: dict | None):
+        """How this turn is gated: a decision callable, "off" when the turn
+        answers on MindsHub and the organization opted out of Jev there, or
+        None for the LLM gate.
+
+        The organization's own decision model, when configured, decides for
+        every provider: configuring it is the opt-in, so the Jev opt-out does
+        not apply to it. Otherwise Jev on MindsHub decides turns that answer
+        on MindsHub, on the turn's minted key when the gate minted one, else
+        on the stored MindsHub key. Turns on other providers, or on MindsHub
+        with no key to ask Jev with, keep the LLM gate."""
+        settings = get_user_settings(self.scope)
+        queue_settings = TurnQueueSettings()
+        mode = jev_route.gate_mode(settings)
+        if mode == "llm":
+            return None
+        if mode == "off":
+            return "off"
+        if mode == "own":
+            target = jev_route.own_decision_target(settings)
+            model = settings.decision_model or queue_settings.jev_route_model
+        else:
+            block = (turn_llm or {}).get("llm") or {}
+            if block.get("base_url") and block.get("api_key"):
+                target = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"])
+            else:
+                key = provider_api_key_str(settings, Provider.MINDS_CLOUD)
+                if not key:
+                    return None
+                target = jev_route.JevTarget.mindshub(minds_chat_base_url(settings.minds_url), key)
+            model = queue_settings.jev_route_model
+
+        async def ask(messages: list[dict]) -> jev_route.JevRoute:
+            return await jev_route.decide(
+                target=target,
+                messages=messages,
+                model=model,
+                timeout_seconds=queue_settings.jev_route_timeout_seconds,
+                min_p_direct=queue_settings.jev_route_min_p_direct,
+            )
+
+        return ask
+
+    def _answer_binding(self, *, model: str | None, turn_llm: dict | None) -> RouterBinding | None:
+        """The model that writes a direct answer the gate routed: the
+        composer's pick, else the planning model, on the planning provider,
+        which is the user's own keys when they brought them. A MindsHub turn
+        uses the key the gate minted for it when there is one. None when no
+        model resolves, which delegates."""
+        settings = get_user_settings(self.scope)
+        answer_model = model or settings.resolved_planning_model
+        if not answer_model:
+            return None
+        provider_kind = settings.resolved_planning_provider
+        block = (turn_llm or {}).get("llm") or {}
+        try:
+            if provider_kind is Provider.MINDS_CLOUD and block.get("base_url") and block.get("api_key"):
+                from anton.core.llm.openai import OpenAIProvider
+
+                provider = OpenAIProvider(
+                    api_key=block["api_key"],
+                    base_url=block["base_url"],
+                    flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
+                )
+            else:
+                provider = build_llm_client(model_override=model, settings=settings).planning_provider
+        except Exception:
+            logger.warning("[direct] could not build the answer's provider; delegating", exc_info=True)
+            return None
+        return RouterBinding(provider=provider, model=answer_model, label=provider_kind.value)
 
     async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
         """Hosted orgs keep no stored Minds key (remote turns mint one), so the
@@ -1395,6 +1485,211 @@ class ResponsesHandler:
             await buffer.append("sse", {"sse": _failed_frame_for(exc)})
             await buffer.close("error")
         finally:
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+
+    async def _produce_answer(
+        self,
+        *,
+        lifecycle: TurnLifecycle,
+        conv_id: UUID,
+        original_content,
+        question: str,
+        route: RouteDecision,
+        binding: RouterBinding,
+        history: list[dict],
+        trace_metadata: dict[str, str],
+        buffer,
+        delegate: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Stream the direct answer Jev routed, on the user's own model, or
+        hand the turn to the agent on this same buffer.
+
+        Nothing is saved or shown until the answer starts with text
+        (`direct_answer.start_answer`): a delegation, a timeout or a failure
+        before then runs `delegate`, which saves the question itself. Once
+        text has started the turn is a streamed one like the agent's: the
+        question is saved pending (`_start_turn`), the text streams, and the
+        answer is saved with the pending flag cleared in one commit
+        (`_save_answer`), before the completed frame reports it. A Stop saves
+        the answer as it stands; a failure saves it and reports the error."""
+        from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
+        # Attributes the answer's model call to the conversation, as the gate's
+        # is; without it the call reaches MindsHub anonymous.
+        token = set_trace_context(TraceContext(
+            session_id=str(conv_id),
+            harness=self.harness_name,
+            tags=("cowork-direct",),
+            metadata={**trace_metadata, "correlation_id": lifecycle.identity.correlation_id},
+        ))
+        try:
+            answer = await direct_answer.start_answer(binding, history=history)
+        finally:
+            reset_trace_context(token)
+        if answer is None:
+            logger.warning(
+                "[direct] conversation=%s model=%s delegated to the agent", conv_id, binding.model,
+            )
+            await delegate()
+            return
+
+        scope = scope_from_principal(self.principal)
+        item_id = f"msg-{conv_id.hex[:12]}"
+        parts: list[str] = [answer.first_text]
+        question_id: UUID | None = None
+        persisted = False
+        sequence = 1
+
+        def text_delta(text: str) -> dict:
+            nonlocal sequence
+            sequence += 1
+            return {
+                "type": "response.output_text.delta",
+                "sequence_number": sequence,
+                "item_id": item_id,
+                "delta": text,
+                "response_route": route.route,
+                "response_route_reason": route.reason,
+            }
+
+        async def start() -> UUID | None:
+            """Save the question, pending, under the conversation's write lock."""
+            nonlocal question_id
+            async with conversation_writes(conv_id):
+                started = await run_db(
+                    partial(
+                        _start_turn, lifecycle=lifecycle, conversation_id=conv_id,
+                        content=original_content, sent_at=datetime.now(timezone.utc),
+                    ),
+                    scope=scope,
+                )
+            if started is None:
+                return None
+            question_id = started.question_id
+            lifecycle.saved_question = True
+            return question_id
+
+        async def persist(events: list[dict]) -> _SavedAnswer:
+            """Save the answer as it stands, once, clearing the question's
+            pending flag in the same commit."""
+            nonlocal persisted
+            if persisted or question_id is None:
+                return _SavedAnswer()
+            persisted = True
+            save = partial(
+                _save_answer,
+                lifecycle=lifecycle,
+                conversation_id=conv_id,
+                question_id=question_id,
+                text="".join(parts),
+                events=tuple(events),
+                tool_rows=(),
+                harness="cowork-direct",
+            )
+            try:
+                async with conversation_writes(conv_id):
+                    return _SavedAnswer(message_id=await run_db(save, scope=scope))
+            except Exception as exc:
+                logger.exception(
+                    "[direct] failed to save the answer", extra=log_context(conversation_id=conv_id),
+                )
+                return _SavedAnswer(failure=exc)
+
+        async def end_turn(reason: TerminalReason, exc: Exception | None = None) -> None:
+            """Save the partial answer, then the failure frame if any, then the terminal record."""
+            saved = await persist([text_delta("".join(parts)), _DIRECT_MEMORY_READ.payload()])
+            if lifecycle.discarded:
+                return
+            failure = exc or saved.failure
+            if failure is not None:
+                await buffer.append("sse", {"sse": _failed_frame_for(failure)})
+                reason = "error"
+            await buffer.close(reason)
+
+        try:
+            if await run_to_completion(start()) is None:
+                return
+            response = Response(status=ResponseStatus.created, model=binding.model)
+            await buffer.append("sse", {"sse": sse_frame("response.created", {
+                "type": "response.created",
+                "sequence_number": 1,
+                "conversation_id": str(conv_id),
+                "run_id": lifecycle.identity.run_id,
+                "harness": "cowork-direct",
+                "user_message_id": str(question_id),
+                "response": response.model_dump(),
+            })})
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(answer.first_text))})
+            async for text in answer.rest():
+                parts.append(text)
+                await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(text))})
+
+            text = "".join(parts)
+            sources = await self._direct_figure_sources(conversation_id=conv_id, answer=text, question=question)
+            memory_frame = _DIRECT_MEMORY_READ.payload(sequence_number=sequence + 1)
+            sources_frame = None if sources is None else {
+                "type": "response.figure_sources",
+                "sequence_number": sequence + 2,
+                "item_id": item_id,
+                **sources.model_dump(mode="json"),
+            }
+            # Saved as one delta holding the whole answer, as the gate's direct
+            # answers are: a reload replays the text, not its chunking.
+            saved_events = [
+                {**text_delta(text), "sequence_number": 2},
+                memory_frame,
+                *([] if sources_frame is None else [sources_frame]),
+                {"type": "response.completed"},
+            ]
+
+            async def finish() -> None:
+                saved = await persist(saved_events)
+                if lifecycle.discarded:
+                    return
+                if saved.failure is not None:
+                    await buffer.append("sse", {"sse": _failed_frame_for(saved.failure)})
+                    await buffer.close("error")
+                    return
+                await buffer.append("sse", {"sse": sse_frame("response.memory_read", memory_frame)})
+                if sources_frame is not None:
+                    await buffer.append("sse", {"sse": sse_frame("response.figure_sources", sources_frame)})
+                completed_frame = {
+                    "type": "response.completed",
+                    "sequence_number": sequence + (3 if sources_frame is not None else 2),
+                    "response": Response(
+                        id=response.id,
+                        created_at=response.created_at,
+                        status=ResponseStatus.completed,
+                        model=binding.model,
+                        output=[self._build_output(item_id, text, figure_sources=sources)],
+                    ).model_dump(),
+                }
+                if saved.assistant_message_id is not None:
+                    completed_frame["assistant_message_id"] = saved.assistant_message_id
+                await buffer.append("sse", {"sse": sse_frame("response.completed", completed_frame)})
+                await buffer.close("completed")
+
+            # A Stop that lands here waits for the save and its frames.
+            await run_to_completion(finish())
+        except asyncio.CancelledError:
+            if lifecycle.discarded:
+                # Deleted mid-answer: its rows and buffer are gone (see _produce_direct).
+                logger.info("[direct] discarded turn %s — not persisting", conv_id)
+                return
+            if buffer.is_closed:
+                return
+            await run_to_completion(end_turn("cancelled"))
+        except Exception as exc:
+            if isinstance(exc, PoolTimeoutError):
+                logger.warning(
+                    "[direct] turn for conversation %s found no free database connection", conv_id,
+                )
+            else:
+                logger.exception("[direct] answer failed", extra=log_context(conversation_id=conv_id))
+            if not buffer.is_closed:
+                await run_to_completion(end_turn("error", exc))
+        finally:
+            await answer.close()
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
 
     def _select_producer(

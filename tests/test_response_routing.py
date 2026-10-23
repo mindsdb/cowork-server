@@ -267,6 +267,9 @@ def test_sse_frames_use_real_newlines():
 def _routing_handler(monkeypatch):
     handler = ResponsesHandler()
     handler.harness_name = "anton"  # handle() sets it from the turn's settings
+    # The LLM gate, as on a provider other than MindsHub; tests of the Jev
+    # gate replace this.
+    handler._jev_gate = lambda _turn_llm: None
     return handler
 
 
@@ -300,193 +303,6 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gate(monkeypatch):
-    """The shadow probe is logging-only. A Jev result that confidently
-    disagrees with the gate, or is an error dict, must never change the
-    decision `_route_request` returns."""
-    import cowork.handlers.responses as responses
-    from cowork.handlers import jev_shadow
-
-    handler = _routing_handler(monkeypatch)
-    async def fake_decide_route(**_kwargs):
-        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
-
-    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
-
-    async def loud_wrong_jev(**_kwargs):
-        return {"jev_choice": "needs_agent", "jev_confidence": 0.99, "jev_ms": 5}
-
-    monkeypatch.setattr(jev_shadow, "probe", loud_wrong_jev)
-
-    decision, _turn_llm = await handler._route_request(
-        conversation_id=None,
-        gate_rows=[],
-        harness_input=[{"type": "text", "text": "Hello"}],
-        has_attachments=False,
-        has_disabled_connections=False,
-    )
-
-    assert decision.route == DIRECT_CONTEXT
-    assert decision.text == "hi"
-
-    async def jev_error(**_kwargs):
-        return {"jev_error": "timeout", "jev_ms": 3000}
-
-    monkeypatch.setattr(jev_shadow, "probe", jev_error)
-
-    decision, _turn_llm = await handler._route_request(
-        conversation_id=None,
-        gate_rows=[],
-        harness_input=[{"type": "text", "text": "Hello"}],
-        has_attachments=False,
-        has_disabled_connections=False,
-    )
-
-    assert decision.route == DIRECT_CONTEXT
-    assert decision.text == "hi"
-
-
-@pytest.mark.asyncio
-async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
-    """The gate's trace context carries the turn's correlation_id, and
-    the detached probe inherits it, so the real probe's Jev call is attributed
-    to the conversation (origin:harness, not direct-api) and joins the gate
-    decision it shadows. Only the HTTP client is faked: the context has to cross
-    the gate's create_task for this to pass."""
-    import asyncio
-    import json
-
-    import cowork.handlers.responses as responses
-    from anton.core.llm.tracing import get_trace_context
-    from cowork.handlers import jev_shadow
-
-    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
-    handler = _routing_handler(monkeypatch)
-    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
-
-    async def fake_binding():
-        return None, {"correlation_id": "corr-1", "llm": llm_block}
-
-    handler._router_binding = fake_binding
-    seen = {}
-
-    async def fake_decide_route(**_kwargs):
-        seen["gate_context"] = get_trace_context()
-        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
-
-    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
-    sent = asyncio.Event()
-
-    class _Client:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        async def post(self, _url, *, headers, json):
-            seen["probe_headers"] = headers
-            sent.set()
-            return SimpleNamespace(status_code=500, json=lambda: {})
-
-    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
-
-    await handler._route_request(
-        conversation_id="conv-1",
-        gate_rows=[],
-        harness_input=[{"type": "text", "text": "Hello"}],
-        has_attachments=False,
-        has_disabled_connections=False,
-        trace_metadata={"cowork_server_version": "1.2.3"},
-    )
-    await asyncio.wait_for(sent.wait(), timeout=2)
-
-    gate = seen["gate_context"]
-    assert gate.metadata["correlation_id"] == "corr-1"
-    assert gate.turn_id is None
-    headers = seen["probe_headers"]
-    assert "Langfuse-Session-Id" not in headers
-    assert "cowork-gate" not in headers["Langfuse-Tags"]
-    assert jev_shadow.JEV_SHADOW_TAG in headers["Langfuse-Tags"]
-    metadata = json.loads(headers["Langfuse-Metadata"])
-    assert (metadata["correlation_id"], metadata["harness"], metadata["conversation_id"]) == (
-        "corr-1",
-        "anton",
-        "conv-1",
-    )
-    # The context is the gate's alone: it does not leak past the gate block.
-    assert get_trace_context() is None
-
-
-@pytest.mark.asyncio
-async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypatch):
-    """A remote turn with a minted minds-cloud key and no shadow override sends
-    nothing to '/v1/decisions'. The probe runs on the turn's own key: Jev is
-    zero-priced, so it charges no wallet, but with the default on every turn on
-    an unfunded org would draw that org's free Jev allowance in the background.
-    Only the HTTP client is faked, the gate's own decision (not the
-    router_unavailable fallback) proves the gate block ran through the probe
-    spawn, and the detached probe task is awaited to the end, so a default
-    flipped back on makes the POST this test forbids."""
-    import asyncio
-    import functools
-
-    import cowork.handlers.responses as responses
-    from cowork.common.settings.app_settings import TurnQueueSettings
-    from cowork.handlers import jev_shadow
-
-    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
-    # The handler's settings skip the .env chain, so a repo-root .env cannot
-    # turn the probe on or off here and only the field default decides.
-    monkeypatch.setattr(responses, "TurnQueueSettings", functools.partial(TurnQueueSettings, _env_file=None))
-    handler = _routing_handler(monkeypatch)
-    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
-
-    async def fake_binding():
-        return None, {"correlation_id": "corr-1", "llm": llm_block}
-
-    handler._router_binding = fake_binding
-
-    async def fake_decide_route(**_kwargs):
-        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
-
-    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
-    posted_urls = []
-
-    class _Client:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        async def post(self, url, *, headers, json):
-            posted_urls.append(url)
-            return SimpleNamespace(status_code=402, json=lambda: {})
-
-    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
-
-    decision, _turn_llm = await handler._route_request(
-        conversation_id="conv-1",
-        gate_rows=[],
-        harness_input=[{"type": "text", "text": "Hello"}],
-        has_attachments=False,
-        has_disabled_connections=False,
-    )
-    await asyncio.gather(*list(responses._jev_shadow_tasks))
-
-    assert decision.fallback is False
-    assert decision.reason == "test"
-    assert posted_urls == []
-
-
-@pytest.mark.asyncio
 async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypatch):
     import cowork.handlers.responses as responses
     from anton.core.llm.tracing import get_trace_context
@@ -510,46 +326,6 @@ async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypa
     )
 
     assert seen["gate_context"].metadata == {"cowork_server_version": "1.2.3"}
-
-
-@pytest.mark.asyncio
-async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch):
-    """The probe must be detached, not awaited alongside the gate: a ready
-    gate decision returning only after Jev finishes would mean a 'shadow'
-    probe delays every real turn it shadows, exactly what it must never do."""
-    import asyncio
-    import time
-
-    import cowork.handlers.responses as responses
-    from cowork.handlers import jev_shadow
-
-    handler = _routing_handler(monkeypatch)
-
-    async def fast_decide_route(**_kwargs):
-        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
-
-    monkeypatch.setattr(responses, "decide_route", fast_decide_route)
-
-    async def slow_jev(**_kwargs):
-        await asyncio.sleep(0.25)
-        return {"jev_choice": "needs_agent", "jev_confidence": 0.9, "jev_ms": 250}
-
-    monkeypatch.setattr(jev_shadow, "probe", slow_jev)
-
-    started = time.monotonic()
-    decision, _turn_llm = await handler._route_request(
-        conversation_id=None,
-        gate_rows=[],
-        harness_input=[{"type": "text", "text": "Hello"}],
-        has_attachments=False,
-        has_disabled_connections=False,
-    )
-    elapsed = time.monotonic() - started
-
-    assert decision.route == DIRECT_CONTEXT
-    assert elapsed < 0.1  # nowhere near the slow probe's 0.25s
-
-    await asyncio.sleep(0.3)  # let the detached probe finish before teardown
 
 
 @pytest.mark.asyncio
@@ -795,8 +571,9 @@ async def test_history_query_failure_fails_open(monkeypatch):
 async def test_turn_start_counts_every_stored_row(monkeypatch):
     """turn_id names the turn's stream buffer, and boot recovery indexes the
     stored rows with it, so it counts every row: hidden tool rows and a
-    stranded pending question too. The gate reads the tail of the replayed
-    history. Neither read loads every stored row to get there."""
+    stranded pending question too. The gate and the direct answer read the
+    tail of the replayed history. Neither read loads every stored row to get
+    there."""
     from functools import partial
 
     from sqlalchemy import event
@@ -805,7 +582,7 @@ async def test_turn_start_counts_every_stored_row(monkeypatch):
     from cowork.db.scoped import LOCAL_SCOPE
     from cowork.db.session import get_engine
     from cowork.db.units import run_db
-    from cowork.handlers.response_routing import _MAX_HISTORY_MESSAGES
+    from cowork.handlers.direct_answer import MAX_HISTORY_MESSAGES
     from cowork.schemas.responses import ResponsesRequest
     from cowork.services.conversations import ConversationService
     from cowork.services.projects import GENERAL_PROJECT_ID
@@ -818,7 +595,7 @@ async def test_turn_start_counts_every_stored_row(monkeypatch):
     def seed(session):
         service = ConversationService(session)
         conversation = service.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
-        for turn in range(6):
+        for turn in range(12):
             service.save_user_message(conversation.id, f"question {turn}")
             service.save_assistant_turn(conversation.id, f"answer {turn}", [], tool_rows=tool_rows)
         service.save_user_message(conversation.id, "stranded", pending=True)
@@ -828,7 +605,7 @@ async def test_turn_start_counts_every_stored_row(monkeypatch):
         service = ConversationService(session)
         stored = service.get_ordered_messages(conversation_id, include_pending=True)
         replayed = service.get_ordered_messages(conversation_id)
-        tail = [m.id for m in replayed if m.role in {"user", "assistant"}][-_MAX_HISTORY_MESSAGES:]
+        tail = [m.id for m in replayed if m.role in {"user", "assistant"}][-MAX_HISTORY_MESSAGES:]
         return len(stored), tail
 
     conversation_id = await run_db(seed, scope=LOCAL_SCOPE)
@@ -853,9 +630,9 @@ async def test_turn_start_counts_every_stored_row(monkeypatch):
         event.remove(engine, "before_cursor_execute", record)
     stored, tail = await run_db(partial(read_back, conversation_id=conversation_id), scope=LOCAL_SCOPE)
 
-    assert start.turn_id == stored == 6 * 4 + 1
+    assert start.turn_id == stored == 12 * 4 + 1
     assert [m.id for m in start.gate_rows] == tail
-    assert len(tail) == _MAX_HISTORY_MESSAGES
+    assert len(tail) == MAX_HISTORY_MESSAGES
     message_reads = [s for s in statements if "FROM messages" in s]
     assert message_reads
     assert [s for s in message_reads if "count(" not in s and "LIMIT" not in s] == []
