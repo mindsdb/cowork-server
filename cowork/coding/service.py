@@ -120,6 +120,9 @@ class CodingService(
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
         self._maintenance: set[str] = set()
+        # Folders outside a task's own workspace that a maintenance operation
+        # is changing, so no other task's turn or operation changes them too.
+        self._maintenance_roots: dict[str, frozenset[Path]] = {}
         self.approvals = ApprovalBroker(
             self._approval_opened, self._approval_closed,
             lambda session_id: self.store.load_session(session_id).command_approval_grants,
@@ -726,20 +729,34 @@ class CodingService(
         self,
         session_id: str,
         active_turn_error: str,
+        *,
+        touches_source: bool = False,
     ) -> Iterator[CodingSession]:
-        """Reserve an idle task for a potentially slow lifecycle operation."""
+        """Reserve an idle task for a potentially slow lifecycle operation.
+
+        The reservation also covers every folder the operation may change that
+        another task can work in: an in-place task's folders, and the source
+        folders when ``touches_source``. It is refused while another task's
+        turn or operation is changing an overlapping folder.
+        """
         with self._lock:
             session = self.get_session(session_id)
             if session_id in self._running:
                 raise RuntimeError(active_turn_error)
             if session_id in self._maintenance:
                 raise RuntimeError("This coding task is already being updated")
+            roots = self._shared_roots(session, touches_source=touches_source)
+            busy = self._shared_folder_conflict(session_id, roots)
+            if busy:
+                raise RuntimeError(busy)
             self._maintenance.add(session_id)
+            self._maintenance_roots[session_id] = roots
         try:
             yield session
         finally:
             with self._lock:
                 self._maintenance.discard(session_id)
+                self._maintenance_roots.pop(session_id, None)
 
 @lru_cache(maxsize=1)
 def get_coding_service() -> CodingService:
