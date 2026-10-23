@@ -159,6 +159,78 @@ def test_the_rendered_page_is_publishable_like_any_html_artifact(client, doc):
     assert is_publishable_static(target, page.parent.parent)
 
 
+def _wait_for(pred, timeout=3.0):
+    import time
+
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def test_a_shared_doc_republishes_itself_after_edits_settle(client, doc, monkeypatch):
+    """Like a shared Google Doc: the link shows the latest, with no Update step."""
+    import json
+    from pathlib import Path
+
+    from cowork.docs import republish
+
+    calls = []
+    monkeypatch.setattr(republish, "update_artifact", lambda path, *, scope: calls.append(path) or {})
+    monkeypatch.setattr(republish._republishes, "delay", 0.2)
+
+    page = Path(client.get(_url(doc)).json()["card"]["htmlPath"])
+    lead = doc["doc"]["tabs"][0]["blocks"][0]
+    edit = lambda text: client.post(_url(doc, "/ops"), json={"ops": [  # noqa: E731
+        {"op": "update", "id": lead["id"], "set": {"text": text}}]})
+
+    edit("Not shared yet.")
+    assert not republish.pending() and not _wait_for(lambda: calls, timeout=0.4)
+
+    (page.parent / ".published.json").write_text(json.dumps(
+        {"doc.html": {"url": "https://view.example/abc", "report_id": "abc", "published": True}}))
+    for text in ("One", "Two", "Three"):  # a burst of typing is one republish
+        assert edit(text).status_code == 200
+    assert _wait_for(lambda: calls)
+    assert _wait_for(lambda: not republish.pending())
+    assert calls == [str(page)]
+
+    (page.parent / ".published.json").write_text(json.dumps(
+        {"doc.html": {"url": "https://view.example/abc", "report_id": "abc", "published": False}}))
+    edit("Stopped sharing.")
+    assert not _wait_for(lambda: len(calls) > 1, timeout=0.5)
+
+
+def test_a_republish_waiting_when_sharing_stops_does_not_put_the_page_back(tmp_path, monkeypatch):
+    """Unsharing in the seconds after an edit: the republish that edit scheduled must stand down."""
+    import json
+
+    from cowork.docs import republish
+
+    calls = []
+    monkeypatch.setattr(republish, "update_artifact", lambda path, *, scope: calls.append(path) or {})
+    monkeypatch.setattr(republish._republishes, "delay", 0.2)
+    published = tmp_path / ".published.json"
+    published.write_text(json.dumps({"doc.html": {"url": "https://view.example/abc", "published": True}}))
+    assert republish.schedule(tmp_path) is True
+    published.write_text(json.dumps({"doc.html": {"url": "https://view.example/abc", "published": False}}))
+    assert _wait_for(lambda: not republish.pending())
+    assert not _wait_for(lambda: calls, timeout=0.3)
+
+
+def test_org_mode_leaves_a_shared_doc_to_autopublish(tmp_path):
+    import json
+
+    from cowork.db.scoped import TenantScope
+    from cowork.docs import republish, sharing
+
+    (tmp_path / ".published.json").write_text(json.dumps({"doc.html": {"url": "https://x", "published": True}}))
+    assert sharing.is_shared(tmp_path)
+    assert republish.schedule(tmp_path, scope=TenantScope(org_mode=True, org_id="org")) is False
+
+
 # ---------------------------------------------------------------- who may see and change what
 
 

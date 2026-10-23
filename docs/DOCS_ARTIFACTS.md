@@ -14,7 +14,10 @@ The modules depend in one direction, each on those above it:
 | `render` | The agent's outline and full views, the page (`doc.html`) and export markup |
 | `store` | The doc file in its artifact folder: the lock, atomic writes, one kept version per editing session |
 | `hub` | In-process fan-out of changes to the editors and chats watching |
+| `sharing` | Which docs are shared |
 | `service` | Create and apply (rendering the page under the doc's lock), and `announce` |
+| `republish` | A shared page following its edits |
+| `sync` | What follows a write (announce, republish), and catching shared docs up at startup |
 | `prompt`, `export` | What the agent is told; downloads |
 
 The package uses the services; they never import its behaviour, and know a doc only by its files (`store`'s names).
@@ -78,7 +81,7 @@ Both the agent and the editor apply the same ops through `cowork.docs.service.ap
 - keeps one version per editing session: when a session ends, the doc as it left it is kept. A session is one reply of the agent's (`turn`, which the doc tools name per turn), or a stretch of a person's typing that ends after a five-minute pause, after thirty minutes, or when the agent writes. The newest 100 are kept, and only as many as fit in 50 MB, always at least one;
 - re-renders `doc.html`, the page a doc is shared as, still under the lock.
 
-Callers then announce the change (`service.announce`) on the in-process hub (`cowork.docs.hub`) to the editors and chats watching.
+Then `cowork.docs.sync.after_write` announces the change on the in-process hub (`cowork.docs.hub`) to the editors and chats watching, and for a shared doc schedules its republish.
 
 Every write lands at once, like a Google Doc's: there is no save step and no versions to manage.
 
@@ -115,6 +118,10 @@ Each handler streams one progress line, for example "Writing “Risks”", so th
 
 Turns that run on a remote worker (org mode) do not get these tools yet, so they are not handed `doc_context` or the Output: Doc note either: such a turn is answered like any other. Moving the engine and tools into anton and adding them to the cloud allowlist is the follow-up that brings docs there.
 
+## A shared doc follows its edits
+
+Sharing a doc publishes its page (`doc.html`) through the normal publish flow and access. From then on `cowork.docs.republish` republishes it four seconds after the last write, keeping its URL and access, so there is no "update the shared copy" step; a burst of writes (a person typing, the agent filling sections) is one republish. That is not done in org mode, where autopublish owns what a shared artifact shows. At startup (`sync.start`) each shared doc's page is re-rendered and republished if it differs from what went out, which catches an edit made just before the app quit.
+
 ## Working on it
 
 Tests, in `tests/`:
@@ -124,6 +131,7 @@ Tests, in `tests/`:
 - `test_docs_store.py`: the write path, editing sessions and their versions, and the hub.
 - `test_docs_endpoints.py`: the HTTP API.
 - `test_docs_tools.py`: the agent's tools.
+- `test_docs_sharing.py`: which docs are shared, catching them up at startup, and the debouncer.
 
 By hand: run the app against a server with a throwaway `COWORK_HOME` (never your own `~/.cowork`). The editor's tests sit beside it in the cowork repo, under `src/renderer/cowork/components/doc/`.
 

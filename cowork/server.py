@@ -243,6 +243,11 @@ async def lifespan(app: FastAPI):
         logger.info("warmed MindsHub model-availability map on boot")
     start_scheduler()
     await _start_channels(app)
+    # Shared docs catch up on what was still waiting when the app quit (see
+    # cowork.docs.sync; on a background thread, so boot never waits).
+    from cowork.docs import sync as shared_docs
+
+    shared_docs.start()
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
     if get_app_settings().tenancy_mode == "org":
@@ -278,6 +283,7 @@ async def lifespan(app: FastAPI):
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        shared_docs.stop()
         # After both turn drains above: each turn they unwound has queued the
         # close of its scratchpad processes, and those must finish before the
         # event loop stops.
