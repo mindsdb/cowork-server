@@ -7,6 +7,7 @@ import mimetypes
 import ntpath
 import os
 import stat
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -15,7 +16,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
@@ -30,7 +31,9 @@ from cowork.common.paths import (
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
+from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -1240,6 +1243,74 @@ async def decide_agent_repair(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _primary_rel_path(folder: Path, primary: Path | None) -> str:
+    """The primary file's path inside ``folder``, as the draft link names it."""
+    if primary is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no previewable file.",
+        )
+    try:
+        return primary.resolve(strict=False).relative_to(folder.resolve(strict=False)).as_posix()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact file not found",
+        ) from exc
+
+
+@router.post("/drafts/{project_ref}/{artifact_id}/link")
+async def create_draft_link(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
+):
+    """A 30-minute signed link to this draft on the draft host.
+
+    The same access check as ``serve_private_draft``: the owner, or a same-org
+    reviewer the owner granted. The link carries the caller's identity and
+    points at the primary file; its relative assets reuse the token. The web
+    app asks for a new link on every open, reload and "open in a browser tab",
+    so nothing caches or reuses one.
+    """
+    settings = get_app_settings()
+    if not settings.draft_links_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Draft links are not available",
+        )
+    scope = session.scope
+    if not scope.user_id or not scope.org_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
+    _source, folder, metadata, _is_own = review_artifact_for_request(
+        session, project_selector, artifact_selector
+    )
+    primary = await run_in_threadpool(_artifact_primary, folder, metadata)
+    parts = _draft_file_parts(_primary_rel_path(folder, primary), metadata)
+    now = int(time.time())
+    token = issue_draft_token(
+        env=default_draft_env_label(),
+        sub=str(scope.user_id),
+        org=str(scope.org_id),
+        proj=project_selector,
+        art=artifact_selector,
+        keys=settings.draft_link_keyring(),
+        kid=settings.draft_link_kid,
+        now=now,
+    )
+    # Counted at WARNING so LOG_LEVEL=WARNING deployments keep it during the
+    # rollout. The link itself is never logged.
+    logger.warning("Draft link issued", extra={"event": "draft_link_issued"})
+    url = f"{settings.draft_origin.rstrip('/')}/_t/{token}/{quote('/'.join(parts), safe='/')}"
+    return JSONResponse(
+        {"url": url, "expiresAt": now + DRAFT_TTL_SECONDS},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/drafts/{project_ref}/{artifact_id}/{rel_path:path}")
