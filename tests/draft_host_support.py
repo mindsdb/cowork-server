@@ -31,7 +31,7 @@ def configure_draft_env(monkeypatch) -> None:
     """Org mode on staging with the six draft-link values set.
 
     Nothing listens on COWORK_DRAFT_PORT here: only start_draft_listener()
-    binds it, and the tests that call it set a free port of their own.
+    binds it, and the tests that call it bind a free port instead.
     """
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     monkeypatch.setenv("ENV", "staging")
