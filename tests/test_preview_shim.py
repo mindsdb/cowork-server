@@ -75,7 +75,8 @@ def test_reporter_is_installed_before_the_storage_guard():
 def test_every_reported_url_field_goes_through_the_one_cut():
     # On the draft host the document sits under /_t/<token>/. A field that
     # skipped the cut would carry the token into the agent's repair prompt.
-    assert r"\/_t\/[^\/?#]+\/" in SHIM_JS
+    assert r"\/_t\/v1\.[^\/?#]+\/" in SHIM_JS
+    assert r"\/_t\/v1\.[^\/?#\s]+\/" in SHIM_JS
     for field in (
         "file = local(file);",
         "message: local(ev.message),",
@@ -148,6 +149,37 @@ def test_a_desktop_document_keeps_its_folder_cut():
         "static/app.js",
         "https://cdn.example/x.js",
     ]
+
+
+def test_a_folder_named_t_in_a_desktop_artifact_is_not_a_token_root():
+    # The loopback address has the artifact's own folders in it; only the draft
+    # host puts /_t/v1.<token>/ first.
+    folder = "http://127.0.0.1:26866/api/v1/artifacts/drafts/p/a/_t/x/"
+    assert _cut(
+        f"{folder}pages/index.html?sig=1",
+        [f"{folder}pages/app.js", f"{folder}static/x.png", "see /_t/x/pages/app.js", "/_t/x/"],
+    ) == [
+        "app.js",
+        f"{folder}static/x.png",
+        "see /_t/x/pages/app.js",
+        "/_t/x/",
+    ]
+
+
+def test_a_t_folder_below_a_desktop_document_keeps_its_path():
+    base = "http://127.0.0.1:26866/api/v1/artifacts/drafts/p/a/"
+    assert _cut(f"{base}index.html?sig=1", [f"{base}_t/x/app.js", "at /_t/x/app.js"]) == [
+        "_t/x/app.js",
+        "at /_t/x/app.js",
+    ]
+
+
+def test_a_t_folder_inside_a_draft_host_artifact_is_not_cut():
+    # Only the token segment (v1.<...>) goes; the artifact's own _t folder stays.
+    assert _cut(
+        f"{DRAFT}_t/x/index.html",
+        [f"{DRAFT}_t/x/app.js", f"at /_t/{TOKEN}/_t/x/app.js", "at /_t/x/app.js"],
+    ) == ["_t/x/app.js", "at _t/x/app.js", "at /_t/x/app.js"]
 
 
 def test_a_slash_in_the_query_or_hash_does_not_move_the_folder():

@@ -29,24 +29,24 @@
   var seen = Object.create(null);
   var sent = 0;
   /* A report names what the agent can open, and never a draft link's token.
-     On the draft host the document sits under /_t/<token>/, so everything up
-     to and including that segment goes, and so does the same segment without
-     its origin (a page's own message can carry location.pathname); anywhere
-     else the document's own folder goes (a desktop draft's loopback path).
-     about:srcdoc has no folder, and nothing is cut there. */
+     On the draft host the document's address starts with /_t/v1.<token>/, so
+     that segment goes, with or without its origin (a page's own message can
+     carry location.pathname). Anywhere else the document's own folder goes (a
+     desktop draft's loopback path), and a /_t/ folder inside an artifact is
+     just a folder. about:srcdoc has no folder, and nothing is cut there. */
   var HREF = String(window.location.href);
-  var TOKEN_ROOT = /^[^?#]*?\/_t\/[^\/?#]+\//.exec(HREF);
+  var ON_DRAFT_HOST = /^[a-z][a-z0-9+.-]*:\/\/[^\/?#]+\/_t\/v1\.[^\/?#]+\//i.test(HREF);
   /* The folder comes from the path alone: a query or hash such as
      ?next=/a or #/route would otherwise move it. */
   var PATH_ONLY = HREF.split(/[?#]/)[0];
-  var BASE = TOKEN_ROOT ? TOKEN_ROOT[0] : PATH_ONLY.slice(0, PATH_ONLY.lastIndexOf('/') + 1);
-  var TOKEN_PATH = TOKEN_ROOT ? /(?:https?:\/\/[^\/\s]+)?\/_t\/[^\/?#\s]+\//g : null;
+  var BASE = PATH_ONLY.slice(0, PATH_ONLY.lastIndexOf('/') + 1);
+  var TOKEN_PATH = ON_DRAFT_HOST ? /(?:https?:\/\/[^\/\s]+)?\/_t\/v1\.[^\/?#\s]+\//g : null;
 
   function local(value) {
     var text = String(value || '');
+    if (TOKEN_PATH) return text.replace(TOKEN_PATH, '');
     if (!BASE) return text;
-    text = text.split(BASE).join('');
-    return TOKEN_PATH ? text.replace(TOKEN_PATH, '') : text;
+    return text.split(BASE).join('');
   }
 
   function post(payload) {
