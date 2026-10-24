@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -167,6 +168,63 @@ def test_the_review_and_the_path_lookup_run_off_the_event_loop(api, reviewed, mo
 
     assert api.post(LINK, headers=IDENTITY).status_code == 200
     assert on_loop == dict.fromkeys(names, False)
+
+
+def _issued(caplog) -> list:
+    return [r for r in caplog.records if getattr(r, "event", None) == "draft_link_issued"]
+
+
+def test_an_artifact_with_no_previewable_file_gets_no_link(api, tmp_path, monkeypatch, caplog):
+    source, folder, metadata = make_artifact(tmp_path)
+    (folder / "index.html").unlink()
+    shutil.rmtree(folder / "assets")
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", fake_review(source, folder, metadata, {}))
+
+    with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
+        response = api.post(LINK, headers=IDENTITY)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "This artifact has no previewable file."
+    assert _issued(caplog) == []
+
+
+def test_a_primary_outside_the_artifact_folder_gets_no_link(api, tmp_path, monkeypatch, caplog):
+    source, folder, metadata = make_artifact(tmp_path)
+    outside = folder.parent / "secret.txt"
+    assert outside.is_file()
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", fake_review(source, folder, metadata, {}))
+    monkeypatch.setattr(workspace_ep, "_artifact_primary", lambda *_args: outside)
+
+    with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
+        response = api.post(LINK, headers=IDENTITY)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Artifact file not found"
+    assert _issued(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        TenantScope(org_mode=True, org_id=ORG, user_id=None),
+        TenantScope(org_mode=True, org_id=None, user_id=USER),
+    ],
+    ids=["no-user", "no-org"],
+)
+async def test_a_scope_without_a_user_or_an_org_is_401_and_reviews_nothing(draft_env, monkeypatch, caplog, scope):
+    # Reached only by a caller that builds the session itself: the request
+    # dependency already answers 401 for an org request without an org.
+    def never(*_args):
+        raise AssertionError("the review must not run")
+
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", never)
+
+    with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
+        with pytest.raises(HTTPException) as refused:
+            await workspace_ep.create_draft_link(PROJECT, DASHED_ARTIFACT, SimpleNamespace(scope=scope))
+
+    assert refused.value.status_code == 401
+    assert _issued(caplog) == []
 
 
 def test_the_same_path_checks_as_the_draft_route(api, reviewed):
