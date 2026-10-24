@@ -60,6 +60,14 @@ def draft_env(monkeypatch):
 
 
 @pytest.fixture
+def fresh_settings():
+    """Settings rebuilt from the test's own environment, and dropped after it."""
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
 def middleware_calls(monkeypatch):
     """Every path the API app's identity middleware sees."""
     calls: list[str] = []
@@ -287,3 +295,51 @@ def test_the_api_lifespan_starts_the_listener_and_stops_it_first():
     stop = source.index("await stop_draft_listener(")
 
     assert start < source.index("yield") < stop < source.index("await registry.shutdown()")
+
+
+async def test_a_listener_that_fails_to_start_still_runs_the_shutdown(fresh_settings, monkeypatch, tmp_path):
+    from fastapi import FastAPI
+
+    from cowork import server
+    from cowork.common import http_client
+
+    calls: list[str] = []
+
+    async def refuse() -> None:
+        raise RuntimeError("the draft listener could not start")
+
+    async def stopped(listener) -> None:
+        calls.append(f"stop_draft_listener({listener})")
+
+    async def closed() -> None:
+        calls.append("close_proxy_client")
+
+    async def nothing(*args) -> bool:
+        return False
+
+    def boot_database_is_off():
+        raise RuntimeError("no database in this test")
+
+    # Boot work that needs the database, the model map or the channels is out of
+    # scope here; the steps that remain run as they do in the server.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    get_app_settings.cache_clear()
+    monkeypatch.setattr(server, "run_dev_setup", lambda: None)
+    monkeypatch.setattr(server, "consume_pending_credential_clear", lambda *args: None)
+    monkeypatch.setattr(server, "_warm_agent_runtime", lambda: None)
+    monkeypatch.setattr(server, "_warm_model_map_on_boot", nothing)
+    monkeypatch.setattr(server, "_start_channels", nothing)
+    monkeypatch.setattr(server, "start_scheduler", lambda: None)
+    monkeypatch.setattr("cowork.db.session.get_open_session", boot_database_is_off)
+    monkeypatch.setattr(server, "start_draft_listener", refuse)
+    monkeypatch.setattr(server, "stop_draft_listener", stopped)
+    monkeypatch.setattr(http_client, "close_proxy_client", closed)
+    app = FastAPI()
+    app.state.channel_ingress = SimpleNamespace(stop_all=nothing)
+    app.state.channel_adapters = SimpleNamespace(shutdown=nothing)
+
+    with pytest.raises(RuntimeError, match="the draft listener could not start"):
+        async with server.lifespan(app):
+            pass
+
+    assert calls == ["stop_draft_listener(None)", "close_proxy_client"]
