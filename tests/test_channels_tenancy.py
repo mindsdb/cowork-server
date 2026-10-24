@@ -496,6 +496,29 @@ async def test_lifecycle_setup_and_teardown_hit_the_callers_own_org_slot(engine)
     assert adapters.get("slack", ORG_A) is None
 
 
+async def test_a_persons_lifecycle_change_hits_the_deployments_slot(engine, personal_deployment):
+    """On a trusted-identity deployment a person's partition id is never a
+    channel's org, so a set-up there builds the deployment's one adapter, the
+    one the boot path and every webhook use, never one keyed by the partition
+    that Gateway or polling ingress would hand to a turn in that person's
+    space."""
+    from cowork.db.scoped import scope_for_identity
+    from cowork.services.channel_lifecycle import ChannelLifecycleService
+
+    plugins = _lifecycle_registry()
+    scoped = _scoped(engine, scope_for_identity(org_id=ORG_A, user_id="sub-a"))
+    ChannelConfigService(scoped, registry=plugins).set_config("slack", {"signing_secret": "deployment-secret"})
+    adapters = LiveAdapterRegistry(plugins)
+    svc = ChannelLifecycleService(scoped, adapters, plugins)
+
+    await svc.setup("slack")
+    assert adapters.get("slack") is not None
+    assert adapters.get("slack", ORG_A) is None
+
+    await svc.teardown("slack")
+    assert adapters.get("slack") is None
+
+
 # --- AntonChannelRuntime: the scope one inbound turn runs under ---
 
 class _ScopeSeen(Exception):
@@ -539,3 +562,9 @@ async def test_channel_turn_with_an_org_id_is_org_mode_in_org_tenancy(monkeypatc
 async def test_channel_turn_with_a_partition_id_stays_in_the_partition(monkeypatch, personal_deployment):
     scope = await _turn_scope(monkeypatch, ORG_A)
     assert (scope.org_mode, scope.personal, scope.org_id) == (False, True, ORG_A)
+
+
+async def test_channel_turn_with_no_org_binds_no_person_on_a_trusted_deployment(
+    monkeypatch, personal_deployment
+):
+    assert await _turn_scope(monkeypatch, None) == LOCAL_SCOPE

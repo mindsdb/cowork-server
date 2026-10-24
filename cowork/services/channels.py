@@ -6,10 +6,12 @@ from cowork.channels.plugin import ChannelPlugin, VerifyResult
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import MissingTenantScopeError, ScopedSession
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession, TenantScope
+from cowork.harnesses.base import available_harness_ids
 from cowork.models.channel import ChannelInstallation
 from cowork.models.setting import Setting
 from cowork.schemas.channels import (
+    ChannelAgentResponse,
     ChannelConfigResponse,
     ChannelInstallationResponse,
     ChannelStatusItem,
@@ -41,6 +43,50 @@ def is_org_ready(plugin: ChannelPlugin) -> bool:
     if get_app_settings().tenancy_mode != "org":
         return True
     return plugin.extract_routing_key is not None
+
+
+def installation_org_id(scope: TenantScope) -> str | None:
+    """The org a channel's installation, credentials and live adapter belong
+    to under ``scope``: its org in org mode, else None, the deployment's one
+    installation. Org-wide, not per-member: one installation's credentials
+    serve the whole org, matching how provider credentials are already scoped
+    (SettingService). On a deployment that trusts identity headers a person's
+    partition id is never a channel's org, so a channel's turns never run in
+    one person's space. Fails closed rather than falling back to a global
+    row: a channel credential belonging to no specific org must never be
+    readable or writable once org mode is on."""
+    if not scope.org_mode:
+        return None
+    if not scope.org_id:
+        raise MissingTenantScopeError("channel config requires an organization in scope")
+    return scope.org_id
+
+
+def set_channels_harness(session: Session, scoped: ScopedSession, harness: str) -> ChannelAgentResponse:
+    """Set the harness that serves ``scoped``'s channel conversations, from
+    the channel-agent route and ``python -m cowork.ops.channels agent``.
+
+    channels_harness is ORG-marked, so SettingService routes the write to the
+    scope's own org row, and two orgs never share or overwrite each other's.
+    Changing the agent re-points existing chats: it detaches their
+    conversations so the next message starts fresh under the new agent
+    (existing pins are per-conversation, so without this only new chats would
+    switch). Raises ValueError for a harness that isn't registered.
+    """
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.services.channel_bindings import ChannelBindingService
+    from cowork.services.settings import SettingService
+
+    options = available_harness_ids()
+    harness = harness.strip()
+    if harness not in options:
+        raise ValueError(f"unknown harness '{harness}'. Available: {', '.join(options) or 'none'}")
+    previous = (get_user_settings(scoped.scope).channels_harness or "").strip()
+    SettingService(session, scoped.scope).upsert_setting("channels_harness", harness)
+    reset = 0
+    if harness != previous:
+        reset = ChannelBindingService(scoped).reset_conversations()
+    return ChannelAgentResponse(harness=harness, options=options, reset_conversations=reset)
 
 
 def resolve_installation_by_external_account(
@@ -228,17 +274,7 @@ class ChannelConfigService:
         )
 
     def _org_id(self) -> str | None:
-        """Org-wide, not per-member: one installation's credentials serve the
-        whole org, matching how provider credentials are already scoped
-        (SettingService). Fails closed rather than falling back to a global
-        row — a channel credential belonging to no specific org must never be
-        readable or writable once org mode is on."""
-        scope = self.session.scope
-        if not scope.org_mode:
-            return None
-        if not scope.org_id:
-            raise MissingTenantScopeError("channel config requires an organization in scope")
-        return scope.org_id
+        return installation_org_id(self.session.scope)
 
     def _fetch_setting(self, key: str) -> Setting | None:
         # Not routed through SettingService (its keys are fixed UserSettings

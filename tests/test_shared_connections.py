@@ -54,6 +54,7 @@ from cowork.schemas.connectors import DirectSaveRequest, PatchPickedFilesBody, S
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import (
     CREATED_BY_FIELD,
+    NO_PERSON_SAVE_REFUSAL,
     SHARED_CONNECTION_REFUSAL,
     STILL_SHARED_CONNECTION_REFUSAL,
     LayeredDataVault,
@@ -700,6 +701,120 @@ def test_only_a_scope_with_personal_connections_reads_the_registry(sharing):
     bob = _person(partition=PARTITION_B, sub=SUB_B, resources=SHARED_RESOURCES)
     assert _names(vault_for_scope(bob)) == set()
     assert _names(vault_for_scope(LOCAL_SCOPE)) == set()
+
+
+# ── a turn with no person, where connections are personal ───────────────────
+
+EVERYONES = {("postgres", "managed-db"), ("postgres", "erp")}
+
+
+def _beside_alices_shared_erp(managed_dir) -> None:
+    """A base-vault record saved before connections went personal, Bob's own
+    connection, and one in the managed folder, beside the `erp` Alice shares
+    (the sharing fixture)."""
+    persist_connection("postgres", None, "legacy", {**ERP, "user": "legacy"}, scope=LOCAL_SCOPE)
+    persist_connection("postgres", None, "bobs", {**ERP, "user": "bob"}, scope=BOB)
+    LocalDataVault(managed_dir.vault_dir).save("postgres", "managed-db", {**ERP, "user": "managed"})
+
+
+async def test_a_turn_with_no_person_reads_only_what_everyone_can_use(sharing, monkeypatch, stores):
+    """A channel's turn, or the operator view's own under audit, binds the
+    scope with no person. It reads the managed folder's connections and the
+    ones people share, never the base vault, which no person reads here, nor
+    any person's own vault."""
+    _beside_alices_shared_erp(sharing)
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=LOCAL_SCOPE) as turn:
+        vault = turn.config.data_vault
+        assert _names(vault) == EVERYONES
+        assert vault.load("postgres", "managed-db")["user"] == "managed"
+        assert vault.env_for("postgres", "erp")["DS_POSTGRES_ERP__PASSWORD"] == ERP["password"]
+        for name in ("legacy", "bobs"):
+            assert vault.load("postgres", name) is None
+            assert vault.read_record("postgres", name) is None
+            assert vault.env_for("postgres", name) is None
+    # An artifact's live backend with no person reads the same.
+    assert _names(turn_vault_for_scope(LOCAL_SCOPE)) == EVERYONES
+    # The operator view's own requests still list the base vault.
+    assert ("postgres", "legacy") in _names(vault_for_scope(LOCAL_SCOPE))
+
+
+async def test_a_turn_with_no_person_saves_and_changes_no_connection(sharing, monkeypatch, stores):
+    _beside_alices_shared_erp(sharing)
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=LOCAL_SCOPE) as turn:
+        vault = turn.config.data_vault
+        # What anton's connect_new_datasource does with a pasted connection.
+        with pytest.raises(SharedConnectionError) as refused:
+            vault.save("mysql", "pasted", {"host": "pasted.example"})
+        assert refused.value.detail == NO_PERSON_SAVE_REFUSAL
+        for name in ("managed-db", "erp"):
+            assert not vault.can_change("postgres", name)
+            with pytest.raises(SharedConnectionError):
+                vault.save("postgres", name, {**ERP, "password": "replaced"})
+            with pytest.raises(SharedConnectionError):
+                vault.delete("postgres", name)
+        assert vault.delete("postgres", "legacy") is False
+    with use_settings_scope(LOCAL_SCOPE):
+        labeled = await _cowork_label_connection(
+            None, {"engine": "postgres", "name": "erp", "label": "The channel's"}
+        )
+    assert labeled == f"label_connection: {SHARED_CONNECTION_REFUSAL}"
+
+    assert _names(own_vault_for_scope(LOCAL_SCOPE)) == {("postgres", "legacy")}
+    assert _stored(ALICE)["password"] == ERP["password"]
+
+
+def test_a_turn_with_no_person_publishes_with_its_own_vault(sharing, monkeypatch, tmp_path):
+    """The agent's publish tool hands the publisher the turn's vault, so a
+    published backend gets none of the base vault's secrets."""
+    import cowork.services.publish as publish_mod
+    from cowork.harnesses.anton_harness.tools import _publish_artifact
+
+    _beside_alices_shared_erp(sharing)
+    monkeypatch.setenv("ANTON_COWORK_STATE_DIR", str(tmp_path / "state"))
+    page = tmp_path / "artifacts" / "report.html"
+    page.parent.mkdir()
+    page.write_text("<html><body>hi</body></html>", encoding="utf-8")
+    monkeypatch.setattr(
+        publish_mod,
+        "desktop_publish_context",
+        lambda raw_path, scope: (page, page.parent, "key", "https://view.example"),
+    )
+    vaults: list = []
+
+    def fake_publish(path, **kwargs):
+        vaults.append(kwargs["vault"])
+        return {"view_url": "https://view.example/a/r1", "report_id": "r1", "md5": "m1"}
+
+    monkeypatch.setattr("anton.publisher.publish", fake_publish)
+
+    with use_settings_scope(LOCAL_SCOPE):
+        _publish_artifact(str(page))
+
+    (vault,) = vaults
+    assert _names(vault) == EVERYONES
+    assert vault.load("postgres", "legacy") is None
+
+
+def test_a_turn_with_no_person_is_offered_no_base_vault_connection_to_extend(sharing):
+    from cowork.harnesses.anton_harness.tools import _extends_refusal
+
+    _beside_alices_shared_erp(sharing)
+
+    with use_settings_scope(LOCAL_SCOPE):
+        refused = _extends_refusal("postgres", "legacy")
+    assert refused == (
+        "request_credentials: there is no postgres connection named 'legacy' to extend. "
+        "Use the name the first save reported."
+    )
+
+
+async def test_with_no_managed_folder_a_turn_with_no_person_reads_no_connection(trusted, monkeypatch):
+    persist_connection("postgres", None, "legacy", dict(ERP), scope=LOCAL_SCOPE)
+    persist_connection("postgres", None, "erp", dict(ERP), scope=ALICE)
+
+    assert _names(turn_vault_for_scope(LOCAL_SCOPE)) == set()
 
 
 async def test_the_operators_own_entry_answers_the_shared_sentence(trusted, managed_dir, monkeypatch):

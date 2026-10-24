@@ -777,6 +777,7 @@ def test_channel_agent_endpoint_validates_and_persists(monkeypatch):
     from fastapi import HTTPException
 
     import cowork.api.v1.endpoints.channels as channels_ep
+    import cowork.services.channels as channels_service
     import cowork.common.settings.user_settings as user_settings_mod
     from cowork.api.v1.endpoints.channels import get_channel_agent, set_channel_agent
     from cowork.common.settings.user_settings import get_user_settings
@@ -785,6 +786,7 @@ def test_channel_agent_endpoint_validates_and_persists(monkeypatch):
 
     # A second registered harness, so the switch is observable.
     monkeypatch.setattr(channels_ep, "available_harness_ids", lambda: ["anton", "other"])
+    monkeypatch.setattr(channels_service, "available_harness_ids", lambda: ["anton", "other"])
     monkeypatch.setattr(user_settings_mod, "_harness_options", lambda: ["anton", "other"])
 
     session = get_open_session()

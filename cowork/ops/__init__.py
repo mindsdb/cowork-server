@@ -6,10 +6,11 @@ acts for one person on a local deployment that trusts identity headers
 proxy sends for the person: ``--organization-id``, the deployment's own id
 (X-Organization-Id), and ``--user-id``, the person's ``sub`` (X-User-Id).
 Memory left shared acts on the deployment's one store and takes neither
-(cowork.ops.memory). Connections list also takes neither to enumerate all
-stored partitions (cowork.ops.connections). cowork-server
-works out the person's space from the pair, as it does for their requests, so
-a caller never repeats the storage layout.
+(cowork.ops.memory), and so do channels, which act on the deployment's one
+channel installation (cowork.ops.channels). Connections list also takes
+neither to enumerate all stored partitions (cowork.ops.connections).
+cowork-server works out the person's space from the pair, as it does for their
+requests, so a caller never repeats the storage layout.
 
 Results go to stdout as plain text, and errors and log lines to stderr. A
 command that can't do what it was asked prints why and exits with status 1.

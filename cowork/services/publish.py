@@ -53,6 +53,8 @@ from cowork.services.artifacts import (
 # session factory and the FastAPI dependency graph, and this module is imported
 # from the harness turn path where that is dead weight.
 if TYPE_CHECKING:
+    from anton.core.datasources.data_vault import DataVault
+
     from cowork.db.scoped import TenantScope
 
 logger = logging.getLogger(__name__)
@@ -584,6 +586,7 @@ def publish_artifact(
     access: dict | None = None,
     scope: TenantScope | None = None,
     project_id: str | None = None,
+    vault: DataVault | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -607,6 +610,11 @@ def publish_artifact(
 
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
+
+    `vault` is where a turn's publish reads those secrets: the agent's own
+    tool passes its turn's (turn_vault_for_scope), so a turn with no person
+    publishes none of the base vault's. None reads ``scope``'s, as a request
+    does (vault_for_scope).
     """
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
@@ -689,7 +697,7 @@ def publish_artifact(
             # the published artifact has no DB connection in the cloud.
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
-            vault=vault_for_scope(scope),
+            vault=vault if vault is not None else vault_for_scope(scope),
             # While the password is unchanged anton re-sends the hash stored
             # here, so a content-only re-publish keeps viewers' password grants.
             previous_access=previous if isinstance(previous, dict) else None,

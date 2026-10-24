@@ -130,7 +130,7 @@ def saved_linkedin(tmp_path, monkeypatch):
     """A vault holding the connection a follow-up step extends, as the tool sees it."""
     vault = LocalDataVault(Path(tmp_path) / "tool-vault")
     vault.save("linkedin", "linkedin-1a2b3c4d", {"client_id": "c"}, secure_keys=[])
-    monkeypatch.setattr("cowork.harnesses.anton_harness.tools.vault_for_scope", lambda scope: vault)
+    monkeypatch.setattr("cowork.harnesses.anton_harness.tools.turn_vault_for_scope", lambda scope: vault)
     return vault
 
 
@@ -159,7 +159,7 @@ class TestRequestCredentialsExtends:
         def no_scope(scope):
             raise MissingTenantScopeError("no org in scope")
 
-        monkeypatch.setattr("cowork.harnesses.anton_harness.tools.vault_for_scope", no_scope)
+        monkeypatch.setattr("cowork.harnesses.anton_harness.tools.turn_vault_for_scope", no_scope)
         result = await _cowork_request_credentials(
             session=None,
             tc_input={"engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-1a2b3c4d"},

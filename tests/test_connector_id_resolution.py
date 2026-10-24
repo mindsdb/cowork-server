@@ -151,7 +151,7 @@ class TestRequestCredentialsTool:
     async def test_extends_connection_on_a_non_registry_stamped_form_renders(self, tmp_path, monkeypatch):
         vault = LocalDataVault(Path(tmp_path) / "vault")
         vault.save("linkedin", "linkedin-1a2b3c4d", {"client_id": "c"}, secure_keys=[])
-        monkeypatch.setattr("cowork.harnesses.anton_harness.tools.vault_for_scope", lambda scope: vault)
+        monkeypatch.setattr("cowork.harnesses.anton_harness.tools.turn_vault_for_scope", lambda scope: vault)
         # `linkedin` is not a registry id, so copying it into `_connector_id`
         # still leaves the form handcrafted and mergeable.
         result = await _cowork_request_credentials(
