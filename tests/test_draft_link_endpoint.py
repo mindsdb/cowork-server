@@ -1,6 +1,7 @@
 """POST /api/v1/artifacts/drafts/{project}/{artifact}/link and /health's draft_links."""
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from uuid import UUID
@@ -143,6 +144,29 @@ def test_a_draft_the_caller_may_not_review_is_404(api, monkeypatch):
     monkeypatch.setattr(workspace_ep, "review_artifact_for_request", refuse)
 
     assert api.post(LINK, headers=IDENTITY).status_code == 404
+
+
+def test_the_review_and_the_path_lookup_run_off_the_event_loop(api, reviewed, monkeypatch):
+    # The review reads the database and the artifact roots, and the path lookup
+    # resolves symlinks: all blocking, on a request the web app sends at every
+    # preview open and reload.
+    on_loop: dict[str, bool] = {}
+    names = ("review_artifact_for_request", "_artifact_primary", "_primary_rel_path", "_draft_file_parts")
+    for name in names:
+
+        def watched(*args, _name=name, _original=getattr(workspace_ep, name)):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop[_name] = False
+            else:
+                on_loop[_name] = True
+            return _original(*args)
+
+        monkeypatch.setattr(workspace_ep, name, watched)
+
+    assert api.post(LINK, headers=IDENTITY).status_code == 200
+    assert on_loop == dict.fromkeys(names, False)
 
 
 def test_the_same_path_checks_as_the_draft_route(api, reviewed):

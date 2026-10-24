@@ -1277,6 +1277,21 @@ def _primary_rel_path(folder: Path, primary: Path | None) -> str:
         ) from exc
 
 
+def _draft_link_file_parts(
+    session: ScopedSession, project_selector: str, artifact_selector: str
+) -> tuple[str, ...]:
+    """Review access to the draft and name its primary file for the link.
+
+    Blocking (database, artifact-root discovery, path resolution), so the
+    endpoint runs it in a worker thread, as the draft host does.
+    """
+    _source, folder, metadata, _is_own = review_artifact_for_request(
+        session, project_selector, artifact_selector
+    )
+    primary = _artifact_primary(folder, metadata)
+    return _draft_file_parts(_primary_rel_path(folder, primary), metadata)
+
+
 @router.post("/drafts/{project_ref}/{artifact_id}/link")
 async def create_draft_link(
     project_ref: str,
@@ -1303,11 +1318,9 @@ async def create_draft_link(
     if not scope.user_id or not scope.org_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
     project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
-    _source, folder, metadata, _is_own = review_artifact_for_request(
-        session, project_selector, artifact_selector
+    parts = await run_in_threadpool(
+        _draft_link_file_parts, session, project_selector, artifact_selector
     )
-    primary = await run_in_threadpool(_artifact_primary, folder, metadata)
-    parts = _draft_file_parts(_primary_rel_path(folder, primary), metadata)
     now = int(time.time())
     token = issue_draft_token(
         env=default_draft_env_label(),
