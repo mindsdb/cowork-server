@@ -15,7 +15,8 @@ from starlette.testclient import TestClient
 from cowork.common.structured_logging import make_formatter
 from cowork.db.scoped import TenantScope
 from cowork.draft_host import app as draft_app_module
-from cowork.draft_host.app import DRAFT_ROUTE, EXPIRED_MESSAGE, create_draft_app, request_host
+from cowork.api.v1.artifact_preview import HTML_SANDBOX_CSP
+from cowork.draft_host.app import DRAFT_ROUTE, DRAFT_SANDBOX, EXPIRED_MESSAGE, create_draft_app, request_host
 from cowork.draft_host.token import DRAFT_TTL_SECONDS
 from cowork.principal import get_principal
 from cowork.services.comments_layer import ACTIVATION_PARAM
@@ -69,6 +70,25 @@ def _assert_draft_headers(response):
     assert headers["cache-control"] == "private, no-store"
     assert "set-cookie" not in headers
     assert "access-control-allow-credentials" not in headers
+
+
+def test_the_draft_sandbox_is_the_preview_iframe_sandbox_without_a_shared_origin():
+    # A change to the iframe's sandbox must be a decision for this host too.
+    assert DRAFT_SANDBOX == HTML_SANDBOX_CSP
+    assert "allow-same-origin" not in DRAFT_SANDBOX
+
+
+def test_a_web_origin_that_is_not_bare_never_reaches_the_csp(draft_env, monkeypatch):
+    monkeypatch.setenv("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai; script-src *")
+    get_app_settings.cache_clear()
+    client = TestClient(create_draft_app(), base_url=f"https://{DRAFT_HOST}")
+
+    response = client.get(f"/_t/{draft_token()}/index.html", headers=FETCH)
+
+    assert response.status_code == 404
+    csp = response.headers["content-security-policy"]
+    assert csp.endswith("frame-ancestors 'none'")
+    assert "script-src" not in csp
 
 
 def test_serves_the_draft_document_with_the_shim_and_the_draft_headers(client, seen):

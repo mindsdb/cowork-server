@@ -1384,7 +1384,7 @@ async def create_draft_link(
     # Counted at WARNING so LOG_LEVEL=WARNING deployments keep it during the
     # rollout. The link itself is never logged.
     logger.warning("Draft link issued", extra={"event": "draft_link_issued"})
-    url = f"{settings.draft_origin.rstrip('/')}/_t/{token}/{quote('/'.join(parts), safe='/')}"
+    url = f"{settings.draft_link_origin()}/_t/{token}/{quote('/'.join(parts), safe='/')}"
     return JSONResponse(
         {"url": url, "expiresAt": now + DRAFT_TTL_SECONDS},
         headers={"Cache-Control": "no-store"},

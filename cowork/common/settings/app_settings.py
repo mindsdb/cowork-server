@@ -184,16 +184,25 @@ _KNOWN_ENV_SLUGS = ("staging", "dev")
 # can read an access log, so a short signing secret could be brute-forced offline.
 _DRAFT_KEY_MIN_CHARS = 32
 
-# scheme://host[:port] and one optional trailing slash, nothing else: no
+# scheme://host[:port] and one optional trailing slash, nothing else: no inner
 # whitespace, userinfo, path, query, fragment, wildcard, or the `;` and `,` that
 # would end or extend a CSP source list this value is written into.
-_BARE_ORIGIN = re.compile(r"https?://(?P<host>[A-Za-z0-9][A-Za-z0-9.-]*)(?::[0-9]{1,5})?/?")
+_BARE_ORIGIN = re.compile(
+    r"(?P<scheme>https?)://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?/?",
+    re.IGNORECASE,
+)
 
 
-def _bare_origin_host(value: str) -> str | None:
-    """The lower-case host of a bare http(s) origin, without a trailing dot; None otherwise."""
-    match = _BARE_ORIGIN.fullmatch(value)
-    return match["host"].lower().rstrip(".") if match else None
+def _bare_origin(value: str) -> tuple[str, str] | None:
+    """``(origin, host)`` of a bare http(s) origin, lower-cased; None otherwise.
+
+    Whitespace around the value (a newline from a mounted secret) is ignored.
+    """
+    match = _BARE_ORIGIN.fullmatch(value.strip())
+    if match is None:
+        return None
+    host = match["host"].lower().rstrip(".")
+    return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
 
 
 def _env_slug() -> str:
@@ -1121,12 +1130,27 @@ class AppSettings(Settings):
             if kid and isinstance(secret, str) and len(secret) >= _DRAFT_KEY_MIN_CHARS
         }
 
+    def draft_link_origin(self) -> str:
+        """COWORK_DRAFT_ORIGIN as a bare origin, or '' when it is not one."""
+        parsed = _bare_origin(self.draft_origin)
+        return parsed[0] if parsed else ""
+
+    def draft_frame_origin(self) -> str:
+        """COWORK_WEB_ORIGIN as a bare origin, or '' when it is not one.
+
+        The only value written into the draft host's CSP frame-ancestors.
+        """
+        parsed = _bare_origin(self.web_origin)
+        return parsed[0] if parsed else ""
+
     def draft_links_enabled(self) -> bool:
         """Whether this server issues and serves signed draft links."""
+        link_origin = _bare_origin(self.draft_origin)
         return (
             self.tenancy_mode == "org"
-            and _bare_origin_host(self.draft_origin) in self.draft_host_names()
-            and _bare_origin_host(self.web_origin) is not None
+            and link_origin is not None
+            and link_origin[1] in self.draft_host_names()
+            and bool(self.draft_frame_origin())
             and self.draft_link_kid in self.draft_link_keyring()
             and self.draft_port > 0
         )

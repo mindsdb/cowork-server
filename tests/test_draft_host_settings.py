@@ -53,7 +53,6 @@ def test_any_missing_value_leaves_draft_links_off(draft_env, monkeypatch, name, 
         ("COWORK_DRAFT_ORIGIN", "https://user@draft-staging.artifacts.test"),
         ("COWORK_DRAFT_ORIGIN", "https:///draft-staging.artifacts.test"),
         ("COWORK_DRAFT_ORIGIN", "ftp://draft-staging.artifacts.test"),
-        ("COWORK_DRAFT_ORIGIN", " https://draft-staging.artifacts.test"),
         ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test//"),
         # Sources that would widen or end the CSP's frame-ancestors list.
         ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai https://evil.test"),
@@ -64,8 +63,6 @@ def test_any_missing_value_leaves_draft_links_off(draft_env, monkeypatch, name, 
         ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/app"),
         ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai:port"),
         ("COWORK_WEB_ORIGIN", "https://"),
-        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai\n"),
-        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/ "),
     ],
 )
 def test_an_origin_that_is_not_a_bare_origin_leaves_draft_links_off(draft_env, monkeypatch, name, value):
@@ -83,12 +80,35 @@ def test_an_origin_that_is_not_a_bare_origin_leaves_draft_links_off(draft_env, m
         ("COWORK_DRAFT_ORIGIN", "http://draft-staging.artifacts.test"),
         ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/"),
         ("COWORK_WEB_ORIGIN", "http://localhost:5173"),
+        # A mounted secret often ends in a newline; the scheme is case-insensitive.
+        ("COWORK_DRAFT_ORIGIN", " https://draft-staging.artifacts.test"),
+        ("COWORK_DRAFT_ORIGIN", "HTTPS://draft-staging.artifacts.test"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai\n"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/ "),
     ],
 )
 def test_a_bare_origin_keeps_draft_links_on(draft_env, monkeypatch, name, value):
     monkeypatch.setenv(name, value)
 
     assert AppSettings().draft_links_enabled() is True
+
+
+def test_the_origins_are_read_as_bare_lower_case_origins(draft_env, monkeypatch):
+    monkeypatch.setenv("COWORK_DRAFT_ORIGIN", " HTTPS://Draft-Staging.Artifacts.Test/\n")
+    monkeypatch.setenv("COWORK_WEB_ORIGIN", "https://Cowork.Staging.Mindshub.AI:8443/")
+    settings = AppSettings()
+
+    assert settings.draft_link_origin() == "https://draft-staging.artifacts.test"
+    assert settings.draft_frame_origin() == "https://cowork.staging.mindshub.ai:8443"
+
+
+def test_an_origin_that_is_not_bare_reads_as_none(draft_env, monkeypatch):
+    monkeypatch.setenv("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test/preview")
+    monkeypatch.setenv("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai; script-src *")
+    settings = AppSettings()
+
+    assert settings.draft_link_origin() == ""
+    assert settings.draft_frame_origin() == ""
 
 
 def test_the_draft_port_defaults_off_and_an_empty_value_is_off(monkeypatch):

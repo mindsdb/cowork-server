@@ -75,6 +75,15 @@ def _on_the_draft_host(url: str) -> str:
     return url.removeprefix(f"https://{DRAFT_HOST}")
 
 
+def test_the_link_starts_with_the_bare_draft_origin(api, reviewed, monkeypatch):
+    monkeypatch.setenv("COWORK_DRAFT_ORIGIN", f"HTTPS://{DRAFT_HOST.upper()}/\n")
+    get_app_settings.cache_clear()
+
+    url = api.post(LINK, headers=IDENTITY).json()["url"]
+
+    assert url.startswith(f"https://{DRAFT_HOST}/_t/v1.")
+
+
 def test_issues_a_signed_link_to_the_primary_file(api, reviewed):
     seen, _ = reviewed
 
