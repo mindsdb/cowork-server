@@ -184,6 +184,17 @@ _KNOWN_ENV_SLUGS = ("staging", "dev")
 # can read an access log, so a short signing secret could be brute-forced offline.
 _DRAFT_KEY_MIN_CHARS = 32
 
+# scheme://host[:port] and one optional trailing slash, nothing else: no
+# whitespace, userinfo, path, query, fragment, wildcard, or the `;` and `,` that
+# would end or extend a CSP source list this value is written into.
+_BARE_ORIGIN = re.compile(r"https?://(?P<host>[A-Za-z0-9][A-Za-z0-9.-]*)(?::[0-9]{1,5})?/?")
+
+
+def _bare_origin_host(value: str) -> str | None:
+    """The lower-case host of a bare http(s) origin, without a trailing dot; None otherwise."""
+    match = _BARE_ORIGIN.fullmatch(value)
+    return match["host"].lower().rstrip(".") if match else None
+
 
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
@@ -1117,9 +1128,8 @@ class AppSettings(Settings):
         """Whether this server issues and serves signed draft links."""
         return (
             self.tenancy_mode == "org"
-            and bool(self.draft_host_names())
-            and self.draft_origin.startswith(("https://", "http://"))
-            and bool(self.web_origin)
+            and _bare_origin_host(self.draft_origin) in self.draft_host_names()
+            and _bare_origin_host(self.web_origin) is not None
             and self.draft_link_kid in self.draft_link_keyring()
             and self.draft_port > 0
         )

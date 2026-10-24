@@ -43,6 +43,7 @@ def test_all_six_values_in_org_mode_turn_draft_links_on(configured):
         ("COWORK_DRAFT_ORIGIN", ""),
         ("COWORK_DRAFT_ORIGIN", "draft-staging.artifacts.test"),
         ("COWORK_WEB_ORIGIN", ""),
+        ("COWORK_WEB_ORIGIN", "cowork.staging.mindshub.ai"),
         ("COWORK_DRAFT_LINK_KID", "k2"),
         ("COWORK_DRAFT_LINK_KEYS", "not json"),
         ("COWORK_DRAFT_LINK_KEYS", json.dumps(["k1"])),
@@ -54,6 +55,56 @@ def test_any_missing_value_leaves_draft_links_off(configured, monkeypatch, name,
     monkeypatch.setenv(name, value)
 
     assert AppSettings().draft_links_enabled() is False
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        # A link to a host the listener answers 404 for.
+        ("COWORK_DRAFT_ORIGIN", "https://draft.other.test"),
+        ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test.evil.test"),
+        ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test/preview"),
+        ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test?x=1"),
+        ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test#top"),
+        ("COWORK_DRAFT_ORIGIN", "https://user@draft-staging.artifacts.test"),
+        ("COWORK_DRAFT_ORIGIN", "https:///draft-staging.artifacts.test"),
+        ("COWORK_DRAFT_ORIGIN", "ftp://draft-staging.artifacts.test"),
+        ("COWORK_DRAFT_ORIGIN", " https://draft-staging.artifacts.test"),
+        ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test//"),
+        # Sources that would widen or end the CSP's frame-ancestors list.
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai https://evil.test"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai;"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai; script-src *"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai,https://evil.test"),
+        ("COWORK_WEB_ORIGIN", "https://*.mindshub.ai"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/app"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai:port"),
+        ("COWORK_WEB_ORIGIN", "https://"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai\n"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/ "),
+    ],
+)
+def test_an_origin_that_is_not_a_bare_origin_leaves_draft_links_off(configured, monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+
+    assert AppSettings().draft_links_enabled() is False
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test/"),
+        ("COWORK_DRAFT_ORIGIN", "https://Draft-Staging.Artifacts.Test"),
+        ("COWORK_DRAFT_ORIGIN", "https://draft-staging.artifacts.test:8443"),
+        ("COWORK_DRAFT_ORIGIN", "http://draft-staging.artifacts.test"),
+        ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/"),
+        ("COWORK_WEB_ORIGIN", "http://localhost:5173"),
+    ],
+)
+def test_a_bare_origin_keeps_draft_links_on(configured, monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+
+    assert AppSettings().draft_links_enabled() is True
 
 
 def test_the_draft_port_defaults_off_and_an_empty_value_is_off(monkeypatch):
