@@ -68,6 +68,23 @@ def fresh_settings():
 
 
 @pytest.fixture
+def bound_on_a_free_port(monkeypatch):
+    """What start_draft_listener asks serve_draft_app to bind.
+
+    The socket is bound on port 0 instead: a port picked beforehand can be taken
+    by the time uvicorn binds it, and uvicorn then ends the whole test process.
+    """
+    asked: dict = {}
+
+    async def serve(app, *, host, port):
+        asked.update(host=host, port=port)
+        return await serve_draft_app(app, host=host, port=0)
+
+    monkeypatch.setattr("cowork.draft_host.listener.serve_draft_app", serve)
+    return asked
+
+
+@pytest.fixture
 def middleware_calls(monkeypatch):
     """Every path the API app's identity middleware sees."""
     calls: list[str] = []
@@ -79,12 +96,6 @@ def middleware_calls(monkeypatch):
 
     monkeypatch.setattr(TrustedHeaderMiddleware, "dispatch", recording)
     return calls
-
-
-def _free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
 
 
 def _client(port: int) -> httpx.AsyncClient:
@@ -157,16 +168,16 @@ async def test_stop_closes_the_port(draft_env):
         socket.create_connection(("127.0.0.1", port), timeout=1).close()
 
 
-async def test_the_configured_port_is_served(draft_env, monkeypatch):
-    port = _free_port()
-    monkeypatch.setenv("COWORK_DRAFT_PORT", str(port))
+async def test_the_configured_port_is_served(draft_env, bound_on_a_free_port, monkeypatch):
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+    monkeypatch.setenv("COWORK_DRAFT_PORT", "9123")
     get_app_settings.cache_clear()
 
     listener = await start_draft_listener()
     try:
         assert listener is not None
-        assert listener.port == port
-        async with _client(port) as client:
+        assert bound_on_a_free_port == {"host": "127.0.0.1", "port": 9123}
+        async with _client(listener.port) as client:
             response = await client.get("/", headers={"Host": DRAFT_HOST})
     finally:
         await stop_draft_listener(listener)
@@ -183,8 +194,9 @@ async def test_the_configured_port_is_served(draft_env, monkeypatch):
     ],
     ids=["unknown-kid", "short-secret"],
 )
-async def test_a_half_configured_draft_host_is_reported_at_boot(draft_env, monkeypatch, caplog, name, value):
-    monkeypatch.setenv("COWORK_DRAFT_PORT", str(_free_port()))
+async def test_a_half_configured_draft_host_is_reported_at_boot(
+    draft_env, bound_on_a_free_port, monkeypatch, caplog, name, value
+):
     monkeypatch.setenv(name, value)
     get_app_settings.cache_clear()
 
