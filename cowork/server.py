@@ -256,9 +256,12 @@ async def lifespan(app: FastAPI):
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
         )
-    # The draft-preview host's own port (COWORK_DRAFT_PORT); None when unset.
-    app.state.draft_listener = await start_draft_listener()
+    app.state.draft_listener = None
     try:
+        # The draft-preview host's own port (COWORK_DRAFT_PORT); None when unset.
+        # Inside the try so a listener that fails to start still runs the
+        # teardown below for everything started above.
+        app.state.draft_listener = await start_draft_listener()
         yield
     finally:
         # First, so no draft request is still reading files or the database
