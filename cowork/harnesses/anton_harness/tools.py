@@ -23,12 +23,21 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 import uuid
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.scoped import MissingTenantScopeError
+from cowork.db import session as db_session
+from cowork.db.scoped import (
+    LOCAL_SCOPE,
+    MissingTenantScopeError,
+    ScopedSession,
+    TenantScope,
+    tenant_scope_required,
+)
 from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
 from cowork.services.connectors.connections import ConnectionsService
@@ -36,6 +45,33 @@ from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _desktop_scope(scope: TenantScope | None):
+    """A session under the turn's own ``scope`` for the desktop publish path,
+    or None where none may be opened.
+
+    The publish service resolves an artifact through the project row so a folder
+    the user chose is addressable, and this tool runs outside any request, so it
+    has to open its own. An unbound turn falls back to LOCAL_SCOPE only where
+    that is not the operator view of every person's rows.
+
+    Org mode yields None and opens nothing: a folder can only be adopted on a
+    local deployment, so there is nothing there to find. The same refusal
+    guards the sibling reader in services/skill_links.py.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        yield None
+        return
+    if scope is None:
+        if tenant_scope_required():
+            yield None
+            return
+        scope = LOCAL_SCOPE
+
+    with db_session.get_open_session() as raw:
+        yield ScopedSession(raw, scope)
 
 
 def _published_state(raw_path: str) -> dict:
@@ -48,7 +84,10 @@ def _published_state(raw_path: str) -> dict:
     """
     from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_state
-    return published_state(raw_path, scope=current_settings_scope())
+
+    scope = current_settings_scope()
+    with _desktop_scope(scope) as session:
+        return published_state(raw_path, scope=scope, session=session)
 
 
 def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
@@ -61,9 +100,10 @@ def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
     from cowork.services.publish import desktop_publish_context, publish_artifact
 
     scope = current_settings_scope()
-    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
-        raw_path, scope=scope
-    )
+    with _desktop_scope(scope) as session:
+        artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
+            raw_path, scope=scope, session=session
+        )
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
         api_key=api_key, publish_url=publish_url, access=access, scope=scope,
@@ -76,7 +116,10 @@ def _published_owner_state(raw_path: str) -> dict:
     startup import cycle."""
     from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_owner_state
-    return published_owner_state(raw_path, scope=current_settings_scope())
+
+    scope = current_settings_scope()
+    with _desktop_scope(scope) as session:
+        return published_owner_state(raw_path, scope=scope, session=session)
 
 
 def _access_from_state(entry: dict) -> dict:

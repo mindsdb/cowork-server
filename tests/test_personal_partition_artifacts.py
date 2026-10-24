@@ -266,7 +266,7 @@ def test_a_backend_preview_token_forwards_only_for_the_owner(two_people, monkeyp
         async def send(self, upstream_req, stream):
             return _Upstream()
 
-    async def running(root, port, *, scope):
+    async def running(root, port, *, scope, session=None):
         # A's backend, launched for A's project and slug.
         project_root = str(root.parents[2].resolve())
         artifacts._LAUNCHED_BACKENDS.setdefault(project_root, {})[root.name] = {"proc": _LiveProc(), "port": port}

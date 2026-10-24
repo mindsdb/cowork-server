@@ -1626,7 +1626,9 @@ async def test_a_sandboxed_backend_preview_mints_no_token(landlock_alone, monkey
     from cowork.services import artifacts
 
     folder = _backend_artifact(tmp_path, port=26866)
-    monkeypatch.setattr(artifacts, "_artifact_root_for", lambda path, *, scope: folder)
+    monkeypatch.setattr(
+        artifacts, "_artifact_root_for", lambda path, *, scope, session=None: folder
+    )
     monkeypatch.setattr(artifacts, "_PREVIEW_MOUNTS", {})
     monkeypatch.setattr(artifacts, "_ensure_backend_running", _never)
 

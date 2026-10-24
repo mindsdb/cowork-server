@@ -7,6 +7,7 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
@@ -19,7 +20,10 @@ from cowork.services.artifact_identity import (
 )
 from cowork.db.scoped import TenantScope
 from cowork.services.artifact_lock import artifact_lock
-from cowork.services.artifact_roots import artifacts_sources_for_scan
+from cowork.services.artifact_roots import artifacts_sources_for_desktop_paths
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import ScopedSession
 
 _VIEWER = {"user_id": "desktop-owner", "email": "You", "role": "owner"}
 _CAPABILITIES = {
@@ -40,10 +44,17 @@ class LocalArtifactComments:
     person's artifact id answers 404.
     """
 
-    def __init__(self, artifact_id: str, *, scope: TenantScope | None) -> None:
+    def __init__(
+        self,
+        artifact_id: str,
+        *,
+        scope: TenantScope | None,
+        session: ScopedSession | None = None,
+    ) -> None:
         try:
             _, folder, _ = resolve_artifact_folder(
-                artifacts_sources_for_scan(scope=scope), artifact_id
+                artifacts_sources_for_desktop_paths(scope=scope, session=session),
+                artifact_id,
             )
         except ArtifactIdentityConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -229,9 +240,14 @@ class LocalArtifactComments:
 
 
 async def handle_local_comments(
-    request: Request, artifact_id: str, subpath: str, *, scope: TenantScope | None
+    request: Request,
+    artifact_id: str,
+    subpath: str,
+    *,
+    scope: TenantScope | None,
+    session: ScopedSession | None = None,
 ):
-    service = LocalArtifactComments(artifact_id, scope=scope)
+    service = LocalArtifactComments(artifact_id, scope=scope, session=session)
     parts = [part for part in subpath.split("/") if part]
     method = request.method.upper()
     try:
@@ -263,8 +279,10 @@ async def handle_local_comments(
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown comment operation")
 
 
-def local_comments_stream(artifact_id: str, *, scope: TenantScope | None) -> StreamingResponse:
-    service = LocalArtifactComments(artifact_id, scope=scope)
+def local_comments_stream(
+    artifact_id: str, *, scope: TenantScope | None, session: ScopedSession | None = None
+) -> StreamingResponse:
+    service = LocalArtifactComments(artifact_id, scope=scope, session=session)
 
     async def events():
         previous = {

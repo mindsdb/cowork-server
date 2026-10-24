@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from cowork.api.v1.permissions import DesktopOnly, require
-from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
 
 from cowork.services.publish import (
     PublisherUnavailable,
@@ -67,14 +67,16 @@ class _ActivateBody(BaseModel):
 
 
 @router.get("/")
-async def list_publishable_endpoint(scope: ScopeDep):
-    return list_publishable(scope=scope)
+async def list_publishable_endpoint(scope: ScopeDep, session: ScopedSessionDep):
+    return list_publishable(scope=scope, session=session)
 
 
 @router.post("/")
-async def publish_artifact(req: _PublishBody, scope: ScopeDep):
+async def publish_artifact(req: _PublishBody, scope: ScopeDep, session: ScopedSessionDep):
     try:
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path, scope=scope)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(
+            req.path, scope=scope, session=session
+        )
         # The publisher resolves datasource secrets from the connector vault,
         # which is keyed by the scope wherever connections are partitioned;
         # without it the publisher would look in the shared root. This router
@@ -100,9 +102,9 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep):
 
 
 @router.post("/update")
-async def update_artifact(req: _UpdateBody, scope: ScopeDep):
+async def update_artifact(req: _UpdateBody, scope: ScopeDep, session: ScopedSessionDep):
     try:
-        return _update(req.path, scope=scope)
+        return _update(req.path, scope=scope, session=session)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -116,10 +118,13 @@ async def update_artifact(req: _UpdateBody, scope: ScopeDep):
 @router.delete("/")
 async def unpublish_artifact(
     scope: ScopeDep,
+    session: ScopedSessionDep,
     path: str = Query(..., description="Absolute path to the published HTML artifact"),
 ):
     try:
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(path, scope=scope)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(
+            path, scope=scope, session=session
+        )
         return _unpublish(
             artifact, artifacts_base=artifacts_base,
             api_key=api_key, publish_url=publish_url,
@@ -137,10 +142,11 @@ async def unpublish_artifact(
 @router.get("/versions")
 async def list_versions_endpoint(
     scope: ScopeDep,
+    session: ScopedSessionDep,
     path: str = Query(..., description="Absolute path to the published artifact"),
 ):
     try:
-        return _list_versions(path, scope=scope)
+        return _list_versions(path, scope=scope, session=session)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -152,9 +158,11 @@ async def list_versions_endpoint(
 
 
 @router.post("/activate")
-async def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
+async def activate_version_endpoint(
+    req: _ActivateBody, scope: ScopeDep, session: ScopedSessionDep
+):
     try:
-        return _activate_version(req.path, req.md5, scope=scope)
+        return _activate_version(req.path, req.md5, scope=scope, session=session)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:

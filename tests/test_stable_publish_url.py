@@ -80,9 +80,12 @@ def _patch_scan(container: Path):
 
 
 def _patch_publish_scan(container: Path):
-    """publish.py binds `_scan_artifact_dirs` at import, so the artifacts-module
-    patch above does not reach its own reference."""
-    return patch.object(publish_mod, "_scan_artifact_dirs", lambda *, scope: [container])
+    """publish.py binds `_artifact_dirs_for_scope` at import, so patching only
+    the artifacts module leaves its own reference pointing at the real projects
+    root, which `desktop_publish_context` then scans and finds nothing in."""
+    return patch.object(
+        publish_mod, "_artifact_dirs_for_scope", lambda *, scope, session=None: [container]
+    )
 
 
 def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", report_id="uuid-1"):

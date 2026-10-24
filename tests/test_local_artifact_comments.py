@@ -10,7 +10,9 @@ from cowork.services import local_artifact_comments as comments
 def _service(tmp_path, monkeypatch):
     folder = tmp_path / "artifact"
     folder.mkdir()
-    monkeypatch.setattr(comments, "artifacts_sources_for_scan", lambda *, scope: [])
+    monkeypatch.setattr(
+        comments, "artifacts_sources_for_desktop_paths", lambda *, scope, session=None: []
+    )
     monkeypatch.setattr(
         comments,
         "resolve_artifact_folder",

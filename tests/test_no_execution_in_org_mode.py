@@ -82,7 +82,8 @@ async def test_open_artifact_endpoint_refused_in_org_mode(org_mode):
     from cowork.api.v1.endpoints.artifacts import _PathBody, open_artifact
 
     with pytest.raises(HTTPException) as exc:
-        await open_artifact(_PathBody(path="/tmp/whatever"), scope=LOCAL_SCOPE)
+        # No session: org mode refuses before any root resolution.
+        await open_artifact(_PathBody(path="/tmp/whatever"), scope=LOCAL_SCOPE, session=None)
     assert exc.value.status_code == 403
 
 
@@ -139,7 +140,7 @@ async def test_export_pdf_docx_refused_in_org_mode(org_mode, fmt):
 
     with pytest.raises(HTTPException) as exc:
         await export_artifact_endpoint(
-            _ExportBody(path="/tmp/whatever.md", format=fmt), scope=LOCAL_SCOPE
+            _ExportBody(path="/tmp/whatever.md", format=fmt), scope=LOCAL_SCOPE, session=None
         )
     assert exc.value.status_code == 403
 
@@ -157,7 +158,9 @@ async def test_export_pdf_docx_not_refused_on_desktop(desktop, tmp_path, fmt):
 
     with pytest.raises(HTTPException) as exc:
         await export_artifact_endpoint(
-            _ExportBody(path=str(tmp_path / "missing.md"), format=fmt), scope=LOCAL_SCOPE
+            _ExportBody(path=str(tmp_path / "missing.md"), format=fmt),
+            scope=LOCAL_SCOPE,
+            session=None,
         )
     assert exc.value.status_code == 404
 
@@ -171,7 +174,9 @@ async def test_open_not_refused_on_desktop(desktop, tmp_path):
     from cowork.api.v1.endpoints.artifacts import _PathBody, open_artifact
 
     with pytest.raises(HTTPException) as exc:
-        await open_artifact(_PathBody(path=str(tmp_path / "missing.html")), scope=LOCAL_SCOPE)
+        await open_artifact(
+            _PathBody(path=str(tmp_path / "missing.html")), scope=LOCAL_SCOPE, session=None
+        )
     assert exc.value.status_code == 404
 
 
@@ -187,7 +192,9 @@ async def test_export_html_not_refused_in_org_mode(org_mode, tmp_path):
 
     with pytest.raises(HTTPException) as exc:
         await export_artifact_endpoint(
-            _ExportBody(path=str(tmp_path / "missing.md"), format="html"), scope=LOCAL_SCOPE
+            _ExportBody(path=str(tmp_path / "missing.md"), format="html"),
+            scope=LOCAL_SCOPE,
+            session=None,
         )
     assert exc.value.status_code == 404
 

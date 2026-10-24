@@ -217,6 +217,14 @@ def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monke
         "cowork.services.artifact_roots.artifacts_sources_for_scan",
         lambda *, scope: called.append(scope) or [],
     )
+    # The adopted-folder half reads real rows, and this suite shares one
+    # process-wide database with every test that adopts a folder over HTTP.
+    # Stubbed so the assertion below is about the scan, not about whichever
+    # projects happen to exist by the time this runs.
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots._sources_outside_the_projects_root",
+        lambda _session: [],
+    )
 
     assert artifacts_sources_for_scope(ScopedSession(session, LOCAL_SCOPE)) == []
     assert called == [LOCAL_SCOPE]
@@ -313,7 +321,9 @@ def test_the_unfiltered_scan_yields_nothing_for_an_org_project(session, tmp_path
     only one taking no session, so it applies no owner filter. It walks
     `_projects_root(scope=...)`, the scope's own projects root: an org's is
     `<shared_root>/<org_id>/projects`, so the org filter is the root itself.
-    `/api/v1/search` skips the scan in org mode explicitly.
+    `/api/v1/search` reaches it through `artifacts_sources_for_desktop_paths`,
+    which adds desktop projects pointed at a chosen folder, and skips it in
+    org mode explicitly.
 
     The owner filter is not a check either. `_scan_artifact_dirs` looks only
     for `<project>/.anton/artifacts`, the desktop layout, while an org

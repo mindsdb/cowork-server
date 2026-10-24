@@ -49,7 +49,7 @@ from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
-    artifacts_sources_for_scan,
+    artifacts_sources_for_desktop_paths,
 )
 from cowork.services.artifacts import (
     BackendPreviewRefused,
@@ -284,7 +284,7 @@ class _DesktopSourceCatalogEntry:
 
 
 def _desktop_registered_path_catalog(
-    *, scope: TenantScope | None
+    *, scope: TenantScope | None, session: ScopedSession | None = None
 ) -> tuple[_DesktopSourceCatalogEntry, ...]:
     """Build the complete legacy source catalog of ``scope``'s projects
     without an HTTP selector."""
@@ -294,7 +294,7 @@ def _desktop_registered_path_catalog(
             project_name=os.path.basename(str(Path(source.base).parent.parent)),
             source=source,
         )
-        for source in artifacts_sources_for_scan(scope=scope)
+        for source in artifacts_sources_for_desktop_paths(scope=scope, session=session)
         for path_key in sorted(_desktop_source_path_keys(source))
     )
 
@@ -328,7 +328,7 @@ def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict
     retained in that catalog keeps ``project_id=None``, preserving local draft
     URLs and card addressing.
     """
-    catalog = _desktop_registered_path_catalog(scope=session.scope)
+    catalog = _desktop_registered_path_catalog(scope=session.scope, session=session)
     if not project_path or "\x00" in project_path:
         return []
     requested = os.path.normpath(os.path.expanduser(project_path))
@@ -524,7 +524,9 @@ def _pinned_loose_match(
     return None
 
 
-def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -> dict:
+def _desktop_artifact_status_for_path(
+    path: str, *, scope: TenantScope | None, session: ScopedSession | None = None
+) -> dict:
     """Match a legacy path only against entries scanned from ``scope``'s roots.
 
     The request is reduced to a string lookup key. Every card and folder key is
@@ -548,7 +550,7 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
     )
     from cowork.services.artifacts import card_for_folder
 
-    for source in artifacts_sources_for_scan(scope=scope):
+    for source in artifacts_sources_for_desktop_paths(scope=scope, session=session):
         source_base = Path(source.base)
         try:
             with opened_artifact_root(source) as root:
@@ -643,7 +645,7 @@ async def list_artifacts(
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
             catalog = await run_in_threadpool(
-                _desktop_registered_path_catalog, scope=session.scope
+                _desktop_registered_path_catalog, scope=session.scope, session=session
             )
             if not project_path or "\x00" in project_path:
                 return []
@@ -872,17 +874,21 @@ async def delete_artifact_for_request(
 # accident.
 @router.get("/status", dependencies=[Depends(require(DesktopOnly))])
 async def artifact_status(
-    scope: ScopeDep, path: str = Query(..., min_length=1, max_length=4096)
+    scope: ScopeDep,
+    session: ScopedSessionDep,
+    path: str = Query(..., min_length=1, max_length=4096),
 ):
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
-    return _desktop_artifact_status_for_path(path, scope=scope)
+    return _desktop_artifact_status_for_path(path, scope=scope, session=session)
 
 
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
-async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
+async def preview_artifact(
+    scope: ScopeDep, session: ScopedSessionDep, path: str = Query(...)
+):
     try:
-        artifact = resolve_artifact_path(path, scope=scope)
+        artifact = resolve_artifact_path(path, scope=scope, session=session)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -901,7 +907,9 @@ class _ExportBody(BaseModel):
 
 
 @router.post("/export", dependencies=[Depends(require(DesktopOnly))])
-async def export_artifact_endpoint(req: _ExportBody, scope: ScopeDep):
+async def export_artifact_endpoint(
+    req: _ExportBody, scope: ScopeDep, session: ScopedSessionDep
+):
     """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
     the result into the same artifact folder. Returns the new file's path so
     the client can open or download it.
@@ -933,7 +941,7 @@ async def export_artifact_endpoint(req: _ExportBody, scope: ScopeDep):
             detail="PDF and Word export are not available on this deployment. Export to HTML instead.",
         )
     try:
-        source = resolve_artifact_path(req.path, scope=scope)
+        source = resolve_artifact_path(req.path, scope=scope, session=session)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -948,15 +956,17 @@ async def export_artifact_endpoint(req: _ExportBody, scope: ScopeDep):
 
 
 @router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
-async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeDep):
+async def preview_mount_endpoint(
+    req: _PathBody, request: Request, scope: ScopeDep, session: ScopedSessionDep
+):
     try:
-        artifact = resolve_artifact_path(req.path, scope=scope)
+        artifact = resolve_artifact_path(req.path, scope=scope, session=session)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        payload = await mount_preview(artifact, scope=scope)
+        payload = await mount_preview(artifact, scope=scope, session=session)
     except BackendPreviewRefused as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -1036,7 +1046,7 @@ def serve_artifact_file(
 
 
 @router.post("/open", dependencies=[Depends(require(DesktopOnly))])
-async def open_artifact(req: _PathBody, scope: ScopeDep):
+async def open_artifact(req: _PathBody, scope: ScopeDep, session: ScopedSessionDep):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
     # A person's partition refuses too: the server is not that person's
@@ -1045,7 +1055,7 @@ async def open_artifact(req: _PathBody, scope: ScopeDep):
     if _org_mode() or scope.personal:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     try:
-        artifact = resolve_artifact_path(req.path, scope=scope)
+        artifact = resolve_artifact_path(req.path, scope=scope, session=session)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -1059,7 +1069,7 @@ async def open_artifact(req: _PathBody, scope: ScopeDep):
 
 def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     try:
-        return resolve_artifact_path(path, scope=session.scope)
+        return resolve_artifact_path(path, scope=session.scope, session=session)
     except FileNotFoundError:
         pass
     except ValueError as e:
@@ -1147,14 +1157,16 @@ async def proxy(token: str, rel_path: str, request: Request, scope: ScopeDep):
 
 
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])
-def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
+def delete_artifact_endpoint(
+    scope: ScopeDep, session: ScopedSessionDep, path: str = Query(...)
+):
     try:
         from cowork.services.publish import (
             desktop_artifact_and_base,
             desktop_publish_credential,
         )
 
-        found = desktop_artifact_and_base(path, scope=scope)
+        found = desktop_artifact_and_base(path, scope=scope, session=session)
         # Credential resolved after the path so an unresolvable artifact still
         # reports 404 rather than "configure your API key". Only needed at all
         # because delete unpublishes first.

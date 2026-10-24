@@ -308,6 +308,65 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
     return list(dirs.values())
 
 
+def _artifact_dirs_for_scope(
+    *, scope: TenantScope | None, session: ScopedSession | None = None
+) -> list[Path]:
+    """Every `.anton/artifacts` dir a desktop caller can address by path.
+
+    The scan only sees direct children of ``scope``'s projects root, so a
+    project pointed at a folder the user chose has to come from its row.
+    Without a session, or in org mode, this IS the scan: callers that
+    legitimately hold no session keep today's behavior, and the org path is
+    resolved by `artifact_roots.artifacts_sources_for_scope` rather than by
+    any scan.
+    """
+    dirs = _scan_artifact_dirs(scope=scope)
+    if session is None or _org_mode():
+        return dirs
+    # Imported here because `artifact_roots` imports this module at module
+    # level; the same cycle `_external_project_artifacts_base` works around.
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    known = {str(d.resolve(strict=False)) for d in dirs}
+    for source in _sources_outside_the_projects_root(session):
+        base = Path(source.base)
+        if str(base.resolve(strict=False)) in known:
+            continue
+        known.add(str(base.resolve(strict=False)))
+        dirs.append(base)
+    return dirs
+
+
+def _project_dirs_for_scope(
+    *, scope: TenantScope | None, session: ScopedSession | None = None
+) -> list[Path]:
+    """Registered project directories of ``scope``, plus folders the user
+    chose, all resolved.
+
+    `_registered_project_dirs` resolves what it returns and callers match against
+    it with bare set membership, so a row path has to be resolved here too: on
+    macOS an adopted folder under /var reaches this as /private/var and would
+    simply fail to match.
+    """
+    dirs = _registered_project_dirs(scope=scope)
+    if session is None or _org_mode():
+        return dirs
+    # Imported here for the `artifact_roots` cycle; see `_artifact_dirs_for_scope`.
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    known = {str(d) for d in dirs}
+    for source in _sources_outside_the_projects_root(session):
+        anchor = source.trusted_anchor
+        if anchor is None:
+            continue
+        project_dir = Path(anchor).resolve(strict=False)
+        if str(project_dir) in known:
+            continue
+        known.add(str(project_dir))
+        dirs.append(project_dir)
+    return dirs
+
+
 def _load_metadata(folder: Path) -> dict | None:
     path = folder / "metadata.json"
     try:
@@ -758,6 +817,33 @@ def _project_artifacts_base(
     return base if base.is_dir() else None
 
 
+def _external_source_for_path(
+    path: Path, session: ScopedSession | None = None
+) -> ProjectArtifacts | None:
+    """The adopted-folder source whose artifacts dir holds `path`, if any.
+
+    A serve URL for such a folder cannot be rediscovered by scanning, and its
+    basename is not its project name, so callers holding only a path need the
+    source itself to build one.
+    """
+    if session is None or _org_mode():
+        return None
+    # Imported here for the `artifact_roots` cycle; see `_artifact_dirs_for_scope`.
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    for source in _sources_outside_the_projects_root(session):
+        try:
+            resolved.relative_to(Path(source.base).resolve())
+        except (ValueError, OSError):
+            continue
+        return source
+    return None
+
+
 def serve_url_for(
     path: str | Path,
     *,
@@ -828,7 +914,12 @@ def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> l
 
 
 def resolve_artifact_path(
-    raw_path: str, *, scope: TenantScope | None, allow_dir: bool = False
+    raw_path: str,
+    *,
+    scope: TenantScope | None,
+    allow_dir: bool = False,
+    session: ScopedSession | None = None,
+    artifact_dirs: list[Path] | None = None,
 ) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
@@ -844,6 +935,9 @@ def resolve_artifact_path(
     by publish/unpublish so a folder-based artifact can be addressed by its
     folder. The relative-path branch stays file-only (the client always
     sends absolute folder paths).
+
+    `artifact_dirs` lets a caller that already resolved the roots for
+    `session` pass them in, so resolution does not read the database again.
     """
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
@@ -854,9 +948,11 @@ def resolve_artifact_path(
     if not str(target).strip():
         raise ValueError("Invalid artifact path")
 
+    if artifact_dirs is None:
+        artifact_dirs = _artifact_dirs_for_scope(scope=scope, session=session)
     if target.is_absolute():
         resolved = target.resolve()
-        for art_root in _scan_artifact_dirs(scope=scope):
+        for art_root in artifact_dirs:
             try:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
@@ -867,7 +963,7 @@ def resolve_artifact_path(
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path, _scan_artifact_dirs(scope=scope))
+    matches = _candidate_relative_artifacts(raw_path, artifact_dirs)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -875,7 +971,13 @@ def resolve_artifact_path(
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
-def _artifact_root_for(path: Path, *, scope: TenantScope | None) -> Path:
+def _artifact_root_for(
+    path: Path,
+    *,
+    scope: TenantScope | None,
+    session: ScopedSession | None = None,
+    containers: set[str] | None = None,
+) -> Path:
     """Climb from an artifact file to the folder that holds its
     `metadata.json` — the artifact root.
 
@@ -888,8 +990,16 @@ def _artifact_root_for(path: Path, *, scope: TenantScope | None) -> Path:
     bounded by the registered artifact container dirs
     (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
     climbing into the rest of the disk. Falls back to `path.parent`.
+
+    `containers` is for callers that climb many files under roots they have
+    already resolved: deriving the set costs a database read now, and this runs
+    once per file in the publish picker.
     """
-    containers = {str(d.resolve()) for d in _scan_artifact_dirs(scope=scope)}
+    if containers is None:
+        containers = {
+            str(d.resolve())
+            for d in _artifact_dirs_for_scope(scope=scope, session=session)
+        }
     current = path.parent.resolve()
     while True:
         if (current / "metadata.json").is_file():
@@ -1664,7 +1774,9 @@ def preview_artifact(path: Path) -> dict:
     }
 
 
-async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
+async def mount_preview(
+    path: Path, *, scope: TenantScope | None, session: ScopedSession | None = None
+) -> dict:
     """Register an artifact for iframe preview.
 
     ``path`` is already resolved inside ``scope``'s artifacts roots; ``scope``
@@ -1683,7 +1795,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     # primary file's parent — fullstack apps keep their frontend in a
     # `static/` subdir. Resolve it explicitly for all backend lookups so
     # we read the `port` from the root, not from `static/`.
-    root = _artifact_root_for(path, scope=scope)
+    root = _artifact_root_for(path, scope=scope, session=session)
 
     # Backend+frontend artifacts: detect them by a `port` field in the
     # root's metadata.json. The iframe will load through our proxy
@@ -1727,7 +1839,9 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         # reach us.
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
-        backend = await _ensure_backend_running(root, backend_port, scope=scope)
+        backend = await _ensure_backend_running(
+            root, backend_port, scope=scope, session=session
+        )
         return {
             "kind": "proxy",
             "token": root_token,
@@ -1748,13 +1862,19 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         raise ValueError("Preview mount is only available for HTML artifacts")
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
+    _external = _external_source_for_path(path, session)
 
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
-        "serveUrl": serve_url_for(path, scope=scope),
+        "serveUrl": serve_url_for(
+            path,
+            scope=scope,
+            artifacts_base=_external.base if _external else None,
+            project_name=_external.project_name if _external else None,
+        ),
         # Route through _published_url_for so a soft-deleted (published=False)
         # record reports an empty URL — matching the artifact grid and the
         # fullstack branch, instead of surfacing a dead 4nton.ai link.
@@ -1867,7 +1987,9 @@ def _publishable_in_folder(
     return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
 
 
-def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
+def html_artifacts(
+    *, scope: TenantScope | None, session: ScopedSession | None = None
+) -> list[dict]:
     """List the most recently changed publishable files (HTML + Markdown)
     across the artifacts tree of every project of ``scope``.
 
@@ -1879,7 +2001,7 @@ def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
     """
     fullstack_types = _fullstack_types()
     candidates: list[_PublishableCandidate] = []
-    for container in _scan_artifact_dirs(scope=scope):
+    for container in _artifact_dirs_for_scope(scope=scope, session=session):
         try:
             with os.scandir(container) as it:
                 entries = list(it)
@@ -2009,7 +2131,12 @@ def _backends_cross_people() -> bool:
     )
 
 
-def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> Path | None:
+def _resolve_project_root(
+    artifact_dir: Path,
+    *,
+    scope: TenantScope | None,
+    session: ScopedSession | None = None,
+) -> Path | None:
     """The registered project root of ``scope`` that owns this artifact dir.
 
     `artifact_dir` is the parent of the primary file (e.g.
@@ -2022,7 +2149,7 @@ def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> P
         artifact_resolved = artifact_dir.resolve()
     except OSError:
         return None
-    registered = _registered_project_dirs(scope=scope)
+    registered = _project_dirs_for_scope(scope=scope, session=session)
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
             # The registered entry, equal to the ancestor: the caller hands it
@@ -2033,7 +2160,11 @@ def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> P
 
 
 async def _ensure_backend_running(
-    artifact_dir: Path, port: int, *, scope: TenantScope | None
+    artifact_dir: Path,
+    port: int,
+    *,
+    scope: TenantScope | None,
+    session: ScopedSession | None = None,
 ) -> BackendStatus:
     """Bring up the artifact's backend if it isn't already listening.
 
@@ -2054,7 +2185,7 @@ async def _ensure_backend_running(
     slug = artifact_dir.name
     # The project root first, so nothing about the port is reported for an
     # artifact outside the caller's own projects.
-    project_root = _resolve_project_root(artifact_dir, scope=scope)
+    project_root = _resolve_project_root(artifact_dir, scope=scope, session=session)
     if project_root is None:
         return BackendStatus(running=False, detail="Artifact is not in a registered project.", port=0)
     if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):

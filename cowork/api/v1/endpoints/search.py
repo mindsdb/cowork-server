@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, Query
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
-from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
+from cowork.services.artifact_roots import (
+    artifacts_sources_for_desktop_paths as _desktop_sources,
+)
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
 from cowork.services.pins import PinService
@@ -78,12 +80,14 @@ async def search_cowork(
                 "score": score,
             })
 
-    # Artifacts: the scan of the caller's own projects root (a person's
-    # partition where projects are personal). Hosted search has never listed
-    # artifacts, and the scan of an org's projects root would start to, so org
-    # mode skips it.
+    # Artifacts: the caller's own projects root (a person's partition where
+    # projects are personal) and the folders they chose. Hosted search has
+    # never listed artifacts, and the scan of an org's projects root would
+    # start to, so org mode skips it.
     artifacts = (
-        [] if scoped.scope.org_mode else _list_artifacts(_sources_for_scan(scope=scoped.scope))
+        []
+        if scoped.scope.org_mode
+        else _list_artifacts(_desktop_sources(scope=scoped.scope, session=scoped))
     )
     for artifact in artifacts:
         text = " ".join([

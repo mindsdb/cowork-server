@@ -75,7 +75,7 @@ async def test_desktop_route_selects_exact_source_from_complete_catalog(monkeypa
     )
     events = []
 
-    def discover(*, scope):
+    def discover(*, scope, session=None):
         events.append(("roots", scope))
         return [other, selected]
 
@@ -84,7 +84,7 @@ async def test_desktop_route_selects_exact_source_from_complete_catalog(monkeypa
         return []
 
     monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
-    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", discover)
+    monkeypatch.setattr(artifacts, "artifacts_sources_for_desktop_paths", discover)
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(
@@ -116,7 +116,9 @@ async def test_desktop_route_distinguishes_duplicate_project_basenames(monkeypat
 
     monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
     monkeypatch.setattr(
-        artifacts, "artifacts_sources_for_scan", lambda *, scope: [first, selected]
+        artifacts,
+        "artifacts_sources_for_desktop_paths",
+        lambda *, scope, session=None: [first, selected],
     )
 
     def list_from_roots(sources):
@@ -144,7 +146,9 @@ async def test_desktop_route_rejects_unregistered_path_with_same_basename(
         project_name="project",
     )
     monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
-    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda *, scope: [source])
+    monkeypatch.setattr(
+        artifacts, "artifacts_sources_for_desktop_paths", lambda *, scope, session=None: [source]
+    )
     monkeypatch.setattr(
         artifacts,
         "_list_artifacts",

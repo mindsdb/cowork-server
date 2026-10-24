@@ -39,7 +39,9 @@ def _patch_context():
     exception-mapping tests below must get past that step to reach `_publish`."""
     return patch.object(
         publish_ep, "_desktop_context",
-        lambda raw, *, scope: (Path(raw), Path(raw).parent, "key", "https://4nton.ai"),
+        lambda raw, *, scope, session=None: (
+            Path(raw), Path(raw).parent, "key", "https://4nton.ai"
+        ),
     )
 
 
