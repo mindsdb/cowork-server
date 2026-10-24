@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from anton.core.datasources.data_vault import DataVault, _slug_env_prefix
+from anton.core.datasources.data_vault import DataVault, _slug_env_prefix, _sweep_ds_env_vars
 
 from cowork.creators import Changer
 from cowork.managed import SharedConnection
@@ -28,6 +28,12 @@ SHARED_CONNECTION_REFUSAL = "This connection is shared with you and can't be cha
 STILL_SHARED_CONNECTION_REFUSAL = (
     "This name is still shared for a connection of yours that is gone. "
     "Ask your operator to stop sharing it before you use the name again."
+)
+# A save in a turn with no person where connections are personal: it has no
+# vault of its own to save into (EmptyOwnVault).
+NO_PERSON_SAVE_REFUSAL = (
+    "A turn with no person, such as a channel's, can't save a connection. "
+    "Ask your operator to add it."
 )
 
 # The bookkeeping field that records who created a connection: the person's
@@ -57,6 +63,49 @@ class SharedConnectionError(PermissionError):
         self.engine = engine
         self.name = name
         self.detail = detail
+
+
+class EmptyOwnVault:
+    """The own layer of a turn with no person where connections are personal
+    (cowork.services.connectors.persist.turn_vault_for_scope).
+
+    It holds nothing, so the LayeredDataVault over it reads only the managed
+    connections and the ones people share: no base-vault record, which no
+    person reads there, and nothing from any person's own vault. A save
+    raises SharedConnectionError with NO_PERSON_SAVE_REFUSAL, so nothing the
+    turn's agent saves lands where a later turn with no person reads it.
+    """
+
+    def save(
+        self,
+        engine: str,
+        name: str,
+        credentials: dict[str, str],
+        *,
+        secure_keys: list[str] | None = None,
+    ) -> object:
+        raise SharedConnectionError(engine=engine, name=name, detail=NO_PERSON_SAVE_REFUSAL)
+
+    def load(self, engine: str, name: str) -> dict[str, str] | None:
+        return None
+
+    def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
+        return None
+
+    def delete(self, engine: str, name: str) -> bool:
+        return False
+
+    def list_connections(self) -> list[dict[str, str]]:
+        return []
+
+    def env_for(self, engine: str, name: str, *, flat: bool = False) -> dict[str, str] | None:
+        return None
+
+    def inject_env(self, engine: str, name: str, *, flat: bool = False) -> list[str] | None:
+        return None
+
+    def clear_ds_env(self) -> None:
+        _sweep_ds_env_vars()
 
 
 @dataclass(frozen=True)

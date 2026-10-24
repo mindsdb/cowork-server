@@ -304,13 +304,25 @@ class AuthenticatedOrgAdmin(AuthenticatedInOrgMode):
     question of the same header on the same six routes — moving that into the
     vocabulary changes nothing about who is admitted, and swapping the source
     is its own slice.
+
+    A local deployment that trusts identity headers has no org admin: what
+    these routes configure is the deployment's one global row, which every
+    person's channel turns run through, so every person is refused and only
+    the operator view (a request with no person, under
+    ``COWORK_IDENTITY_ENFORCE=audit``) passes. The operator otherwise sets a
+    channel with ``python -m cowork.ops.channels``.
     """
 
     async def check(
         self, request: Request, principal: Principal | None = Depends(get_principal)
     ) -> Principal | None:
+        settings = get_app_settings()
+        # The parent answers None in local tenancy, so the person is read
+        # from the injected principal, not from its answer.
+        if settings.tenancy_mode != "org" and settings.trust_identity_headers and principal is not None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="requires the operator")
         principal = await super().check(request, principal=principal)
-        if get_app_settings().tenancy_mode == "org" and not can_manage_org(principal):
+        if settings.tenancy_mode == "org" and not can_manage_org(principal):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="requires an org admin")
         return principal
 

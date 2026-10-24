@@ -7,7 +7,7 @@ from cowork.channels.plugin import ChannelPlugin
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession
-from cowork.services.channels import ChannelConfigService, UnknownChannelError
+from cowork.services.channels import ChannelConfigService, UnknownChannelError, installation_org_id
 
 _LOCAL_ENVS = {"local", "dev", "development", "test"}
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -69,7 +69,7 @@ class ChannelLifecycleService:
         def persist(values: dict[str, str]) -> None:
             self.config.set_config(channel_type, values)
 
-        org_id = self.session.scope.org_id
+        org_id = installation_org_id(self.session.scope)
 
         async def refresh() -> bool:
             return await self.adapters.refresh(channel_type, org_id, session=self.session)

@@ -32,7 +32,7 @@ from cowork.db.scoped import MissingTenantScopeError
 from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.connectors.persist import turn_vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 
 logger = logging.getLogger(__name__)
@@ -64,9 +64,12 @@ def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
     artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
         raw_path, scope=scope
     )
+    # The turn's own vault, so a turn with no person publishes no secret
+    # the turn itself can't read.
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
         api_key=api_key, publish_url=publish_url, access=access, scope=scope,
+        vault=turn_vault_for_scope(scope),
     )
 
 
@@ -671,7 +674,7 @@ def _extends_refusal(engine: str, name: str) -> str | None:
     """
     scope = current_settings_scope()
     try:
-        vault = vault_for_scope(scope)
+        vault = turn_vault_for_scope(scope)
     except MissingTenantScopeError:
         logger.warning("request_credentials: no tenant scope to check extends_connection against")
         return None

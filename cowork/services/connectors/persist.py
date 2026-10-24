@@ -30,7 +30,7 @@ from cowork.services.connectors.identity import (
     resolve_unique_slug,
     secure_keys_for,
 )
-from cowork.services.connectors.layered_vault import LayeredDataVault, SharedFrom
+from cowork.services.connectors.layered_vault import EmptyOwnVault, LayeredDataVault, SharedFrom
 from cowork.services.connectors.vault_lock import lock_for
 
 if TYPE_CHECKING:
@@ -183,11 +183,48 @@ def turn_vault_for_scope(scope: "TenantScope | None") -> LocalDataVault | Layere
     turn with no person, such as a scheduled run where schedules are shared,
     is not the operator view: it changes no connection already in the base
     vault (cowork.creators.turn_changer_for).
+
+    Where connections are personal, a turn with no person (a channel's, or
+    the operator view's own under COWORK_IDENTITY_ENFORCE=audit) reads only
+    what every person can use: the managed connections and every one people
+    share. It reads no base-vault record, which no person reads there, and
+    nothing from any person's own vault, and it saves nothing
+    (_no_person_turn_vault).
     """
     from cowork.db.personal_resources import PersonalResource
 
+    if _turn_has_no_person_where_connections_are_personal(scope):
+        return _no_person_turn_vault()
     return _vault_changed_by(
         scope=scope, changer=turn_changer_for(scope, resource=PersonalResource.CONNECTIONS)
+    )
+
+
+def _turn_has_no_person_where_connections_are_personal(scope: "TenantScope | None") -> bool:
+    from cowork.db.personal_resources import PersonalResource
+
+    settings = get_app_settings()
+    return (
+        scope is not None
+        and not scope.partitioned
+        and settings.trust_identity_headers
+        and PersonalResource.CONNECTIONS in settings.personal_resources
+    )
+
+
+def _no_person_turn_vault() -> LayeredDataVault:
+    """The managed connections and every one people share, over an own layer
+    that holds nothing and refuses saves (EmptyOwnVault)."""
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    managed = managed_folder()
+    if managed is None:
+        return LayeredDataVault(own=EmptyOwnVault())
+    registry = SharedConnections.read_live(managed.shared_connections_file, logger=logger).root
+    return LayeredDataVault(
+        own=EmptyOwnVault(),
+        managed=LocalDataVault(managed.vault_dir),
+        shared=_shared_sources(registry, own_partition=None),
     )
 
 

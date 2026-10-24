@@ -174,6 +174,7 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
     """The precise thing this change adds: set_channel_agent must write the
     caller's org row, not the one global row every org would otherwise share."""
     import cowork.api.v1.endpoints.channels as channels_ep
+    import cowork.services.channels as channels_service
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.db.scoped import ScopedSession, TenantScope
     from cowork.db.session import get_open_session
@@ -184,6 +185,7 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
     get_app_settings.cache_clear()
     import cowork.common.settings.user_settings as user_settings_mod
     monkeypatch.setattr(channels_ep, "available_harness_ids", lambda: ["anton", "other"])
+    monkeypatch.setattr(channels_service, "available_harness_ids", lambda: ["anton", "other"])
     monkeypatch.setattr(user_settings_mod, "_harness_options", lambda: ["anton", "other"])
 
     session = get_open_session()

@@ -35,7 +35,12 @@ from cowork.services.channel_lifecycle import (
     ChannelLifecycleService,
     LifecycleNotImplementedError,
 )
-from cowork.services.channels import ChannelConfigService, UnknownChannelError
+from cowork.services.channels import (
+    ChannelConfigService,
+    UnknownChannelError,
+    installation_org_id,
+    set_channels_harness,
+)
 from cowork.harnesses.base import available_harness_ids
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -108,28 +113,10 @@ def get_channel_agent(scoped: ScopedSessionDep) -> ChannelAgentResponse:
 def set_channel_agent(
     body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep,
 ) -> ChannelAgentResponse:
-    # channels_harness is ORG-marked, so SettingService routes this write to
-    # the caller's own org row — two orgs never share or overwrite each other's.
-    from cowork.common.settings.user_settings import get_user_settings
-    from cowork.services.settings import SettingService
-
-    options = available_harness_ids()
-    harness = (body.harness or "").strip()
-    if harness not in options:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"unknown harness '{harness}'. Available: {', '.join(options) or 'none'}",
-        )
-    previous = (get_user_settings(scoped.scope).channels_harness or "").strip()
-    SettingService(session, scoped.scope).upsert_setting("channels_harness", harness)
-
-    # Changing the agent re-points existing chats: detach their conversations
-    # so the next message starts fresh under the new agent (existing pins are
-    # per-conversation, so without this only new chats would switch).
-    reset = 0
-    if harness != previous:
-        reset = ChannelBindingService(scoped).reset_conversations()
-    return ChannelAgentResponse(harness=harness, options=options, reset_conversations=reset)
+    try:
+        return set_channels_harness(session, scoped, body.harness or "")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.get("/{channel_type}/config", response_model=ChannelConfigResponse)
@@ -161,8 +148,8 @@ async def set_config(
 
     adapters = _live_adapters(request)
     if adapters is not None:
-        await adapters.refresh(channel_type, scoped.scope.org_id, session=scoped)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+        await adapters.refresh(channel_type, installation_org_id(scoped.scope), session=scoped)
+    await _reconcile_ingress(request, channel_type, installation_org_id(scoped.scope))
     return result
 
 
@@ -187,8 +174,8 @@ async def delete_config(
     # Tear the live adapter down — its credentials are gone.
     adapters = _live_adapters(request)
     if adapters is not None:
-        await adapters.remove(channel_type, scoped.scope.org_id)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+        await adapters.remove(channel_type, installation_org_id(scoped.scope))
+    await _reconcile_ingress(request, channel_type, installation_org_id(scoped.scope))
 
 
 @router.post(
@@ -208,8 +195,8 @@ async def reload_channel(
     adapters = _live_adapters(request)
     active = False
     if adapters is not None:
-        active = await adapters.refresh(channel_type, scoped.scope.org_id, session=scoped)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+        active = await adapters.refresh(channel_type, installation_org_id(scoped.scope), session=scoped)
+    await _reconcile_ingress(request, channel_type, installation_org_id(scoped.scope))
     return ChannelReloadResponse(channel_type=channel_type, active=active)
 
 
@@ -294,7 +281,7 @@ async def setup_channel(
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+    await _reconcile_ingress(request, channel_type, installation_org_id(scoped.scope))
     return ChannelLifecycleResponse(channel_type=channel_type, action="setup", active=result.active, detail=result.detail)
 
 
@@ -319,5 +306,5 @@ async def teardown_channel(
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+    await _reconcile_ingress(request, channel_type, installation_org_id(scoped.scope))
     return ChannelLifecycleResponse(channel_type=channel_type, action="teardown", active=result.active, detail=result.detail)

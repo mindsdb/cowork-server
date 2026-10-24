@@ -145,6 +145,22 @@ def test_org_admin_is_a_no_op_in_local_mode():
     assert _client().get("/org-admin").status_code == 200
 
 
+def test_org_admin_403s_every_person_where_identity_headers_are_trusted(monkeypatch):
+    # The routes it guards configure the deployment's one global row, so no
+    # person may, whatever roles the proxy forwards.
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    for principal in (MEMBER, ADMIN):
+        resp = _client(principal).get("/org-admin")
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "requires the operator"
+
+
+def test_org_admin_allows_the_operator_view_where_identity_headers_are_trusted(monkeypatch):
+    # A request with no person reaches here only under COWORK_IDENTITY_ENFORCE=audit.
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    assert _client().get("/org-admin").status_code == 200
+
+
 # ── require() itself ─────────────────────────────────────────────────
 
 

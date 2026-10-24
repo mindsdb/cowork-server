@@ -94,8 +94,10 @@ def test_an_unbound_read_is_refused_on_a_trusted_deployment(stack):
         turn_vault_for_scope(None)
 
 
-def test_shared_connections_keep_one_vault(stack):
+def test_shared_connections_keep_one_vault(stack, monkeypatch):
     shared = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS})
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(shared)))
+    get_app_settings.cache_clear()
     alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shared)
     bob = _person(partition=PARTITION_B, sub=SUB_B, resources=shared)
     _save_sales(alice, secret="team-secret")
