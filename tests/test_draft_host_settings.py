@@ -7,30 +7,14 @@ import pytest
 
 from cowork.common.settings.app_settings import AppSettings, default_draft_env_label
 
-from draft_host_support import KEYS
-
-CONFIGURED = {
-    "COWORK_TENANCY_MODE": "org",
-    "COWORK_DRAFT_HOSTS": "draft-staging.artifacts.test",
-    "COWORK_DRAFT_ORIGIN": "https://draft-staging.artifacts.test",
-    "COWORK_DRAFT_LINK_KEYS": json.dumps(KEYS),
-    "COWORK_DRAFT_LINK_KID": "k1",
-    "COWORK_WEB_ORIGIN": "https://cowork.staging.mindshub.ai",
-    "COWORK_DRAFT_PORT": "9011",
-}
+from draft_host_support import DRAFT_HOST, KEYS, draft_env  # noqa: F401  (fixture)
 
 
-@pytest.fixture
-def configured(monkeypatch):
-    for name, value in CONFIGURED.items():
-        monkeypatch.setenv(name, value)
-
-
-def test_all_six_values_in_org_mode_turn_draft_links_on(configured):
+def test_all_six_values_in_org_mode_turn_draft_links_on(draft_env):
     settings = AppSettings()
 
     assert settings.draft_links_enabled() is True
-    assert settings.draft_host_names() == frozenset({"draft-staging.artifacts.test"})
+    assert settings.draft_host_names() == frozenset({DRAFT_HOST})
     assert settings.draft_link_keyring() == KEYS
     assert settings.draft_port == 9011
 
@@ -51,7 +35,7 @@ def test_all_six_values_in_org_mode_turn_draft_links_on(configured):
         ("COWORK_DRAFT_PORT", ""),
     ],
 )
-def test_any_missing_value_leaves_draft_links_off(configured, monkeypatch, name, value):
+def test_any_missing_value_leaves_draft_links_off(draft_env, monkeypatch, name, value):
     monkeypatch.setenv(name, value)
 
     assert AppSettings().draft_links_enabled() is False
@@ -84,7 +68,7 @@ def test_any_missing_value_leaves_draft_links_off(configured, monkeypatch, name,
         ("COWORK_WEB_ORIGIN", "https://cowork.staging.mindshub.ai/ "),
     ],
 )
-def test_an_origin_that_is_not_a_bare_origin_leaves_draft_links_off(configured, monkeypatch, name, value):
+def test_an_origin_that_is_not_a_bare_origin_leaves_draft_links_off(draft_env, monkeypatch, name, value):
     monkeypatch.setenv(name, value)
 
     assert AppSettings().draft_links_enabled() is False
@@ -101,7 +85,7 @@ def test_an_origin_that_is_not_a_bare_origin_leaves_draft_links_off(configured, 
         ("COWORK_WEB_ORIGIN", "http://localhost:5173"),
     ],
 )
-def test_a_bare_origin_keeps_draft_links_on(configured, monkeypatch, name, value):
+def test_a_bare_origin_keeps_draft_links_on(draft_env, monkeypatch, name, value):
     monkeypatch.setenv(name, value)
 
     assert AppSettings().draft_links_enabled() is True
@@ -143,7 +127,7 @@ def test_the_keyring_drops_secrets_shorter_than_32_characters(monkeypatch):
     assert AppSettings().draft_link_keyring() == {"exact": "b" * 32, "long": "c" * 64}
 
 
-def test_a_short_secret_for_the_active_kid_leaves_draft_links_off(configured, monkeypatch):
+def test_a_short_secret_for_the_active_kid_leaves_draft_links_off(draft_env, monkeypatch):
     monkeypatch.setenv("COWORK_DRAFT_LINK_KEYS", json.dumps({"k1": "a" * 31}))
 
     assert AppSettings().draft_links_enabled() is False

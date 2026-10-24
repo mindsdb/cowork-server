@@ -35,8 +35,9 @@ from draft_host_support import (
     FETCH,
     ORG,
     USER,
-    configure_draft_env,
+    draft_env,  # noqa: F401  (fixture)
     draft_token,
+    events,
     fake_review,
     make_artifact,
 )
@@ -50,13 +51,6 @@ FORGED = {
     "X-User-Email": "attacker@example.com",
     "X-Forwarded-User": "attacker",
 }
-
-
-@pytest.fixture
-def draft_env(monkeypatch):
-    configure_draft_env(monkeypatch)
-    yield
-    get_app_settings.cache_clear()
 
 
 @pytest.fixture
@@ -79,6 +73,26 @@ def bound_on_a_free_port(monkeypatch):
     async def serve(app, *, host, port):
         asked.update(host=host, port=port)
         return await serve_draft_app(app, host=host, port=0)
+
+    monkeypatch.setattr("cowork.draft_host.listener.serve_draft_app", serve)
+    return asked
+
+
+@pytest.fixture
+async def listener(draft_env):
+    """A draft listener on a free loopback port; stopping it twice is harmless."""
+    running = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
+    yield running
+    await running.stop()
+
+
+@pytest.fixture
+def serve_stub(monkeypatch):
+    """What start_draft_listener asked serve_draft_app for, without binding it."""
+    asked: dict = {}
+
+    async def serve(app, *, host, port):
+        asked.update(host=host, port=port)
 
     monkeypatch.setattr("cowork.draft_host.listener.serve_draft_app", serve)
     return asked
@@ -112,28 +126,24 @@ async def test_without_a_draft_port_no_listener_starts(draft_env, monkeypatch):
 
 
 async def test_the_draft_port_serves_the_draft_app_and_nothing_else(
-    draft_env, middleware_calls, tmp_path, monkeypatch
+    listener, middleware_calls, tmp_path, monkeypatch
 ):
     recorded: dict = {}
     source, folder, metadata = make_artifact(tmp_path)
     monkeypatch.setattr(
         draft_app_module, "review_artifact_for_request", fake_review(source, folder, metadata, recorded)
     )
-    listener = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
-    try:
-        async with _client(listener.port) as client:
-            served = await client.get(
-                f"/_t/{draft_token()}/index.html", headers={"Host": DRAFT_HOST, **FETCH, **FORGED}
-            )
-            refused = [
-                await client.get("/api/v1/health/", headers={"Host": DRAFT_HOST, **FORGED}),
-                await client.get("/api/v1/health/", headers={"Host": COWORK_HOST, **FORGED}),
-                await client.get(
-                    f"/_t/{draft_token()}/index.html", headers={"Host": COWORK_HOST, **FETCH, **FORGED}
-                ),
-            ]
-    finally:
-        await listener.stop()
+    async with _client(listener.port) as client:
+        served = await client.get(
+            f"/_t/{draft_token()}/index.html", headers={"Host": DRAFT_HOST, **FETCH, **FORGED}
+        )
+        refused = [
+            await client.get("/api/v1/health/", headers={"Host": DRAFT_HOST, **FORGED}),
+            await client.get("/api/v1/health/", headers={"Host": COWORK_HOST, **FORGED}),
+            await client.get(
+                f"/_t/{draft_token()}/index.html", headers={"Host": COWORK_HOST, **FETCH, **FORGED}
+            ),
+        ]
 
     assert served.status_code == 200
     assert recorded["scope"].user_id == USER
@@ -146,7 +156,8 @@ async def test_the_draft_port_serves_the_draft_app_and_nothing_else(
 
 async def test_the_api_server_keeps_the_process_signals(draft_env):
     # uvicorn.Server.serve() takes SIGINT and SIGTERM for itself. The API
-    # server must keep them: it stops this server from its lifespan.
+    # server must keep them: it stops this server from its lifespan. Not the
+    # listener fixture: the handlers are read before the server starts.
     before = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     listener = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
     try:
@@ -157,8 +168,7 @@ async def test_the_api_server_keeps_the_process_signals(draft_env):
     assert during == before
 
 
-async def test_stop_closes_the_port(draft_env):
-    listener = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
+async def test_stop_closes_the_port(listener):
     port = listener.port
 
     await listener.stop()
@@ -195,16 +205,16 @@ async def test_the_configured_port_is_served(draft_env, bound_on_a_free_port, mo
     ids=["unknown-kid", "short-secret"],
 )
 async def test_a_half_configured_draft_host_is_reported_at_boot(
-    draft_env, bound_on_a_free_port, monkeypatch, caplog, name, value
+    draft_env, serve_stub, monkeypatch, caplog, name, value
 ):
     monkeypatch.setenv(name, value)
     get_app_settings.cache_clear()
 
     with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):
-        listener = await start_draft_listener()
-    await stop_draft_listener(listener)
+        await start_draft_listener()
 
-    assert listener is not None
+    # Still started: the draft app answers 404 until the value is fixed.
+    assert serve_stub["port"] == 9011
     [record] = [r for r in caplog.records if r.name == "cowork.draft_host.listener"]
     assert record.event == "draft_host_misconfigured"
     assert "draft host answers 404" in json.loads(make_formatter().format(record))["message"]
@@ -242,23 +252,6 @@ async def test_the_draft_port_access_line_never_carries_the_token(draft_env, mon
     assert any(line.get("event") == "http_access" and line.get("status_code") == 401 for line in lines)
 
 
-def _loopback_records(caplog) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if getattr(r, "event", None) == "draft_host_loopback"]
-
-
-@pytest.fixture
-def serve_stub(monkeypatch):
-    """What start_draft_listener asked serve_draft_app for, without binding it."""
-    asked: dict = {}
-
-    async def serve(app, *, host, port):
-        asked.update(host=host, port=port)
-        return SimpleNamespace(host=host)
-
-    monkeypatch.setattr("cowork.draft_host.listener.serve_draft_app", serve)
-    return asked
-
-
 @pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "::1", "localhost"])
 async def test_a_draft_listener_on_a_loopback_address_is_reported_at_boot(
     draft_env, serve_stub, monkeypatch, caplog, host
@@ -269,7 +262,7 @@ async def test_a_draft_listener_on_a_loopback_address_is_reported_at_boot(
     with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):
         await start_draft_listener()
 
-    [record] = _loopback_records(caplog)
+    [record] = events(caplog, "draft_host_loopback")
     assert record.levelno == logging.WARNING
     message = json.loads(make_formatter().format(record))["message"]
     assert "COWORK_SERVER_HOST" in message and "0.0.0.0" in message
@@ -285,7 +278,7 @@ async def test_a_draft_listener_on_a_pod_address_is_not_reported(draft_env, serv
     with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):
         await start_draft_listener()
 
-    assert _loopback_records(caplog) == []
+    assert events(caplog, "draft_host_loopback") == []
     assert serve_stub["host"] == host
 
 
@@ -296,23 +289,17 @@ async def test_a_loopback_address_is_not_reported_while_the_draft_host_is_off(dr
     with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):
         await start_draft_listener()
 
-    assert _loopback_records(caplog) == []
+    assert events(caplog, "draft_host_loopback") == []
 
 
-def _stop_records(caplog) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if getattr(r, "event", None) == "draft_host_stopped"]
-
-
-async def test_a_listener_that_stops_by_itself_is_logged(draft_env, caplog):
-    listener = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
-
+async def test_a_listener_that_stops_by_itself_is_logged(listener, caplog):
     with caplog.at_level("ERROR", logger="cowork.draft_host.listener"):
         # Ends the server without going through stop(), as a failure would.
         listener.server.should_exit = True
         await listener.task
         await asyncio.sleep(0)
 
-    [record] = _stop_records(caplog)
+    [record] = events(caplog, "draft_host_stopped")
     assert record.levelno == logging.ERROR
     assert json.loads(make_formatter().format(record))["message"] == "Draft host stopped"
 
@@ -328,18 +315,16 @@ async def test_a_crashed_listener_is_logged_with_its_error_type(caplog):
             await listener.task
         await asyncio.sleep(0)
 
-    [record] = _stop_records(caplog)
+    [record] = events(caplog, "draft_host_stopped")
     assert json.loads(make_formatter().format(record))["error_type"] == "RuntimeError"
 
 
-async def test_a_deliberate_stop_is_not_logged_as_a_failure(draft_env, caplog):
-    listener = await serve_draft_app(create_draft_app(), host="127.0.0.1", port=0)
-
+async def test_a_deliberate_stop_is_not_logged_as_a_failure(listener, caplog):
     with caplog.at_level("INFO", logger="cowork.draft_host.listener"):
         await listener.stop()
         await asyncio.sleep(0)
 
-    assert _stop_records(caplog) == []
+    assert events(caplog, "draft_host_stopped") == []
 
 
 async def test_a_failed_stop_is_logged_and_shutdown_goes_on(caplog):

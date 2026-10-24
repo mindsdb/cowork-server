@@ -7,7 +7,6 @@ only, fixed headers.
 from __future__ import annotations
 
 import json
-import logging
 import time
 
 import pytest
@@ -34,20 +33,14 @@ from draft_host_support import (
     ORG,
     PROJECT,
     USER,
-    configure_draft_env,
+    draft_env,  # noqa: F401  (fixture)
     draft_token,
+    events,
     fake_review,
     forge_identity,
-    sign_claims,
     make_artifact,
+    sign_claims,
 )
-
-
-@pytest.fixture
-def draft_env(monkeypatch):
-    configure_draft_env(monkeypatch)
-    yield
-    get_app_settings.cache_clear()
 
 
 @pytest.fixture
@@ -138,16 +131,6 @@ def test_the_identity_comes_from_the_token_and_forged_headers_are_ignored(client
     assert principals == [None]
 
 
-def test_a_token_without_fetch_metadata_is_refused(client, seen):
-    # A link unfurler or a mail link scanner: no Sec-Fetch-* at all.
-    response = client.get(f"/_t/{draft_token()}/index.html")
-
-    assert response.status_code == 401
-    assert response.text == "Unauthorized"
-    assert seen == {}
-    _assert_draft_headers(response)
-
-
 def test_an_expired_link_shows_the_open_again_page(client, seen):
     stale = draft_token(now=int(time.time()) - DRAFT_TTL_SECONDS - 1)
 
@@ -173,33 +156,53 @@ def test_a_subresource_with_an_expired_token_gets_a_short_401(client, seen):
 
 
 @pytest.mark.parametrize(
-    "token",
+    "token, headers, reason",
     [
-        pytest.param(lambda: draft_token(env="dev"), id="other-env"),
-        pytest.param(lambda: draft_token(env="pr-cowork-server-42"), id="pr-env"),
-        pytest.param(lambda: draft_token(keys={"k9": "other"}, kid="k9"), id="other-key"),
-        pytest.param(lambda: draft_token(sub="not-a-uuid"), id="bad-identity"),
-        pytest.param(lambda: forge_identity(draft_token(), sub="99999999-9999-4999-8999-999999999999"), id="tampered"),
-        pytest.param(lambda: "v1.garbage.sig", id="garbage"),
+        # A link unfurler or a mail link scanner: no Sec-Fetch-* at all.
+        pytest.param(draft_token, {}, "draft_no_fetch_metadata", id="no-fetch-metadata"),
+        pytest.param(lambda: "v1.garbage.sig", FETCH, "draft_token_malformed", id="malformed"),
+        pytest.param(
+            lambda: draft_token(keys={"k9": "other"}, kid="k9"), FETCH, "draft_token_kid", id="other-key"
+        ),
+        pytest.param(
+            lambda: forge_identity(draft_token(), sub="99999999-9999-4999-8999-999999999999"),
+            FETCH,
+            "draft_token_signature",
+            id="tampered",
+        ),
+        pytest.param(
+            lambda: sign_claims(
+                {
+                    "p": "published", "env": "staging", "sub": USER, "org": ORG, "proj": PROJECT,
+                    "art": ARTIFACT, "exp": int(time.time()) + 600, "kid": "k1",
+                },
+                KEYS["k1"],
+            ),
+            FETCH,
+            "draft_token_purpose",
+            id="other-purpose",
+        ),
+        pytest.param(lambda: draft_token(env="dev"), FETCH, "draft_token_env", id="other-env"),
+        pytest.param(lambda: draft_token(env="pr-cowork-server-42"), FETCH, "draft_token_env", id="pr-env"),
+        pytest.param(
+            lambda: draft_token(now=int(time.time()) - DRAFT_TTL_SECONDS - 1),
+            FETCH,
+            "draft_token_expired",
+            id="expired",
+        ),
+        pytest.param(lambda: draft_token(sub="not-a-uuid"), FETCH, "draft_token_identity", id="bad-identity"),
     ],
 )
-def test_foreign_or_broken_tokens_are_refused(client, seen, token):
-    response = client.get(f"/_t/{token()}/index.html", headers=FETCH)
+def test_a_refused_token_is_a_401_that_names_its_reason_and_reviews_nothing(
+    client, seen, caplog, token, headers, reason
+):
+    with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
+        response = client.get(f"/_t/{token()}/index.html", headers=headers)
 
     assert response.status_code == 401
+    assert [record.reason for record in events(caplog, "request_refused")] == [reason]
     assert seen == {}
-
-
-def test_a_token_for_another_purpose_is_refused(client, seen):
-    published = sign_claims({
-        "p": "published", "env": "staging", "sub": USER, "org": ORG, "proj": PROJECT,
-        "art": ARTIFACT, "exp": int(time.time()) + 600, "kid": "k1",
-    }, KEYS["k1"])
-
-    response = client.get(f"/_t/{published}/index.html", headers=FETCH)
-
-    assert response.status_code == 401
-    assert seen == {}
+    _assert_draft_headers(response)
 
 
 @pytest.mark.parametrize("query", ["download=1", "download=0", "download"])
@@ -286,19 +289,14 @@ async def test_paths_outside_the_artifact_are_refused(draft_env, seen, rel, expe
     assert b"outside the artifact" not in body
 
 
-def test_nothing_is_served_while_draft_links_are_off(draft_env, seen, monkeypatch):
+def test_nothing_is_served_while_draft_links_are_off(client, seen, monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
     get_app_settings.cache_clear()
-    client = TestClient(create_draft_app(), base_url=f"https://{DRAFT_HOST}")
 
     response = client.get(f"/_t/{draft_token()}/index.html", headers=FETCH)
 
     assert response.status_code == 404
     assert seen == {}
-
-
-def _refusals(caplog) -> list[logging.LogRecord]:
-    return [record for record in caplog.records if getattr(record, "event", None) == "request_refused"]
 
 
 def test_the_refusal_log_names_the_reason_and_never_the_token(client, seen, caplog):
@@ -307,7 +305,7 @@ def test_the_refusal_log_names_the_reason_and_never_the_token(client, seen, capl
     with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
         response = client.get(f"/_t/{token}/index.html", headers=FETCH)
 
-    [record] = _refusals(caplog)
+    [record] = events(caplog, "request_refused")
     assert (record.reason, record.status_code, record.route) == ("draft_token_env", 401, DRAFT_ROUTE)
     line = make_formatter().format(record)
     assert (json.loads(line)["reason"], json.loads(line)["route"]) == ("draft_token_env", DRAFT_ROUTE)
@@ -316,46 +314,27 @@ def test_the_refusal_log_names_the_reason_and_never_the_token(client, seen, capl
     assert response.headers["x-request-id"]
 
 
-@pytest.mark.parametrize(
-    "path, headers, reason",
-    [
-        pytest.param(lambda: f"/_t/{draft_token()}/index.html", {}, "draft_no_fetch_metadata", id="no-fetch-metadata"),
-        pytest.param(lambda: "/_t/v1.garbage.sig/index.html", FETCH, "draft_token_malformed", id="malformed"),
-        pytest.param(
-            lambda: f"/_t/{draft_token(sub='not-a-uuid')}/index.html", FETCH, "draft_token_identity", id="identity"
-        ),
-    ],
-)
-def test_each_token_refusal_names_its_reason(client, seen, caplog, path, headers, reason):
+def test_a_host_outside_the_draft_hosts_is_logged_as_such(client, seen, caplog):
     with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
-        response = client.get(path(), headers=headers)
-
-    assert response.status_code == 401
-    assert [record.reason for record in _refusals(caplog)] == [reason]
-
-
-def test_a_host_outside_the_draft_hosts_is_logged_as_such(draft_env, seen, caplog):
-    client = TestClient(create_draft_app(), base_url="https://evil.example")
-
-    with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
-        response = client.get(f"/_t/{draft_token()}/index.html", headers=FETCH)
+        response = client.get(
+            f"/_t/{draft_token()}/index.html", headers={**FETCH, "Host": "evil.example"}
+        )
 
     assert response.status_code == 404
-    assert [record.reason for record in _refusals(caplog)] == ["draft_host_unknown"]
+    assert [record.reason for record in events(caplog, "request_refused")] == ["draft_host_unknown"]
 
 
-def test_switched_off_draft_links_are_logged_as_such(draft_env, seen, monkeypatch, caplog):
+def test_switched_off_draft_links_are_logged_as_such(client, seen, monkeypatch, caplog):
     # What the network check sees before the key is in the pod.
     monkeypatch.delenv("COWORK_DRAFT_LINK_KEYS")
     get_app_settings.cache_clear()
-    client = TestClient(create_draft_app(), base_url=f"https://{DRAFT_HOST}")
 
     with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
         response = client.get(f"/_t/{draft_token()}/index.html", headers=FETCH)
 
     assert response.status_code == 404
     assert response.text == "Not Found"
-    assert [record.reason for record in _refusals(caplog)] == ["draft_links_disabled"]
+    assert [record.reason for record in events(caplog, "request_refused")] == ["draft_links_disabled"]
 
 
 def test_a_failure_is_logged_by_its_event_and_without_the_token(client, monkeypatch, caplog):
@@ -381,7 +360,7 @@ def test_a_path_outside_the_route_is_logged_without_a_route(client, seen, caplog
     with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
         client.get("/", headers=FETCH)
 
-    [record] = _refusals(caplog)
+    [record] = events(caplog, "request_refused")
     assert (record.status_code, record.reason, record.route) == (404, "not_found", None)
 
 
@@ -392,7 +371,7 @@ def test_a_missing_file_is_404(client, seen):
     _assert_draft_headers(response)
 
 
-def test_a_fullstack_draft_serves_only_its_public_subtree(draft_env, tmp_path, monkeypatch):
+def test_a_fullstack_draft_serves_only_its_public_subtree(client, tmp_path, monkeypatch):
     calls: dict = {}
     source, folder, metadata = make_artifact(
         tmp_path,
@@ -402,7 +381,6 @@ def test_a_fullstack_draft_serves_only_its_public_subtree(draft_env, tmp_path, m
     monkeypatch.setattr(
         draft_app_module, "review_artifact_for_request", fake_review(source, folder, metadata, calls)
     )
-    client = TestClient(create_draft_app(), base_url=f"https://{DRAFT_HOST}")
     token = draft_token()
 
     assert client.get(f"/_t/{token}/static/index.html", headers=FETCH).status_code == 200
@@ -428,13 +406,12 @@ def test_the_host_is_read_from_the_header_lower_cased_without_port(host, expecte
 
 
 @pytest.mark.parametrize("host", ["cowork.staging.mindshub.ai", "draft-dev.artifacts.test", "evil.example"])
-def test_a_host_other_than_the_draft_host_is_404(draft_env, seen, host):
+def test_a_host_other_than_the_draft_host_is_404(client, seen, host):
     # The draft Ingress pins Host. Anything else did not come through it, and
     # X-Forwarded-Host is never read in its place.
-    client = TestClient(create_draft_app(), base_url=f"https://{host}")
-
     response = client.get(
-        f"/_t/{draft_token()}/index.html", headers={**FETCH, "X-Forwarded-Host": DRAFT_HOST}
+        f"/_t/{draft_token()}/index.html",
+        headers={**FETCH, "Host": host, "X-Forwarded-Host": DRAFT_HOST},
     )
 
     assert response.status_code == 404

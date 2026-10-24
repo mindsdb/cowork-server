@@ -1,35 +1,33 @@
 """The draft-preview token: one wire format, checked field by field."""
 from __future__ import annotations
 
-import base64
+from functools import partial
 
 import pytest
 
 from cowork.draft_host.token import (
     DRAFT_TTL_SECONDS,
     DraftTokenError,
-    issue_draft_token,
     verify_draft_token,
 )
 
-from draft_host_support import forge_identity, sign_claims
+from draft_host_support import (
+    ARTIFACT,
+    ORG,
+    PROJECT,
+    USER,
+    b64url,
+    draft_token,
+    forge_identity,
+    sign_claims,
+)
 
-USER = "11111111-1111-4111-8111-111111111111"
-ORG = "22222222-2222-4222-8222-222222222222"
-PROJECT = "33333333-3333-4333-8333-333333333333"
-ARTIFACT = "44444444444444444444444444444444"
+# Short on purpose: these tests call the token functions directly, past the
+# keyring's 32-character floor.
 KEYS = {"k1": "draft-secret"}
 NOW = 1_700_000_000
 
-
-def _issue(**overrides) -> str:
-    fields = dict(env="staging", sub=USER, org=ORG, proj=PROJECT, art=ARTIFACT, keys=KEYS, kid="k1", now=NOW)
-    fields.update(overrides)
-    return issue_draft_token(**fields)
-
-
-def _b64(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+_issue = partial(draft_token, keys=KEYS, now=NOW)
 
 
 def _claims(**overrides) -> dict:
@@ -106,9 +104,9 @@ def test_an_unknown_kid_is_refused_and_a_rotation_keeps_both_keys():
         "v2.eyJ9.sig",
         "v1..sig",
         "v1.!!!!.sig",
-        "v1." + _b64(b"not json") + ".sig",
-        "v1." + _b64(b"[1, 2]") + ".sig",
-        "v1." + _b64(b"[" * 3000) + ".sig",
+        "v1." + b64url(b"not json") + ".sig",
+        "v1." + b64url(b"[1, 2]") + ".sig",
+        "v1." + b64url(b"[" * 3000) + ".sig",
         "v1.a.b.c",
         "v1." + "a" * 5000 + ".sig",
     ],
@@ -125,7 +123,7 @@ def test_a_payload_that_exhausts_the_json_parser_is_malformed(monkeypatch):
 
     monkeypatch.setattr("cowork.draft_host.token.json.loads", too_deep)
 
-    assert _reason("v1." + _b64(b"[]") + ".sig") == "malformed"
+    assert _reason("v1." + b64url(b"[]") + ".sig") == "malformed"
 
 
 def test_a_signed_token_without_an_identity_is_refused():
