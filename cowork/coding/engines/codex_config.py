@@ -10,6 +10,7 @@ from typing import Any
 
 from cowork.coding.contracts import PermissionMode, TerminalShellPreference
 from cowork.coding.engines.base import EngineInputReference, EngineSessionConfig
+from cowork.coding.engines.permission_guidance import permission_guidance
 from cowork.coding.shells import resolve_shell, shell_environment
 
 # Process-local bearer credential for the inference proxy. A fixed string would
@@ -79,7 +80,7 @@ def turn_input(
 
 
 def approval_policy(permission_mode: PermissionMode) -> str:
-    return "on-request" if permission_mode in {PermissionMode.read_only, PermissionMode.supervised} else "never"
+    return "on-request" if permission_mode == PermissionMode.supervised else "never"
 
 
 def sandbox_mode(permission_mode: PermissionMode) -> str:
@@ -263,8 +264,9 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         "serviceTier": config.service_tier,
         "personality": config.personality,
     }
-    if config.developer_instructions:
-        thread_params["developerInstructions"] = config.developer_instructions
+    thread_params["developerInstructions"] = "\n\n".join(
+        item for item in (config.developer_instructions, permission_guidance(config)) if item
+    )
     return CodexLaunchConfig(
         approval_policy=resolved_approval,
         sandbox_policy=resolved_policy,
