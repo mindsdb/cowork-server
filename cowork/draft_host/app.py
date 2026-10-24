@@ -27,10 +27,9 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, Response
 from starlette.routing import Match, Route
 
-from cowork.api.v1.artifact_preview import HTML_SANDBOX_CSP, wants_comment_layer
+from cowork.api.v1.artifact_preview import wants_comment_layer
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.endpoints.artifact_workspace import (
-    _DRAFT_RESPONSE_HEADERS,
     _draft_file_parts,
     _draft_file_response,
     _draft_selectors,
@@ -43,6 +42,10 @@ from cowork.draft_host.token import DraftTokenError, verify_draft_token
 
 logger = logging.getLogger(__name__)
 
+# The preview iframe's sandbox, and never allow-same-origin: the draft host is
+# shared by every user, so a draft must not get its origin. Its own constant,
+# so a change to the iframe's sandbox cannot widen this one unnoticed.
+DRAFT_SANDBOX = "sandbox allow-scripts allow-popups allow-forms allow-modals"
 EXPIRED_MESSAGE = "This preview link has expired. Open the preview again."
 
 _EXPIRED_PAGE = (
@@ -68,22 +71,27 @@ _REMOVED_RESPONSE_HEADERS = (
 DRAFT_ROUTE = "/_t/{token}/{rel_path:path}"
 
 
-def draft_csp(web_origin: str) -> str:
+def draft_csp(frame_origin: str) -> str:
     """The draft host's one Content-Security-Policy.
 
-    The sandbox is the preview iframe's, without allow-same-origin: the host is
-    shared by every user, so a draft must not get its origin. The Cloudflare
-    worker in front of the host sets the same value at the edge.
+    ``frame_origin`` is the validated web origin (settings.draft_frame_origin);
+    without one no page may frame a draft. The Cloudflare worker in front of
+    the host sets the same value at the edge.
     """
-    ancestors = web_origin.rstrip("/") or "'none'"
-    return f"{HTML_SANDBOX_CSP}; connect-src 'self'; frame-ancestors {ancestors}"
+    ancestors = frame_origin or "'none'"
+    return f"{DRAFT_SANDBOX}; connect-src 'self'; frame-ancestors {ancestors}"
 
 
-def draft_response_headers(web_origin: str) -> dict[str, str]:
-    """Headers every draft-host response carries, whatever its status."""
+def draft_response_headers(frame_origin: str) -> dict[str, str]:
+    """Headers every draft-host response carries, whatever its status.
+
+    Spelled out here rather than shared with the API's draft route: the token
+    is the pass, so these must never become cacheable.
+    """
     return {
-        **_DRAFT_RESPONSE_HEADERS,
-        "Content-Security-Policy": draft_csp(web_origin),
+        "Content-Security-Policy": draft_csp(frame_origin),
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
         "Origin-Agent-Cluster": "?1",
         # The frame's origin is opaque (no allow-same-origin), so its own module
@@ -127,7 +135,7 @@ class _DraftHeadersMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        fixed = draft_response_headers(get_app_settings().web_origin)
+        fixed = draft_response_headers(get_app_settings().draft_frame_origin())
 
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
