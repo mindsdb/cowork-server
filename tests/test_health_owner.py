@@ -43,7 +43,7 @@ def test_health_reports_owner_from_app_settings():
     from cowork.api.v1.endpoints import health
 
     with (
-        patch.object(health, "get_app_settings", return_value=_app_settings(owner="install-token-abc", tenancy_mode="local")),
+        patch.object(health, "get_app_settings", return_value=_app_settings(owner="install-token-abc")),
         patch.object(health, "get_user_settings", return_value=_user_settings()),
     ):
         body = health.health()
@@ -57,7 +57,7 @@ def test_health_owner_empty_when_unset():
     from cowork.api.v1.endpoints import health
 
     with (
-        patch.object(health, "get_app_settings", return_value=_app_settings(owner="", tenancy_mode="local")),
+        patch.object(health, "get_app_settings", return_value=_app_settings()),
         patch.object(health, "get_user_settings", return_value=_user_settings()),
     ):
         body = health.health()
@@ -70,9 +70,7 @@ def _health_with(tenancy_mode: str) -> dict:
     from cowork.api.v1.endpoints import health
 
     with (
-        patch.object(
-            health, "get_app_settings", return_value=_app_settings(owner="", tenancy_mode=tenancy_mode)
-        ),
+        patch.object(health, "get_app_settings", return_value=_app_settings(tenancy_mode=tenancy_mode)),
         patch.object(health, "get_user_settings", return_value=_user_settings()),
     ):
         return health.health()
@@ -109,11 +107,7 @@ def test_health_reports_when_required_roles_need_the_runtime_minds_credential(
         resolved_coding_provider=coding,
     )
     with (
-        patch.object(
-            health,
-            "get_app_settings",
-            return_value=_app_settings(owner="", tenancy_mode="local"),
-        ),
+        patch.object(health, "get_app_settings", return_value=_app_settings()),
         patch.object(health, "get_user_settings", return_value=settings),
     ):
         body = health.health()
@@ -171,7 +165,7 @@ def test_health_serves_antons_install_id_on_desktop():
     from cowork.api.v1.endpoints import health
 
     with (
-        patch.object(health, "get_app_settings", return_value=_app_settings(owner="", tenancy_mode="local")),
+        patch.object(health, "get_app_settings", return_value=_app_settings()),
         patch.object(health, "get_user_settings", return_value=_user_settings()),
         patch.object(health, "_anton_install_id", return_value="a1b2c3d4e5f60718"),
     ):
@@ -191,7 +185,7 @@ def test_health_withholds_the_id_in_org_mode():
     from cowork.api.v1.endpoints import health
 
     with (
-        patch.object(health, "get_app_settings", return_value=_app_settings(owner="", tenancy_mode="org")),
+        patch.object(health, "get_app_settings", return_value=_app_settings(tenancy_mode="org")),
         patch.object(health, "get_user_settings", return_value=_user_settings()),
         patch.object(health, "_anton_install_id", return_value="a1b2c3d4e5f60718"),
     ):
@@ -216,7 +210,7 @@ def test_health_still_answers_when_the_id_cannot_be_resolved():
     import anton.analytics
 
     with (
-        patch.object(health, "get_app_settings", return_value=_app_settings(owner="", tenancy_mode="local")),
+        patch.object(health, "get_app_settings", return_value=_app_settings()),
         patch.object(health, "get_user_settings", return_value=_user_settings()),
         patch.object(
             anton.analytics, "get_installation_id", side_effect=RuntimeError("anton not importable")

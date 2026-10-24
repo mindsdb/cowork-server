@@ -5,6 +5,9 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+
+import pytest
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.draft_host.token import issue_draft_token
@@ -46,6 +49,22 @@ def configure_draft_env(monkeypatch) -> None:
     get_app_settings.cache_clear()
 
 
+@pytest.fixture
+def draft_env(monkeypatch):
+    configure_draft_env(monkeypatch)
+    yield
+    get_app_settings.cache_clear()
+
+
+def events(caplog, name: str) -> list[logging.LogRecord]:
+    """The captured records whose structured ``event`` is ``name``."""
+    return [record for record in caplog.records if getattr(record, "event", None) == name]
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
 def draft_token(**overrides) -> str:
     fields = dict(env="staging", sub=USER, org=ORG, proj=PROJECT, art=ARTIFACT, keys=KEYS, kid="k1")
     fields.update(overrides)
@@ -59,12 +78,9 @@ def sign_claims(claims: dict, secret: str = "draft-secret") -> str:
     through the keyring passes ``KEYS["k1"]``.
     """
 
-    def b64(raw: bytes) -> str:
-        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-    payload = b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    payload = b64url(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signing_input = f"v1.{payload}"
-    sig = b64(hmac.new(secret.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest())
+    sig = b64url(hmac.new(secret.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest())
     return f"{signing_input}.{sig}"
 
 

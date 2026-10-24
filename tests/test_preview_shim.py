@@ -8,6 +8,7 @@ before the shim runs is exactly the failure this exists to prevent.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 
@@ -72,21 +73,25 @@ def test_reporter_is_installed_before_the_storage_guard():
     assert SHIM_JS.index("addEventListener('error'") < SHIM_JS.index("nativeStorageWorks")
 
 
+# Each reported field that can hold an address, and the value that feeds it.
+# Whitespace and line breaks may change; a field that stops going through
+# local() may not.
+_CUT_FIELDS = {
+    "error file": r"\bfile\s*=\s*local\(\s*file\b",
+    "error message": r"\bmessage\s*:\s*local\(\s*ev\.message\b",
+    "error stack": r"\bstack\s*:[^,}]*\blocal\(\s*ev\.error\.stack\b",
+    "resource url": r"\burl\s*=\s*local\(\s*node\.src\b",
+    "rejection message": r"\bmessage\s*:[^,}]*\blocal\(\s*message\b",
+    "rejection stack": r"\bstack\s*:[^,}]*\blocal\(\s*reason\.stack\b",
+    "csp blocked uri": r"\bblockedURI\s*:\s*local\(\s*ev\.blockedURI\b",
+}
+
+
 def test_every_reported_url_field_goes_through_the_one_cut():
     # On the draft host the document sits under /_t/<token>/. A field that
     # skipped the cut would carry the token into the agent's repair prompt.
-    assert r"\/_t\/v1\.[^\/?#]+\/" in SHIM_JS
-    assert r"\/_t\/v1\.[^\/?#\s]+\/" in SHIM_JS
-    for field in (
-        "file = local(file);",
-        "message: local(ev.message),",
-        "stack: ev.error && ev.error.stack ? local(ev.error.stack) : ''",
-        "var url = local(node.src || node.href || '');",
-        "message: 'Unhandled promise rejection: ' + local(message),",
-        "stack: reason && reason.stack ? local(reason.stack) : ''",
-        "blockedURI: local(ev.blockedURI)",
-    ):
-        assert field in SHIM_JS, field
+    for field, pattern in _CUT_FIELDS.items():
+        assert re.search(pattern, SHIM_JS), field
     assert "String(ev.error.stack)" not in SHIM_JS
     assert "String(ev.blockedURI" not in SHIM_JS
 

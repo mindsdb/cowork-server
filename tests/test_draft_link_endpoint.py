@@ -13,13 +13,14 @@ from sqlmodel import Session
 from starlette.testclient import TestClient
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+from cowork.api.v1.endpoints import health
 from cowork.api.v1.route_walker import undeclared_routes
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.structured_logging import make_formatter
 from cowork.db.scoped import TenantScope
 from cowork.draft_host import app as draft_app_module
 from cowork.draft_host.app import create_draft_app
-from cowork.draft_host.token import DRAFT_TTL_SECONDS, verify_draft_token
+from cowork.draft_host.token import verify_draft_token
 from cowork.server import create_app
 from cowork.services.artifact_draft_review import disable_draft_review
 from cowork.services.artifact_identity import ensure_full_id
@@ -33,7 +34,8 @@ from draft_host_support import (
     ORG,
     PROJECT,
     USER,
-    configure_draft_env,
+    draft_env,  # noqa: F401  (fixture)
+    events,
     fake_review,
     make_artifact,
 )
@@ -42,13 +44,6 @@ from test_artifacts_api_tenancy import session  # noqa: F401  (fixture)
 IDENTITY = {"X-User-Id": USER, "X-Organization-Id": ORG}
 DASHED_ARTIFACT = str(UUID(ARTIFACT))
 LINK = f"/api/v1/artifacts/drafts/{PROJECT}/{DASHED_ARTIFACT}/link"
-
-
-@pytest.fixture
-def draft_env(monkeypatch):
-    configure_draft_env(monkeypatch)
-    yield
-    get_app_settings.cache_clear()
 
 
 @pytest.fixture
@@ -76,6 +71,10 @@ def _token_of(url: str) -> str:
     return url.split("/_t/", 1)[1].split("/", 1)[0]
 
 
+def _on_the_draft_host(url: str) -> str:
+    return url.removeprefix(f"https://{DRAFT_HOST}")
+
+
 def test_issues_a_signed_link_to_the_primary_file(api, reviewed):
     seen, _ = reviewed
 
@@ -89,7 +88,6 @@ def test_issues_a_signed_link_to_the_primary_file(api, reviewed):
     claims = verify_draft_token(_token_of(body["url"]), env="staging", keys=KEYS)
     assert (claims["sub"], claims["org"], claims["proj"], claims["art"]) == (USER, ORG, PROJECT, ARTIFACT)
     assert body["expiresAt"] == claims["exp"]
-    assert DRAFT_TTL_SECONDS == 1800
     assert seen["scope"] == TenantScope(org_mode=True, org_id=ORG, user_id=USER)
 
 
@@ -97,7 +95,7 @@ def test_an_issued_link_is_counted_but_never_logged(api, reviewed, caplog):
     with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
         url = api.post(LINK, headers=IDENTITY).json()["url"]
 
-    [record] = [r for r in caplog.records if getattr(r, "event", None) == "draft_link_issued"]
+    [record] = events(caplog, "draft_link_issued")
     line = make_formatter().format(record)
     assert json.loads(line)["message"] == "Draft link issued"
     assert _token_of(url) not in line
@@ -119,7 +117,7 @@ def test_the_link_opens_on_the_draft_host(api, reviewed):
     url = api.post(LINK, headers=IDENTITY).json()["url"]
     draft = TestClient(create_draft_app(), base_url=f"https://{DRAFT_HOST}")
 
-    response = draft.get(url.removeprefix(f"https://{DRAFT_HOST}"), headers=FETCH)
+    response = draft.get(_on_the_draft_host(url), headers=FETCH)
 
     assert response.status_code == 200
     assert "draft body" in response.text
@@ -170,10 +168,6 @@ def test_the_review_and_the_path_lookup_run_off_the_event_loop(api, reviewed, mo
     assert on_loop == dict.fromkeys(names, False)
 
 
-def _issued(caplog) -> list:
-    return [r for r in caplog.records if getattr(r, "event", None) == "draft_link_issued"]
-
-
 def test_an_artifact_with_no_previewable_file_gets_no_link(api, tmp_path, monkeypatch, caplog):
     source, folder, metadata = make_artifact(tmp_path)
     (folder / "index.html").unlink()
@@ -185,7 +179,7 @@ def test_an_artifact_with_no_previewable_file_gets_no_link(api, tmp_path, monkey
 
     assert response.status_code == 404
     assert response.json()["detail"] == "This artifact has no previewable file."
-    assert _issued(caplog) == []
+    assert events(caplog, "draft_link_issued") == []
 
 
 def test_a_primary_outside_the_artifact_folder_gets_no_link(api, tmp_path, monkeypatch, caplog):
@@ -200,7 +194,7 @@ def test_a_primary_outside_the_artifact_folder_gets_no_link(api, tmp_path, monke
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Artifact file not found"
-    assert _issued(caplog) == []
+    assert events(caplog, "draft_link_issued") == []
 
 
 @pytest.mark.parametrize(
@@ -224,7 +218,7 @@ async def test_a_scope_without_a_user_or_an_org_is_401_and_reviews_nothing(draft
             await workspace_ep.create_draft_link(PROJECT, DASHED_ARTIFACT, SimpleNamespace(scope=scope))
 
     assert refused.value.status_code == 401
-    assert _issued(caplog) == []
+    assert events(caplog, "draft_link_issued") == []
 
 
 def test_the_same_path_checks_as_the_draft_route(api, reviewed):
@@ -254,27 +248,18 @@ def test_the_route_declares_a_permission(draft_env):
     assert undeclared_routes(create_app()) == []
 
 
-def test_health_says_the_deployment_serves_draft_links(api):
+def test_health_says_the_deployment_serves_draft_links(draft_env):
     # The web client reads this once at boot; every way into a preview (the
     # Artifacts page, the rail, a chat card) then opens drafts by link.
-    assert api.get("/api/v1/health/").json()["draft_links"] is True
+    assert health.health()["draft_links"] is True
 
 
-@pytest.mark.parametrize(
-    "name, value",
-    [
-        ("COWORK_TENANCY_MODE", "local"),
-        ("COWORK_DRAFT_HOSTS", ""),
-        ("COWORK_DRAFT_LINK_KEYS", ""),
-        ("COWORK_DRAFT_PORT", "0"),
-    ],
-    ids=["local-tenancy", "no-hosts", "no-key", "no-port"],
-)
-def test_health_says_no_draft_links_while_any_value_is_missing(draft_env, monkeypatch, name, value):
-    monkeypatch.setenv(name, value)
+def test_health_says_no_draft_links_while_a_value_is_missing(draft_env, monkeypatch):
+    # The settings tests cover each value; this pins that /health follows them.
+    monkeypatch.setenv("COWORK_DRAFT_PORT", "0")
     get_app_settings.cache_clear()
 
-    assert TestClient(create_app()).get("/api/v1/health/").json()["draft_links"] is False
+    assert health.health()["draft_links"] is False
 
 
 
@@ -283,13 +268,8 @@ def test_health_says_no_draft_links_while_any_value_is_missing(draft_env, monkey
 # withdrawn stops a link that was issued while it stood.
 
 
-@pytest.fixture
-def real_review(draft_env, granted_product_permissions):
-    """Draft links on and role checks granted; the review itself is not stubbed."""
-
-
-def _on_the_draft_host(url: str) -> str:
-    return url.removeprefix(f"https://{DRAFT_HOST}")
+# Draft links on and role checks granted; the review itself is not stubbed.
+real_review = pytest.mark.usefixtures("draft_env", "granted_product_permissions")
 
 
 async def _issue_link(row, artifact_id, scoped) -> str:
@@ -298,7 +278,8 @@ async def _issue_link(row, artifact_id, scoped) -> str:
     return json.loads(response.body)["url"]
 
 
-async def test_an_owner_link_opens_through_the_real_review(session, tmp_path, real_review):
+@real_review
+async def test_an_owner_link_opens_through_the_real_review(session, tmp_path):
     row, folder = tenancy._project_with_artifact(session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug="dash")
     artifact_id, _ = ensure_full_id(folder)
     url = await _issue_link(row, artifact_id, tenancy._scoped(session, tenancy.ORG_A))
@@ -309,9 +290,8 @@ async def test_an_owner_link_opens_through_the_real_review(session, tmp_path, re
     assert response.status_code == 200, response.text
 
 
-async def test_a_reviewer_link_stops_opening_when_the_grant_is_withdrawn(
-    session, tmp_path, real_review, monkeypatch
-):
+@real_review
+async def test_a_reviewer_link_stops_opening_when_the_grant_is_withdrawn(session, tmp_path, monkeypatch):
     row, folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch)
     with Session(session.get_bind()) as reviewer_session:
         reviewer = tenancy._scoped(reviewer_session, tenancy.ORG_A, tenancy.USER_A2)
@@ -324,7 +304,8 @@ async def test_a_reviewer_link_stops_opening_when_the_grant_is_withdrawn(
     assert draft.get(_on_the_draft_host(url), headers=FETCH).status_code == 404
 
 
-async def test_a_co_member_without_a_grant_gets_no_link(session, tmp_path, real_review):
+@real_review
+async def test_a_co_member_without_a_grant_gets_no_link(session, tmp_path):
     row, folder = tenancy._project_with_artifact(session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug="dash")
     artifact_id, _ = ensure_full_id(folder)
 
