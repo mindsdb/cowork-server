@@ -462,6 +462,41 @@ def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
     return parts
 
 
+def _draft_file_response(
+    source,
+    folder: Path,
+    parts: tuple[str, ...],
+    *,
+    comments: bool,
+    download: bool = False,
+):
+    """Open the draft file at ``parts`` and answer with it.
+
+    Shared by the authenticated ``/drafts`` route and the draft host. HTML goes
+    out as the preview document unless ``download`` asks for the bytes; every
+    other file, and HTML that is not UTF-8, streams from the pinned descriptor.
+    Blocking, so callers run it in a worker thread.
+    """
+    media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
+    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
+    try:
+        if not download and media_type == "text/html":
+            response = _preview_html_from_fd(fd, comments=comments)
+            if response is not None:
+                resources.close()
+                return response
+        extra = (
+            {"Content-Disposition": _attachment_disposition(parts[-1])}
+            if download else None
+        )
+        return _draft_stream(
+            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+        )
+    except BaseException:
+        resources.close()
+        raise
+
+
 def _artifact_id_from_path(artifact_id: UUID) -> str:
     """The identity gate for every route in this file.
 
@@ -1269,10 +1304,16 @@ def _draft_link_file_parts(
     Blocking (database, artifact-root discovery, path resolution), so the
     endpoint runs it in a worker thread, as the draft host does.
     """
+    from cowork.services.artifacts import _pick_primary
+
     _source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_selector, artifact_selector
     )
-    primary = _artifact_primary(folder, metadata)
+    hint = metadata.get("primary")
+    # A recorded primary that resolves needs no walk of the artifact tree.
+    primary = _pick_primary(folder, [], primary_hint=hint) if hint else None
+    if primary is None:
+        primary = _artifact_primary(folder, metadata)
     return _draft_file_parts(_primary_rel_path(folder, primary), metadata)
 
 
@@ -1363,26 +1404,11 @@ async def serve_private_draft(
     )
     parts = _draft_file_parts(rel_path, metadata)
 
-    download = download or wants_download(request)
-    media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
-    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
-    try:
-        if not download and media_type == "text/html":
-            resp = await run_in_threadpool(
-                _preview_html_from_fd,
-                fd,
-                comments=wants_comment_layer(request),
-            )
-            if resp is not None:
-                resources.close()
-                return resp
-        extra = (
-            {"Content-Disposition": _attachment_disposition(parts[-1])}
-            if download else None
-        )
-        return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
-        )
-    except BaseException:
-        resources.close()
-        raise
+    return await run_in_threadpool(
+        _draft_file_response,
+        source,
+        folder,
+        parts,
+        comments=wants_comment_layer(request),
+        download=download or wants_download(request),
+    )

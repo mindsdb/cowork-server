@@ -14,9 +14,8 @@ tests/test_draft_host_app.py pins its surface instead.
 from __future__ import annotations
 
 import logging
-import mimetypes
-import os
 from dataclasses import dataclass
+from http import HTTPStatus
 from uuid import UUID
 
 from starlette.applications import Starlette
@@ -28,26 +27,22 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, Response
 from starlette.routing import Match, Route
 
-from cowork.api.v1.artifact_preview import wants_comment_layer
+from cowork.api.v1.artifact_preview import HTML_SANDBOX_CSP, wants_comment_layer
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.endpoints.artifact_workspace import (
+    _DRAFT_RESPONSE_HEADERS,
     _draft_file_parts,
-    _draft_stream,
-    _open_pinned_draft_file,
-    _preview_html_from_fd,
+    _draft_file_response,
+    _draft_selectors,
 )
 from cowork.common.request_logging import RequestLoggingMiddleware
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import ScopedSession, scope_for_identity
 from cowork.db.session import get_open_session
 from cowork.draft_host.token import DraftTokenError, verify_draft_token
-from cowork.principal import Principal
 
 logger = logging.getLogger(__name__)
 
-# The same set the cowork preview iframe carries. No allow-same-origin: the
-# draft host is shared by every user, so a draft must not get its origin.
-DRAFT_SANDBOX = "allow-scripts allow-popups allow-forms allow-modals"
 EXPIRED_MESSAGE = "This preview link has expired. Open the preview again."
 
 _EXPIRED_PAGE = (
@@ -58,7 +53,6 @@ _EXPIRED_PAGE = (
     '<body style="font-family: system-ui, sans-serif; margin: 2rem; color: #333;">'
     f"<p>{EXPIRED_MESSAGE}</p></body></html>\n"
 )
-_STATUS_TEXT = {400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 409: "Conflict"}
 # Replaced or dropped on every response: nothing on this host sets a cookie,
 # and the one CSP is ours alone.
 _REMOVED_RESPONSE_HEADERS = (
@@ -77,24 +71,25 @@ DRAFT_ROUTE = "/_t/{token}/{rel_path:path}"
 def draft_csp(web_origin: str) -> str:
     """The draft host's one Content-Security-Policy.
 
-    The Cloudflare worker in front of the host sets the same value at the edge.
+    The sandbox is the preview iframe's, without allow-same-origin: the host is
+    shared by every user, so a draft must not get its origin. The Cloudflare
+    worker in front of the host sets the same value at the edge.
     """
     ancestors = web_origin.rstrip("/") or "'none'"
-    return f"sandbox {DRAFT_SANDBOX}; connect-src 'self'; frame-ancestors {ancestors}"
+    return f"{HTML_SANDBOX_CSP}; connect-src 'self'; frame-ancestors {ancestors}"
 
 
 def draft_response_headers(web_origin: str) -> dict[str, str]:
     """Headers every draft-host response carries, whatever its status."""
     return {
+        **_DRAFT_RESPONSE_HEADERS,
         "Content-Security-Policy": draft_csp(web_origin),
         "Referrer-Policy": "no-referrer",
-        "X-Content-Type-Options": "nosniff",
         "Origin-Agent-Cluster": "?1",
         # The frame's origin is opaque (no allow-same-origin), so its own module
         # scripts and fonts are cross-origin reads. No credentials: the token in
         # the path is the only pass, and whoever holds it may read the files.
         "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "private, no-store",
     }
 
 
@@ -202,33 +197,24 @@ def _unauthorized(request: Request) -> Response:
 
 def _draft_response(request: Request, grant: _DraftGrant) -> Response:
     """Resolve and open the file as the token's user. Runs in a worker thread."""
-    principal = Principal(user_id=grant.user_id, org_id=grant.org_id)
-    # Shared code reads the caller from request.state (get_principal). On this
-    # host it can only be the token's identity, whatever headers came along.
-    request.state.principal = principal
-    scope = scope_for_identity(org_id=principal.org_id, user_id=principal.user_id)
+    scope = scope_for_identity(org_id=grant.org_id, user_id=grant.user_id)
+    project_selector, artifact_selector = _draft_selectors(grant.project_ref, grant.artifact_id)
     raw_session = get_open_session()
     try:
         source, folder, metadata, _is_own = review_artifact_for_request(
-            ScopedSession(raw_session, scope),
-            os.path.basename(grant.project_ref),
-            os.path.basename(grant.artifact_id),
+            ScopedSession(raw_session, scope), project_selector, artifact_selector
         )
     finally:
         raw_session.close()
     parts = _draft_file_parts(request.path_params["rel_path"], metadata)
-    media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
-    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
+    return _draft_file_response(source, folder, parts, comments=wants_comment_layer(request))
+
+
+def _status_phrase(status_code: int) -> str:
     try:
-        if media_type == "text/html":
-            response = _preview_html_from_fd(fd, comments=wants_comment_layer(request))
-            if response is not None:
-                resources.close()
-                return response
-        return _draft_stream(resources, fd, file_stat.st_size, media_type)
-    except BaseException:
-        resources.close()
-        raise
+        return HTTPStatus(status_code).phrase
+    except ValueError:
+        return "Error"
 
 
 async def _serve_draft(request: Request) -> Response:
@@ -250,9 +236,7 @@ async def _serve_draft(request: Request) -> Response:
     try:
         return await run_in_threadpool(_draft_response, request, grant)
     except HTTPException as exc:
-        return PlainTextResponse(
-            _STATUS_TEXT.get(exc.status_code, "Error"), status_code=exc.status_code
-        )
+        return PlainTextResponse(_status_phrase(exc.status_code), status_code=exc.status_code)
     except Exception:
         logger.exception("Draft file failed", extra={"event": "draft_host_failed"})
         return PlainTextResponse("Internal Server Error", status_code=500)

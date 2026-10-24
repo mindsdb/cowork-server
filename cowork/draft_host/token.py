@@ -65,7 +65,7 @@ def issue_draft_token(
     now: int | None = None,
 ) -> str:
     """Sign a token for one user's view of one draft, valid for 30 minutes."""
-    secret = keys.get(kid) if kid else None
+    secret = keys.get(kid)
     if not secret:
         raise DraftTokenError("kid")
     issued_at = int(time.time()) if now is None else int(now)
