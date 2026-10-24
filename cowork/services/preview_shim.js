@@ -35,7 +35,7 @@
      desktop draft's loopback path), and a /_t/ folder inside an artifact is
      just a folder. about:srcdoc has no folder, and nothing is cut there. */
   var HREF = String(window.location.href);
-  var ON_DRAFT_HOST = /^[a-z][a-z0-9+.-]*:\/\/[^\/?#]+\/_t\/v1\.[^\/?#]+\//i.test(HREF);
+  var ON_DRAFT_HOST = /^[a-z][a-z0-9+.-]*:\/\/[^\/?#]+\/_t\/v1\.[^\/?#]+\//.test(HREF);
   /* The folder comes from the path alone: a query or hash such as
      ?next=/a or #/route would otherwise move it. */
   var PATH_ONLY = HREF.split(/[?#]/)[0];
