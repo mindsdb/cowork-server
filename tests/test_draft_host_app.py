@@ -109,7 +109,7 @@ def test_head_answers_with_the_same_headers(client, seen):
     _assert_draft_headers(response)
 
 
-def test_the_principal_comes_from_the_token_and_forged_headers_are_ignored(client, seen, monkeypatch):
+def test_the_identity_comes_from_the_token_and_forged_headers_are_ignored(client, seen, monkeypatch):
     principals = []
     real_flag = draft_app_module.wants_comment_layer
 
@@ -133,7 +133,9 @@ def test_the_principal_comes_from_the_token_and_forged_headers_are_ignored(clien
     assert seen["scope"] == TenantScope(org_mode=True, org_id=ORG, user_id=USER)
     assert seen["project_ref"] == PROJECT
     assert seen["artifact_id"] == ARTIFACT
-    assert [(p.user_id, p.org_id) for p in principals] == [(USER, ORG)]
+    # Nothing on this host sets a request principal, so shared code that asked
+    # for one would find none rather than whatever the headers claimed.
+    assert principals == [None]
 
 
 def test_a_token_without_fetch_metadata_is_refused(client, seen):

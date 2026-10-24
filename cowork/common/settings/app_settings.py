@@ -219,6 +219,12 @@ def default_minds_url() -> str:
     return f"{default_minds_api_host()}/v1"
 
 
+def _pr_namespace() -> str:
+    """This pod's per-PR namespace (``pr-...``) from the downward API, else ''."""
+    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
+    return ns if ns.startswith("pr-") else ""
+
+
 def default_turn_minds_api_host() -> str:
     """MindsHub API host for the POD's turn — this deployment's OWN inference.
 
@@ -232,8 +238,8 @@ def default_turn_minds_api_host() -> str:
     Everything else — dev, staging, prod, desktop — keeps the ENV-slug host,
     which is already correct (notably prod, which has no slug at all).
     """
-    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
-    if ns.startswith("pr-"):
+    ns = _pr_namespace()
+    if ns:
         return f"https://api-{ns}.dev.mindshub.ai"
     return default_minds_api_host()
 
@@ -247,10 +253,7 @@ def default_draft_env_label() -> str:
     and ``prod`` for everything else. Read from the downward API, never from a
     request.
     """
-    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
-    if ns.startswith("pr-"):
-        return ns
-    return _env_slug() or "prod"
+    return _pr_namespace() or _env_slug() or "prod"
 
 
 def default_minds_auth_host() -> str:
@@ -1106,11 +1109,8 @@ class AppSettings(Settings):
 
         A secret shorter than 32 characters is dropped like a non-string one.
         """
-        raw = self.draft_link_keys.strip()
-        if not raw:
-            return {}
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(self.draft_link_keys)
         except ValueError:
             return {}
         if not isinstance(parsed, dict):
@@ -1118,10 +1118,7 @@ class AppSettings(Settings):
         return {
             kid: secret
             for kid, secret in parsed.items()
-            if isinstance(kid, str)
-            and kid
-            and isinstance(secret, str)
-            and len(secret) >= _DRAFT_KEY_MIN_CHARS
+            if kid and isinstance(secret, str) and len(secret) >= _DRAFT_KEY_MIN_CHARS
         }
 
     def draft_links_enabled(self) -> bool:

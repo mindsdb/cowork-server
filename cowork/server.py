@@ -292,17 +292,14 @@ async def lifespan(app: FastAPI):
         # Bootstrap and credential clearing finish first; provider checks must
         # not delay readiness while the configured endpoint is unavailable.
         app.state.router_startup_probe = asyncio.create_task(run_router_startup_probe())
-    app.state.draft_listener = None
+    draft_listener = None
     try:
-        # The draft-preview host's own port (COWORK_DRAFT_PORT); None when unset.
-        # Inside the try so a listener that fails to start still runs the
-        # teardown below for everything started above.
-        app.state.draft_listener = await start_draft_listener()
+        draft_listener = await start_draft_listener()
         yield
     finally:
         # First, so no draft request is still reading files or the database
         # while the steps below close them.
-        await stop_draft_listener(getattr(app.state, "draft_listener", None))
+        await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
