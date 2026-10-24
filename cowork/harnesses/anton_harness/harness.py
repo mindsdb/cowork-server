@@ -670,7 +670,7 @@ _LIVE_APPS_RULE = (
     "add it or rename theirs to match, or their operator to approve it. When a launch is refused "
     "because every app slot is taken, tell the person who holds each slot and since when, and that "
     "they can wait or ask their operator for more slots. Before the first launch of an app someone "
-    "shared with the person, read its `backend.py` and tell the person what it reads and what it "
+    "let the person duplicate, read its `backend.py` and tell the person what it reads and what it "
     "writes. When the relay refuses a call that writes, say the connection is approved for reads "
     "only, and that the operator can approve it for writes. "
 )
@@ -684,7 +684,7 @@ def _live_apps_rule(apps: TurnLiveApps | None) -> str:
         return rule
     if apps.received:
         copies = "; ".join(f"`{app.slug}`, from {prompt_email(app.owner_email)}" for app in apps.received)
-        rule += f"Apps someone shared with the person, copied into this project and not launched yet: {copies}. "
+        rule += f"Apps someone let the person duplicate, copied into this project and not launched yet: {copies}. "
     for app in apps.running:
         rule += f"The person's live app `{app.slug}` is running at `{app.address}`. "
     for app in apps.stopped:

@@ -33,8 +33,15 @@ class LiveAppShareResponse(CamelResponse):
     shared_at: datetime
 
 
+class LiveAppCopyRef(CamelResponse):
+    """Where the caller's copy of a shared app lives."""
+
+    project_id: UUID
+    slug: str
+
+
 class SharedLiveAppResponse(CamelResponse):
-    """One app someone shared with the caller, as "Shared with you" lists it."""
+    """One app someone let the caller duplicate, as Cowork lists it."""
 
     share_id: UUID
     slug: str
@@ -43,6 +50,9 @@ class SharedLiveAppResponse(CamelResponse):
     owner_email: str
     everyone: bool
     shared_at: datetime
+    # The caller's copy from this share while its folder is there: one copy
+    # per person per share, so the list offers it instead of Duplicate.
+    your_copy: LiveAppCopyRef | None = None
 
 
 class LiveAppDuplicateRequest(CamelRequest):

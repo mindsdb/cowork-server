@@ -16,7 +16,7 @@ import subprocess
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -50,6 +50,7 @@ from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
 from cowork.schemas.live_apps import (
+    LiveAppCopyRef,
     LiveAppDuplicateRequest,
     LiveAppShareRequest,
     LiveAppShareResponse,
@@ -75,6 +76,9 @@ from cowork.services.artifacts import (
     reveal_in_file_manager,
 )
 from cowork.services.projects import ProjectService
+
+if TYPE_CHECKING:
+    from cowork.services.live_apps import CopyOfShare
 
 logger = logging.getLogger(__name__)
 
@@ -1215,12 +1219,13 @@ live_app_router = APIRouter(route_class=LiveAppRoute)
 _SHARE_ONE_WAY = "Choose one address, or everyone on this stack."
 _NOT_AN_EMAIL = "Enter a valid email address."
 _OWN_ADDRESS = "That's your own address."
-_NOT_A_LIVE_APP = "Only full-stack apps can be shared this way."
+_NOT_A_LIVE_APP = "Only full-stack apps can be duplicated this way."
 _NO_SUCH_ARTIFACT = "No artifact by that name in this project."
 _NOT_CONFIRMED = "Confirm the disclaimer first."
-_NO_LONGER_SHARED = "This app is no longer shared with you."
+_NO_LONGER_SHARED = "You can no longer duplicate this app."
 _NO_SUCH_PROJECT = "No project by that id."
-_SHARE_GONE = "This share no longer exists."
+_SHARE_GONE = "That permission no longer exists."
+_ALREADY_COPIED = "You already have a copy of this app. Open it, or delete it to duplicate the app again."
 _NO_EMAIL = "Live apps need an email address on your account. Ask the operator to add one."
 
 _LIVE_APP_ROUTE = [Depends(require(AuthenticatedInOrgMode))]
@@ -1348,15 +1353,20 @@ async def withdraw_live_app_share(share_id: UUID, principal: Principal | None = 
 
 
 @live_app_router.get("/shared-live-apps", dependencies=_LIVE_APP_ROUTE)
-async def shared_live_apps(principal: Principal | None = Depends(get_principal)) -> list[SharedLiveAppResponse]:
-    """The apps other people shared with the caller's address or with
-    everyone, newest first, each once. An app whose owner deleted it, or whose
-    folder no longer holds a full-stack app the server can read, drops out."""
+async def shared_live_apps(
+    session: ScopedSession = Depends(get_scoped_session),
+    principal: Principal | None = Depends(get_principal),
+) -> list[SharedLiveAppResponse]:
+    """The apps other people let the caller duplicate, by address or for
+    everyone, newest first, each once, with the caller's copy from each while
+    its folder is there. An app whose owner deleted it, or whose folder no
+    longer holds a full-stack app the server can read, drops out."""
     from cowork.db.scoped import SYSTEM_SCOPE, scope_for_identity
     from cowork.db.units import run_db
     from cowork.services.live_apps import (
         LiveAppCopyRefused,
         LiveAppGone,
+        copies_of_shares,
         live_app_person,
         read_app_metadata,
         shared_text,
@@ -1367,6 +1377,7 @@ async def shared_live_apps(principal: Principal | None = Depends(get_principal))
     if recipient is None:
         return []
     shares = await run_db(partial(shares_with, recipient=recipient), scope=SYSTEM_SCOPE)
+    copies = await run_db(partial(copies_of_shares, recipient=recipient), scope=SYSTEM_SCOPE)
     listed = []
     for share in shares:
         owner_scope = scope_for_identity(org_id=share.owner_partition_id, user_id=share.owner_user_id)
@@ -1377,6 +1388,7 @@ async def shared_live_apps(principal: Principal | None = Depends(get_principal))
             metadata = await run_in_threadpool(read_app_metadata, project_dir, share.slug)
         except (LiveAppGone, LiveAppCopyRefused):
             continue
+        kept = await _kept_copy_of(session, copies.get(share.share_id, []))
         listed.append(
             SharedLiveAppResponse(
                 share_id=share.share_id,
@@ -1386,9 +1398,21 @@ async def shared_live_apps(principal: Principal | None = Depends(get_principal))
                 owner_email=share.owner_email,
                 everyone=share.everyone,
                 shared_at=share.shared_at,
+                your_copy=None if kept is None else LiveAppCopyRef(project_id=kept.project_id, slug=kept.slug),
             )
         )
     return listed
+
+
+async def _kept_copy_of(session: ScopedSession, copies: list[CopyOfShare]) -> CopyOfShare | None:
+    """The caller's copy among ``copies`` whose folder is still there, in a
+    project of theirs (``session``'s scope)."""
+    from cowork.services.live_apps import kept_copy
+
+    project_dirs = {}
+    for copy in copies:
+        project_dirs[copy.project_id] = await run_in_threadpool(_project_dir, session, project_id=copy.project_id)
+    return await run_in_threadpool(kept_copy, project_dirs, copies)
 
 
 @live_app_router.post("/live-app-duplicate", dependencies=_LIVE_APP_ROUTE)
@@ -1397,15 +1421,17 @@ async def duplicate_live_app(
     session: ScopedSession = Depends(get_scoped_session),
     principal: Principal | None = Depends(get_principal),
 ) -> dict:
-    """Copy an app someone shared with the caller into a project of the
+    """Copy an app someone let the caller duplicate into a project of the
     caller's own, after the caller confirmed the disclaimer, and answer the
-    copy's card. Each call makes a new copy."""
+    copy's card. One copy per person per share: while the caller's copy from
+    this share still has its folder, another call answers 409."""
     from cowork.db.scoped import SYSTEM_SCOPE, scope_for_identity
     from cowork.db.units import run_db
     from cowork.services.artifact_ownership import record_artifact_owner
     from cowork.services.live_apps import (
         LiveAppCopyRefused,
         LiveAppGone,
+        copies_of_shares,
         forget_copy,
         read_shared_app,
         record_copy,
@@ -1422,6 +1448,9 @@ async def duplicate_live_app(
     )
     if share is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED)
+    copies = await run_db(partial(copies_of_shares, recipient=recipient), scope=SYSTEM_SCOPE)
+    if await _kept_copy_of(session, copies.get(share.share_id, [])) is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ALREADY_COPIED)
     owner_scope = scope_for_identity(org_id=share.owner_partition_id, user_id=share.owner_user_id)
     owner_dir = await run_db(partial(_project_dir, project_id=share.project_id), scope=owner_scope)
     if owner_dir is None:

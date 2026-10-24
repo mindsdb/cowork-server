@@ -33,7 +33,7 @@ import os
 import re
 import ssl
 import stat
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -1550,6 +1550,34 @@ def received_from(session: ScopedSession, *, partition_id: str) -> dict[tuple[UU
         session.select(LiveAppCopy).where(LiveAppCopy.partition_id == partition_id)
     ).all()
     return {(row.project_id, row.slug): row.owner_email for row in rows}
+
+
+class CopyOfShare(NamedTuple):
+    project_id: UUID
+    slug: str
+
+
+def copies_of_shares(session: ScopedSession, *, recipient: LiveAppPerson) -> dict[UUID, list[CopyOfShare]]:
+    """``recipient``'s copies by the share each came from. A copy whose folder
+    is gone keeps its row, so the caller checks the folder (kept_copy)."""
+    rows = session.exec(
+        session.select(LiveAppCopy).where(LiveAppCopy.partition_id == recipient.partition_id)
+    ).all()
+    by_share: dict[UUID, list[CopyOfShare]] = {}
+    for row in rows:
+        by_share.setdefault(row.share_id, []).append(CopyOfShare(row.project_id, row.slug))
+    return by_share
+
+
+def kept_copy(project_dirs: Mapping[UUID, Path | None], copies: Iterable[CopyOfShare]) -> CopyOfShare | None:
+    """The first of ``copies`` whose folder is still there, in a project the
+    person still has (``project_dirs``, by project id): one copy per person
+    per share, until they delete it."""
+    for copy in copies:
+        project_dir = project_dirs.get(copy.project_id)
+        if project_dir is not None and _still_there(Path(project_artifacts_base(str(project_dir))), copy.slug):
+            return copy
+    return None
 
 
 class ReceivedApp(NamedTuple):

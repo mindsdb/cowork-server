@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -202,7 +203,7 @@ def test_only_a_full_stack_app_is_shared(people):
     response = _share(_client(), people["a_project"], slug="page-9z8y7x6w", everyone=True)
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "Only full-stack apps can be shared this way."
+    assert response.json()["detail"] == "Only full-stack apps can be duplicated this way."
 
 
 def test_a_share_of_a_missing_app_or_someone_elses_project_is_404(people):
@@ -338,14 +339,28 @@ def test_cards_carry_no_mark_with_live_apps_off(people, monkeypatch):
     assert cards and all("receivedFrom" not in card for card in cards)
 
 
-def test_a_later_duplicate_makes_a_new_copy(people):
+def test_one_copy_per_person_per_share_until_they_delete_it(people):
+    """A second Duplicate of one share answers 409 while the first copy's
+    folder is there, and the list names that copy; once the person deletes
+    it, they duplicate the app again."""
     client = _client()
     share = _share(client, people["a_project"], everyone=True).json()
 
     first = _duplicate(client, share["shareId"], people["b_project"]).json()
-    second = _duplicate(client, share["shareId"], people["b_project"]).json()
+    again = _duplicate(client, share["shareId"], people["b_project"])
+    (listed,) = _shared_with(client, B).json()
 
-    assert first["folder"] != second["folder"]
+    assert (again.status_code, again.json()["detail"]) == (
+        409, "You already have a copy of this app. Open it, or delete it to duplicate the app again."
+    )
+    assert listed["yourCopy"] == {"projectId": str(people["b_project"]), "slug": Path(first["folder"]).name}
+
+    shutil.rmtree(first["folder"])
+    second = _duplicate(client, share["shareId"], people["b_project"])
+    (relisted,) = _shared_with(client, B).json()
+
+    assert second.status_code == 200 and second.json()["folder"] != first["folder"]
+    assert relisted["yourCopy"]["slug"] == Path(second.json()["folder"]).name
 
 
 def test_anyone_on_the_stack_duplicates_an_app_shared_with_everyone(people):
@@ -377,7 +392,7 @@ def test_the_owner_never_lists_or_copies_their_own_share(people):
 
     assert _shared_with(client, A).json() == []
     response = _duplicate(client, everyone["shareId"], people["a_project"], headers=A)
-    assert (response.status_code, response.json()["detail"]) == (404, "This app is no longer shared with you.")
+    assert (response.status_code, response.json()["detail"]) == (404, "You can no longer duplicate this app.")
 
 
 def test_a_share_with_someone_else_or_into_their_project_is_404(people):
@@ -388,7 +403,7 @@ def test_a_share_with_someone_else_or_into_their_project_is_404(people):
     not_b = _duplicate(client, share["shareId"], people["b_project"])
     into_a = _duplicate(client, for_b["shareId"], people["a_project"])
 
-    assert (not_b.status_code, not_b.json()["detail"]) == (404, "This app is no longer shared with you.")
+    assert (not_b.status_code, not_b.json()["detail"]) == (404, "You can no longer duplicate this app.")
     assert (into_a.status_code, into_a.json()["detail"]) == (404, "No project by that id.")
 
 
@@ -594,7 +609,7 @@ def test_the_share_list_refuses_as_sharing_does(people):
     page = _shares_of(client, people["a_project"], slug="page-9z8y7x6w")
 
     assert (missing.status_code, missing.json()["detail"]) == (404, "No artifact by that name in this project.")
-    assert (page.status_code, page.json()["detail"]) == (400, "Only full-stack apps can be shared this way.")
+    assert (page.status_code, page.json()["detail"]) == (400, "Only full-stack apps can be duplicated this way.")
 
 
 def test_stopping_a_share_ends_it_for_the_recipients_and_keeps_their_copies(people):
@@ -610,7 +625,7 @@ def test_stopping_a_share_ends_it_for_the_recipients_and_keeps_their_copies(peop
     # B's own email share of the same app stays.
     assert [entry["shareId"] for entry in _shared_with(client, B).json()] == [by_email["shareId"]]
     again = _duplicate(client, everyone["shareId"], c_project, headers=C)
-    assert (again.status_code, again.json()["detail"]) == (404, "This app is no longer shared with you.")
+    assert (again.status_code, again.json()["detail"]) == (404, "You can no longer duplicate this app.")
     cards = client.get("/api/v1/artifacts/", params={"project_id": str(c_project)}, headers=C).json()
     assert {Path(card["folder"]).name: card["receivedFrom"] for card in cards}[Path(copy["folder"]).name] == {
         "email": EMAIL_A
@@ -624,10 +639,10 @@ def test_only_the_owner_stops_a_share(people):
 
     for headers in (B, C):
         refused = _withdraw(client, share["shareId"], headers=headers)
-        assert (refused.status_code, refused.json()["detail"]) == (404, "This share no longer exists.")
+        assert (refused.status_code, refused.json()["detail"]) == (404, "That permission no longer exists.")
     assert _withdraw(client, share["shareId"]).status_code == 204
     gone = _withdraw(client, share["shareId"])
-    assert (gone.status_code, gone.json()["detail"]) == (404, "This share no longer exists.")
+    assert (gone.status_code, gone.json()["detail"]) == (404, "That permission no longer exists.")
 
 
 # ── moving a conversation ────────────────────────────────────────────────────
