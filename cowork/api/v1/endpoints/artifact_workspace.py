@@ -7,6 +7,7 @@ import mimetypes
 import ntpath
 import os
 import stat
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -15,7 +16,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
@@ -30,7 +31,9 @@ from cowork.common.paths import (
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
+from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -388,6 +391,110 @@ class _PinnedDraftResponse(StreamingResponse):
             # covers that disconnect path; ExitStack.close is idempotent with
             # the generator's normal cleanup.
             self._resources.close()
+
+
+def _draft_selectors(project_ref: str, artifact_id: str) -> tuple[str, str]:
+    """The project and artifact selectors a draft route resolves with.
+
+    Parse before taking basename so a path ending in a valid UUID is rejected,
+    never silently accepted. Keep the recognized sanitizer at this filesystem
+    boundary; SAST does not model the UUID dependency or catalog lookup.
+    """
+    if project_ref == "local":
+        project_selector = "local"
+    else:
+        try:
+            project_selector = os.path.basename(str(UUID(project_ref)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            ) from exc
+    try:
+        artifact_selector = os.path.basename(UUID(artifact_id).hex)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact identity",
+        ) from exc
+    return project_selector, artifact_selector
+
+
+def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
+    """Validate a draft file path against the artifact it is read from.
+
+    Shared by the authenticated ``/drafts`` route, the draft-link route and the
+    draft host (cowork/draft_host/app.py), so all three refuse the same paths:
+    400 for a path that is not a plain relative one, 404 for the private
+    entries and, in a full-stack artifact, anything outside its public subtree.
+    """
+    try:
+        parts = _relative_file_parts(rel_path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact path",
+        ) from exc
+    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
+    if str(metadata.get("type") or "").startswith("fullstack-"):
+        try:
+            primary_parts = _relative_file_parts(
+                str(metadata.get("primary") or "static/index.html")
+            )
+        except ValueError:
+            primary_parts = ()
+        public_parts = primary_parts[:-1]
+        if not public_parts:
+            # A full-stack artifact needs a distinct public subtree. Serving its
+            # root would let a reviewer guess backend.py or credential-bearing
+            # runtime files. The dedicated runtime can handle legacy root-level
+            # apps; the private source preview must stay fail-closed.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Artifact file not found",
+            )
+        if parts[:len(public_parts)] != public_parts:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Artifact file not found",
+            )
+    return parts
+
+
+def _draft_file_response(
+    source,
+    folder: Path,
+    parts: tuple[str, ...],
+    *,
+    comments: bool,
+    download: bool = False,
+):
+    """Open the draft file at ``parts`` and answer with it.
+
+    Shared by the authenticated ``/drafts`` route and the draft host. HTML goes
+    out as the preview document unless ``download`` asks for the bytes; every
+    other file, and HTML that is not UTF-8, streams from the pinned descriptor.
+    Blocking, so callers run it in a worker thread.
+    """
+    media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
+    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
+    try:
+        if not download and media_type == "text/html":
+            response = _preview_html_from_fd(fd, comments=comments)
+            if response is not None:
+                resources.close()
+                return response
+        extra = (
+            {"Content-Disposition": _attachment_disposition(parts[-1])}
+            if download else None
+        )
+        return _draft_stream(
+            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+        )
+    except BaseException:
+        resources.close()
+        raise
 
 
 def _artifact_id_from_path(artifact_id: UUID) -> str:
@@ -1173,6 +1280,93 @@ async def decide_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _primary_rel_path(folder: Path, primary: Path | None) -> str:
+    """The primary file's path inside ``folder``, as the draft link names it."""
+    if primary is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no previewable file.",
+        )
+    try:
+        return primary.resolve(strict=False).relative_to(folder.resolve(strict=False)).as_posix()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact file not found",
+        ) from exc
+
+
+def _draft_link_file_parts(
+    session: ScopedSession, project_selector: str, artifact_selector: str
+) -> tuple[str, ...]:
+    """Review access to the draft and name its primary file for the link.
+
+    Blocking (database, artifact-root discovery, path resolution), so the
+    endpoint runs it in a worker thread, as the draft host does.
+    """
+    from cowork.services.artifacts import _pick_primary
+
+    _source, folder, metadata, _is_own = review_artifact_for_request(
+        session, project_selector, artifact_selector
+    )
+    hint = metadata.get("primary")
+    # A recorded primary that resolves needs no walk of the artifact tree.
+    primary = _pick_primary(folder, [], primary_hint=hint) if hint else None
+    if primary is None:
+        primary = _artifact_primary(folder, metadata)
+    return _draft_file_parts(_primary_rel_path(folder, primary), metadata)
+
+
+@router.post("/drafts/{project_ref}/{artifact_id}/link")
+async def create_draft_link(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
+):
+    """A 30-minute signed link to this draft on the draft host.
+
+    The same access check as ``serve_private_draft``: the owner, or a same-org
+    reviewer the owner granted. The link carries the caller's identity and
+    points at the primary file; its relative assets reuse the token. The web
+    app asks for a new link on every open, reload and "open in a browser tab",
+    so nothing caches or reuses one.
+    """
+    settings = get_app_settings()
+    if not settings.draft_links_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Draft links are not available",
+        )
+    scope = session.scope
+    if not scope.user_id or not scope.org_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
+    parts = await run_in_threadpool(
+        _draft_link_file_parts, session, project_selector, artifact_selector
+    )
+    now = int(time.time())
+    token = issue_draft_token(
+        env=default_draft_env_label(),
+        sub=str(scope.user_id),
+        org=str(scope.org_id),
+        proj=project_selector,
+        art=artifact_selector,
+        keys=settings.draft_link_keyring(),
+        kid=settings.draft_link_kid,
+        now=now,
+    )
+    # Counted at WARNING so LOG_LEVEL=WARNING deployments keep it during the
+    # rollout. The link itself is never logged.
+    logger.warning("Draft link issued", extra={"event": "draft_link_issued"})
+    url = f"{settings.draft_link_origin()}/_t/{token}/{quote('/'.join(parts), safe='/')}"
+    return JSONResponse(
+        {"url": url, "expiresAt": now + DRAFT_TTL_SECONDS},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/drafts/{project_ref}/{artifact_id}/{rel_path:path}")
 async def serve_private_draft(
     project_ref: str,
@@ -1204,81 +1398,17 @@ async def serve_private_draft(
     call still controls the outcome through the keyword argument, since its
     bare ``request`` carries no query string of its own.
     """
-    # Parse before taking basename so a path ending in a valid UUID is rejected,
-    # never silently accepted. Keep the recognized sanitizer at this filesystem
-    # boundary; SAST does not model the UUID dependency or catalog lookup.
-    if project_ref == "local":
-        project_selector = "local"
-    else:
-        try:
-            project_selector = os.path.basename(str(UUID(project_ref)))
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid project",
-            ) from exc
-    try:
-        artifact_selector = os.path.basename(UUID(artifact_id).hex)
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid artifact identity",
-        ) from exc
+    project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_selector, artifact_selector
     )
-    try:
-        parts = _relative_file_parts(rel_path)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid artifact path",
-        ) from exc
-    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
-    if str(metadata.get("type") or "").startswith("fullstack-"):
-        try:
-            primary_parts = _relative_file_parts(
-                str(metadata.get("primary") or "static/index.html")
-            )
-        except ValueError:
-            primary_parts = ()
-        public_parts = primary_parts[:-1]
-        if not public_parts:
-            # A full-stack artifact needs a distinct public subtree. Serving its
-            # root would let a reviewer guess backend.py or credential-bearing
-            # runtime files. The dedicated runtime can handle legacy root-level
-            # apps; the private source preview must stay fail-closed.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Artifact file not found",
-            )
-        if parts[:len(public_parts)] != public_parts:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Artifact file not found",
-            )
+    parts = _draft_file_parts(rel_path, metadata)
 
-    download = download or wants_download(request)
-    media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
-    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
-    try:
-        if not download and media_type == "text/html":
-            resp = await run_in_threadpool(
-                _preview_html_from_fd,
-                fd,
-                comments=wants_comment_layer(request),
-            )
-            if resp is not None:
-                resources.close()
-                return resp
-        extra = (
-            {"Content-Disposition": _attachment_disposition(parts[-1])}
-            if download else None
-        )
-        return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
-        )
-    except BaseException:
-        resources.close()
-        raise
+    return await run_in_threadpool(
+        _draft_file_response,
+        source,
+        folder,
+        parts,
+        comments=wants_comment_layer(request),
+        download=download or wants_download(request),
+    )
