@@ -65,9 +65,18 @@ def unshare_project(*, person: Person, project: str | None = None, project_id: U
                 project_id = ProjectService(ScopedSession(raw, scope)).get_project_by_name(project).id
             except ValueError as error:
                 raise OperatorCommandError("Project not found; use --project-id to revoke a deleted project's grant.") from error
-    _change(lambda registry: SharedProjects(tuple(item for item in registry.root if not (
-        item.project_id == project_id and item.partition_id == person.partition_id and item.user_id == person.user_id
-    ))))
+    def revoke(registry: SharedProjects) -> SharedProjects:
+        kept = tuple(item for item in registry.root if not (
+            item.project_id == project_id and item.partition_id == person.partition_id and item.user_id == person.user_id
+        ))
+        if len(kept) == len(registry.root):
+            raise OperatorCommandError(
+                f"No share of project {project_id} owned by user {person.user_id}; nothing changed. "
+                "The list command names each share's project and owner."
+            )
+        return SharedProjects(kept)
+
+    _change(revoke)
     return f"Stopped sharing project {project_id} of user {person.user_id}. The owner's project is unchanged."
 
 
@@ -84,9 +93,12 @@ def list_shared_projects() -> str:
     with get_open_session() as session:
         for entry in registry.root:
             row = session.get(Project, entry.project_id)
-            if row is None or row.org_id != entry.partition_id or row.created_by != entry.user_id:
-                continue
             audience = "everyone" if entry.audience == "everyone" else ", ".join(map(str, entry.audience))
+            if row is None or row.org_id != entry.partition_id or row.created_by != entry.user_id:
+                # Grants nothing (the recipient routes apply the same match), but
+                # stays listed so the operator can revoke it by these IDs.
+                lines.append(f"  (no such project; grants nothing) ({entry.project_id}) | owner {entry.user_id} | audience {audience}")
+                continue
             lines.append(f"  {row.display_name or row.name} ({row.id}) | owner {entry.user_id} | audience {audience}")
     if len(lines) == 1:
         lines.append("  none")

@@ -1,5 +1,4 @@
 """Read-only recipient routes. Every request rechecks the operator's grant."""
-import errno
 from contextlib import contextmanager
 from urllib.parse import quote
 from uuid import UUID
@@ -9,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.project_files import ProjectFileListResponse, ProjectFileReadResponse
-from cowork.services.shared_projects import DOWNLOAD_MAX_BYTES, TEXT_MAX_BYTES, SharedProjectFiles
+from cowork.services.shared_projects import DOWNLOAD_MAX_BYTES, TEXT_MAX_BYTES, UNREADABLE_ERRNOS, SharedProjectFiles
 
 
 def _no_cache(response: Response):
@@ -28,9 +27,7 @@ def _file_errors():
     except UnicodeDecodeError as error:
         raise HTTPException(415, "File is not valid UTF-8 text", headers={"Cache-Control": "no-store"}) from error
     except OSError as error:
-        if isinstance(error, FileNotFoundError) or error.errno in {
-            errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM,
-        }:
+        if isinstance(error, FileNotFoundError) or error.errno in UNREADABLE_ERRNOS:
             raise HTTPException(404, "File not found", headers={"Cache-Control": "no-store"}) from error
         raise
 

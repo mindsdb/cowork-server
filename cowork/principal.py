@@ -210,27 +210,22 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         reason: str | None = None
         if supplied is None or not supplied.strip():
             status_code = 426
-            reason = "missing expected organization"
+            reason = "expected_organization_missing"
         else:
             try:
                 expected_org_id = str(UUID(supplied.strip()))
             except ValueError:
                 status_code = 409
-                reason = "malformed expected organization"
+                reason = "expected_organization_invalid"
             else:
                 if expected_org_id != trusted_org_id:
                     status_code = 409
-                    reason = "organization mismatch"
+                    reason = "organization_mismatch"
 
         if status_code is None or reason is None:
             return None
 
-        logger.warning(
-            "organization boundary: %s on %s %s",
-            reason,
-            request.method,
-            request.url.path,
-        )
+        request.state._request_log_reason = reason
         return JSONResponse(
             {
                 "code": "organization_reload_required",

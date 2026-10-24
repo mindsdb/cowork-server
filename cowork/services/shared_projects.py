@@ -1,6 +1,7 @@
 """Recipient presentation and file reads. Never used by execution or mutation paths."""
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from collections.abc import Iterator
@@ -29,6 +30,9 @@ MAX_DEPTH = 32
 TEXT_MAX_BYTES = 2 * 1024 * 1024
 DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024
 _PRIVATE_NAMES = frozenset({"conversations", "skills", "memory", "__pycache__", "node_modules"})
+# What a recipient sees as "not there": the walk skips such an entry, and the
+# routes answer 404.
+UNREADABLE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM})
 
 
 def _safe_component(name: str) -> bool:
@@ -139,8 +143,11 @@ class SharedProjectFiles:
                         elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
                             files.append(ProjectFileMetadata(path="/".join(parts), name=entry.name,
                                 size=info.st_size, modified=info.st_mtime, is_dir=False))
-                    except (FileNotFoundError, NotADirectoryError):
-                        continue  # Owner moved this entry during the listing.
+                    except OSError as error:
+                        # Moved, locked or swapped for a link by the owner mid-listing.
+                        if error.errno in UNREADABLE_ERRNOS:
+                            continue
+                        raise
                     if truncated and visited > MAX_LIST_ENTRIES:
                         return
 

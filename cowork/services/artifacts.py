@@ -981,9 +981,9 @@ def _unpublish_identifier(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
-        from cowork.services.publish import raise_publish_permission_error
+        from cowork.services.publish import classify_upload_error
 
-        raise_publish_permission_error(exc)
+        classify_upload_error(exc)
         message = str(exc) or "Unpublishing failed."
         if "404" in message or "not found" in message.lower():
             logger.warning(

@@ -1,4 +1,5 @@
 """Selective sharing must never turn a recipient into the owner's executor."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -184,6 +185,33 @@ def test_operator_replaces_audience_and_revokes_by_immutable_id(shared):
     assert project["id"] not in listing(client, CAROL)
 
 
+def test_unshare_that_matches_nothing_fails_and_keeps_the_grant(shared):
+    from cowork.ops import OperatorCommandError, Person
+    from cowork.ops.projects import unshare_project
+
+    client, project, root, registry, entry = shared
+    before = registry.read_bytes()
+    with pytest.raises(OperatorCommandError, match="nothing changed"):
+        unshare_project(person=Person(organization_id=DEPLOYMENT, user_id=CAROL), project_id=UUID(project["id"]))
+    assert registry.read_bytes() == before
+    assert project["id"] in listing(client, BOB)
+
+
+def test_a_recreated_name_does_not_hide_the_old_grant_from_the_operator(shared):
+    from cowork.ops import OperatorCommandError, Person
+    from cowork.ops.projects import list_shared_projects, unshare_project
+
+    client, project, root, registry, entry = shared
+    person = Person(organization_id=DEPLOYMENT, user_id=ALICE)
+    assert client.delete(f"/api/v1/projects/{project['id']}", headers=headers(ALICE)).status_code == 204
+    assert client.post("/api/v1/projects/", headers=headers(ALICE), json={"name": project["name"]}).status_code == 201
+    with pytest.raises(OperatorCommandError, match="nothing changed"):
+        unshare_project(person=person, project=project["name"])
+    assert f"(no such project; grants nothing) ({project['id']}) | owner {ALICE} | audience {BOB}" in list_shared_projects()
+    unshare_project(person=person, project_id=UUID(project["id"]))
+    assert list_shared_projects().endswith("\n  none")
+
+
 @pytest.mark.parametrize("broken", ["malformed", "unreadable"])
 def test_operator_does_not_erase_entries_when_registry_read_fails(shared, monkeypatch, broken):
     from cowork.managed import SharedRegistryUnreadableError
@@ -277,3 +305,39 @@ def test_inventory_reports_inactive_sharing_without_breaking_startup(shared, mon
     inventory = list_shared_projects()
     assert "inactive" in inventory
     assert project["id"] not in inventory
+
+
+def _listed_paths(client, project):
+    response = client.get(f"/api/v1/shared-projects/{project['id']}/files", headers=headers(BOB))
+    assert response.status_code == 200, response.text
+    return [file["path"] for file in response.json()["files"]]
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root opens mode-000 folders")
+def test_a_locked_folder_hides_only_itself_from_the_listing(shared):
+    client, project, root, registry, entry = shared
+    locked = root / "locked"
+    locked.mkdir()
+    (locked / "inside.txt").write_text("unreadable")
+    locked.chmod(0)
+    try:
+        assert _listed_paths(client, project) == ["report.txt"]
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_folder_swapped_for_a_link_hides_only_itself_from_the_listing(shared, monkeypatch):
+    from cowork.services import shared_projects
+
+    client, project, root, registry, entry = shared
+    (root / "swapped").mkdir()
+    (root / "swapped" / "inside.txt").write_text("behind a link")
+    original = shared_projects.open_pinned_child
+
+    def open_child(directory, name, **options):
+        if name == "swapped":
+            raise OSError(errno.ELOOP, os.strerror(errno.ELOOP))
+        return original(directory, name, **options)
+
+    monkeypatch.setattr(shared_projects, "open_pinned_child", open_child)
+    assert _listed_paths(client, project) == ["report.txt"]

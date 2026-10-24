@@ -18,6 +18,21 @@ networkPolicy:
   enabled: true
 
 deployment:
+  # One uvicorn process per pod can use about one core, so cowork-server scales
+  # by replicas, not workers (see `image.args` in values.yaml). The HPA adds a
+  # pod when average CPU passes 70% of the 1-CPU request. The subchart's default
+  # 90% memory target applies too, as it does for auth.
+  #
+  # The ceiling stays at 4 because each replica widens a race. Every replica runs
+  # the scheduler, and `_due_schedules` in cowork/scheduler.py checks
+  # `has_active_run` and then fires with no cross-replica claim. Two replicas
+  # polling together can both fire one schedule.
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
   ingress:
     enabled: true
     name: cowork-server
@@ -39,6 +54,9 @@ deployment:
 
     - name: ENV
       value: "staging"
+
+    - name: ACCESS_LOG_MODE
+      value: "all"
 
     - name: LOG_LEVEL
       value: "WARNING"

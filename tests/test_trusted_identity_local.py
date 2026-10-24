@@ -14,6 +14,7 @@ A shared project another person still works in is never deleted under them.
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -165,7 +166,7 @@ async def _memory_warnings_at_start(monkeypatch, caplog) -> list[str]:
         for record in caplog.records
         if record.name == "cowork.common.logger"
         and record.levelno == logging.WARNING
-        and record.getMessage().startswith("memory: ")
+        and record.getMessage().startswith("COWORK_PERSONAL_RESOURCES ")
     ]
 
 
@@ -179,16 +180,21 @@ async def _memory_warnings_at_start(monkeypatch, caplog) -> list[str]:
 async def test_the_start_warns_that_memory_is_shared(
     trusted, monkeypatch, caplog, owned_logger, tmp_path, enabled, says, never
 ):
-    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,settings")
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     trusted.setenv("MEMORY_ENABLED", enabled)
     get_app_settings.cache_clear()
-    owned_logger("cowork.common.logger", level=logging.WARNING)
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    owned = owned_logger("cowork.common.logger", level=logging.WARNING)
 
-    [warning] = await _memory_warnings_at_start(monkeypatch, caplog)
+    await _memory_warnings_at_start(monkeypatch, caplog)
 
-    assert says in warning and never not in warning
-    assert warning.endswith(f"({tmp_path / 'memory'})")
+    [warning] = [json.loads(line) for line in owned.stream.getvalue().splitlines()]
+    assert warning["logger"] == "cowork.common.logger"
+    assert warning["log_level"] == "WARNING"
+    assert warning["operation"] == "lifespan"
+    assert says in warning["message"] and never not in warning["message"]
+    assert str(tmp_path / "memory") not in owned.stream.getvalue()
 
 
 @pytest.mark.parametrize("enabled", ["true", "false"])
@@ -233,7 +239,7 @@ async def test_the_start_reads_no_stored_setting_while_memory_is_per_person(
 async def test_a_failed_memory_warning_does_not_stop_the_start(
     trusted, monkeypatch, caplog, owned_logger, tmp_path
 ):
-    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,settings")
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     get_app_settings.cache_clear()
     calls = _unreadable_stored_settings(monkeypatch)
@@ -817,7 +823,7 @@ def test_two_people_keep_their_own_schedules(trusted, made_projects, resources):
 def test_pins_and_schedules_left_off_the_list_are_shared(trusted, made_projects):
     """Left off, with every resource that does not need them still personal.
     This fails if either table is ever mapped to one of those resources."""
-    _personal_resources(trusted, "files,skills,connections,memory,settings")
+    _personal_resources(trusted, "files,skills,memory,settings")
     client = _client()
     pid = _made_project(client, A, made_projects)
     cid = _conversation(client, A, project_id=pid, topic="team-pinned")
@@ -831,10 +837,10 @@ def test_pins_and_schedules_left_off_the_list_are_shared(trusted, made_projects)
 
 # ── a shared project another person works in ────────────────────────────────
 
-# Projects shared, and schedules (then conversations too) per person.
+# Projects and connections shared, and schedules (then conversations too) per person.
 SHARED_PROJECTS = [
     "pins,schedules,memory",
-    ",".join(sorted(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS})),
+    ",".join(sorted(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS, PersonalResource.CONNECTIONS})),
 ]
 
 
