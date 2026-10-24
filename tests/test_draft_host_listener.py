@@ -230,6 +230,63 @@ async def test_the_draft_port_access_line_never_carries_the_token(draft_env, mon
     assert any(line.get("event") == "http_access" and line.get("status_code") == 401 for line in lines)
 
 
+def _loopback_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event", None) == "draft_host_loopback"]
+
+
+@pytest.fixture
+def serve_stub(monkeypatch):
+    """What start_draft_listener asked serve_draft_app for, without binding it."""
+    asked: dict = {}
+
+    async def serve(app, *, host, port):
+        asked.update(host=host, port=port)
+        return SimpleNamespace(host=host)
+
+    monkeypatch.setattr("cowork.draft_host.listener.serve_draft_app", serve)
+    return asked
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "::1", "localhost"])
+async def test_a_draft_listener_on_a_loopback_address_is_reported_at_boot(
+    draft_env, serve_stub, monkeypatch, caplog, host
+):
+    monkeypatch.setenv("COWORK_SERVER_HOST", host)
+    get_app_settings.cache_clear()
+
+    with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):
+        await start_draft_listener()
+
+    [record] = _loopback_records(caplog)
+    assert record.levelno == logging.WARNING
+    message = json.loads(make_formatter().format(record))["message"]
+    assert "COWORK_SERVER_HOST" in message and "0.0.0.0" in message
+    assert host not in message
+    assert serve_stub["host"] == host
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "10.1.2.3"])
+async def test_a_draft_listener_on_a_pod_address_is_not_reported(draft_env, serve_stub, monkeypatch, caplog, host):
+    monkeypatch.setenv("COWORK_SERVER_HOST", host)
+    get_app_settings.cache_clear()
+
+    with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):
+        await start_draft_listener()
+
+    assert _loopback_records(caplog) == []
+    assert serve_stub["host"] == host
+
+
+async def test_a_loopback_address_is_not_reported_while_the_draft_host_is_off(draft_env, serve_stub, caplog, monkeypatch):
+    monkeypatch.setenv("COWORK_DRAFT_LINK_KID", "missing")
+    get_app_settings.cache_clear()
+
+    with caplog.at_level("WARNING", logger="cowork.draft_host.listener"):
+        await start_draft_listener()
+
+    assert _loopback_records(caplog) == []
+
+
 def _stop_records(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if getattr(r, "event", None) == "draft_host_stopped"]
 

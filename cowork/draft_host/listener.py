@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 
 import uvicorn
@@ -26,6 +27,20 @@ logger = logging.getLogger(__name__)
 
 # Upper bound on draining in-flight draft responses at shutdown.
 _GRACEFUL_SHUTDOWN_SECONDS = 2
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether a bind address is reachable only from the pod itself."""
+    name = host.strip().strip("[]").lower()
+    if name == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
 
 
 class _DraftServer(uvicorn.Server):
@@ -107,6 +122,15 @@ async def start_draft_listener() -> DraftListener | None:
             "missing or shorter than 32 characters; the draft host answers 404 and "
             "previews stay on srcdoc",
             extra={"event": "draft_host_misconfigured"},
+        )
+    elif _is_loopback(settings.host):
+        # The bind address is COWORK_SERVER_HOST, not the API server's --host,
+        # so a command line that listens on every address can still leave this
+        # port on loopback, where the draft Ingress gets a 502.
+        logger.warning(
+            "Draft host listens on a loopback address; the draft Ingress cannot reach it. "
+            "Set COWORK_SERVER_HOST to the pod address (0.0.0.0).",
+            extra={"event": "draft_host_loopback"},
         )
     # Imported here: app.py pulls in the API endpoint modules.
     from cowork.draft_host.app import create_draft_app
