@@ -484,6 +484,25 @@ class TestStepsFromTheTurnsToolRows:
         assert figures["250"]["sources"] == [{"tool_use_id": "toolu_rows", "page": None}]
         assert figures["42"]["origin"] == "none"
 
+    async def test_a_replayed_cells_live_app_lines_are_not_what_it_printed(self):
+        """With live apps on, anton appends [live app] to the result of a cell
+        that relaunched a running app."""
+        code = "print(open('/workspace/stock.csv').read())"
+        result = (
+            format_cell_result(Cell(code=code, stdout="P100,S1,250\n", stderr="", error=None))
+            + "\n\n[live app]\nsales-dash relaunched in slot 7"
+        )
+
+        events = await _run_turn(
+            TurnContext(question="What is at S1?"),
+            StreamTextDelta(text="S1 holds 250 units; the app runs in slot 7."),
+            TurnHistory(_tool_rows("toolu_rows", "scratchpad", {"action": "exec", "name": "main", "code": code}, result)),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_rows", "page": None}]
+        assert figures["7"]["origin"] == "none"
+
     @pytest.mark.parametrize(("logs", "lint"), [
         ("", ""),
         ("HTTP Request: GET /stock 200 OK", ""),
