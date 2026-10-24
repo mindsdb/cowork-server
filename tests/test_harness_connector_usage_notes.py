@@ -22,6 +22,14 @@ def test_google_drive_spec_carries_the_drive_api_rules():
     assert "corpora='allDrives'" in notes
 
 
+def test_google_drive_spec_explains_the_picker_instead_of_broader_access():
+    notes = registry.usage_notes_for(["google_drive"])["google_drive"]
+
+    assert "Add files from Google Drive" in notes
+    assert "files.get(fileId=...)" in notes
+    assert "never suggest reconnecting with broader permissions" in notes
+
+
 def test_picker_guidance_lists_files_but_no_longer_the_drive_api_rules():
     text = harness._picked_files_guidance({
         "work": [{"id": "f1", "name": "Roadmap.gdoc", "resourceKey": "rk1"}],
@@ -96,8 +104,12 @@ async def test_usage_notes_reach_the_session_config(monkeypatch, tmp_path):
 
 async def test_drive_notes_reach_the_session_config_without_picked_files(monkeypatch, tmp_path):
     async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
-        assert "corpora='allDrives'" in config.connector_usage_notes["google_drive"]
+        notes = config.connector_usage_notes["google_drive"]
+        assert "corpora='allDrives'" in notes
+        # A fresh connection has no picked files, so the Picker block is empty;
+        # the usage notes alone must tell the agent how to reach an existing file.
         assert "Google Picker" not in config.system_prompt_context.suffix
+        assert "Add files from Google Drive" in notes
 
 
 @pytest.mark.parametrize(
