@@ -3,16 +3,26 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.schemas.artifact_export import ExportPdfSettings
 
 if TYPE_CHECKING:
     from anton.core.llm.identity import DeploymentIdentity
@@ -1131,3 +1141,59 @@ class AppSettings(Settings):
 def get_app_settings() -> AppSettings:
     """Get cached application settings."""
     return AppSettings()
+
+
+EXPORT_PDF_ENGINE_VAR = "COWORK_EXPORT_PDF_ENGINE"
+EXPORT_RENDER_URL_VAR = "COWORK_EXPORT_RENDER_URL"
+
+
+def load_export_pdf_settings(*, environ: Mapping[str, str]) -> ExportPdfSettings:
+    """Read the PDF export settings from ``environ``, the process environment.
+
+    They never come from the ``.env`` chain the settings above read. On the
+    desktop, ``POST /settings/raw`` writes ``<COWORK_HOME>/.env``, so a render
+    URL taken from there would send every exported document wherever that
+    write pointed it.
+
+    An unset or blank engine means no PDF. Any other engine than "render"
+    raises ValueError, and so does "render" without an http(s) URL, which
+    stops the server's start.
+    """
+    engine = environ.get(EXPORT_PDF_ENGINE_VAR, "").strip()
+    if not engine:
+        return ExportPdfSettings(engine=None, render_url=None)
+    if engine != "render":
+        raise ValueError(f"{EXPORT_PDF_ENGINE_VAR} must be 'render' or unset, not {engine!r}.")
+    url = environ.get(EXPORT_RENDER_URL_VAR, "").strip()
+    if not url:
+        raise ValueError(
+            f"{EXPORT_PDF_ENGINE_VAR}=render needs {EXPORT_RENDER_URL_VAR}, the http(s) base "
+            "address of the render service. Set it, or unset the engine to turn PDF export off."
+        )
+    # The URL itself stays out of these messages: it may carry credentials.
+    try:
+        settings = ExportPdfSettings(engine="render", render_url=url)
+    except ValidationError:
+        raise ValueError(
+            f"{EXPORT_RENDER_URL_VAR} must be an http:// or https:// address with a host."
+        ) from None
+    render_url = settings.render_url
+    # A bare "?" or "#" parses as an empty query or fragment, not None, and
+    # still moves /v1/pdf out of the path.
+    if render_url is not None and (render_url.query is not None or render_url.fragment is not None):
+        raise ValueError(
+            f"{EXPORT_RENDER_URL_VAR} must be the render service's base address, with no "
+            "query or fragment: the server adds /v1/pdf to it."
+        )
+    return settings
+
+
+@lru_cache
+def get_export_pdf_settings() -> ExportPdfSettings:
+    """The process's PDF export settings, read once.
+
+    ``cowork.cli.main`` reads them before it loads a ``.env`` file into the
+    environment, so a value only in a ``.env`` file never reaches them, and
+    ``create_app`` reads them so a bad value stops the start.
+    """
+    return load_export_pdf_settings(environ=os.environ)

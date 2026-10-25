@@ -59,5 +59,6 @@ class ProjectResponse(BaseModel):
     is_active: bool
     org_id: str | None = None
     created_by: str | None = None
+    shared: bool = False
     attribution: ResourceAttribution
     capabilities: ProjectCapabilities

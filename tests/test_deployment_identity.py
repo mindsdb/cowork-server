@@ -104,8 +104,8 @@ def test_startup_freezes_the_validated_pack_name(monkeypatch, tmp_path, name):
 
 @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
 def test_startup_accepts_the_pack_loaders_json_encodings(monkeypatch, tmp_path, encoding):
-    # cowork-self-hosted scripts/branding.py:read_pack_json passes bytes to
-    # json.loads, which accepts a BOM and detects UTF-16/32 as well as UTF-8.
+    # A self-hosted deployment's pack loader passes bytes to json.loads,
+    # which accepts a BOM and detects UTF-16/32 as well as UTF-8.
     pack = tmp_path / "pack.json"
     pack.write_bytes(json.dumps({"name": PRODUCT}).encode(encoding))
     _enable(monkeypatch, pack)
