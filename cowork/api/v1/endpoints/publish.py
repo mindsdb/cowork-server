@@ -122,7 +122,7 @@ async def unpublish_artifact(
         artifact, artifacts_base, api_key, publish_url = _desktop_context(path, scope=scope)
         return _unpublish(
             artifact, artifacts_base=artifacts_base,
-            api_key=api_key, publish_url=publish_url,
+            api_key=api_key, publish_url=publish_url, scope=scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

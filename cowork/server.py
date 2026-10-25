@@ -169,6 +169,23 @@ async def lifespan(app: FastAPI):
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    # Ownership recovery runs before the first request can mint a page. A pass
+    # that cannot read publish history or verify the publisher does not stop
+    # Cowork: published_page_ownership._require_backfill retries it on each
+    # protected publish, unpublish or delete and answers 503 until it completes.
+    from cowork.services.published_page_owner_backfill import (
+        PublishedPageBackfillUnavailable,
+        run_published_page_owner_backfill,
+    )
+
+    try:
+        await asyncio.to_thread(run_published_page_owner_backfill)
+    except PublishedPageBackfillUnavailable as exc:
+        # Its messages are fixed text, raised without the underlying error.
+        logger.error(
+            "Published page ownership backfill did not finish; publishing answers 503 and retries it",
+            extra={"event": "published_page_backfill_unavailable", "reason": str(exc)},
+        )
     # After the clear, since resolving MEMORY_ENABLED where memory is shared
     # loads the stored settings.
     try:
