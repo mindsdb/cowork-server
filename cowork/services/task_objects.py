@@ -196,6 +196,7 @@ class TaskObjectService:
                 self.session, src_root, [row.ref for row in rows]
             )
         rekeys: list[tuple[str, str]] = []
+        moved_folders: list[tuple[Path, Path]] = []
         moved = 0
         for row in rows:
             src_folder = src_base / row.ref
@@ -223,6 +224,7 @@ class TaskObjectService:
                 continue
             if org_mode:
                 rekeys.append((row.ref, dest_slug))
+            moved_folders.append((src_folder, dest_base / dest_slug))
             if live_apps:
                 follow_moved_app(
                     self.session,
@@ -237,6 +239,13 @@ class TaskObjectService:
             self.session.add(row)
             moved += 1
         self.session.commit()
+        # A published page keeps its link: .published.json moved with the
+        # folder, and its owner record follows. A failed rekey is logged; the
+        # owner's next publish then gets a new link, as a copy would.
+        from cowork.services.published_page_ownership import rekey_published_page_paths
+
+        for old_folder, new_folder in moved_folders:
+            rekey_published_page_paths(old_folder, new_folder)
         # After the index commit: each rekey commits on its own, and must not
         # commit a half-applied batch of index rows along with it.
         if rekeys:

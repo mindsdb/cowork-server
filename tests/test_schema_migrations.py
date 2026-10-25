@@ -677,6 +677,31 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     assert "reports" in names and "untitled-project" in names
 
 
+def test_published_page_ownership_upgrade_is_unique_and_survives_rollback(tmp_path):
+    from uuid import uuid4
+    from sqlalchemy.exc import IntegrityError
+    from sqlmodel import Session, select
+    from cowork.models.published_page import PublishedPageOwner
+
+    uri = _sqlite_uri(tmp_path / "published-pages.db")
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "3e4b5f7586d3")
+    run_schema_migrations(engine, uri)
+    values = dict(publisher_key="publisher", report_id="page", artifact_path="/project/page.html", owner_user_id=str(uuid4()))
+    with Session(engine) as session:
+        session.add(PublishedPageOwner(**values))
+        session.commit()
+        session.add(PublishedPageOwner(**values))
+        with pytest.raises(IntegrityError):
+            session.commit()
+    _downgrade_to(engine, uri, "3e4b5f7586d3")
+    run_schema_migrations(engine, uri)
+    with Session(engine) as session:
+        rows = session.exec(select(PublishedPageOwner)).all()
+        assert len(rows) == 1
+        assert rows[0].owner_user_id == values["owner_user_id"]
+
+
 # ── ENG-3566: live apps' records (f3b9d6a2c8e4) ──────────────────────────────
 
 _LIVE_LAUNCH = (

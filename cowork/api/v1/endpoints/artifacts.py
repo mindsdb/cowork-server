@@ -864,6 +864,7 @@ async def delete_artifact_for_request(
             expected_artifact_id=expected_artifact_id,
             api_key=api_key,
             publish_url=publish_url,
+            scope=session.scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1198,12 +1199,15 @@ def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
         api_key, publish_url = desktop_publish_credential()
         _delete_artifact(
             found.artifact, artifacts_base=found.artifacts_base,
-            api_key=api_key, publish_url=publish_url,
+            api_key=api_key, publish_url=publish_url, scope=scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except HTTPException:
+        # An owner refusal (409) or unavailable ownership (503) keeps its status.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
 
