@@ -8,7 +8,9 @@ and all necessary configurations for the Cowork service.
 import asyncio
 import contextlib
 import os
+import stat
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,6 +49,7 @@ from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
+from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -364,14 +367,14 @@ def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
     remedy, rather than surface here with the path and the fix."""
     from anton.core.tools.skill_format import SKILL_FILE
 
-    for folder in (managed.skills_dir, managed.vault_dir):
-        if not os.access(folder, os.R_OK | os.X_OK):
-            raise RuntimeError(
-                f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
-                "server's user needs read and search permission on it. Run "
-                f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
-                f"{folder}` if it is owned by another user)."
-            )
+    folder = managed.skills_dir
+    if not os.access(folder, os.R_OK | os.X_OK):
+        raise RuntimeError(
+            f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
+            "server's user needs read and search permission on it. Run "
+            f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
+            f"{folder}` if it is owned by another user)."
+        )
     for slug_dir in sorted(managed.skills_dir.iterdir()):
         if not slug_dir.is_dir():
             continue
@@ -386,16 +389,59 @@ def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
                 f"COWORK_MANAGED_DIR's skill file {skill_file} can't be read: run "
                 f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
             )
-    # A managed connection file the server's user can't read vanishes for
-    # everyone and frees its name, so a tester could save their own under it.
-    # Refuse at start rather than silently share less.
-    for vault_file in sorted(managed.vault_dir.iterdir()):
-        if vault_file.is_file() and not os.access(vault_file, os.R_OK):
-            raise RuntimeError(
-                f"COWORK_MANAGED_DIR's connection file {vault_file} can't be read: run "
-                f"`chown 1000:1000 {vault_file}` on the host copy so it is not freed and "
-                "re-saved by a tester."
-            )
+    _refuse_unreadable_managed_connections(managed.vault_dir)
+
+
+def _refuse_unreadable_managed_connections(vault_dir: Path) -> None:
+    """Probe as the server's user, without loading credentials or logging a record.
+
+    A bind mount can pass os.access but still deny open. Refuse startup before
+    LocalDataVault silently skips that connection and exposes a lower layer.
+    """
+    try:
+        if not os.access(vault_dir, os.R_OK | os.X_OK):
+            raise PermissionError
+        with pinned_dir(vault_dir) as directory:
+            with dir_scandir(directory) as entries:
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                try:
+                    if not stat.S_ISREG(dir_stat(directory, name).st_mode):
+                        continue
+                    fd = dir_open(directory, name, os.O_RDONLY | O_NONBLOCK)
+                    try:
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            raise OSError("Managed connection is no longer a regular file")
+                    finally:
+                        os.close(fd)
+                except FileNotFoundError:
+                    continue  # The operator may remove a connection during the scan.
+                except OSError as error:
+                    logger.error(
+                        "Cowork cannot read a managed connection; check its ownership "
+                        "and permissions before restarting.",
+                        extra={
+                            "event": "managed_connection_unreadable",
+                            "reason": "file_unreadable",
+                            "managed_connection_file": name,
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    raise RuntimeError(
+                        f"COWORK_MANAGED_DIR's connection file {vault_dir / name} can't be read: "
+                        f"run `chown 1000:1000 {vault_dir / name}` on the host copy."
+                    ) from None
+    except OSError as error:
+        logger.error(
+            "Cowork cannot read the managed data-vault directory; check its ownership "
+            "and permissions before restarting.",
+            extra={
+                "event": "managed_connection_unreadable",
+                "reason": "vault_unreadable",
+                "error_type": type(error).__name__,
+            },
+        )
+        raise RuntimeError("COWORK_MANAGED_DIR's data-vault folder can't be read") from None
 
 
 def create_app() -> FastAPI:
