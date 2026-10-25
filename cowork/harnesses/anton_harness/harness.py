@@ -652,7 +652,10 @@ def _other_files_rule(*, sandboxed: bool) -> str:
 # there.
 _SANDBOXED_BACKENDS_RULE = (
     "App backends are off on this deployment because your code runs in a sandbox, so never "
-    "build a full-stack artifact or call `launch_backend`; build static artifacts instead."
+    "build a full-stack artifact or call `launch_backend`; build static artifacts instead. "
+    "Never give the person a runtime-local address such as `127.0.0.1:<port>` or "
+    "`localhost:<port>`, which their browser can't open: point them to the artifact in Cowork, "
+    "or to the link `publish_or_preview` returns, even when that link is on a `.localhost` name."
 )
 
 # What the agent hears about long-running services with live apps on

@@ -47,10 +47,14 @@ from tests._live_apps import (
 )
 from tests._turns import built_turn
 
-# The sandbox's refusal at the commit live apps branch from (0ceb4189).
+# The sandbox's refusal, written out: with live apps off a turn says exactly
+# this. Live apps (0ceb4189) left its first sentence as it was.
 BASE_SANDBOXED_BACKENDS_RULE = (
     "App backends are off on this deployment because your code runs in a sandbox, so never "
-    "build a full-stack artifact or call `launch_backend`; build static artifacts instead."
+    "build a full-stack artifact or call `launch_backend`; build static artifacts instead. "
+    "Never give the person a runtime-local address such as `127.0.0.1:<port>` or "
+    "`localhost:<port>`, which their browser can't open: point them to the artifact in Cowork, "
+    "or to the link `publish_or_preview` returns, even when that link is on a `.localhost` name."
 )
 
 # What the live-app rule must tell the agent (ENG-3566), each as it reads.
