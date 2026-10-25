@@ -162,7 +162,8 @@ dependencies = [
     "pillow==13.0.0",
     # Agent code cells use these: the built-in pdf skill
     # (cowork/skills_builtin/pdf/SKILL.md) imports pypdf and reportlab, and
-    # anton's prompt names BeautifulSoup. Declared directly so they stay
+    # anton's prompt names BeautifulSoup. The PDF export client also counts a
+    # render service's pages with pypdf. Declared directly so they stay
     # installed whatever another package's dependencies become.
     "pypdf==6.21.1",
     "reportlab==5.0.1",

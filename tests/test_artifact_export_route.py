@@ -24,7 +24,9 @@ from unittest.mock import Mock
 from urllib.parse import quote
 from uuid import uuid4
 
+import anyio
 import docx
+import httpx
 import pytest
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -32,15 +34,17 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import get_app_settings, get_export_pdf_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
-from cowork.schemas.artifact_export import ExportRequest, ExportResult
+from cowork.schemas.artifact_export import ExportPdfSettings, ExportRequest, ExportResult, RenderPdfRequest
 from cowork.services import artifact_export
 from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
+from cowork.services.artifact_export import ExportRefused, ExportSource, export_slot
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.markdown_render import MAX_FENCE_LENGTH
+from cowork.services.render_pdf_client import RenderServicePdf
 from test_artifact_ownership import legacy_root, make_conversation, make_project, project_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
@@ -1096,3 +1100,216 @@ async def test_one_export_per_user_and_org_at_a_time(org_world, role, org_export
         result = await first
 
     assert result.filename == "report.docx"
+
+
+# ── PDF through a render service ─────────────────────────────────────────────
+#
+# The render service is an ``httpx.MockTransport`` handed to the export's
+# client, so these tests see the exact request the route sends and answer it
+# the way a render service can: with a PDF, busy, refusing, redirecting or
+# broken.
+
+PDF_RESULT = json.loads((Path(__file__).parent / "fixtures" / "render_pdf" / "response.json").read_text(encoding="utf-8"))
+PDF_FAILURES = yaml.safe_load(
+    (Path(__file__).parent / "fixtures" / "artifact_export" / "pdf_failures.yaml").read_text(encoding="utf-8")
+)["cases"]
+PDF_SETTINGS = ExportPdfSettings(engine="render", render_url="http://render.test")
+
+def _streamed(*, status: int, body: bytes) -> httpx.Response:
+    """An answer the client reads as a stream, as it reads a real one."""
+    return httpx.Response(
+        status, stream=httpx.ByteStream(body), headers={"Content-Type": "application/json"}
+    )
+
+
+class RenderService:
+    """Answers each request with the next queued answer and keeps every request."""
+
+    def __init__(self) -> None:
+        self.requests: list[RenderPdfRequest] = []
+        self.answers: list[dict] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(RenderPdfRequest.model_validate_json(request.content))
+        answer = self.answers.pop(0) if self.answers else {"status": 200}
+        status = answer["status"]
+        if status == 302:
+            return httpx.Response(302, headers={"Location": answer["location"]})
+        if "raw" in answer:
+            return _streamed(status=status, body=answer["raw"].encode())
+        if status == 200:
+            result = {**PDF_RESULT, **({"pdf_base64": answer["pdf_base64"]} if "pdf_base64" in answer else {})}
+            return _streamed(status=200, body=json.dumps(result).encode())
+        return httpx.Response(status)
+
+
+@pytest.fixture
+def render_service(monkeypatch):
+    """Turn PDF export on, with this stand-in as the render service."""
+    service = RenderService()
+    monkeypatch.setattr(artifact_export, "export_pdf_settings", lambda: PDF_SETTINGS)
+    monkeypatch.setattr(
+        artifact_export,
+        "_pdf_client",
+        lambda: RenderServicePdf(settings=PDF_SETTINGS, transport=httpx.MockTransport(service)),
+    )
+    return service
+
+
+def test_exports_read_the_pdf_settings_from_the_process_environment(monkeypatch):
+    monkeypatch.setenv("COWORK_EXPORT_PDF_ENGINE", "render")
+    monkeypatch.setenv("COWORK_EXPORT_RENDER_URL", "http://render.test")
+    get_export_pdf_settings.cache_clear()
+    try:
+        assert artifact_export.export_pdf_settings() == PDF_SETTINGS
+    finally:
+        get_export_pdf_settings.cache_clear()
+
+
+def test_pdf_is_offered_only_with_a_render_service_and_never_in_org_mode(monkeypatch):
+    report = ExportSource(source_name="report.md", is_backend=False)
+    page = ExportSource(source_name="page.html", is_backend=False)
+    sheet = ExportSource(source_name="data.csv", is_backend=False)
+
+    def offered(source: ExportSource, *, org_mode: bool = False) -> list[str]:
+        return artifact_export.offered_export_formats(source=source, can_edit=True, org_mode=org_mode)
+
+    assert offered(report) == ["html", "docx"]
+    monkeypatch.setattr(artifact_export, "export_pdf_settings", lambda: PDF_SETTINGS)
+    assert offered(report) == ["html", "docx", "pdf"]
+    assert offered(page) == ["docx", "pdf"]
+    assert offered(sheet) == []
+    assert offered(report, org_mode=True) == []
+
+
+def test_a_pdf_export_writes_the_render_services_pdf(client, local_artifact, render_service):
+    folder = local_artifact({"report.md": "# Report\n\nRevenue rose.\n"})
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == "report.pdf"
+    written = (folder / "report.pdf").read_bytes()
+    assert written.startswith(b"%PDF-")
+    [sent] = render_service.requests
+    assert sent.scripts is False
+    assert "Revenue rose." in sent.html
+
+
+@pytest.mark.parametrize(("primary", "scripts"), [("page.html", True), ("page.htm", True), ("notes.txt", False)])
+def test_only_an_html_page_asks_for_its_scripts_to_run(
+    client, local_artifact, render_service, primary, scripts
+):
+    local_artifact({primary: "<p>hello</p>" if primary.startswith("page") else "hello"}, primary=primary)
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 200, response.text
+    assert [request.scripts for request in render_service.requests] == [scripts]
+
+
+def test_a_pdf_inlines_at_most_its_own_smaller_budget(client, local_artifact, render_service):
+    images = {f"chart{n}.png": padded_png(int(1.9 * MIB), filler=bytes([65 + n])) for n in range(4)}
+    page = "".join(f'<img src="chart{n}.png">' for n in range(4))
+    local_artifact({**images, "report.html": f"<html><body>{page}</body></html>"}, primary="report.html")
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["omittedCount"] >= 1
+    [sent] = render_service.requests
+    assert len(sent.html) < 1.4 * artifact_export.PDF_INLINE_BUDGET_BYTES
+
+
+def test_a_pdf_of_an_html_page_keeps_its_scripts(client, local_artifact, render_service):
+    cdn = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+    page = f'<html><body><p>chart</p><script>window.x = 1;</script><script src="{cdn}"></script></body></html>'
+    local_artifact({"page.html": page}, primary="page.html")
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 200, response.text
+    [sent] = render_service.requests
+    assert "window.x = 1;" in sent.html
+    assert f'src="{cdn}"' in sent.html
+    assert response.json()["scriptsDropped"] is False
+
+
+@pytest.mark.parametrize("case", PDF_FAILURES, ids=[case["id"] for case in PDF_FAILURES])
+def test_a_pdf_that_does_not_come_back_writes_nothing(client, local_artifact, render_service, case):
+    folder = local_artifact({"report.md": "# Report\n"})
+    before = _snapshot(folder)
+    render_service.answers = [dict(answer) for answer in case["answers"]]
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == case["status"], response.text
+    assert response.json()["detail"] == case["detail"]
+    assert _snapshot(folder) == before
+
+
+def test_no_pdf_comes_back_in_time_answers_504_and_writes_nothing(
+    client, local_artifact, monkeypatch
+):
+    settings = PDF_SETTINGS.model_copy(update={"timeout_seconds": 0.5})
+
+    async def stall(_request: httpx.Request) -> httpx.Response:
+        await anyio.sleep(5)
+        return httpx.Response(503)
+
+    monkeypatch.setattr(artifact_export, "export_pdf_settings", lambda: settings)
+    monkeypatch.setattr(
+        artifact_export,
+        "_pdf_client",
+        lambda: RenderServicePdf(settings=settings, transport=httpx.MockTransport(stall)),
+    )
+    folder = local_artifact({"report.md": "# Report\n"})
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 504, response.text
+    assert _snapshot(folder) == before
+
+
+def test_without_a_render_service_pdf_answers_422_and_nothing_makes_one(client, local_artifact):
+    folder = local_artifact({"report.md": "# Report\n"})
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 422, response.text
+    assert _snapshot(folder) == before
+
+
+def test_a_pdf_of_markdown_with_a_fence_past_the_cap_answers_413_and_sends_nothing(
+    client, local_artifact, render_service
+):
+    fence = "`" * (MAX_FENCE_LENGTH + 1)
+    folder = local_artifact({"report.md": f"# Report\n\n{fence}\ncode\n{fence}\n"})
+    before = _snapshot(folder)
+
+    response = client.post(EXPORT_URL, json={"format": "pdf"})
+
+    assert response.status_code == 413, response.text
+    assert response.json()["detail"] == "This file can't be exported."
+    assert render_service.requests == []
+    assert _snapshot(folder) == before
+
+
+def _local_person(user_id: str) -> TenantScope:
+    return TenantScope(org_mode=False, org_id=None, user_id=user_id)
+
+
+async def test_pdf_export_has_its_own_slot():
+    """A running PDF export leaves Word and HTML export free, and only one PDF runs."""
+    async with export_slot(scope=_local_person("alice"), export_format="pdf"):
+        async with export_slot(scope=_local_person("bob"), export_format="docx"):
+            pass
+        async with export_slot(scope=_local_person("dave"), export_format="html"):
+            pass
+        with pytest.raises(ExportRefused):
+            async with export_slot(scope=_local_person("carol"), export_format="pdf"):
+                pass
+    async with export_slot(scope=_local_person("carol"), export_format="pdf"):
+        await anyio.sleep(0)
