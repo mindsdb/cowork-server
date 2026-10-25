@@ -16,6 +16,7 @@ from pathlib import Path
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine
 
+from cowork.common.paths import open_fd
 from cowork.db import session as db_session
 from cowork.db.units import run_to_completion
 from cowork.services.shared_resources import _database_lock_engine, advisory_lock_key
@@ -53,7 +54,7 @@ class _LaunchLock:
         # Resolve aliases to the actual DB path, so workers with different
         # working directories or symlinked paths still use the same lock.
         path = Path(database.removeprefix("file:")).resolve()
-        self.fd = os.open(
+        self.fd = open_fd(
             str(path) + ".live-app-launch.lock",
             os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
             0o600,
