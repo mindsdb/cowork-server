@@ -345,8 +345,8 @@ _APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTI
 # anton hands the model a cell's result in labeled parts (format_cell_result):
 # what the cell printed under [output], then [logs], [stderr] and [error].
 # anton's session appends [artifact lint] after a cell that changed an
-# artifact.
-_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint)\]\n", re.MULTILINE)
+# artifact, and [live app] after a cell that relaunched a running live app.
+_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint|live app)\]\n", re.MULTILINE)
 # The note format_cell_result puts after printed output it cut short, with
 # the line breaks before the next part.
 _TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)\n*\Z")
@@ -566,8 +566,8 @@ def _cell_arguments(arguments: dict[str, Any]) -> _CellArguments:
 def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     """A cell's result as history rows hold it: its code and description
     from the call's arguments, and what it printed, the [output] part,
-    without the logs, stderr, error and artifact lint the model saw beside
-    it, or the note on how long output cut short was."""
+    without the logs, stderr, error, artifact lint and live-app lines the
+    model saw beside it, or the note on how long output cut short was."""
     stdout = ""
     if result.startswith("[output]\n"):
         printed = result[len("[output]\n"):]

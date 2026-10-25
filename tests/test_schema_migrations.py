@@ -700,3 +700,50 @@ def test_published_page_ownership_upgrade_is_unique_and_survives_rollback(tmp_pa
         rows = session.exec(select(PublishedPageOwner)).all()
         assert len(rows) == 1
         assert rows[0].owner_user_id == values["owner_user_id"]
+
+
+# ── ENG-3566: live apps' records (f3b9d6a2c8e4) ──────────────────────────────
+
+_LIVE_LAUNCH = (
+    "INSERT INTO live_app_launches (id, slot, launcher_user_id, launcher_partition_id, launcher_email,"
+    " project_id, slug, artifact_dir, address, boot_id, started_at, state, stop_noticed)"
+    " VALUES (?, ?, 'u', 'p', 'a@example.com', 'proj', 'dash', '/d', 'http://app1', 'b', CURRENT_TIMESTAMP, ?, 0)"
+)
+_LIVE_SHARE = (
+    "INSERT INTO live_app_shares (id, owner_partition_id, owner_user_id, owner_email, project_id, slug,"
+    " recipient_email) VALUES (?, 'p', 'u', 'a@example.com', 'proj', 'dash', ?)"
+)
+
+
+def test_migrated_schema_holds_the_live_app_uniqueness_rules(tmp_path, monkeypatch):
+    """One running record per slot, one share with everyone per app, and one
+    share per app and address: rules of the database, not only of the code.
+    The downgrade drops the three tables."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "live-apps.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    def refused(statement: str, *rows: tuple) -> bool:
+        """Whether inserting ``rows`` together breaks a rule; none stays."""
+        with sqlite3.connect(db_path) as connection:
+            try:
+                for row in rows:
+                    connection.execute(statement, row)
+            except sqlite3.IntegrityError:
+                return True
+            finally:
+                connection.rollback()
+            return False
+
+    assert refused(_LIVE_LAUNCH, ("l1", 1, "running"), ("l2", 1, "running"))
+    assert not refused(_LIVE_LAUNCH, ("l3", 2, "running"), ("l4", 2, "stopped"), ("l5", 2, "stopped"))
+    assert refused(_LIVE_SHARE, ("s1", None), ("s2", None))
+    assert refused(_LIVE_SHARE, ("s3", "b@example.com"), ("s4", "b@example.com"))
+    assert not refused(_LIVE_SHARE, ("s5", None), ("s6", "c@example.com"))
+
+    _downgrade_to(engine, uri, "3e4b5f7586d3")
+    for table in ("live_app_launches", "live_app_shares", "live_app_copies"):
+        assert not _has_table(db_path, table)

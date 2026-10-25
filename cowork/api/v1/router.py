@@ -21,6 +21,7 @@ from cowork.api.v1.endpoints import (
     health,
     hub_usage,
     hub_workspaces,
+    live_apps,
     memory,
     pins,
     project_files,
@@ -79,8 +80,10 @@ api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
+api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
+api_router.include_router(live_apps.router, prefix="/live-apps", tags=["live-apps"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(
