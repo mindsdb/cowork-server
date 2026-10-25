@@ -77,3 +77,14 @@ class LiveAppStateResponse(CamelResponse):
     stopped_at: datetime | None
     stop_reason: ShownStopReason | None
     stop_reason_text: str | None
+
+
+class LiveAppAvailabilityNotice(CamelResponse):
+    id: UUID
+    message: str
+
+
+class LiveAppAvailabilityResponse(CamelResponse):
+    waiting: bool
+    notice: LiveAppAvailabilityNotice | None = None
+    scope: str

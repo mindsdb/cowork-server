@@ -188,6 +188,12 @@ fallback-version = "0.0.0-dev"
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
 
+[tool.uv.sources]
+# Temporary source pairing for shared live-app admission. Before merging,
+# replace this with a published Anton release containing the change, raise
+# the public dependency floor, and regenerate the lock and runtime export.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "434345d571b912f9365a24a24ef1dca854e0583d" }
+
 [dependency-groups]
 dev = [
     "alembic>=1.18.4",

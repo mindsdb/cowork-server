@@ -10,10 +10,12 @@ apps from ``/api/v1/live-apps/mine``. Every route answers 404 with live apps off
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from collections.abc import Callable, Coroutine
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse
@@ -22,15 +24,22 @@ from fastapi.routing import APIRoute
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.code_sandbox import live_apps_on
 from cowork.principal import Principal, get_principal
-from cowork.schemas.live_apps import LiveAppStateResponse
+from cowork.schemas.live_apps import (
+    LiveAppAvailabilityNotice,
+    LiveAppAvailabilityResponse,
+    LiveAppStateResponse,
+)
 from cowork.services.live_apps import (
+    AVAILABILITY_MESSAGE,
     LiveAppAccessUnavailable,
+    acknowledge_availability,
     SlotReportRefused,
     SlotStopReport,
     check_access,
     is_live_app_slot,
     live_app_person,
     person_apps,
+    person_availability,
     record_slot_stop,
     stopped_page,
 )
@@ -88,6 +97,55 @@ async def my_live_apps(principal: Principal | None = Depends(get_principal)) -> 
         )
         for app in await person_apps(person)
     ]
+
+
+def _availability_principal(principal: Principal | None) -> Principal:
+    if principal is None or not principal.user_id or not principal.org_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in to check live app availability.")
+    return principal
+
+
+@router.get("/availability", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def live_app_availability(
+    response: Response, principal: Principal | None = Depends(get_principal)
+) -> LiveAppAvailabilityResponse:
+    from anton.core.artifacts.live_app_slots import LiveAppLaunchError
+
+    principal = _availability_principal(principal)
+    response.headers["Cache-Control"] = "no-store"
+    # A stable opaque cache namespace, never another person's id or email.
+    identity = f"{len(principal.org_id)}:{principal.org_id}{principal.user_id}"
+    scope = hashlib.sha256(identity.encode()).hexdigest()
+    person = live_app_person(principal)
+    if person is None:
+        return LiveAppAvailabilityResponse(waiting=False, scope=scope)
+    try:
+        availability = await person_availability(person)
+    except LiveAppLaunchError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from None
+    notice = None if availability.notice_id is None else LiveAppAvailabilityNotice(
+        id=availability.notice_id, message=AVAILABILITY_MESSAGE
+    )
+    return LiveAppAvailabilityResponse(waiting=availability.waiting, notice=notice, scope=scope)
+
+
+@router.post(
+    "/availability/{notice_id}/ack",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def acknowledge_live_app_availability(
+    notice_id: UUID, principal: Principal | None = Depends(get_principal)
+) -> Response:
+    from anton.core.artifacts.live_app_slots import LiveAppLaunchError
+
+    person = live_app_person(_availability_principal(principal))
+    if person is not None:
+        try:
+            await acknowledge_availability(person, notice_id)
+        except LiveAppLaunchError as error:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # OpenByDesign, standalone reason: the credential is the visitor's viewer
