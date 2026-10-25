@@ -559,7 +559,7 @@ def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
 
     from_disk = []
     opened_names = []
-    original_entry_name = artifact_files._existing_draft_entry_name
+    original_entry_name = artifact_files.existing_draft_entry_name
     original_open_child = workspace_ep.open_pinned_child
     original_dir_lstat = workspace_ep.dir_lstat
 
@@ -576,7 +576,7 @@ def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
         opened_names.append(name)
         return original_dir_lstat(directory, name)
 
-    monkeypatch.setattr(artifact_files, "_existing_draft_entry_name", entry_name)
+    monkeypatch.setattr(artifact_files, "existing_draft_entry_name", entry_name)
     monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
     monkeypatch.setattr(workspace_ep, "dir_lstat", lstat)
 

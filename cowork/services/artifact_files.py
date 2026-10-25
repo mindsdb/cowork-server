@@ -25,6 +25,7 @@ from __future__ import annotations
 import errno
 import ntpath
 import os
+import re
 import stat
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -80,13 +81,15 @@ _RESERVED_DEVICE_NAMES = frozenset(
 # directory open and a scan, and one document can name thousands of
 # references, so a chain thousands of folders deep would hold the export for
 # seconds. The drafts route serves one file per request and has no cap.
-_MAX_PATH_PARTS = 64
+MAX_PATH_PARTS = 64
 
 # The most directory entries one export read scans while it matches names. A
 # folder the agent fills with entries would otherwise make every segment of
 # every reference read all of them. The drafts route reads every entry, so a
 # folder of map tiles still serves.
 _MAX_SCANNED_ENTRIES = 20_000
+
+_PATH_SEPARATORS = re.compile(r"[/\\]")
 
 
 class ArtifactFileRefused(Exception):
@@ -122,7 +125,7 @@ class _OpenedFile(NamedTuple):
     file_stat: os.stat_result
 
 
-class _CheckedName(NamedTuple):
+class CheckedName(NamedTuple):
     """A name the walk opened by a joined path, and the file its ``lstat`` saw."""
 
     directory: PinnedDir
@@ -142,24 +145,58 @@ class _ScanBudget:
         self.remaining -= 1
 
 
-def _relative_file_parts(value: str) -> tuple[str, ...]:
-    """Split an untrusted relative path into safe, single components.
+def _is_plain_segment(*, segment: str) -> bool:
+    """Whether *segment* is one name: not empty, ``.`` or ``..``, with no separator, NUL or drive."""
+    return (
+        segment not in {"", ".", ".."}
+        and not any(character in segment for character in "/\\\x00")
+        and not ntpath.splitdrive(segment)[0]
+    )
 
-    The returned strings are passed to descriptor-relative opens; no
-    request-derived string is ever joined onto an absolute filesystem path.
-    Treat backslashes as separators too so the validation has the same meaning
-    on the Windows desktop and the Linux service. A UNC or device path starts
-    with two separators, so the leading-separator rule refuses it.
+
+def split_relative_path(*, text: str, skip_dot_segments: bool = False) -> tuple[str, ...]:
+    """Split a relative path a request or a document names into plain segments.
+
+    Every relative path goes through here, and every segment through the rule
+    the pinned read checks again. Backslashes separate too, so the rules mean
+    the same on the Windows desktop and the Linux service. NUL is refused, and
+    so is a drive: a UNC or device path is a drive that starts with two
+    separators. A leading separator leaves an empty first segment, so it is
+    refused with the rest. A ``.`` segment is refused unless
+    *skip_dot_segments*: in a document, ``./chart.png`` names ``chart.png``.
+
+    Raises ``ArtifactFileRefused`` with the reason an export records.
     """
-    if not value or "\x00" in value:
-        raise ValueError("invalid path")
-    normalized = value.replace("\\", "/")
-    if normalized.startswith("/") or ntpath.splitdrive(normalized)[0]:
-        raise ValueError("invalid path")
-    parts = tuple(normalized.split("/"))
-    if not parts or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError("invalid path")
+    if "\x00" in text:
+        raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "NUL")
+    if not text:
+        raise ArtifactFileRefused(OmittedReason.MISSING, "empty path")
+    drive = ntpath.splitdrive(text)[0]
+    if drive:
+        reason = OmittedReason.UNC_PATH if drive[0] in "/\\" else OmittedReason.TRAVERSAL
+        raise ArtifactFileRefused(reason, "drive or UNC path")
+    parts = tuple(
+        segment
+        for segment in _PATH_SEPARATORS.split(text)
+        if not (skip_dot_segments and segment == ".")
+    )
+    if not parts or not all(_is_plain_segment(segment=segment) for segment in parts):
+        raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "segment is not a plain name")
     return parts
+
+
+def relative_file_parts(value: str) -> tuple[str, ...]:
+    """Split an untrusted request path into safe, single components.
+
+    ``split_relative_path`` holds the rules; a refusal here is a
+    ``ValueError``. The returned strings are passed to descriptor-relative
+    opens; no request-derived string is ever joined onto an absolute
+    filesystem path.
+    """
+    try:
+        return split_relative_path(text=value)
+    except ArtifactFileRefused as exc:
+        raise ValueError("invalid path") from exc
 
 
 def artifact_folder_name(*, source: ProjectArtifacts, folder: Path) -> str:
@@ -183,7 +220,7 @@ def artifact_folder_name(*, source: ProjectArtifacts, folder: Path) -> str:
     return name
 
 
-def _existing_draft_entry_name(
+def existing_draft_entry_name(
     directory: PinnedDir,
     requested: str,
     *,
@@ -256,31 +293,25 @@ def _windows_rewrites(*, name: str) -> bool:
     )
 
 
-def _refuse_unsafe_parts(*, parts: tuple[str, ...]) -> None:
+def refuse_unsafe_parts(*, parts: tuple[str, ...]) -> None:
     """Refuse a path whose text alone makes it unsafe, before any file call.
 
     Two leading separators make a UNC path, and ``\\\\?\\`` or ``\\\\.\\`` a
     device path: on Windows even a stat of one can send the user's credentials
-    to another host. Each segment must then be one plain name, and a name
-    Windows would rewrite is refused on every platform.
+    to another host. Each segment must then be one plain name, by the rule
+    ``split_relative_path`` splits with, and a name Windows would rewrite is
+    refused on every platform.
     """
     if "/".join(parts).replace("\\", "/").startswith("//"):
         raise ArtifactFileRefused(OmittedReason.UNC_PATH, "UNC or device path")
     if not parts:
         raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "empty path")
     for segment in parts:
-        if (
-            segment in {"", ".", ".."}
-            or "/" in segment
-            or "\\" in segment
-            or "\x00" in segment
-            or ntpath.splitdrive(segment)[0]
-            or _windows_rewrites(name=segment)
-        ):
+        if not _is_plain_segment(segment=segment) or _windows_rewrites(name=segment):
             raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "segment is not a plain name")
 
 
-def _refuse_housekeeping(*, parts: tuple[str, ...]) -> None:
+def refuse_housekeeping(*, parts: tuple[str, ...]) -> None:
     if parts[0].casefold() in _HOUSEKEEPING_NAMES or any(
         segment.casefold() in _HOUSEKEEPING_AT_ANY_DEPTH for segment in parts[1:]
     ):
@@ -303,7 +334,7 @@ def _disk_name(*, directory: PinnedDir, requested: str, budget: _ScanBudget | No
         raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "segment is not a plain name")
     try:
         dir_lstat(directory, requested)
-        return _existing_draft_entry_name(directory, requested, budget=budget)
+        return existing_draft_entry_name(directory, requested, budget=budget)
     except (OSError, ValueError) as exc:
         raise ArtifactFileRefused(OmittedReason.MISSING, "no such entry") from exc
 
@@ -313,14 +344,14 @@ def _disk_name(*, directory: PinnedDir, requested: str, budget: _ScanBudget | No
 _NAME_SURROGATE_TAG = 0x20000000
 
 
-def _refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> _CheckedName | None:
+def refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> CheckedName | None:
     """Without a directory descriptor, refuse a link before opening through it.
 
     ``lstat`` reports the link itself. A symlink is refused as one. A junction
     or mount point is a reparse point whose tag marks it a name surrogate, one
     that stands for another path. Other reparse points, such as cloud-sync
     placeholders and deduplicated files, are files in place and are read.
-    Returns what ``lstat`` saw, for ``_refuse_a_changed_walk``; with a
+    Returns what ``lstat`` saw, for ``refuse_a_changed_walk``; with a
     directory descriptor there is nothing to check, and it returns None.
     """
     if directory.fd is not None:
@@ -334,12 +365,12 @@ def _refuse_link_by_lstat(*, directory: PinnedDir, name: str) -> _CheckedName | 
     is_reparse_point = getattr(entry_stat, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     if is_reparse_point and getattr(entry_stat, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG:
         raise ArtifactFileRefused(OmittedReason.REPARSE_POINT, "link")
-    return _CheckedName(
+    return CheckedName(
         directory=directory, name=name, identity=(entry_stat.st_dev, entry_stat.st_ino)
     )
 
 
-def _refuse_a_changed_walk(*, checked: list[_CheckedName]) -> None:
+def refuse_a_changed_walk(*, checked: list[CheckedName]) -> None:
     """Once the file is open, refuse a walk whose names changed since their ``lstat``.
 
     Each name was opened by a joined path after its ``lstat``, so a folder on
@@ -347,7 +378,7 @@ def _refuse_a_changed_walk(*, checked: list[_CheckedName]) -> None:
     between. Every name must still be no link and the same file it was.
     """
     for entry in checked:
-        current = _refuse_link_by_lstat(directory=entry.directory, name=entry.name)
+        current = refuse_link_by_lstat(directory=entry.directory, name=entry.name)
         if current is None or current.identity != entry.identity:
             raise ArtifactFileRefused(OmittedReason.MISSING, "changed during the walk")
 
@@ -369,12 +400,12 @@ def _open_failure(*, directory: PinnedDir, name: str, exc: OSError) -> ArtifactF
     return ArtifactFileRefused(OmittedReason.MISSING, "cannot open")
 
 
-def _descend(*, directory: PinnedDir, name: str, checked: list[_CheckedName]) -> PinnedDir:
+def _descend(*, directory: PinnedDir, name: str, checked: list[CheckedName]) -> PinnedDir:
     """Open direct child directory *name*, returning a ``PinnedDir`` to close.
 
     Without a directory descriptor, what ``lstat`` saw joins *checked*.
     """
-    seen = _refuse_link_by_lstat(directory=directory, name=name)
+    seen = refuse_link_by_lstat(directory=directory, name=name)
     if seen is not None:
         checked.append(seen)
         return open_pinned_child(directory, name)
@@ -401,8 +432,8 @@ def _open_regular_file(
     """
     if not parts:
         raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "empty path")
-    _refuse_housekeeping(parts=parts)
-    checked: list[_CheckedName] = []
+    refuse_housekeeping(parts=parts)
+    checked: list[CheckedName] = []
     current = folder
     try:
         for requested in parts[:-1]:
@@ -417,7 +448,7 @@ def _open_regular_file(
             if parent is not folder:
                 parent.close()
         name = _disk_name(directory=current, requested=parts[-1], budget=budget)
-        seen = _refuse_link_by_lstat(directory=current, name=name)
+        seen = refuse_link_by_lstat(directory=current, name=name)
         if seen is not None:
             checked.append(seen)
         try:
@@ -425,7 +456,7 @@ def _open_regular_file(
         except OSError as exc:
             raise _open_failure(directory=current, name=name, exc=exc) from exc
         resources.callback(os.close, fd)
-        _refuse_a_changed_walk(checked=checked)
+        refuse_a_changed_walk(checked=checked)
     finally:
         if current is not folder:
             current.close()
@@ -442,7 +473,7 @@ def _open_regular_file(
     return _OpenedFile(fd=fd, file_stat=file_stat)
 
 
-def _open_pinned_draft_file(
+def open_pinned_draft_file(
     source: ProjectArtifacts, folder: Path, parts: tuple[str, ...]
 ) -> PinnedDraftFile:
     """Open one regular draft file without following any writable symlink.
@@ -486,14 +517,14 @@ def read_artifact_file_entry(
     ``UNC_PATH``, a junction or other reparse point that stands for another
     path is ``REPARSE_POINT``, anything absent or not a regular file is
     ``MISSING``, a file over *max_bytes* is ``TOO_LARGE``,
-    and a path over ``_MAX_PATH_PARTS`` segments or a walk that would read
+    and a path over ``MAX_PATH_PARTS`` segments or a walk that would read
     over ``_MAX_SCANNED_ENTRIES`` directory entries is ``BUDGET``. The read
     stops one byte past *max_bytes*, so a file that grows after the size
     check is still refused. Every descriptor is closed before it returns or
     raises.
     """
-    _refuse_unsafe_parts(parts=parts)
-    if len(parts) > _MAX_PATH_PARTS:
+    refuse_unsafe_parts(parts=parts)
+    if len(parts) > MAX_PATH_PARTS:
         raise ArtifactFileRefused(OmittedReason.BUDGET, "path nests too deep")
     with ExitStack() as resources:
         opened = _open_regular_file(

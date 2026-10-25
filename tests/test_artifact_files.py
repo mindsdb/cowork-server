@@ -128,7 +128,7 @@ def test_a_path_refused_by_its_text_never_reaches_the_filesystem(art, monkeypatc
 
 
 def test_a_path_deeper_than_the_cap_is_refused_before_any_file_call(art, monkeypatch):
-    parts = ("d",) * artifact_files._MAX_PATH_PARTS + ("chart.png",)
+    parts = ("d",) * artifact_files.MAX_PATH_PARTS + ("chart.png",)
 
     reason = _refusal_without_file_calls(folder=art, parts=parts, monkeypatch=monkeypatch)
 
@@ -136,7 +136,7 @@ def test_a_path_deeper_than_the_cap_is_refused_before_any_file_call(art, monkeyp
 
 
 def test_a_path_at_the_depth_cap_reads(art):
-    folders = ("d",) * (artifact_files._MAX_PATH_PARTS - 1)
+    folders = ("d",) * (artifact_files.MAX_PATH_PARTS - 1)
     art.joinpath(*folders).mkdir(parents=True)
     art.joinpath(*folders, "chart.png").write_bytes(PNG)
 
@@ -226,7 +226,7 @@ def test_a_name_holding_a_lone_surrogate_is_missing(art, tmp_path, parts):
     source, folder = _draft_artifact(tmp_path=tmp_path)
 
     with pytest.raises(ArtifactFileRefused) as drafts:
-        artifact_files._open_pinned_draft_file(source, folder, parts)
+        artifact_files.open_pinned_draft_file(source, folder, parts)
 
     assert _refusal(folder=art, parts=parts) is OmittedReason.MISSING
     assert drafts.value.reason is OmittedReason.MISSING
@@ -579,7 +579,7 @@ def test_only_names_from_the_directory_scan_reach_an_open(art, monkeypatch):
     requested = (("sub" + "x")[:-1], ("chart.png" + "x")[:-1])
     scanned: list[str] = []
     opened: list[str] = []
-    real_entry_name = artifact_files._existing_draft_entry_name
+    real_entry_name = artifact_files.existing_draft_entry_name
     real_dir_open = artifact_files.dir_open
     real_open_child = artifact_files.open_pinned_child
 
@@ -596,7 +596,7 @@ def test_only_names_from_the_directory_scan_reach_an_open(art, monkeypatch):
         opened.append(name)
         return real_open_child(directory, name, **kwargs)
 
-    monkeypatch.setattr(artifact_files, "_existing_draft_entry_name", entry_name)
+    monkeypatch.setattr(artifact_files, "existing_draft_entry_name", entry_name)
     monkeypatch.setattr(artifact_files, "dir_open", recording_open)
     monkeypatch.setattr(artifact_files, "open_pinned_child", recording_child)
 
@@ -683,7 +683,7 @@ def test_the_source_name_match_still_accepts_a_housekeeping_name(art, name):
     (art / name).write_text("# source\n", encoding="utf-8")
 
     with pinned_dir(art) as pinned:
-        found = artifact_files._existing_draft_entry_name(pinned, name, native_case=True)
+        found = artifact_files.existing_draft_entry_name(pinned, name, native_case=True)
 
     assert found == name
 
@@ -800,7 +800,7 @@ async def test_the_drafts_route_serves_a_path_deeper_than_the_export_cap(
 ):
     """The depth cap bounds an export read; the drafts route serves any depth."""
     source, folder = _draft_artifact(tmp_path=tmp_path)
-    folders = ("d",) * artifact_files._MAX_PATH_PARTS
+    folders = ("d",) * artifact_files.MAX_PATH_PARTS
     folder.joinpath(*folders).mkdir(parents=True)
     folder.joinpath(*folders, "notes.txt").write_text("deep", encoding="utf-8")
     rel_path = "/".join((*folders, "notes.txt"))
@@ -854,7 +854,7 @@ async def test_on_windows_the_drafts_route_hides_a_trailing_dot_spelling_of_a_ho
         handle.write(b"decoy")
     try:
         with pytest.raises(ArtifactFileRefused) as refused:
-            artifact_files._open_pinned_draft_file(source, folder, ("metadata.json.",))
+            artifact_files.open_pinned_draft_file(source, folder, ("metadata.json.",))
         with pytest.raises(HTTPException) as error:
             await _serve_draft(
                 monkeypatch=monkeypatch, source=source, folder=folder, rel_path="metadata.json."
@@ -873,9 +873,9 @@ def test_the_drafts_open_names_its_refusal(tmp_path, outside):
     _hard_link(target=outside / "secret.txt", link=folder / "leak.txt")
 
     with pytest.raises(ArtifactFileRefused) as housekeeping:
-        artifact_files._open_pinned_draft_file(source, folder, ("sub", "metadata.json"))
+        artifact_files.open_pinned_draft_file(source, folder, ("sub", "metadata.json"))
     with pytest.raises(ArtifactFileRefused) as hard_link:
-        artifact_files._open_pinned_draft_file(source, folder, ("leak.txt",))
+        artifact_files.open_pinned_draft_file(source, folder, ("leak.txt",))
 
     assert housekeeping.value.reason is OmittedReason.HOUSEKEEPING
     assert hard_link.value.reason is OmittedReason.SYMLINK
@@ -939,10 +939,10 @@ def test_the_services_package_imports_nothing_from_the_api_package():
 # its tests still call them positionally.
 _MOVED_FROM_THE_DRAFTS_ROUTE = frozenset(
     {
-        "_relative_file_parts",
-        "_existing_draft_entry_name",
+        "relative_file_parts",
+        "existing_draft_entry_name",
         "_names_one_inode",
-        "_open_pinned_draft_file",
+        "open_pinned_draft_file",
     }
 )
 
