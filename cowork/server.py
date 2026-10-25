@@ -51,7 +51,11 @@ from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
 from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
+from cowork.common.settings.app_settings import (
+    TurnQueueSettings,
+    get_app_settings,
+    get_export_pdf_settings,
+)
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
@@ -453,6 +457,9 @@ def create_app() -> FastAPI:
     """
 
     settings = get_app_settings()
+    # PDF export settings come from the process environment alone. An engine
+    # other than "render", or "render" without an http(s) URL, stops the start.
+    get_export_pdf_settings()
 
     from cowork.deployment_identity import initialize_deployment_identity
 

@@ -1,0 +1,114 @@
+# Same shape as elements.yaml.
+
+- id: event-handlers
+  html: '<body onload="alert(0)"><p onclick="alert(1)" ONMOUSEOVER="alert(2)" id="p1">x</p><svg onload="alert(3)"><rect onbegin="alert(4)"/></svg></body>'
+  present: ['<body><p id="p1">x</p><svg><rect></rect></svg></body>']
+  absent: ['alert', 'onclick', 'onmouseover', 'onload', 'onbegin']
+
+- id: loading-attributes-on-kept-elements
+  html: '<body background="{outside}/body.png"><table background="tile.png"><tr><td background="{outside}/cell.png" lowsrc="low.png">t</td></tr></table></body>'
+  present: ['<body><table><tr><td>t</td></tr></table></body>']
+  absent: ['background', 'lowsrc', 'tile', 'cell.png']
+  omitted:
+    - [scheme, '{outside}/body.png']
+    - [unsupported_type, tile.png]
+    - [scheme, '{outside}/cell.png']
+    - [unsupported_type, low.png]
+
+- id: navigation-attributes-go-quietly
+  html: '<blockquote cite="{outside}/cite">q</blockquote><img src="chart.png" longdesc="{outside}/long" usemap="#m" ismap><a href="https://example.com/" ping="{outside}/ping" target="_blank">a</a><p profile="{outside}/p">p</p>'
+  present: ['<blockquote>q</blockquote>', '<a href="https://example.com/">a</a>', '<p>p</p>']
+  absent: ['cite=', 'longdesc', 'usemap', 'ismap', 'ping', 'target', 'profile']
+
+- id: html-element-manifest-and-namespaces
+  html: '<html manifest="{outside}/app.manifest" xmlns:xi="http://www.w3.org/2001/XInclude" lang="en"><body>x</body></html>'
+  present: ['<html lang="en">']
+  absent: ['manifest', 'xmlns', 'XInclude']
+  omitted: [[scheme, '{outside}/app.manifest']]
+
+- id: link-targets
+  html: >-
+    <a href="https://example.com/a">1</a><a href="HTTP://example.com/b">2</a><a href="mailto:x@example.com">3</a><a href="#top">4</a><a href="javascript:alert(1)">5</a><a href=" java&#9;script:alert(2)">6</a><a href="data:text/html,x">7</a><a href="vbscript:x">8</a><a href="page.html">9</a><a href="file:///etc/passwd">10</a><a href="  https://example.com/c  ">11</a>
+  present:
+    - '<a href="https://example.com/a">1</a>'
+    - '<a href="HTTP://example.com/b">2</a>'
+    - '<a href="mailto:x@example.com">3</a>'
+    - '<a href="#top">4</a>'
+    - '<a>5</a>'
+    - '<a>6</a>'
+    - '<a>7</a>'
+    - '<a>8</a>'
+    - '<a>9</a>'
+    - '<a>10</a>'
+    - '<a href="https://example.com/c">11</a>'
+  absent: ['javascript', 'vbscript', 'data:text', 'page.html', 'file:']
+
+- id: svg-references-keep-only-fragments
+  html: >-
+    <svg><defs><linearGradient id="g"></linearGradient></defs><rect fill="url(#g)" stroke="url('#g')" filter="url({outside}/f.svg#x)" mask="u\72 l({outside}/m)" clip-path="url(clip.svg#c)" marker-end="url(#m)"/><use href="#g"/><use xlink:href="sprite.svg#icon"/><use href="{outside}/s.svg#a"/><a xlink:href="https://example.com/">l</a><textPath href="#p">t</textPath></svg>
+  present:
+    - '<rect fill="url(#g)" stroke="url(''#g'')" marker-end="url(#m)"></rect>'
+    - '<use href="#g"></use>'
+    - '<a xlink:href="https://example.com/">l</a>'
+    - '<textpath href="#p">t</textpath>'
+  absent: ['filter=', 'mask=', 'clip-path=', 'sprite', 's.svg']
+  omitted:
+    - [scheme, '{outside}/f.svg#x']
+    - [scheme, '{outside}/m']
+    - [unsupported_type, 'clip.svg#c']
+    - [unsupported_type, 'sprite.svg#icon']
+    - [scheme, '{outside}/s.svg#a']
+
+- id: url-in-any-attribute
+  html: '<p title="see url({outside}/t)" data-bg="url(#ok)" class="a" aria-label="u\72 l(chart.png)">x</p>'
+  present: ['<p data-bg="url(#ok)" class="a">x</p>']
+  absent: ['title=', 'aria-label']
+  omitted: [[scheme, '{outside}/t'], [unsupported_type, chart.png]]
+
+- id: url-through-substitution-in-an-attribute
+  html: '<svg><rect fill="image-set(var(--u) 1x)" stroke="red"/></svg>'
+  present: ['<rect stroke="red"></rect>']
+  absent: ['fill=']
+
+- id: data-and-aria-kept-other-unknown-attributes-go
+  html: '<div data-chart="1" aria-label="Chart" role="img" tabindex="0" contenteditable="true" draggable="true" accesskey="k" is="x-y">x</div>'
+  present: ['<div data-chart="1" aria-label="Chart" role="img">x</div>']
+  absent: ['tabindex', 'contenteditable', 'draggable', 'accesskey', 'is=']
+
+- id: style-attribute-drops-only-the-unresolved-declaration
+  html: '<p style="color: red; background: url({outside}/x.png); width: 10px">x</p>'
+  present: ['<p style="color: red;width: 10px;">x</p>']
+  omitted: [[scheme, '{outside}/x.png']]
+
+- id: style-attribute-inlines
+  html: '<p style="background-image:url(chart.png)">x</p>'
+  present: ['<p style="background-image:url(data:image/png;base64,']
+
+- id: style-attribute-emptied-goes
+  html: '<p style="background:url(absent.png)">x</p>'
+  present: ['<p>x</p>']
+  omitted: [[missing, absent.png]]
+
+- id: style-attribute-on-svg-keeps-fragment
+  html: '<svg><rect style="fill: url(#g); stroke: url({outside}/s)"/></svg>'
+  present: ['<rect style="fill: url(#g);"></rect>']
+  omitted: [[scheme, '{outside}/s']]
+
+- id: style-attribute-escapes-angle-brackets
+  html: '<p style="font-family: &quot;&lt;/p&gt;&lt;img src=x&gt;&quot;">x</p>'
+  present: ['\3c /p\3e \3c img src=x\3e ']
+  absent: ['<img']
+
+# libxml2 accepts these characters in names and values, but lxml refuses to
+# delete or set a name holding one, so the attribute goes.
+- id: attribute-name-with-a-control-character
+  html: "<p a\x01b=\"1\" id=\"p1\">x</p><img a\x02=\"1\" src=\"chart.png\" alt=\"c\"><div data-a\x0bb=\"1\" data-\uFFFE=\"2\" data-ok=\"3\">d</div>"
+  # libxml2 before 2.12 splits a name at the bad character, which can leave a
+  # valueless data- attribute; either way no such character survives.
+  present: ['<p id="p1">x</p>', '<img alt="c" src="data:image/png;base64,', 'data-ok="3">d</div>']
+  absent: ["\x01", "\x02", "\x0b", "\uFFFE"]
+
+- id: kept-attribute-value-with-a-character-xml-refuses
+  html: "<p title=\"a\x01b\" onclick=\"x()\">x</p><a href=\"#a\uFFFE\" onclick=\"x()\">y</a>"
+  present: ['<p>x</p>', '<a>y</a>']
+  absent: ["\x01", "\uFFFE", 'onclick']
