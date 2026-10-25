@@ -41,6 +41,7 @@ from cowork.managed import (
 )
 from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
+from cowork.services.live_apps import live_app_slot_paths
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
@@ -567,6 +568,11 @@ def create_app() -> FastAPI:
     # Identity headers need the code sandbox, and the sandbox needs a kernel
     # and an anton that hold it (cowork.code_sandbox.check_startup).
     check_code_sandbox_startup(settings, remote_turns=TurnQueueSettings().is_remote)
+    # The edge's access check and stopped page for each live-app slot carry
+    # only the visitor's viewer sign-in cookie, and a slot's stop report
+    # carries nothing; each route checks its caller itself
+    # (cowork.services.live_apps.live_app_slot_paths).
+    channel_webhook_paths.update(live_app_slot_paths())
     # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
     # turns in this process (check_write_approval_startup).
     check_write_approval_startup(

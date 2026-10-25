@@ -1,13 +1,13 @@
 """Persist shared-publisher ownership independently of editable artifact files.
 
 Revision ID: e3618a102301
-Revises: 3e4b5f7586d3
+Revises: f3b9d6a2c8e4
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "e3618a102301"
-down_revision = "3e4b5f7586d3"
+down_revision = "f3b9d6a2c8e4"
 branch_labels = None
 depends_on = None
 
