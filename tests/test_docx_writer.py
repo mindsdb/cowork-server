@@ -636,6 +636,29 @@ def test_writer_takes_the_note_and_character_filter_from_the_inliner():
     assert docx_writer.XML_UNSAFE is artifact_inline.XML_UNSAFE
 
 
+def test_writer_takes_the_image_signatures_and_placeholders_from_the_inliner():
+    assert docx_writer.PNG_SIGNATURE is artifact_inline.PNG_SIGNATURE
+    assert docx_writer.JPEG_SIGNATURE is artifact_inline.JPEG_SIGNATURE
+    assert docx_writer.GIF_SIGNATURES is artifact_inline.GIF_SIGNATURES
+    assert isinstance(docx_writer._SetAsideUris().placeholders, artifact_inline.UriPlaceholders)
+
+
+def test_an_item_outside_any_list_is_a_first_level_bullet_and_deep_lists_stop_at_level_3():
+    package = _write(
+        "<li>loose</li>"
+        "<ol><li>one<ul><li>two<ol><li>three<ul><li>four</li></ul></li></ol></li></ul></li></ol>"
+    )
+    styles = {p.text.strip(): p.style.name for p in package.document.paragraphs if p.text.strip()}
+
+    assert styles == {
+        "loose": "List Bullet",
+        "one": "List Number",
+        "two": "List Bullet 2",
+        "three": "List Number 3",
+        "four": "List Bullet 3",
+    }
+
+
 # Large inlined assets
 
 LARGE_ASSETS = yaml.safe_load((FIXTURES / "large_assets.yaml").read_text(encoding="utf-8"))

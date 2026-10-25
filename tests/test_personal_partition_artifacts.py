@@ -870,6 +870,12 @@ def test_shared_projects_with_personal_connections_refuse_a_live_backend(
     monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: True)
     monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
     monkeypatch.setattr(artifacts, "_PREVIEW_MOUNTS", {})
+    if status_code == 409:
+        # Startup rejects this configuration. Keep exercising the route's
+        # independent refusal too, behind that earlier guard.
+        with pytest.raises(RuntimeError, match="private connections require personal projects"):
+            _client()
+        monkeypatch.setattr("cowork.server.check_code_sandbox_startup", lambda *_a, **_kw: None)
     client = _client()
 
     for headers in (A, B):

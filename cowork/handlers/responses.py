@@ -119,6 +119,7 @@ from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
+from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
@@ -834,7 +835,7 @@ class ResponsesHandler:
                 partial(_conversation_for_harness, conversation_id=start.conversation_id),
                 scope=self.scope,
             )
-            with use_settings_scope(self.scope):
+            with use_settings_scope(self.scope), use_live_app_launcher(self.principal):
                 stream = harness.stream_response(
                     conversation=conversation,
                     input=start.harness_input,
@@ -2429,7 +2430,7 @@ class ResponsesHandler:
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
-        with use_settings_scope(scope_from_principal(self.principal)):
+        with use_settings_scope(scope_from_principal(self.principal)), use_live_app_launcher(self.principal):
             try:
                 await self._run_turn(**kwargs)
             finally:

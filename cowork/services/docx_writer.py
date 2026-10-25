@@ -15,7 +15,6 @@ import copy
 import io
 import itertools
 import re
-import secrets
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -41,9 +40,13 @@ from lxml.html import HtmlElement
 
 from cowork.schemas.artifact_export import InlinedDocument
 from cowork.services.artifact_inline import (
+    GIF_SIGNATURES,
+    JPEG_SIGNATURE,
     JPEG_STANDALONE_MARKERS,
+    PNG_SIGNATURE,
     TRUNCATION_NOTE,
     XML_UNSAFE,
+    UriPlaceholders,
     parse_stopped,
 )
 
@@ -92,9 +95,6 @@ _LONG_DATA_URI = re.compile(rf"(?<!{_URI_CHARACTER})(?i:data:){_URI_CHARACTER}{{
 # The attributes the writer reads text or a URI from.
 _READ_ATTRIBUTES = ("src", "alt", "href")
 
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_JPEG_SIGNATURE = b"\xff\xd8\xff"
-_GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
 # python-docx keeps every chunk of a PNG, every marker before a JPEG's scan,
 # and every entry of each Exif block's first directory, strings and all,
 # before it reads an image's size. So a small crafted header can cost a
@@ -203,13 +203,14 @@ class _Flow:
 
 @dataclass(eq=False)
 class _ListNumbering:
-    """One list's numbering as its items go by.
+    """One list's level, style and numbering as its items go by.
 
     Items share one w:num and Word counts them on. An item's value attribute
     starts a new w:num at that number, and in a reversed list every item
     gets its own w:num, since Word only counts up.
     """
 
+    level: int  # 1 to MAX_LIST_LEVEL
     style: str
     ordered: bool
     number_format: str | None
@@ -224,9 +225,7 @@ class _Context:
     run: _RunStyle = field(default_factory=_RunStyle)
     pre: bool = False
     paragraph_style: str | None = None
-    list_kind: str | None = None
-    list_level: int = 0
-    list_numbering: _ListNumbering | None = None
+    list_numbering: _ListNumbering | None = None  # the innermost list around the element
     depth: int = 0
     table_depth: int = 0
 
@@ -332,18 +331,14 @@ class _SetAsideUris:
     libxml2 with huge_tree off stops reading after about 10 MB of large
     attribute or text tokens and drops the rest of the document, so a few
     inlined images would cut every block after them. The parser reads a
-    placeholder instead, and ``put_back`` restores each URI in the tree.
+    placeholder from ``UriPlaceholders`` instead, and ``put_back`` restores
+    each URI in the tree.
     """
 
-    uris: list[str] = field(default_factory=list)
-    nonce: str = field(default_factory=lambda: secrets.token_hex(16))
+    placeholders: UriPlaceholders = field(default_factory=UriPlaceholders)
 
     def set_aside(self, *, text: str) -> str:
-        return _LONG_DATA_URI.sub(lambda match: self._placeholder(uri=match.group()), text)
-
-    def _placeholder(self, *, uri: str) -> str:
-        self.uris.append(uri)
-        return f"{self.nonce}{len(self.uris) - 1}-"
+        return _LONG_DATA_URI.sub(lambda match: self.placeholders.hold(uri=match.group()), text)
 
     def put_back(self, *, root: HtmlElement) -> None:
         """Swap each placeholder in a text, or in an attribute the writer reads, back for its URI.
@@ -351,13 +346,14 @@ class _SetAsideUris:
         A placeholder anywhere else stays: nothing reads it, and the parser
         accepts attribute names, such as ``{a``, that lxml refuses to set.
         """
-        if not self.uris:
+        if not self.placeholders.uris:
             return
-        placeholder = re.compile(re.escape(self.nonce) + r"([0-9]+)-")
         paths = [f"//@{name}[contains(., $nonce)]" for name in _READ_ATTRIBUTES]
-        found = root.xpath(" | ".join([*paths, "//text()[contains(., $nonce)]"]), nonce=self.nonce)
+        found = root.xpath(
+            " | ".join([*paths, "//text()[contains(., $nonce)]"]), nonce=self.placeholders.nonce
+        )
         for value in found:
-            restored = placeholder.sub(lambda match: self.uris[int(match.group(1))], value)
+            restored = self.placeholders.restore(text=value)
             owner = value.getparent()
             if value.is_attribute:
                 owner.set(value.attrname, restored)
@@ -504,15 +500,17 @@ class _Writer:
             return replace(outer, pre=True, run=replace(outer.run, monospace=True))
         if tag in ("ul", "ol"):
             _close_paragraph(flow=flow)
-            level = min(outer.list_level + 1, MAX_LIST_LEVEL)
-            numbering = _list_numbering(element=element, kind=tag, level=level)
-            return replace(
-                outer, list_kind=tag, list_level=level, list_numbering=numbering, paragraph_style=None
+            outer_level = outer.list_numbering.level if outer.list_numbering is not None else 0
+            numbering = _list_numbering(
+                element=element, kind=tag, level=min(outer_level + 1, MAX_LIST_LEVEL)
             )
+            return replace(outer, list_numbering=numbering, paragraph_style=None)
         if tag == "li":
-            level = max(outer.list_level, 1)
-            paragraph = self._start_paragraph(flow=flow, style=_list_style(kind=outer.list_kind or "ul", level=level))
+            # An item outside any list is a first-level bullet.
             numbering = outer.list_numbering
+            level = numbering.level if numbering is not None else 1
+            style = numbering.style if numbering is not None else _list_style(kind="ul", level=1)
+            paragraph = self._start_paragraph(flow=flow, style=style)
             if numbering is not None:
                 value = _leading_number(value=element.get("value"), ceiling=MAX_LIST_NUMBER)
                 num_pr = paragraph._p.get_or_add_pPr().get_or_add_numPr()
@@ -949,13 +947,16 @@ def _leading_number(*, value: str | None, ceiling: int) -> int | None:
 def _list_numbering(*, element: HtmlElement, kind: str, level: int) -> _ListNumbering:
     style = _list_style(kind=kind, level=level)
     if kind != "ol":
-        return _ListNumbering(style=style, ordered=False, number_format=None, reversed=False, next_number=1)
+        return _ListNumbering(
+            level=level, style=style, ordered=False, number_format=None, reversed=False, next_number=1
+        )
     start = _leading_number(value=element.get("start"), ceiling=MAX_LIST_NUMBER)
     is_reversed = element.get("reversed") is not None
     if start is None:
         # A reversed list counts down to 1 from its number of items.
         start = min(sum(1 for child in element if child.tag == "li"), MAX_LIST_NUMBER) if is_reversed else 1
     return _ListNumbering(
+        level=level,
         style=style,
         ordered=True,
         number_format=_NUMBER_FORMATS.get(element.get("type") or ""),
@@ -1033,7 +1034,7 @@ def _image_bytes(*, src: str) -> bytes | None:
         data = base64.b64decode(_HTML_SPACE.sub("", payload), validate=True)
     except (binascii.Error, ValueError):
         return None
-    if data.startswith((_PNG_SIGNATURE, _JPEG_SIGNATURE, *_GIF_SIGNATURES)):
+    if data.startswith((PNG_SIGNATURE, JPEG_SIGNATURE, *GIF_SIGNATURES)):
         return data
     return None
 
@@ -1071,7 +1072,7 @@ def _header_is_bounded(*, data: bytes) -> bool:
     then a JFIF or Exif tag at offset 6, and only then the GIF signature.
     So bytes with a GIF signature and either tag are read as a JPEG.
     """
-    if data.startswith(_PNG_SIGNATURE):
+    if data.startswith(PNG_SIGNATURE):
         return _png_chunk_count(data=data) <= _MAX_PNG_CHUNKS
     if data[6:10] in (b"JFIF", b"Exif"):
         return _jpeg_header_is_bounded(data=data)
@@ -1082,7 +1083,7 @@ def _header_is_bounded(*, data: bytes) -> bool:
 
 def _png_chunk_count(*, data: bytes) -> int:
     """The chunks python-docx reads, up to IEND; it stops counting past the cap."""
-    count, offset = 0, len(_PNG_SIGNATURE)
+    count, offset = 0, len(PNG_SIGNATURE)
     while offset + 8 <= len(data) and count <= _MAX_PNG_CHUNKS:
         count += 1
         if data[offset + 4 : offset + 8] == b"IEND":
