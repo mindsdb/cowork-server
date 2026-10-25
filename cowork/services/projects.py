@@ -1027,7 +1027,11 @@ class ProjectService:
         project: Project,
         stage: ProjectRenameStage | None,
     ) -> None:
-        """Commit the staged rows, undoing the staged filesystem move on failure."""
+        """Commit the staged rows, undoing the staged filesystem move on failure.
+
+        After a committed rename, published page owners follow the moved
+        directory, so their links survive it.
+        """
         try:
             self.session.commit()
         except Exception:
@@ -1043,6 +1047,10 @@ class ProjectService:
                         extra=log_context(project_id=stage.project_id),
                     )
             raise
+        if stage is not None and stage.directory_moved:
+            from cowork.services.published_page_ownership import rekey_published_page_paths
+
+            rekey_published_page_paths(stage.old_path, stage.new_path)
 
     def reconcile_renamed_project_links(
         self,

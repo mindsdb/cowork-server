@@ -237,7 +237,7 @@ async def test_refused_none_is_not_retried_with_another_effort(endpoint, caplog)
         record for record in caplog.records
         if record.name == routing.__name__ and record.levelno == logging.WARNING
     ]
-    assert "status=400" in record.getMessage()
+    assert (record.event, record.status_code) == ("router_call_failed", 400)
     assert record.exc_info is None
     assert private not in repr(record.__dict__)
 
@@ -382,7 +382,8 @@ async def test_startup_probe_uses_real_configured_router(
         assert body["tools"][0]["function"]["name"] == "delegate"
         assert body["max_completion_tokens"] == routing._DIRECT_MAX_TOKENS
     assert any(
-        r.name == probe.__name__ and r.levelno == logging.INFO and "outcome=passed" in r.getMessage()
+        r.name == probe.__name__ and r.levelno == logging.INFO
+        and getattr(r, "event", None) == "router_startup_probe_passed"
         for r in caplog.records
     )
     assert endpoint.stream.closed
@@ -408,7 +409,8 @@ async def test_startup_refused_effort_does_not_substitute(endpoint, monkeypatch,
     records = [r for r in caplog.records if r.name == probe.__name__]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
-    assert "outcome=unverified reason=provider_refused" in records[0].getMessage()
+    assert (records[0].event, records[0].reason) == ("router_startup_probe_unverified", "provider_refused")
+    assert records[0].status_code == 400
     assert private not in repr([r.__dict__ for r in caplog.records])
     assert all(client.is_closed for client in endpoint.clients)
 
@@ -437,7 +439,7 @@ async def test_startup_responses_does_not_pass_an_unfinished_or_invalid_response
 
     records = [r for r in caplog.records if r.name == probe.__name__]
     assert len(records) == 1
-    assert "outcome=unverified" in records[0].getMessage()
+    assert records[0].event == "router_startup_probe_unverified"
     assert records[0].levelno == logging.WARNING
     assert "private-failure" not in repr([r.__dict__ for r in caplog.records])
     assert endpoint.stream.closed
@@ -467,4 +469,6 @@ async def test_startup_does_not_probe_coding_when_router_construction_fails(endp
     records = [r for r in caplog.records if r.name == router_probe.__name__]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
-    assert "outcome=unverified reason=configuration_unavailable" in records[0].getMessage()
+    assert (records[0].event, records[0].reason) == (
+        "router_startup_probe_unverified", "configuration_unavailable"
+    )

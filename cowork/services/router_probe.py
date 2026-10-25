@@ -50,15 +50,32 @@ def _valid_response(response: LLMResponse) -> bool:
     return isinstance(response.content, str) and bool(response.content.strip())
 
 
-def _unverified(reason: str, *, provider: str, model: str | None, exc: Exception | None = None) -> None:
+def _unverified(reason: str, *, provider: str, exc: Exception | None = None) -> None:
     # Never format the exception or its body: SDK errors can contain requests,
-    # credentials, provider text, or database values.
-    status = exception_http_status(exc=exc) if exc is not None else None
+    # credentials, provider text, or database values. Values ride as fields,
+    # since the log formatter drops a template's values.
     logger.warning(
-        "[router-startup-probe] outcome=unverified reason=%s provider=%s model=%s "
-        "error=%s status=%s; startup continues; recheck router configuration and provider availability",
-        reason, provider, model, type(exc).__name__ if exc is not None else "none",
-        status if status is not None else "unknown",
+        "Router startup probe could not verify the router; startup continues. "
+        "Recheck the router configuration and the provider's availability",
+        extra={
+            "event": "router_startup_probe_unverified",
+            "outcome": "unverified",
+            "reason": reason,
+            "provider": provider,
+            "error_type": type(exc).__name__ if exc is not None else None,
+            "status_code": exception_http_status(exc=exc) if exc is not None else None,
+        },
+    )
+
+
+def _cleanup_unverified(error_type: str, status: int | None = None) -> None:
+    logger.warning(
+        "Router startup probe cleanup did not finish; startup continues",
+        extra={
+            "event": "router_startup_probe_cleanup_unverified",
+            "error_type": error_type,
+            "status_code": status,
+        },
     )
 
 
@@ -69,10 +86,7 @@ async def _close(resource) -> None:
         async with asyncio.timeout(_CLOSE_TIMEOUT_SECONDS):
             await resource.aclose()
     except Exception as exc:
-        logger.warning(
-            "[router-startup-probe] cleanup=unverified error=%s status=%s; startup continues",
-            type(exc).__name__, exception_http_status(exc=exc) or "unknown",
-        )
+        _cleanup_unverified(type(exc).__name__, exception_http_status(exc=exc))
 
 
 async def _read_response(events) -> LLMResponse | None:
@@ -102,9 +116,7 @@ async def _stop_read(task: asyncio.Task | None) -> None:
             done, _ = await asyncio.wait({task}, timeout=_CLOSE_TIMEOUT_SECONDS)
             if done:
                 return
-        logger.warning(
-            "[router-startup-probe] cleanup=unverified error=TimeoutError status=unknown; startup continues"
-        )
+        _cleanup_unverified("TimeoutError")
     finally:
         if not task.done():
             task.cancel()
@@ -128,7 +140,7 @@ async def run_router_startup_probe() -> None:
             provider = settings.resolved_router_provider.value
             model = settings.resolved_gate_model
             if not model:
-                _unverified(failure_reason, provider=provider, model=model)
+                _unverified(failure_reason, provider=provider)
                 return
             # Keep the whole client so all constructed role providers close.
             # Missing credentials, including hosted per-turn credentials, fail
@@ -138,7 +150,7 @@ async def run_router_startup_probe() -> None:
             # configuration. Anton then substitutes coding; that cannot verify
             # the router's configured endpoint, transport, or effort.
             if client.router_provider is client.coding_provider:
-                _unverified(failure_reason, provider=provider, model=model)
+                _unverified(failure_reason, provider=provider)
                 return
             failure_reason = "provider_unavailable"
             events = client.router_provider.stream(
@@ -159,13 +171,13 @@ async def run_router_startup_probe() -> None:
             response = reader.result()
             if response is not None and _valid_response(response):
                 logger.info(
-                    "[router-startup-probe] outcome=passed provider=%s model=%s",
-                    provider, model,
+                    "Router startup probe passed",
+                    extra={"event": "router_startup_probe_passed", "outcome": "passed", "provider": provider},
                 )
             else:
-                _unverified("invalid_response", provider=provider, model=model)
+                _unverified("invalid_response", provider=provider)
     except TimeoutError as exc:
-        _unverified("timeout", provider=provider, model=model, exc=exc)
+        _unverified("timeout", provider=provider, exc=exc)
     except Exception as exc:
         status = exception_http_status(exc=exc)
         if failure_reason == "provider_unavailable" and (
@@ -175,7 +187,7 @@ async def run_router_startup_probe() -> None:
             # Refusal includes authentication and access failures. It does not
             # establish that the API, effort, or model is unsupported.
             failure_reason = "provider_refused"
-        _unverified(failure_reason, provider=provider, model=model, exc=exc)
+        _unverified(failure_reason, provider=provider, exc=exc)
     finally:
         try:
             await _stop_read(reader)

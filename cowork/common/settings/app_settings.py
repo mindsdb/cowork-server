@@ -949,6 +949,28 @@ class AppSettings(Settings):
             "Under 'landlock', app backends and Code mode are refused."
         ),
     )
+    live_apps_viewer_login_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_VIEWER_LOGIN_URL"),
+        description=(
+            "With live apps on (anton's ANTON_LIVE_APP_SLOTS), the viewer "
+            "sign-in this server asks who opens an app, for example "
+            "http://viewer-login:4180: its /oauth2/userinfo names the signed-in "
+            "visitor (cowork.services.live_apps). create_app refuses live apps "
+            "without it."
+        ),
+    )
+    live_apps_launch_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_LAUNCH_TOKEN"),
+        description=(
+            "With live apps on, the token anton sends each app slot with a "
+            "launch; each slot holds only its SHA-256. Agent code never "
+            "receives it: anton's launcher passes a cell no COWORK_ variable "
+            "(anton.core.backends.sandbox._ENV_NEVER_PREFIXES). create_app "
+            "refuses live apps with fewer than 32 characters."
+        ),
+    )
 
     organization_switch_enabled: bool = Field(
         default=False,
@@ -972,6 +994,20 @@ class AppSettings(Settings):
     )  # COWORK_SERVER_OWNER
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
+    # The same switch that turns on anton's per-call usage log. Set by evals only.
+    usage_log: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ANTON_USAGE_LOG"),
+        description="Read delegated gate streams to their end so the call's usage is recorded.",
+    )
+
+    @field_validator("usage_log", mode="before")
+    @classmethod
+    def _read_usage_log_as_anton_does(cls, v: object) -> object:
+        # anton reads any other value as off; failing startup here would split the two.
+        if isinstance(v, str):
+            return v.strip().lower() in {"1", "true", "yes", "on"}
+        return v
 
     master_key: str = Field(
         default="",

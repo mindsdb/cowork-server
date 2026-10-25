@@ -336,7 +336,7 @@ POLICY_CARRIERS = {
 #: Where each carrier is constructed today, so the scan below is known to see
 #: them: (relative path, enclosing function, carrier).
 POLICY_CARRIER_SITES = (
-    ("harnesses/anton_harness/harness.py", "AntonHarness._build_chat_session", "ChatSessionConfig"),
+    ("harnesses/anton_harness/harness.py", "AntonHarness._build_turn_session", "ChatSessionConfig"),
     ("services/connectors/probe.py", "CredentialProbe.run", "ChatSessionConfig"),
     ("handlers/probe.py", "ProbeHandler.run", "CredentialProbe"),
     ("services/scratchpad_runtime.py", "_make_runtime", "LocalScratchpadRuntime"),

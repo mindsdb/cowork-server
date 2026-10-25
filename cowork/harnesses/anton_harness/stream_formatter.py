@@ -7,6 +7,7 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.memory_read        (whether the turn read learned memory, and how many entries)
     response.figure_sources     (each figure in the answer and the steps it came from)
     response.completed          (final response object)
     response.failed             (error)
@@ -64,6 +65,31 @@ class ArtifactCreated:
     deterministically — live and on reload."""
 
     artifact: dict
+
+
+@dataclass(frozen=True)
+class TurnMemoryRead:
+    """Synthetic event: whether the turn read learned memory, the person's
+    own or the shared store, and how many entries it put in front of the
+    model (anton's ChatSession.memory_read: rules, lessons, profile lines and
+    scratchpad wisdom, never the operator's managed layer). The harness sends
+    it once anton has built the turn's prompt. Mapped to a
+    `response.memory_read` SSE event below, which the answer's saved events
+    keep."""
+
+    read: bool
+    entries: int
+
+    def payload(self, *, sequence_number: int | None = None) -> dict[str, Any]:
+        """The `response.memory_read` event body, the one shape every answer
+        sends and saves: an agent turn's, here, and a direct answer's
+        (cowork.handlers.responses). A streamed frame carries its
+        ``sequence_number``; the saved events of a non-streaming answer
+        don't."""
+        body: dict[str, Any] = {"type": "response.memory_read", "read": self.read, "entries": self.entries}
+        if sequence_number is not None:
+            body["sequence_number"] = sequence_number
+        return body
 
 
 @dataclass
@@ -319,8 +345,8 @@ _APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTI
 # anton hands the model a cell's result in labeled parts (format_cell_result):
 # what the cell printed under [output], then [logs], [stderr] and [error].
 # anton's session appends [artifact lint] after a cell that changed an
-# artifact.
-_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint)\]\n", re.MULTILINE)
+# artifact, and [live app] after a cell that relaunched a running live app.
+_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint|live app)\]\n", re.MULTILINE)
 # The note format_cell_result puts after printed output it cut short, with
 # the line breaks before the next part.
 _TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)\n*\Z")
@@ -540,8 +566,8 @@ def _cell_arguments(arguments: dict[str, Any]) -> _CellArguments:
 def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     """A cell's result as history rows hold it: its code and description
     from the call's arguments, and what it printed, the [output] part,
-    without the logs, stderr, error and artifact lint the model saw beside
-    it, or the note on how long output cut short was."""
+    without the logs, stderr, error, artifact lint and live-app lines the
+    model saw beside it, or the note on how long output cut short was."""
     stdout = ""
     if result.startswith("[output]\n"):
         printed = result[len("[output]\n"):]
@@ -791,7 +817,11 @@ async def format_responses_stream(
         elif (
             isinstance(event, StreamToolResult)
             and getattr(event, "action", None) == "message"
-            # A scratchpad result carries the model's own `action`.
+            # A scratchpad result stays a cell's result. Its action is the one
+            # anton resolved for the call, not the model's raw input:
+            # ChatSession's inline exec path and dump branch name theirs, and
+            # _known_scratchpad_action keeps a discarded call's only when the
+            # scratchpad schema allows it.
             and getattr(event, "name", "") != "scratchpad"
         ):
             # A tool's message to the user (generate_artifact's brief when the
@@ -825,6 +855,9 @@ async def format_responses_stream(
                 "thought_role": Role.thought_scratchpad_result.value,
                 "content": event.content[:65536],
                 "tool_name": getattr(event, "name", "") or "",
+                # anton's action, not the model's: the cell replay takes it as
+                # the action of a call that named none
+                # (scratchpad_cell_replay._ran_action).
                 "tool_action": getattr(event, "action", "") or "",
                 "tool_use_id": getattr(event, "id", None) or "",
                 # ok / timeout / error — lets the renderer show a killed cell
@@ -1080,6 +1113,10 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "skill": event.skill,
             })
+
+        elif isinstance(event, TurnMemoryRead):
+            seq += 1
+            yield _event("response.memory_read", event.payload(sequence_number=seq))
 
         elif isinstance(event, StreamComplete):
             # One LLM round is over. anton's agent loop streams the next

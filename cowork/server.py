@@ -33,7 +33,6 @@ from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
-from cowork.harnesses.memory.store import deployment_memory_root
 from cowork.managed import (
     ManagedFolder,
     SharedRegistryError,
@@ -42,9 +41,11 @@ from cowork.managed import (
 )
 from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
+from cowork.services.live_apps import live_app_slot_paths
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
+from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
@@ -169,12 +170,29 @@ async def lifespan(app: FastAPI):
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    # Ownership recovery runs before the first request can mint a page. A pass
+    # that cannot read publish history or verify the publisher does not stop
+    # Cowork: published_page_ownership._require_backfill retries it on each
+    # protected publish, unpublish or delete and answers 503 until it completes.
+    from cowork.services.published_page_owner_backfill import (
+        PublishedPageBackfillUnavailable,
+        run_published_page_owner_backfill,
+    )
+
+    try:
+        await asyncio.to_thread(run_published_page_owner_backfill)
+    except PublishedPageBackfillUnavailable as exc:
+        # Its messages are fixed text, raised without the underlying error.
+        logger.error(
+            "Published page ownership backfill did not finish; publishing answers 503 and retries it",
+            extra={"event": "published_page_backfill_unavailable", "reason": str(exc)},
+        )
     # After the clear, since resolving MEMORY_ENABLED where memory is shared
     # loads the stored settings.
     try:
         memory_warning = memory_start_warning()
         if memory_warning is not None:
-            logger.warning("memory: %s (%s)", memory_warning, deployment_memory_root())
+            logger.warning(memory_warning)
     except Exception:
         logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
@@ -230,7 +248,7 @@ async def lifespan(app: FastAPI):
         try:
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
             if reaped:
-                logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
+                logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:
             recovery_session.close()
     except Exception:
@@ -407,7 +425,7 @@ def create_app() -> FastAPI:
     initialize_deployment_identity(settings, remote_turns=TurnQueueSettings().is_remote)
 
     # Create FastAPI app
-    app = FastAPI(
+    app = RequestLoggingApp(
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
@@ -562,6 +580,11 @@ def create_app() -> FastAPI:
     # Identity headers need the code sandbox, and the sandbox needs a kernel
     # and an anton that hold it (cowork.code_sandbox.check_startup).
     check_code_sandbox_startup(settings, remote_turns=TurnQueueSettings().is_remote)
+    # The edge's access check and stopped page for each live-app slot carry
+    # only the visitor's viewer sign-in cookie, and a slot's stop report
+    # carries nothing; each route checks its caller itself
+    # (cowork.services.live_apps.live_app_slot_paths).
+    channel_webhook_paths.update(live_app_slot_paths())
     # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
     # turns in this process (check_write_approval_startup).
     check_write_approval_startup(

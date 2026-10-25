@@ -13,6 +13,7 @@ from anton.core.llm.provider import LLMResponse, StreamComplete, StreamTextDelta
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.handlers import response_routing as routing
 from cowork.services import router_probe
+from tests._logging_assertions import assert_log_fields
 
 
 class _Provider:
@@ -67,16 +68,17 @@ def probe(monkeypatch):
 def _outcome(caplog, outcome, *, reason=None):
     records = [
         record for record in caplog.records
-        if record.name == router_probe.__name__ and f"outcome={outcome}" in record.getMessage()
+        if record.name == router_probe.__name__ and getattr(record, "outcome", None) == outcome
     ]
     assert len(records) == 1
     record = records[0]
+    assert record.event == f"router_startup_probe_{outcome}"
     assert record.levelno == (logging.INFO if outcome == "passed" else logging.WARNING)
     assert record.exc_info is None
     if reason:
-        assert f"reason={reason}" in record.getMessage()
+        assert record.reason == reason
         assert "startup continues" in record.getMessage()
-        assert "recheck" in record.getMessage()
+        assert "Recheck" in record.getMessage()
     return record
 
 
@@ -235,18 +237,34 @@ async def test_stalled_stream_finally_cannot_block_probe_cleanup(probe, monkeypa
     (403, "provider_refused"), (404, "provider_refused"),
     (429, "provider_unavailable"), (503, "provider_unavailable"),
 ])
-async def test_provider_errors_are_safe_and_never_infer_unsupported(probe, caplog, status, reason):
+async def test_provider_errors_are_safe_and_never_infer_unsupported(
+    probe, caplog, owned_logger, status, reason,
+):
     sentinel = "private-provider-body-and-key"
     request = httpx.Request("POST", f"https://{sentinel}.example/v1/responses")
     probe.provider.error = openai.APIStatusError(
         sentinel, response=httpx.Response(status, request=request), body={"error": sentinel},
     )
+    logged = owned_logger(router_probe.__name__, level=logging.WARNING)
     await router_probe.run_router_startup_probe()
     record = _outcome(caplog, "unverified", reason=reason)
-    assert f"status={status}" in record.getMessage()
-    assert "error=APIStatusError" in record.getMessage()
+    assert (record.status_code, record.error_type) == (status, "APIStatusError")
     assert sentinel not in repr(record.__dict__)
     assert "unsupported" not in record.getMessage()
+    # The serialized line, as the server writes it, carries the values.
+    output = logged.output()
+    assert_log_fields(
+        output,
+        event="router_startup_probe_unverified",
+        log_level="WARNING",
+        outcome="unverified",
+        reason=reason,
+        provider="openai_compatible",
+        error_type="APIStatusError",
+        status_code=status,
+    )
+    assert "%s" not in output
+    assert sentinel not in output
     assert len(probe.provider.calls) == 1
     probe.client.aclose.assert_awaited_once()
 
