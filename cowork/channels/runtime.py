@@ -31,7 +31,7 @@ from cowork.common.settings.app_settings import TurnQueueSettings, get_app_setti
 from cowork.common.settings.user_settings import get_user_settings, use_settings_scope
 from cowork.services.artifact_roots import conversation_artifacts_base
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
-from cowork.services.channel_bindings import ChannelBindingService
+from cowork.services.channel_bindings import ChannelBindingService, operator_bindings_required
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 # hotswitch (UserSettings.harness) never applies to channels.
 DEFAULT_CHANNEL_HARNESS = "anton"
 _DEFAULT_THREAD_KEY = "__default__"
+OPERATOR_SETUP_REQUIRED = "This chat group needs operator setup."
 
 
 def turn_used_tools(events: list[dict]) -> bool:
@@ -300,9 +301,16 @@ class AntonChannelRuntime:
             # resolution (resolve_bridge) — None means local mode, or (in org
             # mode) a genuinely unresolved org, which still fails closed below.
             # An org_id alone never turns org mode on in local tenancy.
+            if operator_bindings_required():
+                # Legacy installations can carry a person's partition id. No
+                # channel turn on this deployment may inherit that identity.
+                org_id = None
             scope = scope_for_org(org_id) if org_id else scope_for_background_context()
             scoped = ScopedSession(session, scope)
             binding = self._resolve_or_create_binding(scoped, channel_type, event)
+            if binding is None:
+                await self._deliver(channel_type, event, OPERATOR_SETUP_REQUIRED, org_id)
+                return
             log.info(
                 "channel %s: binding %s → project %s (trigger=%s)",
                 channel_type, binding.id, binding.anton_project_id, binding.trigger_rule,
@@ -375,7 +383,7 @@ class AntonChannelRuntime:
             org_id,
         )
 
-    def _resolve_or_create_binding(self, scoped: ScopedSession, channel_type: str, event: Any) -> ChannelBinding:
+    def _resolve_or_create_binding(self, scoped: ScopedSession, channel_type: str, event: Any) -> ChannelBinding | None:
         group_id = event.address.platform_id
         thread_id = event.address.thread_id
         thread_key = thread_id or _DEFAULT_THREAD_KEY
@@ -386,6 +394,10 @@ class AntonChannelRuntime:
                 ChannelBinding.external_thread_key == thread_key,
             )
         ).first()
+        if operator_bindings_required():
+            if binding is None or not ChannelBindingService(scoped).operator_ready(binding):
+                return None
+            return binding
         if binding is not None:
             return binding
         binding = ChannelBinding(

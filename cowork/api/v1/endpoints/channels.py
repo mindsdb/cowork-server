@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, ChannelBindingWriter, require
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.schemas.channels import (
@@ -224,7 +224,8 @@ def list_bindings(scoped: ScopedSessionDep, channel_type: str | None = None) -> 
     return ChannelBindingService(scoped).list(channel_type=channel_type)
 
 
-@router.post("/bindings", response_model=BindingResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/bindings", response_model=BindingResponse, status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(require(ChannelBindingWriter))])
 def create_binding(body: BindingCreateRequest, scoped: ScopedSessionDep) -> BindingResponse:
     try:
         return ChannelBindingService(scoped).create(body)
@@ -234,7 +235,8 @@ def create_binding(body: BindingCreateRequest, scoped: ScopedSessionDep) -> Bind
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@router.patch("/bindings/{binding_id}", response_model=BindingResponse)
+@router.patch("/bindings/{binding_id}", response_model=BindingResponse,
+              dependencies=[Depends(require(ChannelBindingWriter))])
 def update_binding(binding_id: UUID, body: BindingUpdateRequest, scoped: ScopedSessionDep) -> BindingResponse:
     try:
         return ChannelBindingService(scoped).update(binding_id, body)
@@ -244,7 +246,8 @@ def update_binding(binding_id: UUID, body: BindingUpdateRequest, scoped: ScopedS
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@router.delete("/bindings/{binding_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/bindings/{binding_id}", status_code=status.HTTP_204_NO_CONTENT,
+               dependencies=[Depends(require(ChannelBindingWriter))])
 def delete_binding(binding_id: UUID, scoped: ScopedSessionDep) -> None:
     if not ChannelBindingService(scoped).delete(binding_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")

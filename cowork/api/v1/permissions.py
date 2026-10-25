@@ -285,6 +285,22 @@ class AuthenticatedInOrgMode(Authenticated):
         return await super().check(request, principal=principal)
 
 
+class ChannelBindingWriter(AuthenticatedInOrgMode):
+    """Only the operator writes bindings on a trusted local deployment.
+
+    Org members retain their existing binding permissions; no org-admin
+    requirement is added. The route's service still checks conversation ownership.
+    """
+
+    async def check(
+        self, request: Request, principal: Principal | None = Depends(get_principal)
+    ) -> Principal | None:
+        settings = get_app_settings()
+        if settings.tenancy_mode != "org" and settings.trust_identity_headers and principal is not None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="requires the operator")
+        return await super().check(request, principal=principal)
+
+
 class AuthenticatedOrgAdmin(AuthenticatedInOrgMode):
     """``AuthenticatedInOrgMode``, plus org-admin standing in org mode.
 
