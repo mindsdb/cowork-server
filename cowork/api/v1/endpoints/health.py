@@ -3,6 +3,7 @@ from importlib.metadata import version, PackageNotFoundError
 from fastapi import APIRouter, Depends
 
 from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.code_sandbox import live_apps_on
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -120,6 +121,10 @@ def health() -> dict:
         # client must not finalize onboarding by writing it. `config_ready` can't
         # express this: it says the deployment can run, not who may configure it.
         "org_mode": _org_mode,
+        # Whether full-stack apps run as live apps in app slots outside this
+        # server (cowork.code_sandbox.live_apps_on): the client then offers
+        # sharing and duplicating them.
+        "live_apps": live_apps_on(),
         "minds_runtime_credential_required": _minds_runtime_credential_required(
             settings, org_mode=_org_mode
         ),

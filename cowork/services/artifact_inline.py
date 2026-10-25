@@ -24,7 +24,6 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
-import ntpath
 import re
 import secrets
 import time
@@ -53,6 +52,7 @@ from cowork.services.artifact_files import (
     ArtifactFileContent,
     ArtifactFileRefused,
     read_artifact_file_entry,
+    split_relative_path,
 )
 
 # The paragraph that ends a document whose rest was left out.
@@ -64,7 +64,7 @@ DEADLINE_SECONDS = 10.0
 # carriage return, lone surrogates, U+FFFE and U+FFFF. libxml2's HTML parser
 # keeps these in names, values and text, but lxml refuses to set or delete a
 # string holding one.
-XML_UNSAFE = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+XML_UNSAFE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 # Element names as libxml2's HTML parser reports them: lowercased, with no
 # namespace, so SVG's ``linearGradient`` arrives as ``lineargradient``.
@@ -250,7 +250,6 @@ _UNSTABLE_SCRIPT_MARKERS = ("<!--", "<script", "</script")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:")
 _QUERY_OR_FRAGMENT = re.compile(r"[?#]")
-_PATH_SEPARATORS = re.compile(r"[/\\]")
 _NAVIGATION_SCHEME = re.compile(r"(?:https?|mailto):", re.IGNORECASE)
 _DATA_URI = re.compile(r"data:([^,]*),(.*)", re.IGNORECASE | re.DOTALL)
 # A ``srcset`` candidate's URL runs to the next whitespace; commas before it
@@ -260,6 +259,10 @@ _SRCSET_DESCRIPTORS = re.compile(r"(?:[^,(]|\([^)]*\)?)*,?")
 _HTML_TOKEN_SEPARATORS = re.compile(r"[ \t\n\r\f]+")
 _BASE64_WHITESPACE = re.compile(rb"[ \t\n\r\f]")
 
+# The signatures that open each raster type the export keeps.
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
+GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
 _JPEG_FRAME_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 )
@@ -309,9 +312,10 @@ _CSS_HEX_ESCAPED = re.compile(r"[<>\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 _MAX_OMITTED = 1000
 # tinycss2 keeps every token as a Python object, which takes about 130 times
 # the text's size in memory. So a document parses at most this much CSS in
-# all: its style elements, style attributes, url() attribute values and the
-# stylesheets it links or imports. Past it, inline CSS is dropped and a
-# stylesheet is left out as BUDGET.
+# all: its style elements, its style attributes, every other kept attribute
+# whose value holds "(", which could hide an escaped url(, and the
+# stylesheets it links or imports. Past it, inline CSS and each such
+# attribute are dropped, and a stylesheet is left out as BUDGET.
 _MAX_CSS_BYTES = 1024 * 1024
 
 
@@ -436,6 +440,33 @@ class _CssFrame:
     index: int = 0
 
 
+@dataclass
+class UriPlaceholders:
+    """Long ``data:`` URIs held out of an lxml parse, each behind a short placeholder.
+
+    libxml2 with huge_tree off stops reading after about 10 MB of large
+    attribute or text tokens and drops the rest of the document, so until
+    the parse is done the text holds a placeholder instead, and ``restore``
+    swaps each one back. The nonce is random, so a document can't spell a
+    placeholder of its own. The inliner and the Word writer both use it.
+    """
+
+    uris: list[str] = field(default_factory=list)
+    nonce: str = field(default_factory=lambda: secrets.token_hex(16))
+
+    def hold(self, *, uri: str) -> str:
+        """The placeholder for *uri*: letters, digits and a hyphen."""
+        self.uris.append(uri)
+        return f"{self.nonce}{len(self.uris) - 1}-"
+
+    def restore(self, *, text: str) -> str:
+        """*text* with each placeholder swapped back for its URI."""
+        if not self.uris:
+            return text
+        placeholder = re.compile(re.escape(self.nonce) + r"([0-9]+)-")
+        return placeholder.sub(lambda match: self.uris[int(match.group(1))], text)
+
+
 def inline_artifact_html(
     *,
     html: bytes,
@@ -464,7 +495,7 @@ def inline_artifact_html(
     if inliner.truncated or reparsed.stopped:
         _append_truncation_note(root=reparsed.root)
     return InlinedDocument(
-        html=inliner.splice(text=_serialize_html(root=reparsed.root)),
+        html=inliner.placeholders.restore(text=_serialize_html(root=reparsed.root)),
         omitted=inliner.omitted,
         inlined_bytes=inliner.total_bytes,
         scripts_dropped=inliner.scripts_dropped,
@@ -495,12 +526,9 @@ class _Inliner:
     refusals: dict[tuple[tuple[str, ...], _AssetKind], OmittedReason] = field(
         default_factory=dict
     )
-    # Each inlined ``data:`` URI, indexed by its placeholder. libxml2 with
-    # huge_tree off stops reading after about 10 MB of large attribute or
-    # text tokens and drops the rest, so until the reparse is done the tree
-    # holds a short placeholder instead, which ``splice`` swaps back.
-    uris: list[str] = field(default_factory=list)
-    nonce: str = field(default_factory=lambda: secrets.token_hex(16))
+    # Each inlined ``data:`` URI, which the tree holds as a placeholder until
+    # the reparse is done.
+    placeholders: UriPlaceholders = field(default_factory=UriPlaceholders)
 
     def sanitized_html(self, *, html: bytes) -> bytes:
         """The sanitized document as UTF-8, with placeholders for its ``data:`` URIs.
@@ -513,17 +541,6 @@ class _Inliner:
         self.sanitize(root=source.root)
         _declare_utf8(root=source.root)
         return _serialize_html(root=source.root).encode("utf-8")
-
-    def splice(self, *, text: str) -> str:
-        """Put each ``data:`` URI back in place of its placeholder."""
-        if not self.uris:
-            return text
-        placeholder = re.compile(re.escape(self.nonce) + r"([0-9]+)-")
-        return placeholder.sub(lambda match: self.uris[int(match.group(1))], text)
-
-    def _placeholder(self, *, uri: str) -> str:
-        self.uris.append(uri)
-        return f"{self.nonce}{len(self.uris) - 1}-"
 
     def sanitize(self, *, root: lxml.html.HtmlElement) -> None:
         """Walk the tree in document order with an explicit stack of kept elements.
@@ -800,7 +817,7 @@ class _Inliner:
                 reference=candidate, base_parts=self.base_parts, kind=_AssetKind.IMAGE
             )
             if asset is not None:
-                element.set("src", self._placeholder(uri=asset.uri))
+                element.set("src", self.placeholders.hold(uri=asset.uri))
                 used = _clean_reference(value=candidate)
                 unused = [*sources.tried[index + 1:], *sources.untried]
                 break
@@ -985,7 +1002,7 @@ class _Inliner:
         if not scan.checkable:
             return False
         spent = 0
-        kept_uris = len(self.uris)
+        kept_uris = len(self.placeholders.uris)
         for reference in scan.references:
             cleaned = _clean_reference(value=reference.url)
             if cleaned.startswith("#"):
@@ -994,12 +1011,12 @@ class _Inliner:
             if asset is None:
                 # The declaration goes, so the URIs it placed go with it.
                 self.total_bytes -= spent
-                del self.uris[kept_uris:]
+                del self.placeholders.uris[kept_uris:]
                 return False
             spent += asset.size
             # The placeholder is letters, digits and a hyphen, so it needs no
             # escape in an unquoted url().
-            placeholder = self._placeholder(uri=asset.uri)
+            placeholder = self.placeholders.hold(uri=asset.uri)
             original = reference.items[reference.index]
             reference.items[reference.index] = URLToken(
                 original.source_line, original.source_column, placeholder, f"url({placeholder})"
@@ -1253,10 +1270,12 @@ def _reference_parts(*, reference: str) -> tuple[str, ...]:
     """The path segments a cleaned relative reference names, in the refusal order.
 
     A scheme, then a leading slash or backslash, are refused first. The query
-    and fragment are cut, the rest is percent-decoded once, and every segment
-    must then be a plain name. ``.`` segments name the current folder and are
-    skipped. Reserved device names, a trailing dot or space and housekeeping
-    names are refused by the pinned file walk, after these.
+    and fragment are cut, and the rest is percent-decoded once.
+    ``split_relative_path`` then splits it by the rules every relative path
+    follows, skipping ``.`` segments, which name the current folder, and a
+    segment holding ``:`` is refused. Reserved device names, a trailing dot or
+    space and housekeeping names are refused by the pinned file walk, after
+    these.
     """
     if _SCHEME.match(reference):
         raise ArtifactFileRefused(OmittedReason.SCHEME, "has a scheme")
@@ -1267,16 +1286,8 @@ def _reference_parts(*, reference: str) -> tuple[str, ...]:
         decoded = unquote(path, errors="strict")
     except UnicodeDecodeError as exc:
         raise ArtifactFileRefused(OmittedReason.MISSING, "not UTF-8") from exc
-    if "\x00" in decoded:
-        raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "NUL")
-    if not decoded:
-        raise ArtifactFileRefused(OmittedReason.MISSING, "empty path")
-    drive = ntpath.splitdrive(decoded)[0]
-    if drive:
-        reason = OmittedReason.UNC_PATH if drive[0] in "/\\" else OmittedReason.TRAVERSAL
-        raise ArtifactFileRefused(reason, "drive or UNC path")
-    parts = tuple(segment for segment in _PATH_SEPARATORS.split(decoded) if segment != ".")
-    if not parts or any(segment in ("", "..") or ":" in segment for segment in parts):
+    parts = split_relative_path(text=decoded, skip_dot_segments=True)
+    if any(":" in segment for segment in parts):
         raise ArtifactFileRefused(OmittedReason.TRAVERSAL, "segment is not a plain name")
     return parts
 
@@ -1338,15 +1349,15 @@ def _font_type(*, data: bytes) -> str | None:
 def _image_header(*, data: bytes) -> _ImageHeader | None:
     """The type and size a PNG, GIF, JPEG or WebP header declares, with no decoding."""
     header = None
-    if data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR" and len(data) >= 24:
+    if data.startswith(PNG_SIGNATURE) and data[12:16] == b"IHDR" and len(data) >= 24:
         width = int.from_bytes(data[16:20], "big")
         height = int.from_bytes(data[20:24], "big")
         header = _ImageHeader("image/png", width, height)
-    elif data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+    elif data.startswith(GIF_SIGNATURES) and len(data) >= 10:
         width = int.from_bytes(data[6:8], "little")
         height = int.from_bytes(data[8:10], "little")
         header = _ImageHeader("image/gif", width, height)
-    elif data.startswith(b"\xff\xd8\xff"):
+    elif data.startswith(JPEG_SIGNATURE):
         header = _jpeg_header(data=data)
     elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         header = _webp_header(data=data)

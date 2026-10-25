@@ -191,11 +191,11 @@ def _read_takes_name(segments: list[str]) -> bool:
     and a store-owned one such as ``metadata.json`` at any depth, so
     ``docs/README.md`` exports.
     """
-    if len(segments) > artifact_files._MAX_PATH_PARTS:
+    if len(segments) > artifact_files.MAX_PATH_PARTS:
         return False
     try:
-        artifact_files._refuse_unsafe_parts(parts=tuple(segments))
-        artifact_files._refuse_housekeeping(parts=tuple(segments))
+        artifact_files.refuse_unsafe_parts(parts=tuple(segments))
+        artifact_files.refuse_housekeeping(parts=tuple(segments))
     except artifact_files.ArtifactFileRefused:
         return False
     return True
@@ -244,16 +244,23 @@ def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
     return relative.parts or None
 
 
-def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
-    """The export source of the artifact in *folder*: its primary file and its type.
+def _exportable_primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
+    """The primary file's path inside *folder*, or None when the export's read would refuse it.
 
-    A primary the export's read refuses for what it is on disk names no
-    source, so no format is offered for it: a file that isn't regular, or one
-    with a second hard link, which a sync or backup tool can give it.
+    A primary the read refuses for what it is on disk names no source: a file
+    that isn't regular, or one with a second hard link, which a sync or backup
+    tool can give it. So the workspace response offers no format for it, and
+    the route answers 422, as for any format the artifact doesn't offer.
     """
     parts = _primary_parts(folder=folder, metadata=metadata)
     if parts is not None and not _single_link_file(folder.joinpath(*parts)):
-        parts = None
+        return None
+    return parts
+
+
+def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
+    """The export source of the artifact in *folder*: its primary file and its type."""
+    parts = _exportable_primary_parts(folder=folder, metadata=metadata)
     return ExportSource(
         source_name="/".join(parts or ()),
         is_backend=is_backend_type(metadata.get("type")),
@@ -269,12 +276,24 @@ def _single_link_file(path: Path) -> bool:
 
 
 def card_export_source(card: dict) -> ExportSource:
-    """The export source an artifact card describes, from its ``path``, ``folder`` and ``type``."""
+    """The export source an artifact card describes, from its ``path``, ``folder`` and ``type``.
+
+    A primary with a second hard link names no source, as in
+    ``primary_export_source``. The ``lstat`` that finds one is skipped while
+    org export is off, as the workspace response skips its walk: no card
+    offers a format then.
+    """
     try:
         relative = Path(str(card.get("path") or "")).relative_to(
             Path(str(card.get("folder") or ""))
         )
     except ValueError:
+        relative = Path()
+    if (
+        relative.parts
+        and not org_export_refused(org_mode=_org_mode())
+        and not _single_link_file(Path(str(card["path"])))
+    ):
         relative = Path()
     return ExportSource(
         source_name="/".join(relative.parts),
@@ -550,12 +569,12 @@ def _write_beside(
     """
     source_name = parts[-1]
     stem = _output_stem(stem=PurePosixPath(source_name).stem, extension=extension)
-    checked: list[artifact_files._CheckedName] = []
+    checked: list[artifact_files.CheckedName] = []
     with ExitStack() as opened:
         parent = folder
         for requested in parts[:-1]:
-            entry = artifact_files._existing_draft_entry_name(parent, requested)
-            seen = artifact_files._refuse_link_by_lstat(directory=parent, name=entry)
+            entry = artifact_files.existing_draft_entry_name(parent, requested)
+            seen = artifact_files.refuse_link_by_lstat(directory=parent, name=entry)
             if seen is not None:
                 checked.append(seen)
             parent = open_pinned_child(parent, entry)
@@ -569,7 +588,7 @@ def _write_beside(
             finally:
                 os.close(fd)
             before_placing()
-            artifact_files._refuse_a_changed_walk(checked=checked)
+            artifact_files.refuse_a_changed_walk(checked=checked)
             name = _place_temporary(
                 parent=parent,
                 temporary=temporary,
@@ -655,7 +674,7 @@ def export_primary_file(
         io_folder = _pinned_directory_path(folder)
         if io_folder is None:
             raise ExportRefused(ExportRefusal.NOT_FOUND, "Artifact source not found")
-        parts = _primary_parts(folder=io_folder, metadata=metadata)
+        parts = _exportable_primary_parts(folder=io_folder, metadata=metadata)
         offered = offered_export_formats(
             source=ExportSource(
                 source_name="/".join(parts or ()),

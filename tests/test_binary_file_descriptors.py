@@ -105,7 +105,7 @@ def test_draft_file_open_is_binary(tmp_path, recorded_flags):
         root_parts=(".anton", "artifacts"),
     )
 
-    resources, _fd, _stat = artifact_files._open_pinned_draft_file(
+    resources, _fd, _stat = artifact_files.open_pinned_draft_file(
         source, folder, ("data.csv",)
     )
     resources.close()

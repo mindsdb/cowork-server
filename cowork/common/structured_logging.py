@@ -45,6 +45,7 @@ EVENT_FIELDS = frozenset(
         "attempt",
         "attempts",
         "count",
+        "slot",
         "model_alias",
         "retryable",
     ]

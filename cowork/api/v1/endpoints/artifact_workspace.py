@@ -82,14 +82,14 @@ _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
 # Matched against the first path component of a draft request. The file
 # walk refuses them there casefolded too, and the store-owned ones at any
-# depth (`artifact_files._refuse_housekeeping`).
+# depth (`artifact_files.refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 
 def _attachment_disposition(filename: str) -> str:
     """``Content-Disposition`` for saving ``filename``, safe to put on the wire.
 
-    The name is a request-derived path component. ``_relative_file_parts``
+    The name is a request-derived path component. ``relative_file_parts``
     rejects NUL, separators and ``..``, but a quote, CR or LF still pass — and
     any of them interpolated raw into a header is a header-injection vector
     (``project_files.download_project_file`` has exactly that shape; ENG-2044).
@@ -141,7 +141,7 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     shared storage, so what makes the fallback safe is the inner gate's own
     containment, symlink and extension checks rather than where it came from.
     Anything else is the same kind of request-derived string
-    ``_open_pinned_draft_file`` refuses to
+    ``open_pinned_draft_file`` refuses to
     hand to the filesystem: it is validated into single components, each one
     is matched against a ``dir_scandir`` pass on a pinned descriptor, and the
     path the revision service receives is joined from the ``DirEntry`` names
@@ -160,7 +160,7 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     if requested is None or not requested.strip():
         return None
     try:
-        parts = artifact_files._relative_file_parts(requested.strip())
+        parts = artifact_files.relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
     # Only the journal (any depth), like the inner gate: the private-listing
@@ -174,13 +174,13 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         with ExitStack() as resources:
             current = resources.enter_context(opened_artifact_folder(source, folder_name))
             for part in parts[:-1]:
-                disk_name = artifact_files._existing_draft_entry_name(
+                disk_name = artifact_files.existing_draft_entry_name(
                     current, part, native_case=True
                 )
                 current = open_pinned_child(current, disk_name)
                 resources.callback(current.close)
                 disk_parts.append(disk_name)
-            disk_name = artifact_files._existing_draft_entry_name(
+            disk_name = artifact_files.existing_draft_entry_name(
                 current, parts[-1], native_case=True
             )
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
@@ -1223,7 +1223,7 @@ async def serve_private_draft(
         session, project_selector, artifact_selector
     )
     try:
-        parts = artifact_files._relative_file_parts(rel_path)
+        parts = artifact_files.relative_file_parts(rel_path)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1233,7 +1233,7 @@ async def serve_private_draft(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     if str(metadata.get("type") or "").startswith("fullstack-"):
         try:
-            primary_parts = artifact_files._relative_file_parts(
+            primary_parts = artifact_files.relative_file_parts(
                 str(metadata.get("primary") or "static/index.html")
             )
         except ValueError:
@@ -1257,7 +1257,7 @@ async def serve_private_draft(
     download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     try:
-        resources, fd, file_stat = artifact_files._open_pinned_draft_file(
+        resources, fd, file_stat = artifact_files.open_pinned_draft_file(
             source, folder, parts
         )
     except artifact_files.ArtifactFileRefused as exc:

@@ -923,14 +923,28 @@ def _fullstack_types() -> frozenset[str]:
         return frozenset()
 
 
+def is_publish_record_name(name: object) -> bool:
+    """A `.published.json` key names a file directly in the record's folder."""
+    return (
+        isinstance(name, str)
+        and name not in {"", ".", ".."}
+        and Path(name).name == name
+        and "/" not in name
+        and "\\" not in name
+        and "\x00" not in name
+    )
+
+
 def _unpublish_folder(
-    folder: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+    folder: Path, *, artifacts_base: Path, api_key: str, publish_url: str,
+    scope: TenantScope | None = None,
 ) -> None:
     """Unpublish every published file in an artifact folder.
 
     Reads `.published.json` and unpublishes each recorded file from the
     remote. Raises if any unpublish fails so the caller can abort the
-    delete and leave the artifact intact.
+    delete and leave the artifact intact. On a protected publisher,
+    `unpublish_artifact` checks each page's owner with ``scope``.
     """
     published_map = _load_published_map(folder)
     if not published_map:
@@ -951,6 +965,14 @@ def _unpublish_folder(
             continue
         if not (entry.get("report_id") or entry.get("last_md5")):
             continue
+        if not is_publish_record_name(name):
+            # A key like ../other/index.html would reach another folder's page.
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=primary_invalid",
+                entry.get("report_id") or entry.get("last_md5"),
+                entry.get("url", ""),
+            )
+            continue
         if not (folder / name).is_file():
             # The path-based unpublish needs the file present, so this record
             # cannot be cleared upstream — and once the folder is gone there is
@@ -964,7 +986,7 @@ def _unpublish_folder(
             continue
         unpublish_artifact(
             folder / name, artifacts_base=artifacts_base,
-            api_key=api_key, publish_url=publish_url,
+            api_key=api_key, publish_url=publish_url, scope=scope,
         )
 
 
@@ -1006,24 +1028,29 @@ def _unpublish_identifier(
 
 
 def _unpublish_pinned_folder(
-    folder: PinnedDir, *, api_key: str, publish_url: str
+    folder: PinnedDir, *, api_key: str, publish_url: str,
+    scope: TenantScope | None = None,
 ) -> None:
-    """Unpublish records read and updated through one pinned artifact folder."""
+    """Unpublish records read and updated through one pinned artifact folder.
+
+    On a protected publisher each page id goes through the same owner check
+    as `unpublish_artifact`: another tester's page refuses the delete, and an
+    id this artifact has no record for is dropped locally without a request.
+    """
+    from cowork.services.published_page_ownership import (
+        protects_publisher,
+        publication_owner,
+    )
+
+    protected = protects_publisher(publish_url)
     published_map = _load_published_map_pinned(folder)
-    for name, entry in published_map.items():
+    for name, entry in list(published_map.items()):
         if not isinstance(entry, dict) or entry.get("published") is False:
             continue
         identifier = entry.get("report_id") or entry.get("last_md5")
         if not identifier:
             continue
-        if (
-            not name
-            or name in {".", ".."}
-            or Path(name).name != name
-            or "/" in name
-            or "\\" in name
-            or "\x00" in name
-        ):
+        if not is_publish_record_name(name):
             logger.warning(
                 "orphaned_publish identifier=%s url=%s reason=primary_invalid",
                 identifier,
@@ -1042,9 +1069,25 @@ def _unpublish_pinned_folder(
             )
             continue
 
-        _unpublish_identifier(
-            str(identifier), entry, api_key=api_key, publish_url=publish_url
-        )
+        if protected:
+            with publication_owner(
+                folder.path / name, published_dir=folder.path,
+                publish_url=publish_url, scope=scope,
+            ) as ownership:
+                identifier = ownership.checked_report_id(
+                    entry.get("report_id"), url=entry.get("url", ""),
+                )
+                if identifier is None:
+                    published_map.pop(name, None)
+                    _write_published_map_pinned(folder, published_map)
+                    continue
+                _unpublish_identifier(
+                    identifier, entry, api_key=api_key, publish_url=publish_url
+                )
+        else:
+            _unpublish_identifier(
+                str(identifier), entry, api_key=api_key, publish_url=publish_url
+            )
         entry["published"] = False
         published_map[name] = entry
         # Match the historical partial-progress behavior: if a later remote
@@ -1053,7 +1096,8 @@ def _unpublish_pinned_folder(
 
 
 def delete_artifact(
-    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str,
+    scope: TenantScope | None = None,
 ) -> None:
     """Permanently delete an artifact folder from disk.
 
@@ -1078,6 +1122,7 @@ def delete_artifact(
     # Unpublish before deleting; if this raises, the artifact stays.
     _unpublish_folder(
         folder, artifacts_base=artifacts_base, api_key=api_key, publish_url=publish_url,
+        scope=scope,
     )
     shutil.rmtree(folder)
 
@@ -1106,6 +1151,7 @@ def delete_artifact_from_source(
     expected_artifact_id: str | None,
     api_key: str,
     publish_url: str,
+    scope: TenantScope | None = None,
 ) -> None:
     """Delete one direct artifact child through pinned directory descriptors.
 
@@ -1150,6 +1196,7 @@ def delete_artifact_from_source(
                 folder,
                 api_key=api_key,
                 publish_url=publish_url,
+                scope=scope,
             )
 
             opened_stat = (

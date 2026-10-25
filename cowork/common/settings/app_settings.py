@@ -959,6 +959,28 @@ class AppSettings(Settings):
             "Under 'landlock', app backends and Code mode are refused."
         ),
     )
+    live_apps_viewer_login_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_VIEWER_LOGIN_URL"),
+        description=(
+            "With live apps on (anton's ANTON_LIVE_APP_SLOTS), the viewer "
+            "sign-in this server asks who opens an app, for example "
+            "http://viewer-login:4180: its /oauth2/userinfo names the signed-in "
+            "visitor (cowork.services.live_apps). create_app refuses live apps "
+            "without it."
+        ),
+    )
+    live_apps_launch_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_LAUNCH_TOKEN"),
+        description=(
+            "With live apps on, the token anton sends each app slot with a "
+            "launch; each slot holds only its SHA-256. Agent code never "
+            "receives it: anton's launcher passes a cell no COWORK_ variable "
+            "(anton.core.backends.sandbox._ENV_NEVER_PREFIXES). create_app "
+            "refuses live apps with fewer than 32 characters."
+        ),
+    )
 
     organization_switch_enabled: bool = Field(
         default=False,

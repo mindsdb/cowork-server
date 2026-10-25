@@ -81,28 +81,30 @@ def test_no_deployment_offers_pdf_until_a_render_service_is_configured():
 
 
 @pytest.mark.parametrize(
-    ("card", "expected"),
+    ("primary", "artifact_type", "expected"),
     [
+        ("report.md", "document", ExportSource(source_name="report.md", is_backend=False)),
+        ("docs/report.md", "mixed", ExportSource(source_name="docs/report.md", is_backend=False)),
         (
-            {"folder": "/a/report", "path": "/a/report/report.md", "type": "document"},
-            ExportSource(source_name="report.md", is_backend=False),
-        ),
-        (
-            {"folder": "/a/report", "path": "/a/report/docs/report.md", "type": "mixed"},
-            ExportSource(source_name="docs/report.md", is_backend=False),
-        ),
-        (
-            {"folder": "/a/app", "path": "/a/app/static/index.html", "type": "fullstack-stateful-app"},
+            "static/index.html",
+            "fullstack-stateful-app",
             ExportSource(source_name="static/index.html", is_backend=True),
         ),
         # A card with no primary file carries its folder as its path.
-        (
-            {"folder": "/a/empty", "path": "/a/empty", "type": "mixed"},
-            ExportSource(source_name="", is_backend=False),
-        ),
+        (None, "mixed", ExportSource(source_name="", is_backend=False)),
     ],
 )
-def test_a_card_names_its_primary_file_and_type(card, expected):
+def test_a_card_names_its_primary_file_and_type(tmp_path, primary, artifact_type, expected):
+    """The primary file is on disk, since a card checks it has one link."""
+    folder = tmp_path / "artifact"
+    folder.mkdir()
+    path = folder
+    if primary is not None:
+        path = folder / primary
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+    card = {"folder": str(folder), "path": str(path), "type": artifact_type}
+
     assert card_export_source(card) == expected
 
 
@@ -232,17 +234,19 @@ def test_the_workspace_response_decides_export_formats_where_artifact_capabiliti
     assert response.json()["capabilities"]["exportFormats"] == ["docx"]
 
 
-def test_the_workspace_response_offers_nothing_for_a_hard_linked_primary(
+def test_a_hard_linked_primary_offers_nothing_anywhere_and_the_route_answers_422(
     tmp_path, local_mode, monkeypatch
 ):
     """A sync or backup tool can give the primary a second hard link. The
-    export's read refuses such a file, so the workspace response offers no
-    format the route would then answer 404."""
+    export's read refuses such a file, so its card and the workspace response
+    offer no format, and the route answers 422, as for any format not offered."""
     source = _local_source(tmp_path)
     artifact_id, folder = _write_artifact(
         source.base, "report", {"report.md": "# R\n"}, type="document", primary="report.md"
     )
     os.link(folder / "report.md", tmp_path / "backup.md")
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        cards = artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
@@ -252,14 +256,17 @@ def test_the_workspace_response_offers_nothing_for_a_hard_linked_primary(
 
     client = TestClient(create_app())
     response = client.get(f"/api/v1/artifacts/workspace/local/{artifact_id}")
+    files_before = sorted(path.name for path in folder.iterdir())
 
+    assert [card["capabilities"]["exportFormats"] for card in cards] == [[]]
     assert response.status_code == 200, response.text
     assert response.json()["capabilities"]["exportFormats"] == []
     for export_format in ("html", "docx"):
         refused = client.post(
             f"/api/v1/artifacts/workspace/local/{artifact_id}/export", json={"format": export_format}
         )
-        assert refused.status_code == 404, refused.text
+        assert refused.status_code == 422, refused.text
+    assert sorted(path.name for path in folder.iterdir()) == files_before
 
 
 def test_capabilities_without_an_export_source_leave_the_field_out():

@@ -41,7 +41,7 @@ from cowork.schemas.artifact_export import (
     InlineMode,
     OmittedReason,
 )
-from cowork.services import artifact_inline
+from cowork.services import artifact_files, artifact_inline
 from cowork.services.artifact_inline import TRUNCATION_NOTE, inline_artifact_html
 from cowork.services.markdown_render import render_markdown
 from tests._no_fetch import RecordingServer, no_fetch, recording_server
@@ -418,6 +418,49 @@ def test_a_segment_holding_a_colon_is_refused_before_the_file_walk(reference):
         artifact_inline._reference_parts(reference=reference)
 
     assert refused.value.reason is OmittedReason.TRAVERSAL
+
+
+@pytest.mark.parametrize("path", ["sub/C:y.png", "C:x/y.png", "sub/../y.png", "sub//y.png", "a\x00b.png"])
+def test_a_request_path_and_a_reference_refuse_the_same_segments(path):
+    """The drafts route's request paths and a document's references split by one rule."""
+    with pytest.raises(ValueError):
+        artifact_files.relative_file_parts(path)
+    with pytest.raises(artifact_files.ArtifactFileRefused):
+        artifact_inline._reference_parts(reference=path)
+
+
+def test_the_drafts_path_a_reference_and_the_read_share_one_segment_rule(monkeypatch):
+    monkeypatch.setattr(artifact_files, "_is_plain_segment", lambda *, segment: segment != "blocked")
+
+    with pytest.raises(ValueError):
+        artifact_files.relative_file_parts("sub/blocked")
+    with pytest.raises(artifact_files.ArtifactFileRefused):
+        artifact_inline._reference_parts(reference="sub/blocked")
+    with pytest.raises(artifact_files.ArtifactFileRefused):
+        artifact_files.refuse_unsafe_parts(parts=("sub", "blocked"))
+
+
+def _is_xml_character(code: int) -> bool:
+    """XML 1.0's Char: tab, LF, CR, U+0020 to U+D7FF, U+E000 to U+FFFD, U+10000 and up."""
+    return code in (0x9, 0xA, 0xD) or 0x20 <= code <= 0xD7FF or 0xE000 <= code <= 0xFFFD or code >= 0x10000
+
+
+def test_the_xml_filter_removes_exactly_what_xml_forbids():
+    every_character = "".join(map(chr, range(0x110000)))
+    expected = "".join(chr(code) for code in range(0x110000) if _is_xml_character(code))
+
+    assert artifact_inline.XML_UNSAFE.sub("", every_character) == expected
+
+
+def test_a_placeholder_holds_its_uri_until_restored():
+    placeholders = artifact_inline.UriPlaceholders()
+    first = placeholders.hold(uri="data:image/png;base64,AAAA")
+    second = placeholders.hold(uri="data:image/gif;base64,R0lG")
+
+    assert re.fullmatch(r"[0-9a-f]+[0-9]+-", first)
+    assert placeholders.restore(text=f'<img src="{first}"><b>{second}</b>') == (
+        '<img src="data:image/png;base64,AAAA"><b>data:image/gif;base64,R0lG</b>'
+    )
 
 
 @pytest.mark.parametrize(
