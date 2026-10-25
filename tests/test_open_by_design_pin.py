@@ -82,6 +82,23 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
     ),
     ("/api/v1/scratchpad/cancel", ("POST",)): "a hardcoded stub",
     ("/api/v1/browse/status", ("GET",)): "a hardcoded stub reporting the feature is off",
+    ("/api/v1/live-apps/{slot}/access", ("GET",)): (
+        "the credential is the visitor's viewer sign-in cookie, which the route "
+        "checks itself against the viewer sign-in and the slot's recorded launcher; "
+        "it answers only whether that visitor launched the app, and 404 with live "
+        "apps off"
+    ),
+    ("/api/v1/live-apps/{slot}/stopped-page", ("GET",)): (
+        "the credential is the visitor's viewer sign-in cookie, which the route "
+        "checks itself; it explains a stop only to the person who launched the "
+        "app, shows anyone else a plain refusal, and answers 404 with live apps off"
+    ),
+    ("/api/v1/live-apps/{slot}/stopped", ("POST",)): (
+        "a slot's report that its app ended, believed only from that slot's own "
+        "address and only for the boot id of the slot's running launch, which only "
+        "anton and the slot know; at most it marks that one launch stopped, and it "
+        "answers 404 with live apps off"
+    ),
 }
 
 
