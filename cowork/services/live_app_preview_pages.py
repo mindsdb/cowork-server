@@ -1,22 +1,26 @@
 """Trusted pages served by the edge before any live app code can run."""
 import json
 
-from cowork.services.live_app_preview import COWORK_ORIGIN, app_origin
+from cowork.services.live_app_preview import app_origin, cowork_origins, viewer_sign_in_url
 
 
 def page(slot: int, *, authorize: bool) -> str:
-    config = json.dumps({"cowork": COWORK_ORIGIN, "app": app_origin(slot), "authorize": authorize})
+    config = json.dumps({"cowork": sorted(cowork_origins()), "app": app_origin(slot), "signIn": viewer_sign_in_url(),
+                         "authorize": authorize}).replace("<", "\\u003c")
     return '''<!doctype html><meta charset="utf-8"><title>App preview</title>
 <p id="status">Connecting app preview…</p><script>
 'use strict';
 const config = CONFIG;
-const [nonce, launchId] = location.hash.slice(1).split('/');
+const [nonce, launchId, parentOrigin = ''] = location.hash.slice(1).split('/');
+// The opening page names its own origin, which must be one this server serves.
+const named = (() => { try { return decodeURIComponent(parentOrigin); } catch { return ''; } })();
+const cowork = config.cowork.includes(named) ? named : '';
 const peer = config.authorize ? window.opener : window.parent;
 const prefix = '/_live_app/preview/';
 let stage = 'starting';
 let previewIntent;
 const validId = value => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
-const send = (event, extra = {}) => peer.postMessage({type:'live-app-preview', event, nonce, launchId, ...extra}, config.cowork);
+const send = (event, extra = {}) => peer.postMessage({type:'live-app-preview', event, nonce, launchId, ...extra}, cowork);
 const deadline = async promise => {
   let timer;
   try { return await Promise.race([promise, new Promise((_, reject) => {
@@ -29,7 +33,11 @@ const call = async (name, body) => {
   try {
     const r = await fetch(prefix + name, {method:'POST', credentials:'same-origin', signal:controller.signal,
       headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), cache:'no-store', redirect:'error'});
-    if (!r.ok) { const error = new Error('Preview unavailable'); error.status = r.status; throw error; }
+    if (!r.ok) {
+      const error = new Error('Preview unavailable'); error.status = r.status;
+      try { error.detail = (await r.json()).detail; } catch {}
+      throw error;
+    }
     return r.status === 204 ? {} : await r.json();
   } finally { clearTimeout(timer); }
 };
@@ -51,7 +59,7 @@ async function storageAvailable() {
 }
 window.addEventListener('message', async event => {
   const data = event.data;
-  if (event.origin !== config.cowork || event.source !== peer || !data || data.type !== 'live-app-preview'
+  if (event.origin !== cowork || event.source !== peer || !data || data.type !== 'live-app-preview'
       || data.nonce !== nonce || data.launchId !== launchId) return;
   if (data.event === 'intent' && stage === 'ready' && /^[a-f0-9]{64}$/.test(data.token || '')) {
     stage = 'checking';
@@ -66,10 +74,14 @@ window.addEventListener('message', async event => {
     } catch (error) {
       if (error.status === 401) {
         if (config.authorize) {
-          const back = config.app + prefix + 'authorize#' + nonce + '/' + launchId;
-          location.replace('http://view.localhost:8080/oauth2/start?rd=' + encodeURIComponent(back));
+          const back = config.app + prefix + 'authorize#' + nonce + '/' + launchId + '/' + encodeURIComponent(cowork);
+          location.replace(config.signIn + '?rd=' + encodeURIComponent(back));
         } else { stage = 'sign-in'; send('sign-in'); }
-      } else { stage = 'failed'; send('failed'); }
+      } else {
+        // The sign-in window says why the server refused, such as another account.
+        stage = 'failed';
+        send('failed', config.authorize && typeof error.detail === 'string' ? {message:error.detail} : {});
+      }
     }
   } else if (data.event === 'grant' && stage === 'sign-in' && /^[a-f0-9]{64}$/.test(data.grant || '')) {
     stage = 'checking';
@@ -81,7 +93,7 @@ window.addEventListener('message', async event => {
   }
 });
 (async () => {
-  if (!validId(nonce) || !validId(launchId) || !peer || (config.authorize ? window.top !== window : window.top === window)) return;
+  if (!validId(nonce) || !validId(launchId) || !cowork || !config.signIn || !peer || (config.authorize ? window.top !== window : window.top === window)) return;
   if (!config.authorize) {
     try { await storageAvailable(); }
     catch { stage = 'failed'; send('storage-blocked'); return; }

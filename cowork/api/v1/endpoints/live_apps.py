@@ -24,7 +24,13 @@ from cowork.code_sandbox import live_apps_on
 from cowork.principal import Principal, get_principal
 from uuid import UUID
 
-from cowork.schemas.live_apps import LiveAppStateResponse, LiveAppPreviewRequest, LiveAppPreviewToken, LiveAppPreviewResponse
+from cowork.schemas.live_apps import (
+    LiveAppPreviewGrant,
+    LiveAppPreviewRequest,
+    LiveAppPreviewResponse,
+    LiveAppPreviewToken,
+    LiveAppStateResponse,
+)
 from cowork.services import live_app_preview as preview
 from cowork.services.live_app_preview_pages import page as preview_page
 from cowork.services.live_apps import (
@@ -105,12 +111,16 @@ async def live_app_access(slot: int, request: Request) -> Response:
     _require_slot(slot)
     try:
         cookie = request.headers.get("cookie", "")
-        if preview.cookie_value(cookie, preview.PREVIEW_COOKIE):
+        if preview.preview_tokens(cookie):
             try:
                 await preview.check(slot, cookie)
                 outcome = "allowed"
             except preview.PreviewRefused as refused:
                 outcome = "signed_out" if refused.status == 401 else "refused"
+                # A tab holds the viewer cookie too: a stale lease cookie there,
+                # or one an app's own script wrote, mustn't shut the launcher out.
+                if viewer := preview.viewer_cookie_only(cookie):
+                    outcome = await check_access(slot, cookie=viewer)
         else:
             outcome = await check_access(slot, cookie=cookie)
     except LiveAppAccessUnavailable as error:
@@ -134,7 +144,9 @@ async def live_app_access(slot: int, request: Request) -> Response:
 async def live_app_stopped_page(slot: int, request: Request) -> HTMLResponse:
     _require_slot(slot)
     try:
-        page = await stopped_page(slot, cookie=request.headers.get("cookie", ""))
+        cookie = request.headers.get("cookie", "")
+        # A preview frame carries its lease cookie but not the viewer cookie.
+        page = await stopped_page(slot, cookie=cookie, owner_id=await preview.lease_owner(slot, cookie))
     except LiveAppAccessUnavailable as error:
         logger.warning(
             "Live app stopped page unavailable",
@@ -245,11 +257,12 @@ def _preview_origin(slot: int, request: Request) -> None:
 # OpenByDesign: an owner-authenticated secret intent and this browser's
 # independently verified viewer cookie must name the same current launcher.
 @router.post("/{slot}/preview/authorize", dependencies=[Depends(require(OpenByDesign))])
-async def authorize_live_app_preview(slot: int, body: LiveAppPreviewToken, request: Request, response: Response) -> dict[str, str]:
+async def authorize_live_app_preview(slot: int, body: LiveAppPreviewToken, request: Request,
+                                     response: Response) -> LiveAppPreviewGrant:
     _preview_origin(slot, request)
     grant = await _preview_call(preview.authorize(slot, body.token, request.headers.get("cookie", "")))
     response.headers.update(_PREVIEW_HEADERS)
-    return {"grant": grant}
+    return LiveAppPreviewGrant(grant=grant)
 
 
 # OpenByDesign: only a still-unused, unexpired viewer-confirmed grant can
@@ -257,9 +270,9 @@ async def authorize_live_app_preview(slot: int, body: LiveAppPreviewToken, reque
 @router.post("/{slot}/preview/exchange", dependencies=[Depends(require(OpenByDesign))])
 async def exchange_live_app_preview(slot: int, body: LiveAppPreviewToken, request: Request) -> Response:
     _preview_origin(slot, request)
-    token = await _preview_call(preview.exchange(slot, body.token))
+    name, token = await _preview_call(preview.exchange(slot, body.token))
     return Response(status_code=204, headers={**_PREVIEW_HEADERS,
-        "Set-Cookie": f"{preview.PREVIEW_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned"})
+        "Set-Cookie": f"{name}={token}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned"})
 
 
 # OpenByDesign: requires both the parent's secret intent and the matching

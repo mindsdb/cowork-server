@@ -91,3 +91,7 @@ class LiveAppPreviewToken(CamelRequest):
 class LiveAppPreviewResponse(CamelResponse):
     id: UUID
     intent: str
+
+
+class LiveAppPreviewGrant(CamelResponse):
+    grant: str

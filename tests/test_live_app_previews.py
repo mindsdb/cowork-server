@@ -14,10 +14,12 @@ from sqlalchemy import delete
 from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, select
 
+from cowork.common.datetime_utils import ensure_utc
 from cowork.common.encryption import decrypt
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession
 from cowork.db.session import get_engine
+from cowork.models.live_app import LiveAppLaunchRecord
 from cowork.models.live_app_preview import LiveAppPreview, LiveAppPreviewOwner
 from cowork.services import live_app_preview as preview
 from tests._live_apps import A, ALICE, B, BOB, VIEWER_A, VIEWER_B, viewer_cookie
@@ -27,6 +29,16 @@ from tests import test_live_apps_access as access_tests
 services = access_tests.services
 
 BASE = "/api/v1/live-apps"
+COWORK = "http://cowork.localhost:8080"
+
+
+@pytest.fixture(autouse=True)
+def preview_origins(monkeypatch):
+    """The web UI's origin, as compose sets COWORK_ALLOWED_ORIGINS for the cowork service."""
+    monkeypatch.setenv("COWORK_ALLOWED_ORIGINS", f'["{COWORK}"]')
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +62,7 @@ def launched(services):
     return _records(1)[-1].id
 
 
-def _create(client, launch_id, *, owner=A, origin=preview.COWORK_ORIGIN):
+def _create(client, launch_id, *, owner=A, origin=COWORK):
     return client.post(f"{BASE}/previews", json={"launchId": str(launch_id)}, headers={**owner, "Origin": origin})
 
 
@@ -115,7 +127,7 @@ def test_exchange_cookie_flags_and_no_cache_are_pinned(services, launched):
     response = _post(client, "exchange", grant)
     assert response.status_code == 204
     attributes = response.headers["set-cookie"].split("; ")
-    assert attributes[0].startswith(preview.PREVIEW_COOKIE + "=")
+    assert attributes[0].startswith(preview.preview_cookie(0) + "=")
     assert set(attributes[1:]) == {"Path=/", "HttpOnly", "Secure", "SameSite=None", "Partitioned"}
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["referrer-policy"] == "no-referrer"
@@ -354,17 +366,21 @@ def test_wrong_slot_cannot_consume_an_intent_or_grant(services, launched):
     assert _post(client, "exchange", grant).status_code == 204
 
 
-def test_keepalive_extends_only_an_active_lease(services, launched, monkeypatch):
+def test_keepalive_extends_an_active_lease_and_a_pending_intent_but_not_a_grant(services, launched, monkeypatch):
     client = _client()
     clock = preview.now()
     monkeypatch.setattr(preview, "now", lambda: clock)
     lease = _active(client, launched)
     pending = _create(client, launched).json()
-    pending_expiry = _row(pending["id"]).expires_at
-    clock += timedelta(seconds=40)
+    granted = _create(client, launched).json()
+    _post(client, "authorize", granted["intent"], cookie=viewer_cookie("a")).raise_for_status()
+    granted_expiry = _row(granted["id"]).expires_at
+    clock += timedelta(seconds=20)
     assert client.post(f"{BASE}/previews/{lease.record_id}/keepalive", headers=A).status_code == 204
     assert client.post(f"{BASE}/previews/{pending['id']}/keepalive", headers=A).status_code == 204
-    assert _row(pending["id"]).expires_at == pending_expiry
+    assert client.post(f"{BASE}/previews/{granted['id']}/keepalive", headers=A).status_code == 204
+    assert ensure_utc(_row(pending["id"]).expires_at) == clock + timedelta(seconds=preview.INTENT_SECONDS)
+    assert _row(granted["id"]).expires_at == granted_expiry
     clock += timedelta(seconds=30)
     assert _access(client, lease.cookie).status_code == 200
     clock += timedelta(seconds=30)
@@ -394,10 +410,11 @@ def test_two_worker_loops_exchange_a_grant_exactly_once(services, launched, monk
 
     with ThreadPoolExecutor(max_workers=2) as workers:
         outcomes = list(workers.map(lambda _: exchange(), range(2)))
-    tokens = [token for token in outcomes if token is not None]
-    assert len(tokens) == 1
+    leases = [lease for lease in outcomes if lease is not None]
+    assert len(leases) == 1
     assert outcomes.count(None) == 1
-    assert _access(client, f"{preview.PREVIEW_COOKIE}={tokens[0]}").status_code == 200
+    name, token = leases[0]
+    assert _access(client, f"{name}={token}").status_code == 200
 
 
 def test_app_recreation_keeps_capability_consumption_in_the_database(services, launched):
@@ -412,7 +429,7 @@ def test_app_recreation_keeps_capability_consumption_in_the_database(services, l
 @pytest.mark.parametrize("owner_exists", [False, True])
 def test_owner_gate_serializes_create_with_logout_across_worker_loops(services, launched, monkeypatch, owner_exists):
     if owner_exists:
-        asyncio.run(preview.create(ALICE, launched, preview.COWORK_ORIGIN))
+        asyncio.run(preview.create(ALICE, launched, COWORK))
     operation = ContextVar("preview_owner_race_operation", default="")
     creator_read = Event()
     logout_completed = Event()
@@ -430,7 +447,7 @@ def test_owner_gate_serializes_create_with_logout_across_worker_loops(services, 
     def create():
         operation.set("create")
         try:
-            return asyncio.run(preview.create(ALICE, launched, preview.COWORK_ORIGIN))
+            return asyncio.run(preview.create(ALICE, launched, COWORK))
         except preview.PreviewRefused:
             return None
 
@@ -511,7 +528,7 @@ def test_reloading_can_revoke_one_lease_while_creating_its_replacement(services,
 
     def create():
         operation.set("create")
-        return asyncio.run(preview.create(ALICE, launched, preview.COWORK_ORIGIN))
+        return asyncio.run(preview.create(ALICE, launched, COWORK))
 
     def revoke_one():
         operation.set("revoke-one")
@@ -550,3 +567,113 @@ def test_reload_with_revoked_cookie_requests_sign_in_for_valid_replacement_only(
     expired = _create(client, launched).json()["intent"]
     clock += timedelta(seconds=preview.INTENT_SECONDS)
     assert _post(client, "connect", expired).status_code == 403
+
+
+def test_a_malformed_neighbour_cookie_hides_neither_the_viewer_cookie_nor_the_lease(services, launched):
+    """An app's own script can write a cookie SimpleCookie rejects, which made it drop the whole header."""
+    client = _client()
+    odd = "theme=dark mode"
+    created = _create(client, launched).json()
+    authorized = _post(client, "authorize", created["intent"], cookie=f"{odd}; {viewer_cookie('a')}")
+    assert authorized.status_code == 200, authorized.text
+    exchanged = _post(client, "exchange", authorized.json()["grant"])
+    cookie = exchanged.headers["set-cookie"].split(";", 1)[0]
+    assert _post(client, "connect", created["intent"], cookie=f"{cookie}; {odd}").status_code == 204
+    assert _access(client, f"{odd}; {cookie}").status_code == 200
+    signed_out = client.get(f"{BASE}/1/preview/revoke-viewer", headers={"Cookie": f"{viewer_cookie('a')}; {odd}"})
+    assert signed_out.status_code == 204
+    assert _row(created["id"]).state == "revoked"
+    assert _access(client, f"{odd}; {cookie}").status_code == 403
+
+
+def test_two_panes_in_one_browser_keep_separate_leases(services, launched):
+    client = _client()
+    first = _active(client, launched)
+    second = _active(client, launched)
+    assert first.cookie.split("=", 1)[0] != second.cookie.split("=", 1)[0]
+    browser = f"{first.cookie}; {second.cookie}"
+    assert _post(client, "connect", first.intent, cookie=browser).status_code == 204
+    assert _post(client, "connect", second.intent, cookie=browser).status_code == 204
+    assert client.delete(f"{BASE}/previews/{second.record_id}", headers=A).status_code == 204
+    assert _access(client, browser).status_code == 200
+    assert client.delete(f"{BASE}/previews/{first.record_id}", headers=A).status_code == 204
+    assert _access(client, browser).status_code == 403
+
+
+def test_an_open_pane_keeps_its_intent_through_a_slow_sign_in(services, launched, monkeypatch):
+    client = _client()
+    clock = preview.now()
+    monkeypatch.setattr(preview, "now", lambda: clock)
+    created = _create(client, launched).json()
+    for _ in range(4):
+        clock += timedelta(seconds=preview.INTENT_SECONDS - 10)
+        assert client.post(f"{BASE}/previews/{created['id']}/keepalive", headers=A).status_code == 204
+    assert client.post(f"{BASE}/previews/{created['id']}/keepalive", headers=B).status_code == 403
+    assert _post(client, "authorize", created["intent"], cookie=viewer_cookie("a")).status_code == 200
+
+
+def test_a_tab_with_a_stale_or_planted_lease_cookie_still_opens_for_the_launcher(services, launched):
+    planted = f"{preview.preview_cookie(0)}=x"
+    client = _client()
+    assert _access(client, f"{planted}; {viewer_cookie('a')}").status_code == 200
+    assert _access(client, f"{planted}; {viewer_cookie('b')}").status_code == 403
+    assert _access(client, planted).status_code == 403
+
+
+@pytest.mark.parametrize("slot_state", ["running", "exited"])
+def test_the_stopped_page_in_a_pane_speaks_to_the_lease_owner(services, launched, slot_state):
+    """A frame carries its lease but not the viewer cookie: a hung or stopped app explains itself there."""
+    client = _client()
+    lease = _active(client, launched)
+    services.slots[1].state = slot_state
+    page = client.get(f"{BASE}/1/stopped-page", headers={"Cookie": lease.cookie})
+    assert page.status_code == 200
+    assert "have access" not in page.text
+    assert client.delete(f"{BASE}/previews", headers=A).status_code == 204
+    assert client.get(f"{BASE}/1/stopped-page", headers={"Cookie": lease.cookie}).status_code == 403
+
+
+def test_the_next_preview_drops_expired_copies_of_the_viewer_cookie(services, launched, monkeypatch):
+    client = _client()
+    clock = preview.now()
+    monkeypatch.setattr(preview, "now", lambda: clock)
+    for _ in range(3):
+        _active(client, launched)
+    clock += timedelta(seconds=preview.LEASE_SECONDS)
+    assert _create(client, launched).status_code == 200
+    with Session(get_engine(get_app_settings().database.uri)) as session:
+        assert [row.viewer_cookie for row in session.exec(select(LiveAppPreview)).all()] == [None] * 3
+
+
+def test_preview_addresses_follow_the_deployment_settings(services, launched, monkeypatch):
+    monkeypatch.setenv("ANTON_LIVE_APP_ADDRESS", "http://app{n}.view.localhost:8081/")
+    monkeypatch.setenv("COWORK_ALLOWED_ORIGINS", '["http://cowork.localhost:8081"]')
+    monkeypatch.setenv("COWORK_LIVE_APPS_VIEWER_PUBLIC_URL", "http://view.localhost:8081")
+    get_app_settings.cache_clear()
+    client = _client()
+    assert _create(client, launched, origin="http://cowork.localhost:8081").status_code == 403
+    with Session(get_engine(get_app_settings().database.uri)) as session:
+        record = session.get(LiveAppLaunchRecord, launched)
+        record.address = "http://app1.view.localhost:8081/"
+        session.add(record)
+        session.commit()
+    assert _create(client, launched).status_code == 403
+    created = _create(client, launched, origin="http://cowork.localhost:8081")
+    assert created.status_code == 200, created.text
+    authorized = _post(client, "authorize", created.json()["intent"], cookie=viewer_cookie("a"))
+    assert authorized.status_code == 200
+    assert _post(client, "authorize", created.json()["intent"], cookie=viewer_cookie("a"),
+                 origin="http://app1.view.localhost:8080").status_code == 403
+    page = client.get(f"{BASE}/1/preview/authorize").text
+    assert '"cowork": ["http://cowork.localhost:8081"]' in page
+    assert '"app": "http://app1.view.localhost:8081"' in page
+    assert '"signIn": "http://view.localhost:8081/oauth2/start"' in page
+    assert "8080" not in page
+
+
+def test_previews_are_refused_without_the_viewer_sign_in_address(services, launched, monkeypatch):
+    monkeypatch.delenv("COWORK_LIVE_APPS_VIEWER_PUBLIC_URL")
+    get_app_settings.cache_clear()
+    refused = _create(_client(), launched)
+    assert refused.status_code == 503
+    assert "Open the app in your browser" in refused.json()["detail"]

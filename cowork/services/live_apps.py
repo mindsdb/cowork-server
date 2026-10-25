@@ -1012,19 +1012,21 @@ async def _app_name(*, partition_id: str, user_id: str, project_id: UUID, slug: 
     return shared_text(metadata.name) or slug
 
 
-async def stopped_page(slot: int, *, cookie: str) -> StoppedPage:
+async def stopped_page(slot: int, *, cookie: str, owner_id: str | None = None) -> StoppedPage:
     """The page the edge shows at slot ``slot``'s address instead of a bare
     403, 502 or 503: why the visitor's app there stopped, or where it runs
     now, for a visitor who launched one there, and a plain refusal for anyone
-    else."""
+    else. ``owner_id`` names the visitor when the request carries a preview
+    lease of theirs instead of the viewer cookie."""
     refusal = StoppedPage(403, _page(f"<p>{_NO_ACCESS}</p>"))
     if not cookie:
         return refusal
     async with _http_client() as client:
         visitor = await viewer_identity(client, cookie)
-    if visitor is None or not visitor.user_id:
+    user_id = visitor.user_id if visitor is not None and visitor.user_id else owner_id
+    if not user_id:
         return refusal
-    history = await run_db(partial(_slot_history, slot=slot, user_id=visitor.user_id), scope=SYSTEM_SCOPE)
+    history = await run_db(partial(_slot_history, slot=slot, user_id=user_id), scope=SYSTEM_SCOPE)
     app = history.mine
     if app is None or history.partition_id is None:
         return refusal
@@ -1034,7 +1036,7 @@ async def stopped_page(slot: int, *, cookie: str) -> StoppedPage:
     if elsewhere is not None and not app.running:
         (elsewhere,) = await reconcile_running([elsewhere])
     name = html.escape(
-        await _app_name(partition_id=history.partition_id, user_id=visitor.user_id, project_id=app.project_id, slug=app.slug)
+        await _app_name(partition_id=history.partition_id, user_id=user_id, project_id=app.project_id, slug=app.slug)
     )
     if app.running:
         return StoppedPage(

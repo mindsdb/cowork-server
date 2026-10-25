@@ -12,8 +12,8 @@ import secrets
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from http.cookies import SimpleCookie, CookieError
 from typing import TypeVar
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cryptography.fernet import InvalidToken
@@ -22,13 +22,15 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from cowork.common.datetime_utils import ensure_utc
 from cowork.common.encryption import decrypt, encrypt
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
 from cowork.db.units import run_db
 from cowork.models.live_app import LiveAppLaunchRecord
 from cowork.models.live_app_preview import LiveAppPreview, LiveAppPreviewOwner
 from cowork.services import live_apps
 
-COWORK_ORIGIN = "http://cowork.localhost:8080"
+# Each lease has its own cookie, named by its position, so two panes in one
+# browser partition never overwrite each other's lease.
 PREVIEW_COOKIE = "__Host-live-app-preview"
 INTENT_SECONDS = 120
 GRANT_SECONDS = 30
@@ -37,6 +39,8 @@ MAX_PREVIEWS = 8
 T = TypeVar("T")
 _TOKEN = re.compile(r"[0-9a-f]{64}")
 _VIEWER_COOKIE = re.compile(r"_oauth2_proxy(?:_\d+)?")
+_PREVIEW_COOKIE_NAME = re.compile(re.escape(PREVIEW_COOKIE) + r"-[0-7]")
+_SIGN_IN = "Sign in to the app viewer to continue."
 
 
 class PreviewRefused(Exception):
@@ -48,8 +52,33 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def cowork_origins() -> frozenset[str]:
+    """The web UI origins this server serves (COWORK_ALLOWED_ORIGINS), the
+    only pages that may open a preview."""
+    return frozenset(origin.rstrip("/") for origin in get_app_settings().allowed_origins if origin != "*")
+
+
+def viewer_sign_in_url() -> str:
+    """The viewer sign-in's /oauth2/start at its browser address, or '' when
+    COWORK_LIVE_APPS_VIEWER_PUBLIC_URL isn't set."""
+    public = get_app_settings().live_apps_viewer_public_url.rstrip("/")
+    return f"{public}/oauth2/start" if public else ""
+
+
+def app_address(slot: int) -> str:
+    """The address anton gives slot ``slot``'s app (ANTON_LIVE_APP_ADDRESS)."""
+    from anton.core.artifacts.live_app_slots import app_address as slot_address
+
+    return slot_address(slot)
+
+
 def app_origin(slot: int) -> str:
-    return f"http://app{slot}.view.localhost:8080"
+    parts = urlsplit(app_address(slot))
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def preview_cookie(position: int) -> str:
+    return f"{PREVIEW_COOKIE}-{position}"
 
 
 def digest(token: str) -> str:
@@ -58,27 +87,31 @@ def digest(token: str) -> str:
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-def cookie_value(cookie: str, name: str) -> str:
-    try:
-        parsed = SimpleCookie(cookie)
-        return parsed[name].value if name in parsed else ""
-    except CookieError:
-        return ""
+def cookie_pairs(cookie: str) -> list[tuple[str, str]]:
+    """Each name=value pair of a Cookie header, in order. SimpleCookie isn't
+    used: it drops every cookie in the header when any one is malformed, such
+    as an app's ``theme=dark mode``."""
+    pairs = []
+    for part in cookie.split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name.strip():
+            pairs.append((name.strip(), value.strip()))
+    return pairs
+
+
+def preview_tokens(cookie: str) -> list[str]:
+    return [value for name, value in cookie_pairs(cookie) if _PREVIEW_COOKIE_NAME.fullmatch(name)]
 
 
 def viewer_cookie_only(cookie: str) -> str:
     if len(cookie) > 32768:
         raise PreviewRefused()
-    try:
-        parsed = SimpleCookie(cookie)
-    except CookieError:
-        return ""
-    return "; ".join(m.OutputString() for k, m in parsed.items() if _VIEWER_COOKIE.fullmatch(k))
+    return "; ".join(f"{name}={value}" for name, value in cookie_pairs(cookie) if _VIEWER_COOKIE.fullmatch(name))
 
 
 def _launch(session: ScopedSession, launch_id: UUID) -> LiveAppLaunchRecord:
     launch = session.get(LiveAppLaunchRecord, launch_id)
-    if launch is None or launch.state != "running" or launch.address != app_origin(launch.slot) + "/":
+    if launch is None or launch.state != "running" or launch.address != app_address(launch.slot):
         raise PreviewRefused()
     return launch
 
@@ -133,7 +166,7 @@ async def _revoke_unit(fn: Callable[[ScopedSession], None]) -> None:
     raise PreviewRefused("Couldn't close app previews. Please try again.", 503)
 
 
-def _create(session: ScopedSession, person: live_apps.LiveAppPerson, launch_id: UUID, token: str) -> UUID:
+def _create(session: ScopedSession, person: live_apps.LiveAppPerson, launch_id: UUID, token: str, origin: str) -> UUID:
     _touch_owner(session, person.user_id, person.email)
     launch = _launch(session, launch_id)
     if not _owner(launch, person):
@@ -146,20 +179,26 @@ def _create(session: ScopedSession, person: live_apps.LiveAppPerson, launch_id: 
     reusable = None
     for row in rows:
         occupied.add(row.position)
-        if reusable is None and (row.state == "revoked" or ensure_utc(row.expires_at) <= now()):
-            reusable = row
+        if row.state == "revoked" or ensure_utc(row.expires_at) <= now():
+            if reusable is None:
+                reusable = row
+            elif row.viewer_cookie is not None:
+                # A closed tab never revokes its lease: drop the expired copy of
+                # the viewer's session cookie at the owner's next preview.
+                row.viewer_cookie = row.grant_hash = None
+                session.add(row)
     if reusable is None:
         position = next((n for n in range(MAX_PREVIEWS) if n not in occupied), None)
         if position is None:
             raise PreviewRefused("Close another app preview and try again.", 429)
         reusable = LiveAppPreview(owner_partition_id=person.partition_id, owner_user_id=person.user_id,
-            owner_email=person.email, position=position, launch_id=launch_id, origin=COWORK_ORIGIN,
+            owner_email=person.email, position=position, launch_id=launch_id, origin=origin,
             intent_hash=digest(token), state="pending", expires_at=now() + timedelta(seconds=INTENT_SECONDS))
     else:
         reusable.id = uuid4()
         reusable.owner_email = person.email
         reusable.launch_id = launch_id
-        reusable.origin = COWORK_ORIGIN
+        reusable.origin = origin
         reusable.intent_hash = digest(token)
         reusable.grant_hash = reusable.session_hash = reusable.viewer_cookie = None
         reusable.state = "pending"
@@ -170,17 +209,19 @@ def _create(session: ScopedSession, person: live_apps.LiveAppPerson, launch_id: 
 
 
 async def create(person: live_apps.LiveAppPerson, launch_id: UUID, origin: str) -> tuple[UUID, str]:
-    if origin != COWORK_ORIGIN:
+    if origin not in cowork_origins():
         raise PreviewRefused()
+    if not viewer_sign_in_url():
+        raise PreviewRefused("App previews aren't set up on this server. Open the app in your browser.", 503)
     token = secrets.token_hex(32)
-    record_id = await _unit(partial(_create, person=person, launch_id=launch_id, token=token))
+    record_id = await _unit(partial(_create, person=person, launch_id=launch_id, token=token, origin=origin))
     return record_id, token
 
 
 def _snapshot(session: ScopedSession, token: str, field: str, slot: int) -> tuple[LiveAppPreview, LiveAppLaunchRecord]:
     row = _by_token(session, token, field)
     launch = _launch(session, row.launch_id)
-    if launch.slot != slot or row.origin != COWORK_ORIGIN or (row.owner_user_id, row.owner_email, row.owner_partition_id) != (
+    if launch.slot != slot or row.origin not in cowork_origins() or (row.owner_user_id, row.owner_email, row.owner_partition_id) != (
         launch.launcher_user_id, launch.launcher_email, launch.launcher_partition_id
     ):
         raise PreviewRefused()
@@ -224,7 +265,7 @@ async def authorize(slot: int, intent: str, cookie: str) -> str:
     return grant
 
 
-def _exchange(session: ScopedSession, grant: str, slot: int, token: str) -> None:
+def _exchange(session: ScopedSession, grant: str, slot: int, token: str) -> int:
     row, _ = _snapshot(session, grant, "grant_hash", slot)
     _valid(row, state="granted")
     row.state = "active"
@@ -232,12 +273,14 @@ def _exchange(session: ScopedSession, grant: str, slot: int, token: str) -> None
     row.session_hash = digest(token)
     row.expires_at = now() + timedelta(seconds=LEASE_SECONDS)
     session.add(row)
+    return row.position
 
 
-async def exchange(slot: int, grant: str) -> str:
+async def exchange(slot: int, grant: str) -> tuple[str, str]:
+    """The new lease's cookie name and token."""
     token = secrets.token_hex(32)
-    await _unit(partial(_exchange, grant=grant, slot=slot, token=token))
-    return token
+    position = await _unit(partial(_exchange, grant=grant, slot=slot, token=token))
+    return preview_cookie(position), token
 
 
 async def check(slot: int, cookie: str, *, intent: str | None = None) -> LiveAppPreview:
@@ -246,14 +289,30 @@ async def check(slot: int, cookie: str, *, intent: str | None = None) -> LiveApp
         if target.state != "active":
             # A newly opened pane must establish its own lease even when the
             # browser still holds a cookie from a pane that was just closed.
-            raise PreviewRefused("Sign in to the app viewer to continue.", 401)
-    token = cookie_value(cookie, PREVIEW_COOKIE)
-    if not token:
-        raise PreviewRefused("Sign in to the app viewer to continue.", 401)
+            raise PreviewRefused(_SIGN_IN, 401)
+        name = preview_cookie(target.position)
+        tokens = [value for key, value in cookie_pairs(cookie) if key == name]
+    else:
+        tokens = preview_tokens(cookie)
+    if not tokens:
+        raise PreviewRefused(_SIGN_IN, 401)
+    # Another pane's revoked or expired lease may ride along: any valid one
+    # admits the request, and a sign-in refusal outranks the others.
+    refusal = None
+    for token in tokens:
+        try:
+            return await _check_lease(slot, token, intent)
+        except PreviewRefused as error:
+            if refusal is None or error.status == 401:
+                refusal = error
+    raise refusal
+
+
+async def _check_lease(slot: int, token: str, intent: str | None) -> LiveAppPreview:
     row, launch = await _unit(partial(_snapshot, token=token, field="session_hash", slot=slot))
     _valid(row, state="active")
     if intent is not None and row.intent_hash != digest(intent):
-        raise PreviewRefused("Sign in to the app viewer to continue.", 401)
+        raise PreviewRefused(_SIGN_IN, 401)
     if not row.viewer_cookie:
         raise PreviewRefused()
     try:
@@ -278,6 +337,9 @@ async def keepalive(person: live_apps.LiveAppPerson, record_id: UUID) -> None:
             raise PreviewRefused()
         return row, _launch(session, row.launch_id)
     row, launch = await _unit(read)
+    if row.state == "pending":
+        await _keep_intent(record_id, row.intent_hash)
+        return
     if row.state != "active":
         return
     if not row.viewer_cookie:
@@ -295,6 +357,40 @@ async def keepalive(person: live_apps.LiveAppPerson, record_id: UUID) -> None:
         current.expires_at = now() + timedelta(seconds=LEASE_SECONDS)
         session.add(current)
     await _unit(renew)
+
+
+async def _keep_intent(record_id: UUID, intent_hash: str) -> None:
+    """An open pane keeps its intent alive while its owner signs in, however
+    long they take before the click or at the viewer sign-in."""
+    def extend(session: ScopedSession) -> None:
+        current = session.get(LiveAppPreview, record_id)
+        if current is None or current.state != "pending" or current.intent_hash != intent_hash:
+            return
+        current.expires_at = now() + timedelta(seconds=INTENT_SECONDS)
+        session.add(current)
+    try:
+        await _unit(extend)
+    except PreviewRefused:
+        # authorize consumed the intent meanwhile, which is progress.
+        return
+
+
+async def lease_owner(slot: int, cookie: str) -> str | None:
+    """The user a preview lease cookie in ``cookie`` belongs to, for slot
+    ``slot``'s stopped page, which a frame reaches without the viewer cookie.
+    An expired lease still names its owner; a revoked one keeps no token."""
+    tokens = [token for token in preview_tokens(cookie) if _TOKEN.fullmatch(token)]
+    if not tokens:
+        return None
+
+    def read(session: ScopedSession) -> str | None:
+        for token in tokens:
+            row = session.exec(session.select(LiveAppPreview).where(LiveAppPreview.session_hash == digest(token))).first()
+            launch = session.get(LiveAppLaunchRecord, row.launch_id) if row is not None else None
+            if launch is not None and launch.slot == slot:
+                return row.owner_user_id
+        return None
+    return await run_db(read, scope=SYSTEM_SCOPE)
 
 
 def _revoke_rows(session: ScopedSession, *, user_id: str, email: str, partition: str | None, record_id: UUID | None) -> None:
