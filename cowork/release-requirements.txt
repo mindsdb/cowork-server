@@ -59,7 +59,7 @@ annotated-types==0.7.0 \
 anthropic==1.8.0 \
     --hash=sha256:79a4516a21e64fd7b15be1a49ebf544bd6376c96a971a77365358823a2717bc6 \
     --hash=sha256:9c1783ed90f409617749a61c5ab98e20624a572626f2e0a15cea03ed8e1401e5
-anton-agent @ git+https://github.com/mindsdb/anton.git@434345d571b912f9365a24a24ef1dca854e0583d
+anton-agent @ git+https://github.com/mindsdb/anton.git@5680965fd98b10c3bd023afbd7c859e2f3b219e5
 anyio==4.15.1 \
     --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101 \
     --hash=sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94

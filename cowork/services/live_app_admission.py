@@ -115,3 +115,16 @@ async def live_app_launch_lock() -> AsyncIterator[None]:
         # A cancelled acquisition can complete in its thread; both it and a
         # cancelled holder must release before the caller unwinds.
         await run_to_completion(asyncio.to_thread(lock.close))
+
+
+@asynccontextmanager
+async def try_live_app_launch_lock() -> AsyncIterator[bool]:
+    """``live_app_launch_lock`` without the wait: one attempt, yielding
+    whether it now holds admission. A caller that gets False holds nothing."""
+    engine = db_session.get_engine(db_session.settings.database.uri)
+    lock = _LaunchLock(engine)
+    try:
+        await run_to_completion(asyncio.to_thread(lock.open))
+        yield await run_to_completion(asyncio.to_thread(lock.try_acquire))
+    finally:
+        await run_to_completion(asyncio.to_thread(lock.close))

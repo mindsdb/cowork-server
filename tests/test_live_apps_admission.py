@@ -157,6 +157,31 @@ async def test_cancelled_waiter_does_not_unlock_holder(monkeypatch):
             rival.close()
 
 
+async def test_try_lock_reports_a_busy_lock_without_waiting_or_unlocking_the_holder(monkeypatch):
+    monkeypatch.setattr(admission, "_LOCK_RETRY_SECONDS", 5.0)
+    async with admission.live_app_launch_lock():
+        started = asyncio.get_running_loop().time()
+        async with admission.try_live_app_launch_lock() as acquired:
+            assert acquired is False
+        assert asyncio.get_running_loop().time() - started < 1
+        rival = admission._LaunchLock(db_session.get_engine(db_session.settings.database.uri))
+        rival.open()
+        try:
+            assert rival.try_acquire() is False
+        finally:
+            rival.close()
+    async with admission.try_live_app_launch_lock() as acquired:
+        assert acquired is True
+        rival = admission._LaunchLock(db_session.get_engine(db_session.settings.database.uri))
+        rival.open()
+        try:
+            assert rival.try_acquire() is False
+        finally:
+            rival.close()
+    async with admission.live_app_launch_lock():
+        pass
+
+
 def test_database_path_aliases_share_lock(tmp_path):
     actual = tmp_path / "actual.db"
     actual.touch()

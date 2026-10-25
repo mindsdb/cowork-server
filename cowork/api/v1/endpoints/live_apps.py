@@ -30,7 +30,6 @@ from cowork.schemas.live_apps import (
     LiveAppStateResponse,
 )
 from cowork.services.live_apps import (
-    AVAILABILITY_MESSAGE,
     LiveAppAccessUnavailable,
     acknowledge_availability,
     SlotReportRefused,
@@ -38,6 +37,7 @@ from cowork.services.live_apps import (
     check_access,
     is_live_app_slot,
     live_app_person,
+    names_a_person,
     person_apps,
     person_availability,
     record_slot_stop,
@@ -100,7 +100,7 @@ async def my_live_apps(principal: Principal | None = Depends(get_principal)) -> 
 
 
 def _availability_principal(principal: Principal | None) -> Principal:
-    if principal is None or not principal.user_id or not principal.org_id:
+    if not names_a_person(principal):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in to check live app availability.")
     return principal
 
@@ -109,8 +109,6 @@ def _availability_principal(principal: Principal | None) -> Principal:
 async def live_app_availability(
     response: Response, principal: Principal | None = Depends(get_principal)
 ) -> LiveAppAvailabilityResponse:
-    from anton.core.artifacts.live_app_slots import LiveAppLaunchError
-
     principal = _availability_principal(principal)
     response.headers["Cache-Control"] = "no-store"
     # A stable opaque cache namespace, never another person's id or email.
@@ -119,12 +117,9 @@ async def live_app_availability(
     person = live_app_person(principal)
     if person is None:
         return LiveAppAvailabilityResponse(waiting=False, scope=scope)
-    try:
-        availability = await person_availability(person)
-    except LiveAppLaunchError as error:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from None
-    notice = None if availability.notice_id is None else LiveAppAvailabilityNotice(
-        id=availability.notice_id, message=AVAILABILITY_MESSAGE
+    availability = await person_availability(person)
+    notice = None if availability.notice is None else LiveAppAvailabilityNotice(
+        id=availability.notice.id, message=availability.notice.message
     )
     return LiveAppAvailabilityResponse(waiting=availability.waiting, notice=notice, scope=scope)
 

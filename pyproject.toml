@@ -192,7 +192,7 @@ packages = ["cowork"]
 # Temporary source pairing for shared live-app admission. Before merging,
 # replace this with a published Anton release containing the change, raise
 # the public dependency floor, and regenerate the lock and runtime export.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "434345d571b912f9365a24a24ef1dca854e0583d" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "5680965fd98b10c3bd023afbd7c859e2f3b219e5" }
 
 [dependency-groups]
 dev = [

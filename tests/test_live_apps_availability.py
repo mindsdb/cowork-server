@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -10,9 +12,12 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 import cowork.server as cowork_server
+from cowork.common.datetime_utils import ensure_utc
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db import session as db_session
 from cowork.db.session import get_engine
 from cowork.models.live_app import LiveAppAvailabilityWait
+from cowork.services import live_app_admission as admission
 from cowork.services import live_apps
 from tests._live_apps import (
     A, B, ALICE, BOB, BEARER_TOKEN, LAUNCH_TOKEN, MODULE,
@@ -81,7 +86,9 @@ def test_never_launched_person_gets_notice_without_sending_another_message(servi
     _free(services)
     notice = _available(client)
     assert notice["waiting"] is False
-    assert notice["notice"]["message"] == live_apps.AVAILABILITY_MESSAGE
+    assert notice["notice"]["message"] == live_apps.AvailabilityNotice(
+        id=UUID(notice["notice"]["id"]), notified_at=ensure_utc(_rows()[0].modified_at)
+    ).message
     assert notice["scope"] == initial["scope"]
     assert ALICE.user_id not in notice["scope"]
     # A fresh app/client reads the same persisted notice, without generating
@@ -173,3 +180,66 @@ def test_poll_broadcasts_to_other_waiters_and_ack_needs_identity(services):
         "Authorization": f"Bearer {BEARER_TOKEN}"
     }).status_code == 401
     assert client.post(f"/api/v1/live-apps/availability/{uuid4()}/ack").status_code == 401
+
+
+def test_notice_message_names_the_time_the_slot_was_seen_free():
+    seen = datetime.now(timezone.utc).replace(hour=14, minute=5)
+    assert live_apps.AvailabilityNotice(id=uuid4(), notified_at=seen).message == (
+        "A live app slot became available at 14:05 UTC. You can try launching again. It is not reserved."
+    )
+    older = live_apps.AvailabilityNotice(id=uuid4(), notified_at=seen - timedelta(days=1)).message
+    assert f"available at {(seen - timedelta(days=1)).day} " in older
+
+
+def test_notice_time_is_when_the_slot_was_seen_free_not_the_refusal(services):
+    asyncio.run(_refuse(ALICE))
+    refused_at = datetime(2026, 1, 2, 9, 30, tzinfo=timezone.utc)
+    with Session(get_engine(get_app_settings().database.uri)) as session:
+        row = session.exec(select(LiveAppAvailabilityWait)).one()
+        row.created_at = row.modified_at = refused_at
+        session.add(row)
+        session.commit()
+    _free(services)
+    before = datetime.now(timezone.utc)
+    message = _available(_client())["notice"]["message"]
+    notified_at = ensure_utc(_rows()[0].modified_at)
+    assert before - timedelta(minutes=1) <= notified_at <= datetime.now(timezone.utc) + timedelta(minutes=1)
+    assert "2 Jan" not in message
+    assert message == live_apps.AvailabilityNotice(id=_rows()[0].generation, notified_at=notified_at).message
+
+
+def test_another_persons_poll_neither_reconciles_nor_takes_admission(services, monkeypatch):
+    asyncio.run(_refuse(ALICE))
+    _free(services)
+
+    def no_admission():
+        pytest.fail("a person who is not waiting must not take admission")
+
+    monkeypatch.setattr(live_apps, "try_live_app_launch_lock", no_admission)
+    monkeypatch.setattr(live_apps, "live_app_launch_lock", no_admission)
+    client = _client()
+    result = _available(client, B)
+    assert result["waiting"] is False and result["notice"] is None
+    assert services.requests == []
+    assert _rows()[0].notified is False
+
+
+def test_busy_admission_returns_the_callers_state_without_reconciling_or_waiting(services):
+    asyncio.run(_refuse(ALICE))
+    _free(services)
+    holder = admission._LaunchLock(db_session.get_engine(db_session.settings.database.uri))
+    holder.open()
+    try:
+        assert holder.try_acquire() is True
+        client = _client()
+        started = time.monotonic()
+        result = _available(client)
+        # A blocking acquisition would wait out LAUNCH_LOCK_TIMEOUT_SECONDS.
+        assert time.monotonic() - started < admission.LAUNCH_LOCK_TIMEOUT_SECONDS / 3
+        assert result["waiting"] is True and result["notice"] is None
+        assert services.requests == []
+        assert _rows()[0].notified is False
+    finally:
+        holder.close()
+    # The next poll, with admission free, reconciles.
+    assert _available(client)["notice"] is not None
