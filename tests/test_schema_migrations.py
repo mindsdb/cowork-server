@@ -747,3 +747,102 @@ def test_migrated_schema_holds_the_live_app_uniqueness_rules(tmp_path, monkeypat
     _downgrade_to(engine, uri, "3e4b5f7586d3")
     for table in ("live_app_launches", "live_app_shares", "live_app_copies"):
         assert not _has_table(db_path, table)
+
+
+def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monkeypatch):
+    """Only ephemeral previews disappear on downgrade; launch history survives."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "live-app-previews.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    previous = "e3618a102301"
+    _upgrade_to(engine, uri, previous)
+    assert not _has_table(db_path, "live_app_previews")
+    assert not _has_table(db_path, "live_app_preview_owners")
+
+    def persistent_schema():
+        with sqlite3.connect(db_path) as connection:
+            return connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' "
+                "AND tbl_name NOT IN ('live_app_previews', 'live_app_preview_owners') "
+                "ORDER BY type, name"
+            ).fetchall()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(_LIVE_LAUNCH, ("retained-launch", 1, "running"))
+        connection.execute(_LIVE_SHARE, ("retained-share", None))
+        launch_before = connection.execute("SELECT * FROM live_app_launches").fetchall()
+        shares_before = connection.execute("SELECT * FROM live_app_shares").fetchall()
+    schema_before = persistent_schema()
+
+    _upgrade_to(engine, uri, "head")
+    assert _alembic_version(db_path) == expected_head()
+    expected_columns = {
+        "id", "created_at", "modified_at", "owner_partition_id", "owner_user_id",
+        "owner_email", "viewer_cookie", "position", "launch_id", "origin",
+        "intent_hash", "grant_hash", "session_hash", "state", "expires_at", "revision",
+    }
+    assert _table_columns(db_path, "live_app_previews") == expected_columns
+    assert _table_columns(db_path, "live_app_preview_owners") == {"id", "created_at", "modified_at", "marker", "revision"}
+    assert persistent_schema() == schema_before
+
+    insert = """
+        INSERT INTO live_app_previews
+            (id, owner_partition_id, owner_user_id, owner_email, position, launch_id,
+             origin, intent_hash, grant_hash, session_hash, state, expires_at, revision)
+        VALUES (:id, :partition, :owner, 'alice@example.com', :position, 'retained-launch',
+                'http://cowork.localhost:8080', :intent, :grant, :session, 'active',
+                '2026-10-25 12:00:00', 1)
+    """
+    first = dict(id="preview-one", partition="partition-a", owner="owner-a", position=0,
+                 intent="a" * 64, grant="b" * 64, session="c" * 64)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(insert, first)
+        connection.execute("INSERT INTO live_app_preview_owners (id, marker, revision) VALUES ('owner-gate', 3, 4)")
+        owner_columns = {row[1]: row for row in connection.execute("PRAGMA table_info(live_app_preview_owners)")}
+        assert owner_columns["revision"][2:4] == ("INTEGER", 1)
+        assert owner_columns["marker"][2:4] == ("INTEGER", 1)
+        columns = {row[1]: row for row in connection.execute("PRAGMA table_info(live_app_previews)")}
+        assert columns["revision"][2:4] == ("INTEGER", 1)
+        assert all(columns[name][3] == 1 for name in expected_columns - {
+            "created_at", "modified_at", "viewer_cookie", "grant_hash", "session_hash",
+        })
+
+    candidate = dict(id="preview-two", partition="partition-a", owner="owner-a", position=1,
+                     intent="d" * 64, grant="e" * 64, session="f" * 64)
+    for duplicate in ({"position": 0}, {"intent": first["intent"]},
+                      {"grant": first["grant"]}, {"session": first["session"]},
+                      {"position": -1}, {"position": 8}):
+        with pytest.raises(sqlite3.IntegrityError):
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(insert, {**candidate, **duplicate})
+    # Position zero belongs independently to another owner; the bound is per owner.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(insert, {**candidate, "owner": "owner-b", "position": 0})
+        assert connection.execute("SELECT count(*) FROM live_app_previews").fetchone()[0] == 2
+
+    _downgrade_to(engine, uri, previous)
+    assert _alembic_version(db_path) == previous
+    assert not _has_table(db_path, "live_app_previews")
+    assert not _has_table(db_path, "live_app_preview_owners")
+    assert persistent_schema() == schema_before
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
+        assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
+
+    _upgrade_to(engine, uri, "head")
+    assert _alembic_version(db_path) == expected_head()
+    assert _table_columns(db_path, "live_app_previews") == expected_columns
+    assert _table_columns(db_path, "live_app_preview_owners") == {"id", "created_at", "modified_at", "marker", "revision"}
+    assert persistent_schema() == schema_before
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT count(*) FROM live_app_previews").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM live_app_preview_owners").fetchone()[0] == 0
+        connection.execute(insert, first)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(insert, {**candidate, "position": 0})
+        assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
+        assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
+    engine.dispose()

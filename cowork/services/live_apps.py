@@ -429,7 +429,7 @@ def is_live_app_slot(slot: int) -> bool:
 #: identity layers let through: the edge's access check and stopped page carry
 #: only the visitor's cookie, and a slot's stop report carries nothing. Each
 #: route checks its caller itself.
-_SLOT_PATHS = ("access", "stopped-page", "stopped")
+_SLOT_PATHS = ("access", "stopped-page", "stopped", "preview/bootstrap", "preview/authorize", "preview/exchange", "preview/connect", "preview/revoke-viewer")
 
 
 def live_app_slot_paths() -> frozenset[str]:
