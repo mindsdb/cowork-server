@@ -655,7 +655,7 @@ class TurnQueueSettings(Settings):
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
 
 
-# The OpenAI API an openai_compatible provider's planning and coding roles call.
+# The OpenAI API an openai_compatible provider's planning, coding and router roles call.
 OpenAICompatibleAPI = Literal["chat_completions", "responses"]
 
 
@@ -1071,16 +1071,16 @@ class AppSettings(Settings):
         default="chat_completions",
         validation_alias=AliasChoices("COWORK_OPENAI_COMPATIBLE_API"),
         description=(
-            "The API the planning and coding roles call on an openai_compatible "
+            "The API the planning, coding and router roles call on an openai_compatible "
             "provider. 'chat_completions' (default) calls {base}/chat/completions. "
             "'responses' calls {base}/responses through anton's openai flavor, "
             "where OpenAI and Azure accept function tools together with a "
             "reasoning effort. It applies only when the installed anton reports "
-            "RESPONSES_TRANSPORT_READY; with an older anton both roles stay on "
+            "RESPONSES_TRANSPORT_READY; with an older anton all three roles stay on "
             "chat completions and one warning says so. On the Responses path the "
             "agent loop runs without web tools, since OpenAI's hosted web_search "
             "reads the web from the provider's side, outside the deployment's "
-            "egress controls. The router and Gemini stay on chat completions. "
+            "egress controls. Gemini is unaffected. "
             "Deployment-wide; get_app_settings() is cached, so a change needs a "
             "restart."
         ),

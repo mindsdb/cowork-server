@@ -280,6 +280,17 @@ async def lifespan(app: FastAPI):
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
         )
+    app.state.router_startup_probe = None
+    if (
+        app_settings.deployment_kind == "self-hosted"
+        and app_settings.tenancy_mode == "local"
+        and not TurnQueueSettings().is_remote
+    ):
+        from cowork.services.router_probe import run_router_startup_probe
+
+        # Bootstrap and credential clearing finish first; provider checks must
+        # not delay readiness while the configured endpoint is unavailable.
+        app.state.router_startup_probe = asyncio.create_task(run_router_startup_probe())
     try:
         yield
     finally:
@@ -300,6 +311,7 @@ async def lifespan(app: FastAPI):
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
+        await _cancel_and_wait(getattr(app.state, "router_startup_probe", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
