@@ -1112,6 +1112,7 @@ async def test_a_turn_off_passes_what_it_passed_before(monkeypatch, tmp_path):
     assert off_keys - set(calls[-1]) == set()
     assert BACKEND_SENTENCE in off_suffix
     assert "datasets, fullstack apps, etc." in off_suffix
+    assert "runtime-local address" not in off_suffix
     assert BACKEND_SENTENCE not in on_suffix
     assert harness._SANDBOXED_BACKENDS_RULE in on_suffix
     assert "fullstack apps" not in on_suffix
