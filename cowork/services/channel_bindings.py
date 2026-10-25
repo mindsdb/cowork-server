@@ -7,6 +7,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from cowork.channels.registry import PluginRegistry, get_registry
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
@@ -25,6 +26,11 @@ _DEFAULT_THREAD_KEY = "__default__"
 # as server errors in production logs.
 _QUIET_REGEX_OPTIONS = re2.Options()
 _QUIET_REGEX_OPTIONS.log_errors = False
+
+
+def operator_bindings_required() -> bool:
+    settings = get_app_settings()
+    return settings.tenancy_mode != "org" and settings.trust_identity_headers
 
 
 class BindingNotFoundError(Exception):
@@ -47,7 +53,12 @@ class ChannelBindingService:
         rows = self.session.exec(stmt).all()
         return [self._dto(row) for row in rows if self._binding_readable(row)]
 
+    def _require_writer(self) -> None:
+        if operator_bindings_required() and (self.session.scope.org_id or self.session.scope.user_id):
+            raise ValueError("requires the operator")
+
     def create(self, req: BindingCreateRequest) -> BindingResponse:
+        self._require_writer()
         self._validate_channel(req.channel_type)
         self._validate_trigger(req.trigger_rule.value, req.trigger_pattern)
         self._validate_links(req.anton_project_id, req.anton_conversation_id)
@@ -68,6 +79,7 @@ class ChannelBindingService:
             trigger_rule=req.trigger_rule.value,
             trigger_pattern=req.trigger_pattern,
             instructions=req.instructions,
+            operator_configured=operator_bindings_required(),
             anton_project_id=req.anton_project_id,
             anton_conversation_id=req.anton_conversation_id,
         )
@@ -81,9 +93,13 @@ class ChannelBindingService:
         return self._dto(binding)
 
     def update(self, binding_id: UUID, req: BindingUpdateRequest) -> BindingResponse:
+        self._require_writer()
         binding = self.session.get(ChannelBinding, binding_id)
         if binding is None or not self._binding_readable(binding):
             raise BindingNotFoundError(str(binding_id))
+
+        if operator_bindings_required() and not self.operator_ready(binding):
+            raise ValueError("This binding needs full operator setup with the bindings set command.")
 
         provided = req.model_fields_set
         eff_rule = (
@@ -97,6 +113,9 @@ class ChannelBindingService:
         eff_conversation = (
             req.anton_conversation_id if "anton_conversation_id" in provided else binding.anton_conversation_id
         )
+        if (operator_bindings_required() and "anton_project_id" in provided
+                and eff_project != binding.anton_project_id and "anton_conversation_id" not in provided):
+            eff_conversation = None
         self._validate_links(eff_project, eff_conversation)
 
         if "display_name" in provided:
@@ -115,12 +134,87 @@ class ChannelBindingService:
                 binding.anton_conversation_id = None
                 self._drop_sessions(binding.id)
         if "anton_conversation_id" in provided:
+            if operator_bindings_required() and req.anton_conversation_id != binding.anton_conversation_id:
+                self._drop_sessions(binding.id)
             binding.anton_conversation_id = req.anton_conversation_id
+        # A later return to trusted identity must not trust edits made while off.
+        if not operator_bindings_required():
+            binding.operator_configured = False
 
         self.session.add(binding)
         self.session.commit()
         self.session.refresh(binding)
         return self._dto(binding)
+
+    def configure(self, req: BindingCreateRequest) -> BindingResponse:
+        """Replace a local target's full configuration, including legacy rows.
+
+        One commit frees an occupied target without deleting its former work.
+        A safe conversation is retained only when the selected project stays.
+        """
+        scope = self.session.scope
+        if get_app_settings().tenancy_mode == "org" or scope.org_id or scope.user_id:
+            raise ValueError("requires the local operator")
+        self._validate_channel(req.channel_type)
+        self._validate_trigger(req.trigger_rule.value, req.trigger_pattern)
+        self._validate_operator_links(req.anton_project_id, req.anton_conversation_id)
+        binding = self._find(req.channel_type, req.external_group_id, req.external_thread_id or _DEFAULT_THREAD_KEY)
+        if binding is None:
+            binding = ChannelBinding(channel_type=req.channel_type, external_group_id=req.external_group_id,
+                                     external_thread_id=req.external_thread_id,
+                                     external_thread_key=req.external_thread_id or _DEFAULT_THREAD_KEY)
+        conversation_id = req.anton_conversation_id
+        was_ready = self.operator_ready(binding)
+        if (was_ready and req.anton_project_id == binding.anton_project_id
+                and "anton_conversation_id" not in req.model_fields_set):
+            conversation_id = binding.anton_conversation_id
+        if not was_ready or conversation_id != binding.anton_conversation_id:
+            self._drop_sessions(binding.id)
+        for name in ("display_name", "trigger_pattern", "instructions", "anton_project_id"):
+            setattr(binding, name, getattr(req, name))
+        binding.trigger_rule = req.trigger_rule.value
+        binding.anton_conversation_id = conversation_id
+        binding.org_id = None
+        binding.created_by = None
+        binding.operator_configured = True
+        self.session.add(binding)
+        try:
+            self.session.commit()
+        except IntegrityError as exc:
+            self.session.rollback()
+            raise BindingConflictError("binding changed concurrently; retry operator setup") from exc
+        self.session.refresh(binding)
+        return self._dto(binding)
+
+    def operator_ready(self, binding: ChannelBinding) -> bool:
+        """Whether an explicitly configured binding names only deployment work."""
+        if not binding.operator_configured or binding.org_id is not None or binding.created_by is not None:
+            return False
+        try:
+            self._validate_operator_links(binding.anton_project_id, binding.anton_conversation_id)
+        except ValueError:
+            return False
+        return True
+
+    def _validate_operator_links(self, project_id: UUID | None, conversation_id: UUID | None) -> None:
+        from cowork.services.projects import GENERAL_PROJECT_ID
+
+        def project_exists(ident: UUID) -> None:
+            project = self.session.get(Project, ident)
+            if project is None or project.org_id is not None or project.created_by is not None:
+                raise ValueError("A channel binding requires a deployment-owned project.")
+
+        if project_id is not None:
+            project_exists(project_id)
+        if conversation_id is not None:
+            conversation = self.session.get(Conversation, conversation_id)
+            if conversation is None or conversation.org_id is not None or conversation.created_by is not None:
+                raise ValueError("A channel binding requires a deployment-owned conversation.")
+            project_exists(conversation.project_id)
+            if project_id is not None and conversation.project_id != project_id:
+                raise ValueError("The conversation must belong to the selected project.")
+        elif project_id is None:
+            project_exists(GENERAL_PROJECT_ID)
 
     def detach_conversation(self, binding: ChannelBinding) -> None:
         """Unpin the binding's conversation so the next inbound message starts a fresh one."""
@@ -193,6 +287,7 @@ class ChannelBindingService:
         )
 
     def delete(self, binding_id: UUID) -> bool:
+        self._require_writer()
         binding = self.session.get(ChannelBinding, binding_id)
         if binding is None or not self._binding_readable(binding):
             return False
@@ -233,6 +328,9 @@ class ChannelBindingService:
                 raise ValueError(f"invalid trigger_pattern regex: {exc}")
 
     def _validate_links(self, project_id: UUID | None, conversation_id: UUID | None) -> None:
+        if operator_bindings_required():
+            self._validate_operator_links(project_id, conversation_id)
+            return
         # Scoped get: another org's project/conversation reads as nonexistent.
         if project_id is not None and self.session.get(Project, project_id) is None:
             raise ValueError(f"project not found: {project_id}")

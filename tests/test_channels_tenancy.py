@@ -559,9 +559,9 @@ async def test_channel_turn_with_an_org_id_is_org_mode_in_org_tenancy(monkeypatc
     assert await _turn_scope(monkeypatch, ORG_A) == TenantScope(org_mode=True, org_id=ORG_A)
 
 
-async def test_channel_turn_with_a_partition_id_stays_in_the_partition(monkeypatch, personal_deployment):
+async def test_channel_turn_with_a_legacy_partition_id_has_no_person(monkeypatch, personal_deployment):
     scope = await _turn_scope(monkeypatch, ORG_A)
-    assert (scope.org_mode, scope.personal, scope.org_id) == (False, True, ORG_A)
+    assert (scope.org_mode, scope.personal, scope.org_id) == (False, False, None)
 
 
 async def test_channel_turn_with_no_org_binds_no_person_on_a_trusted_deployment(
