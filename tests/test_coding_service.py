@@ -25,6 +25,7 @@ from coding_service_fakes import (
     wait_for_status,
     wait_for_turn_thread,
     wait_for_workspace,
+    wait_for_steerable_turn,
     wait_for_steers,
 )
 
@@ -2001,6 +2002,7 @@ def test_failed_queue_promotion_restores_the_instruction(tmp_path: Path) -> None
         SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
     )
     assert engine.started.wait(timeout=1)
+    wait_for_steerable_turn(service, created.id)
 
     queued = service.queue_turn(created.id, "Try this immediately")
     instruction_id = queued.queued_instructions[0].id
