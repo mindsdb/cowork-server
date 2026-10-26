@@ -1245,10 +1245,11 @@ class ResponsesHandler:
             try:
                 async with conversation_writes(conversation_id):
                     anchor_id = await run_db(save_turn, scope=self.scope)
-            except MissingTenantScopeError:
-                # Org-scoped data touched without an org in scope is a 401 by
-                # deliberate classification (server.py). It is a RuntimeError,
-                # so the blanket clause below would answer 500 instead.
+            except (MissingTenantScopeError, PoolTimeoutError):
+                # server.py classifies both on purpose: a missing org scope is a
+                # 401, and a database with no free connection (DatabaseBusy
+                # included) is a 503 with Retry-After. The blanket clause below
+                # would answer either as a 500.
                 raise
             except Exception:
                 # Without this the escape reaches the client as Starlette's bare
