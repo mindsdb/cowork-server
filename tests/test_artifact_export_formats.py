@@ -331,7 +331,8 @@ def _role_permissions(monkeypatch, *, artifact_manage: bool):
         return artifact_manage if permission == "artifact.manage" else True
 
     monkeypatch.setattr(product_permissions, "has_product_permission", decide)
-    monkeypatch.setattr(workspace_ep, "has_product_permission", decide)
+    # The workspace response narrows its capabilities through artifact_permissions.
+    monkeypatch.setattr(artifact_permissions, "has_product_permission", decide)
 
 
 @pytest.mark.parametrize(
@@ -405,7 +406,7 @@ async def test_the_live_recheck_keeps_formats_only_with_artifact_manage(
         "exportFormats": ["html", "docx"],
     }
 
-    current = await workspace_ep._current_capabilities(
+    current = await artifact_permissions.current_capabilities(
         SimpleNamespace(scope=TenantScope(org_mode=True, org_id="org", user_id="user")),
         capabilities,
     )

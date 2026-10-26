@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import quote
 
 from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
+from cowork.docs.store import DOC_HTML, is_doc_primary
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -589,8 +590,10 @@ def _modified_state(
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
+    # A doc publishes its rendered page, so that page is what changed or not.
+    target = primary if primary.name == DOC_HTML else folder
     current_md5 = compute_publish_md5(
-        folder, artifacts_base=artifacts_base or folder.parent
+        target, artifacts_base=artifacts_base or folder.parent
     )
     if current_md5 is None:
         return False, False  # can't tell — don't raise a false "modified"
@@ -1304,6 +1307,11 @@ def _prepare_artifact_card(
     primary_ext = logical_primary.suffix.lower() if logical_primary is not None else ""
     artifact_type = meta.get("type") or "mixed"
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
+    # A doc (cowork.docs) is a document artifact whose primary is the doc file;
+    # the renderer opens it in the doc editor rather than as a JSON file.
+    is_doc = is_doc_primary(logical_primary.name if logical_primary is not None else meta.get("primary"))
+    if is_doc:
+        kind = "Doc"
     is_live = False
     if primary is not None:
         # `primary_hint` can point at a file `_user_files` skipped (e.g. a
@@ -1376,6 +1384,17 @@ def _prepare_artifact_card(
     # `.published.json` key is intentionally overridden here so comments do not
     # fork when an artifact is re-published under a different report URL.
     card["artifactKey"] = artifact_key(artifact_id)
+    if is_doc:
+        card["format"] = "doc"
+        # A doc is shared as its rendered page (doc.html, rewritten on every
+        # write), so its publish state, access and "modified" badge are the
+        # page's, not the JSON's.
+        doc_html = io_folder / DOC_HTML
+        card["htmlPath"] = str(logical_folder / DOC_HTML)
+        card["publishedUrl"] = _published_url_for(io_folder, doc_html, published_map=published_map)
+        card.update(_published_access_for(io_folder, doc_html, published_map=published_map))
+        if doc_html.is_file():
+            primary = doc_html
     if primary is not None:
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving

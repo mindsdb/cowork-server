@@ -25,14 +25,16 @@ from cowork.common.paths import (
     open_pinned_child,
     read_bounded,
 )
+from cowork.api.v1.downloads import attachment_disposition
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
-from cowork.services.product_permissions import has_product_permission, require_product_permission
+from cowork.services.product_permissions import require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
+    current_capabilities,
     require_artifact_owner,
     with_export_formats,
 )
@@ -88,36 +90,6 @@ _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
 # walk refuses them there casefolded too, and the store-owned ones at any
 # depth (`artifact_files.refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
-
-
-def _attachment_disposition(filename: str) -> str:
-    """``Content-Disposition`` for saving ``filename``, safe to put on the wire.
-
-    The name is a request-derived path component. ``relative_file_parts``
-    rejects NUL, separators and ``..``, but a quote, CR or LF still pass — and
-    any of them interpolated raw into a header is a header-injection vector
-    (``project_files.download_project_file`` has exactly that shape; ENG-2044).
-
-    Two spellings so every client gets a usable name: an ASCII ``filename=``
-    with quotes and backslashes escaped and non-printables dropped, and an
-    RFC 5987 ``filename*=UTF-8''…`` carrying the exact name percent-encoded,
-    which is what current browsers read first.
-    """
-    cleaned = "".join(ch for ch in filename if ch.isprintable())
-    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii")
-    ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"').strip() or "download"
-    # A fully non-ASCII stem leaves only the extension(s) behind — "报告.xlsx"
-    # -> ".xlsx", "报告.tar.gz" -> ".tar.gz" — a HIDDEN dotfile on macOS/Linux.
-    # Prefix rather than rpartition: splitting on the last dot rescued only
-    # single-extension names (review pass 2 on #413). Distinct artifacts can
-    # still degrade to the same "download.xlsx" — acceptable, since the ASCII
-    # spelling is a fallback and `filename*` below carries the exact name.
-    if ascii_name.startswith("."):
-        ascii_name = "download" + ascii_name
-    return (
-        f'attachment; filename="{ascii_name}"; '
-        f"filename*=UTF-8''{quote(cleaned or 'download', safe='')}"
-    )
 
 
 def _artifact_folder_component(source, folder: Path) -> str:
@@ -397,7 +369,7 @@ def _draft_file_response(
                 resources.close()
                 return response
         extra = (
-            {"Content-Disposition": _attachment_disposition(parts[-1])}
+            {"Content-Disposition": attachment_disposition(parts[-1])}
             if download else None
         )
         return _draft_stream(
@@ -607,23 +579,6 @@ async def _acquire_live_publish_lock(folder: Path) -> bool:
     return True
 
 
-async def _current_capabilities(session, capabilities: dict) -> dict:
-    if not capabilities["canEdit"]:
-        return capabilities
-    can_edit = await has_product_permission(session.scope, "artifact.manage")
-    can_execute = await has_product_permission(session.scope, "product.execute")
-    current = {
-        **capabilities,
-        "canEdit": can_edit,
-        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
-        "canResolveComments": capabilities["canResolveComments"] and can_edit,
-    }
-    # The export route needs `artifact.manage` too, so it offers nothing here.
-    if not can_edit and "exportFormats" in capabilities:
-        current["exportFormats"] = []
-    return current
-
-
 @router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
@@ -660,7 +615,7 @@ async def artifact_source(
             export_source = await run_in_threadpool(
                 primary_export_source, folder=folder, metadata=metadata
             )
-        capabilities = await _current_capabilities(
+        capabilities = await current_capabilities(
             session, with_export_formats(session, owner_capabilities, export_source)
         )
         return {**result, "capabilities": capabilities, "repair": repair}
@@ -824,7 +779,7 @@ async def artifact_review_entry(
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = await _current_capabilities(
+    capabilities = await current_capabilities(
         session, artifact_capabilities(session, source, folder.name)
     )
     current_revision = None
@@ -1042,7 +997,7 @@ async def enable_artifact_comments(
     from cowork.services.artifact_identity import artifact_key
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
-    capabilities = await _current_capabilities(session, capabilities)
+    capabilities = await current_capabilities(session, capabilities)
     if session.scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is
         # the caller; resolving it again would only repeat that query.

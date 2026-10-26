@@ -2,5 +2,5 @@
 
 See docs/DOCS_ARTIFACTS.md for the modules, which depend in one direction:
 ``model`` → ``markdown`` → ``ops`` / ``undo`` / ``render`` → ``store`` → ``hub`` →
-``service``.
+``images`` → ``service``.
 """
