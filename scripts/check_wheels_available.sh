@@ -19,7 +19,7 @@
 # installed wheel-only", which is not the question. The question is "does the
 # version we are actually going to install have a wheel".
 #
-# So: resolve normally to get the pinned set (step 1), then re-resolve THAT
+# So: resolve under the reviewed release constraints (step 1), then re-resolve THAT
 # pinned set wheel-only (step 2). Exact `==` pins leave nothing to backtrack
 # to, so a missing wheel has to fail.
 #
@@ -27,10 +27,8 @@
 # nearest uv.toml or pyproject.toml `[tool.uv]` table at or above the working
 # directory, plus the user's and the system's uv.toml, while resolving, and
 # settings there such as `override-dependencies` are NOT part of the published
-# wheel, so a user's `uv tool install` never sees them. This project sets none
-# today. A gate
-# that resolves under constraints users do not have is the same defect class
-# this file exists to catch.
+# wheel. Release constraints come only from the packaged export passed below;
+# the floating probe uses the public metadata without those constraints.
 #
 # `--no-sources` on both steps, for a related reason. A `[tool.uv.sources]`
 # entry (git, URL or local path) does not appear in the published wheel's
@@ -44,18 +42,20 @@
 # wheel, and the installer ships `nsis x64` only. Supporting Windows ARM is its
 # own piece of work, not this gate's business.
 #
-# TARGET. With no argument this checks `pyproject.toml`, which is what the PR
-# and pre-tag gates want: it blames the commit that broke it, before anything is
-# tagged. Pass a BUILT WHEEL instead where the published metadata is not the
-# checked-in metadata — `publish-staging.yml` rewrites the anton-agent
-# requirement to an exact rc before building, so the wheel users install can
-# carry a dependency set this file never described. Checking the wheel checks
-# what ships.
+# With no argument, check pyproject.toml under the exported runtime lock.
+# Pass a built wheel to check its metadata under the same contract. The weekly
+# --floating probe checks compatibility ranges independently of release pins.
 #
 # Run locally with:  bash scripts/check_wheels_available.sh
 #                    bash scripts/check_wheels_available.sh dist/cowork_server-*.whl
+#                    bash scripts/check_wheels_available.sh --floating
 set -uo pipefail
 
+CONTRACT_ARGS=(--constraint "$(cd "$(dirname "$0")/.." && pwd)/cowork/release-requirements.txt")
+if [ "${1:-}" = "--floating" ]; then
+  CONTRACT_ARGS=()
+  shift
+fi
 TARGET="${1:-pyproject.toml}"
 if [ ! -e "$TARGET" ]; then
   echo "error: target '$TARGET' does not exist" >&2
@@ -77,6 +77,8 @@ PYTHON_VERSIONS=(3.12 3.13)
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # `uv pip compile` takes a requirements file or a pyproject.toml, not a wheel
 # path, so a wheel is wrapped in a one-line requirements file. Resolving it
@@ -103,7 +105,7 @@ for plat in "${PLATFORMS[@]}"; do
     pinned="$workdir/$plat-$pyver.txt"
 
     # Step 1 — what would we actually install here?
-    if ! out=$(uv pip compile "$SOURCE" \
+    if ! out=$(uv pip compile "$SOURCE" ${CONTRACT_ARGS[@]+"${CONTRACT_ARGS[@]}"} \
                  --python-platform "$plat" \
                  --python-version "$pyver" \
                  --no-sources --no-config \

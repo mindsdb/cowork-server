@@ -427,6 +427,17 @@ def test_credit_spend_comes_from_the_usage_summary(calls):
     assert spend.period_end == "2026-09-01T00:00:00Z"
 
 
+def test_credit_spend_is_the_invoice_when_auth_serves_it(calls):
+    """The organization's view of a cycle is headed by the bill, not the stamped rows."""
+    calls.answers[svc.WALLET_PATH] = WALLET
+    calls.answers[svc.USAGE_SUMMARY_PATH] = {
+        **SUMMARY,
+        "totals": {"usage": {}, "cost": {"total_usd": "27.00"}, "billed_usd": "3.00", "unattributed_usd": "-24.00"},
+    }
+
+    assert _fetch().credit_spend.usd == 3.0
+
+
 def test_an_unknown_cost_is_not_reported_as_zero(calls):
     calls.answers[svc.WALLET_PATH] = WALLET
     calls.answers[svc.USAGE_SUMMARY_PATH] = {**SUMMARY, "meta": {"cost_source": "unavailable"}}

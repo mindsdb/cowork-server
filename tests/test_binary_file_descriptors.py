@@ -13,15 +13,28 @@ from pathlib import Path
 
 import pytest
 
-from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.api.v1.endpoints import project_files as project_files_ep
 from cowork.common import paths
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
+from cowork.services import artifact_files
 from cowork.services import files as files_service
 from cowork.services.artifacts import ProjectArtifacts
 
-SENTINEL = 1 << 30
+
+def _unused_open_flag() -> int:
+    """The highest bit up to ``1 << 30`` that no ``os.O_*`` flag uses on this platform.
+
+    Linux and Windows leave ``1 << 30`` free; macOS spends it on ``O_EXEC``.
+    """
+    used = 0
+    for name, value in vars(os).items():
+        if name.startswith("O_") and isinstance(value, int):
+            used |= value
+    return next(1 << bit for bit in range(30, 0, -1) if not used & (1 << bit))
+
+
+SENTINEL = _unused_open_flag()
 CSV_CRLF = b"id,name\r\n1,alpha\r\n2,beta\r\n"
 
 
@@ -92,7 +105,7 @@ def test_draft_file_open_is_binary(tmp_path, recorded_flags):
         root_parts=(".anton", "artifacts"),
     )
 
-    resources, _fd, _stat = workspace_ep._open_pinned_draft_file(
+    resources, _fd, _stat = artifact_files.open_pinned_draft_file(
         source, folder, ("data.csv",)
     )
     resources.close()
