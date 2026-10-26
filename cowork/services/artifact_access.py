@@ -14,14 +14,6 @@ class ArtifactAccessUnavailable(RuntimeError):
     pass
 
 
-class ArtifactAuthorizationNotConfigured(ArtifactAccessUnavailable):
-    """The deployment runs no artifact authorization service to ask.
-
-    A setting, not an outage: draft review can't run here at all, so the
-    comments-access route answers that it is off rather than failing.
-    """
-
-
 def draft_review_access_key(artifact_id: str) -> str:
     """Internal auth rule for draft collaborators, separate from sharing.
 
@@ -57,9 +49,7 @@ async def provision_draft_review_access(
         raise ArtifactAccessUnavailable("Artifact ownership could not be established")
     settings = settings or TurnQueueSettings()
     if not settings.auth_internal_base_url or not settings.auth_internal_secret:
-        raise ArtifactAuthorizationNotConfigured(
-            "Draft collaboration authorization is not configured"
-        )
+        raise ArtifactAccessUnavailable("Draft collaboration authorization is not configured")
 
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=5.0)

@@ -94,6 +94,8 @@ def test_the_owner_turns_draft_comments_on(client, draft):
 
     assert response.status_code == 200
     body = response.json()
+    # The keys the web client reads, and no others.
+    assert set(body) == {"enabled", "artifactKey", "scope", "capabilities", "currentRevision"}
     assert body["enabled"] is True
     assert body["scope"] == "owner"
     assert body["artifactKey"] == artifact_key(artifact_id)
@@ -148,5 +150,5 @@ def test_opening_an_artifact_logs_no_error(client, draft, caplog):
     )
     access = client.post(_comments_access(project_id, artifact_id), headers=A)
 
-    assert (review.status_code, access.status_code) == (200, 200)
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert (review.status_code, access.status_code) == (200, 200)

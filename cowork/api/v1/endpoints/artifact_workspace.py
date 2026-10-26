@@ -37,6 +37,7 @@ from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
+from cowork.schemas.base import CamelResponse
 from cowork.services.artifact_export import (
     ExportRefusal,
     ExportRefused,
@@ -887,20 +888,29 @@ async def set_artifact_access(
             await key.revoke()
 
 
+class CommentsAccessResponse(CamelResponse):
+    """The owner's draft comments, turned on."""
+
+    enabled: Literal[True] = True
+    artifact_key: str
+    # "organization": same-org reviewers may comment; "owner": only the owner.
+    scope: Literal["organization", "owner"]
+    capabilities: dict[str, Any]
+    current_revision: dict[str, Any] | None
+
+
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
 async def enable_artifact_comments(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
-):
+) -> CommentsAccessResponse:
     """Turn on draft comments for the artifact's owner.
 
     Owner-only. In org mode this provisions same-org draft review without
     broadening source-edit access: it mints an auth rule and reopens a private
     conversation workspace to the organization, which is the owner's call to
-    make. A reviewer's client calls the `review` GET above instead. An org
-    deployment with no authorization service answers `enabled: false`, since
-    draft review can't run there; that is the answer, not a failure.
+    make. A reviewer's client calls the `review` GET above instead.
 
     Local tenancy provisions nothing. Its comment routes keep the threads in the
     artifact's own folder (`LocalArtifactComments`), which finds the artifact
@@ -910,7 +920,6 @@ async def enable_artifact_comments(
     await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.artifact_access import (
         ArtifactAccessUnavailable,
-        ArtifactAuthorizationNotConfigured,
         provision_draft_review_access,
     )
     from cowork.services.artifact_draft_review import enable_draft_review
@@ -935,9 +944,6 @@ async def enable_artifact_comments(
                 session.scope,
                 owner_user_id=owner_user_id,
             )
-        except ArtifactAuthorizationNotConfigured:
-            # Not a 5xx: every 5xx is logged as an error, and nothing failed.
-            return {"enabled": False, "capabilities": capabilities}
         except ArtifactAccessUnavailable as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -962,15 +968,14 @@ async def enable_artifact_comments(
     except (FileNotFoundError, OSError, ValueError, TimeoutError):
         # Binary/oversized artifacts still support general review comments.
         pass
-    return {
-        "enabled": True,
+    return CommentsAccessResponse(
         # Workspace routes/cards keep the local id. The authenticated comments
         # proxy translates it through the same durable alias used to publish.
-        "artifactKey": artifact_key(artifact_id),
-        "scope": comments_scope,
-        "capabilities": capabilities,
-        "currentRevision": current_revision,
-    }
+        artifact_key=artifact_key(artifact_id),
+        scope=comments_scope,
+        capabilities=capabilities,
+        current_revision=current_revision,
+    )
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}")

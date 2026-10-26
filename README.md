@@ -732,10 +732,6 @@ answer 403 instead, because to a client already looking at the draft a 404 would
 read as deleted. The artifacts list is unaffected either way: a co-member's
 artifact never appears in it, so review starts from the link the owner shares.
 
-The same route answers `{"enabled": false}` on an org deployment with no auth
-service set up (`auth_internal_base_url` or its secret blank). Draft review
-can't run there, and the answer is no 5xx, because the request log records every
-5xx as an error. An auth service that is set up but failing still answers 503.
 Local tenancy provisions nothing and answers `enabled` with `"scope": "owner"`.
 Its comment routes keep each artifact's threads in that artifact's
 `.revisions/comments.json` (`services/local_artifact_comments.py`), and find the

@@ -256,7 +256,7 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
         str(project.id), local_id, session
     )
     canonical = identities.existing_authorization_key(local_id, scope)
-    assert granted["artifactKey"] == artifact_key(local_id)
+    assert granted.artifact_key == artifact_key(local_id)
     assert issuer.calls[-1][1]["artifact_id"] == canonical.replace(
         "artifact/", "artifact-draft/"
     )
@@ -300,27 +300,6 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
     }
     assert not folder.exists()
     assert identities.existing_authorization_key(local_id, scope) == canonical
-
-
-@pytest.mark.asyncio
-async def test_draft_comments_are_off_without_an_authorization_service(
-    local_id, owned_artifact, monkeypatch
-):
-    """No auth service is a setting, not an outage: the owner hears that draft
-    comments are off, in an answer that is no 5xx, since the request log
-    records every 5xx as an error."""
-    session, project, _conversation, folder = owned_artifact
-    unconfigured = TurnQueueSettings(auth_internal_base_url="", auth_internal_secret="")
-    monkeypatch.setattr(identities, "TurnQueueSettings", lambda: unconfigured)
-    monkeypatch.setattr(artifact_access, "TurnQueueSettings", lambda: unconfigured)
-
-    answer = await artifact_workspace.enable_artifact_comments(
-        str(project.id), local_id, session
-    )
-
-    assert answer["enabled"] is False
-    assert answer["capabilities"]["role"] == "owner"
-    assert not (folder / ".revisions" / "draft-review.json").exists()
 
 
 @pytest.mark.asyncio
