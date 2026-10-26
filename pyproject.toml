@@ -44,7 +44,9 @@ dependencies = [
     # 2.26.10.22.1rc2 is the first with `anton.core.artifacts.live_app_slots`
     # (mindsdb/anton#620), which live apps hand their launches to and the
     # live-app tests import.
-    "anton-agent>=2.26.10.22.1rc2,<3",
+    # 2.26.10.25.1rc1 is the first with `skills_artifact_roots`
+    # (mindsdb/anton#630), which every in-process turn sets.
+    "anton-agent>=2.26.10.25.1rc1,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
