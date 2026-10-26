@@ -34,6 +34,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/wheels-available.yml
+    with:
+      floating: true
 
   notify:
     # A scheduled run has no PR and no release to surface a failure through, so

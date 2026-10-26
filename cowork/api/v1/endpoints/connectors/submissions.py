@@ -13,7 +13,10 @@ from fastapi.responses import StreamingResponse
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.handlers.probe import ProbeHandler
-from cowork.schemas.connectors import ConnectorField, SubmitFormRequest
+from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
+from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
+from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 
@@ -73,6 +76,8 @@ def _missing_required(fields: list, values: dict, skipped: list[str]) -> list[st
 async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> StreamingResponse:
     try:
         connector_id = req.resolve_connector_id()
+    except InvalidConnectorIdError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -107,6 +112,22 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
         form_id = req.form_spec.get("form_id") or req.form_id or f"{connector_id}-connector"
         fields = _fields_from_spec_dict(req.form_spec, method)
+        extends_name = req.form_spec.get("_extends_connection")
+        if extends_name is not None and (
+            not isinstance(extends_name, str)
+            or not extends_name.strip()
+            or vault_for_scope(scope).read_record(connector_id, extends_name) is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"No {connector_id} connection named {extends_name!r} to add these fields to.",
+            )
+        if extends_name is not None and not ConnectionsService(scope).can_change(connector_id, extends_name):
+            # A later step adds fields only to a connection the caller can
+            # change (ConnectionsService.can_change), never to one someone
+            # shares or the operator manages; refused before its values are
+            # staged. The vault refuses the save itself too.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_CONNECTION_REFUSAL)
 
     missing = _missing_required(fields, req.values, req.skipped)
     if missing:

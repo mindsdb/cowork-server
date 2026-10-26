@@ -324,3 +324,92 @@ def test_file_mode_survives_seeding(skills_root, tmp_path, monkeypatch):
     assert ensure_builtin_skills(_org()) is True
     copied = _store() / "with-script" / "scripts" / "run.sh"
     assert copied.stat().st_mode & 0o111, "executable bit lost in the copy"
+
+
+# ── personal partitions (local tenancy with trusted identity headers) ──────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _person(*, partition: str = PARTITION_A, user: str = "alice", resources=None) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=user,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def test_every_person_gets_their_own_builtin_copies(skills_root, personal_deployment, tmp_path):
+    alice, bob = _person(partition=PARTITION_A, user="alice"), _person(partition=PARTITION_B, user="bob")
+
+    assert ensure_builtin_skills(alice) is True
+    assert SkillService(alice).root == tmp_path / PARTITION_A / "skills"
+    assert {s.name for s in SkillService(alice).list_skills()} == _packaged_slugs()
+    # Bob's store is untouched until his own first read seeds it.
+    assert SkillService(bob).list_skills() == []
+    assert ensure_builtin_skills(bob) is True
+    assert {s.name for s in SkillService(bob).list_skills()} == _packaged_slugs()
+
+
+def test_a_persons_builtin_copy_is_immutable(skills_root, personal_deployment):
+    alice = _person()
+    ensure_builtin_skills(alice)
+    victim = sorted(_packaged_slugs())[0]
+    with pytest.raises(SkillImmutableError):
+        SkillService(alice).delete_skill(victim)
+    with pytest.raises(SkillImmutableError):
+        SkillService(alice).update_skill(victim, instructions="changed")
+    assert victim in {s.name for s in SkillService(alice).list_skills()}
+
+
+def test_a_person_with_shared_skills_keeps_the_desktop_store(skills_root, personal_deployment):
+    """Skills left off the personal list stay in the unkeyed store, seeded at
+    boot. Its builtin copies are mutable there, but nobody created them, so
+    only the operator view changes them."""
+    shared = _person(resources=frozenset())
+    assert ensure_builtin_skills(shared) is False
+    assert SkillService(shared).root == skills_root
+
+    victim = sorted(_packaged_slugs())[0]
+    target = skills_root / victim
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(BUILTIN_SKILLS_DIR / victim, target)
+    with pytest.raises(SkillImmutableError, match="shared with you"):
+        SkillService(shared).delete_skill(victim)
+    assert SkillService(LOCAL_SCOPE).delete_skill(victim) is True
+
+
+def test_skill_links_run_only_where_skills_and_projects_are_shared(
+    skills_root, personal_deployment, monkeypatch
+):
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.personal_resources import PersonalResource
+
+    projects_only = frozenset({
+        PersonalResource.PROJECTS, PersonalResource.CONVERSATIONS, PersonalResource.FILES,
+        PersonalResource.PINS, PersonalResource.SCHEDULES,
+    })
+
+    # Skills personal on the deployment: the unkeyed store is the operator
+    # view's alone, so nothing fans it out, the operator view included.
+    assert SkillService(_person())._link_projects is False
+    assert SkillService(_person(resources=frozenset({PersonalResource.SKILLS})))._link_projects is False
+    assert SkillService(LOCAL_SCOPE)._link_projects is False
+
+    # Skills shared, projects personal: a person's projects get no fan-out,
+    # while the operator view's unkeyed projects still do.
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(projects_only)))
+    get_app_settings.cache_clear()
+    assert SkillService(_person(resources=projects_only))._link_projects is False
+    assert SkillService(LOCAL_SCOPE)._link_projects is True
+
+    # Both shared: today's stack.
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "")
+    get_app_settings.cache_clear()
+    assert SkillService(_person(resources=frozenset()))._link_projects is True
+    assert SkillService(LOCAL_SCOPE)._link_projects is True
+    assert SkillService(_org())._link_projects is False

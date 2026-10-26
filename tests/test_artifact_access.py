@@ -146,3 +146,40 @@ async def test_revoke_is_a_noop_when_draft_authorization_is_unconfigured():
             settings=TurnQueueSettings(auth_internal_base_url="", auth_internal_secret=""),
             client=client,
         ) is False
+
+
+@pytest.mark.asyncio
+async def test_draft_review_writes_only_the_draft_rule_never_the_published_one():
+    """`artifact-draft/<uuid>` is its own ArtifactAccess row.
+
+    Enabling review must not upsert, and so must not broaden, the published
+    artifact's rule `artifact/<uuid>`.
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await provision_draft_review_access(
+            "11111111-1111-1111-1111-111111111111",
+            TenantScope(
+                org_mode=True,
+                user_id="22222222-2222-2222-2222-222222222222",
+                org_id="33333333-3333-3333-3333-333333333333",
+            ),
+            owner_user_id="22222222-2222-2222-2222-222222222222",
+            settings=TurnQueueSettings(
+                auth_internal_base_url="http://auth.internal",
+                auth_internal_secret="secret",
+            ),
+            client=client,
+        )
+
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/v1/internal/artifact-access/"
+    body = json.loads(requests[0].content)
+    assert body["artifact_id"] == "artifact-draft/11111111-1111-1111-1111-111111111111"
+    assert not body["artifact_id"].startswith("artifact/")

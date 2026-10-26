@@ -23,6 +23,20 @@ def test_app_settings_reads_cowork_listen_port(monkeypatch):
     assert settings.port == 9999
 
 
+def test_app_settings_reads_cowork_publish_token(monkeypatch):
+    monkeypatch.setenv("COWORK_PUBLISH_TOKEN", "mdb_publish_token")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.publish_token.get_secret_value() == "mdb_publish_token"
+
+
+def test_app_settings_publish_token_defaults_to_unset(monkeypatch):
+    monkeypatch.delenv("COWORK_PUBLISH_TOKEN", raising=False)
+
+    assert AppSettings(_env_file=None).publish_token is None
+
+
 def test_app_settings_rejects_invalid_cowork_listen_port(monkeypatch):
     monkeypatch.setenv("COWORK_LISTEN_PORT", "invalid")
     with pytest.raises(ValidationError):
@@ -403,3 +417,14 @@ def test_gate_total_timeout_rejects_values_outside_its_bounds(monkeypatch, value
     monkeypatch.setenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", value)
     with pytest.raises(ValidationError):
         TurnQueueSettings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), (" ON ", True), ("", False), ("0", False), ("enabled", False)],
+)
+def test_usage_log_reads_its_variable_as_anton_does(monkeypatch, value, expected):
+    # A blank line in a desktop .env must not stop the server from starting.
+    monkeypatch.setenv("ANTON_USAGE_LOG", value)
+
+    assert AppSettings(_env_file=None).usage_log is expected
