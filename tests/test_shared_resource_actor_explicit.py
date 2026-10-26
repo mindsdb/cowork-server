@@ -199,6 +199,30 @@ def test_a_personal_scope_reports_no_author_for_its_own_items():
         assert operator.attribution("project", "p", fallback_creator_id=SUB_A).created_by is None
 
 
+def test_a_personal_scope_with_a_live_apps_email_still_names_nobody():
+    """With the live-apps overlay the principal carries the person's verified
+    email (X-User-Email), which only the live-apps service reads: attribution
+    outside org mode reports the same nobody as without it."""
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+    from cowork.principal import Principal
+
+    scope = TenantScope(
+        personal=True, org_id=PARTITION_A, user_id=SUB_A, personal_resources=ALL_PERSONAL_RESOURCES
+    )
+    with Session(_engine()) as raw:
+        session = ScopedSession(raw, scope)
+        without = SharedResourceAccess(session, Principal(user_id=SUB_A, org_id=PARTITION_A))
+        with_email = SharedResourceAccess(
+            session, Principal(user_id=SUB_A, org_id=PARTITION_A, email="a@example.com")
+        )
+        for access in (without, with_email):
+            attribution = access.attribution("skill", "documents", fallback_creator_id=SUB_A)
+            assert (attribution.created_by, attribution.last_modified_by) == (None, None)
+        assert with_email.attribution("connection", "postgres/demo", fallback_creator_id="someone-else") == (
+            without.attribution("connection", "postgres/demo", fallback_creator_id="someone-else")
+        )
+
+
 def test_org_mode_still_reports_the_fallback_author(org_id):
     """Hosted regression: an unattributed resource still names its creator."""
     from cowork.principal import Principal

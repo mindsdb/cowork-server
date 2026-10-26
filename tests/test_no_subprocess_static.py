@@ -110,9 +110,14 @@ BANNED_MODULES = {
     # attacker-authored HTML (SSRF / local-file read) while rendering.
     "xhtml2pdf",
     "htmldocx",
+    # A fork of htmldocx that fetches images the same way.
+    "html4docx",
     "weasyprint",
     "pdfkit",
     "imgkit",
+    # Runs the pandoc binary in a child process, and pandoc fetches the
+    # images and stylesheets the source names.
+    "pypandoc",
 }
 BANNED_ATTRS = {
     "system",
@@ -285,33 +290,6 @@ ALLOWLIST = (
         "imports packaged cowork.channels.plugins modules discovered via "
         "pkgutil.iter_modules, never an attacker-supplied name",
     ),
-    (
-        "services/artifact_export.py",
-        "_to_pdf",
-        "xhtml2pdf",
-        "PDF export renderer; the export endpoint refuses pdf in org mode "
-        "(endpoints/artifacts.py), so it is desktop-only",
-    ),
-    (
-        "services/artifact_export.py",
-        "_to_pdf",
-        "xhtml2pdf.CreatePDF",
-        "PDF export render call (`pisa.CreatePDF`); same endpoint org-mode "
-        "refusal as the import",
-    ),
-    (
-        "services/artifact_export.py",
-        "_to_docx",
-        "htmldocx",
-        "DOCX export renderer import; the export endpoint refuses docx in org "
-        "mode, so it is desktop-only",
-    ),
-    (
-        "services/artifact_export.py",
-        "_to_docx",
-        "htmldocx.HtmlToDocx",
-        "DOCX export render call; same endpoint org-mode refusal as the import",
-    ),
 )
 
 
@@ -336,7 +314,7 @@ POLICY_CARRIERS = {
 #: Where each carrier is constructed today, so the scan below is known to see
 #: them: (relative path, enclosing function, carrier).
 POLICY_CARRIER_SITES = (
-    ("harnesses/anton_harness/harness.py", "AntonHarness._build_chat_session", "ChatSessionConfig"),
+    ("harnesses/anton_harness/harness.py", "AntonHarness._build_turn_session", "ChatSessionConfig"),
     ("services/connectors/probe.py", "CredentialProbe.run", "ChatSessionConfig"),
     ("handlers/probe.py", "ProbeHandler.run", "CredentialProbe"),
     ("services/scratchpad_runtime.py", "_make_runtime", "LocalScratchpadRuntime"),
@@ -907,3 +885,14 @@ def test_a_thread_pool_is_not_a_spawn():
     assert _snippet_labels(
         "from concurrent.futures import ThreadPoolExecutor\nThreadPoolExecutor()\n"
     ) == []
+
+
+@pytest.mark.parametrize("module", ["xhtml2pdf", "htmldocx", "html4docx", "pypandoc"])
+def test_a_document_converter_that_fetches_is_caught(module):
+    """Export builds Word files from the artifact's own bytes, so no converter
+    that fetches what the source names may come back under cowork/."""
+    assert _snippet_labels(f"import {module}\n") == [module]
+    assert _snippet_labels(f"from {module} import convert\nconvert(source)\n") == [
+        module,
+        f"{module}.convert",
+    ]
