@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.10.26.1rc1"
+version = "2.26.10.26.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/69/86/52db762c9bed67110e3b9719539bc5d5389e99c4c7f656c1bcc7ebbe4266/anton_agent-2.26.10.26.1rc1.tar.gz", hash = "sha256:cc045236aebb7bb22e504d5d4756d964afc0b83952abc92194fad21937255fb2", size = 3773168, upload-time = "2026-10-26T02:56:58.818Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/be/9526ebc28e4e97c8b93597daf45b8fd406e17b9496ad73996c63b4ae6563/anton_agent-2.26.10.26.1.tar.gz", hash = "sha256:9c80284a80ab99a1018401f9c514550b14b53adbe319d71dd40b464c8bc54936", size = 3849212, upload-time = "2026-10-26T12:27:16.682Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/1b/dbddcd9b8e16b8a645c90fc5e7a082be6461725b99688b69c109f4af17e7/anton_agent-2.26.10.26.1rc1-py3-none-any.whl", hash = "sha256:9293c6600a044210b159b29fcd707d421122cde5c93a5e49ca6e6b3b5ae74913", size = 1299333, upload-time = "2026-10-26T02:56:56.923Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/10/17173116c5a04cf16c4d6bc27cb17c0f0536a4281f1a66f6c7042d8ef907/anton_agent-2.26.10.26.1-py3-none-any.whl", hash = "sha256:6b5c62bab73772d25ddffe9fbd8acd5491d3a5e4b1341c20b09c2edbedcc6686", size = 1330586, upload-time = "2026-10-26T12:27:14.779Z" },
 ]
 
 [[package]]
@@ -456,7 +456,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", specifier = ">=2.26.10.25.1rc1,<3" },
+    { name = "anton-agent", specifier = ">=2.26.10.26.1,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },
