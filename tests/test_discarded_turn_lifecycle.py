@@ -60,8 +60,13 @@ class _FakeBuffer:
         return self.closed is not None
 
 
-def _blocked_handler(monkeypatch, saved: dict, asked: asyncio.Event):
-    """A handler whose turn publishes a question and blocks on the broker."""
+def _blocked_handler(
+    monkeypatch, saved: dict, asked: asyncio.Event, *, frame_on_cancel: str | None = None,
+):
+    """A handler whose turn publishes a question and blocks on the broker.
+    With ``frame_on_cancel``, the stream sends that frame when the cancel
+    lands and then raises the cancel on, as the anton harness does with a
+    turn's memory record."""
     handler = object.__new__(ResponsesHandler)
     handler.principal = object()
 
@@ -96,6 +101,10 @@ def _blocked_handler(monkeypatch, saved: dict, asked: asyncio.Event):
         asked.set()
         try:
             await future
+        except asyncio.CancelledError:
+            if frame_on_cancel is not None:
+                yield frame_on_cancel
+            raise
         finally:
             broker.close(CID, QID)
         yield "event: response.completed\ndata: {}\n\n"
@@ -109,10 +118,10 @@ def _blocked_handler(monkeypatch, saved: dict, asked: asyncio.Event):
     return handler
 
 
-async def _start_blocked_turn(monkeypatch, saved, buffer):
+async def _start_blocked_turn(monkeypatch, saved, buffer, *, frame_on_cancel: str | None = None):
     """Register a real producer that is blocked on a pending question."""
     asked = asyncio.Event()
-    handler = _blocked_handler(monkeypatch, saved, asked)
+    handler = _blocked_handler(monkeypatch, saved, asked, frame_on_cancel=frame_on_cancel)
     lifecycle = TurnLifecycle()
     handle = await registry.start(
         conversation_id=CID, turn_id=0, open_buffer=opens(buffer),
@@ -163,6 +172,43 @@ async def test_stop_still_persists_a_blocked_turn(monkeypatch):
 
     assert await handle.cancel() is True
     assert "events" in saved
+    assert buffer.closed == "cancelled"
+
+
+_MEMORY_FRAME = (
+    'event: response.memory_read\ndata: {"type": "response.memory_read", "read": true, "entries": 1}\n\n'
+)
+
+
+def _memory_frames(buffer: _FakeBuffer) -> list[tuple]:
+    return [record for record in buffer.records if "response.memory_read" in record[1].get("sse", "")]
+
+
+async def test_discard_writes_no_frame_the_stream_sends_after_the_cancel(monkeypatch):
+    """A delete removed the turn's buffer. On Redis, a write after that
+    recreates the stream with a record that isn't terminal, and the next turn
+    at this number keeps it."""
+    saved: dict = {}
+    buffer = _FakeBuffer()
+    handle = await _start_blocked_turn(monkeypatch, saved, buffer, frame_on_cancel=_MEMORY_FRAME)
+
+    await asyncio.to_thread(discard_conversation, CID)
+    await asyncio.wait_for(asyncio.gather(handle.task, return_exceptions=True), timeout=5)
+
+    assert handle.task.done()
+    assert _memory_frames(buffer) == []
+    assert buffer.closed is None
+    assert "events" not in saved
+
+
+async def test_stop_writes_the_frame_the_stream_sends_after_the_cancel(monkeypatch):
+    """The counterpart: a Stop keeps the frame."""
+    saved: dict = {}
+    buffer = _FakeBuffer()
+    handle = await _start_blocked_turn(monkeypatch, saved, buffer, frame_on_cancel=_MEMORY_FRAME)
+
+    assert await handle.cancel() is True
+    assert _memory_frames(buffer) == [("sse", {"sse": _MEMORY_FRAME})]
     assert buffer.closed == "cancelled"
 
 

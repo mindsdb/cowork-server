@@ -45,8 +45,12 @@ store. ``refuse_planted_links`` refuses a link, or a hard-linked file, that
 agent code before the sandbox left there, before the server follows it into
 another person's space.
 
+``live_apps_on`` asks anton whether live apps run full-stack apps in app
+slots outside this server.
+
 ``check_startup`` runs in create_app. It refuses identity headers with the
-sandbox off, and ``landlock`` where it can't hold. ``_probe_abi`` and
+sandbox off, live apps without what keeps each app to its launcher
+(``_check_live_apps_startup``), and ``landlock`` where it can't hold. ``_probe_abi`` and
 ``_run_self_test`` are the one seam tests stub, since neither a macOS machine
 nor every CI kernel has Landlock.
 """
@@ -62,6 +66,7 @@ from collections.abc import Iterable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from cowork.common.logger import get_logger
@@ -97,6 +102,41 @@ NO_CODE_MODE_DETAIL = (
 def code_sandbox_on() -> bool:
     """Whether agent code runs under Landlock on this deployment."""
     return get_app_settings().code_sandbox == "landlock"
+
+
+#: anton's live-apps switch, which the live-apps overlay sets on this service.
+#: anton reads it (live_apps_enabled); check_startup reads it by name only to
+#: refuse it on an anton that can't.
+LIVE_APP_SLOTS_VARIABLE = "ANTON_LIVE_APP_SLOTS"
+
+#: The shortest COWORK_LIVE_APPS_LAUNCH_TOKEN check_startup accepts.
+MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH = 32
+
+#: What this server uses of anton's live-app slots (anton.core.artifacts.live_app_slots).
+_LIVE_APP_SLOTS_API = (
+    "live_apps_enabled",
+    "live_app_slot_addresses",
+    "SlotStatus",
+    "LiveAppLauncher",
+    "LAUNCH_FILES",
+    "LAUNCH_DIRS",
+    "MAX_LAUNCH_FILES",
+    "MAX_LAUNCH_FILE_BYTES",
+    "MAX_LAUNCH_TOTAL_BYTES",
+    "MAX_REPLY_BYTES",
+)
+
+
+def live_apps_on() -> bool:
+    """Whether live apps run in app slots outside this server: anton's own
+    reading of ANTON_LIVE_APP_SLOTS. An anton without the slots reads as off,
+    and that means the variable is unset: check_startup refuses it on such an
+    anton (_live_apps_gap)."""
+    try:
+        from anton.core.artifacts.live_app_slots import live_apps_enabled
+    except ImportError:
+        return False
+    return live_apps_enabled()
 
 
 def refuse_a_missing_policy(cell_sandbox: CellSandbox | None, *, site: str) -> None:
@@ -168,27 +208,46 @@ def _trusted_roots() -> list[Path]:
     ]
 
 
-def _anchored(path: Path) -> _Anchored | None:
+class _TrustedRoots:
+    """Configured roots resolved for one policy build, never descendant grants."""
+
+    def __init__(self) -> None:
+        self.resolved = {root: _real(root) for root in dict.fromkeys(_trusted_roots())}
+        self.forms = tuple(
+            (Path(os.path.normcase(form)).parts, real)
+            for root, real in self.resolved.items()
+            for form in dict.fromkeys((Path(os.path.abspath(root)), real))
+        )
+
+    def real(self, path: Path) -> Path:
+        """Reuse only configured roots; other paths still resolve where requested."""
+        if path in self.resolved:
+            return self.resolved[path]
+        return _real(path)
+
+
+def _anchored(path: Path, *, roots: _TrustedRoots | None = None) -> _Anchored | None:
     """``path`` below the outermost trusted root that holds it, the one that
     leaves the most names to check, or None when no trusted root holds it (an
     adopted project folder, the packaged and managed skills). Each root is
     compared as written and as resolved, since a project's stored path is
     resolved (safe_join)."""
     lexical = Path(os.path.abspath(path))
+    parts = lexical.parts
+    matched_parts = Path(os.path.normcase(lexical)).parts
     best: _Anchored | None = None
-    for root in _trusted_roots():
-        real = _real(root)
-        for form in (Path(os.path.abspath(root)), real):
-            try:
-                names = lexical.relative_to(form).parts
-            except ValueError:
-                continue
-            if best is None or len(names) > len(best.names):
-                best = _Anchored(real, names)
+    for form, real in (roots if roots is not None else _TrustedRoots()).forms:
+        if matched_parts[:len(form)] != form:
+            continue
+        names = parts[len(form):]
+        if best is None or len(names) > len(best.names):
+            best = _Anchored(real, names)
     return best
 
 
-def _granted_dir(path: Path, *, create: bool = False, missing_ok: bool = False) -> Path:
+def _granted_dir(
+    path: Path, *, create: bool = False, missing_ok: bool = False, roots: _TrustedRoots | None = None,
+) -> Path:
     """``path`` as the policy grants it: absolute, normalized, with every
     link resolved.
 
@@ -200,7 +259,7 @@ def _granted_dir(path: Path, *, create: bool = False, missing_ok: bool = False) 
     folder (ELOOP or ENOTDIR), and FileNotFoundError when one is missing,
     unless ``missing_ok``: the launcher skips a missing optional grant.
     """
-    anchored = _anchored(path)
+    anchored = _anchored(path, roots=roots)
     if anchored is None:
         return _real(path)
     if create:
@@ -219,11 +278,11 @@ def _granted_dir(path: Path, *, create: bool = False, missing_ok: bool = False) 
 _LINK_ERRNOS = frozenset({errno.ELOOP, errno.ENOTDIR})
 
 
-def _required_dir(path: Path, *, create: bool = False) -> Path:
+def _required_dir(path: Path, *, create: bool = False, roots: _TrustedRoots | None = None) -> Path:
     """``_granted_dir`` for a folder the session can't run without. A link
     on the way refuses the session with an OSError that names the folder."""
     try:
-        return _granted_dir(path, create=create)
+        return _granted_dir(path, create=create, roots=roots)
     except OSError as error:
         if error.errno not in _LINK_ERRNOS:
             raise
@@ -235,14 +294,14 @@ def _required_dir(path: Path, *, create: bool = False) -> Path:
         ) from error
 
 
-def _read_only_dirs(paths: Iterable[Path]) -> tuple[Path, ...]:
+def _read_only_dirs(paths: Iterable[Path], *, roots: _TrustedRoots | None = None) -> tuple[Path, ...]:
     """The read-only grants for ``paths``, each once. A folder behind a link,
     or that isn't a folder, is left out and logged: granting it would grant
     where the link points, maybe another person's folder."""
     granted: dict[Path, None] = {}
     for path in paths:
         try:
-            granted[_granted_dir(path, missing_ok=True)] = None
+            granted[_granted_dir(path, missing_ok=True, roots=roots)] = None
         except OSError as error:
             logger.warning(
                 "code sandbox: not granting %s, a folder on the way is a link or not a folder (%s)",
@@ -252,12 +311,12 @@ def _read_only_dirs(paths: Iterable[Path]) -> tuple[Path, ...]:
     return tuple(granted)
 
 
-def _private_dir(root: Path, *, name: str) -> Path:
+def _private_dir(root: Path, *, name: str, roots: _TrustedRoots | None = None) -> Path:
     """``root/name``, created when missing, as the policy grants it. Opened
     from the shared root (cowork-home for the operator view) without following
     links, so a link at the partition, ``sandbox/`` or ``name`` refuses the
     session instead of handing the cell where it points."""
-    return _required_dir(root / name, create=True)
+    return _required_dir(root / name, create=True, roots=roots)
 
 
 def refuse_a_linked_project(project_dir: Path) -> None:
@@ -271,6 +330,14 @@ def refuse_a_linked_project(project_dir: Path) -> None:
     link into another person's space before the policy refused it.
     """
     _required_dir(project_dir, create=True)
+
+
+def refuse_a_linked_folder(folder: Path) -> None:
+    """Raise OSError when a folder on the way to ``folder`` below the server's
+    roots is a link or not a folder (``_required_dir``), and FileNotFoundError
+    when ``folder`` is gone. Unlike refuse_a_linked_project it makes nothing,
+    so it fits a read of someone else's folder."""
+    _required_dir(folder, create=False)
 
 
 class PlantedLinkError(OSError):
@@ -402,12 +469,12 @@ def _resolved_entry(entry: os.DirEntry[str], *, real_root: Path) -> Path:
     return real_root / entry.name
 
 
-def _partition_roots(shared_root: Path) -> list[_Partition]:
+def _partition_roots(shared_root: Path, *, roots: _TrustedRoots | None = None) -> list[_Partition]:
     """Every person's partition folder: the children of the shared root named
     by a partition id (cowork.principal.personal_partition_id, a UUID), each
     resolved once. The shared root is resolved once for all of them, and only
     a partition that is a link is resolved on its own (``_resolved_entry``)."""
-    real_root = _real(shared_root)
+    real_root = roots.real(shared_root) if roots is not None else _real(shared_root)
     try:
         with os.scandir(real_root) as scanned:
             entries = list(scanned)
@@ -424,16 +491,19 @@ def _partition_roots(shared_root: Path) -> list[_Partition]:
     return partitions
 
 
-def _forbidden_roots(settings: AppSettings, *, partitions: list[_Partition]) -> tuple[Path, ...]:
+def _forbidden_roots(
+    settings: AppSettings, *, partitions: list[_Partition], roots: _TrustedRoots | None = None,
+) -> tuple[Path, ...]:
     """The folders no grant may equal or contain, each resolved and named
     once: cowork-home, the shared root, its ``shared/`` folder, every
     partition (resolved by _partition_roots), and the managed folder."""
     shared_root = Path(settings.storage.shared_root)
-    roots = [_real(root) for root in (cowork_home(), shared_root, shared_root / "shared")]
-    roots += [partition.real for partition in partitions]
+    real = roots.real if roots is not None else _real
+    forbidden = [real(root) for root in (cowork_home(), shared_root, shared_root / "shared")]
+    forbidden += [partition.real for partition in partitions]
     if settings.managed_dir is not None:
-        roots.append(_real(settings.managed_dir))
-    return tuple(dict.fromkeys(roots))
+        forbidden.append(real(settings.managed_dir))
+    return tuple(dict.fromkeys(forbidden))
 
 
 def _other_partitions(
@@ -497,14 +567,15 @@ def build_cell_sandbox(
     if settings.code_sandbox != "landlock":
         return None
     root = _sandbox_root(scope)
-    partitions = _partition_roots(Path(settings.storage.shared_root))
+    roots = _TrustedRoots()
+    partitions = _partition_roots(Path(settings.storage.shared_root), roots=roots)
     return _cell_sandbox(
-        project_dir=_required_dir(project_dir),
-        home_dir=_private_dir(root, name="home"),
-        tmp_dir=_private_dir(root, name="tmp"),
-        shared_dir=_required_dir(shared_files_dir(), create=True),
-        read_only_dirs=_read_only_dirs(read_only_dirs),
-        forbidden_roots=_forbidden_roots(settings, partitions=partitions),
+        project_dir=_required_dir(project_dir, roots=roots),
+        home_dir=_private_dir(root, name="home", roots=roots),
+        tmp_dir=_private_dir(root, name="tmp", roots=roots),
+        shared_dir=_required_dir(shared_files_dir(), create=True, roots=roots),
+        read_only_dirs=_read_only_dirs(read_only_dirs, roots=roots),
+        forbidden_roots=_forbidden_roots(settings, partitions=partitions, roots=roots),
         other_partitions=_other_partitions(scope, partitions=partitions),
     )
 
@@ -582,6 +653,94 @@ def _policy_model_gap() -> str | None:
     return None
 
 
+def _live_apps_gap() -> str | None:
+    """What the installed anton lacks of the live-app slots this server hands
+    its people's launches to, or None when it has all of it."""
+    try:
+        from anton.core.artifacts import live_app_slots
+    except ImportError:
+        return "has no anton.core.artifacts.live_app_slots"
+    missing = [name for name in _LIVE_APP_SLOTS_API if not hasattr(live_app_slots, name)]
+    if missing:
+        return f"has a live_app_slots without {', '.join(missing)}"
+    from anton.core.session import ChatSessionConfig
+
+    if "live_app_host" not in inspect.signature(ChatSessionConfig).parameters:
+        return "has a ChatSessionConfig that takes no live_app_host"
+    return None
+
+
+def _check_live_apps_startup(settings: AppSettings) -> None:
+    """Raise RuntimeError, naming what to change, where ANTON_LIVE_APP_SLOTS
+    is set and live apps can't keep each app to the person who launched it.
+
+    It runs when either the variable is set or anton reads live apps as on,
+    since every runtime decision (live_apps_on) asks anton, and the slot
+    paths skip the bearer only behind these refusals."""
+    if not (os.environ.get(LIVE_APP_SLOTS_VARIABLE, "").strip() or live_apps_on()):
+        return
+    if settings.code_sandbox != "landlock":
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_CODE_SANDBOX=landlock. Live apps run "
+            "outside this server only for an agent whose code is locked to its person's "
+            "space; leave the sandbox on and add the live-apps overlay beside it."
+        )
+    if not settings.trust_identity_headers:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_TRUST_IDENTITY_HEADERS. Only the person "
+            "who launched an app may open it, and without identity headers this server "
+            "knows no person."
+        )
+    if PersonalResource.PROJECTS not in settings.personal_resources:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs projects in COWORK_PERSONAL_RESOURCES. In a "
+            "shared project every member's agent can rewrite an app's backend, which then "
+            "runs with the connections of whoever launches it next."
+        )
+    gap = _live_apps_gap()
+    if gap is not None:
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs an anton with live-app slots. The installed "
+            f"anton {gap}. Install the anton this cowork-server pins."
+        )
+    from anton.core.artifacts.live_app_slots import live_app_slot_addresses
+
+    try:
+        # A blank entry fails to parse, so a set variable names a slot.
+        live_app_slot_addresses()
+    except ValueError as error:
+        raise RuntimeError(f"{LIVE_APP_SLOTS_VARIABLE} doesn't parse: {error}") from error
+    viewer_login_url = settings.live_apps_viewer_login_url
+    if viewer_login_url != viewer_login_url.strip() or not _is_viewer_login_url(viewer_login_url):
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_VIEWER_LOGIN_URL, the viewer "
+            "sign-in's http:// or https:// address that tells this server who opens an app, "
+            "for example http://viewer-login:4180."
+        )
+    token = settings.live_apps_launch_token.get_secret_value()
+    if (
+        len(token) < MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH
+        or token != token.strip()
+        or not token.isascii()
+        or not token.isprintable()
+    ):
+        raise RuntimeError(
+            f"{LIVE_APP_SLOTS_VARIABLE} needs COWORK_LIVE_APPS_LAUNCH_TOKEN of at least "
+            f"{MIN_LIVE_APPS_LAUNCH_TOKEN_LENGTH} printable ASCII characters with no space "
+            "around them, the token every app slot checks before it takes a launch."
+        )
+
+
+def _is_viewer_login_url(value: str) -> bool:
+    """Whether ``value`` is an http or https address with a host and no query
+    or fragment, which the access check can join /oauth2/userinfo to."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and not parts.query and not parts.fragment
+
+
 #: cowork-home's own files and folders the server reads and writes at fixed
 #: names: its settings (.env), the encryption key, every answer stream, the
 #: turns' scratch folders and the self-test's, and the shared registries.
@@ -608,8 +767,9 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
     what a shared project leaves shared.
 
     Raises RuntimeError, naming COWORK_CODE_SANDBOX and the fix: identity
-    headers with the sandbox off; and with ``landlock``, org tenancy, remote
-    turns, an anton without the launcher or whose policy model refuses this
+    headers with the sandbox off; live apps without what keeps each app to
+    its launcher (_check_live_apps_startup); and with ``landlock``, org tenancy, remote
+    turns, private connections with shared projects, an anton without the launcher or whose policy model refuses this
     server's policy, a kernel below the Landlock floor, a link at one of
     cowork-home's own entries (_COWORK_HOME_ENTRIES), or a self-test that
     can't confirm a denied path is denied. Then creates the shared folder.
@@ -622,6 +782,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "space. Set COWORK_CODE_SANDBOX=landlock on a Linux host with Landlock "
             "(kernel 6.2 or later)."
         )
+    _check_live_apps_startup(settings)
     if settings.code_sandbox != "landlock":
         return
     if settings.tenancy_mode == "org":
@@ -635,6 +796,17 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "COWORK_CODE_SANDBOX=landlock is not supported with COWORK_TURN_BACKEND=remote: "
             "remote workers start agent code without the launcher. Leave "
             "COWORK_TURN_BACKEND unset to run turns in this process."
+        )
+    if (
+        settings.trust_identity_headers
+        and PersonalResource.CONNECTIONS in settings.personal_resources
+        and PersonalResource.PROJECTS not in settings.personal_resources
+    ):
+        raise RuntimeError(
+            "With COWORK_TRUST_IDENTITY_HEADERS, private connections require personal projects: "
+            "shared project venvs and saved cell state can run one person's code with another "
+            "person's connections. Add projects to COWORK_PERSONAL_RESOURCES before starting. "
+            "Preserve any shared project files before changing their storage namespace."
         )
     gap = _anton_sandbox_gap()
     if gap is not None:

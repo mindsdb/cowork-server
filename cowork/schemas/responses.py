@@ -1,5 +1,5 @@
 import time
-from typing import Any
+from typing import Any, Literal
 import uuid
 from enum import Enum
 from uuid import UUID
@@ -202,6 +202,20 @@ class ResponsesRequest(BaseModel):
     cancel_on_disconnect: StrictBool = Field(
         default=False,
         description="Cancel this streaming turn if its originating HTTP client disconnects. Reconnected tails do not own the turn.",
+    )
+
+    # A scripted caller's opt-out, such as a scored evaluation run: "off" runs
+    # this question as MEMORY_ENABLED=false runs every turn, so it reads no
+    # learned memory and learns nothing, while other questions keep memory.
+    # ResponsesHandler.handle refuses it where memory off still reads stored
+    # memory.
+    memory: Literal["on", "off"] = Field(
+        default="on",
+        description=(
+            '"off" keeps this question from reading learned memory or learning any; '
+            "the operator's managed rules still apply. "
+            '"on", the default, follows the deployment\'s memory setting and never turns memory on.'
+        ),
     )
 
     @model_validator(mode="after")

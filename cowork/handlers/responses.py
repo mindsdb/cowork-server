@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -45,11 +45,13 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import has_figures
+from cowork.harnesses.memory.policy import memory_policy
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
     TurnContext,
     TurnEvidence,
+    TurnMemoryRead,
     find_answer_sources,
     format_responses_stream,
 )
@@ -117,6 +119,7 @@ from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
+from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
@@ -172,6 +175,11 @@ class _RemoteTurnFailed(Exception):
 # this module synthesizes when a turn is stopped while a question is on screen.
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
+
+#: A direct answer from the routing gate runs no agent, so it reads no learned
+#: memory. It sends and saves the record an agent turn does, in the same shape
+#: (TurnMemoryRead.payload).
+_DIRECT_MEMORY_READ = TurnMemoryRead(read=False, entries=0)
 
 #: Budget for a pod-reported history summary. Well above what the summarizer's
 #: own output cap can produce, and the summary is sticky: it is replayed on
@@ -549,7 +557,11 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
-def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
+def _first_take_binding(
+    minted: RouterBinding | None,
+    *,
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
+) -> RouterBinding | None:
     """The gate's own binding: the take only helps if it lands within a second
     or two, which a chat model is routinely too slow for. `minted` is the
     gate's per-turn MindsHub binding on hosted orgs. None when there is no
@@ -557,7 +569,7 @@ def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
     if minted is not None:
         return minted
     try:
-        return _settings_binding()
+        return (binding_factory or _settings_binding)()
     except Exception:
         return None
 
@@ -576,6 +588,7 @@ def _start_first_take(
     conversation_id: UUID,
     harness: str | None,
     metadata: dict[str, str],
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
 ) -> FirstTake | None:
     """Start the turn's first take on the gate's model, or None when it is
     switched off or there is no model to run it on.
@@ -585,7 +598,7 @@ def _start_first_take(
     """
     if not _first_take_enabled():
         return None
-    binding = _first_take_binding(minted)
+    binding = _first_take_binding(minted, binding_factory=binding_factory)
     if binding is None:
         return None
     from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
@@ -631,6 +644,18 @@ class ResponsesHandler:
 
         await require_product_permission(self.scope, "product.execute")
 
+        # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
+        # deployment where that still reads stored memory (memory_policy: the
+        # desktop), the question is refused rather than answered from memory.
+        if request.memory == "off" and not memory_policy(memory_enabled=False).off:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "This deployment can't keep one question from reading memory. "
+                    'Retry the request without "memory": "off".'
+                ),
+            )
+
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
         # metric be attributed to a release instead of to a date on which
@@ -659,8 +684,15 @@ class ResponsesHandler:
 
         # Every settings read for this turn, in the gate and in the producer
         # task created below (create_task copies this context), is served from
-        # the snapshot the unit loaded.
-        with use_turn_settings(self.scope, start.settings):
+        # the snapshot the unit loaded. A question with "memory": "off" gets a
+        # copy with memory off, so AntonHarness._build_chat_session gives it
+        # two empty tiers in its scratch folder and no background passes.
+        turn_settings = (
+            start.settings.model_copy(update={"memory_enabled": False})
+            if request.memory == "off"
+            else start.settings
+        )
+        with use_turn_settings(self.scope, turn_settings):
             try:
                 route, turn_llm = await self._route_request(
                     conversation_id=start.conversation_id,
@@ -686,10 +718,18 @@ class ResponsesHandler:
                 **({"response_router_model": route.model} if route.model else {}),
                 **({"response_route_fallback": "true"} if route.fallback else {}),
             }
-            logger.info(
-                "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
-                route.route, route.reason, route.fallback, route.provider, route.model,
-                start.conversation_id,
+            # Fields, not template values: the log formatter drops those. A
+            # fallback is WARNING so the default level keeps it.
+            logger.log(
+                logging.WARNING if route.fallback else logging.INFO,
+                "Router fell back to the agent" if route.fallback else "Router chose the turn's route",
+                extra={
+                    "event": "router_fallback" if route.fallback else "router_route",
+                    "outcome": route.route,
+                    "reason": route.reason,
+                    "provider": route.provider,
+                    **log_context(conversation_id=start.conversation_id),
+                },
             )
 
             if route.route == DIRECT_CONTEXT and first_take is not None:
@@ -803,7 +843,7 @@ class ResponsesHandler:
                 partial(_conversation_for_harness, conversation_id=start.conversation_id),
                 scope=self.scope,
             )
-            with use_settings_scope(self.scope):
+            with use_settings_scope(self.scope), use_live_app_launcher(self.principal):
                 stream = harness.stream_response(
                     conversation=conversation,
                     input=start.harness_input,
@@ -1020,10 +1060,19 @@ class ResponsesHandler:
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
+
+                    @cache
+                    def binding_for_turn() -> RouterBinding | None:
+                        # Share successful resolution (including no model) only
+                        # in this request. Exceptions remain retryable by the gate,
+                        # which must still propagate a database pool timeout.
+                        return binding if binding is not None else _settings_binding()
+
                     correlation_id = (turn_llm or {}).get("correlation_id")
                     if first_take:
                         self.first_take = _start_first_take(
                             binding,
+                            binding_factory=binding_for_turn,
                             history=history,
                             conversation_id=conversation_id,
                             harness=self.harness_name,
@@ -1050,18 +1099,25 @@ class ResponsesHandler:
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
+                        binding_factory=binding_for_turn,
                     )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
                     # WARNING (app_settings.py's own default too), so an info-level
                     # line here is silently dropped everywhere it would actually
                     # be read from — found live on staging, zero [gate] lines
-                    # across 8 real requests until this was bumped.
+                    # across 8 real requests until this was bumped. Fields, not
+                    # template values: the log formatter drops those.
                     logger.warning(
-                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
-                        "provider=%s model=%s gate_ms=%d",
-                        conversation_id, correlation_id, decision.route, decision.reason,
-                        decision.provider, decision.model, gate_ms,
+                        "Router gate decided the turn's route",
+                        extra={
+                            "event": "router_gate_decided",
+                            "outcome": decision.route,
+                            "reason": decision.reason,
+                            "provider": decision.provider,
+                            "duration_ms": gate_ms,
+                            **log_context(conversation_id=conversation_id),
+                        },
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
                     # would make a ready gate decision wait for Jev, exactly the
@@ -1165,7 +1221,7 @@ class ResponsesHandler:
                 "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
-            }, *([] if sources is None else [{
+            }, _DIRECT_MEMORY_READ.payload(), *([] if sources is None else [{
                 "type": "response.figure_sources",
                 **sources.model_dump(mode="json"),
             }]), {"type": "response.completed"}]
@@ -1273,13 +1329,16 @@ class ResponsesHandler:
         async def answer() -> None:
             # Found before the save, which keeps them with the answer.
             sources = await self._direct_figure_sources(conversation_id=conv_id, answer=route.text, question=question)
+            memory_frame = _DIRECT_MEMORY_READ.payload(sequence_number=3)
             sources_frame = None if sources is None else {
                 "type": "response.figure_sources",
-                "sequence_number": 3,
+                "sequence_number": 4,
                 "item_id": item_id,
                 **sources.model_dump(mode="json"),
             }
-            saved_events = [delta, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"}]
+            saved_events = [
+                delta, memory_frame, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"},
+            ]
             async with conversation_writes(conv_id):
                 saved = await run_db(
                     partial(save_turn, events=saved_events), scope=scope_from_principal(self.principal),
@@ -1303,6 +1362,7 @@ class ResponsesHandler:
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
+            await buffer.append("sse", {"sse": sse_frame("response.memory_read", memory_frame)})
             if sources_frame is not None:
                 await buffer.append("sse", {"sse": sse_frame("response.figure_sources", sources_frame)})
             completed_response = Response(
@@ -1314,7 +1374,7 @@ class ResponsesHandler:
             ).model_dump()
             completed_frame = {
                 "type": "response.completed",
-                "sequence_number": 3 if sources_frame is None else 4,
+                "sequence_number": 4 if sources_frame is None else 5,
                 "response": completed_response,
             }
             # The persisted row's real id, at the frame root (not
@@ -2384,7 +2444,7 @@ class ResponsesHandler:
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
-        with use_settings_scope(scope_from_principal(self.principal)):
+        with use_settings_scope(scope_from_principal(self.principal)), use_live_app_launcher(self.principal):
             try:
                 await self._run_turn(**kwargs)
             finally:
@@ -2576,6 +2636,13 @@ class ResponsesHandler:
             # buffer, so it can never write after the terminal record.
             async with model_wait.running(buffer=buffer):
                 async for sse_string in harness.formatter(stream, model, event_sink):
+                    if lifecycle.discarded:
+                        # A frame sent after a turn delete's cancel landed, such
+                        # as the turn's memory record: the delete removed this
+                        # turn's buffer, and a write would recreate it for the
+                        # next turn at this number. The stream raises the
+                        # cancel on the next read.
+                        continue
                     event_count += 1
                     sse_string = self._inject_created(
                         sse_string, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id,

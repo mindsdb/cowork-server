@@ -104,8 +104,8 @@ def test_startup_freezes_the_validated_pack_name(monkeypatch, tmp_path, name):
 
 @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
 def test_startup_accepts_the_pack_loaders_json_encodings(monkeypatch, tmp_path, encoding):
-    # cowork-self-hosted scripts/branding.py:read_pack_json passes bytes to
-    # json.loads, which accepts a BOM and detects UTF-16/32 as well as UTF-8.
+    # A self-hosted deployment's pack loader passes bytes to json.loads,
+    # which accepts a BOM and detects UTF-16/32 as well as UTF-8.
     pack = tmp_path / "pack.json"
     pack.write_bytes(json.dumps({"name": PRODUCT}).encode(encoding))
     _enable(monkeypatch, pack)
@@ -341,3 +341,20 @@ async def test_self_hosted_publish_tool_names_neither_the_desktop_app_nor_mindsh
     for text in (publish.description, publish.prompt, answer):
         assert "desktop" not in text
         assert "MindsHub" not in text
+
+
+async def test_self_hosted_publish_tool_says_full_stack_apps_cant_be_published(monkeypatch, tmp_path):
+    """The stack's own publisher refuses every full-stack artifact
+    (`publish.FULLSTACK_PUBLISH_UNSUPPORTED`), live apps on or off, so the
+    agent reads it in the tool before it builds one, not when the share fails.
+    Default hosts keep their text (test_harness_publish_access's digests)."""
+    from cowork.harnesses.anton_harness import tools
+
+    _enable(monkeypatch, _pack(tmp_path))
+    cowork_server.create_app()
+
+    description = tools.build_cowork_publish_tool().description
+    assert description.endswith(
+        "Full-stack apps (a backend with its frontend) can't be published from this "
+        "deployment: publish an HTML page or a Markdown document."
+    )

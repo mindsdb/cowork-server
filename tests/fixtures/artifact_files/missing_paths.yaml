@@ -1,0 +1,10 @@
+# Paths that name nothing on disk. The test folder holds one empty `sub`
+# directory, so each case misses at a different segment. Every one is
+# refused as missing.
+
+- id: file
+  parts: ["absent.png"]
+- id: directory
+  parts: ["absent", "chart.png"]
+- id: file-at-depth
+  parts: ["sub", "absent.png"]
