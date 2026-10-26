@@ -17,3 +17,5 @@ from cowork.models.shared_resource import (  # noqa: F401
     SharedResourceMutation,
 )
 from cowork.models.task_object import TaskObject  # noqa: F401
+
+from cowork.models.live_app_preview import LiveAppPreview  # noqa: F401

@@ -99,6 +99,30 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
         "anton and the slot know; at most it marks that one launch stopped, and it "
         "answers 404 with live apps off"
     ),
+    ("/api/v1/live-apps/{slot}/preview/bootstrap", ("GET",)): (
+        "a trusted bootstrap document containing no credential or app data; "
+        "its parent must supply an owner-created intent before access can be checked"
+    ),
+    ("/api/v1/live-apps/{slot}/preview/authorize", ("GET",)): (
+        "a trusted sign-in bridge document containing no credential or app data; "
+        "only its separate POST can authorize a preview"
+    ),
+    ("/api/v1/live-apps/{slot}/preview/authorize", ("POST",)): (
+        "checks a secret owner-created intent, exact browser origin and viewer "
+        "cookie against the current launch before issuing a one-use grant"
+    ),
+    ("/api/v1/live-apps/{slot}/preview/exchange", ("POST",)): (
+        "requires the exact browser origin and a still-unused, unexpired "
+        "viewer-confirmed grant; consumption commits before a cookie is returned"
+    ),
+    ("/api/v1/live-apps/{slot}/preview/connect", ("POST",)): (
+        "requires the exact browser origin, matching secret intent and preview "
+        "cookie, then checks viewer identity, lease expiry and current launch"
+    ),
+    ("/api/v1/live-apps/{slot}/preview/revoke-viewer", ("GET",)): (
+        "can only revoke previews for the viewer identity independently verified "
+        "from the presented cookie; it grants no access or new credential"
+    ),
 }
 
 
@@ -159,7 +183,7 @@ def test_the_open_set_is_small_enough_to_read(open_routes):
     is deliberately loose — it is a tripwire for a bulk reclassification, not
     a budget to spend down.
     """
-    assert len(open_routes) <= 20, (
+    assert len(open_routes) <= 22, (
         f"{len(open_routes)} routes now answer with no credential. If that is "
         "right, raise the bound in the same commit that explains why."
     )

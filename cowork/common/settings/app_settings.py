@@ -970,6 +970,16 @@ class AppSettings(Settings):
             "without it."
         ),
     )
+    live_apps_viewer_public_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_VIEWER_PUBLIC_URL"),
+        description=(
+            "The same viewer sign-in at the address a browser reaches, for "
+            "example http://view.localhost:8080. A live app's preview in the "
+            "web UI sends its sign-in window there; without it a preview is "
+            "refused, and the pane offers only Open in browser."
+        ),
+    )
     live_apps_launch_token: SecretStr = Field(
         default=SecretStr(""),
         validation_alias=AliasChoices("COWORK_LIVE_APPS_LAUNCH_TOKEN"),
