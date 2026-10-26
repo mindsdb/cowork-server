@@ -283,10 +283,6 @@ async def test_only_scratchpad_call_inputs_lose_the_length_cap():
     assert contents == [content[:65_536]] * 4
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the current anton-agent floor drops a compacted cell's error flag; the floor moves to the release that keeps it",
-)
 @pytest.mark.parametrize("code_size", [1000, 70_000], ids=["error-cut", "code-and-error-cut"])
 async def test_a_replayed_failure_folded_by_compaction_grants_no_file_ownership(tmp_path, monkeypatch, code_size):
     """A replayed cell that failed while writing the user's report still
