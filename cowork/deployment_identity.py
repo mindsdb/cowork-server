@@ -109,8 +109,8 @@ def initialize_deployment_identity(settings: AppSettings, *, remote_turns: bool)
             "with no symlinks in its path."
         ) from None
     try:
-        # cowork-self-hosted scripts/branding.py:read_pack_json also uses
-        # json.loads on bytes, preserving BOM and UTF-16/32 pack support.
+        # A self-hosted deployment's pack loader also uses json.loads on
+        # bytes, preserving BOM and UTF-16/32 pack support.
         pack = _BrandPack.model_validate(json.loads(raw, object_pairs_hook=_unique_object))
         identity = identity_type(kind="self-hosted", product_name=pack.name)
     except (ValidationError, ValueError, TypeError):
