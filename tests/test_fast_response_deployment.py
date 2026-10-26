@@ -17,7 +17,7 @@ from cowork.server import create_app
 PRODUCT = "Acme & Co's $workbench"
 # Exact unbranded prompts the providers receive; a deliberate prompt edit updates
 # its hash here. These assertions exercise provider requests, not just the constants.
-DEFAULT_GATE_SHA256 = "b98ab995c9b1d0e9e40c57498a6ac4c68fd63b41f3921de667f33be5e6df186e"
+DEFAULT_GATE_SHA256 = "250948b03e2678c435eac61b1675f7f89842319b3a30a6e7bdc8744a090172cf"
 DEFAULT_TAKE_SHA256 = "423cf10dd88589f84adadb158b7851a89cfd32da4bad967c473062f07a51427a"
 
 
