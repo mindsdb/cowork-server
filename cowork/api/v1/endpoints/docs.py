@@ -8,7 +8,8 @@ source edit through the artifact workspace does.
 Writes from the editor and from the agent's tools share one path
 (``cowork.docs.service``), so the person typing and the agent writing are
 serialised on the same lock and announced on the same hub; ``/events`` streams
-those announcements to every open editor.
+those announcements to every open editor. ``/history`` lists the versions the
+doc's editing sessions left and restores one, for its owner alone.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from cowork.docs.export import CONVERTED_FORMATS, MEDIA_TYPES, export_bytes, exp
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot, org_export_refused
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.render_pdf_client import RenderPdfFailed
+from cowork.docs.history import LIST_LIMIT, LIST_MAX, list_versions, read_version, restore
 from cowork.docs.hub import conv_topic, doc_topic, hub
 from cowork.docs.images import MAX_IMAGE_BYTES, store_image
 from cowork.docs.model import DocError
@@ -60,6 +62,7 @@ _POLL_S = 2.0
 _STATUS_FOR_CODE = {
     "stale": status.HTTP_409_CONFLICT,
     "no_doc": status.HTTP_404_NOT_FOUND,
+    "no_version": status.HTTP_404_NOT_FOUND,
     "too_big": status.HTTP_413_CONTENT_TOO_LARGE,
     # Another replica held the doc's lock past the wait: the edit is fine, resend it.
     "busy": status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -328,6 +331,64 @@ async def export_doc(
         headers={"Content-Disposition": attachment_disposition(export_filename(doc, format)),
                  "Cache-Control": "no-store"},
     )
+
+
+# ---------------------------------------------------------------- history
+#
+# The owner's alone, like writing: a version can hold what was later taken out.
+
+
+@router.get("/{project_ref}/{artifact_id}/history")
+async def doc_history(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    session: ScopedSessionDep,
+    limit: int = Query(default=LIST_LIMIT, ge=1, le=LIST_MAX),
+):
+    """The doc now and its kept versions, newest first: who made each, when, and what changed."""
+    _source, folder, _metadata, _is_own = await run_in_threadpool(
+        _resolve, session, project_ref, artifact_id, write=True
+    )
+    try:
+        return await run_in_threadpool(lambda: list_versions(folder, limit=limit))
+    except DocError as err:
+        raise _doc_error(err) from err
+
+
+@router.get("/{project_ref}/{artifact_id}/history/{rev}")
+async def doc_version(project_ref: str, artifact_id: ArtifactIdDep, rev: int, session: ScopedSessionDep):
+    _source, folder, _metadata, _is_own = await run_in_threadpool(
+        _resolve, session, project_ref, artifact_id, write=True
+    )
+    try:
+        return {"doc": await run_in_threadpool(read_version, folder, rev)}
+    except DocError as err:
+        raise _doc_error(err) from err
+
+
+class _RestoreBody(BaseModel):
+    clientId: str | None = Field(default=None, max_length=100)
+
+
+@router.post("/{project_ref}/{artifact_id}/history/{rev}/restore")
+async def restore_version(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    rev: int,
+    session: ScopedSessionDep,
+    body: _RestoreBody | None = None,
+):
+    """Bring version ``rev`` back. ``replacedRev`` is the version restoring undoes this."""
+    await require_product_permission(session.scope, "artifact.manage")
+    _source, folder, _metadata, _is_own = await run_in_threadpool(
+        _resolve, session, project_ref, artifact_id, write=True
+    )
+    try:
+        doc, replaced = await run_in_threadpool(restore, folder, rev)
+    except DocError as err:
+        raise _doc_error(err) from err
+    after_write(folder, doc, None, by="user", scope=session.scope, client_id=body.clientId if body else None)
+    return {"doc": doc, "replacedRev": replaced}
 
 
 # ---------------------------------------------------------------- SSE

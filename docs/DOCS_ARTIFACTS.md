@@ -12,12 +12,14 @@ The modules depend in one direction, each on those above it:
 | `markdown` | The Markdown dialect the agent writes, both ways |
 | `ops` | The atomic edit operations |
 | `undo` | What puts back one of the person's writes |
+| `changes` | What changed between two versions, in one line |
 | `render` | The agent's outline and full views, the page (`doc.html`) and export markup |
 | `store` | The doc file in its artifact folder: the lock, atomic writes, one kept version per editing session |
 | `hub` | In-process fan-out of changes to the editors and chats watching |
 | `images` | Images on this computer, kept beside the doc |
 | `sharing` | Which docs are shared |
 | `service` | Create and apply (rendering the page under the doc's lock), and `announce` |
+| `history` | The versions listed and described, and restoring one |
 | `republish` | A shared page following its edits |
 | `sync` | What follows a write (announce, republish), and catching shared docs up at startup |
 | `prompt`, `export` | What the agent is told; downloads |
@@ -133,6 +135,18 @@ Turns that run on a remote worker (org mode) do not get these tools yet, so they
 
 Sharing a doc publishes its page (`doc.html`) through the normal publish flow and access. From then on `cowork.docs.republish` republishes it four seconds after the last write, keeping its URL and access, so there is no "update the shared copy" step; a burst of writes (a person typing, the agent filling sections) is one republish. That is not done in org mode, where autopublish owns what a shared artifact shows. At startup (`sync.start`) each shared doc's page is re-rendered and republished if it differs from what went out, which catches an edit made just before the app quit.
 
+## Version history
+
+The editor's clock button lists the doc's versions, newest first and the doc as it is now on top, and restores one. All three routes are the owner's alone, like writing, because a version can hold what was later taken out:
+
+- `GET /{project}/{artifact}/history?limit=30` returns `current` and `versions`, each with `rev`, `at` (the session's last write), `by` (`agent` or `user`), `summary` and, for a restore, `restoredFrom` (`{rev, at}`).
+- `GET /{project}/{artifact}/history/{rev}` returns that version's doc, for the read-only preview.
+- `POST /{project}/{artifact}/history/{rev}/restore` brings it back and returns `replacedRev`.
+
+`summary` is what changed since the version before it, worked out by `changes.describe` from the two docs, block by block: "Budget: Paid search 72 → 80, and 2 more cells", "Added the Risks tab", "3 changes across Budget and Risks". The first version reads "First draft". A version whose predecessor was let go has none. Kept versions never change, so a summary is worked out once per pair of revs.
+
+A restore is an ordinary write through `store.mutate_doc`: the doc as it was is kept first, and the restore is a version of its own, so restoring `replacedRev` undoes it. Every block takes the new rev, so an edit made against the doc before the restore (the agent mid-reply) is refused as stale rather than written over it. It then follows every write: announced, and a shared page republishes.
+
 ## Working on it
 
 Tests, in `tests/`:
@@ -145,6 +159,7 @@ Tests, in `tests/`:
 - `test_docs_images.py`: images kept beside the doc.
 - `test_docs_tools.py`: the agent's tools.
 - `test_docs_sharing.py`: which docs are shared, catching them up at startup, and the debouncer.
+- `test_docs_history.py`: what changed between versions, the history listed, restoring and undoing.
 
 By hand: run the app against a server with a throwaway `COWORK_HOME` (never your own `~/.cowork`). The editor's tests sit beside it in the cowork repo, under `src/renderer/cowork/components/doc/`.
 
