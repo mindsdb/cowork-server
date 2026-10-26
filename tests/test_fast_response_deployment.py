@@ -96,7 +96,7 @@ async def test_actual_direct_handler_uses_startup_identity_without_building_anto
     _initialize(monkeypatch, tmp_path, branded=branded)
     answer = f"Hello from {PRODUCT if branded else 'Cowork'}."
     provider = _Provider(answer)
-    monkeypatch.setattr(response_routing, "_settings_binding", lambda: _binding(provider))
+    monkeypatch.setattr(responses, "_settings_binding", lambda: _binding(provider))
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: False)
 
     def no_harness(*args, **kwargs):
@@ -126,8 +126,10 @@ async def test_real_routing_starts_a_first_take_with_the_same_startup_identity(
     _initialize(monkeypatch, tmp_path, branded=branded)
     gate_provider = _Provider("", delegate=True)
     take_provider = _Provider("I'll look into that.")
-    monkeypatch.setattr(response_routing, "_settings_binding", lambda: _binding(gate_provider))
-    monkeypatch.setattr(responses, "_first_take_binding", lambda minted: _binding(take_provider))
+    monkeypatch.setattr(responses, "_settings_binding", lambda: _binding(gate_provider))
+    monkeypatch.setattr(
+        responses, "_first_take_binding", lambda minted, *, binding_factory=None: _binding(take_provider)
+    )
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: True)
     handler = responses.ResponsesHandler()
     handler.harness_name = "anton"

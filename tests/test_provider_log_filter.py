@@ -159,7 +159,8 @@ def test_nonprovider_connection_errors_keep_their_traceback(owned_logger, caplog
     assert record.getMessage() == "Reconnect failed"
     assert record.exc_info is not None
     assert str(record.exc_info[1]) == "ordinary socket failure"
-    assert "ordinary socket failure" in logged.output()
+    assert "ordinary socket failure" not in logged.output()
+    assert "ConnectionError: [error details omitted]" in logged.output()
 
 
 # asyncio's default exception handler logs a context that carries no
@@ -191,7 +192,9 @@ def test_asyncios_message_for_a_context_without_an_exception_survives_setup_logg
                             env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://",
                                  "LOG_LEVEL": "WARNING", "RICH_LOGGING": "false"}, timeout=60)
     assert result.returncode == 0, result.stderr
-    assert "[ERROR] asyncio: Task was destroyed but it is pending!" in result.stdout, result.stdout + result.stderr
+    event = json.loads(result.stderr)
+    assert event["logger"] == "asyncio" and event["log_level"] == "ERROR"
+    assert event["message"] == "Task was destroyed but it is pending!"
     assert "Exception in default exception handler" not in result.stdout + result.stderr
 
 
@@ -374,7 +377,7 @@ def test_uvicorns_default_log_config_prints_only_sanitized_provider_errors(tmp_p
     assert run.statuses == (500,)
     assert ("Provider operation failed: error_type=RuntimeError provider_error=BadRequestError status=400"
             in run.stderr), run.stderr
-    assert "Finished server process" in run.stderr
+    assert "Finished server process" not in run.stderr
     assert PRIVATE not in run.stdout + run.stderr
 
 
@@ -551,5 +554,7 @@ def test_a_repaired_content_validation_error_keeps_its_count_in_the_log(path, mo
     )
     assert (record.request_id, record.conversation_id) == (request_id, str(conversation_id))
     emitted = logged.output()
-    assert f"[Req:{request_id}][Conversation:{conversation_id}]" in emitted
+    event = json.loads(emitted)
+    assert event["request_id"] == request_id
+    assert event["conversation_id"] == str(conversation_id)
     assert PRIVATE not in emitted

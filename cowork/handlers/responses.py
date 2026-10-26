@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -119,6 +119,7 @@ from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
+from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
@@ -556,7 +557,11 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
-def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
+def _first_take_binding(
+    minted: RouterBinding | None,
+    *,
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
+) -> RouterBinding | None:
     """The gate's own binding: the take only helps if it lands within a second
     or two, which a chat model is routinely too slow for. `minted` is the
     gate's per-turn MindsHub binding on hosted orgs. None when there is no
@@ -564,7 +569,7 @@ def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
     if minted is not None:
         return minted
     try:
-        return _settings_binding()
+        return (binding_factory or _settings_binding)()
     except Exception:
         return None
 
@@ -583,6 +588,7 @@ def _start_first_take(
     conversation_id: UUID,
     harness: str | None,
     metadata: dict[str, str],
+    binding_factory: Callable[[], RouterBinding | None] | None = None,
 ) -> FirstTake | None:
     """Start the turn's first take on the gate's model, or None when it is
     switched off or there is no model to run it on.
@@ -592,7 +598,7 @@ def _start_first_take(
     """
     if not _first_take_enabled():
         return None
-    binding = _first_take_binding(minted)
+    binding = _first_take_binding(minted, binding_factory=binding_factory)
     if binding is None:
         return None
     from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
@@ -712,10 +718,18 @@ class ResponsesHandler:
                 **({"response_router_model": route.model} if route.model else {}),
                 **({"response_route_fallback": "true"} if route.fallback else {}),
             }
-            logger.info(
-                "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
-                route.route, route.reason, route.fallback, route.provider, route.model,
-                start.conversation_id,
+            # Fields, not template values: the log formatter drops those. A
+            # fallback is WARNING so the default level keeps it.
+            logger.log(
+                logging.WARNING if route.fallback else logging.INFO,
+                "Router fell back to the agent" if route.fallback else "Router chose the turn's route",
+                extra={
+                    "event": "router_fallback" if route.fallback else "router_route",
+                    "outcome": route.route,
+                    "reason": route.reason,
+                    "provider": route.provider,
+                    **log_context(conversation_id=start.conversation_id),
+                },
             )
 
             if route.route == DIRECT_CONTEXT and first_take is not None:
@@ -829,7 +843,7 @@ class ResponsesHandler:
                 partial(_conversation_for_harness, conversation_id=start.conversation_id),
                 scope=self.scope,
             )
-            with use_settings_scope(self.scope):
+            with use_settings_scope(self.scope), use_live_app_launcher(self.principal):
                 stream = harness.stream_response(
                     conversation=conversation,
                     input=start.harness_input,
@@ -1046,10 +1060,19 @@ class ResponsesHandler:
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
+
+                    @cache
+                    def binding_for_turn() -> RouterBinding | None:
+                        # Share successful resolution (including no model) only
+                        # in this request. Exceptions remain retryable by the gate,
+                        # which must still propagate a database pool timeout.
+                        return binding if binding is not None else _settings_binding()
+
                     correlation_id = (turn_llm or {}).get("correlation_id")
                     if first_take:
                         self.first_take = _start_first_take(
                             binding,
+                            binding_factory=binding_for_turn,
                             history=history,
                             conversation_id=conversation_id,
                             harness=self.harness_name,
@@ -1076,18 +1099,25 @@ class ResponsesHandler:
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
+                        binding_factory=binding_for_turn,
                     )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
                     # WARNING (app_settings.py's own default too), so an info-level
                     # line here is silently dropped everywhere it would actually
                     # be read from — found live on staging, zero [gate] lines
-                    # across 8 real requests until this was bumped.
+                    # across 8 real requests until this was bumped. Fields, not
+                    # template values: the log formatter drops those.
                     logger.warning(
-                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
-                        "provider=%s model=%s gate_ms=%d",
-                        conversation_id, correlation_id, decision.route, decision.reason,
-                        decision.provider, decision.model, gate_ms,
+                        "Router gate decided the turn's route",
+                        extra={
+                            "event": "router_gate_decided",
+                            "outcome": decision.route,
+                            "reason": decision.reason,
+                            "provider": decision.provider,
+                            "duration_ms": gate_ms,
+                            **log_context(conversation_id=conversation_id),
+                        },
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
                     # would make a ready gate decision wait for Jev, exactly the
@@ -2414,7 +2444,7 @@ class ResponsesHandler:
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
-        with use_settings_scope(scope_from_principal(self.principal)):
+        with use_settings_scope(scope_from_principal(self.principal)), use_live_app_launcher(self.principal):
             try:
                 await self._run_turn(**kwargs)
             finally:

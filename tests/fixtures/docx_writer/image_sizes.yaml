@@ -1,0 +1,8 @@
+# Generated PNGs with no pHYs chunk, so python-docx reads them at 72 DPI.
+# fit: native keeps the image's own size; width and height scale it down,
+# keeping its aspect, until it fits the page's text width or text height
+# (place: body) or its table cell's width (place: cell).
+- {name: small_image_keeps_its_size, px: [3, 2], place: body, fit: native}
+- {name: wide_image_fits_the_text_width, px: [5000, 100], place: body, fit: width}
+- {name: tall_image_fits_the_text_height, px: [100, 20000], place: body, fit: height}
+- {name: image_in_a_table_cell_fits_the_cell, px: [2000, 100], place: cell, fit: width}

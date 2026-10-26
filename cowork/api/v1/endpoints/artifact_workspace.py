@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-import ntpath
 import os
 import stat
 from contextlib import ExitStack
@@ -21,10 +20,7 @@ from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
 from cowork.common.paths import (
-    O_NOFOLLOW,
     dir_lstat,
-    dir_open,
-    dir_scandir,
     open_pinned_child,
     read_bounded,
 )
@@ -35,9 +31,23 @@ from cowork.services.product_permissions import has_product_permission, require_
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
+    with_export_formats,
 )
+from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
+from cowork.schemas.artifact_export import ExportRequest, ExportResult
+from cowork.schemas.base import CamelResponse
+from cowork.services.artifact_export import (
+    ExportRefusal,
+    ExportRefused,
+    ExportSource,
+    export_primary_file,
+    export_slot,
+    org_export_refused,
+    primary_export_source,
+)
+from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.services.artifact_revisions import (
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
@@ -71,14 +81,16 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
-# Matched against the first path component of a draft request.
+# Matched against the first path component of a draft request. The file
+# walk refuses them there casefolded too, and the store-owned ones at any
+# depth (`artifact_files.refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 
 def _attachment_disposition(filename: str) -> str:
     """``Content-Disposition`` for saving ``filename``, safe to put on the wire.
 
-    The name is a request-derived path component. ``_relative_file_parts``
+    The name is a request-derived path component. ``relative_file_parts``
     rejects NUL, separators and ``..``, but a quote, CR or LF still pass — and
     any of them interpolated raw into a header is a header-injection vector
     (``project_files.download_project_file`` has exactly that shape; ENG-2044).
@@ -105,133 +117,20 @@ def _attachment_disposition(filename: str) -> str:
     )
 
 
-def _relative_file_parts(value: str) -> tuple[str, ...]:
-    """Split an untrusted relative path into safe, single components.
-
-    The returned strings are passed to descriptor-relative opens; no
-    request-derived string is ever joined onto an absolute filesystem path.
-    Treat backslashes as separators too so the validation has the same meaning
-    on the Windows desktop and the Linux service.
-    """
-    if not value or "\x00" in value:
-        raise ValueError("invalid path")
-    normalized = value.replace("\\", "/")
-    if normalized.startswith("/") or ntpath.splitdrive(normalized)[0]:
-        raise ValueError("invalid path")
-    parts = tuple(normalized.split("/"))
-    if not parts or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError("invalid path")
-    return parts
-
-
 def _artifact_folder_component(source, folder: Path) -> str:
-    """Return the direct child of ``source.base`` selected by resolution.
+    """Return the direct child of ``source.base`` selected by resolution, or 404.
 
-    Identity lookup indexes a resolved artifacts root, so a normal result can
-    be parented by either the declared root or its resolved spelling. Anything
-    else must not be translated to ``folder.name``: doing so could turn a grant
-    for one resolved folder into a same-named folder under another source.
+    ``artifact_files.artifact_folder_name`` holds the rule: a folder whose
+    parent is not the source's base is refused, so a grant for one resolved
+    folder can't select a same-named folder under another source.
     """
-    base = Path(source.base)
     try:
-        parents = {base, base.resolve(strict=False)}
-    except OSError as exc:
+        return artifact_files.artifact_folder_name(source=source, folder=folder)
+    except artifact_files.ArtifactFileRefused as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Artifact file not found",
         ) from exc
-    if folder.parent not in parents:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artifact file not found",
-        )
-    name = folder.name
-    if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artifact file not found",
-        )
-    return name
-
-
-def _existing_draft_entry_name(
-    directory, requested: str, *, native_case: bool = False
-) -> str:
-    """Return the pinned directory's own name for a request selector.
-
-    Validation makes ``requested`` a single component, but it still originated
-    in an HTTP path.  Compare it with entries already discovered below the
-    pinned directory and return ``DirEntry.name`` so no request-derived string
-    is ever supplied to ``openat``.  A replacement after the scan remains safe:
-    the subsequent descriptor-relative open uses ``O_NOFOLLOW``.
-
-    ``native_case`` also accepts a spelling the filesystem itself accepts. It
-    exists because ``resolve_source`` opens by path and so inherits the
-    volume's own case rules, and a boundary stricter than the gate behind it
-    makes a reported source unsaveable. The filesystem decides, never the
-    platform: the requested spelling has to name the same inode as the entry,
-    which on a case-sensitive volume it cannot. The name returned is still the
-    one the scan produced.
-    """
-    insensitive_matches: list[str] = []
-    with dir_scandir(directory) as entries:
-        for entry in entries:
-            if entry.name == requested:
-                return entry.name
-            if native_case and entry.name.lower() == requested.lower():
-                insensitive_matches.append(entry.name)
-    # Ambiguous only on a case-sensitive volume, where the exact match above
-    # is the only correct answer anyway.
-    if len(insensitive_matches) == 1:
-        if _names_one_inode(directory, requested, insensitive_matches[0]):
-            return insensitive_matches[0]
-    raise FileNotFoundError(requested)
-
-
-def _names_one_inode(directory, requested: str, discovered: str) -> bool:
-    """Whether the filesystem resolves both spellings to the same file.
-
-    Neither stat follows a link, so a symlink whose name differs only in case
-    from a real entry compares unequal and is refused rather than matched.
-    """
-    try:
-        probe = dir_lstat(directory, requested)
-        found = dir_lstat(directory, discovered)
-    except OSError:
-        return False
-    return (probe.st_dev, probe.st_ino) == (found.st_dev, found.st_ino)
-
-
-def _open_pinned_draft_file(source, folder: Path, parts: tuple[str, ...]):
-    """Open one regular draft file without following any writable symlink.
-
-    Authorization chose ``source`` and ``folder`` before this call. The source
-    retains its server-owned anchor, and ``opened_artifact_folder`` walks from
-    that anchor to the artifact with ``O_NOFOLLOW`` on every component. The
-    request path is then walked the same way. Returning the ``ExitStack`` keeps
-    every descriptor alive until the response has consumed the final file.
-    """
-    folder_name = _artifact_folder_component(source, folder)
-    resources = ExitStack()
-    try:
-        current = resources.enter_context(opened_artifact_folder(source, folder_name))
-        for requested in parts[:-1]:
-            disk_name = _existing_draft_entry_name(current, requested)
-            current = open_pinned_child(current, disk_name)
-            resources.callback(current.close)
-        disk_name = _existing_draft_entry_name(current, parts[-1])
-        fd = dir_open(current, disk_name, os.O_RDONLY | O_NOFOLLOW)
-        resources.callback(os.close, fd)
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise OSError("draft target is not a regular file")
-    except (OSError, ValueError) as exc:
-        resources.close()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artifact file not found",
-        ) from exc
-    return resources, fd, file_stat
 
 
 def _editable_source_selector(source, folder: Path, requested: str | None) -> str | None:
@@ -243,7 +142,7 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     shared storage, so what makes the fallback safe is the inner gate's own
     containment, symlink and extension checks rather than where it came from.
     Anything else is the same kind of request-derived string
-    ``_open_pinned_draft_file`` refuses to
+    ``open_pinned_draft_file`` refuses to
     hand to the filesystem: it is validated into single components, each one
     is matched against a ``dir_scandir`` pass on a pinned descriptor, and the
     path the revision service receives is joined from the ``DirEntry`` names
@@ -262,7 +161,7 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     if requested is None or not requested.strip():
         return None
     try:
-        parts = _relative_file_parts(requested.strip())
+        parts = artifact_files.relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
     # Only the journal (any depth), like the inner gate: the private-listing
@@ -276,11 +175,15 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         with ExitStack() as resources:
             current = resources.enter_context(opened_artifact_folder(source, folder_name))
             for part in parts[:-1]:
-                disk_name = _existing_draft_entry_name(current, part, native_case=True)
+                disk_name = artifact_files.existing_draft_entry_name(
+                    current, part, native_case=True
+                )
                 current = open_pinned_child(current, disk_name)
                 resources.callback(current.close)
                 disk_parts.append(disk_name)
-            disk_name = _existing_draft_entry_name(current, parts[-1], native_case=True)
+            disk_name = artifact_files.existing_draft_entry_name(
+                current, parts[-1], native_case=True
+            )
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
                 raise OSError("draft source is not a regular file")
             disk_parts.append(disk_name)
@@ -491,6 +394,7 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         PublishOwnedByOtherUser,
+        PublishTooLarge,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -557,6 +461,10 @@ async def _sync_live_artifact(
         # Repeats on every save of this artifact, so no traceback.
         logger.warning("Could not synchronize live artifact %s: another account owns its report", folder)
         return False
+    except PublishTooLarge:
+        # Repeats on every save until the artifact shrinks, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
+        return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
         return False
@@ -589,12 +497,16 @@ async def _current_capabilities(session, capabilities: dict) -> dict:
         return capabilities
     can_edit = await has_product_permission(session.scope, "artifact.manage")
     can_execute = await has_product_permission(session.scope, "product.execute")
-    return {
+    current = {
         **capabilities,
         "canEdit": can_edit,
         "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
         "canResolveComments": capabilities["canResolveComments"] and can_edit,
     }
+    # The export route needs `artifact.manage` too, so it offers nothing here.
+    if not can_edit and "exportFormats" in capabilities:
+        current["exportFormats"] = []
+    return current
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}")
@@ -606,8 +518,13 @@ async def artifact_source(
     session: ScopedSession = Depends(get_scoped_session),
     path: str | None = Query(default=None, max_length=1000),
 ):
-    """Authenticated source + revision token for Desktop and Cowork SaaS."""
-    source, folder, metadata, capabilities = _owner_workspace(
+    """Authenticated source + revision token for Desktop and Cowork SaaS.
+
+    ``_owner_workspace`` is the owner gate. The capabilities it returns gain
+    ``exportFormats``, which read the artifact's primary file, once the folder
+    is resolved, through the helper ``artifact_capabilities`` adds it with.
+    """
+    source, folder, metadata, owner_capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     selected = await run_in_threadpool(_editable_source_selector, source, folder, path)
@@ -620,7 +537,17 @@ async def artifact_source(
             current_workspace, folder, metadata, artifact_id, selected
         )
         repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
-        capabilities = await _current_capabilities(session, capabilities)
+        if org_export_refused(org_mode=bool(session.scope.org_mode)):
+            # No format is offered whatever the folder holds, so the walk that
+            # finds the primary is skipped, and the source names none.
+            export_source = ExportSource(source_name="", is_backend=False)
+        else:
+            export_source = await run_in_threadpool(
+                primary_export_source, folder=folder, metadata=metadata
+            )
+        capabilities = await _current_capabilities(
+            session, with_export_formats(session, owner_capabilities, export_source)
+        )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -672,6 +599,80 @@ async def update_artifact_source(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+_EXPORT_REFUSAL_STATUS = {
+    ExportRefusal.NOT_OFFERED: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    ExportRefusal.TOO_LARGE: status.HTTP_413_CONTENT_TOO_LARGE,
+    ExportRefusal.NOT_FOUND: status.HTTP_404_NOT_FOUND,
+    ExportRefusal.BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
+}
+# What the route says for each status a failed PDF export answers with.
+_PDF_FAILURE_DETAIL = {
+    413: "This file can't be exported.",
+    422: "This file can't be exported.",
+    502: "Couldn't export this file.",
+    503: "PDF export is busy; try again.",
+    504: "PDF export took too long.",
+}
+
+
+@router.post("/workspace/{project_ref}/{artifact_id}/export")
+async def export_workspace_artifact(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: ExportRequest,
+    session: ScopedSessionDep,
+) -> ExportResult:
+    """Export the artifact's primary file as a new HTML, Word or PDF file beside it.
+
+    One route for every tenancy, checked the way a source edit is: the caller
+    needs ``artifact.manage`` and must own the artifact, and both checks run
+    before the format is read, so a caller who may not export gets 403 or 404
+    whatever they ask for. While org export is off, the owner gets 403 too,
+    after those checks, so a caller with no grant still gets 404. A busy
+    server answers 429 at once. The conversion runs in a worker thread, a PDF
+    that doesn't come back answers the render client's status, and only a
+    200 leaves a file behind.
+    """
+    await require_product_permission(session.scope, "artifact.manage")
+    source, folder, metadata, capabilities = _owner_workspace(
+        session, project_ref, artifact_id
+    )
+    if org_export_refused(org_mode=bool(session.scope.org_mode)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Export isn't available on this deployment.",
+        )
+    folder_name = _artifact_folder_component(source, folder)
+    try:
+        async with export_slot(scope=session.scope, export_format=body.format):
+            return await run_in_threadpool(
+                export_primary_file,
+                source=source,
+                folder_name=folder_name,
+                metadata=metadata,
+                artifact_id=artifact_id,
+                export_format=body.format,
+                can_edit=bool(capabilities.get("canEdit")),
+            )
+    except ExportRefused as exc:
+        raise HTTPException(
+            status_code=_EXPORT_REFUSAL_STATUS[exc.refusal], detail=str(exc)
+        ) from exc
+    except RenderPdfFailed as exc:
+        # The reason never quotes the render service, so it is safe to log.
+        logger.info("PDF export failed for %s: %s", artifact_id, exc)
+        raise HTTPException(
+            status_code=exc.status, detail=_PDF_FAILURE_DETAIL[exc.status]
+        ) from exc
+    except Exception as exc:
+        logger.warning(
+            "Artifact export to %s failed for %s", body.format, artifact_id, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Export failed"
+        ) from exc
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions")
@@ -809,6 +810,7 @@ async def set_artifact_access(
     every turn, with the owner's selection in place of the first-publish default.
     """
     await require_product_permission(session.scope, "artifact.manage")
+    from cowork.services.publish import PublishRejected, PublisherUnavailable
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
@@ -866,9 +868,35 @@ async def set_artifact_access(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    # PublisherUnavailable and PublishRejected are RuntimeErrors, so they come first.
+    except PublisherUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except PublishRejected as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    except (RuntimeError, OSError) as exc:
+        # A local failure's text can name shared-storage paths, so only the log
+        # gets it. Not every such error passed publish_artifact's own log.
+        logger.warning("Could not change access for artifact %s", artifact_id, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Publishing failed. Try again in a moment.",
+        ) from exc
     finally:
         if not publish_abandoned:
             await run_in_threadpool(release, folder.parent, folder.name)
+        if key is not None and not publish_abandoned:
+            await key.revoke()
+
+
+class CommentsAccessResponse(CamelResponse):
+    """The owner's draft comments, turned on."""
+
+    enabled: Literal[True] = True
+    artifact_key: str
+    # "organization": same-org reviewers may comment; "owner": only the owner.
+    scope: Literal["organization", "owner"]
+    capabilities: dict[str, Any]
+    current_revision: dict[str, Any] | None
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
@@ -876,12 +904,18 @@ async def enable_artifact_comments(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
-):
-    """Provision same-org draft review without broadening source-edit access.
+) -> CommentsAccessResponse:
+    """Turn on draft comments for the artifact's owner.
 
-    Owner-only: this mints an auth rule and reopens a private conversation
-    workspace to the organization, which is the owner's call to make. A
-    reviewer's client calls the `review` GET above instead.
+    Owner-only. In org mode this provisions same-org draft review without
+    broadening source-edit access: it mints an auth rule and reopens a private
+    conversation workspace to the organization, which is the owner's call to
+    make. A reviewer's client calls the `review` GET above instead.
+
+    Local tenancy provisions nothing. Its comment routes keep the threads in the
+    artifact's own folder (`LocalArtifactComments`), which finds the artifact
+    only among the caller's artifacts roots, so the owner is the one person who
+    reaches them.
     """
     await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.artifact_access import (
@@ -894,35 +928,39 @@ async def enable_artifact_comments(
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
     capabilities = await _current_capabilities(session, capabilities)
-    # `_owner_workspace` already refused anyone but the owner, so the owner is
-    # the caller; resolving it again would only repeat that query.
-    owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
-    try:
-        canonical_key = await run_in_threadpool(
-            ensure_authorization_key,
-            artifact_id,
-            session.scope,
-            owner_user_id=owner_user_id,
+    if session.scope.org_mode:
+        # `_owner_workspace` already refused anyone but the owner, so the owner is
+        # the caller; resolving it again would only repeat that query.
+        owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
+        try:
+            canonical_key = await run_in_threadpool(
+                ensure_authorization_key,
+                artifact_id,
+                session.scope,
+                owner_user_id=owner_user_id,
+            )
+            await provision_draft_review_access(
+                canonical_key.split("/", 1)[1],
+                session.scope,
+                owner_user_id=owner_user_id,
+            )
+        except ArtifactAccessUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        # After the auth rule, never before: the marker is what reopens the folder
+        # to co-members on this server, and a rule-less grant would show a draft the
+        # comments service then refuses to talk about.
+        await run_in_threadpool(
+            enable_draft_review,
+            folder,
+            org_id=str(session.scope.org_id),
+            enabled_by=str(session.scope.user_id),
         )
-        await provision_draft_review_access(
-            canonical_key.split("/", 1)[1],
-            session.scope,
-            owner_user_id=owner_user_id,
-        )
-    except ArtifactAccessUnavailable as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
-    # After the auth rule, never before: the marker is what reopens the folder
-    # to co-members on this server, and a rule-less grant would show a draft the
-    # comments service then refuses to talk about.
-    await run_in_threadpool(
-        enable_draft_review,
-        folder,
-        org_id=str(session.scope.org_id),
-        enabled_by=str(session.scope.user_id),
-    )
+        comments_scope = "organization"
+    else:
+        comments_scope = "owner"
     current_revision = None
     try:
         draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
@@ -930,15 +968,14 @@ async def enable_artifact_comments(
     except (FileNotFoundError, OSError, ValueError, TimeoutError):
         # Binary/oversized artifacts still support general review comments.
         pass
-    return {
-        "enabled": True,
+    return CommentsAccessResponse(
         # Workspace routes/cards keep the local id. The authenticated comments
         # proxy translates it through the same durable alias used to publish.
-        "artifactKey": artifact_key(artifact_id),
-        "scope": "organization",
-        "capabilities": capabilities,
-        "currentRevision": current_revision,
-    }
+        artifact_key=artifact_key(artifact_id),
+        scope=comments_scope,
+        capabilities=capabilities,
+        current_revision=current_revision,
+    )
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}")
@@ -1207,7 +1244,7 @@ async def serve_private_draft(
         session, project_selector, artifact_selector
     )
     try:
-        parts = _relative_file_parts(rel_path)
+        parts = artifact_files.relative_file_parts(rel_path)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1217,7 +1254,7 @@ async def serve_private_draft(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     if str(metadata.get("type") or "").startswith("fullstack-"):
         try:
-            primary_parts = _relative_file_parts(
+            primary_parts = artifact_files.relative_file_parts(
                 str(metadata.get("primary") or "static/index.html")
             )
         except ValueError:
@@ -1240,7 +1277,15 @@ async def serve_private_draft(
 
     download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
-    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
+    try:
+        resources, fd, file_stat = artifact_files.open_pinned_draft_file(
+            source, folder, parts
+        )
+    except artifact_files.ArtifactFileRefused as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact file not found",
+        ) from exc
     try:
         if not download and media_type == "text/html":
             resp = await run_in_threadpool(

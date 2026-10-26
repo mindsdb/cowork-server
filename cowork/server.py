@@ -8,7 +8,9 @@ and all necessary configurations for the Cowork service.
 import asyncio
 import contextlib
 import os
+import stat
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +35,6 @@ from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
-from cowork.harnesses.memory.store import deployment_memory_root
 from cowork.managed import (
     ManagedFolder,
     SharedRegistryError,
@@ -42,12 +43,19 @@ from cowork.managed import (
 )
 from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
+from cowork.services.live_apps import live_app_slot_paths
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
+from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
+from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
 from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
+from cowork.common.settings.app_settings import (
+    TurnQueueSettings,
+    get_app_settings,
+    get_export_pdf_settings,
+)
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
@@ -169,12 +177,29 @@ async def lifespan(app: FastAPI):
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    # Ownership recovery runs before the first request can mint a page. A pass
+    # that cannot read publish history or verify the publisher does not stop
+    # Cowork: published_page_ownership._require_backfill retries it on each
+    # protected publish, unpublish or delete and answers 503 until it completes.
+    from cowork.services.published_page_owner_backfill import (
+        PublishedPageBackfillUnavailable,
+        run_published_page_owner_backfill,
+    )
+
+    try:
+        await asyncio.to_thread(run_published_page_owner_backfill)
+    except PublishedPageBackfillUnavailable as exc:
+        # Its messages are fixed text, raised without the underlying error.
+        logger.error(
+            "Published page ownership backfill did not finish; publishing answers 503 and retries it",
+            extra={"event": "published_page_backfill_unavailable", "reason": str(exc)},
+        )
     # After the clear, since resolving MEMORY_ENABLED where memory is shared
     # loads the stored settings.
     try:
         memory_warning = memory_start_warning()
         if memory_warning is not None:
-            logger.warning("memory: %s (%s)", memory_warning, deployment_memory_root())
+            logger.warning(memory_warning)
     except Exception:
         logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
@@ -230,7 +255,7 @@ async def lifespan(app: FastAPI):
         try:
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
             if reaped:
-                logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
+                logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:
             recovery_session.close()
     except Exception:
@@ -255,6 +280,17 @@ async def lifespan(app: FastAPI):
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
         )
+    app.state.router_startup_probe = None
+    if (
+        app_settings.deployment_kind == "self-hosted"
+        and app_settings.tenancy_mode == "local"
+        and not TurnQueueSettings().is_remote
+    ):
+        from cowork.services.router_probe import run_router_startup_probe
+
+        # Bootstrap and credential clearing finish first; provider checks must
+        # not delay readiness while the configured endpoint is unavailable.
+        app.state.router_startup_probe = asyncio.create_task(run_router_startup_probe())
     try:
         yield
     finally:
@@ -275,6 +311,7 @@ async def lifespan(app: FastAPI):
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
+        await _cancel_and_wait(getattr(app.state, "router_startup_probe", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
@@ -346,14 +383,14 @@ def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
     remedy, rather than surface here with the path and the fix."""
     from anton.core.tools.skill_format import SKILL_FILE
 
-    for folder in (managed.skills_dir, managed.vault_dir):
-        if not os.access(folder, os.R_OK | os.X_OK):
-            raise RuntimeError(
-                f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
-                "server's user needs read and search permission on it. Run "
-                f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
-                f"{folder}` if it is owned by another user)."
-            )
+    folder = managed.skills_dir
+    if not os.access(folder, os.R_OK | os.X_OK):
+        raise RuntimeError(
+            f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
+            "server's user needs read and search permission on it. Run "
+            f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
+            f"{folder}` if it is owned by another user)."
+        )
     for slug_dir in sorted(managed.skills_dir.iterdir()):
         if not slug_dir.is_dir():
             continue
@@ -368,16 +405,59 @@ def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
                 f"COWORK_MANAGED_DIR's skill file {skill_file} can't be read: run "
                 f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
             )
-    # A managed connection file the server's user can't read vanishes for
-    # everyone and frees its name, so a tester could save their own under it.
-    # Refuse at start rather than silently share less.
-    for vault_file in sorted(managed.vault_dir.iterdir()):
-        if vault_file.is_file() and not os.access(vault_file, os.R_OK):
-            raise RuntimeError(
-                f"COWORK_MANAGED_DIR's connection file {vault_file} can't be read: run "
-                f"`chown 1000:1000 {vault_file}` on the host copy so it is not freed and "
-                "re-saved by a tester."
-            )
+    _refuse_unreadable_managed_connections(managed.vault_dir)
+
+
+def _refuse_unreadable_managed_connections(vault_dir: Path) -> None:
+    """Probe as the server's user, without loading credentials or logging a record.
+
+    A bind mount can pass os.access but still deny open. Refuse startup before
+    LocalDataVault silently skips that connection and exposes a lower layer.
+    """
+    try:
+        if not os.access(vault_dir, os.R_OK | os.X_OK):
+            raise PermissionError
+        with pinned_dir(vault_dir) as directory:
+            with dir_scandir(directory) as entries:
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                try:
+                    if not stat.S_ISREG(dir_stat(directory, name).st_mode):
+                        continue
+                    fd = dir_open(directory, name, os.O_RDONLY | O_NONBLOCK)
+                    try:
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            raise OSError("Managed connection is no longer a regular file")
+                    finally:
+                        os.close(fd)
+                except FileNotFoundError:
+                    continue  # The operator may remove a connection during the scan.
+                except OSError as error:
+                    logger.error(
+                        "Cowork cannot read a managed connection; check its ownership "
+                        "and permissions before restarting.",
+                        extra={
+                            "event": "managed_connection_unreadable",
+                            "reason": "file_unreadable",
+                            "managed_connection_file": name,
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    raise RuntimeError(
+                        f"COWORK_MANAGED_DIR's connection file {vault_dir / name} can't be read: "
+                        f"run `chown 1000:1000 {vault_dir / name}` on the host copy."
+                    ) from None
+    except OSError as error:
+        logger.error(
+            "Cowork cannot read the managed data-vault directory; check its ownership "
+            "and permissions before restarting.",
+            extra={
+                "event": "managed_connection_unreadable",
+                "reason": "vault_unreadable",
+                "error_type": type(error).__name__,
+            },
+        )
+        raise RuntimeError("COWORK_MANAGED_DIR's data-vault folder can't be read") from None
 
 
 def create_app() -> FastAPI:
@@ -389,13 +469,16 @@ def create_app() -> FastAPI:
     """
 
     settings = get_app_settings()
+    # PDF export settings come from the process environment alone. An engine
+    # other than "render", or "render" without an http(s) URL, stops the start.
+    get_export_pdf_settings()
 
     from cowork.deployment_identity import initialize_deployment_identity
 
     initialize_deployment_identity(settings, remote_turns=TurnQueueSettings().is_remote)
 
     # Create FastAPI app
-    app = FastAPI(
+    app = RequestLoggingApp(
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
@@ -550,6 +633,11 @@ def create_app() -> FastAPI:
     # Identity headers need the code sandbox, and the sandbox needs a kernel
     # and an anton that hold it (cowork.code_sandbox.check_startup).
     check_code_sandbox_startup(settings, remote_turns=TurnQueueSettings().is_remote)
+    # The edge's access check and stopped page for each live-app slot carry
+    # only the visitor's viewer sign-in cookie, and a slot's stop report
+    # carries nothing; each route checks its caller itself
+    # (cowork.services.live_apps.live_app_slot_paths).
+    channel_webhook_paths.update(live_app_slot_paths())
     # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
     # turns in this process (check_write_approval_startup).
     check_write_approval_startup(

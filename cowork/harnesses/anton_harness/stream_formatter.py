@@ -23,6 +23,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -285,7 +286,15 @@ PROGRESS_THROTTLE = 0.25  # seconds
 _NOT_RUN_PREFIX = "Not run: "
 
 
-def classify_cell_status(content: str) -> str:
+class CellStatus(StrEnum):
+    """How a scratchpad result ended, as the renderer and the replay read it."""
+
+    ok = "ok"
+    timeout = "timeout"
+    error = "error"
+
+
+def classify_cell_status(content: str) -> CellStatus:
     """Classify a scratchpad tool-result as ok / timeout / error.
 
     The renderer uses this to show a killed cell as distinctly dead rather
@@ -305,7 +314,7 @@ def classify_cell_status(content: str) -> str:
     any other non-empty error → "error".
     """
     if not content:
-        return "ok"
+        return CellStatus.ok
     try:
         cell = json.loads(content)
     except (ValueError, TypeError):
@@ -313,20 +322,20 @@ def classify_cell_status(content: str) -> str:
     if isinstance(cell, dict) and "error" in cell:
         err = (cell.get("error") or "").strip()
         if not err:
-            return "ok"
+            return CellStatus.ok
         low = err.lower()
         if "timed out" in low or "of inactivity" in low or "cell killed" in low:
-            return "timeout"
-        return "error"
+            return CellStatus.timeout
+        return CellStatus.error
     # Fallback for non-JSON results (dump notebook, non-scratchpad tools).
     if content.startswith(_NOT_RUN_PREFIX):
-        return "error"
+        return CellStatus.error
     low = content.lower()
     if "cell timed out" in low or "of inactivity" in low or "cell killed" in low:
-        return "timeout"
+        return CellStatus.timeout
     if "[error]" in low or "exec failed" in low:
-        return "error"
-    return "ok"
+        return CellStatus.error
+    return CellStatus.ok
 
 
 # anton's reply when every attempt at the turn failed: its error, not an answer
@@ -345,8 +354,8 @@ _APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTI
 # anton hands the model a cell's result in labeled parts (format_cell_result):
 # what the cell printed under [output], then [logs], [stderr] and [error].
 # anton's session appends [artifact lint] after a cell that changed an
-# artifact.
-_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint)\]\n", re.MULTILINE)
+# artifact, and [live app] after a cell that relaunched a running live app.
+_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint|live app)\]\n", re.MULTILINE)
 # The note format_cell_result puts after printed output it cut short, with
 # the line breaks before the next part.
 _TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)\n*\Z")
@@ -566,8 +575,8 @@ def _cell_arguments(arguments: dict[str, Any]) -> _CellArguments:
 def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     """A cell's result as history rows hold it: its code and description
     from the call's arguments, and what it printed, the [output] part,
-    without the logs, stderr, error and artifact lint the model saw beside
-    it, or the note on how long output cut short was."""
+    without the logs, stderr, error, artifact lint and live-app lines the
+    model saw beside it, or the note on how long output cut short was."""
     stdout = ""
     if result.startswith("[output]\n"):
         printed = result[len("[output]\n"):]
@@ -799,18 +808,16 @@ async def format_responses_stream(
                 role = Role.thought_recall_end.value
             else:
                 role = Role.thought_progress.value
-            # 64 KB cap — old 2 KB cap routinely chopped scratchpad
-            # JSON mid-`code` field, leaving the desktop renderer with
-            # an unparseable string and the inspector showing "No code
-            # captured for this cell." 64 KB covers every cell we've
-            # seen in practice without bloating the SSE stream or the
-            # persisted turns log.
+            # Replay needs the whole scratchpad call: a cut in its code
+            # hides earlier bindings from the next turn's write check. Every
+            # other tool's input, an MCP tool named like the scratchpad's
+            # included, and result output keep their length cap.
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",
                 "sequence_number": seq,
                 "thought_role": role,
-                "content": accumulated[:65536],
+                "content": accumulated if name == "scratchpad" else accumulated[:65536],
                 "tool_use_id": event.id,
             })
 
