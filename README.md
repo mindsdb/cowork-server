@@ -1076,6 +1076,12 @@ Environment variables fall into these groups:
 |----------|---------|-------------|
 | `COWORK_LISTEN_PORT` | `26866` | Server port |
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
+| `COWORK_DRAFT_PORT` | `0` (off) | Org mode. Port of the draft-preview listener: a second server in this process that serves only signed draft links, on the address in `COWORK_SERVER_HOST`. Links are issued (by the API) and served (by this listener) only with `COWORK_TENANCY_MODE=org` and all six draft values set; otherwise the listener answers 404 and web previews stay on `srcdoc`. `/health` reports which one as `draft_links`. |
+| `COWORK_DRAFT_HOSTS` | unset | Comma-separated host names of the draft host (e.g. `draft.mindshub.co`). The listener answers 404 to any other `Host`. |
+| `COWORK_DRAFT_ORIGIN` | unset | Origin draft links point at, e.g. `https://draft.mindshub.co`. |
+| `COWORK_DRAFT_LINK_KEYS` | unset | Draft-link signing keys as JSON `{kid: secret}`, from the `mindsdb-secrets` Secret. Two kids can be live during a rotation. A secret shorter than 32 characters is ignored. A pod reads it at start. |
+| `COWORK_DRAFT_LINK_KID` | unset | The kid in `COWORK_DRAFT_LINK_KEYS` that signs new draft links. |
+| `COWORK_WEB_ORIGIN` | unset | Origin of the cowork web app, e.g. `https://cowork.mindshub.ai`: the only page allowed to frame a draft (CSP `frame-ancestors`). |
 | `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |
 | `COWORK_DEPLOYMENT_KIND` | unset | `self-hosted` tells the agent this installation runs in the operator's environment. Requires local, in-process turns and a branding pack. Unset keeps desktop and hosted identity and installation guidance. |
 | `COWORK_DEPLOYMENT_BRAND_FILE` | unset | Absolute path to the selected, read-only `pack.json`. With `COWORK_DEPLOYMENT_KIND=self-hosted`, its `name` becomes the agent's product name. Startup accepts the branding pack loader's JSON encodings, including a UTF-8 BOM and UTF-16/32. It refuses missing, malformed or linked files, duplicate JSON keys and invalid names. The name is fixed until restart; member settings cannot change it. |
