@@ -69,6 +69,8 @@ class ScriptedModel:
     def __init__(self, script: list[list[dict]]) -> None:
         replies = list(script)
         lock = threading.Lock()
+        tool_outputs: list[str] = []
+        self.tool_outputs = tool_outputs
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args) -> None:
@@ -78,8 +80,12 @@ class ScriptedModel:
                 self._send("application/json", b'{"object":"list","data":[]}')
 
             def do_POST(self) -> None:  # noqa: N802
-                self.rfile.read(int(self.headers.get("content-length") or 0))
+                body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
                 with lock:
+                    tool_outputs.extend(
+                        str(item.get("output")) for item in body.get("input", [])
+                        if item.get("type") in {"function_call_output", "custom_tool_call_output"}
+                    )
                     items = replies.pop(0) if replies else [{
                         "type": "message", "role": "assistant", "id": "msg_done",
                         "content": [{"type": "output_text", "text": "Finished.", "annotations": []}],
@@ -144,6 +150,11 @@ def run_task(
             time.sleep(0.05)
         session = service.get_session(task.id)
         assert session.status == SessionStatus.completed, session.last_error
+        if any("fs sandbox helper failed" in output for output in model.tool_outputs):
+            # On Linux, Codex verifies a patch inside its bubblewrap sandbox
+            # before asking. Without unprivileged user namespaces (GitHub's
+            # Ubuntu runners, Docker) that fails, so no request is ever made.
+            pytest.skip("Codex's Linux sandbox cannot start here, so the request never reaches approval")
         return service, task.id, Path(session.workspace_path), cards
     finally:
         service.close_all()
