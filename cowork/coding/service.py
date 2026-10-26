@@ -501,6 +501,9 @@ class CodingService(
                 if self.runtimes.terminal_is_running(session_id):
                     raise RuntimeError("Stop the task terminal before changing task controls")
                 values = updates.model_dump(exclude_none=True)
+                # None is a real effort (the model's own default), so an explicit null clears it.
+                if "reasoning_effort" in updates.model_fields_set and updates.reasoning_effort is None:
+                    values["reasoning_effort"] = None
                 if "additional_dirs" in values:
                     values["additional_dirs"] = validate_directories(values["additional_dirs"])
                 next_permission = values.get("permission_mode", session.permission_mode)
