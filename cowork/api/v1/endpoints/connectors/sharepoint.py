@@ -1,10 +1,11 @@
-"""SharePoint connections saved with an Entra app key.
+"""SharePoint connections saved with an Entra app key, and browsing them.
 
 A connection is created or edited here, never through the generic
 submission: the key is checked against Microsoft (``SharePointClient.check``)
 before anything is stored. Create and edit are separate routes so a create
-can never replace an existing connection. Refused in org mode: the hosted
-app keeps connections in auth, not in this vault.
+can never replace an existing connection. Browse reads only the sites the
+connection names. Refused in org mode: the hosted app keeps connections in
+auth, not in this vault.
 """
 from __future__ import annotations
 
@@ -19,10 +20,18 @@ from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
+from cowork.schemas.sharepoint import (
+    SharePointChildrenResponse,
+    SharePointItem,
+    SharePointLibrariesResponse,
+    SharePointLibrary,
+)
 from cowork.services.connectors.sharepoint import (
     AppKey,
     SharePointClient,
     SharePointError,
+    SharePointErrorKind,
+    normalise_site_url,
     parse_site_urls,
     validate_tenant_id,
 )
@@ -37,6 +46,18 @@ _EDIT_FIELDS = frozenset({"user_label", *_KEY_FIELDS})
 # Alphanumeric at both ends, so anton's vault file-name sanitizing leaves it
 # unchanged and two names can't land on one record.
 _NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9_-]{0,62}[A-Za-z0-9])?")
+_MAX_CURSOR = 4096
+_KEY_NO_LONGER_WORKS = "This connection's key no longer works. Ask whoever set it up to update it."
+_BROWSE_STATUS = {
+    SharePointErrorKind.INVALID: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.TENANT_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.APP_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.KEY_REJECTED: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.SITE_NOT_GRANTED: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.ITEM_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.THROTTLED: status.HTTP_429_TOO_MANY_REQUESTS,
+    SharePointErrorKind.UNREACHABLE: status.HTTP_502_BAD_GATEWAY,
+}
 
 
 def _unprocessable(detail: str) -> HTTPException:
@@ -154,3 +175,94 @@ def edit_connection(name: str, body: Annotated[Any, Body()], scope: ScopeDep) ->
         scope=scope,
     )
     return _saved(vault, name)
+
+
+def _browse_error(exc: SharePointError) -> HTTPException:
+    """The browse response for a SharePoint failure; a stored key that stopped working is one message."""
+    detail = str(exc)
+    if exc.kind in {
+        SharePointErrorKind.TENANT_NOT_FOUND,
+        SharePointErrorKind.APP_NOT_FOUND,
+        SharePointErrorKind.KEY_REJECTED,
+    }:
+        detail = _KEY_NO_LONGER_WORKS
+    return HTTPException(status_code=_BROWSE_STATUS[exc.kind], detail=detail)
+
+
+def _stored_connection(scope: TenantScope, name: str) -> tuple[AppKey, list[str]]:
+    """The saved connection's key and sites, validated again on every load.
+
+    A record can be written without the check (an agent turn, an agent-built
+    form), so nothing stored reaches a URL until it passes the same rules a
+    create applies.
+    """
+    record = vault_for_scope(scope).read_record(ENGINE, name) if _NAME.fullmatch(name) else None
+    if record is None or record.get("name") != name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
+    fields = record.get("fields") or {}
+    client_id = str(fields.get("client_id") or "").strip()
+    client_secret = str(fields.get("client_secret") or "")
+    try:
+        tenant_id = validate_tenant_id(str(fields.get("tenant_id") or ""))
+        sites = parse_site_urls(str(fields.get("site_urls") or ""))
+        if not client_id or not client_secret:
+            raise SharePointError(SharePointErrorKind.INVALID, "The stored key is incomplete.")
+    except SharePointError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="This connection needs to be saved again."
+        ) from exc
+    return AppKey(tenant_id, client_id, client_secret), sites
+
+
+def _granted_site(site: str, sites: list[str]) -> str:
+    """``site`` normalised, if the connection names it; 403 otherwise."""
+    try:
+        canonical = normalise_site_url(site)
+    except SharePointError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if canonical not in sites:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This connection doesn't include that site.")
+    return canonical
+
+
+@router.get("/connections/{name}/drives", response_model=SharePointLibrariesResponse)
+def list_libraries(name: str, site: str, scope: ScopeDep) -> SharePointLibrariesResponse:
+    """List the document libraries of one site the connection names."""
+    key, sites = _stored_connection(scope, name)
+    url = _granted_site(site, sites)
+    try:
+        with SharePointClient(key) as client:
+            libraries = client.list_drives(client.resolve_site(url))
+    except SharePointError as exc:
+        raise _browse_error(exc) from exc
+    return SharePointLibrariesResponse(
+        libraries=[SharePointLibrary(id=library.id, name=library.name) for library in libraries]
+    )
+
+
+@router.get("/connections/{name}/children", response_model=SharePointChildrenResponse)
+def list_children(
+    name: str,
+    site: str,
+    drive_id: str,
+    scope: ScopeDep,
+    item_id: str = "root",
+    cursor: str | None = None,
+) -> SharePointChildrenResponse:
+    """List one page of a folder in one of the connection's sites; ``cursor`` pages on."""
+    if cursor is not None and len(cursor) > _MAX_CURSOR:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That page cursor isn't valid.")
+    key, sites = _stored_connection(scope, name)
+    url = _granted_site(site, sites)
+    try:
+        with SharePointClient(key) as client:
+            page = client.list_children(client.resolve_site(url), drive_id, item_id, cursor)
+    except SharePointError as exc:
+        raise _browse_error(exc) from exc
+    return SharePointChildrenResponse(
+        items=[
+            SharePointItem(id=item.id, name=item.name, size=item.size, kind=item.kind, modified=item.modified)
+            for item in page.items
+        ],
+        cursor=page.cursor,
+    )
