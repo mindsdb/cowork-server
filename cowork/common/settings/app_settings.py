@@ -1029,13 +1029,18 @@ class AppSettings(Settings):
             return v.strip().lower() in {"1", "true", "yes", "on"}
         return v
 
-    # For an eval run far from the gateway, where the gate's 2 s decision budget
+    # For an eval run far from the gateway, where the gate's own decision budget
     # measures the network rather than the gate. Unset keeps the gate's own budget.
     gate_first_event_seconds: float | None = Field(
         default=None,
         gt=0,
+        allow_inf_nan=False,
         validation_alias=AliasChoices("COWORK_GATE_FIRST_EVENT_SECONDS"),
-        description="Seconds the route gate waits for its decision before delegating.",
+        description=(
+            "Seconds the route gate waits for its decision before delegating. "
+            "Replaces the gate's own budget, so a smaller value lowers it; a "
+            "larger one also extends the gate's total budget by the difference."
+        ),
     )
 
     master_key: str = Field(

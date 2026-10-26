@@ -257,7 +257,6 @@ async def test_slow_gate_times_out_and_fails_open(monkeypatch):
 @pytest.mark.asyncio
 async def test_configured_decision_budget_replaces_the_default(monkeypatch):
     import cowork.handlers.response_routing as routing
-    from cowork.common.settings.app_settings import AppSettings
 
     provider = _StreamProvider([_text("Hello!"), _complete()], first_delay=0.2)
     monkeypatch.setattr(
@@ -267,8 +266,9 @@ async def test_configured_decision_budget_replaces_the_default(monkeypatch):
     )
     monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
     monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.02)
-    monkeypatch.setenv("COWORK_GATE_FIRST_EVENT_SECONDS", "1.0")
-    monkeypatch.setattr(routing, "get_app_settings", AppSettings)
+    monkeypatch.setattr(
+        routing, "get_app_settings", lambda: SimpleNamespace(usage_log=False, gate_first_event_seconds=1.0),
+    )
 
     decision = await decide_route(
         history=[{"role": "user", "content": "Hello"}],
@@ -279,6 +279,45 @@ async def test_configured_decision_budget_replaces_the_default(monkeypatch):
 
     assert decision.route == DIRECT_CONTEXT
     assert decision.text == "Hello!"
+
+
+@pytest.mark.asyncio
+async def test_a_decision_budget_past_the_total_raises_the_total(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    provider = _StreamProvider([_text("Hello!"), _complete()], first_delay=0.2)
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
+    )
+    monkeypatch.setattr(routing, "build_llm_client", lambda **kwargs: SimpleNamespace(router_provider=provider))
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 0.02)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 0.05)
+    monkeypatch.setattr(
+        routing, "get_app_settings", lambda: SimpleNamespace(usage_log=False, gate_first_event_seconds=1.0),
+    )
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "Hello"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert decision.route == DIRECT_CONTEXT
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan", "abc"])
+def test_an_invalid_decision_budget_fails_at_startup(monkeypatch, value):
+    from pydantic import ValidationError
+
+    from cowork.common.settings.app_settings import AppSettings
+
+    monkeypatch.setenv("COWORK_GATE_FIRST_EVENT_SECONDS", value)
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
 
 
 def test_sse_frames_use_real_newlines():
@@ -2165,7 +2204,9 @@ async def test_gate_total_budget_survives_events_that_decide_nothing(monkeypatch
 def _usage_log(monkeypatch, enabled):
     import cowork.handlers.response_routing as routing
 
-    monkeypatch.setattr(routing, "get_app_settings", lambda: SimpleNamespace(usage_log=enabled, gate_first_event_seconds=None))
+    monkeypatch.setattr(
+        routing, "get_app_settings", lambda: SimpleNamespace(usage_log=enabled, gate_first_event_seconds=None),
+    )
 
 
 async def _drained():
