@@ -156,6 +156,36 @@ def _files(folder: Path) -> set[str]:
 # ── sharing ──────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        ("bob+tag@example.com", True),
+        ("name!@example.com", True),
+        ("name@example..com", True),
+        ("name@.example.com", True),
+        ("name@example.com.", True),
+        ("a@...", True),
+        ("a" * 250 + "@b.c", True),
+        ("", False),
+        ("@a.b", False),
+        ("a@b", False),
+        ("a@.b", False),
+        ("a@b.", False),
+        ("a@b.c@d", False),
+        ("a b@c.d", False),
+        ("a@b.\u00a0c", False),
+        ("a@b.c\n", False),
+        ("!" * 254, False),
+        ("a@" + "." * 250 + "@", False),
+        ("a" * 251 + "@b.c", False),
+    ],
+)
+def test_email_validation_preserves_address_rules(value, valid):
+    from cowork.services.live_apps import is_email
+
+    assert is_email(value) is valid
+
+
 def test_a_share_with_one_address_and_again_is_the_same_share(people):
     client = _client()
 

@@ -159,6 +159,13 @@ class SharedProjectFiles:
         parts = _file_parts(path)
         with ExitStack() as stack:
             directory = stack.enter_context(self.directory(project_id))
+            root = os.path.abspath(directory.path)
+            target = os.path.abspath(os.path.join(root, *parts))
+            if not target.startswith(root + os.sep):
+                raise FileNotFoundError("File not found")
+            # Use only the checked relative components. The pinned descriptors
+            # and O_NOFOLLOW still enforce the filesystem's symlink boundary.
+            parts = tuple(os.path.relpath(target, root).split(os.sep))
             for name in parts[:-1]:
                 directory = open_pinned_child(directory, name)
                 stack.callback(directory.close)
