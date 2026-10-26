@@ -723,15 +723,19 @@ def _learned(client: TestClient, headers: dict) -> set[str]:
 
 def test_a_persons_own_memory_offers_delete_and_no_edit(stores):
     """Every slot of a person's own memory reports Delete and no Edit, global
-    and project tiers alike. The operator view keeps both."""
+    and project tiers alike, a learned project lesson as well as an empty slot.
+    The operator view keeps both."""
     client = _client()
     pid = _project(client, A)
     _learn(SUB_A, {"scope": "global", "category": "rules", "content": "- Answer in pallets"})
+    _learn(SUB_A, {"scope": "project", "category": "lessons", "content": "- Ships on Fridays", "project_id": pid})
 
     mine = client.get("/api/v1/memory/", headers=A).json()
     operator = client.get("/api/v1/memory/", headers=BEARER).json()
 
     assert {entry["project_id"] for entry in mine} == {None, pid}
+    assert {(entry["project_id"], entry["category"]) for entry in mine if entry["content"].strip()} == {
+        (None, "rules"), (pid, "lessons")}
     assert all(entry["capabilities"] == {"canEdit": False, "canDelete": True} for entry in mine)
     assert all(entry["capabilities"]["canEdit"] for entry in operator if entry["scope"] == "global")
     assert client.get("/api/v1/memory/capabilities", headers=A).json() == {"canReset": True}
