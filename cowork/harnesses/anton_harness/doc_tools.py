@@ -24,6 +24,7 @@ from anton.core.tools.tool_defs import ToolDef
 from anton.core.tools.tool_handlers import _track_artifact
 
 from cowork.common.settings.user_settings import current_settings_scope
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.docs import render
 from cowork.docs.model import TEXT_TYPES, Doc, DocError, block_text_for_search
 from cowork.docs.prompt import (
@@ -40,6 +41,7 @@ from cowork.docs.prompt import (
 from cowork.docs.images import localize_images, within, write_images
 from cowork.docs.service import announce, apply, create_doc
 from cowork.docs.store import find_doc_folder, list_doc_folders, load_doc
+from cowork.docs.sync import after_write
 from cowork.services.artifacts import card_for_folder
 
 logger = logging.getLogger(__name__)
@@ -344,7 +346,8 @@ def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
             yield _refusal(err, await asyncio.to_thread(load_doc, folder) if err.code == "stale" else None)
             return
         _track(session, artifacts_dir, folder.name, "Edited doc")
-        announce(doc["id"], doc, result, by="agent", conversation_id=ctx.conversation_id)
+        after_write(folder, doc, result, by="agent", scope=current_settings_scope() or LOCAL_SCOPE,
+                    conversation_id=ctx.conversation_id)
         yield _outcome(_edit_report(before, doc, result, ops))
 
     async def handle_list(session: Any, tc_input: dict) -> Any:

@@ -40,8 +40,9 @@ from cowork.docs.hub import conv_topic, doc_topic, hub
 from cowork.docs.images import MAX_IMAGE_BYTES, store_image
 from cowork.docs.model import DocError
 from cowork.docs.ops import MAX_OPS
-from cowork.docs.service import announce, apply, create_doc
+from cowork.docs.service import apply, create_doc
 from cowork.docs.store import doc_file, is_doc_folder, load_doc
+from cowork.docs.sync import after_write
 from cowork.models.conversation import Conversation
 from cowork.services.artifact_ownership import record_artifact_owner
 from cowork.services.artifact_permissions import artifact_capabilities, current_capabilities, require_artifact_owner
@@ -217,7 +218,7 @@ async def edit_doc(project_ref: str, artifact_id: ArtifactIdDep, body: _OpsBody,
         )
     except DocError as err:
         raise _doc_error(err) from err
-    announce(artifact_id, doc, result, by="user", client_id=body.clientId)
+    after_write(folder, doc, result, by="user", scope=session.scope, client_id=body.clientId)
     return {"doc": doc, **result}
 
 
