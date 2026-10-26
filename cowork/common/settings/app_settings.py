@@ -1043,6 +1043,14 @@ class AppSettings(Settings):
         ),
     )
 
+    @field_validator("gate_first_event_seconds", mode="before")
+    @classmethod
+    def _blank_gate_budget_is_unset(cls, v: object) -> object:
+        # A template that renders an empty value means "not set", not a bad number.
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
     master_key: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_MASTER_KEY"),

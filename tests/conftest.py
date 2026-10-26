@@ -12,6 +12,7 @@ import pkgutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
@@ -118,8 +119,6 @@ def gate_own_budgets():
     sets it up before module fixtures, so its undo would run after their
     teardown, which then sees the test's patches still in place.
     """
-    from types import SimpleNamespace
-
     from cowork.handlers import response_routing
 
     original = response_routing.get_app_settings

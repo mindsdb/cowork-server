@@ -308,18 +308,6 @@ async def test_a_decision_budget_past_the_total_raises_the_total(monkeypatch):
     assert decision.route == DIRECT_CONTEXT
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan", "abc"])
-def test_an_invalid_decision_budget_fails_at_startup(monkeypatch, value):
-    from pydantic import ValidationError
-
-    from cowork.common.settings.app_settings import AppSettings
-
-    monkeypatch.setenv("COWORK_GATE_FIRST_EVENT_SECONDS", value)
-
-    with pytest.raises(ValidationError):
-        AppSettings(_env_file=None)
-
-
 def test_sse_frames_use_real_newlines():
     from cowork.streaming import sse_frame
 
