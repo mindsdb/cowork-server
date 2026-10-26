@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -101,6 +102,7 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
             return [SimpleNamespace(id=server_id)]
 
     monkeypatch.setattr("cowork.services.projects.ProjectService", Projects)
+    monkeypatch.setattr(artifact_scope, "_refuse_a_persons_project_in_the_operator_view", lambda *_args: None)
     monkeypatch.setattr(
         artifact_scope,
         "artifacts_sources_for_project",
@@ -110,6 +112,25 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
     assert artifact_scope._sources_for_project_ref(object(), request_ref) == []
     assert seen == [server_id]
     assert seen[0] is server_id
+
+
+def test_the_desktop_reads_no_row_for_the_operator_view_check(monkeypatch):
+    """The desktop has no operator view and no person's project, so the
+    operator-view check returns before it reads the project row."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    get_app_settings.cache_clear()
+
+    class Projects:
+        session = SimpleNamespace(scope=LOCAL_SCOPE)
+
+        def get_project(self, _project_id):
+            raise AssertionError("the desktop must not read the project row")
+
+    try:
+        artifact_scope._refuse_a_persons_project_in_the_operator_view(Projects(), UUID(int=1))
+    finally:
+        get_app_settings.cache_clear()
 
 
 # ── ?download=1 is read at the route boundary (ENG-2044) ─────────────────────
@@ -534,10 +555,11 @@ def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
     values, which a selector that skipped the scan would not have.
     """
     from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services import artifact_files
 
     from_disk = []
     opened_names = []
-    original_entry_name = workspace_ep._existing_draft_entry_name
+    original_entry_name = artifact_files.existing_draft_entry_name
     original_open_child = workspace_ep.open_pinned_child
     original_dir_lstat = workspace_ep.dir_lstat
 
@@ -554,7 +576,7 @@ def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
         opened_names.append(name)
         return original_dir_lstat(directory, name)
 
-    monkeypatch.setattr(workspace_ep, "_existing_draft_entry_name", entry_name)
+    monkeypatch.setattr(artifact_files, "existing_draft_entry_name", entry_name)
     monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
     monkeypatch.setattr(workspace_ep, "dir_lstat", lstat)
 

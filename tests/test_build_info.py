@@ -346,8 +346,8 @@ class TestTheWebSurfaceIsNotReachableYet:
 
 
 class TestSupportedKwargs:
-    """This server pins anton to a rev, so a config field it knows about can be
-    missing from the installed copy. Passing it anyway raises on every turn."""
+    """The installed anton can predate a config field this server knows about.
+    Passing it anyway raises on every turn."""
 
     def test_a_declared_field_is_passed_through(self):
         from dataclasses import dataclass
@@ -397,7 +397,7 @@ class TestOverlayFallbackAtAnOldPin:
 
         # Compiled names rather than source text: a commented-out call still
         # reads as present in the source, and renames are not the risk here.
-        names = AntonHarness._build_chat_session.__code__.co_names
+        names = AntonHarness._build_turn_session.__code__.co_names
         assert "_apply_overlay_fallback" in names
 
     def test_the_fallback_applies_only_when_the_kwarg_was_dropped(self):

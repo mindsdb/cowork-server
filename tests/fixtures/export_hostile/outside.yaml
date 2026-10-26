@@ -1,0 +1,125 @@
+# References aimed at the network: the cloud metadata address and the
+# 127.0.0.1 recording server, through the elements and attributes that load.
+# Fields and placeholders: see tests/test_export_hostile.py.
+
+- id: metadata-address
+  html: |
+    <p>metadata <img src="http://169.254.169.254/latest/meta-data/" alt="meta"></p>
+    <div style="background: url(http://169.254.169.254/latest/meta-data/iam/)">box</div>
+  markdown: |
+    metadata ![meta](http://169.254.169.254/latest/meta-data/)
+
+    <div style="background: url(http://169.254.169.254/latest/meta-data/iam/)">box</div>
+  text: metadata
+  omitted:
+    - [scheme, "http://169.254.169.254/latest/meta-data/"]
+    - [scheme, "http://169.254.169.254/latest/meta-data/iam/"]
+
+- id: outside-url
+  html: |
+    <p>outside <img src="{server_url}/pixel.png" alt="pixel"></p>
+    <p><img src=" {server_url}/spaced.png " alt="spaced"></p>
+    <p><img src="{server_url}/reference.png" alt="reference"></p>
+  markdown: |
+    outside ![pixel]({server_url}/pixel.png)
+
+    <p><img src=" {server_url}/spaced.png " alt="spaced"></p>
+
+    ![reference][remote]
+
+    [remote]: {server_url}/reference.png
+  text: outside
+  omitted:
+    - [scheme, "{server_url}/pixel.png"]
+    - [scheme, "{server_url}/spaced.png"]
+    - [scheme, "{server_url}/reference.png"]
+
+- id: object-embed-iframe
+  html: |
+    <p>framed</p>
+    <object data="{server_url}/object.html" type="text/html"><param name="movie" value="{server_url}/movie.swf"></object>
+    <object data="{sentinel_file_url}"></object>
+    <embed src="{server_url}/embed.swf">
+    <embed src="../other/secret.png">
+    <iframe src="{server_url}/frame.html"></iframe>
+    <iframe src="../other/secret.txt"></iframe>
+    <iframe srcdoc="&lt;img src=&quot;{server_url}/srcdoc.png&quot;&gt;"></iframe>
+    <applet code="Leak.class" codebase="{server_url}/applet/"></applet>
+  markdown: |
+    framed
+
+    <div>
+    <object data="{server_url}/object.html" type="text/html"><param name="movie" value="{server_url}/movie.swf"></object>
+    <object data="{sentinel_file_url}"></object>
+    <embed src="{server_url}/embed.swf">
+    <embed src="../other/secret.png">
+    <iframe src="{server_url}/frame.html"></iframe>
+    <iframe src="../other/secret.txt"></iframe>
+    <iframe srcdoc="&lt;img src=&quot;{server_url}/srcdoc.png&quot;&gt;"></iframe>
+    <applet code="Leak.class" codebase="{server_url}/applet/"></applet>
+    </div>
+  text: framed
+  omitted:
+    - [scheme, "{server_url}/object.html"]
+    - [scheme, "{sentinel_file_url}"]
+    - [scheme, "{server_url}/embed.swf"]
+    - [traversal, ../other/secret.png]
+    - [scheme, "{server_url}/frame.html"]
+    - [traversal, ../other/secret.txt]
+    - [scheme, "{server_url}/applet/"]
+
+- id: link-stylesheet
+  html: |
+    <link rel="stylesheet" href="{server_url}/site.css">
+    <link rel="stylesheet" href="../other/secret.css">
+    <link rel="preload" as="image" href="{server_url}/preload.png">
+    <link rel="icon" href="{sentinel_file_url}">
+    <p>linked</p>
+  markdown: |
+    <link rel="stylesheet" href="{server_url}/site.css">
+    <link rel="stylesheet" href="../other/secret.css">
+    <link rel="preload" as="image" href="{server_url}/preload.png">
+    <link rel="icon" href="{sentinel_file_url}">
+
+    linked
+  text: linked
+  omitted:
+    - [scheme, "{server_url}/site.css"]
+    - [traversal, ../other/secret.css]
+    - [scheme, "{server_url}/preload.png"]
+    - [scheme, "{sentinel_file_url}"]
+
+# A refresh only navigates, so it is dropped with no omitted entry.
+- id: meta-refresh
+  html: |
+    <meta http-equiv="refresh" content="0; url={server_url}/refresh">
+    <meta http-equiv="refresh" content="0; url={sentinel_file_url}">
+    <p>refreshed</p>
+  markdown: |
+    <meta http-equiv="refresh" content="0; url={server_url}/refresh">
+    <meta http-equiv="refresh" content="0; url={sentinel_file_url}">
+
+    refreshed
+  text: refreshed
+  omitted: []
+
+# A base element is dropped, so a relative reference still resolves against
+# the artifact folder: chart.png inlines, and secret.png is missing there
+# instead of resolving into the other partition.
+- id: base-href
+  html: |
+    <base href="{server_url}/">
+    <base href="../other/">
+    <p>based <img src="chart.png" alt="chart"></p>
+    <p><img src="secret.png" alt="moved"></p>
+  markdown: |
+    <base href="{server_url}/">
+    <base href="../other/">
+
+    based ![chart](chart.png)
+
+    ![moved](secret.png)
+  text: based
+  kept_image: true
+  omitted:
+    - [missing, secret.png]

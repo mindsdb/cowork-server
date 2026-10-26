@@ -141,9 +141,11 @@ class _FakeSettings:
         ("https://api.mindshub.ai/v1", "https://api.mindshub.ai/v1", "mdb_oaikey"),
         # Hyphenated dev/staging subdomain — must still be recognised as MindsHub.
         ("https://api.staging.mindshub.ai/v1", "https://api.staging.mindshub.ai/v1", "mdb_oaikey"),
+        # Saved without /v1 — still routed under it.
+        ("https://api.staging.mindshub.ai/", "https://api.staging.mindshub.ai/v1", "mdb_oaikey"),
         # Non-MindsHub / unset custom endpoint → fall back to prod minds_url.
-        ("https://api.openai.com/v1", "https://api.mindshub.ai", "mdb_prodkey"),
-        ("", "https://api.mindshub.ai", "mdb_prodkey"),
+        ("https://api.openai.com/v1", "https://api.mindshub.ai/v1", "mdb_prodkey"),
+        ("", "https://api.mindshub.ai/v1", "mdb_prodkey"),
     ],
 )
 def test_resolve_inference_endpoint_host_matching(
@@ -153,6 +155,44 @@ def test_resolve_inference_endpoint_host_matching(
     base, key = _resolve_inference_endpoint(_FakeSettings(openai_base_url))
     assert base == expected_base
     assert key == expected_key
+
+
+@pytest.mark.parametrize(
+    "minds_url,expected_base",
+    [
+        # MindsHub sign-in stores the bare host; the ingress serves only /v1.
+        ("https://api.mindshub.ai", "https://api.mindshub.ai/v1"),
+        ("https://api.mindshub.ai/", "https://api.mindshub.ai/v1"),
+        # The settings default already carries /v1 — never doubled.
+        ("https://api.mindshub.ai/v1", "https://api.mindshub.ai/v1"),
+        ("https://api.mindshub.ai/v1/", "https://api.mindshub.ai/v1"),
+        # No chat-only mdb.ai -> /api/v1 rule: comments live under /v1 only.
+        ("https://mdb.ai", "https://mdb.ai/v1"),
+        # Unset stays unset, so the proxy answers 503 instead of calling "/v1".
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_resolve_inference_endpoint_normalizes_minds_url(minds_url, expected_base):
+    base, _key = _resolve_inference_endpoint(_FakeSettings("", minds_url=minds_url))
+    assert base == expected_base
+
+
+def test_route_forwards_bare_minds_url_under_v1(monkeypatch):
+    # The real resolver end to end: stored settings -> route -> upstream URL.
+    monkeypatch.setattr(cp, "resolve_inference_endpoint", _resolve_inference_endpoint)
+    monkeypatch.setattr(
+        cp, "get_user_settings", lambda: _FakeSettings("", minds_url="https://api.mindshub.ai")
+    )
+    resp = httpx.Response(200, json={"threads": []}, headers={"content-type": "application/json"})
+    fake = _FakeClient(response=resp)
+    monkeypatch.setattr(cp, "get_proxy_client", lambda: fake)
+
+    r = client.get("/api/v1/artifact-comments/alice/rep123/threads?status=all")
+    assert r.status_code == 200
+    call = fake.calls["rest"]
+    assert call["url"] == "https://api.mindshub.ai/v1/artifact-comments/alice/rep123/threads?status=all"
+    assert call["headers"]["Authorization"] == "Bearer mdb_prodkey"
 
 
 # --- path-segment normalization (traversal guard) -------------------------

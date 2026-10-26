@@ -7,6 +7,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session
 
+from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.coding.connector_capabilities import ConnectorInvocationRequest
 from cowork.coding.control_models import RUNTIME_PROTOCOL_VERSION, RuntimeEvent
@@ -42,7 +43,7 @@ from cowork.services.settings import SettingService
 # `register_runtime`, whose credential is the registration token in its body.
 # Declared on the router because it refuses: a route added here inherits the
 # desktop-only refusal rather than a marker saying it is open.
-router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
+router = APIRouter(dependencies=[Depends(require(DesktopOnly)), Depends(refuse_code_mode_in_sandbox)])
 
 
 def _control():

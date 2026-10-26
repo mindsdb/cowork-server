@@ -30,6 +30,14 @@ networkPolicy:
   enabled: true
 
 deployment:
+  # Same autoscaling as staging. values-staging.yaml explains the 70% target and
+  # why the ceiling stays at 4.
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
   ingress:
     enabled: true
     name: cowork-server
@@ -51,6 +59,9 @@ deployment:
 
     - name: ENV
       value: "prod"
+
+    - name: ACCESS_LOG_MODE
+      value: "all"
 
     - name: LOG_LEVEL
       value: "WARNING"
