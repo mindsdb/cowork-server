@@ -302,6 +302,41 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
     assert identities.existing_authorization_key(local_id, scope) == canonical
 
 
+@pytest.mark.asyncio
+async def test_draft_comments_are_off_without_an_authorization_service(
+    local_id, owned_artifact, monkeypatch
+):
+    """No auth service is a setting, not an outage: the owner hears that draft
+    comments are off, in an answer that is no 5xx, since the request log
+    records every 5xx as an error."""
+    session, project, _conversation, folder = owned_artifact
+    unconfigured = TurnQueueSettings(auth_internal_base_url="", auth_internal_secret="")
+    monkeypatch.setattr(identities, "TurnQueueSettings", lambda: unconfigured)
+    monkeypatch.setattr(artifact_access, "TurnQueueSettings", lambda: unconfigured)
+
+    answer = await artifact_workspace.enable_artifact_comments(
+        str(project.id), local_id, session
+    )
+
+    assert answer["enabled"] is False
+    assert answer["capabilities"]["role"] == "owner"
+    assert not (folder / ".revisions" / "draft-review.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_an_authorization_outage_still_answers_503(issuer, local_id, owned_artifact):
+    """An auth service that is set up but failing stays a 503, so the outage
+    still shows as one."""
+    session, project, _conversation, folder = owned_artifact
+    issuer.failure = True
+
+    with pytest.raises(HTTPException) as err:
+        await artifact_workspace.enable_artifact_comments(str(project.id), local_id, session)
+
+    assert err.value.status_code == 503
+    assert not (folder / ".revisions" / "draft-review.json").exists()
+
+
 def test_publish_refuses_another_conversation_owner_before_allocating(
     issuer, scope, local_id, owned_artifact
 ):

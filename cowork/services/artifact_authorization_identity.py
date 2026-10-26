@@ -17,7 +17,10 @@ from cowork.common.settings.app_settings import TurnQueueSettings, get_app_setti
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.artifact_identity import ArtifactIdentity
-from cowork.services.artifact_access import ArtifactAccessUnavailable
+from cowork.services.artifact_access import (
+    ArtifactAccessUnavailable,
+    ArtifactAuthorizationNotConfigured,
+)
 from cowork.services.artifact_identity import artifact_key
 
 
@@ -66,7 +69,7 @@ def existing_authorization_key(
 def _allocate_or_adopt(local_id, owner_user_id, scope, request_id):
     settings = TurnQueueSettings()
     if not settings.auth_internal_base_url or not settings.auth_internal_secret:
-        raise ArtifactAccessUnavailable("Artifact authorization is not configured")
+        raise ArtifactAuthorizationNotConfigured("Artifact authorization is not configured")
     identity = {
         "owner_keycloak_id": str(owner_user_id),
         "organization_id": str(scope.org_id),

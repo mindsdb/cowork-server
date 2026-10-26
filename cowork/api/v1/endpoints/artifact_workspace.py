@@ -893,15 +893,24 @@ async def enable_artifact_comments(
     artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
 ):
-    """Provision same-org draft review without broadening source-edit access.
+    """Turn on draft comments for the artifact's owner.
 
-    Owner-only: this mints an auth rule and reopens a private conversation
-    workspace to the organization, which is the owner's call to make. A
-    reviewer's client calls the `review` GET above instead.
+    Owner-only. In org mode this provisions same-org draft review without
+    broadening source-edit access: it mints an auth rule and reopens a private
+    conversation workspace to the organization, which is the owner's call to
+    make. A reviewer's client calls the `review` GET above instead. An org
+    deployment with no authorization service answers `enabled: false`, since
+    draft review can't run there; that is the answer, not a failure.
+
+    Local tenancy provisions nothing. Its comment routes keep the threads in the
+    artifact's own folder (`LocalArtifactComments`), which finds the artifact
+    only among the caller's artifacts roots, so the owner is the one person who
+    reaches them.
     """
     await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.artifact_access import (
         ArtifactAccessUnavailable,
+        ArtifactAuthorizationNotConfigured,
         provision_draft_review_access,
     )
     from cowork.services.artifact_draft_review import enable_draft_review
@@ -910,35 +919,42 @@ async def enable_artifact_comments(
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
     capabilities = await _current_capabilities(session, capabilities)
-    # `_owner_workspace` already refused anyone but the owner, so the owner is
-    # the caller; resolving it again would only repeat that query.
-    owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
-    try:
-        canonical_key = await run_in_threadpool(
-            ensure_authorization_key,
-            artifact_id,
-            session.scope,
-            owner_user_id=owner_user_id,
+    if session.scope.org_mode:
+        # `_owner_workspace` already refused anyone but the owner, so the owner is
+        # the caller; resolving it again would only repeat that query.
+        owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
+        try:
+            canonical_key = await run_in_threadpool(
+                ensure_authorization_key,
+                artifact_id,
+                session.scope,
+                owner_user_id=owner_user_id,
+            )
+            await provision_draft_review_access(
+                canonical_key.split("/", 1)[1],
+                session.scope,
+                owner_user_id=owner_user_id,
+            )
+        except ArtifactAuthorizationNotConfigured:
+            # Not a 5xx: every 5xx is logged as an error, and nothing failed.
+            return {"enabled": False, "capabilities": capabilities}
+        except ArtifactAccessUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        # After the auth rule, never before: the marker is what reopens the folder
+        # to co-members on this server, and a rule-less grant would show a draft the
+        # comments service then refuses to talk about.
+        await run_in_threadpool(
+            enable_draft_review,
+            folder,
+            org_id=str(session.scope.org_id),
+            enabled_by=str(session.scope.user_id),
         )
-        await provision_draft_review_access(
-            canonical_key.split("/", 1)[1],
-            session.scope,
-            owner_user_id=owner_user_id,
-        )
-    except ArtifactAccessUnavailable as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
-    # After the auth rule, never before: the marker is what reopens the folder
-    # to co-members on this server, and a rule-less grant would show a draft the
-    # comments service then refuses to talk about.
-    await run_in_threadpool(
-        enable_draft_review,
-        folder,
-        org_id=str(session.scope.org_id),
-        enabled_by=str(session.scope.user_id),
-    )
+        comments_scope = "organization"
+    else:
+        comments_scope = "owner"
     current_revision = None
     try:
         draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
@@ -951,7 +967,7 @@ async def enable_artifact_comments(
         # Workspace routes/cards keep the local id. The authenticated comments
         # proxy translates it through the same durable alias used to publish.
         "artifactKey": artifact_key(artifact_id),
-        "scope": "organization",
+        "scope": comments_scope,
         "capabilities": capabilities,
         "currentRevision": current_revision,
     }
