@@ -1,10 +1,10 @@
 import time
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 import uuid
 from enum import Enum
 from uuid import UUID
 
-from pydantic import BaseModel, Field, StrictBool, model_serializer, model_validator
+from pydantic import BaseModel, Field, StrictBool, StringConstraints, model_serializer, model_validator
 
 from cowork.schemas.connectors import DisabledConnection
 from cowork.schemas.figure_sources import FigureSources
@@ -143,6 +143,26 @@ class StreamingResponse(BaseModel):
     response: Response | ResponseDelta
 
 
+class DocViewSelection(BaseModel):
+    blockIds: list[Annotated[str, StringConstraints(max_length=40)]] = Field(default_factory=list, max_length=200)
+    quote: str | None = Field(default=None, max_length=4000)
+
+
+class DocViewContext(BaseModel):
+    """The doc beside the chat. Data about the view, never instructions."""
+
+    artifactId: str = Field(max_length=64)
+    projectId: str | None = Field(default=None, max_length=64)
+    title: str | None = Field(default=None, max_length=300)
+    tab: str | None = Field(default=None, max_length=64)
+    tabTitle: str | None = Field(default=None, max_length=300)
+    rev: int | None = None
+    mode: Literal["view", "edit"] | None = None
+    selection: DocViewSelection | None = None
+    # Words the person asked the agent to act on from the doc ("Edit with agent").
+    request: str | None = Field(default=None, max_length=4000)
+
+
 class ResponsesRequest(BaseModel):
     input: str | list[Message] | None = Field(
         default=None, description="Input for the responses request, either a string or a list of messages"
@@ -235,6 +255,26 @@ class ResponsesRequest(BaseModel):
     disabled_connections: list[DisabledConnection] | None = Field(
         default=None,
         description="Connections to exclude from this turn (client sends on every request)",
+    )
+    # What the person has open beside the chat when they send: the doc, its tab,
+    # and the blocks or words they selected. Handed to the agent as a
+    # <doc-view-context> block ahead of their message, so "this" and "here"
+    # resolve; never persisted as part of what they typed.
+    doc_context: DocViewContext | None = Field(
+        default=None,
+        description="The doc open beside the chat, and the person's selection in it",
+    )
+    # Off unless the client says so: an app whose renderer predates docs would
+    # get docs from the agent it has no way to show. doc_context and
+    # output="doc" come only from a client that shows them, so they imply it.
+    docs: bool = Field(
+        default=False,
+        description="The client shows docs, so the agent may write them",
+    )
+    # The composer's Output choice: "doc" asks for the answer as a doc.
+    output: Literal["doc"] | None = Field(
+        default=None,
+        description='"doc": answer this message by writing a doc rather than in chat',
     )
     # Generic observability pass-through. Whatever a caller puts here is
     # forwarded verbatim to the harness → LLM router → Langfuse trace, so new

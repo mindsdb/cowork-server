@@ -110,7 +110,7 @@ def test_stream_response_forwards_channel_context(monkeypatch):
 
     async def _fake_build(
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
-        tool_messages=False,
+        tool_messages=False, docs=False,
     ):
         received["channel_context"] = channel_context
         return BuiltChatSession(session=_FakeSession(), turn_scratch_dir=None, seed_info=None, learns=True)

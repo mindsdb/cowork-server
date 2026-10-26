@@ -69,6 +69,7 @@ from cowork.turnqueue.redis_client import (
     cancel_flag_key,
     get_redis,
 )
+from cowork.docs.prompt import CONTEXT_PREFIXES, DOC_OUTPUT_NOTE, doc_context_block
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -133,6 +134,38 @@ from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_res
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _title_text(blocks: list[dict]) -> str:
+    """What the person typed, for a new conversation's title.
+
+    The doc open beside the chat and the Output: Doc choice travel as text
+    blocks ahead of the message; titled from those, the sidebar showed
+    "<doc-view-context>{"artifactId"…" instead of the question.
+    """
+    own = [b for b in blocks if b.get("type") == "text" and not str(b.get("text", "")).startswith(CONTEXT_PREFIXES)]
+    return prompt_text(own) or prompt_text(blocks)
+
+
+def _runs_remotely(request: ResponsesRequest) -> bool:
+    """A streaming turn on the remote backend runs on a worker pod (see _select_producer)."""
+    return bool(request.stream) and TurnQueueSettings().is_remote
+
+
+def _turn_has_doc(request: ResponsesRequest) -> bool:
+    """Sent with a doc open, or asking for the answer as a doc (see ineligible_reason).
+
+    Never a remote turn: the pod has no doc tools, so there the open doc and
+    Output: Doc are dropped and the turn is answered like any other.
+    """
+    if _runs_remotely(request):
+        return False
+    return request.doc_context is not None or request.output == "doc"
+
+
+def _client_shows_docs(request: ResponsesRequest) -> bool:
+    """Whether the turn's agent gets the doc tools (see ResponsesRequest.docs)."""
+    return request.docs or request.doc_context is not None or request.output == "doc"
 
 # Strong references for fire-and-forget probe tasks: asyncio holds only a weak
 # reference to a task once nothing else does, so a bare `create_task` result
@@ -702,6 +735,7 @@ class ResponsesHandler:
                     has_disabled_connections=bool(disabled),
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
+                    has_doc=_turn_has_doc(request),
                 )
             except BaseException:
                 # A refused or cancelled request must not leave the take's model call running.
@@ -790,6 +824,7 @@ class ResponsesHandler:
                         trace_metadata=trace_metadata,
                         turn_llm=turn_llm,
                         first_take=first_take,
+                        docs=_client_shows_docs(request),
                     )
 
                 try:
@@ -852,6 +887,7 @@ class ResponsesHandler:
                     disabled_connections=disabled,
                     trace_tags=request.trace_tags,
                     trace_metadata=trace_metadata,
+                    docs=_client_shows_docs(request),
                 )
                 return await self._collect(stream, start.conversation_id, request.model, original_content)
 
@@ -893,7 +929,7 @@ class ResponsesHandler:
                     # under an id no conversation ever gets (ENG-264).
                     try:
                         conversation = conversation_service.create_conversation(
-                            topic=prompt_text(harness_input)[:80],
+                            topic=_title_text(harness_input)[:80],
                             project_id=self._resolve_project_id(request, session=session),
                             conversation_id=conv_id,
                             harness=harness_name,
@@ -924,7 +960,7 @@ class ResponsesHandler:
                 # row id, so create a fresh conversation and re-link any
                 # attachments uploaded against the client's id (ENG-264).
                 conversation = conversation_service.create_conversation(
-                    topic=prompt_text(harness_input)[:80],
+                    topic=_title_text(harness_input)[:80],
                     project_id=self._resolve_project_id(request, session=session),
                     harness=harness_name,
                     model=request.model,
@@ -933,7 +969,7 @@ class ResponsesHandler:
                 self._relink_attachments(request.conversation, conversation, session=session)
         else:
             conversation = conversation_service.create_conversation(
-                topic=prompt_text(harness_input)[:80],
+                topic=_title_text(harness_input)[:80],
                 project_id=self._resolve_project_id(request, session=session),
                 harness=harness_name,
                 model=request.model,
@@ -954,6 +990,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
+            has_doc=_turn_has_doc(request),
         ) is None:
             gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
 
@@ -995,6 +1032,7 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
+        has_doc: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
@@ -1017,6 +1055,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
+            has_doc=has_doc,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -1430,6 +1469,7 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
         first_take: FirstTake | None = None,
+        docs: bool = False,
     ):
         """Choose the streaming producer coroutine.
 
@@ -1442,6 +1482,8 @@ class ResponsesHandler:
         either producer from persisting into truncated history; it defaults to
         a fresh one so a directly-called producer (tests) still has a flag to
         read.
+
+        `docs` reaches only the in-process turn: a remote pod has no doc tools.
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle(identity=RunIdentity(
             correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
@@ -1475,6 +1517,7 @@ class ResponsesHandler:
             trace_tags=trace_tags,
             trace_metadata=trace_metadata,
             first_take=first_take,
+            docs=docs,
         )
 
     @staticmethod
@@ -2469,6 +2512,7 @@ class ResponsesHandler:
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
         first_take: FirstTake | None = None,
+        docs: bool = False,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -2629,6 +2673,7 @@ class ResponsesHandler:
                 # tool's message to the user, as on the remote path.
                 tool_messages=True,
                 model_wait=model_wait,
+                docs=docs,
             )
             event_count = 0
             completed_frame: str | None = None
@@ -3117,6 +3162,16 @@ class ResponsesHandler:
                     blocks.append(self._image_block(filepath, content_type))
                 else:
                     blocks.append({"type": "file", "path": str(filepath), "filename": filename})
+
+        # The doc open beside the chat goes ahead of what the person typed, as
+        # data the agent reads ("this section" = their selection), not as part
+        # of their message: it is never saved with the user turn. Both blocks
+        # tell the agent to use the doc tools, which only a turn run here has.
+        if _turn_has_doc(request):
+            if request.doc_context is not None:
+                blocks.append({"type": "text", "text": doc_context_block(request.doc_context.model_dump(exclude_none=True))})
+            if request.output == "doc":
+                blocks.append({"type": "text", "text": DOC_OUTPUT_NOTE})
 
         # Extract text input
         if isinstance(request.input, str):
