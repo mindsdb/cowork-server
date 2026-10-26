@@ -39,6 +39,8 @@ from anton.publish_access import access_from_owner_side
 from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
+from cowork.docs.store import DOC_HTML, is_doc_folder
+from cowork.services import share_hooks
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
@@ -574,7 +576,51 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
+def _doc_folder(artifact: Path, artifacts_base: Path) -> Path | None:
+    """The doc folder when what gets published is a doc's page (doc.html), else None."""
+    try:
+        _target, published_dir, published_key, _fullstack = _resolve_publish_target(
+            artifact, container_dirs=[artifacts_base]
+        )
+    except Exception:
+        return None
+    return published_dir if published_key == DOC_HTML and is_doc_folder(published_dir) else None
+
+
 def publish_artifact(
+    artifact: Path,
+    *,
+    artifacts_base: Path,
+    api_key: str,
+    publish_url: str,
+    password: str | None = None,
+    access: dict | None = None,
+    scope: TenantScope | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Share an artifact (see `_publish_bundle`), however the request arrives.
+
+    A doc's page goes out freshly rendered with its owner's editor, and its
+    live copy follows (cowork.services.share_hooks), whether the share button,
+    the agent or anything else shared it.
+    """
+    doc_folder = _doc_folder(artifact, artifacts_base)
+    hooks = share_hooks.registered() if doc_folder is not None else None
+    if hooks is not None:
+        hooks.before_share(doc_folder)
+    result = _publish_bundle(
+        artifact, artifacts_base=artifacts_base, api_key=api_key, publish_url=publish_url,
+        password=password, access=access, scope=scope, project_id=project_id,
+    )
+    if hooks is not None:
+        try:
+            hooks.after_share(doc_folder)
+        except Exception:  # the share went out; the live copy catches up on the next write
+            logger.warning("could not bring the shared doc %s live", doc_folder, exc_info=True)
+    return result
+
+
+def _publish_bundle(
     artifact: Path,
     *,
     artifacts_base: Path,
@@ -872,6 +918,7 @@ def unpublish_artifact(
     """
     if not api_key:
         raise ValueError("Unpublishing requires an API key")
+    doc_folder = _doc_folder(artifact, artifacts_base)
 
     # Mirror publish: resolve the same .published.json location + key
     # (primary file name) whether a folder or a file was passed.
@@ -942,11 +989,19 @@ def unpublish_artifact(
         # same public URL. Only flip `published` off so readers stop showing it as
         # live. The backend object is gone, but lambda re-mints at the same id when
         # we resend report_id on the next publish.
+        shared_record = dict(entry) if isinstance(entry, dict) else {}
         if isinstance(entry, dict):
             entry["published"] = False
             published_map[published_key] = entry
             _write_published_map(published_json, published_map)
-        return {"status": "ok"}
+    hooks = share_hooks.registered() if doc_folder is not None else None
+    if hooks is not None:
+        # A doc's live copy goes with its page, once the page's lock is let go.
+        try:
+            hooks.after_unshare(shared_record, doc_folder)
+        except Exception:
+            logger.warning("could not take down the live copy of %s", doc_folder, exc_info=True)
+    return {"status": "ok"}
 
 
 def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
@@ -990,7 +1045,8 @@ def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
     api_key, publish_url = desktop_publish_credential()
-    return publish_artifact(
+    # Same content, same sharing: none of publish_artifact's sharing steps apply.
+    return _publish_bundle(
         artifact, artifacts_base=artifacts_base, api_key=api_key,
         publish_url=publish_url, access=access, scope=scope,
     )
