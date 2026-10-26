@@ -46,6 +46,9 @@ dependencies = [
     # live-app tests import.
     # 2.26.10.25.1rc1 is the first with `skills_artifact_roots`
     # (mindsdb/anton#630), which every in-process turn sets.
+    # The current floor passes each live cell's error flag to the write
+    # check; a cell that compaction folds loses that flag until the floor
+    # carries the anton release that keeps each folded cell's error.
     "anton-agent>=2.26.10.25.1rc1,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
