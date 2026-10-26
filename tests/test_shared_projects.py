@@ -117,7 +117,8 @@ def test_links_and_html_cannot_expose_runtime_or_execute_in_the_browser(shared):
     (root / "page.html").write_text("<script>alert('owner')</script>")
     base = f"/api/v1/shared-projects/{project['id']}"
     for path in ("link.txt", "hardlink.txt", "linked-dir/private.txt"):
-        assert client.get(f"{base}/files/{path}", headers=headers(BOB)).status_code == 404
+        for route in ("files", "files-raw"):
+            assert client.get(f"{base}/{route}/{path}", headers=headers(BOB)).status_code == 404
     response = client.get(f"{base}/files-raw/page.html", headers=headers(BOB))
     assert response.status_code == 200
     assert response.headers["content-disposition"].startswith("attachment;")
@@ -341,3 +342,60 @@ def test_a_folder_swapped_for_a_link_hides_only_itself_from_the_listing(shared, 
 
     monkeypatch.setattr(shared_projects, "open_pinned_child", open_child)
     assert _listed_paths(client, project) == ["report.txt"]
+
+
+@pytest.mark.parametrize("path", [
+    "", ".", "..", "../report.txt", "/report.txt", "nested/../report.txt",
+    "nested//report.txt", "nested/", r"nested\report.txt", "nested/blocked\0.txt",
+    "C:/report.txt", "report.txt:stream", "nested/.hidden", "nested/MeMoRy/report.txt",
+    "/".join(["nested"] * 32 + ["report.txt"]),
+])
+def test_invalid_shared_file_paths_fail_before_project_access(path, monkeypatch):
+    from cowork.services.shared_projects import SharedProjectFiles
+
+    def unexpected_directory(*args):
+        pytest.fail("invalid path reaches the project directory")
+
+    monkeypatch.setattr(SharedProjectFiles, "directory", unexpected_directory)
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        SharedProjectFiles(None).read_file(uuid4(), path, limit=100)
+
+
+def test_shared_file_paths_allow_32_ordinary_components():
+    from cowork.services.shared_projects import _file_parts
+
+    parts = (*(["nested"] * 31), "report.txt")
+    assert _file_parts("/".join(parts)) == parts
+
+
+def test_nested_shared_files_keep_spaces_unicode_and_dots(shared):
+    client, project, root, _, _ = shared
+    relative = "folder.with dots/rapport café.txt"
+    target = root / relative
+    target.parent.mkdir()
+    target.write_text("Shared résumé", encoding="utf-8")
+    base = f"/api/v1/shared-projects/{project['id']}"
+
+    text = client.get(f"{base}/files/{relative}", headers=headers(BOB))
+    assert text.status_code == 200
+    assert text.json()["content"] == "Shared résumé"
+    raw = client.get(f"{base}/files-raw/{relative}", headers=headers(BOB))
+    assert raw.status_code == 200
+    assert raw.content == "Shared résumé".encode("utf-8")
+
+
+@pytest.mark.parametrize("route", ["files", "files-raw"])
+def test_shared_file_open_rechecks_containment_after_component_validation(shared, monkeypatch, route):
+    from cowork.services import shared_projects
+
+    client, project, root, _, _ = shared
+    outside = root.parent / "outside.txt"
+    outside.write_text("outside project", encoding="utf-8")
+    # Exercise the open boundary independently of the request validator.
+    monkeypatch.setattr(shared_projects, "_file_parts", lambda path: ("..", "outside.txt"))
+    base = f"/api/v1/shared-projects/{project['id']}"
+
+    response = client.get(f"{base}/{route}/report.txt", headers=headers(BOB))
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "File not found"

@@ -1,13 +1,13 @@
 """Keep full-slot refusals and availability notices across browser reloads.
 
 Revision ID: a3734c9e5210
-Revises: e3618a102301
+Revises: f3733a102501
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "a3734c9e5210"
-down_revision = "e3618a102301"
+down_revision = "f3733a102501"
 branch_labels = None
 depends_on = None
 

@@ -43,6 +43,7 @@ def turn_on_live_apps(monkeypatch) -> types.ModuleType:
 
     monkeypatch.setenv(SLOTS_VARIABLE, ",".join(SLOT_ADDRESSES))
     monkeypatch.setenv("COWORK_LIVE_APPS_VIEWER_LOGIN_URL", VIEWER_LOGIN)
+    monkeypatch.setenv("COWORK_LIVE_APPS_VIEWER_PUBLIC_URL", "http://view.localhost:8080")
     monkeypatch.setenv("COWORK_LIVE_APPS_LAUNCH_TOKEN", LAUNCH_TOKEN)
     get_app_settings.cache_clear()
     return module

@@ -71,6 +71,7 @@ class LiveAppStateResponse(CamelResponse):
     project_id: UUID
     slug: str
     slot: int
+    launch_id: UUID
     state: Literal["running", "stopped"]
     address: str
     started_at: datetime
@@ -88,3 +89,20 @@ class LiveAppAvailabilityResponse(CamelResponse):
     waiting: bool
     notice: LiveAppAvailabilityNotice | None = None
     scope: str
+
+
+class LiveAppPreviewRequest(CamelRequest):
+    launch_id: UUID
+
+
+class LiveAppPreviewToken(CamelRequest):
+    token: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class LiveAppPreviewResponse(CamelResponse):
+    id: UUID
+    intent: str
+
+
+class LiveAppPreviewGrant(CamelResponse):
+    grant: str

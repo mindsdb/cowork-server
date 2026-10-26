@@ -1,0 +1,51 @@
+# Artifacts that name places an export must never reach: the cloud metadata
+# address, a 127.0.0.1 recording server standing in for an outside host, and
+# a file in another person's partition. The test fills {recording}, {other_relative}
+# and {other_absolute}; each case is exported to Word.
+cases:
+  - id: markdown
+    primary: report.md
+    source: |
+      # Quarterly report
+
+      ![metadata](http://169.254.169.254/latest/meta-data/iam/)
+      ![outside]({recording}/chart.png)
+      ![neighbour]({other_relative})
+      ![neighbour by path]({other_absolute})
+      ![neighbour by url](file://{other_absolute})
+
+      <img src="{recording}/raw.png">
+      <link rel="stylesheet" href="{recording}/style.css">
+      <div style="background: url('{recording}/bg.png')">styled</div>
+      <iframe src="{recording}/frame"></iframe>
+
+      See [the source](https://example.com/report) for details.
+  - id: html
+    primary: index.html
+    source: |
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Quarterly report</title>
+        <link rel="stylesheet" href="{recording}/style.css">
+        <style>
+          @import url("{recording}/import.css");
+          body { background-image: url("{recording}/bg.png"); }
+          .n { background: url("{other_relative}"); }
+        </style>
+        <script src="{recording}/app.js"></script>
+      </head>
+      <body>
+        <h1>Quarterly report</h1>
+        <img src="http://169.254.169.254/latest/meta-data/iam/">
+        <img src="{recording}/chart.png" srcset="{recording}/chart-2x.png 2x">
+        <img src="{other_relative}">
+        <img src="{other_absolute}">
+        <img src="file://{other_absolute}">
+        <object data="{recording}/object"></object>
+        <iframe src="{recording}/frame"></iframe>
+        <table><tr><td><img src="{recording}/cell.png"></td></tr></table>
+        <svg><image href="{recording}/svg.png"></image></svg>
+        <p><a href="https://example.com/report">the source</a></p>
+      </body>
+      </html>

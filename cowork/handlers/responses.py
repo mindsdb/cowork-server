@@ -718,10 +718,18 @@ class ResponsesHandler:
                 **({"response_router_model": route.model} if route.model else {}),
                 **({"response_route_fallback": "true"} if route.fallback else {}),
             }
-            logger.info(
-                "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
-                route.route, route.reason, route.fallback, route.provider, route.model,
-                start.conversation_id,
+            # Fields, not template values: the log formatter drops those. A
+            # fallback is WARNING so the default level keeps it.
+            logger.log(
+                logging.WARNING if route.fallback else logging.INFO,
+                "Router fell back to the agent" if route.fallback else "Router chose the turn's route",
+                extra={
+                    "event": "router_fallback" if route.fallback else "router_route",
+                    "outcome": route.route,
+                    "reason": route.reason,
+                    "provider": route.provider,
+                    **log_context(conversation_id=start.conversation_id),
+                },
             )
 
             if route.route == DIRECT_CONTEXT and first_take is not None:
@@ -1098,12 +1106,18 @@ class ResponsesHandler:
                     # WARNING (app_settings.py's own default too), so an info-level
                     # line here is silently dropped everywhere it would actually
                     # be read from — found live on staging, zero [gate] lines
-                    # across 8 real requests until this was bumped.
+                    # across 8 real requests until this was bumped. Fields, not
+                    # template values: the log formatter drops those.
                     logger.warning(
-                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
-                        "provider=%s model=%s gate_ms=%d",
-                        conversation_id, correlation_id, decision.route, decision.reason,
-                        decision.provider, decision.model, gate_ms,
+                        "Router gate decided the turn's route",
+                        extra={
+                            "event": "router_gate_decided",
+                            "outcome": decision.route,
+                            "reason": decision.reason,
+                            "provider": decision.provider,
+                            "duration_ms": gate_ms,
+                            **log_context(conversation_id=conversation_id),
+                        },
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
                     # would make a ready gate decision wait for Jev, exactly the

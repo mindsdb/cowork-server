@@ -110,8 +110,6 @@ SHARED_TEXT_MAX_LENGTH = 200
 #: The shortest email anton's LiveAppLauncher takes.
 EMAIL_MIN_LENGTH = 3
 
-_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-
 # An address a turn's prompt may show as is: no backtick, space or other
 # character that could end its code span or read as an instruction.
 _PROMPT_SAFE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
@@ -123,7 +121,17 @@ def normalized_email(value: str) -> str:
 
 
 def is_email(value: str) -> bool:
-    return len(value) <= EMAIL_MAX_LENGTH and _EMAIL.fullmatch(value) is not None
+    if len(value) > EMAIL_MAX_LENGTH:
+        return False
+    local, separator, domain = value.partition("@")
+    # A separator dot needs at least one domain character on each side.
+    return (
+        bool(local)
+        and bool(separator)
+        and "@" not in domain
+        and "." in domain[1:-1]
+        and not any(character.isspace() for character in value)
+    )
 
 
 def prompt_email(value: str) -> str:
@@ -566,7 +574,7 @@ def is_live_app_slot(slot: int) -> bool:
 #: identity layers let through: the edge's access check and stopped page carry
 #: only the visitor's cookie, and a slot's stop report carries nothing. Each
 #: route checks its caller itself.
-_SLOT_PATHS = ("access", "stopped-page", "stopped")
+_SLOT_PATHS = ("access", "stopped-page", "stopped", "preview/bootstrap", "preview/authorize", "preview/exchange", "preview/connect", "preview/revoke-viewer")
 
 
 def live_app_slot_paths() -> frozenset[str]:
@@ -1149,19 +1157,21 @@ async def _app_name(*, partition_id: str, user_id: str, project_id: UUID, slug: 
     return shared_text(metadata.name) or slug
 
 
-async def stopped_page(slot: int, *, cookie: str) -> StoppedPage:
+async def stopped_page(slot: int, *, cookie: str, owner_id: str | None = None) -> StoppedPage:
     """The page the edge shows at slot ``slot``'s address instead of a bare
     403, 502 or 503: why the visitor's app there stopped, or where it runs
     now, for a visitor who launched one there, and a plain refusal for anyone
-    else."""
+    else. ``owner_id`` names the visitor when the request carries a preview
+    lease of theirs instead of the viewer cookie."""
     refusal = StoppedPage(403, _page(f"<p>{_NO_ACCESS}</p>"))
     if not cookie:
         return refusal
     async with _http_client() as client:
         visitor = await viewer_identity(client, cookie)
-    if visitor is None or not visitor.user_id:
+    user_id = visitor.user_id if visitor is not None and visitor.user_id else owner_id
+    if not user_id:
         return refusal
-    history = await run_db(partial(_slot_history, slot=slot, user_id=visitor.user_id), scope=SYSTEM_SCOPE)
+    history = await run_db(partial(_slot_history, slot=slot, user_id=user_id), scope=SYSTEM_SCOPE)
     app = history.mine
     if app is None or history.partition_id is None:
         return refusal
@@ -1171,7 +1181,7 @@ async def stopped_page(slot: int, *, cookie: str) -> StoppedPage:
     if elsewhere is not None and not app.running:
         (elsewhere,) = await reconcile_running([elsewhere])
     name = html.escape(
-        await _app_name(partition_id=history.partition_id, user_id=visitor.user_id, project_id=app.project_id, slug=app.slug)
+        await _app_name(partition_id=history.partition_id, user_id=user_id, project_id=app.project_id, slug=app.slug)
     )
     if app.running:
         return StoppedPage(
