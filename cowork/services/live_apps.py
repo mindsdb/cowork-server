@@ -108,8 +108,6 @@ SHARED_TEXT_MAX_LENGTH = 200
 #: The shortest email anton's LiveAppLauncher takes.
 EMAIL_MIN_LENGTH = 3
 
-_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-
 # An address a turn's prompt may show as is: no backtick, space or other
 # character that could end its code span or read as an instruction.
 _PROMPT_SAFE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
@@ -121,7 +119,17 @@ def normalized_email(value: str) -> str:
 
 
 def is_email(value: str) -> bool:
-    return len(value) <= EMAIL_MAX_LENGTH and _EMAIL.fullmatch(value) is not None
+    if len(value) > EMAIL_MAX_LENGTH:
+        return False
+    local, separator, domain = value.partition("@")
+    # A separator dot needs at least one domain character on each side.
+    return (
+        bool(local)
+        and bool(separator)
+        and "@" not in domain
+        and "." in domain[1:-1]
+        and not any(character.isspace() for character in value)
+    )
 
 
 def prompt_email(value: str) -> str:
