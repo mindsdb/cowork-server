@@ -732,6 +732,13 @@ answer 403 instead, because to a client already looking at the draft a 404 would
 read as deleted. The artifacts list is unaffected either way: a co-member's
 artifact never appears in it, so review starts from the link the owner shares.
 
+Local tenancy provisions nothing and answers `enabled` with `"scope": "owner"`.
+Its comment routes keep each artifact's threads in that artifact's
+`.revisions/comments.json` (`services/local_artifact_comments.py`), and find the
+artifact only among the caller's own artifacts roots. On a deployment that
+trusts identity headers, while projects are personal, those roots are the
+person's own partition, so another person's calls to the draft answer 404.
+
 Org-mode artifact authorization uses a separate server-owned identity. An agent
 can edit `metadata.json`, so its local UUID cannot reserve a global comment key.
 The `artifact_identities` SQL table binds each `(organization, local UUID)` to
