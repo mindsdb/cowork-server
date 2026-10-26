@@ -120,6 +120,7 @@ from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
+from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
@@ -719,10 +720,18 @@ class ResponsesHandler:
                 **({"response_router_model": route.model} if route.model else {}),
                 **({"response_route_fallback": "true"} if route.fallback else {}),
             }
-            logger.info(
-                "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
-                route.route, route.reason, route.fallback, route.provider, route.model,
-                start.conversation_id,
+            # Fields, not template values: the log formatter drops those. A
+            # fallback is WARNING so the default level keeps it.
+            logger.log(
+                logging.WARNING if route.fallback else logging.INFO,
+                "Router fell back to the agent" if route.fallback else "Router chose the turn's route",
+                extra={
+                    "event": "router_fallback" if route.fallback else "router_route",
+                    "outcome": route.route,
+                    "reason": route.reason,
+                    "provider": route.provider,
+                    **log_context(conversation_id=start.conversation_id),
+                },
             )
 
             if route.route == DIRECT_CONTEXT and first_take is not None:
@@ -836,7 +845,7 @@ class ResponsesHandler:
                 partial(_conversation_for_harness, conversation_id=start.conversation_id),
                 scope=self.scope,
             )
-            with use_settings_scope(self.scope):
+            with use_settings_scope(self.scope), use_live_app_launcher(self.principal):
                 stream = harness.stream_response(
                     conversation=conversation,
                     input=start.harness_input,
@@ -1099,12 +1108,18 @@ class ResponsesHandler:
                     # WARNING (app_settings.py's own default too), so an info-level
                     # line here is silently dropped everywhere it would actually
                     # be read from — found live on staging, zero [gate] lines
-                    # across 8 real requests until this was bumped.
+                    # across 8 real requests until this was bumped. Fields, not
+                    # template values: the log formatter drops those.
                     logger.warning(
-                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
-                        "provider=%s model=%s gate_ms=%d",
-                        conversation_id, correlation_id, decision.route, decision.reason,
-                        decision.provider, decision.model, gate_ms,
+                        "Router gate decided the turn's route",
+                        extra={
+                            "event": "router_gate_decided",
+                            "outcome": decision.route,
+                            "reason": decision.reason,
+                            "provider": decision.provider,
+                            "duration_ms": gate_ms,
+                            **log_context(conversation_id=conversation_id),
+                        },
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
                     # would make a ready gate decision wait for Jev, exactly the
@@ -1241,8 +1256,8 @@ class ResponsesHandler:
                 # non-streaming path raises, so a caller reads one body whichever
                 # producer answered.
                 logger.exception(
-                    "[responses] direct turn failed for conversation %s correlation_id=%s",
-                    conversation_id, corr, extra={"request_id": corr},
+                    "[responses] direct turn failed",
+                    extra=log_context(request_id=corr, conversation_id=conversation_id),
                 )
                 raise HTTPException(
                     status_code=500,
@@ -2467,7 +2482,7 @@ class ResponsesHandler:
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
-        with use_settings_scope(scope_from_principal(self.principal)):
+        with use_settings_scope(scope_from_principal(self.principal)), use_live_app_launcher(self.principal):
             try:
                 await self._run_turn(**kwargs)
             finally:
