@@ -865,17 +865,23 @@ def _opened_existing_project_entry(
 
 @contextmanager
 def _opened_pinned_descendant(
-    root: PinnedDir, names: tuple[str, ...], *, create: bool
+    root: PinnedDir,
+    names: tuple[str, ...],
+    *,
+    create: bool,
+    created: list[tuple[str, ...]] | None = None,
 ) -> Iterator[PinnedDir]:
     """Descend from an already-pinned project root without rebuilding its Path.
 
     Every component is reduced to a basename again beside the descriptor-based
     operation. POSIX resolves it with ``dir_fd`` and ``O_NOFOLLOW``; the local
-    Windows fallback receives the same single-component guarantee.
+    Windows fallback receives the same single-component guarantee. With
+    ``create``, each folder this call made is appended to ``created`` as its
+    path below ``root``, so a caller can remove what it added.
     """
     with ExitStack() as descendants:
         current = root
-        for raw_name in names:
+        for depth, raw_name in enumerate(names, start=1):
             name = os.path.basename(raw_name)
             if not name or name != raw_name or name in {".", ".."}:
                 raise ValueError("invalid path component")
@@ -884,9 +890,33 @@ def _opened_pinned_descendant(
                     dir_mkdir(current, name)
                 except FileExistsError:
                     pass
+                else:
+                    if created is not None:
+                        created.append(names[:depth])
             current = open_pinned_child(current, name)
             descendants.callback(current.close)
         yield current
+
+
+def _create_project_temp(parent: PinnedDir, prefix: str, mode: int) -> tuple[str, int]:
+    """Create a new, empty temporary entry in ``parent`` and open it for writing.
+
+    Returns the entry's name and a descriptor the caller closes. ``O_EXCL``
+    and ``O_NOFOLLOW`` make it a fresh file, never an existing one or a link.
+    """
+    temporary = f"{prefix}{secrets.token_hex(12)}.tmp"
+    fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
+    return temporary, fd
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``; a write that makes no progress is an error."""
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written == 0:
+            raise OSError("project file write made no progress")
+        remaining = remaining[written:]
 
 
 def _write_bytes_at_project_root(
@@ -910,19 +940,13 @@ def _write_bytes_at_project_root(
                 raise HTTPException(status_code=400, detail="Path is a directory")
         # Replacing the entry detaches any pre-existing hardlink. Truncating
         # its inode could edit protected artifact bytes through an ordinary name.
-        temporary = f".cowork-file-{secrets.token_hex(12)}.tmp"
         mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
-        fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
+        temporary, fd = _create_project_temp(parent, ".cowork-file-", mode)
         try:
             try:
                 if existing is not None and hasattr(os, "fchmod"):
                     os.fchmod(fd, mode)
-                remaining = memoryview(data)
-                while remaining:
-                    written = os.write(fd, remaining)
-                    if written == 0:
-                        raise OSError("project file write made no progress")
-                    remaining = remaining[written:]
+                _write_all(fd, data)
                 result = os.fstat(fd)
             finally:
                 os.close(fd)
