@@ -498,8 +498,8 @@ _GLUED_FORM_FENCE = re.compile(r"(?<=[^\n])```data-vault-form")
 # backticks or tildes, then the info string.
 _FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 # Matched in the block's text, not parsed: the renderer opens loosely written
-# JSON that json.loads refuses.
-_FORM_ID = re.compile(r'"form_id"\s*:\s*"([^"]*)"')
+# JSON that json.loads refuses, a single-quoted value included (_looseClean).
+_FORM_ID = re.compile(r"""\"form_id\"\s*:\s*(?:"([^"]*)"|'([^']*)')""")
 # The renderer's _looseClean turns these into ASCII quotes before parsing.
 _SMART_QUOTES = str.maketrans({c: "'" for c in "‘’‚‛′‵"} | {c: '"' for c in "“”„‟″‶"})
 
@@ -508,7 +508,9 @@ def _form_id_in(body: str) -> str | None:
     """The form id in a form block's body, read as loosely as the renderer
     reads it, or None when it has none."""
     match = _FORM_ID.search(body.translate(_SMART_QUOTES))
-    return match.group(1) if match else None
+    if match is None:
+        return None
+    return match.group(1) if match.group(1) is not None else match.group(2)
 
 
 @dataclass(frozen=True)

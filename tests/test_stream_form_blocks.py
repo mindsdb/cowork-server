@@ -141,6 +141,20 @@ async def test_a_pasted_form_with_smart_quotes_shows_once():
     assert saved == answer
 
 
+@pytest.mark.parametrize("quote", ["'", "‘"], ids=["ascii", "smart"])
+async def test_a_pasted_form_with_a_single_quoted_id_shows_once(quote):
+    result = await _form_result()
+    form_id = _form_id(_block(result))
+    closing = "'" if quote == "'" else "’"
+    pasted = _block(result).replace(f'"form_id": "{form_id}"', f'"form_id": {quote}{form_id}{closing}', 1)
+    answer = f"Fill this in:\n\n{pasted}\n"
+    assert f"{quote}{form_id}" in answer
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved == answer
+
+
 async def test_a_refused_call_adds_nothing():
     refused = await _cowork_request_credentials(session=None, tc_input={"title": "No engine"})
     assert "```" not in refused
