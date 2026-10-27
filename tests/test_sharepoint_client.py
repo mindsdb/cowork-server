@@ -559,3 +559,312 @@ def test_a_401_during_a_passing_check_caches_the_token_that_worked():
 def test_every_error_kind_has_a_standard_message():
     for kind in SharePointErrorKind:
         assert str(SharePointError(kind))
+
+
+ITEMS_URL = f"{DRIVES_URL}/{DRIVE_ID}/items"
+
+
+def _file(item_id: str, name: str, size: int = 10) -> dict:
+    return {"id": item_id, "name": name, "size": size, "file": {}}
+
+
+def _folder(item_id: str, name: str) -> dict:
+    return {"id": item_id, "name": name, "folder": {"childCount": 1}}
+
+
+def _library(ms: FakeMicrosoft, picks: list[dict], children: dict[str, list[dict]] | None = None) -> None:
+    """Serve the site, its library, each picked item, and one page of children per folder id."""
+    _site_ok(ms)
+    for entry in picks:
+        ms.on("GET", f"{ITEMS_URL}/{entry['id']}", httpx.Response(200, json=entry))
+    for folder_id, entries in (children or {}).items():
+        ms.on("GET", f"{ITEMS_URL}/{folder_id}/children", httpx.Response(200, json={"value": entries}))
+
+
+def _children_calls(ms: FakeMicrosoft, folder_id: str) -> int:
+    url = f"{ITEMS_URL}/{folder_id}/children"
+    return sum(1 for r in ms.graph_requests() if str(r.url.copy_with(query=None)) == url)
+
+
+def _paths(plan) -> list[tuple[str, ...]]:
+    return [planned.parts for planned in plan.files]
+
+
+def test_plan_places_a_picked_folders_tree_under_its_name_and_a_picked_file_by_name():
+    ms = FakeMicrosoft()
+    _library(
+        ms,
+        [_folder("01A", "Reports"), _file("01T", "top.xlsx", 7)],
+        {"01A": [_file("01a", "a.docx", 3), _folder("01B", "Q3")], "01B": [_file("01b", "b.xlsx", 5)]},
+    )
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01A", "01T"])
+
+    assert plan.site == Site(url=SITE_URL, graph_id=SITE_ID)
+    assert plan.drive_id == DRIVE_ID
+    assert [(f.parts, f.item_id, f.size) for f in plan.files] == [
+        (("Reports", "a.docx"), "01a", 3),
+        (("Reports", "Q3", "b.xlsx"), "01b", 5),
+        (("top.xlsx",), "01T", 7),
+    ]
+    assert plan.skipped == []
+    urls = [str(r.url.copy_with(query=None)) for r in ms.graph_requests()]
+    assert urls.count(SITE_LOOKUP) == 1
+    assert urls.count(DRIVES_URL) == 1
+    pick = next(r for r in ms.graph_requests() if str(r.url.copy_with(query=None)) == f"{ITEMS_URL}/01A")
+    assert pick.url.params["$select"] == "id,name,size,file,folder"
+    walk = next(r for r in ms.graph_requests() if str(r.url.copy_with(query=None)) == f"{ITEMS_URL}/01A/children")
+    assert walk.url.params["$select"] == "id,name,size,file,folder,lastModifiedDateTime"
+    assert walk.headers["authorization"] == f"Bearer {TOKEN}-1"
+
+
+def test_plan_reads_a_folder_across_pages_with_one_site_lookup_and_one_library_list():
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Big")])
+    first = [_file(f"01f{n}", f"f{n}.txt") for n in range(60)]
+    second = [_file(f"01g{n}", f"g{n}.txt") for n in range(40)]
+    ms.on(
+        "GET",
+        f"{ITEMS_URL}/01A/children",
+        httpx.Response(200, json={"value": first, "@odata.nextLink": f"{ITEMS_URL}/01A/children?$skiptoken=next-1"}),
+        httpx.Response(200, json={"value": second}),
+    )
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert len(plan.files) == 100
+    pages = [r for r in ms.graph_requests() if str(r.url.copy_with(query=None)) == f"{ITEMS_URL}/01A/children"]
+    assert [r.url.params.get("$skiptoken") for r in pages] == [None, "next-1"]
+    urls = [str(r.url.copy_with(query=None)) for r in ms.graph_requests()]
+    assert urls.count(SITE_LOOKUP) == 1
+    assert urls.count(DRIVES_URL) == 1
+
+
+def test_skipped_items_do_not_count_toward_the_file_limit():
+    ms = FakeMicrosoft()
+    entries = [_file(f"01f{n}", f"f{n}.txt") for n in range(100)] + [_file("01ds", ".DS_Store")]
+    _library(ms, [_folder("01A", "Big")], {"01A": entries})
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert len(plan.files) == 100
+    assert [(s.path, s.reason) for s in plan.skipped] == [("Big/.DS_Store", "its name starts with a dot")]
+
+
+def test_more_than_100_files_is_refused_naming_the_limit():
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Big")], {"01A": [_file(f"01f{n}", f"f{n}.txt") for n in range(101)]})
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert raised.value.kind is SharePointErrorKind.TOO_MANY_FILES
+    assert "100-file limit" in str(raised.value)
+
+
+def test_more_than_1_gb_of_listed_bytes_is_refused_naming_the_limit():
+    ms = FakeMicrosoft()
+    _library(ms, [_file("01a", "a.bin", 2**29), _file("01b", "b.bin", 2**29 + 1)])
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01a", "01b"])
+
+    assert raised.value.kind is SharePointErrorKind.TOO_LARGE
+    assert "1 GB limit" in str(raised.value)
+    assert str(raised.value) != str(SharePointError(SharePointErrorKind.TOO_MANY_FILES))
+
+
+def test_more_than_200_folders_is_refused():
+    ms = FakeMicrosoft()
+    subfolders = [_folder(f"01s{n}", f"s{n}") for n in range(200)]
+    _library(ms, [_folder("01A", "Wide")], {"01A": subfolders, **{f"01s{n}": [] for n in range(200)}})
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert raised.value.kind is SharePointErrorKind.TOO_LARGE
+    assert "200-folder limit" in str(raised.value)
+
+
+def test_more_than_200_pages_is_refused():
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Long")])
+    link = f"{ITEMS_URL}/01A/children?$skiptoken=more"
+    ms.on("GET", f"{ITEMS_URL}/01A/children", *[httpx.Response(200, json={"value": [], "@odata.nextLink": link})] * 201)
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert raised.value.kind is SharePointErrorKind.TOO_LARGE
+    assert _children_calls(ms, "01A") == 200
+
+
+def test_a_tree_deeper_than_32_levels_is_refused():
+    ms = FakeMicrosoft()
+    children = {f"01d{n}": [_folder(f"01d{n + 1}", f"d{n + 1}")] for n in range(40)}
+    _library(ms, [_folder("01d0", "d0")], children)
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01d0"])
+
+    assert raised.value.kind is SharePointErrorKind.TOO_LARGE
+    assert "32 folders deep" in str(raised.value)
+    assert _children_calls(ms, "01d32") == 0
+
+
+@pytest.mark.parametrize("name", ["..", ".", "a/b", "a\\b", "nul\x00byte", "tab\tname", "del\x7f"])
+def test_a_hostile_name_fails_the_plan_naming_it(name):
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Docs")], {"01A": [_file("01ok", "ok.txt"), _file("01x", name)]})
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert raised.value.kind is SharePointErrorKind.BAD_NAME
+    assert repr(name) in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [
+        ("", "it has no name"),
+        (".DS_Store", "its name starts with a dot"),
+        ("._report.xlsx", "its name starts with a dot"),
+        ("a:b.txt", "its name can't be saved on every computer"),
+        ("what?.txt", "its name can't be saved on every computer"),
+        (" lead.txt", "its name can't be saved on every computer"),
+        ("trail.txt ", "its name can't be saved on every computer"),
+        ("dot.", "its name can't be saved on every computer"),
+        ("CON", "its name is reserved on Windows"),
+        ("con.txt", "its name is reserved on Windows"),
+        ("Lpt1.tar.gz", "its name is reserved on Windows"),
+        ("x" * 252 + ".txt", "its name is too long"),
+    ],
+)
+def test_a_name_the_desktop_cannot_hold_is_skipped_and_the_rest_planned(name, reason):
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Docs")], {"01A": [_file("01ok", "ok.txt"), _file("01x", name)]})
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert _paths(plan) == [("Docs", "ok.txt")]
+    assert [(s.path, s.reason) for s in plan.skipped] == [(f"Docs/{name}", reason)]
+
+
+def test_a_onenote_item_is_skipped():
+    ms = FakeMicrosoft()
+    notebook = {"id": "01N", "name": "Notebook", "package": {"type": "oneNote"}}
+    _library(ms, [_folder("01A", "Docs")], {"01A": [notebook, _file("01ok", "ok.txt")]})
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert _paths(plan) == [("Docs", "ok.txt")]
+    assert [(s.path, s.reason) for s in plan.skipped] == [("Docs/Notebook", "it is not a file or a folder")]
+
+
+def test_a_skipped_folder_is_not_walked():
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Repo")], {"01A": [_folder("01G", ".git")], "01G": [_file("01h", "HEAD")]})
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert plan.files == []
+    assert _children_calls(ms, "01G") == 0
+
+
+@pytest.mark.parametrize("item_id", ["root", "ROOT"])
+def test_the_library_root_cannot_be_picked(item_id):
+    ms = FakeMicrosoft()
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, [item_id])
+
+    assert raised.value.kind is SharePointErrorKind.INVALID
+    assert ms.requests == []
+
+
+@pytest.mark.parametrize("order", [["01Q", "01S"], ["01S", "01Q"]])
+def test_a_picked_folder_inside_another_picked_folder_lands_under_it_once(order):
+    ms = FakeMicrosoft()
+    outer, inner = _folder("01Q", "Q&A #1"), _folder("01S", "Sub")
+    _library(ms, [outer, inner], {"01Q": [inner, _file("01q", "q.txt")], "01S": [_file("01s", "s.txt")]})
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, order)
+
+    assert sorted(_paths(plan)) == [("Q&A #1", "Sub", "s.txt"), ("Q&A #1", "q.txt")]
+    assert _children_calls(ms, "01S") == 1
+
+
+def test_a_picked_file_inside_a_picked_folder_is_placed_once():
+    ms = FakeMicrosoft()
+    inner = _file("01r", "r.xlsx")
+    _library(ms, [inner, _folder("01A", "Reports")], {"01A": [inner]})
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01r", "01A"])
+
+    assert _paths(plan) == [("Reports", "r.xlsx")]
+
+
+def test_one_item_reached_by_two_ids_is_placed_once():
+    ms = FakeMicrosoft()
+    _library(ms, [_file("01X", "x.txt")])
+    ms.on("GET", f"{ITEMS_URL}/01X-alias", httpx.Response(200, json=_file("01X", "x.txt")))
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01X", "01X-alias", "01X"])
+
+    assert _paths(plan) == [("x.txt",)]
+
+
+def test_a_spent_planning_budget_is_reported_as_too_slow():
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Docs")])
+    fake_time = FakeTime()
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/01A/children"):
+            fake_time.now += 61
+            raise httpx.ReadTimeout("slow", request=request)
+        return ms.handler(request)
+
+    client = SharePointClient(KEY, transport=httpx.MockTransport(slow), clock=fake_time.clock, sleep=fake_time.sleep)
+    with client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert raised.value.kind is SharePointErrorKind.PLAN_TOO_SLOW
+    assert "longer than a minute" in str(raised.value)
+
+
+def test_an_unreachable_host_with_time_left_stays_unreachable():
+    ms = FakeMicrosoft()
+    _library(ms, [_folder("01A", "Docs")])
+
+    def down(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/01A/children"):
+            raise httpx.ConnectError("down", request=request)
+        return ms.handler(request)
+
+    client = SharePointClient(KEY, transport=httpx.MockTransport(down), clock=FakeTime().clock)
+    with client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, DRIVE_ID, ["01A"])
+
+    assert raised.value.kind is SharePointErrorKind.UNREACHABLE
+
+
+def test_a_library_from_another_site_is_refused_before_any_pick_is_read():
+    ms = FakeMicrosoft()
+    _site_ok(ms)
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.plan_import(SITE_URL, "b!OtherSitesDrive", ["01A"])
+
+    assert raised.value.kind is SharePointErrorKind.ITEM_NOT_FOUND
+    assert [str(r.url.copy_with(query=None)) for r in ms.graph_requests()] == [SITE_LOOKUP, DRIVES_URL]
