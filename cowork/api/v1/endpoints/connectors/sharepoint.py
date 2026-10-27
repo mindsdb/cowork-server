@@ -232,7 +232,7 @@ def list_libraries(name: str, site: str, scope: ScopeDep) -> SharePointLibraries
     url = _granted_site(site, sites)
     try:
         with SharePointClient(key) as client:
-            libraries = client.list_drives(client.resolve_site(url))
+            libraries = client.list_drives(url)
     except SharePointError as exc:
         raise _browse_error(exc) from exc
     return SharePointLibrariesResponse(
@@ -256,7 +256,7 @@ def list_children(
     url = _granted_site(site, sites)
     try:
         with SharePointClient(key) as client:
-            page = client.list_children(client.resolve_site(url), drive_id, item_id, cursor)
+            page = client.list_children(url, drive_id, item_id, cursor)
     except SharePointError as exc:
         raise _browse_error(exc) from exc
     return SharePointChildrenResponse(

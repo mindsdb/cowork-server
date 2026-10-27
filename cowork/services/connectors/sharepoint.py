@@ -9,6 +9,7 @@ or item id from the caller never changes which site a request goes to.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 import time
@@ -59,9 +60,11 @@ class SharePointErrorKind(str, Enum):
 
 
 _MESSAGES = {
+    SharePointErrorKind.INVALID: "That value isn't valid.",
     SharePointErrorKind.TENANT_NOT_FOUND: "Microsoft doesn't know this tenant. Check the tenant id.",
     SharePointErrorKind.APP_NOT_FOUND: "This app isn't registered in the tenant. Check the client id.",
     SharePointErrorKind.KEY_REJECTED: "Microsoft rejected the client secret. Check that it is right and hasn't expired.",
+    SharePointErrorKind.SITE_NOT_GRANTED: "The app can't open this site. Ask your admin to grant it.",
     SharePointErrorKind.ITEM_NOT_FOUND: "That library or folder wasn't found on this site.",
     SharePointErrorKind.THROTTLED: "SharePoint is busy right now. Try again in a minute.",
     SharePointErrorKind.UNREACHABLE: "SharePoint couldn't be reached. Try again in a moment.",
@@ -204,7 +207,7 @@ def _skiptoken(next_link: Any) -> str | None:
     if next_link is None:
         return None
     query = parse_qs(urlparse(str(next_link)).query)
-    values = query.get("$skiptoken") or query.get("%24skiptoken")
+    values = query.get("$skiptoken")
     if not values or not values[0]:
         raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned a page link this client can't follow.")
     return values[0]
@@ -213,13 +216,17 @@ def _skiptoken(next_link: Any) -> str | None:
 def _retry_after_seconds(response: httpx.Response) -> float:
     """Seconds a 429 or 503 asks to wait; a missing or date-form header waits the default."""
     try:
-        return max(float(response.headers.get("Retry-After", "")), 0.0)
+        seconds = float(response.headers.get("Retry-After", ""))
     except ValueError:
         return _DEFAULT_RETRY_SECONDS
+    return max(seconds, 0.0) if math.isfinite(seconds) else _DEFAULT_RETRY_SECONDS
 
 
 class _Deadline:
+    """One operation's time budget, shared by every request and retry wait in it."""
+
     def __init__(self, clock: Callable[[], float], seconds: float) -> None:
+        """Start the budget of ``seconds`` now, by ``clock``."""
         self._clock = clock
         self._ends_at = clock() + seconds
 
@@ -245,6 +252,7 @@ class SharePointClient:
         self._clock = clock
         self._sleep = sleep
         self._token: str | None = None
+        self._fresh_only = False
 
     def close(self) -> None:
         """Release the HTTP client."""
@@ -265,6 +273,7 @@ class SharePointClient:
         the check at once. The fresh token is cached only after every site passed.
         """
         deadline = _Deadline(self._clock, CHECK_SECONDS)
+        self._fresh_only = True
         token, expires_at = self._fetch_token(deadline)
         self._token = token
         sites = []
@@ -273,26 +282,30 @@ class SharePointClient:
             self._list_drives(site, deadline)
             sites.append(site)
         with _TOKENS_LOCK:
-            _TOKENS[self._key.cache_key()] = (token, expires_at)
+            _TOKENS[self._key.cache_key()] = (self._token, expires_at)
         return sites
 
     def resolve_site(self, url: str) -> Site:
         """Resolve one site URL to its Graph site id."""
         return self._resolve_site(url, _Deadline(self._clock, BROWSE_SECONDS))
 
-    def list_drives(self, site: Site) -> list[Library]:
-        """List the site's document libraries."""
-        return self._list_drives(site, _Deadline(self._clock, BROWSE_SECONDS))
+    def list_drives(self, site_url: str) -> list[Library]:
+        """List a site's document libraries, the site lookup included, within one browse budget."""
+        deadline = _Deadline(self._clock, BROWSE_SECONDS)
+        return self._list_drives(self._resolve_site(site_url, deadline), deadline)
 
-    def list_children(self, site: Site, drive_id: str, item_id: str = "root", cursor: str | None = None) -> Page:
+    def list_children(self, site_url: str, drive_id: str, item_id: str = "root", cursor: str | None = None) -> Page:
         """List one page of a folder's children; ``cursor`` is the previous page's skiptoken.
 
-        The library must be one of the site's own, so an id from another site
-        is refused before any request names it.
+        Ids are checked before any request, and the library must be one of the
+        site's own, so an id from another site is refused before any request
+        names it. The site lookup, the library list and the page share one
+        browse budget.
         """
-        deadline = _Deadline(self._clock, BROWSE_SECONDS)
         _require_id(drive_id, _DRIVE_OR_ITEM_ID)
         _require_id(item_id, _DRIVE_OR_ITEM_ID)
+        deadline = _Deadline(self._clock, BROWSE_SECONDS)
+        site = self._resolve_site(site_url, deadline)
         if drive_id not in {library.id for library in self._list_drives(site, deadline)}:
             raise SharePointError(SharePointErrorKind.ITEM_NOT_FOUND)
         url = (
@@ -359,7 +372,11 @@ class SharePointClient:
         """GET from Graph with the app token, refetching it once on a 401."""
         response = self._send("GET", url, deadline, params=params, token=self._current_token(deadline))
         if response.status_code == 401:
-            self._evict_token()
+            if self._fresh_only:
+                # The check never reads or writes the cache, even on a retry.
+                self._token, _ = self._fetch_token(deadline)
+            else:
+                self._evict_token()
             response = self._send("GET", url, deadline, params=params, token=self._current_token(deadline))
         if response.status_code == 401:
             raise SharePointError(SharePointErrorKind.KEY_REJECTED)
@@ -409,7 +426,8 @@ class SharePointClient:
             except (TypeError, ValueError):
                 lifetime = 0.0
             return token, self._clock() + max(lifetime - _TOKEN_MARGIN_SECONDS, 0.0)
-        codes = {code for code in payload.get("error_codes", []) if isinstance(code, int)}
+        raw_codes = payload.get("error_codes")
+        codes = {code for code in raw_codes if isinstance(code, int)} if isinstance(raw_codes, list) else set()
         if codes & _TENANT_NOT_FOUND_CODES:
             raise SharePointError(SharePointErrorKind.TENANT_NOT_FOUND)
         if codes & _APP_NOT_FOUND_CODES:
@@ -430,7 +448,7 @@ class SharePointClient:
     ) -> httpx.Response:
         """Send one request inside the deadline, waiting out 429 and 503 while time is left."""
         headers = {"Authorization": f"Bearer {token}"} if token else None
-        for _ in range(_MAX_TRIES):
+        for attempt in range(_MAX_TRIES):
             remaining = deadline.remaining()
             if remaining <= 0:
                 raise SharePointError(SharePointErrorKind.UNREACHABLE)
@@ -443,7 +461,7 @@ class SharePointClient:
             if response.status_code not in {429, 503}:
                 return response
             wait = _retry_after_seconds(response)
-            if wait >= deadline.remaining():
+            if attempt == _MAX_TRIES - 1 or wait >= deadline.remaining():
                 raise SharePointError(SharePointErrorKind.THROTTLED)
             self._sleep(wait)
         raise SharePointError(SharePointErrorKind.THROTTLED)
@@ -463,12 +481,13 @@ class SharePointClient:
         except SharePointError as exc:
             raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned an unexpected item id.") from exc
         size = entry.get("size")
+        modified = entry.get("lastModifiedDateTime")
         return Item(
             id=item_id,
             name=str(entry.get("name") or ""),
             size=size if isinstance(size, int) else 0,
             kind=kind,
-            modified=entry.get("lastModifiedDateTime"),
+            modified=modified if isinstance(modified, str) else None,
         )
 
     @staticmethod

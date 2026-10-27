@@ -266,10 +266,9 @@ def test_bad_tenant_ids_are_refused_before_any_request(tenant):
 )
 def test_traversal_ids_are_refused_before_any_request(drive_id, item_id):
     ms = FakeMicrosoft()
-    site = Site(url=SITE_URL, graph_id=SITE_ID)
 
     with _client(ms) as client, pytest.raises(SharePointError) as raised:
-        client.list_children(site, drive_id, item_id)
+        client.list_children(SITE_URL, drive_id, item_id)
 
     assert raised.value.kind is SharePointErrorKind.INVALID
     assert ms.requests == []
@@ -278,13 +277,12 @@ def test_traversal_ids_are_refused_before_any_request(drive_id, item_id):
 def test_a_library_from_another_site_is_refused_before_any_children_call():
     ms = FakeMicrosoft()
     _site_ok(ms)
-    site = Site(url=SITE_URL, graph_id=SITE_ID)
 
     with _client(ms) as client, pytest.raises(SharePointError) as raised:
-        client.list_children(site, "b!OtherSitesDrive")
+        client.list_children(SITE_URL, "b!OtherSitesDrive")
 
     assert raised.value.kind is SharePointErrorKind.ITEM_NOT_FOUND
-    assert [str(r.url.copy_with(query=None)) for r in ms.graph_requests()] == [DRIVES_URL]
+    assert [str(r.url.copy_with(query=None)) for r in ms.graph_requests()] == [SITE_LOOKUP, DRIVES_URL]
 
 
 def test_children_ask_only_the_listed_fields_and_classify_items():
@@ -307,7 +305,7 @@ def test_children_ask_only_the_listed_fields_and_classify_items():
     )
 
     with _client(ms) as client:
-        page = client.list_children(Site(url=SITE_URL, graph_id=SITE_ID), DRIVE_ID)
+        page = client.list_children(SITE_URL, DRIVE_ID)
 
     children = ms.graph_requests()[-1]
     assert str(children.url.copy_with(query=None)) == CHILDREN_URL
@@ -324,11 +322,10 @@ def test_the_next_page_rebuilds_the_same_url_from_the_skiptoken_only(key):
     _site_ok(ms)
     forged_link = f"https://evil.example/other/path?{key}=page-2-token"
     ms.on("GET", CHILDREN_URL, httpx.Response(200, json={"value": [], "@odata.nextLink": forged_link}))
-    site = Site(url=SITE_URL, graph_id=SITE_ID)
 
     with _client(ms) as client:
-        first = client.list_children(site, DRIVE_ID)
-        client.list_children(site, DRIVE_ID, cursor=first.cursor)
+        first = client.list_children(SITE_URL, DRIVE_ID)
+        client.list_children(SITE_URL, DRIVE_ID, cursor=first.cursor)
 
     assert first.cursor == "page-2-token"
     second = ms.graph_requests()[-1]
@@ -345,7 +342,7 @@ def test_a_forged_cursor_stays_a_query_value():
     forged = "x&$filter=1#/../../sites/other/drives"
 
     with _client(ms) as client:
-        client.list_children(Site(url=SITE_URL, graph_id=SITE_ID), DRIVE_ID, cursor=forged)
+        client.list_children(SITE_URL, DRIVE_ID, cursor=forged)
 
     children = ms.graph_requests()[-1]
     assert str(children.url.copy_with(query=None)) == CHILDREN_URL
@@ -359,13 +356,14 @@ def test_a_next_link_without_a_skiptoken_is_an_error():
     ms.on("GET", CHILDREN_URL, httpx.Response(200, json={"value": [], "@odata.nextLink": f"{CHILDREN_URL}?$top=200"}))
 
     with _client(ms) as client, pytest.raises(SharePointError) as raised:
-        client.list_children(Site(url=SITE_URL, graph_id=SITE_ID), DRIVE_ID)
+        client.list_children(SITE_URL, DRIVE_ID)
 
     assert raised.value.kind is SharePointErrorKind.UNREACHABLE
 
 
 def test_libraries_are_read_across_pages():
     ms = FakeMicrosoft()
+    ms.on("GET", SITE_LOOKUP, httpx.Response(200, json={"id": SITE_ID}))
     ms.on(
         "GET",
         DRIVES_URL,
@@ -374,7 +372,7 @@ def test_libraries_are_read_across_pages():
     )
 
     with _client(ms) as client:
-        libraries = client.list_drives(Site(url=SITE_URL, graph_id=SITE_ID))
+        libraries = client.list_drives(SITE_URL)
 
     assert [library.id for library in libraries] == ["b!first", DRIVE_ID]
     assert ms.graph_requests()[-1].url.params["$skiptoken"] == "d2"
@@ -416,6 +414,7 @@ def test_throttling_gives_up_after_three_tries():
 
     assert raised.value.kind is SharePointErrorKind.THROTTLED
     assert len(ms.graph_requests()) == 3
+    assert fake_time.slept == [1.0, 1.0]
 
 
 def test_a_401_from_graph_refetches_the_token_once():
@@ -482,3 +481,81 @@ def test_the_secret_and_token_stay_out_of_errors_and_logs():
     for error in errors:
         assert "graph.microsoft.com" not in str(error)
         assert "login.microsoftonline.com" not in str(error)
+
+
+def test_one_browse_call_shares_one_deadline_across_its_requests():
+    ms = FakeMicrosoft()
+    ms.on("GET", SITE_LOOKUP, httpx.Response(429, headers={"Retry-After": "25"}), httpx.Response(200, json={"id": SITE_ID}))
+    ms.on("GET", DRIVES_URL, httpx.Response(429, headers={"Retry-After": "10"}))
+    fake_time = FakeTime()
+
+    with _client(ms, fake_time) as client, pytest.raises(SharePointError) as raised:
+        client.list_drives(SITE_URL)
+
+    assert raised.value.kind is SharePointErrorKind.THROTTLED
+    assert fake_time.slept == [25.0]
+
+
+@pytest.mark.parametrize("header", ["nan", "inf", "-inf", "soon", "Wed, 21 Oct 2026 07:28:00 GMT"])
+def test_an_unusable_retry_after_waits_the_default(header):
+    ms = FakeMicrosoft()
+    ms.on("GET", SITE_LOOKUP, httpx.Response(429, headers={"Retry-After": header}))
+    fake_time = FakeTime()
+
+    with _client(ms, fake_time) as client, pytest.raises(SharePointError) as raised:
+        client.resolve_site(SITE_URL)
+
+    assert raised.value.kind is SharePointErrorKind.THROTTLED
+    assert fake_time.slept == [1.0, 1.0]
+
+
+@pytest.mark.parametrize("codes", [7000215, "7000215", {"a": 1}, None])
+def test_error_codes_that_are_not_a_list_count_as_unreachable(codes):
+    ms = FakeMicrosoft()
+    ms.on("POST", TOKEN_URL, httpx.Response(401, json={"error_codes": codes}))
+
+    with _client(ms) as client, pytest.raises(SharePointError) as raised:
+        client.check([SITE_URL])
+
+    assert raised.value.kind is SharePointErrorKind.UNREACHABLE
+
+
+def test_a_modified_time_that_is_not_text_is_dropped():
+    ms = FakeMicrosoft()
+    _site_ok(ms)
+    ms.on("GET", CHILDREN_URL, httpx.Response(200, json={"value": [{"id": "01A", "name": "a", "file": {}, "lastModifiedDateTime": 5}]}))
+
+    with _client(ms) as client:
+        page = client.list_children(SITE_URL, DRIVE_ID)
+
+    assert page.items[0].modified is None
+
+
+def test_a_401_during_the_check_fetches_a_fresh_token_without_touching_the_cache():
+    ms = FakeMicrosoft()
+    ms.on("GET", SITE_LOOKUP, httpx.Response(401, json={}), httpx.Response(403, json={}))
+    sharepoint._TOKENS[KEY.cache_key()] = ("another-requests-token", 10**9)
+
+    with _client(ms) as client, pytest.raises(SharePointError):
+        client.check([SITE_URL])
+
+    first, second = ms.graph_requests()
+    assert first.headers["authorization"] == f"Bearer {TOKEN}-1"
+    assert second.headers["authorization"] == f"Bearer {TOKEN}-2"
+    assert sharepoint._TOKENS[KEY.cache_key()][0] == "another-requests-token"
+
+
+def test_a_401_during_a_passing_check_caches_the_token_that_worked():
+    ms = FakeMicrosoft()
+    _site_ok(ms)
+    ms.on("GET", SITE_LOOKUP, httpx.Response(401, json={}), httpx.Response(200, json={"id": SITE_ID}))
+
+    with _client(ms) as client:
+        client.check([SITE_URL])
+
+    assert sharepoint._TOKENS[KEY.cache_key()][0] == f"{TOKEN}-2"
+
+
+def test_every_error_kind_has_a_standard_message():
+    for kind in SharePointErrorKind:
+        assert str(SharePointError(kind))
