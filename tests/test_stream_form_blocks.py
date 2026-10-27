@@ -128,6 +128,18 @@ async def test_a_pasted_form_the_renderer_reads_loosely_shows_once():
     assert saved == answer
 
 
+async def test_a_pasted_form_with_smart_quotes_shows_once():
+    result = await _form_result()
+    smart = _block(result).replace('"form_id": "', "“form_id”: “", 1)
+    smart = smart[:smart.index("“form_id”: “")] + smart[smart.index("“form_id”: “"):].replace('"', "”", 1)
+    answer = f"Fill this in:\n\n{smart}\n"
+    assert "“form_id”" in answer
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved == answer
+
+
 async def test_a_refused_call_adds_nothing():
     refused = await _cowork_request_credentials(session=None, tc_input={"title": "No engine"})
     assert "```" not in refused

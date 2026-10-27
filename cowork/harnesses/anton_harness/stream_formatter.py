@@ -495,6 +495,15 @@ _FORM_FENCE_OPEN = re.compile(r"```data-vault-form[ \t]*\r?\n")
 # Matched in the block's text, not parsed: the renderer opens loosely written
 # JSON that json.loads refuses.
 _FORM_ID = re.compile(r'"form_id"\s*:\s*"([^"]*)"')
+# The renderer's _looseClean turns these into ASCII quotes before parsing.
+_SMART_QUOTES = str.maketrans({c: "'" for c in "‘’‚‛′‵"} | {c: '"' for c in "“”„‟″‶"})
+
+
+def _form_id_in(body: str) -> str | None:
+    """The form id in a form block's body, read as loosely as the renderer
+    reads it, or None when it has none."""
+    match = _FORM_ID.search(body.translate(_SMART_QUOTES))
+    return match.group(1) if match else None
 
 
 @dataclass(frozen=True)
@@ -521,9 +530,9 @@ def requested_form(tool_rows: Sequence[object]) -> RequestedForm | None:
         if call.name != "request_credentials" or result is None or result.is_error:
             continue
         blocks = list(_FORM_BLOCK.finditer(result.text))
-        form_id = _FORM_ID.search(blocks[-1].group(1)) if blocks else None
+        form_id = _form_id_in(blocks[-1].group(1)) if blocks else None
         if form_id is not None:
-            found = RequestedForm(block=blocks[-1].group(0), form_id=form_id.group(1))
+            found = RequestedForm(block=blocks[-1].group(0), form_id=form_id)
     return found
 
 
@@ -536,10 +545,8 @@ def missing_form_text(answer: str, form: RequestedForm) -> str:
     paste cut off) is closed first; otherwise the renderer would end it at the
     added block's opening line and read neither form."""
     blocks = list(_FORM_BLOCK.finditer(answer))
-    if blocks:
-        last_id = _FORM_ID.search(blocks[-1].group(1))
-        if last_id is not None and last_id.group(1) == form.form_id:
-            return ""
+    if blocks and _form_id_in(blocks[-1].group(1)) == form.form_id:
+        return ""
     rest = answer[blocks[-1].end():] if blocks else answer
     text = answer
     closing = ""
