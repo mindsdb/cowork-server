@@ -1099,7 +1099,7 @@ class _ProjectImport:
     def check(self) -> None:
         """Refuse any target that can't be written as asked, before anything is written."""
         files: set[tuple[str, ...]] = set()
-        folders: set[tuple[str, ...]] = set()
+        folders: dict[tuple[str, ...], tuple[str, ...]] = {}
         for target in self._targets:
             if not target.parts or len(target.parts) > _IMPORT_MAX_DEPTH:
                 raise _ImportConflict(f"{target.path} is more than {_IMPORT_MAX_DEPTH} folders deep.", target.path)
@@ -1107,7 +1107,14 @@ class _ProjectImport:
             if key in files:
                 raise _ImportConflict(f"Two picked files would both be saved as {target.path}.", target.path)
             files.add(key)
-            folders.update(key[:depth] for depth in range(1, len(key)))
+            for depth in range(1, len(key)):
+                spelled = folders.setdefault(key[:depth], target.parts[:depth])
+                if spelled != target.parts[:depth]:
+                    raise _ImportConflict(
+                        f"{'/'.join(target.parts[:depth])} and {'/'.join(spelled)} would be one folder "
+                        "on some computers. Rename one of them.",
+                        target.path,
+                    )
         for target in self._targets:
             if tuple(_folded(part) for part in target.parts) in folders:
                 raise _ImportConflict(f"{target.path} would be both a file and a folder.", target.path)
@@ -1123,7 +1130,8 @@ class _ProjectImport:
         """Write one target's bytes to a new temporary entry beside it.
 
         ``feed`` is called with a sink and pushes the file's bytes into it.
-        Errors from ``feed`` itself propagate; a write error becomes a disk error.
+        An ``OSError`` or ``ValueError``, from the disk or from ``feed``,
+        becomes a disk error; any other error from ``feed`` propagates.
         """
         target = self._targets[index]
         try:

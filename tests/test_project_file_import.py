@@ -226,6 +226,8 @@ def test_reimporting_a_hardlinked_file_replaces_only_that_name(tmp_path):
         ({"a.txt": b"1", "A.TXT": b"2"}, None, "would both be saved as"),
         ({"Café.txt": b"1", "Café.txt": b"2"}, None, "would both be saved as"),
         ({"Report": b"1", "report/x.txt": b"2"}, None, "both a file and a folder"),
+        ({"Reports/a.txt": b"1", "reports/b.txt": b"2"}, None, "would be one folder"),
+        ({"Caf\u00e9/a.txt": b"1", "Cafe\u0301/b.txt": b"2"}, None, "would be one folder"),
         ({"Docs": b"1"}, "folder", "is a folder"),
         ({"Docs/a.txt": b"1"}, "file", "needs a folder there"),
     ],
