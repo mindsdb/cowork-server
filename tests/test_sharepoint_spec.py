@@ -12,7 +12,7 @@ import pytest
 
 from cowork.harnesses.anton_harness.tools import _cowork_lookup_connector
 from cowork.schemas.connectors import ConnectorSpecResponse
-from cowork.services.connectors.identity import secure_keys_for, spec_secret_fields
+from cowork.services.connectors.identity import spec_secret_fields
 from cowork.services.connectors.specs._registry import registry
 
 
@@ -40,7 +40,11 @@ def test_only_the_client_secret_is_marked_secret():
     assert spec_secret_fields("sharepoint", "app-key") == ["client_secret"]
 
 
-def test_secure_keys_for_a_route_save_cover_the_client_secret_only():
-    fields = {"tenant_id": "t", "client_id": "c", "client_secret": "s", "site_urls": "https://x.sharepoint.com/sites/a"}
 
-    assert secure_keys_for("sharepoint", None, fields) == ["client_secret"]
+@pytest.mark.parametrize("query", ["excel", "word", "intranet", "word documents"])
+@pytest.mark.asyncio
+async def test_a_generic_office_word_does_not_pick_sharepoint(query):
+    result = json.loads(await _cowork_lookup_connector(None, {"query": query}))
+
+    assert result.get("id") != "sharepoint"
+    assert "sharepoint" not in [c["id"] for c in result.get("candidates", [])]

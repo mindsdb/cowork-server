@@ -2,7 +2,7 @@
   "id": "sharepoint",
   "label": "SharePoint",
   "aliases": ["sharepoint online", "microsoft sharepoint", "ms sharepoint", "sharepoint site", "o365 sharepoint"],
-  "keywords": ["files", "documents", "folders", "libraries", "microsoft", "office365", "m365", "excel", "word", "intranet"],
+  "keywords": ["files", "documents", "folders", "libraries", "microsoft", "office365", "m365"],
   "description": "Bring files and folders from SharePoint sites into a project, with an app key an admin sets up once.",
   "category": "files",
   "logo": "folder",
