@@ -616,17 +616,19 @@ class SharePointClient:
     def _plan(self, site: Site, drive_id: str, requested: list[str], deadline: _Deadline) -> ImportPlan:
         """Read each pick, walk the picked folders, then place the picked files no folder covered."""
         budget = _ImportBudget()
+        picked_ids: set[str] = set()
         picks: list[Item] = []
+        skipped_picks: dict[str, SkippedItem] = {}
         for item_id in requested:
             item = self._get_item(site, drive_id, item_id, deadline)
-            if item.id in {pick.id for pick in picks}:
+            if item.id in picked_ids:
                 continue
+            picked_ids.add(item.id)
             reason = _skip_reason(item)
             if reason is not None:
-                budget.skipped.append(SkippedItem(path=item.name, reason=reason))
+                skipped_picks[item.id] = SkippedItem(path=item.name, reason=reason)
                 continue
             picks.append(item)
-        picked_ids = {pick.id for pick in picks}
         covered: set[str] = set()
         walked: dict[str, list[PlannedFile]] = {}
         for pick in picks:
@@ -637,6 +639,8 @@ class SharePointClient:
             if pick.kind == "file" and pick.id not in covered:
                 budget.add_file(pick.size)
                 files.append(PlannedFile(parts=(pick.name,), item_id=pick.id, size=pick.size))
+        # A skipped pick a walk also reached is already listed under the walk's path.
+        budget.skipped.extend(item for item_id, item in skipped_picks.items() if item_id not in covered)
         return ImportPlan(site=site, drive_id=drive_id, files=files, skipped=budget.skipped)
 
     def _walk(
@@ -667,12 +671,12 @@ class SharePointClient:
                 page = self._children_page(site, drive_id, folder_id, cursor, deadline)
                 for child in page.items:
                     path = (*prefix, child.name)
+                    if child.id in picked_ids:
+                        covered.add(child.id)
                     reason = _skip_reason(child)
                     if reason is not None:
                         budget.skipped.append(SkippedItem(path="/".join(path), reason=reason))
                         continue
-                    if child.id in picked_ids:
-                        covered.add(child.id)
                     if child.kind == "folder" and child.id in walked:
                         for planned in walked.pop(child.id):
                             files.append(PlannedFile(_within_depth((*prefix, *planned.parts)), planned.item_id, planned.size))

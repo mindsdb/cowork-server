@@ -1205,3 +1205,27 @@ def test_cowork_logging_keeps_the_download_url_out_of_every_log():
     assert result.returncode == 0, result.stderr
     assert "collector works" in result.stdout
     assert "tempauth" not in result.stdout + result.stderr
+
+
+def test_a_skipped_pick_inside_a_picked_folder_is_listed_once_under_its_path():
+    ms = FakeMicrosoft()
+    hidden = _folder("01G", ".git")
+    _library(ms, [hidden, _folder("01A", "Repo")], {"01A": [hidden, _file("01r", "readme.md")]})
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01G", "01A"])
+
+    assert _paths(plan) == [("Repo", "readme.md")]
+    assert [(s.path, s.reason) for s in plan.skipped] == [("Repo/.git", "its name starts with a dot")]
+
+
+def test_a_skipped_item_picked_by_two_ids_is_listed_once():
+    ms = FakeMicrosoft()
+    _library(ms, [_file("01d", ".DS_Store")])
+    ms.on("GET", f"{ITEMS_URL}/01d-alias", httpx.Response(200, json=_file("01d", ".DS_Store")))
+
+    with _client(ms) as client:
+        plan = client.plan_import(SITE_URL, DRIVE_ID, ["01d", "01d-alias"])
+
+    assert plan.files == []
+    assert [s.path for s in plan.skipped] == [".DS_Store"]
