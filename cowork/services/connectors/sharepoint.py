@@ -29,6 +29,7 @@ CHECK_SECONDS = 60.0
 BROWSE_SECONDS = 30.0
 PAGE_SIZE = 200
 PLAN_SECONDS = 60.0
+IMPORT_SECONDS = 15 * 60.0
 MAX_IMPORT_FILES = 100
 MAX_IMPORT_BYTES = 2**30
 MAX_IMPORT_DEPTH = 32
@@ -40,6 +41,8 @@ _MAX_IMPORT_PAGES = 200
 _MAX_NAME_BYTES = 255
 _TOKEN_MARGIN_SECONDS = 60.0
 _DEFAULT_RETRY_SECONDS = 1.0
+_READ_TIMEOUT_CAP_SECONDS = 60.0
+_REFUSED_REDIRECT = "SharePoint sent the download to an address Cowork won't follow."
 # An UNREACHABLE with less than this left of an import's own budget is
 # reported as the import being too slow, not as SharePoint being down.
 _SLOW_MARGIN_SECONDS = 1.0
@@ -202,6 +205,20 @@ class _ImportBudget:
                 SharePointErrorKind.TOO_LARGE,
                 "The picked folders hold too many items to list. Pick fewer folders.",
             )
+
+
+class DownloadBudget:
+    """Bytes one import may still write, shared by every file it downloads."""
+
+    def __init__(self, limit: int = MAX_IMPORT_BYTES) -> None:
+        """Start with ``limit`` bytes left."""
+        self._left = limit
+
+    def spend(self, size: int) -> None:
+        """Take ``size`` bytes; refuse once the import would pass its limit."""
+        self._left -= size
+        if self._left < 0:
+            raise SharePointError(SharePointErrorKind.TOO_LARGE)
 
 
 def _within_depth(parts: tuple[str, ...]) -> tuple[str, ...]:
@@ -457,6 +474,144 @@ class SharePointClient:
             if exc.kind is SharePointErrorKind.UNREACHABLE and deadline.remaining() < _SLOW_MARGIN_SECONDS:
                 raise SharePointError(SharePointErrorKind.PLAN_TOO_SLOW) from exc
             raise
+
+    def import_deadline(self) -> _Deadline:
+        """Start the budget one whole import shares: its plan and every download."""
+        return _Deadline(self._clock, IMPORT_SECONDS)
+
+    def download(
+        self,
+        site: Site,
+        drive_id: str,
+        item_id: str,
+        sink: Callable[[bytes], None],
+        budget: DownloadBudget,
+        deadline: _Deadline,
+    ) -> int:
+        """Stream one file's bytes into ``sink`` and return how many were written.
+
+        ``site`` and ``drive_id`` come from a plan, so no site or library call
+        is repeated per file. Graph answers ``/content`` with a redirect to a
+        pre-authenticated URL; it is followed only to the connection's own site
+        host, without the token, and never appears in an error. Errors raised
+        by ``sink`` propagate unchanged.
+        """
+        _require_id(drive_id, _DRIVE_OR_ITEM_ID)
+        _require_id(item_id, _DRIVE_OR_ITEM_ID)
+        try:
+            return self._download(site, drive_id, item_id, sink, budget, deadline)
+        except SharePointError as exc:
+            if exc.kind is SharePointErrorKind.UNREACHABLE and deadline.remaining() < _SLOW_MARGIN_SECONDS:
+                raise SharePointError(SharePointErrorKind.IMPORT_TOO_SLOW) from exc
+            raise
+
+    def _download(
+        self,
+        site: Site,
+        drive_id: str,
+        item_id: str,
+        sink: Callable[[bytes], None],
+        budget: DownloadBudget,
+        deadline: _Deadline,
+    ) -> int:
+        """Ask Graph for the content, then read it from Graph or from the one redirect allowed."""
+        url = (
+            f"{GRAPH_URL}/sites/{quote(site.graph_id, safe='!,')}"
+            f"/drives/{quote(drive_id, safe='!')}/items/{quote(item_id, safe='!')}/content"
+        )
+        response = self._stream_graph(url, deadline)
+        try:
+            if response.status_code == 200:
+                return self._drain(response, sink, budget, deadline)
+            if response.status_code in {400, 403, 404}:
+                raise SharePointError(SharePointErrorKind.ITEM_NOT_FOUND, "A picked file wasn't found on this site.")
+            if response.status_code not in {302, 303}:
+                raise SharePointError(SharePointErrorKind.UNREACHABLE)
+            target = self._download_url(response.headers.get("location"), site)
+        finally:
+            response.close()
+        response = self._send_stream(target, deadline, token=None)
+        try:
+            if response.status_code != 200:
+                raise SharePointError(SharePointErrorKind.UNREACHABLE)
+            return self._drain(response, sink, budget, deadline)
+        finally:
+            response.close()
+
+    @staticmethod
+    def _download_url(location: str | None, site: Site) -> httpx.URL:
+        """The redirect's URL, parsed once, if it is https on the site's own host; refuse anything else."""
+        if not location:
+            raise SharePointError(SharePointErrorKind.UNREACHABLE, _REFUSED_REDIRECT)
+        try:
+            url = httpx.URL(location)
+        except httpx.InvalidURL as exc:
+            raise SharePointError(SharePointErrorKind.UNREACHABLE, _REFUSED_REDIRECT) from exc
+        allowed_host = urlparse(site.url).hostname
+        if (
+            not url.is_absolute_url
+            or url.scheme != "https"
+            or url.userinfo
+            or url.port is not None
+            or url.host.casefold() != allowed_host
+        ):
+            raise SharePointError(SharePointErrorKind.UNREACHABLE, _REFUSED_REDIRECT)
+        return url
+
+    def _drain(
+        self, response: httpx.Response, sink: Callable[[bytes], None], budget: DownloadBudget, deadline: _Deadline,
+    ) -> int:
+        """Hand each raw read to ``sink`` as it arrives, checking the deadline and byte budget first."""
+        written = 0
+        try:
+            for chunk in response.iter_bytes():
+                if deadline.remaining() <= 0:
+                    raise SharePointError(SharePointErrorKind.IMPORT_TOO_SLOW)
+                budget.spend(len(chunk))
+                sink(chunk)
+                written += len(chunk)
+        except httpx.HTTPError as exc:
+            raise SharePointError(SharePointErrorKind.UNREACHABLE) from exc
+        return written
+
+    def _stream_graph(self, url: str, deadline: _Deadline) -> httpx.Response:
+        """Open a streamed GET to Graph with the app token, refetching it once on a 401."""
+        response = self._send_stream(url, deadline, token=self._current_token(deadline))
+        if response.status_code == 401:
+            response.close()
+            self._evict_token()
+            response = self._send_stream(url, deadline, token=self._current_token(deadline))
+        if response.status_code == 401:
+            response.close()
+            raise SharePointError(SharePointErrorKind.KEY_REJECTED)
+        return response
+
+    def _send_stream(self, url: str | httpx.URL, deadline: _Deadline, *, token: str | None) -> httpx.Response:
+        """Open one streamed GET inside the deadline, waiting out 429 and 503 like ``_send``.
+
+        httpx applies one read timeout to every read of a body, so it is fixed
+        here at the time left, capped. The caller closes the returned response.
+        """
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        for attempt in range(_MAX_TRIES):
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                raise SharePointError(SharePointErrorKind.UNREACHABLE)
+            request = self._client.build_request(
+                "GET", url, headers=headers, timeout=min(remaining, _READ_TIMEOUT_CAP_SECONDS),
+            )
+            try:
+                response = self._client.send(request, stream=True, follow_redirects=False)
+            except httpx.HTTPError as exc:
+                raise SharePointError(SharePointErrorKind.UNREACHABLE) from exc
+            if response.status_code not in {429, 503}:
+                return response
+            wait = _retry_after_seconds(response)
+            response.close()
+            if attempt == _MAX_TRIES - 1 or wait >= deadline.remaining():
+                raise SharePointError(SharePointErrorKind.THROTTLED)
+            self._sleep(wait)
+        raise SharePointError(SharePointErrorKind.THROTTLED)
 
     def _plan(self, site: Site, drive_id: str, requested: list[str], deadline: _Deadline) -> ImportPlan:
         """Read each pick, walk the picked folders, then place the picked files no folder covered."""

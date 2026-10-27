@@ -1,4 +1,8 @@
 import logging
+import os
+import subprocess
+import sys
+import textwrap
 from urllib.parse import parse_qs
 
 import httpx
@@ -7,6 +11,7 @@ import pytest
 from cowork.services.connectors import sharepoint
 from cowork.services.connectors.sharepoint import (
     AppKey,
+    DownloadBudget,
     SharePointClient,
     SharePointError,
     SharePointErrorKind,
@@ -868,3 +873,335 @@ def test_a_library_from_another_site_is_refused_before_any_pick_is_read():
 
     assert raised.value.kind is SharePointErrorKind.ITEM_NOT_FOUND
     assert [str(r.url.copy_with(query=None)) for r in ms.graph_requests()] == [SITE_LOOKUP, DRIVES_URL]
+
+
+SITE = Site(url=SITE_URL, graph_id=SITE_ID)
+CONTENT_URL = f"{ITEMS_URL}/01f/content"
+DOWNLOAD_PAGE = "https://contoso.sharepoint.com/sites/team/_layouts/15/download.aspx"
+DOWNLOAD_URL = f"{DOWNLOAD_PAGE}?UniqueId=01f&tempauth=tempauth-secret-7c1d"
+
+
+class Chunks(httpx.SyncByteStream):
+    """A response body read one raw chunk at a time, recording reads and whether it was closed."""
+
+    def __init__(self, chunks: list[bytes], events: list[str] | None = None, before=None) -> None:
+        self.chunks = chunks
+        self.events = events if events is not None else []
+        self.before = before
+        self.closed = False
+
+    def __iter__(self):
+        for index, chunk in enumerate(self.chunks):
+            if self.before is not None:
+                self.before(index)
+            self.events.append(f"read {index}")
+            yield chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _redirect(location: str | None, status: int = 302) -> httpx.Response:
+    headers = {"Location": location} if location is not None else {}
+    return httpx.Response(status, headers=headers, stream=Chunks([]))
+
+
+def _download(ms: FakeMicrosoft, fake_time: FakeTime | None = None, budget: DownloadBudget | None = None, sink=None):
+    fake_time = fake_time or FakeTime()
+    received: list[bytes] = []
+    with _client(ms, fake_time) as client:
+        deadline = client.import_deadline()
+        written = client.download(SITE, DRIVE_ID, "01f", sink or received.append, budget or DownloadBudget(), deadline)
+    return written, received
+
+
+def _non_token_requests(ms: FakeMicrosoft) -> list[httpx.Request]:
+    return [r for r in ms.requests if r.url.host != "login.microsoftonline.com"]
+
+
+def test_download_follows_one_redirect_to_the_site_host_without_the_token():
+    ms = FakeMicrosoft()
+    redirect_body = Chunks([])
+    body = Chunks([b"hello ", b"world"])
+    ms.on("GET", CONTENT_URL, httpx.Response(302, headers={"Location": DOWNLOAD_URL}, stream=redirect_body))
+    ms.on("GET", DOWNLOAD_PAGE, httpx.Response(200, stream=body))
+
+    written, received = _download(ms)
+
+    assert written == 11
+    assert received == [b"hello ", b"world"]
+    content, fetch = _non_token_requests(ms)
+    assert str(content.url) == CONTENT_URL
+    assert content.headers["authorization"] == f"Bearer {TOKEN}-1"
+    assert str(fetch.url) == DOWNLOAD_URL
+    assert "authorization" not in fetch.headers
+    assert redirect_body.closed and body.closed
+
+
+def test_a_200_from_graph_is_streamed_directly():
+    ms = FakeMicrosoft()
+    ms.on("GET", CONTENT_URL, httpx.Response(200, stream=Chunks([b"abc"])))
+
+    written, received = _download(ms)
+
+    assert (written, received) == (3, [b"abc"])
+    assert len(_non_token_requests(ms)) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "location"),
+    [
+        (302, DOWNLOAD_URL),
+        (303, DOWNLOAD_URL),
+        (302, DOWNLOAD_URL.replace("contoso.sharepoint.com", "Contoso.SharePoint.COM")),
+        (302, DOWNLOAD_URL.replace("contoso.sharepoint.com", "contoso.sharepoint.com:443")),
+    ],
+)
+def test_allowed_redirects(status, location):
+    ms = FakeMicrosoft()
+    ms.on("GET", CONTENT_URL, _redirect(location, status))
+    ms.on("GET", DOWNLOAD_PAGE, httpx.Response(200, stream=Chunks([b"ok"])))
+
+    assert _download(ms) == (2, [b"ok"])
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        None,
+        "",
+        "https://evil.example/download.aspx?tempauth=tempauth-secret-7c1d",
+        "https://other.sharepoint.com/x?tempauth=tempauth-secret-7c1d",
+        "http://contoso.sharepoint.com/x?tempauth=tempauth-secret-7c1d",
+        "https://contoso.sharepoint.com:8443/x?tempauth=tempauth-secret-7c1d",
+        "https://contoso.sharepoint.com:abc/x?tempauth=tempauth-secret-7c1d",
+        "https://user:pw@contoso.sharepoint.com/x?tempauth=tempauth-secret-7c1d",
+        "https://contoso.sharepoint.com%2F@evil.example/x?tempauth=tempauth-secret-7c1d",
+        "/sites/team/_layouts/15/download.aspx?tempauth=tempauth-secret-7c1d",
+    ],
+)
+def test_a_redirect_anywhere_else_is_refused_without_a_request(location):
+    ms = FakeMicrosoft()
+    ms.on("GET", CONTENT_URL, _redirect(location))
+
+    with pytest.raises(SharePointError) as raised:
+        _download(ms)
+
+    assert raised.value.kind is SharePointErrorKind.UNREACHABLE
+    assert "tempauth" not in str(raised.value)
+    assert [str(r.url) for r in _non_token_requests(ms)] == [CONTENT_URL]
+
+
+@pytest.mark.parametrize("second", [302, 404, 500])
+def test_any_other_answer_from_the_site_host_is_unreachable(second):
+    ms = FakeMicrosoft()
+    ms.on("GET", CONTENT_URL, _redirect(DOWNLOAD_URL))
+    ms.on("GET", DOWNLOAD_PAGE, _redirect(DOWNLOAD_URL) if second == 302 else httpx.Response(second, stream=Chunks([b"x"])))
+
+    with pytest.raises(SharePointError) as raised:
+        _download(ms)
+
+    assert raised.value.kind is SharePointErrorKind.UNREACHABLE
+    assert len(_non_token_requests(ms)) == 2
+
+
+def test_a_missing_file_is_item_not_found():
+    ms = FakeMicrosoft()
+    ms.on("GET", CONTENT_URL, httpx.Response(404, stream=Chunks([b"{}"])))
+
+    with pytest.raises(SharePointError) as raised:
+        _download(ms)
+
+    assert raised.value.kind is SharePointErrorKind.ITEM_NOT_FOUND
+
+
+def test_throttling_is_waited_out_on_both_hops():
+    ms = FakeMicrosoft()
+    busy = {"Retry-After": "2"}
+    ms.on("GET", CONTENT_URL, httpx.Response(429, headers=busy), _redirect(DOWNLOAD_URL))
+    ms.on("GET", DOWNLOAD_PAGE, httpx.Response(503, headers=busy), httpx.Response(200, stream=Chunks([b"ok"])))
+    fake_time = FakeTime()
+
+    assert _download(ms, fake_time) == (2, [b"ok"])
+    assert fake_time.slept == [2.0, 2.0]
+
+
+def test_a_401_on_the_content_request_refetches_the_token_once():
+    ms = FakeMicrosoft()
+    ms.on("GET", CONTENT_URL, httpx.Response(401), _redirect(DOWNLOAD_URL))
+    ms.on("GET", DOWNLOAD_PAGE, httpx.Response(200, stream=Chunks([b"ok"])))
+
+    assert _download(ms) == (2, [b"ok"])
+    first, second, _ = _non_token_requests(ms)
+    assert first.headers["authorization"] == f"Bearer {TOKEN}-1"
+    assert second.headers["authorization"] == f"Bearer {TOKEN}-2"
+
+
+def test_two_401s_on_the_content_request_mean_the_key_was_rejected():
+    ms = FakeMicrosoft()
+    ms.on("GET", CONTENT_URL, httpx.Response(401))
+
+    with pytest.raises(SharePointError) as raised:
+        _download(ms)
+
+    assert raised.value.kind is SharePointErrorKind.KEY_REJECTED
+    assert ms.token_count == 2
+
+
+def test_each_raw_read_reaches_the_sink_before_the_next_is_read():
+    ms = FakeMicrosoft()
+    events: list[str] = []
+    ms.on("GET", CONTENT_URL, httpx.Response(200, stream=Chunks([b"a", b"b", b"c"], events)))
+
+    _download(ms, sink=lambda chunk: events.append(f"sink {chunk.decode()}"))
+
+    assert events == ["read 0", "sink a", "read 1", "sink b", "read 2", "sink c"]
+
+
+def test_the_import_deadline_passing_between_two_reads_stops_the_download():
+    ms = FakeMicrosoft()
+    fake_time = FakeTime()
+
+    def late(index: int) -> None:
+        if index == 1:
+            fake_time.now += sharepoint.IMPORT_SECONDS
+
+    body = Chunks([b"first", b"second"], before=late)
+    ms.on("GET", CONTENT_URL, httpx.Response(200, stream=body))
+    received: list[bytes] = []
+
+    with pytest.raises(SharePointError) as raised:
+        _download(ms, fake_time, sink=received.append)
+
+    assert raised.value.kind is SharePointErrorKind.IMPORT_TOO_SLOW
+    assert "15 minutes" in str(raised.value)
+    assert received == [b"first"]
+    assert body.closed
+
+
+def test_a_read_timeout_at_the_end_of_the_import_budget_is_too_slow():
+    ms = FakeMicrosoft()
+    fake_time = FakeTime()
+
+    def stall(index: int) -> None:
+        if index == 1:
+            fake_time.now += sharepoint.IMPORT_SECONDS
+            raise httpx.ReadTimeout("stalled")
+
+    ms.on("GET", CONTENT_URL, httpx.Response(200, stream=Chunks([b"first", b"second"], before=stall)))
+
+    with pytest.raises(SharePointError) as raised:
+        _download(ms, fake_time)
+
+    assert raised.value.kind is SharePointErrorKind.IMPORT_TOO_SLOW
+
+
+def test_the_shared_byte_budget_stops_a_file_mid_way():
+    ms = FakeMicrosoft()
+    body = Chunks([b"abc", b"def"])
+    ms.on("GET", CONTENT_URL, httpx.Response(200, stream=body))
+    received: list[bytes] = []
+
+    with pytest.raises(SharePointError) as raised:
+        _download(ms, budget=DownloadBudget(5), sink=received.append)
+
+    assert raised.value.kind is SharePointErrorKind.TOO_LARGE
+    assert received == [b"abc"]
+    assert body.closed
+
+
+def test_a_disk_error_from_the_sink_propagates_and_the_response_is_closed():
+    ms = FakeMicrosoft()
+    body = Chunks([b"abc"])
+    ms.on("GET", CONTENT_URL, _redirect(DOWNLOAD_URL))
+    ms.on("GET", DOWNLOAD_PAGE, httpx.Response(200, stream=body))
+
+    def full_disk(_chunk: bytes) -> None:
+        raise OSError(28, "No space left on device")
+
+    with pytest.raises(OSError) as raised:
+        _download(ms, sink=full_disk)
+
+    assert raised.value.errno == 28
+    assert body.closed
+
+
+def test_the_download_url_stays_out_of_errors_and_the_module_log():
+    records: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Collect(level=logging.DEBUG)
+    module_logger = logging.getLogger(sharepoint.__name__)
+    saved_level = module_logger.level
+    module_logger.addHandler(handler)
+    module_logger.setLevel(logging.DEBUG)
+    errors = []
+    try:
+        for second in (httpx.Response(500, stream=Chunks([DOWNLOAD_URL.encode()])), _redirect(DOWNLOAD_URL)):
+            ms = FakeMicrosoft()
+            ms.on("GET", CONTENT_URL, _redirect(DOWNLOAD_URL))
+            ms.on("GET", DOWNLOAD_PAGE, second)
+            with pytest.raises(SharePointError) as raised:
+                _download(ms)
+            errors.append(raised.value)
+        ms = FakeMicrosoft()
+        ms.on("GET", CONTENT_URL, _redirect(DOWNLOAD_URL.replace("contoso", "evil")))
+        with pytest.raises(SharePointError) as raised:
+            _download(ms)
+        errors.append(raised.value)
+    finally:
+        module_logger.removeHandler(handler)
+        module_logger.setLevel(saved_level)
+
+    for text in [r.getMessage() for r in records] + [repr(e) for e in errors] + [repr(e.__cause__) for e in errors]:
+        assert "tempauth" not in text
+        assert "download.aspx" not in text
+
+
+_LOGGED_DOWNLOAD = textwrap.dedent(
+    """
+    import logging
+
+    import httpx
+
+    from cowork.common.logger import setup_logging
+    from cowork.services.connectors.sharepoint import AppKey, DownloadBudget, SharePointClient, Site
+
+    setup_logging()
+    records = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logging.getLogger().addHandler(Collect(level=logging.DEBUG))
+
+    def answer(request):
+        if request.url.host == "login.microsoftonline.com":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        if request.url.host == "graph.microsoft.com":
+            return httpx.Response(302, headers={"Location": "%(download)s"})
+        return httpx.Response(200, content=b"bytes")
+
+    key = AppKey("contoso.onmicrosoft.com", "client", "secret")
+    site = Site(url="https://contoso.sharepoint.com/sites/team", graph_id="contoso.sharepoint.com,a,b")
+    with SharePointClient(key, transport=httpx.MockTransport(answer)) as client:
+        client.download(site, "b!Lib", "01f", lambda chunk: None, DownloadBudget(), client.import_deadline())
+    logging.getLogger("cowork.sharepoint.probe").info("collector works")
+    print("RECORDS", records)
+    """
+) % {"download": DOWNLOAD_URL}
+
+
+def test_cowork_logging_keeps_the_download_url_out_of_every_log():
+    env = {**os.environ, "LOG_LEVEL": "DEBUG", "ENABLE_FILE_LOGGING": "false"}
+    result = subprocess.run(
+        [sys.executable, "-c", _LOGGED_DOWNLOAD], capture_output=True, text=True, timeout=60, env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "collector works" in result.stdout
+    assert "tempauth" not in result.stdout + result.stderr
