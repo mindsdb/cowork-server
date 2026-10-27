@@ -294,9 +294,12 @@ def test_deleting_a_schedule_removes_its_versions_occurrences_and_runs(engine):
 
 def test_lifecycle_events_are_recorded(engine):
     schedule_id = _create(engine)
-    with Session(engine) as session:
+    # autoflush off, as the app's sessions run (db/session.py).
+    with Session(engine, autoflush=False) as session:
         service = ScheduleService(_scoped(session))
         service.update_schedule(schedule_id, prompt="New prompt")
+        service.pause_schedule(schedule_id)
+        # A second pause changes nothing, so it records nothing.
         service.pause_schedule(schedule_id)
         service.resume_schedule(schedule_id)
 
