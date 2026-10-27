@@ -496,7 +496,7 @@ _FORM_BLOCK = re.compile(r"```data-vault-form[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```
 _GLUED_FORM_FENCE = re.compile(r"(?<=[^\n])```data-vault-form")
 # A CommonMark code fence line: up to three spaces, then three or more
 # backticks or tildes, then the info string.
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 # Matched in the block's text, not parsed: the renderer opens loosely written
 # JSON that json.loads refuses.
 _FORM_ID = re.compile(r'"form_id"\s*:\s*"([^"]*)"')
@@ -542,24 +542,26 @@ def requested_form(tool_rows: Sequence[object]) -> RequestedForm | None:
 
 
 def _open_fence(answer: str) -> str | None:
-    """The fence of the code block ``answer`` ends inside, or None when it
-    ends outside every code block.
+    """The opening fence of the code block ``answer`` ends inside, with its
+    indent, or None when it ends outside every code block.
 
     Follows CommonMark's fence rules: a backtick fence whose info string holds
     a backtick is inline code, and a block closes only on a fence of the same
-    character, at least as long, with nothing after it."""
-    open_fence: str | None = None
-    for line in _GLUED_FORM_FENCE.sub("\n```data-vault-form", answer).splitlines():
+    character, at least as long, with nothing after it. The indent is kept so
+    a closing fence stays inside the list item its block belongs to."""
+    open_indent, open_fence = "", ""
+    lines = _GLUED_FORM_FENCE.sub("\n```data-vault-form", answer).split("\n")
+    for line in (line.rstrip("\r") for line in lines):
         match = _FENCE.match(line)
         if match is None:
             continue
-        fence, info = match.groups()
-        if open_fence is None:
+        indent, fence, info = match.groups()
+        if not open_fence:
             if not (fence[0] == "`" and "`" in info):
-                open_fence = fence
+                open_indent, open_fence = indent, fence
         elif fence[0] == open_fence[0] and len(fence) >= len(open_fence) and not info.strip():
-            open_fence = None
-    return open_fence
+            open_indent, open_fence = "", ""
+    return open_indent + open_fence if open_fence else None
 
 
 def missing_form_text(answer: str, form: RequestedForm) -> str:

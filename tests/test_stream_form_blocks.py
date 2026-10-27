@@ -227,6 +227,17 @@ async def test_an_answer_cut_off_inside_a_tilde_block_is_closed_with_tildes():
     _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
 
     assert saved.startswith(answer + "\n~~~\n\n")
+    assert _opened_form_id(saved) == _form_id(_block(result))
+
+
+async def test_an_answer_cut_off_inside_a_list_item_code_block_closes_it_in_the_item():
+    result = await _form_result()
+    answer = "1. Install the driver:\n  ```bash\n  pip ins"
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved.startswith(answer + "\n  ```\n\n")
+    assert _opened_form_id(saved) == _form_id(_block(result))
 
 
 @pytest.mark.parametrize("answer", [
