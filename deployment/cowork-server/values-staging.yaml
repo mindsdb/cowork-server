@@ -50,49 +50,14 @@ deployment:
             serviceName: cowork-server
             servicePort: 80
 
-  # Draft-preview host. A second Ingress with no auth-url: the signed link in
-  # the path is the credential, and the draft sub-app checks it. It sends /_t/
-  # to the draft port only, where the API app does not listen, and pins the
-  # upstream Host, which ingress-nginx would otherwise take from a client's
-  # X-Forwarded-Host (use-forwarded-headers).
+  # Draft-preview host. values.yaml builds the draft Ingress and the
+  # COWORK_DRAFT_* variables from these two; ingress_secondary.enabled is not
+  # templated, so it is switched on here too. webOrigin is the primary host
+  # above, where the web app runs.
+  draftHost: draft-staging.mindshub.co
+  webOrigin: https://cowork.staging.mindshub.ai
   ingress_secondary:
     enabled: true
-    # The default would repeat the primary Ingress's name.
-    name: cowork-server-draft
-    # The controller that serves the primary Ingress.
-    nginx_class: "infrastructure"
-    # Cookie affinity would add a "route" Set-Cookie; the draft host sets none.
-    nginx_affinity: false
-    annotations:
-      nginx.ingress.kubernetes.io/upstream-vhost: "draft-staging.mindshub.co"
-      # The path carries the link token; keep it out of the access log.
-      nginx.ingress.kubernetes.io/enable-access-log: "false"
-      # Defense in depth: the draft sub-app never reads identity headers, and
-      # this drops them before they reach the pod.
-      nginx.ingress.kubernetes.io/configuration-snippet: |
-        more_clear_input_headers "X-User-*" "X-Organization-*" "X-Cowork-*" "X-Forwarded-User";
-    hosts:
-      - host: draft-staging.mindshub.co
-        enableMultiPath: true
-        paths:
-          - path: /_t/
-            serviceName: cowork-server
-            servicePort: 9011
-
-  # The draft listener (COWORK_DRAFT_PORT below): a second server in the same
-  # process that serves only the draft sub-app. The Service exposes it under
-  # the same name; templates/network-policy.yaml admits it from the ingress.
-  additionalPorts:
-    - name: draft
-      containerPort: 9011
-      protocol: TCP
-
-  service:
-    additionalPorts:
-      - name: draft
-        port: 9011
-        targetPort: draft
-        protocol: TCP
 
   extraEnvs:
 
@@ -128,25 +93,3 @@ deployment:
     #   value: "50"
     # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
     #   value: "5"
-
-    # Draft-preview links: the draft listener's port, the draft host it answers
-    # for, the origin links point at, the only page allowed to frame a draft
-    # (CSP frame-ancestors), and the signing key ring. The key is optional so a
-    # missing secret leaves draft links off (srcdoc previews) instead of
-    # blocking the pod; cowork-server logs a warning at boot.
-    - name: COWORK_DRAFT_PORT
-      value: "9011"
-    - name: COWORK_DRAFT_HOSTS
-      value: "draft-staging.mindshub.co"
-    - name: COWORK_DRAFT_ORIGIN
-      value: "https://draft-staging.mindshub.co"
-    - name: COWORK_WEB_ORIGIN
-      value: "https://cowork.staging.mindshub.ai"
-    - name: COWORK_DRAFT_LINK_KID
-      value: "v1"
-    - name: COWORK_DRAFT_LINK_KEYS
-      valueFrom:
-        secretKeyRef:
-          name: mindsdb-secrets
-          key: COWORK_DRAFT_LINK_KEYS
-          optional: true

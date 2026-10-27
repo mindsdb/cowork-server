@@ -53,6 +53,39 @@ The chart references these Secrets in the target namespace:
   datasource turn is refused, so the bundle must exist before
   `COWORK_TURN_DATASOURCE_ENABLED` turns on, not before this deploys. PR
   environments get it from the keycloak chart's ephemeral secrets.
+- `mindsdb-secrets`, key `COWORK_DRAFT_LINK_KEYS` — the draft-link signing
+  keys, a JSON object `{"<kid>": "<secret>"}`. Each secret must be at least 32
+  characters. A shorter secret is ignored, and a value that is not a JSON
+  object counts as no keys. `COWORK_DRAFT_LINK_KID` (`v1`, in `values.yaml`)
+  names the kid that signs new links, and a link signed with any listed kid
+  still opens. So a rotation adds the new kid, moves `COWORK_DRAFT_LINK_KID`
+  to it, and drops the old kid once its links have expired (30 minutes). The
+  reference is optional: without the key, or without the signing kid in it,
+  the pod starts, logs `draft_host_misconfigured` at boot and keeps previews
+  on srcdoc. The pod reads the key at start, so a change needs a rollout
+  restart.
+
+## Draft-preview host
+
+Off in `values.yaml`. An environment turns it on in `values-<env>.yaml` with
+two names and one switch:
+
+```yaml
+deployment:
+  draftHost: draft-staging.mindshub.co
+  webOrigin: https://cowork.staging.mindshub.ai
+  ingress_secondary:
+    enabled: true
+```
+
+The draft Ingress, the draft port and the `COWORK_DRAFT_*` variables live in
+`values.yaml`, templated from these two names, so do not repeat them per
+environment. `draftHost` must be one of the hosts cowork's web build frames
+(`src/shared/draft-link-origins.ts` in the cowork repository), and `webOrigin`
+is `https://` plus the primary Ingress host, where the web app runs.
+`tests/test_chart_values.py` pins both. Links turn on once
+`COWORK_DRAFT_LINK_KEYS` holds the signing kid, and `/health` then reports
+`draft_links: true`.
 
 ## Datasource grants for hosted turns
 

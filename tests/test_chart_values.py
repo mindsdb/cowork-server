@@ -1,4 +1,4 @@
-"""The cowork-server chart's datasource values: off by default, one identity, no duplicates.
+"""The cowork-server chart's values: datasource grants and the draft-preview host.
 
 Cloud datasource grants for hosted turns sit behind ``COWORK_TURN_DATASOURCE_ENABLED``
 and ``COWORK_DATASOURCE_CAPABILITIES``. Three facts about the values files hold
@@ -19,6 +19,15 @@ the rollout together, and each fails quietly on its own:
   file: a duplicate renders fine and then either fails the upgrade or silently
   empties the variable. The controller's guard exists because that emptied its
   worker image in prod; this chart had no such guard.
+
+The draft-preview host is one Ingress, one container port and the
+``COWORK_DRAFT_*`` variables, all in the base and templated from two
+per-environment names, ``draftHost`` and ``webOrigin``. None of them fails at
+render time when they disagree: a wrong port answers 502, a host the listener
+does not know answers 404 (``draft_host_unknown``), a host outside the web
+build's list is refused by the page, and a wrong web origin blocks the frame
+(CSP frame-ancestors). So the tests pin every reference to its one name, keep
+the per-environment files to the names alone, and pin the names themselves.
 """
 
 from __future__ import annotations
@@ -41,6 +50,14 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # until it does; the gate's own change adds the environment here and sets
 # both deployment scalars in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset()
+# The draft host of each environment. cowork's web build frames exactly these
+# (src/shared/draft-link-origins.ts there) and refuses a link to any other.
+DRAFT_HOSTS = {
+    "dev": "draft-dev.mindshub.co",
+    "staging": "draft-staging.mindshub.co",
+    "prod": "draft.mindshub.co",
+}
+DRAFT_HOST = "{{ $.Values.draftHost }}"
 
 
 @dataclass(frozen=True)
@@ -143,28 +160,56 @@ def test_no_env_name_is_declared_twice_per_environment(base, env_values):
     assert not duplicates, f"{env_values.name} renders {duplicates} more than once with values.yaml"
 
 
-@pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
-def test_the_draft_port_is_the_draft_listener_wherever_a_draft_host_is_routed(base, env_values):
+def test_the_draft_host_is_off_in_the_base():
+    """A PR environment renders the base alone: no draft Ingress, and an empty
+    COWORK_DRAFT_PORT, which starts no listener."""
+    deployment = _deployment(BASE)
+    assert (deployment["draftHost"], deployment["webOrigin"]) == ("", "")
+    assert deployment["ingress_secondary"]["enabled"] is False
+
+
+def test_every_draft_host_reference_is_the_draft_host_name(base):
+    """The host the links point at, the hosts the listener answers for, the
+    Ingress host and the upstream Host the Ingress pins are one name, so a typo
+    cannot split them. The frame origin is the other name."""
+    secondary = _deployment(BASE)["ingress_secondary"]
+    assert _entry(base, "COWORK_DRAFT_HOSTS").value == DRAFT_HOST
+    assert _entry(base, "COWORK_DRAFT_ORIGIN").value == "{{ with $.Values.draftHost }}https://{{ . }}{{ end }}"
+    assert [host["host"] for host in secondary["hosts"]] == [DRAFT_HOST]
+    assert secondary["annotations"]["nginx.ingress.kubernetes.io/upstream-vhost"] == DRAFT_HOST
+    assert _entry(base, "COWORK_WEB_ORIGIN").value == "{{ $.Values.webOrigin }}"
+
+
+def test_the_draft_port_is_the_draft_listener(base):
     """The draft Ingress, the Service port it targets, the container port and
     COWORK_DRAFT_PORT are one port, and the Service sends it to the container
     port named draft, never to the API's. The listener binds
-    COWORK_SERVER_HOST, not the command's --host. Any drift answers 502 or
-    puts the API app behind the draft host."""
-    entries = base + _env(env_values)
-    deployment = {**_deployment(BASE), **_deployment(env_values)}
-    port = next((entry.value for entry in entries if entry.name == "COWORK_DRAFT_PORT"), None)
-    secondary = deployment.get("ingress_secondary") or {}
-    if port is None and not secondary.get("enabled"):
-        pytest.skip(f"{env_values.name} routes no draft host")
-    assert port is not None, f"{env_values.name} routes a draft host but sets no COWORK_DRAFT_PORT"
-    assert secondary.get("enabled") is True, f"{env_values.name} sets COWORK_DRAFT_PORT but routes no draft host"
-    assert _entry(entries, "COWORK_SERVER_HOST").value == "0.0.0.0"
-    container = {p["name"]: p["containerPort"] for p in deployment.get("additionalPorts") or []}
-    service = {p["name"]: p for p in (deployment.get("service") or {}).get("additionalPorts") or []}
-    paths = [path for host in secondary.get("hosts") or [] for path in host.get("paths") or []]
-    assert container.get("draft") == int(port), env_values.name
-    assert service.get("draft", {}).get("port") == int(port), env_values.name
-    assert service["draft"].get("targetPort") in ("draft", int(port)), env_values.name
-    assert paths and {(p["path"], p["serviceName"], p["servicePort"]) for p in paths} == {
-        ("/_t/", deployment["name"], int(port))
-    }, env_values.name
+    COWORK_SERVER_HOST, not the command's --host. A drift answers 502 or puts
+    the API app behind the draft host."""
+    deployment = _deployment(BASE)
+    port = {p["name"]: p["containerPort"] for p in deployment["additionalPorts"]}["draft"]
+    service = {p["name"]: p for p in deployment["service"]["additionalPorts"]}["draft"]
+    paths = [path for host in deployment["ingress_secondary"]["hosts"] for path in host["paths"]]
+    assert port != deployment["service"]["targetPort"]
+    assert _entry(base, "COWORK_DRAFT_PORT").value == f"{{{{ if $.Values.draftHost }}}}{port}{{{{ end }}}}"
+    assert (service["port"], service["targetPort"]) == (port, "draft")
+    assert [(p["path"], p["serviceName"], p["servicePort"]) for p in paths] == [("/_t/", deployment["name"], port)]
+    assert _entry(base, "COWORK_SERVER_HOST").value == "0.0.0.0"
+
+
+@pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
+def test_an_environment_names_its_draft_host_and_nothing_more(env_values):
+    """The rest stays in the base, so an override cannot pull one reference
+    away from the others. Helm replaces a list wholesale, so an environment
+    that set the ports or the Ingress hosts would drop the base's. The web app
+    is served from the primary Ingress host, the only page allowed to frame a
+    draft."""
+    environment = env_values.stem.removeprefix("values-")
+    assert environment in DRAFT_HOSTS, f"{env_values.name} has no draft host the web build frames"
+    deployment = _deployment(env_values)
+    primary = [host["host"] for host in deployment["ingress"]["hosts"]]
+    assert deployment.get("draftHost") == DRAFT_HOSTS[environment]
+    assert deployment.get("webOrigin") == f"https://{primary[0]}"
+    assert deployment.get("ingress_secondary") == {"enabled": True}
+    assert "additionalPorts" not in deployment
+    assert "additionalPorts" not in (deployment.get("service") or {})
