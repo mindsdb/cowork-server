@@ -497,20 +497,39 @@ _GLUED_FORM_FENCE = re.compile(r"(?<=[^\n])```data-vault-form")
 # A CommonMark code fence line: up to three spaces, then three or more
 # backticks or tildes, then the info string.
 _FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
-# Matched in the block's text, not parsed: the renderer opens loosely written
-# JSON that json.loads refuses, a single-quoted value included (_looseClean).
-_FORM_ID = re.compile(r"""\"form_id\"\s*:\s*(?:"([^"]*)"|'([^']*)')""")
-# The renderer's _looseClean turns these into ASCII quotes before parsing.
+# Cleanups the renderer's _looseClean (cowork parseFormSpec.js) applies before
+# its second JSON.parse. Its comment stripping is not copied.
+_STRAY_FENCE_OPEN = re.compile(r"^\s*```(?:json|data-vault-form|js|javascript)?\s*\n")
+_STRAY_FENCE_CLOSE = re.compile(r"\n\s*```\s*$")
 _SMART_QUOTES = str.maketrans({c: "'" for c in "‘’‚‛′‵"} | {c: '"' for c in "“”„‟″‶"})
+_SINGLE_QUOTED_VALUE = re.compile(r"(:\s*|,\s*|\[\s*)'((?:[^'\\]|\\.)*)'")
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
+def _loose_json(body: str) -> str:
+    """``body`` after the renderer's cheap cleanups for model-written JSON."""
+    out = _STRAY_FENCE_CLOSE.sub("", _STRAY_FENCE_OPEN.sub("", body))
+    out = out.translate(_SMART_QUOTES)
+    out = _SINGLE_QUOTED_VALUE.sub(
+        lambda m: m.group(0) if '"' in m.group(2) else f'{m.group(1)}"{m.group(2)}"', out,
+    )
+    return _TRAILING_COMMA.sub(r"\1", out)
 
 
 def _form_id_in(body: str) -> str | None:
-    """The form id in a form block's body, read as loosely as the renderer
-    reads it, or None when it has none."""
-    match = _FORM_ID.search(body.translate(_SMART_QUOTES))
-    if match is None:
-        return None
-    return match.group(1) if match.group(1) is not None else match.group(2)
+    """The form id of a form block's body when the body parses, strictly or
+    after the renderer's cheap cleanups, or None.
+
+    A body that does not parse counts as no form, so a broken paste never
+    stands in for the form; the panel would show its parse error instead."""
+    for text in (body, _loose_json(body)):
+        try:
+            spec = json.loads(text)
+        except ValueError:
+            continue
+        form_id = spec.get("form_id") if isinstance(spec, dict) else None
+        return form_id if isinstance(form_id, str) else None
+    return None
 
 
 @dataclass(frozen=True)

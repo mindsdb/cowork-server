@@ -155,6 +155,30 @@ async def test_a_pasted_form_with_a_single_quoted_id_shows_once(quote):
     assert saved == answer
 
 
+async def test_a_broken_paste_with_the_right_id_gets_the_form_after_it():
+    result = await _form_result()
+    broken = _block(result).replace("\n}\n```", "\n\n```")
+    answer = f"Fill this in:\n\n{broken}\n"
+    assert _form_id(_block(result)) in broken
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved.startswith(answer)
+    assert _opened_form_id(saved) == _form_id(_block(result))
+
+
+async def test_a_paste_with_comments_gets_a_second_card_the_panel_opens():
+    # Accepted: the server does not copy the renderer's comment stripping.
+    result = await _form_result()
+    commented = _block(result).replace("{\n", "{\n  // the connection form\n", 1)
+    answer = f"Fill this in:\n\n{commented}\n"
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved == f"{answer}\n{_block(result)}\n"
+    assert _opened_form_id(saved) == _form_id(_block(result))
+
+
 async def test_a_refused_call_adds_nothing():
     refused = await _cowork_request_credentials(session=None, tc_input={"title": "No engine"})
     assert "```" not in refused
