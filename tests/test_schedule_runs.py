@@ -633,9 +633,10 @@ def test_turn_terminal_reason_none_without_handle(monkeypatch):
     assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
 
 
-def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
+def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
     """Run execute_schedule with a no-op turn and a forced terminal reason;
-    return the resulting run/schedule state as plain values."""
+    return the resulting run/schedule state as plain values. ``turn``, when
+    given, is awaited inside the turn's stream in place of the no-op."""
     import asyncio
 
     import cowork.handlers.responses as responses_mod
@@ -651,6 +652,8 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
 
         async def handle(self, request):
             async def _gen():
+                if turn is not None:
+                    await turn()
                 if False:
                     yield
 
@@ -733,6 +736,40 @@ def test_execute_schedule_completed_is_success(monkeypatch):
     assert state["last_error"] is None
     assert state["last_run_at"] is not None
     assert state["next_advanced"] is True
+
+
+async def _turn_raises():
+    raise RuntimeError("turn blew up")
+
+
+def test_execute_schedule_that_raises_consumes_its_slot(monkeypatch):
+    state = _execute_with_terminal(monkeypatch, None, turn=_turn_raises)
+    assert state["run_status"] == RunStatus.failed
+    assert state["last_error"] == "turn blew up"
+    # Left due, the next poll would start the failing run again.
+    assert state["next_advanced"] is True
+
+
+def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "_MAX_RUN_DURATION_SECONDS", 0.01)
+
+    async def _hangs():
+        await asyncio.sleep(5)
+
+    state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
+    assert state["run_status"] == RunStatus.failed
+    assert "max duration" in state["last_error"]
+    assert state["next_advanced"] is True
+
+
+def test_manual_run_that_raises_leaves_the_cron_slot(monkeypatch):
+    state = _execute_with_terminal(monkeypatch, None, is_manual=True, turn=_turn_raises)
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is False
 
 
 def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversation(

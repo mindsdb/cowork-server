@@ -298,10 +298,16 @@ def _record_turn_outcome(
     return outcome
 
 
-def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str) -> None:
+def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str, is_manual: bool) -> None:
     schedule = ScheduleService(session).get_schedule(schedule_id)
     schedule.last_error = error
     session.add(schedule)
+    # A run that raised consumes its cron slot like one that failed inside its
+    # turn. Left due, the next poll starts it again, and a failure that
+    # repeats (a timeout, a revoked permission) re-fires every poll. A run that
+    # disabled its schedule has already stopped the re-fire.
+    if not is_manual and schedule.enabled:
+        _advance_next_run_at(schedule, session)
 
 
 def _finish_run(
@@ -436,11 +442,15 @@ async def execute_schedule(
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
         try:
-            await run_db(
-                partial(_record_schedule_error, schedule_id=schedule_id, error=error), scope=SYSTEM_SCOPE,
+            await _until_it_lands(
+                partial(_record_schedule_error, schedule_id=schedule_id, error=error, is_manual=is_manual),
+                schedule_id=schedule_id,
             )
         except Exception:
-            pass
+            logger.exception(
+                "Failed to record the scheduled run's error",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
     finally:
         try:
             # This write must always land or the run strands at `running` and
