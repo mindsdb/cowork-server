@@ -122,3 +122,62 @@ def test_occurrences_upgrade_keeps_existing_runs_and_matches_the_models(database
 
     assert "schedule_occurrences" not in sa.inspect(engine).get_table_names()
     assert {"occurrence_id", "outcome", "execution_started_at"}.isdisjoint(_columns(engine, "schedule_runs"))
+
+
+PAUSE_AND_MISSED = "15812ea140b3"
+
+
+def _add_schedule(connection, project_id, *, cadence: str, enabled: bool, missed_runs: int = 0) -> uuid.UUID:
+    schedule_id = uuid.uuid4()
+    connection.execute(_schedules.insert().values(
+        id=schedule_id, title=cadence, prompt="Summarize", cadence=cadence,
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc), enabled=enabled, model="default",
+        project_id=project_id, timezone="UTC", missed_runs=missed_runs,
+    ))
+    return schedule_id
+
+
+def test_pause_upgrade_sorts_existing_disabled_schedules_into_their_states(database):
+    from cowork.models.schedule import Schedule, ScheduleSkippedPeriod
+
+    engine, uri = database
+    _migrate(engine, uri, OCCURRENCES)
+    project_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(_projects.insert().values(id=project_id, name="seed", path="/seed"))
+        active = _add_schedule(connection, project_id, cadence="daily", enabled=True)
+        paused = _add_schedule(connection, project_id, cadence="daily", enabled=False)
+        ran = _add_schedule(connection, project_id, cadence="once", enabled=False)
+        missed = _add_schedule(connection, project_id, cadence="once", enabled=False, missed_runs=1)
+        paused_once = _add_schedule(connection, project_id, cadence="once", enabled=False)
+        now = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+        connection.execute(_runs.insert().values(
+            id=uuid.uuid4(), schedule_id=ran, started_at=now, finished_at=now, status="failed", is_manual=False,
+        ))
+
+    _migrate(engine, uri, PAUSE_AND_MISSED)
+
+    assert {"paused_at", "missed_at", "auto_paused_at", "consecutive_failures"} <= _columns(engine, "schedules")
+    assert _columns(engine, "schedule_skipped_periods") == set(ScheduleSkippedPeriod.__table__.columns.keys())
+    assert set(Schedule.__table__.columns.keys()) <= _columns(engine, "schedules")
+    with engine.connect() as connection:
+        reflected = sa.Table("schedules", sa.MetaData(), autoload_with=connection)
+        rows = {
+            str(r["id"]).replace("-", ""): r
+            for r in connection.execute(sa.select(reflected)).mappings().all()
+        }
+
+    def state(schedule_id):
+        row = rows[schedule_id.hex]
+        return (row["paused_at"] is not None, row["missed_at"] is not None)
+
+    assert state(active) == (False, False)
+    assert state(paused) == (True, False)
+    assert state(ran) == (False, False)
+    assert state(missed) == (False, True)
+    assert state(paused_once) == (True, False)
+
+    _migrate(engine, uri, OCCURRENCES, down=True)
+
+    assert "schedule_skipped_periods" not in sa.inspect(engine).get_table_names()
+    assert {"paused_at", "missed_at"}.isdisjoint(_columns(engine, "schedules"))
