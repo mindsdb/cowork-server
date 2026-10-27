@@ -34,11 +34,18 @@ from cowork.schemas.schedules import (
     DEFAULT_MODEL_SENTINEL,
     Cadence,
     ScheduleCreateRequest,
+    ScheduleState,
     ScheduleUpdateRequest,
+    schedule_state,
 )
-from cowork.services.schedules import ScheduleService
+from cowork.services.schedules import ScheduleConflict, ScheduleService
 
 logger = get_logger(__name__)
+
+# A one-off that already ran, or missed its time, has nothing left to pause.
+_NOT_SCHEDULED = (
+    "This one-off task isn't scheduled to run. Update `next_run_at` to a future time to schedule it again."
+)
 
 LIST_TOOL_NAME = "list_scheduled_tasks"
 MANAGE_TOOL_NAME = "manage_scheduled_task"
@@ -129,7 +136,7 @@ def _summary(schedule) -> dict:
         "cadence": str(getattr(schedule.cadence, "value", schedule.cadence)),
         "timezone": schedule.timezone,
         "next_run_at": ensure_utc(schedule.next_run_at).isoformat(),
-        "paused": not schedule.enabled,
+        "state": schedule_state(schedule).value,
     }
 
 
@@ -454,11 +461,13 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
                     return _result("Those values are what the task already has, so there's nothing to change.", before)
                 apply = partial(_update_unit, schedule_id=schedule_id, changes=changes)
             elif action == "pause":
-                if before["paused"]:
+                if before["state"] in (ScheduleState.paused, ScheduleState.auto_paused):
                     return _result("This task is already paused.", before)
+                if before["state"] != ScheduleState.active:
+                    return _result(_NOT_SCHEDULED, before)
                 apply = partial(_pause_unit, schedule_id=schedule_id)
             elif action == "resume":
-                if not before["paused"]:
+                if before["state"] not in (ScheduleState.paused, ScheduleState.auto_paused):
                     return _result("This task isn't paused.", before)
                 if before["cadence"] == Cadence.once.value and (
                     datetime.fromisoformat(before["next_run_at"]) <= datetime.now(timezone.utc)
@@ -485,6 +494,9 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
     except ValueError as exc:
         # The task was deleted, or its project went away, while the card waited.
         return _result(f"Nothing was changed: {exc}.")
+    except ScheduleConflict as exc:
+        # Its state moved while the card waited, e.g. a one-off's time passed.
+        return _result(f"Nothing was changed: {exc}")
     if action == "delete":
         if not outcome:
             return _result("Nothing was deleted: the task was already gone.")
@@ -504,7 +516,7 @@ def build_schedule_tools(*, project_id: UUID | None) -> list:
     return [
         ToolDef(
             name=LIST_TOOL_NAME,
-            description="List the user's scheduled tasks: id, title, prompt, cadence, timezone, next run, and whether it's paused.",
+            description="List the user's scheduled tasks: id, title, prompt, cadence, timezone, next run, and state (active, paused, auto_paused after repeated failures, missed, or done).",
             input_schema=_LIST_SCHEMA,
             handler=_list_tasks,
         ),

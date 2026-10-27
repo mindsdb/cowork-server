@@ -255,16 +255,39 @@ async def test_a_change_the_user_cancels_leaves_the_task_as_it_was(action, tc_in
     assert await _page_schedules() == before
 
 
+async def test_an_auto_paused_task_resumes_and_a_finished_one_off_does_not_pause():
+    task = await _create_confirmed()
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        schedule.enabled = False
+        schedule.auto_paused_at = datetime.now(timezone.utc)
+        session.add(schedule)
+
+    card = _Card(CONFIRM)
+    await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "resume", "schedule_id": task["schedule_id"]})
+    assert [t["state"] for t in await _page_schedules()] == ["active"]
+
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        schedule.cadence = "once"
+        schedule.enabled = False
+        session.add(schedule)
+
+    result = await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "pause", "schedule_id": task["schedule_id"]})
+    assert result["result"] == schedule_tools._NOT_SCHEDULED
+    assert len(card.shown) == 1
+
+
 async def test_pause_resume_and_delete_each_take_a_confirmation():
     task = await _create_confirmed()
     schedule_id = task["schedule_id"]
 
     card = _Card(CONFIRM)
     await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "pause", "schedule_id": schedule_id})
-    assert [t["enabled"] for t in await _page_schedules()] == [False]
+    assert [t["state"] for t in await _page_schedules()] == ["paused"]
 
     await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "resume", "schedule_id": schedule_id})
-    assert [t["enabled"] for t in await _page_schedules()] == [True]
+    assert [t["state"] for t in await _page_schedules()] == ["active"]
 
     result = await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "delete", "schedule_id": schedule_id})
     assert result["result"] == "Deleted “Daily sales”."

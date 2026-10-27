@@ -1342,6 +1342,7 @@ class AntonHarness:
                 disabled_connections=disabled_connections,
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                interactive=interactive,
                 live_app_notices=notices,
             )
         except BaseException:
@@ -1369,6 +1370,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None,
         channel_context: ChannelContext | None,
         tool_messages: bool,
+        interactive: bool,
         live_app_notices: list[UUID],
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
