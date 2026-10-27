@@ -21,6 +21,7 @@ from cowork.api.v1.endpoints import (
     health,
     hub_usage,
     hub_workspaces,
+    live_apps,
     memory,
     pins,
     project_files,
@@ -29,6 +30,7 @@ from cowork.api.v1.endpoints import (
     responses,
     runtime_credential,
     schedules,
+    shared_projects,
     search,
     settings,
     skills,
@@ -64,6 +66,7 @@ api_router.include_router(connections.router, prefix="/connectors/connections", 
 api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["connectors"])
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(project_files.router, prefix="/projects", tags=["project-files"])
+api_router.include_router(shared_projects.router, prefix="/shared-projects", tags=["shared-projects"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
 # `/tasks` is a branding alias for `/conversations` (ENG-2069) — same router,
 # same request/response schemas, mounted under a second prefix so it can
@@ -77,8 +80,10 @@ api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
+api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
+api_router.include_router(live_apps.router, prefix="/live-apps", tags=["live-apps"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(

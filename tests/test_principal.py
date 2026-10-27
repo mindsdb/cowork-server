@@ -541,7 +541,7 @@ def test_identity_trace_metadata_does_not_mutate_base():
 
 # ── personal partitions (local tenancy, trusted identity headers) ────────────
 
-# The shared vector: cowork-self-hosted's tests pin the same three values.
+# The shared vector: a self-hosted deployment's tests pin the same three values.
 GOLDEN_ORGANIZATION = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 GOLDEN_USER = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
 GOLDEN_PARTITION = "44e92829-e701-599b-88f9-69f5bf1165eb"
