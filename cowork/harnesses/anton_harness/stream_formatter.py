@@ -491,7 +491,12 @@ class ToolRows:
 # The renderer's rule for a form block (cowork parseFormSpec.js extractFormSpec),
 # so the server sees the same blocks the side panel does.
 _FORM_BLOCK = re.compile(r"```data-vault-form[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```")
-_FENCE_LINE = re.compile(r"^[ \t]*```", re.MULTILINE)
+# A form fence glued to the end of a sentence, which the renderer moves onto
+# its own line (MarkdownContent.jsx _normalizeFormFences).
+_GLUED_FORM_FENCE = re.compile(r"(?<=[^\n])```data-vault-form")
+# A CommonMark code fence line: up to three spaces, then three or more
+# backticks or tildes, then the info string.
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # Matched in the block's text, not parsed: the renderer opens loosely written
 # JSON that json.loads refuses.
 _FORM_ID = re.compile(r'"form_id"\s*:\s*"([^"]*)"')
@@ -536,6 +541,27 @@ def requested_form(tool_rows: Sequence[object]) -> RequestedForm | None:
     return found
 
 
+def _open_fence(answer: str) -> str | None:
+    """The fence of the code block ``answer`` ends inside, or None when it
+    ends outside every code block.
+
+    Follows CommonMark's fence rules: a backtick fence whose info string holds
+    a backtick is inline code, and a block closes only on a fence of the same
+    character, at least as long, with nothing after it."""
+    open_fence: str | None = None
+    for line in _GLUED_FORM_FENCE.sub("\n```data-vault-form", answer).splitlines():
+        match = _FENCE.match(line)
+        if match is None:
+            continue
+        fence, info = match.groups()
+        if open_fence is None:
+            if not (fence[0] == "`" and "`" in info):
+                open_fence = fence
+        elif fence[0] == open_fence[0] and len(fence) >= len(open_fence) and not info.strip():
+            open_fence = None
+    return open_fence
+
+
 def missing_form_text(answer: str, form: RequestedForm) -> str:
     """The text that puts ``form`` at the end of ``answer`` so the side panel
     opens it, or "" when the answer already shows it.
@@ -549,11 +575,9 @@ def missing_form_text(answer: str, form: RequestedForm) -> str:
     blocks = list(_FORM_BLOCK.finditer(answer))
     if blocks and _form_id_in(blocks[-1].group(1)) == form.form_id:
         return ""
-    text = answer
-    closing = ""
-    if len(_FENCE_LINE.findall(answer)) % 2:
-        closing = "\n```"
-        text += closing
+    open_fence = _open_fence(answer)
+    closing = f"\n{open_fence}" if open_fence else ""
+    text = answer + closing
     if not text or text.endswith("\n\n"):
         gap = ""
     elif text.endswith("\n"):

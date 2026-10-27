@@ -14,6 +14,7 @@ import json
 import re
 from types import SimpleNamespace
 
+import pytest
 from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
 
 from cowork.harnesses.anton_harness.harness import _captured_turn_history
@@ -206,8 +207,39 @@ async def test_an_answer_cut_off_inside_a_code_block_is_closed_first():
     _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
 
     assert saved.startswith(answer + "\n```\n\n")
-    assert saved.count("```") % 2 == 0
     assert _opened_form_id(saved) == _form_id(_block(result))
+
+
+async def test_a_cut_off_form_fence_glued_to_a_sentence_is_closed_first():
+    result = await _form_result()
+    answer = 'Fill in the form.```data-vault-form\n{\n  "title": "Co'
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved.startswith(answer + "\n```\n\n")
+    assert _opened_form_id(saved) == _form_id(_block(result))
+
+
+async def test_an_answer_cut_off_inside_a_tilde_block_is_closed_with_tildes():
+    result = await _form_result()
+    answer = "~~~python\nimport psycopg"
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved.startswith(answer + "\n~~~\n\n")
+
+
+@pytest.mark.parametrize("answer", [
+    "```psql``` is the client you need.",
+    "````md\n```sql\nselect 1\n````",
+    "~~~text\n```\n~~~",
+], ids=["inline-code-line", "four-backtick-block", "tilde-block"])
+async def test_an_answer_outside_every_code_block_gets_no_closing_fence(answer):
+    result = await _form_result()
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved == f"{answer}\n\n{_block(result)}\n"
 
 
 async def test_a_replaced_answer_still_gets_the_form():
