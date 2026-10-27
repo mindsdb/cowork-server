@@ -107,36 +107,31 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
+          version: "0.11.30"
           python-version: "3.12"
 
-      # Exact cowork-server/anton pairing for the rc stream: pin anton-agent
-      # to its latest staging rc so this wheel records the anton that was
-      # current when it published. The desktop passes the pin as a DIRECT
-      # `--with anton-agent==<rc>` requirement at install time (uv honors
-      # pre-release markers only in direct requirements) — no resolution-wide
-      # prerelease flag is ever used.
-      - name: Pin anton-agent to its latest staging rc
+      # Publishing uses the Anton selected in the reviewed runtime lock.
+      # A newer upload never changes this release's dependency selection.
+      - name: Select anton-agent from the reviewed lock
         id: pin
         run: |
-          set -euo pipefail
-          LATEST=$(curl -fsSL --retry 3 https://pypi.org/pypi/anton-agent/json | jq -r '[.releases | to_entries[] | select(.key | test("^[0-9]+(\\.[0-9]+)*(rc[0-9]+)?$")) | select((.value | length) > 0) | select(any(.value[]; .yanked != true)) | {v: .key, t: ([.value[].upload_time_iso_8601] | max)}] | sort_by(.t) | last | .v')
-          if [[ "$LATEST" == *rc* ]]; then
-            sed -i 's/"anton-agent>=[^"]*"/"anton-agent=='"$LATEST"'"/' pyproject.toml
-            grep -q '"anton-agent=='"$LATEST"'"' pyproject.toml
-            echo "rc=$LATEST" >> "$GITHUB_OUTPUT"
-            echo "Pinned anton-agent==$LATEST"
-          else
-            echo "Latest anton-agent is a stable release ($LATEST); keeping the loose constraint"
-          fi
+          python - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+          packages = tomllib.loads(Path("uv.lock").read_text())["package"]
+          versions = {p["version"] for p in packages if p["name"] == "anton-agent"}
+          if len(versions) != 1:
+              raise SystemExit("Expected one reviewed anton-agent version")
+          version = versions.pop()
+          print(f"Selected anton-agent=={version}")
+          if "rc" in version:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"rc={version}\n")
+          PYTHON
 
-      # The JSON API the pin step reads lists an upload as soon as PyPI accepts
-      # it. uv resolves from the Simple index instead, which can trail the
-      # upload by minutes. Until it catches up, every later step fails with
-      # "there is no version of anton-agent==<rc>", and the wheel check blames
-      # a wheel that is not missing. So wait until uv itself resolves the pin.
-      # `--refresh-package` skips the uv cache setup-uv restored, which can
-      # hold an index page from before the upload; the refreshed page is what
-      # the steps below then read.
+      # Keep the existing visibility wait for an explicitly selected rc.
+      # PyPI can accept its upload before the Simple index serves it.
       - name: Wait until uv resolves the pinned anton-agent rc
         if: steps.pin.outputs.rc != ''
         env:
@@ -161,29 +156,14 @@ jobs:
 
       - name: Build package
         env:
-          # The anton pin dirties the checkout, which would make hatch-vcs
-          # append a +dirty local segment PyPI rejects. Force the version to
-          # exactly what the tag encodes.
+          # Re-runs can leave multiple tags on a commit; use the minted version.
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.release.outputs.version }}
-        run: uv build
+        run: |
+          python scripts/release_contract.py --check
+          uv build
+          python scripts/release_contract.py --check --dist-dir dist
 
-      # Catches the anton/cowork-server pairing race: the pin step above grabs
-      # whichever anton-agent is newest on PyPI right now, which can predate an
-      # anton change this commit already depends on if anton's own matching rc
-      # hasn't finished publishing yet. Installing the wheel about to ship and
-      # importing the app runs the same import chain uvicorn runs at startup
-      # (server.py -> router.py -> endpoints -> services), so a stale pin fails
-      # here instead of on a user's machine.
-      # The `wheels-available` gate above ran against the checked-in
-      # pyproject, i.e. the loose `anton-agent>=...,<3`. The pin step rewrote
-      # that to an exact rc, so the wheel just built can carry a dependency set
-      # the gate never saw — if that rc pulls something with no Intel-Mac or
-      # Windows wheel, desktop users get a source build and the gate stayed
-      # green. The smoke install below cannot catch it either: it runs on
-      # ubuntu and permits source builds.
-      #
-      # So re-run the cross-platform check against the artifact itself, which
-      # is the only thing that carries the pinned metadata.
+      # Check the artifact with the same reviewed contract installers consume.
       - name: Check the built wheel resolves to wheels on every shipped platform
         run: |
           set -euo pipefail
@@ -202,7 +182,9 @@ jobs:
         run: |
           set -euo pipefail
           uv venv .smoke-venv
-          uv pip install --python .smoke-venv "$(ls dist/*.whl)"
+          uv pip install --python .smoke-venv --require-hashes --no-deps --only-binary :all: -r cowork/release-requirements.txt
+          uv pip install --python .smoke-venv --no-deps "$(ls dist/*.whl)"
+          uv pip check --python .smoke-venv
           VENV_PY="$(pwd)/.smoke-venv/bin/python"
           # Run from outside the checkout: the repo root has its own cowork/
           # source directory, and `python -c` puts cwd first on sys.path, so

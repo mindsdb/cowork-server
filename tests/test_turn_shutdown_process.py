@@ -40,6 +40,7 @@ def _hosted_command(port: int) -> list[str]:
     command[command.index("cowork.server:app")] = "turn_shutdown_process_app:app"
     command[command.index("--host") + 1] = "127.0.0.1"
     command[command.index("--port") + 1] = str(port)
+    command[command.index("--log-config") + 1] = str(REPO / "cowork/logging.json")
     return command
 
 

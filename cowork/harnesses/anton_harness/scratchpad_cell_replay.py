@@ -11,6 +11,8 @@ from typing import Any
 
 from anton.core.backends.base import Cell
 
+from cowork.harnesses.anton_harness.stream_formatter import CellStatus
+
 _SCRATCHPAD_END = "thought.scratchpad.end"
 _SCRATCHPAD_RESULT = "thought.scratchpad.result"
 
@@ -19,8 +21,18 @@ _SCRATCHPAD_RESULT = "thought.scratchpad.result"
 # read has to be added here too, or its events never reach it.
 SCRATCHPAD_REPLAY_ROLES = (_SCRATCHPAD_END, _SCRATCHPAD_RESULT)
 
-# Cell's outputs that have no default, for a result cut before them.
-_NO_OUTPUT = {"stdout": "", "stderr": "", "error": None}
+# Cell's stdout and stderr, which have no default, for a result cut before
+# them. Its error, which has no default either, comes from the stored status.
+_NO_OUTPUT = {"stdout": "", "stderr": ""}
+
+# What a replayed cell whose saved result lost its error field reads as, by the
+# status classify_cell_status gave the whole result: a known failure says so,
+# and a cell with no status (an event saved before statuses were) is unknown.
+_LOST_ERROR = {
+    CellStatus.error: "The cell failed; its saved result was cut before the error text.",
+    CellStatus.timeout: "The cell timed out; its saved result was cut before the error text.",
+}
+_UNCONFIRMED = "The saved result was cut before the cell's outcome, so whether it succeeded is unknown."
 
 # JSON's whitespace between tokens.
 _SPACE = re.compile(r"[ \t\n\r]*")
@@ -33,9 +45,10 @@ _CELL_JSON_START = re.compile(r'\{[ \t\n\r]*"code"[ \t\n\r]*:')
 @dataclass(frozen=True)
 class _SentCall:
     """A scratchpad call as its end event stored it: the action the model
-    sent, and its code when the stored event kept that whole."""
+    sent (None when it sent none), and its code when the stored event kept
+    that whole."""
 
-    action: str
+    action: str | None
     code: str | None
 
 
@@ -53,7 +66,7 @@ def _parse_json(raw: Any) -> dict[str, Any] | None:
 def _whole_fields(*, text: str) -> dict[str, Any]:
     """The fields of a JSON object cut short that the cut left whole.
 
-    The stream formatter stores at most 65,536 characters of each event, so a
+    The stream formatter stores at most 65,536 characters of each result, so a
     cell with long output, most often its logs, is stored as JSON that no
     longer parses. json.dumps(asdict(cell)) writes ``code`` first and ``logs``
     last, so ``code`` and the fields after it up to the cut still read whole.
@@ -84,25 +97,46 @@ def _whole_fields(*, text: str) -> dict[str, Any]:
 
 
 def _sent_call(*, content: Any) -> _SentCall | None:
-    """The call an end event stored, or None when its action isn't readable."""
+    """The call an end event stored, or None when it doesn't read as one."""
     parsed = _parse_json(content)
-    action = parsed.get("action") if parsed else None
-    if not isinstance(action, str):
+    if parsed is None:
         return None
+    action = parsed.get("action")
     code = parsed.get("code")
-    return _SentCall(action=action, code=code if isinstance(code, str) else None)
+    return _SentCall(
+        action=action if isinstance(action, str) and action else None,
+        code=code if isinstance(code, str) else None,
+    )
 
 
-def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
+def _ran_action(*, call: _SentCall, result_action: Any) -> str | None:
+    """The action a call ran: the one the model sent, or, for a call that
+    sent none, `result_action`, the one anton reports on its result.
+
+    The end event stores the model's tool input as it streamed, so a call
+    that left out `action` has none there. anton runs such a call as an
+    exec when it carries `code` (anton's scratchpad_action) and names the
+    action it ran on the result, which the stream formatter stores as
+    `tool_action` (format_responses_stream). The connector probe's stored
+    results carry no `tool_action` (ProbeHandler.run), so the probe's cells,
+    which ran in the probe's own scratchpad, stay out.
+    """
+    if call.action is not None:
+        return call.action
+    return result_action if isinstance(result_action, str) else None
+
+
+def _ran_cell(*, content: Any, sent_code: str | None, cell_status: str | None) -> Cell | None:
     """The cell an exec result reports, or None for a result that is no cell.
 
     Plain text is none: anton closes a cell it never ran, such as a write the
     user didn't approve, with its "Not run: ..." reason as plain text. A
     result cut before its code ends (see _whole_fields) makes a cell from the
-    code the model sent, `sent_code`, with no outputs, when the call's end
-    event kept that code whole. It often does: json.dumps escapes each
-    non-ASCII character to six, while the end event keeps the model's tool
-    input as written.
+    code the model sent, `sent_code`, with empty stdout and stderr, when the
+    call's end event kept that code whole. New end events from turns this
+    process runs keep the full input; older stored events, and a remote pod's,
+    may have cut it too. A result cut before its error field counts as failed
+    unless `cell_status` is "ok".
     """
     payload = _parse_json(content)
     if payload is None:
@@ -110,6 +144,11 @@ def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
         if not (cut_in_code and sent_code is not None):
             return None
         payload = {"code": sent_code}
+    if "error" not in payload:
+        # format_responses_stream sets cell_status from classify_cell_status on
+        # the whole result, before it cuts the stored content. Only confirmed
+        # success lets an earlier write establish file ownership.
+        payload["error"] = None if cell_status == CellStatus.ok else _LOST_ERROR.get(cell_status, _UNCONFIRMED)
     # A result cut before its outputs still makes a cell, so the write check
     # sees the code it ran.
     with contextlib.suppress(TypeError, ValueError):
@@ -125,13 +164,15 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
     and a `content` key carrying the JSON payload for scratchpad events. A
     result pairs with the end event of its own `tool_use_id`: when the model
     sends several calls at once, every end event comes before the first
-    result. A result stored without one pairs with the end event just before
-    it.
+    result. A result stored without one pairs with an end event stored
+    without one just before it (the connector probe's). A result makes a cell
+    only when its call ran an exec (_ran_action).
     """
     cells: list[Cell] = []
     # The calls whose result hasn't come yet, by tool_use_id.
     sent: dict[str, _SentCall] = {}
-    # The last call, for a result stored without a tool_use_id.
+    # The last call stored without a tool_use_id, for a result stored
+    # without one.
     last: _SentCall | None = None
 
     for data in events:
@@ -150,16 +191,19 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
                 cells.clear()
                 sent.clear()
                 last = None
+            elif tool_use_id:
+                sent[tool_use_id] = call
+                last = None
             else:
                 last = call
-                if tool_use_id:
-                    sent[tool_use_id] = call
 
         elif role == _SCRATCHPAD_RESULT:
             call = sent.pop(tool_use_id, None) if tool_use_id else last
             last = None
-            if call is not None and call.action == "exec":
-                cell = _ran_cell(content=data.get("content"), sent_code=call.code)
+            if call is not None and _ran_action(call=call, result_action=data.get("tool_action")) == "exec":
+                status = data.get("cell_status")
+                cell = _ran_cell(content=data.get("content"), sent_code=call.code,
+                                 cell_status=status if isinstance(status, str) else None)
                 if cell is not None:
                     cells.append(cell)
 

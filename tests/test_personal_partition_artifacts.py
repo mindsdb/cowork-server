@@ -10,10 +10,16 @@ and the desktop and hosted paths are unchanged.
 """
 from __future__ import annotations
 
+import base64
+import io
 import json
+import os
+import re
+import zipfile
 from pathlib import Path
 from uuid import uuid4
 
+import docx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
@@ -29,6 +35,7 @@ from cowork.db.session import get_engine
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.services.projects import ProjectService
+from test_artifact_export_route import padded_png
 
 TOKEN = "partition-artifacts-test-token"
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
@@ -190,34 +197,74 @@ def test_preview_and_status_by_path_reach_only_the_owner(two_people):
     assert mine.json()["publishedUrl"] == "https://view.example/r/1"
 
 
-def test_export_by_path_reaches_only_the_owner(two_people):
-    dash, _notes = two_people
-    body = {"path": str(dash / "report.md"), "format": "html"}
-    client = _client()
-
-    assert client.post("/api/v1/artifacts/export", json=body, headers=B).status_code == 404
-    assert not (dash / "report.html").exists()
-    mine = client.post("/api/v1/artifacts/export", json=body, headers=A)
-    assert mine.status_code == 200
-    assert (dash / "report.html").is_file()
-
-
-def test_pdf_and_word_export_are_refused_in_a_personal_scope(two_people):
-    """Both converters embed the files the source HTML names, and a person's
-    HTML can name a file in another person's partition. Refused for the owner
-    as for anyone else, as /open and /reveal are; HTML export still works."""
-    dash, _notes = two_people
-    client = _client()
-
-    for fmt in ("pdf", "docx"):
-        body = {"path": str(dash / "index.html"), "format": fmt}
-        for headers in (A, B):
-            assert client.post("/api/v1/artifacts/export", json=body, headers=headers).status_code == 403
-    assert not (dash / "index.pdf").exists() and not (dash / "index.docx").exists()
-    html = client.post(
-        "/api/v1/artifacts/export", json={"path": str(dash / "report.md"), "format": "html"}, headers=A
+def _report(project_dir: Path, slug: str, markdown: str) -> Path:
+    """A Markdown report artifact whose recorded primary is ``report.md``."""
+    folder = project_dir / ".anton" / "artifacts" / slug
+    folder.mkdir(parents=True)
+    (folder / "report.md").write_text(markdown, encoding="utf-8")
+    (folder / "metadata.json").write_text(
+        json.dumps({"id": uuid4().hex, "slug": slug, "name": slug, "type": "document", "primary": "report.md"}),
+        encoding="utf-8",
     )
-    assert html.status_code == 200
+    return folder
+
+
+def _export_url(scope: TenantScope, folder: Path) -> str:
+    return f"/api/v1/artifacts/workspace/{_general_id(scope)}/{_artifact_id(folder)}/export"
+
+
+def test_export_reaches_only_the_owner(stack):
+    """A's Word export lands in A's own folder and opens; B's request for the
+    same artifact is a 404 and writes nothing."""
+    report = _report(_general(ALICE), "report", "# Quarterly forecast\n\nRevenue grew.\n")
+    _general(BOB)
+    url = _export_url(ALICE, report)
+    client = _client()
+
+    theirs = client.post(url, json={"format": "docx"}, headers=B)
+    assert theirs.status_code == 404
+    assert sorted(p.name for p in report.iterdir()) == ["metadata.json", "report.md"]
+
+    mine = client.post(url, json={"format": "docx"}, headers=A)
+    assert mine.status_code == 200, mine.text
+    assert mine.json()["filename"] == "report.docx"
+    assert mine.json()["draftUrl"] == (
+        f"/api/v1/artifacts/drafts/{_general_id(ALICE)}/{_artifact_id(report)}/report.docx"
+    )
+    docx.Document(io.BytesIO((report / "report.docx").read_bytes()))
+
+
+def test_a_persons_export_takes_nothing_from_another_partition(stack):
+    """Word and HTML export are open to a person because they embed only files
+    from the artifact's own folder: a reference to a file in another person's
+    partition is left out and counted, never read."""
+    sentinel = b"SENTINEL-B-PARTITION"
+    secret = _general(BOB) / "notes" / "secret.png"
+    secret.parent.mkdir(parents=True)
+    secret.write_bytes(padded_png(4096, filler=sentinel))
+    a_general = _general(ALICE)
+    relative = Path(os.path.relpath(secret, a_general / ".anton" / "artifacts" / "report"))
+    report = _report(
+        a_general,
+        "report",
+        f"# Report\n\n![b]({relative.as_posix()})\n![b]({secret.as_posix()})\n"
+        f"![b](file://{secret.as_posix()})\n",
+    )
+    client = _client()
+
+    for fmt in ("docx", "html"):
+        response = client.post(_export_url(ALICE, report), json={"format": fmt}, headers=A)
+        assert response.status_code == 200, response.text
+        assert response.json()["omittedCount"] >= 3
+        written = (report / response.json()["filename"]).read_bytes()
+        if fmt == "docx":
+            with zipfile.ZipFile(io.BytesIO(written)) as package:
+                assert all(sentinel not in package.read(name) for name in package.namelist())
+        else:
+            # An embedded image is a base64 data URI, so decode every one.
+            embedded = re.findall(rb"data:[^,\"']*;base64,([A-Za-z0-9+/=]+)", written)
+            assert sentinel not in written
+            assert all(sentinel not in base64.b64decode(data) for data in embedded)
 
 
 def test_preview_mount_and_its_assets_reach_only_the_owner(two_people):
@@ -823,6 +870,12 @@ def test_shared_projects_with_personal_connections_refuse_a_live_backend(
     monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: True)
     monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
     monkeypatch.setattr(artifacts, "_PREVIEW_MOUNTS", {})
+    if status_code == 409:
+        # Startup rejects this configuration. Keep exercising the route's
+        # independent refusal too, behind that earlier guard.
+        with pytest.raises(RuntimeError, match="private connections require personal projects"):
+            _client()
+        monkeypatch.setattr("cowork.server.check_code_sandbox_startup", lambda *_a, **_kw: None)
     client = _client()
 
     for headers in (A, B):

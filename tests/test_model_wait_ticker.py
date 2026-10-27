@@ -399,7 +399,7 @@ async def test_the_anton_harness_attaches_its_session_for_the_turn_only(monkeypa
     session = _Session()
 
     async def _fake_build(self, conversation, **kwargs):
-        return session, None, None
+        return harness_mod.BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(harness_mod.AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

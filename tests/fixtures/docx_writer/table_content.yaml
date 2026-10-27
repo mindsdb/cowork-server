@@ -1,0 +1,62 @@
+# Content a browser shows for a table that sits outside its cells: text and
+# elements straight inside table, a row group or a row, rows inside a
+# wrapper such as form, and cells with no row. A browser moves stray content
+# before the table and keeps the rows in it. paragraphs: the text of every
+# paragraph in document order, table cells included. tables: each top-level
+# table's cell text, row by row.
+- name: text_straight_inside_table
+  html: "<table>Note: values in USD<tr><td>a</td><td>b</td></tr></table>"
+  paragraphs: ["Note: values in USD", a, b]
+  tables: [[[a, b]]]
+- name: rows_inside_a_form
+  html: "<table><form><tr><td>in form</td></tr></form><tr><td>x</td></tr></table>"
+  paragraphs: [in form, x]
+  tables: [[[in form], [x]]]
+- name: paragraph_after_the_rows
+  html: "<table><tr><td>a</td></tr><p>stray paragraph</p></table>"
+  paragraphs: [stray paragraph, a]
+  tables: [[[a]]]
+- name: text_in_a_row_and_between_cells
+  html: "<table><tr>row text <td>a</td> between<td>b</td></tr></table>"
+  paragraphs: [row text between, a, b]
+  tables: [[[a, b]]]
+- name: element_in_a_row
+  html: "<table><tr><div>div in a row</div><td>a</td></tr></table>"
+  paragraphs: [div in a row, a]
+  tables: [[[a]]]
+- name: rows_inside_a_div_with_text
+  html: "<table><div>wrapper text<tr><td>in div</td></tr></div></table>"
+  paragraphs: [wrapper text, in div]
+  tables: [[[in div]]]
+- name: text_in_a_row_group
+  html: "<table><tbody>group text<tr><td>a</td></tr></tbody></table>"
+  paragraphs: [group text, a]
+  tables: [[[a]]]
+- name: cells_with_no_row
+  html: "<table><td>bare</td><td>cells</td><tr><td>row</td></tr></table>"
+  paragraphs: [bare, cells, row, ""]
+  tables: [[[bare, cells], [row, ""]]]
+- name: cells_with_no_row_in_a_row_group
+  html: "<table><tbody><td>bare cell</td></tbody></table>"
+  paragraphs: [bare cell]
+  tables: [[[bare cell]]]
+- name: stray_text_comes_before_the_caption
+  html: "<table>Note<caption>Caption text</caption><tr><td>a</td></tr></table>"
+  paragraphs: [Note, Caption text, a]
+  tables: [[[a]]]
+- name: rows_in_a_template_stay_hidden
+  html: "<table><template><tr><td>hidden</td></tr></template><tr><td>shown</td></tr></table>"
+  paragraphs: [shown]
+  tables: [[[shown]]]
+- name: table_inside_a_stray_wrapper
+  html: "<table><div><table><tr><td>inner</td></tr></table></div><tr><td>outer</td></tr></table>"
+  paragraphs: [inner, outer]
+  tables: [[[inner]], [[outer]]]
+- name: only_stray_text
+  html: "<table>only text</table>"
+  paragraphs: [only text]
+  tables: []
+- name: whitespace_between_rows_adds_nothing
+  html: "<table>\n  <tbody>\n    <tr>\n      <td>a</td>\n    </tr>\n    <tr>\n      <td>b</td>\n    </tr>\n  </tbody>\n</table>"
+  paragraphs: [a, b]
+  tables: [[[a], [b]]]
