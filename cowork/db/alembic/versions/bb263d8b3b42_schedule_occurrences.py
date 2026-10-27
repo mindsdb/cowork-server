@@ -14,7 +14,7 @@ its turn to the agent (execution_started_at) and how it ended (outcome), which
 is what decides whether a failed attempt may be tried again.
 
 Revision ID: bb263d8b3b42
-Revises: 3e4b5f7586d3
+Revises: f3733a102501
 Create Date: 2026-10-14 00:00:00.000000
 
 """
@@ -26,7 +26,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "bb263d8b3b42"
-down_revision: Union[str, Sequence[str], None] = "3e4b5f7586d3"
+down_revision: Union[str, Sequence[str], None] = "f3733a102501"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
