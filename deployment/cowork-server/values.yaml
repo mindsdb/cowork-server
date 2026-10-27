@@ -242,6 +242,8 @@ deployment:
   # X-Forwarded-Host (use-forwarded-headers). The draft sub-app reads no
   # identity headers, so nothing strips them here; a configuration-snippet
   # would make this release depend on the controller allowing snippets.
+  # An empty host would make this Ingress a catch-all for /_t/ on every host
+  # the controller serves, so switching it on without draftHost fails the render.
   ingress_secondary:
     enabled: false
     # The default would repeat the primary Ingress's name.
@@ -251,11 +253,14 @@ deployment:
     # Cookie affinity would add a "route" Set-Cookie; the draft host sets none.
     nginx_affinity: false
     annotations:
+      # Not `required` here: the subchart passes annotations through toYaml,
+      # which folds a long template onto two lines. The host below fails the
+      # render on its own.
       nginx.ingress.kubernetes.io/upstream-vhost: '{{ $.Values.draftHost }}'
       # The path carries the link token; keep it out of the access log.
       nginx.ingress.kubernetes.io/enable-access-log: "false"
     hosts:
-      - host: '{{ $.Values.draftHost }}'
+      - host: '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
         enableMultiPath: true
         paths:
           - path: /_t/

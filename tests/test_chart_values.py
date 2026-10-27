@@ -58,6 +58,8 @@ DRAFT_HOSTS = {
     "prod": "draft.mindshub.co",
 }
 DRAFT_HOST = "{{ $.Values.draftHost }}"
+# The Ingress refuses to render without a host, which would make it a catch-all.
+REQUIRED_DRAFT_HOST = '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
 
 
 @dataclass(frozen=True)
@@ -175,7 +177,7 @@ def test_every_draft_host_reference_is_the_draft_host_name(base):
     secondary = _deployment(BASE)["ingress_secondary"]
     assert _entry(base, "COWORK_DRAFT_HOSTS").value == DRAFT_HOST
     assert _entry(base, "COWORK_DRAFT_ORIGIN").value == "{{ with $.Values.draftHost }}https://{{ . }}{{ end }}"
-    assert [host["host"] for host in secondary["hosts"]] == [DRAFT_HOST]
+    assert [host["host"] for host in secondary["hosts"]] == [REQUIRED_DRAFT_HOST]
     assert secondary["annotations"]["nginx.ingress.kubernetes.io/upstream-vhost"] == DRAFT_HOST
     assert _entry(base, "COWORK_WEB_ORIGIN").value == "{{ $.Values.webOrigin }}"
 
@@ -203,13 +205,17 @@ def test_an_environment_names_its_draft_host_and_nothing_more(env_values):
     away from the others. Helm replaces a list wholesale, so an environment
     that set the ports or the Ingress hosts would drop the base's. The web app
     is served from the primary Ingress host, the only page allowed to frame a
-    draft."""
+    draft. An environment the web build has no draft host for keeps the base,
+    which is off."""
     environment = env_values.stem.removeprefix("values-")
-    assert environment in DRAFT_HOSTS, f"{env_values.name} has no draft host the web build frames"
     deployment = _deployment(env_values)
-    primary = [host["host"] for host in deployment["ingress"]["hosts"]]
-    assert deployment.get("draftHost") == DRAFT_HOSTS[environment]
-    assert deployment.get("webOrigin") == f"https://{primary[0]}"
-    assert deployment.get("ingress_secondary") == {"enabled": True}
+    expected = DRAFT_HOSTS.get(environment)
+    assert deployment.get("draftHost") == expected, f"{env_values.name} names a draft host the web build does not frame"
+    if expected is None:
+        assert "webOrigin" not in deployment and "ingress_secondary" not in deployment, env_values.name
+    else:
+        primary = [host["host"] for host in (deployment.get("ingress") or {}).get("hosts") or []]
+        assert primary and deployment.get("webOrigin") == f"https://{primary[0]}", env_values.name
+        assert deployment.get("ingress_secondary") == {"enabled": True}, env_values.name
     assert "additionalPorts" not in deployment
     assert "additionalPorts" not in (deployment.get("service") or {})
