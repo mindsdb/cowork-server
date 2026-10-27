@@ -19,7 +19,7 @@ from cowork.db.migrations import _alembic_config
 from cowork.models.schedule import ScheduleOccurrence, ScheduleRun
 
 POSTGRES_URI = os.environ.get("COWORK_TEST_POSTGRES_URI", "")
-BEFORE_OCCURRENCES = "3e4b5f7586d3"
+BEFORE_OCCURRENCES = "f3733a102501"
 OCCURRENCES = "bb263d8b3b42"
 
 

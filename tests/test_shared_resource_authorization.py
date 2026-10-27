@@ -154,6 +154,8 @@ def test_pending_claims_hide_attribution_and_fail_capabilities_closed(org_engine
         "canRename": False,
         "canDelete": False,
         "canEditInstructions": False,
+        "canRun": True,
+        "canWriteFiles": True,
         "directoryIsExternal": False,
     }
 
@@ -362,8 +364,12 @@ def test_project_creator_admin_and_general_policy(org_engine):
         "canRename",
         "canDelete",
         "canEditInstructions",
+        "canRun",
+        "canWriteFiles",
         "directoryIsExternal",
     }
+    assert encoded_project["capabilities"]["canRun"] is True
+    assert encoded_project["capabilities"]["canWriteFiles"] is True
     linked = skills.get_skill(
         foreign_skill["id"],
         alice,
