@@ -64,6 +64,7 @@ def test_ascii_fallback_and_exact_name(name, ascii_name, exact_name):
     header = attachment_disposition(name)
 
     assert "\r" not in header and "\n" not in header
+    header.encode("latin-1")  # Starlette encodes header values as Latin-1.
     assert _parts(header) == (ascii_name, exact_name)
 
 
@@ -79,8 +80,3 @@ def test_cyrillic_name_literal():
         "filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82.pdf"
     )
 
-
-def test_header_is_latin1_encodable():
-    # Starlette encodes header values as Latin-1; the original bug was a 500 here.
-    for name in ("Отчёт.pdf", "報告.xlsx", "plan – v2.docx", "café.pdf"):
-        attachment_disposition(name).encode("latin-1")

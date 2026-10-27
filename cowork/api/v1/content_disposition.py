@@ -10,12 +10,9 @@ _INVISIBLE = frozenset("\u061c\u200b\u200e\u200f\u2060\ufeff")
 
 
 def _keep(ch: str) -> bool:
-    # Cc: CR/LF would inject a header line. Cs: lone surrogates stand for
-    # undecodable bytes of an on-disk name and make `quote()` raise. Zl/Zp
-    # break the name across lines in a save dialog. Bidi controls and the
-    # invisible marks above can make a name look like a different one.
-    # Everything else, including non-ASCII spaces and ZWJ/ZWNJ, is safe once
-    # percent-encoded.
+    # Lone surrogates (undecodable on-disk bytes) make `quote()` raise; bidi
+    # controls and invisible marks can disguise a name. Everything else,
+    # including ZWJ/ZWNJ, is safe once percent-encoded.
     return (
         unicodedata.category(ch) not in ("Cc", "Cs", "Zl", "Zp")
         and ch not in _INVISIBLE
@@ -38,23 +35,13 @@ def attachment_disposition(filename: str) -> str:
     first.
     """
     cleaned = "".join(ch for ch in filename if _keep(ch))
-    # NFKD splits accents off letters and maps compatibility spaces to ASCII
-    # ones, so "café" keeps "cafe" instead of degrading to "caf". It also maps
-    # a fullwidth solidus to "/", which must not reach a saved name.
+    # NFKD keeps "cafe" from "café", but also turns a fullwidth solidus into "/".
     ascii_name = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
-    ascii_name = ascii_name.replace("/", "_")
-    ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"').strip() or "download"
-    # A fully non-ASCII stem leaves only the extension(s) behind ("报告.xlsx"
-    # -> ".xlsx", "报告.tar.gz" -> ".tar.gz"), a hidden dotfile on macOS/Linux.
-    # Prefixing rather than splitting on the last dot keeps multi-extension
-    # names whole. A name that was a dotfile to begin with stays one. Distinct
-    # names can still degrade to the same "download.xlsx"; the ASCII spelling
-    # is a fallback and `filename*` carries the exact name.
-    # Check the original name: "\udcff.pdf" cleans to ".pdf" but was not a dotfile.
+    ascii_name = ascii_name.replace("/", "_").replace("\\", "\\\\").replace('"', '\\"').strip()
+    # A non-ASCII stem leaves a hidden ".xlsx"; a real dotfile such as ".env" stays one.
     if ascii_name.startswith(".") and not filename.startswith("."):
         ascii_name = "download" + ascii_name
-    # A name made only of dots names a directory; Windows also trims trailing
-    # spaces, so ". ." would save as ".".
+    # Empty, or only dots and spaces, which Windows trims down to a directory name.
     if not ascii_name.strip(". "):
         ascii_name = "download"
     return (

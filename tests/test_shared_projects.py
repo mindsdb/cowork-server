@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import personal_partition_id
 
@@ -412,7 +413,4 @@ def test_shared_download_serves_a_non_latin1_name(shared):
 
     assert response.status_code == 200, response.text
     assert response.content == b"shared report bytes"
-    assert response.headers["content-disposition"] == (
-        "attachment; filename=\"download.pdf\"; "
-        "filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82.pdf"
-    )
+    assert response.headers["content-disposition"] == attachment_disposition("Отчёт.pdf")

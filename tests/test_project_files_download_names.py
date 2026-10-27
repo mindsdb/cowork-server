@@ -4,20 +4,18 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 from starlette.requests import ClientDisconnect
 
+from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
 from cowork.models.project import Project
 
 pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
-
-RFC5987_PREFIX = "filename*=UTF-8''"
 
 
 @pytest.fixture
@@ -58,30 +56,7 @@ def test_files_raw_serves_any_name(local_project, filename):
 
     assert response.status_code == 200, response.text
     assert response.content == body
-    disposition = response.headers["content-disposition"]
-    assert RFC5987_PREFIX in disposition, disposition
-    assert unquote(disposition.split(RFC5987_PREFIX, 1)[1]) == filename
-
-
-@pytest.mark.parametrize(
-    ("filename", "expected"),
-    [
-        ("report.pdf", "attachment; filename=\"report.pdf\"; filename*=UTF-8''report.pdf"),
-        (
-            "Отчёт.pdf",
-            "attachment; filename=\"download.pdf\"; "
-            "filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82.pdf",
-        ),
-    ],
-)
-def test_files_raw_header_literal(local_project, filename, expected):
-    client, project, root = local_project
-    (root / filename).write_bytes(b"x")
-
-    response = client.get(f"/api/v1/projects/{project}/files-raw/{filename}")
-
-    assert response.status_code == 200, response.text
-    assert response.headers["content-disposition"] == expected
+    assert response.headers["content-disposition"] == attachment_disposition(filename)
 
 
 def _track_pinned_files(monkeypatch, project_files):
