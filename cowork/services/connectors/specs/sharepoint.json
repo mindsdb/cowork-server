@@ -1,0 +1,64 @@
+{
+  "id": "sharepoint",
+  "label": "SharePoint",
+  "aliases": ["sharepoint online", "microsoft sharepoint", "ms sharepoint", "sharepoint site", "o365 sharepoint"],
+  "keywords": ["files", "documents", "folders", "libraries", "microsoft", "office365", "m365", "excel", "word", "intranet"],
+  "description": "Bring files and folders from SharePoint sites into a project, with an app key an admin sets up once.",
+  "category": "files",
+  "logo": "folder",
+  "logo_color": "#0078D4",
+  "logo_url": "logos/sharepoint.svg",
+  "usage_notes": "SharePoint files reach you only when the person imports them into the project with \"Add files from SharePoint\"; work on those project files. Don't call Microsoft Graph or SharePoint with this connection's key, and don't browse or download from SharePoint yourself. If a file the person mentions isn't in the project, ask them to import it.",
+  "form": {
+    "form_id": "sharepoint-connector",
+    "title": "Connect SharePoint",
+    "subtitle": "Read the SharePoint sites an admin grants to an Entra app, and import their files into projects.",
+    "logo": "folder",
+    "logo_color": "#0078D4",
+    "logo_url": "logos/sharepoint.svg",
+    "methods": [
+      {
+        "id": "app-key",
+        "label": "App key (admin)",
+        "description": "An app registered in your Microsoft Entra with the Graph permission Sites.Selected. It reads only the sites an admin grants it.",
+        "recommended": true,
+        "how_to": "## Set up the app key\n\nAn admin does this once. It needs a **Global Administrator** or **Privileged Role Administrator**: a SharePoint Administrator alone can't grant the consent or the site access.\n\n1. In [Microsoft Entra → App registrations](https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade), choose **New registration**. Name it, keep **Single tenant**, and register it.\n2. On the app's **Overview**, copy the **Application (client) ID** and the **Directory (tenant) ID**.\n3. Go to **API permissions → Add a permission → Microsoft Graph → Application permissions**, add `Sites.Selected`, then click **Grant admin consent**.\n4. Go to **Certificates & secrets → Client secrets → New client secret**, pick an expiry, and copy the **Value** at once (it is shown only once).\n5. Give the app read access to each site Cowork may use. In [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer), signed in as an admin whose token holds `Sites.FullControl.All`:\n   - `GET https://graph.microsoft.com/v1.0/sites/{host}:/sites/{site}` and copy the `id`.\n   - `POST https://graph.microsoft.com/v1.0/sites/{that id}/permissions` with\n     `{\"roles\": [\"read\"], \"grantedToIdentities\": [{\"application\": {\"id\": \"{client id}\", \"displayName\": \"{app name}\"}}]}`.\n   - Use the app's **client id** in the body, not the site id. A `201` means it worked.\n6. Enter the tenant id, client id, client secret and site addresses here, one site per line.\n\n## Notes\n\n- With `Sites.Selected` the app reaches only the sites granted in step 5.\n- Anyone who can use this connection sees what the app was granted, whatever their own SharePoint permissions.",
+        "help_url": "https://learn.microsoft.com/en-us/graph/permissions-selected-overview",
+        "fields": [
+          {
+            "name": "tenant_id",
+            "label": "Directory (tenant) ID",
+            "type": "text",
+            "required": true,
+            "placeholder": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            "description": "From the app's Overview page in Microsoft Entra, or your tenant's domain such as contoso.onmicrosoft.com."
+          },
+          {
+            "name": "client_id",
+            "label": "Application (client) ID",
+            "type": "text",
+            "required": true,
+            "placeholder": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            "description": "From the app's Overview page in Microsoft Entra."
+          },
+          {
+            "name": "client_secret",
+            "label": "Client secret",
+            "type": "password",
+            "required": true,
+            "secret": true,
+            "description": "The secret's Value from Certificates & secrets, not its ID."
+          },
+          {
+            "name": "site_urls",
+            "label": "Site addresses",
+            "type": "textarea",
+            "required": true,
+            "placeholder": "https://contoso.sharepoint.com/sites/team",
+            "description": "One per line. Each site must be granted to the app."
+          }
+        ]
+      }
+    ]
+  }
+}
