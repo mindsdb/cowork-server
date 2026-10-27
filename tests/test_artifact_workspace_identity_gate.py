@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -554,10 +555,11 @@ def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
     values, which a selector that skipped the scan would not have.
     """
     from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services import artifact_files
 
     from_disk = []
     opened_names = []
-    original_entry_name = workspace_ep._existing_draft_entry_name
+    original_entry_name = artifact_files.existing_draft_entry_name
     original_open_child = workspace_ep.open_pinned_child
     original_dir_lstat = workspace_ep.dir_lstat
 
@@ -574,7 +576,7 @@ def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
         opened_names.append(name)
         return original_dir_lstat(directory, name)
 
-    monkeypatch.setattr(workspace_ep, "_existing_draft_entry_name", entry_name)
+    monkeypatch.setattr(artifact_files, "existing_draft_entry_name", entry_name)
     monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
     monkeypatch.setattr(workspace_ep, "dir_lstat", lstat)
 

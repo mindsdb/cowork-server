@@ -227,9 +227,14 @@ def test_a_command_sent_as_the_first_prompt_is_shown_once(tmp_path: Path) -> Non
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
     created = service.create_session(SessionCreateRequest(path=str(repo), prompt="/status"), CREDS, "fake", "fake-model")
-    wait_for_status(service, created.id, SessionStatus.ready)
+    # A new task is already "ready" before its first prompt runs, so wait for
+    # the command's own event rather than the status.
+    deadline = time.monotonic() + 3
+    titles: list[str] = []
+    while "Task status" not in titles and time.monotonic() < deadline:
+        titles = [event.title for event in service.events(created.id).items]
+        time.sleep(0.01)
 
-    titles = [event.title for event in service.events(created.id).items]
     assert titles.count("You") == 1
     assert "Task status" in titles
 

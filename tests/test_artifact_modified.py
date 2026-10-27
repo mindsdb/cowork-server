@@ -357,7 +357,10 @@ def test_update_preserves_password_access(tmp_path: Path):
     assert entry["access_password"] == "s3cret"
 
 
-def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Path):
+def test_update_leaves_the_state_write_to_publish(tmp_path: Path):
+    # publish_artifact saves the entry, published_mtime included, under its
+    # folder lock. A second write after it returns would save a map read
+    # outside that lock, so update leaves .published.json as publish left it.
     root = _make_static_html(tmp_path)
     published_json = root / ".published.json"
     published_json.write_text(
@@ -368,6 +371,7 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
         }}),
         encoding="utf-8",
     )
+    before = published_json.read_bytes()
 
     with ExitStack() as stack:
         stack.enter_context(_patch_scan(tmp_path))
@@ -378,10 +382,10 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
         stack.enter_context(patch.object(
             publish_mod, "publish_artifact", lambda *args, **kwargs: {"status": "ok"}
         ))
-        publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
+        out = publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 
-    entry = json.loads(published_json.read_text(encoding="utf-8"))["index.html"]
-    assert entry["published_mtime"] == publish_mod._content_mtime(root)
+    assert out == {"status": "ok"}
+    assert published_json.read_bytes() == before
 
 
 def test_update_unpublished_raises(tmp_path: Path):
