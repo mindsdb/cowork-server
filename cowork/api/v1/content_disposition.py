@@ -5,15 +5,20 @@ import unicodedata
 from urllib.parse import quote
 
 _BIDI_CONTROLS = frozenset({"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"})
+# ALM, ZWSP, LRM, RLM, word joiner, BOM.
+_INVISIBLE = frozenset("\u061c\u200b\u200e\u200f\u2060\ufeff")
 
 
 def _keep(ch: str) -> bool:
     # Cc: CR/LF would inject a header line. Cs: lone surrogates stand for
-    # undecodable bytes of an on-disk name and make `quote()` raise. Bidi
-    # controls can make a save dialog show a fake extension. Everything else,
-    # including non-ASCII spaces and ZWJ/ZWNJ, is safe once percent-encoded.
+    # undecodable bytes of an on-disk name and make `quote()` raise. Zl/Zp
+    # break the name across lines in a save dialog. Bidi controls and the
+    # invisible marks above can make a name look like a different one.
+    # Everything else, including non-ASCII spaces and ZWJ/ZWNJ, is safe once
+    # percent-encoded.
     return (
-        unicodedata.category(ch) not in ("Cc", "Cs")
+        unicodedata.category(ch) not in ("Cc", "Cs", "Zl", "Zp")
+        and ch not in _INVISIBLE
         and unicodedata.bidirectional(ch) not in _BIDI_CONTROLS
     )
 
@@ -33,7 +38,11 @@ def attachment_disposition(filename: str) -> str:
     first.
     """
     cleaned = "".join(ch for ch in filename if _keep(ch))
-    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii")
+    # NFKD splits accents off letters and maps compatibility spaces to ASCII
+    # ones, so "café" keeps "cafe" instead of degrading to "caf". It also maps
+    # a fullwidth solidus to "/", which must not reach a saved name.
+    ascii_name = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
+    ascii_name = ascii_name.replace("/", "_")
     ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"').strip() or "download"
     # A fully non-ASCII stem leaves only the extension(s) behind ("报告.xlsx"
     # -> ".xlsx", "报告.tar.gz" -> ".tar.gz"), a hidden dotfile on macOS/Linux.
@@ -44,8 +53,9 @@ def attachment_disposition(filename: str) -> str:
     # Check the original name: "\udcff.pdf" cleans to ".pdf" but was not a dotfile.
     if ascii_name.startswith(".") and not filename.startswith("."):
         ascii_name = "download" + ascii_name
-    # A name made only of dots names a directory.
-    if not ascii_name.strip("."):
+    # A name made only of dots names a directory; Windows also trims trailing
+    # spaces, so ". ." would save as ".".
+    if not ascii_name.strip(". "):
         ascii_name = "download"
     return (
         f'attachment; filename="{ascii_name}"; '

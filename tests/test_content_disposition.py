@@ -23,14 +23,14 @@ def _parts(header: str) -> tuple[str, str]:
         ("Отчёт.pdf", "download.pdf", "Отчёт.pdf"),
         ("報告.xlsx", "download.xlsx", "報告.xlsx"),
         ("plan – v2.docx", "plan  v2.docx", "plan – v2.docx"),
-        ("café.pdf", "caf.pdf", "café.pdf"),
+        ("café.pdf", "cafe.pdf", "café.pdf"),
         # macOS screenshot names put U+202F before "PM".
         (
             "Screenshot 2026-10-27 at 1.37.00\u202fPM.png",
-            "Screenshot 2026-10-27 at 1.37.00PM.png",
+            "Screenshot 2026-10-27 at 1.37.00 PM.png",
             "Screenshot 2026-10-27 at 1.37.00\u202fPM.png",
         ),
-        ("a\u00a0b.txt", "ab.txt", "a\u00a0b.txt"),
+        ("a\u00a0b.txt", "a b.txt", "a\u00a0b.txt"),
         (".env", ".env", ".env"),
         (".gitignore", ".gitignore", ".gitignore"),
         ("x\r\ny.txt", "xy.txt", "xy.txt"),
@@ -42,7 +42,7 @@ def _parts(header: str) -> tuple[str, str]:
         ("\U0001f468\u200d\U0001f4bb.png", "download.png", "\U0001f468\u200d\U0001f4bb.png"),
         # A name made only of dots would name a directory.
         (".\u5831\u544a", "download", ".\u5831\u544a"),
-        (".\u00e9", "download", ".\u00e9"),
+        (".\u00e9", ".e", ".\u00e9"),
         (".\u5831.", "download", ".\u5831."),
         (" .pdf", "download.pdf", " .pdf"),
         ("a\\b.txt", "a\\\\b.txt", "a\\b.txt"),
@@ -50,6 +50,14 @@ def _parts(header: str) -> tuple[str, str]:
         ("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645.txt", "download.txt", "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645.txt"),
         # Isolate controls are dropped like the other bidi controls.
         ("a\u2066b.txt", "ab.txt", "ab.txt"),
+        # Windows trims trailing dots and spaces, so ". ." would save as ".".
+        (".\u5831 .", "download", ".\u5831 ."),
+        # Invisible marks and line separators are dropped.
+        ("a\u200bb.txt", "ab.txt", "ab.txt"),
+        ("a\ufeffb.txt", "ab.txt", "ab.txt"),
+        ("r\u2028s.pdf", "rs.pdf", "rs.pdf"),
+        # NFKD turns a fullwidth solidus into "/", which must not reach the ASCII name.
+        ("a\uff0fb.txt", "a_b.txt", "a\uff0fb.txt"),
     ],
 )
 def test_ascii_fallback_and_exact_name(name, ascii_name, exact_name):
