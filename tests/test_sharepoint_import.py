@@ -20,6 +20,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_engine
 from cowork.models.project import Project
+from cowork.principal import Principal, get_principal
 from cowork.services.connectors import sharepoint as sharepoint_service
 from cowork.services.connectors.persist import persist_connection
 
@@ -34,6 +35,8 @@ SITE_PATH = "/v1.0/sites/contoso.sharepoint.com:/sites/team"
 DRIVES_PATH = f"/v1.0/sites/{SITE_ID}/drives"
 ITEMS_PATH = f"{DRIVES_PATH}/{DRIVE_ID}/items"
 DOWNLOAD_PATH = "/sites/team/_layouts/15/download.aspx"
+ORG_ID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+ORG_USER = "11111111-1111-4111-8111-111111111111"
 STORED = {"tenant_id": TENANT, "client_id": CLIENT_ID, "client_secret": SECRET, "site_urls": SITE}
 
 
@@ -368,14 +371,22 @@ def test_a_malformed_body_is_refused_without_echoing_it(microsoft, project, over
     assert microsoft.requests == []
 
 
-def test_org_mode_refuses_the_import(microsoft, project, monkeypatch):
+def test_org_mode_refuses_an_authenticated_import(microsoft, project, monkeypatch):
     name, _id, _folder = project
+    microsoft.file("01a", "a.txt", b"a")
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
+    app = FastAPI()
+    app.include_router(api_router)
+    # A verified member, so the router's org-mode authentication passes and
+    # only the route's own desktop-only guard can refuse.
+    app.dependency_overrides[get_principal] = lambda: Principal(user_id=ORG_USER, org_id=ORG_ID)
+    body = {"connection": "corp", "site": SITE, "drive_id": DRIVE_ID, "folder": "", "item_ids": ["01a"]}
 
-    response = _import(name, ["01a"])
+    response = TestClient(app).post(f"/api/v1/projects/{name}/files/import/sharepoint", json=body)
 
-    assert response.status_code in {401, 403}
+    assert response.status_code == 403
+    assert response.json()["detail"] == "not available in org deployments"
     assert microsoft.requests == []
 
 
