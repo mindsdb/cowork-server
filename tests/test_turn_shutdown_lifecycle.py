@@ -80,7 +80,7 @@ def _streaming_handler(monkeypatch, saved: dict, started: asyncio.Event):
         def close(self):
             pass
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         event_sink("response.output_text.delta", {"type": "response.output_text.delta", "delta": "partial"})
         yield "event: response.output_text.delta\ndata: {}\n\n"
         started.set()
