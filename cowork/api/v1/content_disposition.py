@@ -44,6 +44,9 @@ def attachment_disposition(filename: str) -> str:
     # Check the original name: "\udcff.pdf" cleans to ".pdf" but was not a dotfile.
     if ascii_name.startswith(".") and not filename.startswith("."):
         ascii_name = "download" + ascii_name
+    # A name made only of dots names a directory.
+    if not ascii_name.strip("."):
+        ascii_name = "download"
     return (
         f'attachment; filename="{ascii_name}"; '
         f"filename*=UTF-8''{quote(cleaned or 'download', safe='')}"

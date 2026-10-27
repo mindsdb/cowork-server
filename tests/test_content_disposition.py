@@ -40,6 +40,16 @@ def _parts(header: str) -> tuple[str, str]:
         (os.fsdecode(b"\xff.pdf"), "download.pdf", ".pdf"),
         # ZWJ joins emoji sequences and must survive.
         ("\U0001f468\u200d\U0001f4bb.png", "download.png", "\U0001f468\u200d\U0001f4bb.png"),
+        # A name made only of dots would name a directory.
+        (".\u5831\u544a", "download", ".\u5831\u544a"),
+        (".\u00e9", "download", ".\u00e9"),
+        (".\u5831.", "download", ".\u5831."),
+        (" .pdf", "download.pdf", " .pdf"),
+        ("a\\b.txt", "a\\\\b.txt", "a\\b.txt"),
+        # ZWNJ is part of Persian words and must survive.
+        ("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645.txt", "download.txt", "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645.txt"),
+        # Isolate controls are dropped like the other bidi controls.
+        ("a\u2066b.txt", "ab.txt", "ab.txt"),
     ],
 )
 def test_ascii_fallback_and_exact_name(name, ascii_name, exact_name):
