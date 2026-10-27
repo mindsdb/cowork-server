@@ -63,7 +63,7 @@ _SITE_ID = re.compile(r"[A-Za-z0-9.,_-]+")
 # Entra's AADSTS codes in a failed token response. The HTTP status alone does
 # not separate them: an unknown tenant and an unknown app both answer 400.
 _TENANT_NOT_FOUND_CODES = frozenset({90002})
-_APP_NOT_FOUND_CODES = frozenset({700016})
+_APP_NOT_FOUND_CODES = frozenset({700016, 700038})
 _KEY_REJECTED_CODES = frozenset({7000215, 7000222})
 
 

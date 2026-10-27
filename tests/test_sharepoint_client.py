@@ -156,6 +156,7 @@ def test_browse_reuses_a_cached_token_within_its_lifetime():
     [
         (400, [90002], SharePointErrorKind.TENANT_NOT_FOUND),
         (400, [700016], SharePointErrorKind.APP_NOT_FOUND),
+        (400, [700038], SharePointErrorKind.APP_NOT_FOUND),
         (401, [7000215], SharePointErrorKind.KEY_REJECTED),
         (401, [7000222], SharePointErrorKind.KEY_REJECTED),
         (400, [50000], SharePointErrorKind.UNREACHABLE),
