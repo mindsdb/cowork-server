@@ -199,6 +199,17 @@ async def test_a_paste_cut_off_inside_its_fence_is_closed_first():
     assert _opened_form_id(saved) == _form_id(_block(result))
 
 
+async def test_an_answer_cut_off_inside_a_code_block_is_closed_first():
+    result = await _form_result()
+    answer = "Checking the driver:\n\n```python\nimport psycopg"
+
+    _, saved = await _run(StreamTextDelta(text=answer), _history([("request_credentials", result, False)]))
+
+    assert saved.startswith(answer + "\n```\n\n")
+    assert saved.count("```") % 2 == 0
+    assert _opened_form_id(saved) == _form_id(_block(result))
+
+
 async def test_a_replaced_answer_still_gets_the_form():
     result = await _form_result()
 

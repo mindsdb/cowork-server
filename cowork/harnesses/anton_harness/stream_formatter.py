@@ -491,7 +491,7 @@ class ToolRows:
 # The renderer's rule for a form block (cowork parseFormSpec.js extractFormSpec),
 # so the server sees the same blocks the side panel does.
 _FORM_BLOCK = re.compile(r"```data-vault-form[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```")
-_FORM_FENCE_OPEN = re.compile(r"```data-vault-form[ \t]*\r?\n")
+_FENCE_LINE = re.compile(r"^[ \t]*```", re.MULTILINE)
 # Matched in the block's text, not parsed: the renderer opens loosely written
 # JSON that json.loads refuses.
 _FORM_ID = re.compile(r'"form_id"\s*:\s*"([^"]*)"')
@@ -541,16 +541,17 @@ def missing_form_text(answer: str, form: RequestedForm) -> str:
     opens it, or "" when the answer already shows it.
 
     The panel opens the answer's last form block, so the form counts as shown
-    only when that block has its id. A form fence the answer left open (a
-    paste cut off) is closed first; otherwise the renderer would end it at the
-    added block's opening line and read neither form."""
+    only when that block has its id. A code fence the answer left open (an
+    answer cut off) is closed first. Otherwise the renderer would end an open
+    form fence at the added block's opening line and read neither form. After
+    a reload, the markdown would also show the added block as code, not as a
+    form card."""
     blocks = list(_FORM_BLOCK.finditer(answer))
     if blocks and _form_id_in(blocks[-1].group(1)) == form.form_id:
         return ""
-    rest = answer[blocks[-1].end():] if blocks else answer
     text = answer
     closing = ""
-    if _FORM_FENCE_OPEN.search(rest):
+    if len(_FENCE_LINE.findall(answer)) % 2:
         closing = "\n```"
         text += closing
     if not text or text.endswith("\n\n"):
