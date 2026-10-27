@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 
 from cowork.common.paths import (
@@ -1712,5 +1713,5 @@ def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep
         target,
         base,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+        headers={"Content-Disposition": attachment_disposition(target.name)},
     )

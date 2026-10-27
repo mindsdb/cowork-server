@@ -399,3 +399,20 @@ def test_shared_file_open_rechecks_containment_after_component_validation(shared
 
     assert response.status_code == 404
     assert response.json()["detail"] == "File not found"
+
+
+def test_shared_download_serves_a_non_latin1_name(shared):
+    client, project, root, registry, entry = shared
+    (root / "Отчёт.pdf").write_bytes(b"shared report bytes")
+
+    response = client.get(
+        f"/api/v1/shared-projects/{project['id']}/files-raw/Отчёт.pdf",
+        headers=headers(BOB),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.content == b"shared report bytes"
+    assert response.headers["content-disposition"] == (
+        "attachment; filename=\"download.pdf\"; "
+        "filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82.pdf"
+    )
