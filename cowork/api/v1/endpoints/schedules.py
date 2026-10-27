@@ -96,11 +96,12 @@ def get_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 @router.put("/{schedule_id}")
 @router.patch("/{schedule_id}")
 def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scoped: ScopedSessionDep):
+    changes = body.model_dump(exclude_none=True)
+    # "No project" arrives as an explicit null, which exclude_none drops.
+    if "project_id" in body.model_fields_set and body.project_id is None:
+        changes["project_id"] = None
     try:
-        schedule = ScheduleService(scoped).update_schedule(
-            schedule_id,
-            **body.model_dump(exclude_none=True),
-        )
+        schedule = ScheduleService(scoped).update_schedule(schedule_id, **changes)
     except ScheduleConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
