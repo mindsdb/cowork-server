@@ -80,6 +80,14 @@ _IDLE_POLL_SECONDS = 15
 # RunRegistry.shutdown.
 TURN_SHUTDOWN_GRACE_SECONDS = 5
 
+# How long past RunRegistry.shutdown's own bound a turn it ended may wait for
+# its save before it writes its interrupted frame anyway. With remote turns,
+# Uvicorn's request drain starts once that bound passes, and about 2.2 s later
+# (its tick, its pause and --timeout-graceful-shutdown 2 in the image's
+# command) it cuts every stream still open. The frame goes out about a second
+# before that cut; the save goes on in the background.
+SHUTDOWN_FRAME_SECONDS_PAST_GRACE = 1.0
+
 
 class TurnInProgress(Exception):
     """A conversation already has a turn answering, so a new question is refused.
@@ -138,6 +146,8 @@ class TurnLifecycle:
     ``shutting_down`` means "the server is exiting, not the user's own Stop".
     Set BEFORE the cancel, same ordering as ``discarded``: a producer's
     ``CancelledError`` handler checks it to persist an interrupted turn.
+    ``shutdown_frame_deadline``, set with it, is the loop time by which that
+    turn writes its frame, saved or not (SHUTDOWN_FRAME_SECONDS_PAST_GRACE).
 
     ``stalled`` means "the UI heard nothing for its idle window and gave up",
     not the user's own Stop. Set BEFORE the cancel, same ordering again: the
@@ -153,6 +163,7 @@ class TurnLifecycle:
 
     discarded: bool = False
     shutting_down: bool = False
+    shutdown_frame_deadline: float | None = None
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
     timed_out: bool = False
     saved_question: bool = False
@@ -264,8 +275,7 @@ async def _stop_controller_turns(handles: list[RunHandle], *, timeout_seconds: f
 
     writes = [
         asyncio.create_task(stop_controller_turn(
-            handle.lifecycle.identity.correlation_id,
-            turn_label=f"turn {handle.run_id} for shutdown",
+            handle.lifecycle.identity.correlation_id, turn_id=handle.run_id, reason="shutdown",
         ))
         for handle in handles
     ]
@@ -281,6 +291,32 @@ async def _forget_unstarted_run(conversation_id: str, run_id: str) -> None:
             await forget_run(conversation_id, run_id)
     except Exception:
         logger.exception("Could not remove unstarted run %s", run_id)
+
+
+async def _seal_interrupted(handle: RunHandle) -> None:
+    """End the stream of a turn whose task ended at shutdown without a
+    terminal record, as a producer cancelled before its first step does: the
+    interrupted frame, then the terminal record. A failure is logged, so the
+    other turns are still sealed."""
+    from cowork.handlers.turn_errors import (
+        GENERIC_TURN_ERROR_CODE,
+        INTERRUPTED_TURN_MESSAGE,
+        response_failed_sse,
+    )
+
+    request_id = handle.lifecycle.identity.correlation_id
+    context = log_context(request_id=request_id, conversation_id=handle.conversation_id)
+    logger.warning(
+        "A turn ended at shutdown without a terminal record; sealing its stream as interrupted.",
+        extra={"event": "shutdown_turn_sealed", **context},
+    )
+    try:
+        await handle.buffer.append("sse", {"sse": response_failed_sse(
+            INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id,
+        )})
+        await handle.buffer.close("interrupted")
+    except Exception:
+        logger.exception("Could not seal the stream of a turn ended at shutdown", extra=context)
 
 
 class RunRegistry:
@@ -306,8 +342,8 @@ class RunRegistry:
     @staticmethod
     def _shutdown_refusal(conversation_id: str) -> ServerShuttingDown:
         logger.info(
-            "Refused a turn for conversation %s; the server is shutting down.",
-            conversation_id,
+            "Refused a turn; the server is shutting down.",
+            extra=log_context(conversation_id=conversation_id),
         )
         return ServerShuttingDown()
 
@@ -579,6 +615,13 @@ class RunRegistry:
         controller replies meanwhile, the relay's cancel branch sees
         ``shutting_down`` and saves the turn as interrupted.
 
+        A task cancelled before its first step never runs its body, so a
+        producer cancelled that early saves no question and writes no
+        terminal record. Two loop passes before the cancel start the producer
+        of a turn that registered just before this call. A turn whose task
+        still ended with its stream open has the interrupted frame and
+        terminal record written here.
+
         Bounded by ``timeout_seconds``, the flags and the unwinding together.
         A turn already marked ``shutting_down`` is skipped, so a second call
         leaves the turns the first one ended alone. Returns how many turns
@@ -591,6 +634,11 @@ class RunRegistry:
         deadline = loop.time() + timeout_seconds
         for handle in handles:
             handle.lifecycle.shutting_down = True
+            handle.lifecycle.shutdown_frame_deadline = deadline + SHUTDOWN_FRAME_SECONDS_PAST_GRACE
+        # One pass starts the _run_bounded task of a turn that registered in
+        # this loop pass, the next starts the producer task it creates.
+        for _ in range(2):
+            await asyncio.sleep(0)
         # The identity the turn captured when it started, not a settings read:
         # an in-process turn has no controller to stop. A turn that is only
         # saving its finished answer has nothing left running there.
@@ -604,18 +652,22 @@ class RunRegistry:
         )
         if pending:
             from cowork.streaming.backend import get_backend
+            unfinished = {"event": "shutdown_turns_unfinished", "count": len(pending)}
             if get_backend() == "redis":
-                fate = (
-                    "boot recovery does not read Redis buffers, so one that never finishes "
-                    "keeps its question pending, and its stream stays open until a reader's "
-                    "idle cut ends it"
+                logger.warning(
+                    "Turns still unwinding past the shutdown budget; each saves if it finishes "
+                    "before the process exits, and boot recovery does not read Redis buffers, so "
+                    "one that never finishes keeps its question pending, and its stream stays "
+                    "open until a reader's idle cut ends it.",
+                    extra=unfinished,
                 )
             else:
-                fate = "one that never finishes is sealed by the next boot's recovery"
-            logger.warning(
-                "%d turn(s) still unwinding past the %ss shutdown budget; each saves if it "
-                "finishes before the process exits, and %s.", len(pending), timeout_seconds, fate,
-            )
+                logger.warning(
+                    "Turns still unwinding past the shutdown budget; each saves if it finishes "
+                    "before the process exits, and one that never finishes is sealed by the "
+                    "next boot's recovery.",
+                    extra=unfinished,
+                )
         for task in done:
             if task.cancelled():
                 continue
@@ -624,6 +676,9 @@ class RunRegistry:
                 logger.error(
                     "Turn raised while unwinding for shutdown", exc_info=exc,
                 )
+        for handle in handles:
+            if handle.task.done() and not handle.lifecycle.discarded and not handle.buffer.is_closed:
+                await _seal_interrupted(handle)
         return len(handles)
 
     def reset(self) -> None:

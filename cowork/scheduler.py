@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,10 +52,15 @@ _scheduler_task: asyncio.Task | None = None
 # A run's error when its turn was refused because the server was shutting
 # down. The run never started, so the schedule's own last_error is left alone.
 _SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
+# A run's error when a shutdown cancelled it before it recorded its turn's
+# outcome. Saved as failed, not success, so a cron slot it did not consume
+# stays due, and the freshness guard skips no slot because of it.
+_INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it finished."
 # The runs the poll loop started and nothing awaits. A shutdown waits for them
 # (wait_for_scheduled_runs) so each run's last writes land before the process
-# exits. A manual run belongs to its request instead, which Uvicorn's drain
-# waits for.
+# exits. A manual run belongs to its request instead. Uvicorn's request drain
+# waits for that request only up to --timeout-graceful-shutdown, then cancels
+# it, and the run is saved as interrupted (_INTERRUPTED_RUN_ERROR).
 _scheduled_runs: set[asyncio.Task] = set()
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
@@ -478,6 +484,12 @@ async def execute_schedule(
         )
         final_status, error = outcome.status, outcome.error
 
+    except asyncio.CancelledError:
+        # A shutdown cut the run: Uvicorn's request drain cancels a manual
+        # run's request at its bound, and the event loop's close cancels a
+        # cron run still going. The finally saves it as failed.
+        error = _INTERRUPTED_RUN_ERROR
+        raise
     except Exception as exc:
         error = str(exc)
         # The ids travel as record attributes: a database error's sanitized
@@ -589,6 +601,9 @@ def _poll(session: ScopedSession) -> list[UUID]:
 
 async def _scheduler_loop() -> None:
     logger.info("Scheduler loop started")
+    # Replicas a rollout starts together would otherwise poll in step, and two
+    # replicas polling together can both start one due schedule.
+    await asyncio.sleep(random.uniform(0, _POLL_INTERVAL_SECONDS))
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         try:

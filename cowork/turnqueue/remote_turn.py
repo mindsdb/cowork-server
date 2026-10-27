@@ -138,7 +138,7 @@ async def remote_turn_events(
     except (asyncio.CancelledError, GeneratorExit):
         # Both terminals leave this block (break, raise), so the controller is
         # still running the turn here.
-        await stop_controller_turn(correlation_id, turn_label=f"channel turn {correlation_id}")
+        await stop_controller_turn(correlation_id, turn_id=correlation_id, reason="channel_turn_ended")
         raise
     finally:
         if artifacts is not None and artifact_writes_allowed:

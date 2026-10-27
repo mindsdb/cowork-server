@@ -7,6 +7,7 @@ and all necessary configurations for the Cowork service.
 
 import asyncio
 import contextlib
+import contextvars
 import os
 import signal
 import stat
@@ -162,14 +163,25 @@ async def _end_remote_turns() -> None:
 
     registry.close()
     poll_loop = stop_scheduler()
-    cancelled = await registry.shutdown(timeout_seconds=remaining())
-    if cancelled:
-        logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+    _log_cancelled_turns(await registry.shutdown(timeout_seconds=remaining()))
     if poll_loop is not None:
         await asyncio.wait([poll_loop], timeout=remaining())
     unfinished = await wait_for_scheduled_runs(timeout_seconds=remaining())
     if unfinished:
-        logger.warning("%d scheduled run(s) still recording their outcome at shutdown", unfinished)
+        logger.warning(
+            "Scheduled runs still recording their outcome at shutdown",
+            extra={"event": "shutdown_scheduled_runs_unfinished", "count": unfinished},
+        )
+
+
+def _log_cancelled_turns(cancelled: int) -> None:
+    """The WARNING naming how many turns a shutdown ended. The count is a
+    field: the hosted log formatter drops a message's arguments."""
+    if cancelled:
+        logger.warning(
+            "Cancelled in-flight turns for shutdown",
+            extra={"event": "shutdown_turns_cancelled", "count": cancelled},
+        )
 
 
 def _server_busy(*, retry_after: int, status_code: int) -> JSONResponse:
@@ -198,21 +210,30 @@ def _end_remote_turns_on_sigterm() -> None:
     runs the lifespan's shutdown. Ending the turns first lets each open answer
     stream carry its response.failed frame and end cleanly before that cut.
     A second SIGTERM goes straight to Uvicorn.
+
+    The turns end in the context lifespan startup installed the handler in,
+    not in that of whatever task the signal interrupted, which may hold one
+    organization's settings scope.
     """
-    previous = signal.getsignal(signal.SIGTERM)
-    if not callable(previous):
-        logger.warning(
-            "SIGTERM handler is %r, not one to hand the signal on to; turns in progress "
-            "are ended only after the server's request drain", previous,
-        )
-        return
     if threading.current_thread() is not threading.main_thread():
         logger.warning(
             "Server lifespan runs off the main thread, where no signal handler can be set; "
             "turns in progress are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": "off_main_thread"},
+        )
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        # SIG_DFL or SIG_IGN, or None for a handler not set from Python.
+        reason = previous.name if isinstance(previous, signal.Handlers) else "not_set_from_python"
+        logger.warning(
+            "SIGTERM handler is not one to hand the signal on to; turns in progress "
+            "are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": reason},
         )
         return
     loop = asyncio.get_running_loop()
+    drain_context = contextvars.copy_context()
     signalled = False
     # Held here because the event loop keeps only a weak reference to a task.
     drain: asyncio.Task | None = None
@@ -226,7 +247,11 @@ def _end_remote_turns_on_sigterm() -> None:
 
         def hand_on(task: asyncio.Task) -> None:
             if not task.cancelled() and task.exception() is not None:
-                logger.error("Ending turns before shutdown failed", exc_info=task.exception())
+                logger.error(
+                    "Ending turns before shutdown failed",
+                    exc_info=task.exception(),
+                    extra={"event": "shutdown_predrain_failed"},
+                )
             previous(signum, frame)
 
         def begin() -> None:
@@ -236,8 +261,9 @@ def _end_remote_turns_on_sigterm() -> None:
 
         # A signal handler runs between two bytecodes of whatever the loop was
         # doing, possibly while it waits in select(); call_soon_threadsafe
-        # wakes it to run begin().
-        loop.call_soon_threadsafe(begin)
+        # wakes it to run begin(). Without a context it would run begin() in a
+        # copy of the interrupted task's, and the drain task would inherit it.
+        loop.call_soon_threadsafe(begin, context=drain_context)
 
     signal.signal(signal.SIGTERM, on_sigterm)
 
@@ -425,9 +451,7 @@ async def lifespan(app: FastAPI):
         if remote_turns:
             await _end_remote_turns()
         else:
-            cancelled = await registry.shutdown()
-            if cancelled:
-                logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+            _log_cancelled_turns(await registry.shutdown())
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))

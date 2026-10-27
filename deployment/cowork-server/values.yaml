@@ -157,11 +157,13 @@ deployment:
   #           remaining answer as interrupted on its open stream
   #           (TURN_SHUTDOWN_GRACE_SECONDS).
   #   2 s     uvicorn's own drain (--timeout-graceful-shutdown in the image).
-  #   about 18 s  the lifespan teardown's bounded waits: another pass over
-  #           turns (5 s), channel tasks (3 s, then up to 5 s more while each
-  #           one cancelled writes its sandbox turn's cancel flag) and
-  #           scratchpad closes (5 s).
-  # About 40 s in all, so 60 s leaves room for the unbounded closes at the end
+  #   about 20 s  the lifespan teardown's bounded waits: the draft listener's
+  #           own drain when COWORK_DRAFT_PORT is set (2 s,
+  #           cowork/draft_host/listener.py), another pass over turns (5 s),
+  #           channel tasks (3 s, then up to 5 s more while each one
+  #           cancelled writes its sandbox turn's cancel flag) and scratchpad
+  #           closes (5 s).
+  # About 42 s in all, so 60 s leaves room for the unbounded closes at the end
   # of teardown before the kubelet's SIGKILL.
   terminationGracePeriodSeconds: 60
 
@@ -170,21 +172,27 @@ deployment:
       exec:
         command: ["/bin/sh", "-c", "sleep 15"]
 
-  # Create every new pod at once, and stop no old pod until a new one is
-  # Ready. The old pods then stop within seconds of each other instead of a
-  # rollout step apart, so the retry an interrupted answer asks for lands on a
-  # new pod rather than on an old one about to stop too.
+  # Create every new pod at once, as many as the Deployment runs when the
+  # rollout starts (the autoscaler's count in staging and prod, 2 to 4), and
+  # stop no old pod until a new one is Ready. When the cluster has room for
+  # every new pod, the old pods then stop within seconds of each other instead
+  # of a rollout step apart, so the retry an interrupted answer asks for lands
+  # on a new pod rather than on an old one about to stop too. A new pod still
+  # waiting for a node keeps one old pod running until it turns Ready. An
+  # autoscaler scale-in stops a pod the same way a rollout does (README.md).
   deploymentStrategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: "100%"
       maxUnavailable: 0
 
-  # Alembic locks via the alembic_version table, so concurrent replicas don't
-  # race; on already-migrated databases this is a no-op. The deployment
-  # subchart applies `tpl` to top-level string fields on each initContainer,
-  # so the image string can reference the same chart helpers as the main
-  # container — no need to duplicate the repository/tag here.
+  # The new pods of a rollout start together, and each runs this. On
+  # PostgreSQL, cowork/db/alembic/env.py takes an advisory lock first
+  # (cowork.db.migrations.lock_migrations), so they migrate one at a time and
+  # the later ones find nothing to do; on an already-migrated database this is
+  # a no-op. The deployment subchart applies `tpl` to top-level string fields
+  # on each initContainer, so the image string can reference the same chart
+  # helpers as the main container, with no need to repeat the repository/tag.
   initContainers:
     - name: db-migrate
       image: '{{ template "get-repository" . }}:{{ template "get-release-tag" . }}'

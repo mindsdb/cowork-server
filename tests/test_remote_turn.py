@@ -15,6 +15,7 @@ from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import RemoteWorkspace
 from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
+from tests._logging_assertions import assert_log_fields
 
 
 class _FakeScope:
@@ -562,10 +563,14 @@ async def test_a_channel_turn_that_reached_its_terminal_writes_no_cancel_flag(
     assert await controller_flags.keys("*") == []
 
 
-async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_written(monkeypatch, caplog):
+async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_written(
+    monkeypatch, caplog, owned_logger,
+):
     """Redis down at shutdown: the controller cannot be told, which is logged,
     and the channel task still ends cancelled rather than with the Redis
-    error, which drain_background_tasks would get in place of the cancel."""
+    error, which drain_background_tasks would get in place of the cancel. The
+    hosted log line names the turn in fields, since its formatter drops a
+    message's arguments."""
     import logging
 
     from cowork.streaming import cancellation
@@ -574,9 +579,7 @@ async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_
         raise ConnectionError("redis is down")
 
     monkeypatch.setattr(cancellation, "get_redis", unreachable)
-    # The migration tests' alembic env calls fileConfig, which disables every
-    # logger that existed before it for the rest of the session.
-    monkeypatch.setattr(cancellation.logger, "disabled", False)
+    logged = owned_logger(cancellation.logger.name, level=logging.WARNING)
     _fake_handler(monkeypatch)
     sent: list[dict] = []
     replies, started = _replies_that_wait(sent)
@@ -587,17 +590,21 @@ async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_
         input_text="hi", model="anton", turn_rows=[],
     )))
     await asyncio.wait_for(started.wait(), timeout=2)
-    with caplog.at_level(logging.WARNING, logger=cancellation.logger.name):
-        turn.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await turn
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
 
     records = [
         r for r in caplog.records
         if r.name == cancellation.logger.name and r.levelno == logging.WARNING
     ]
-    assert [r.getMessage() for r in records] == [
-        f"Could not ask the sandbox controller to stop channel turn {sent[0]['correlation_id']}; "
-        "the sandbox turn may run on."
-    ]
+    correlation_id = sent[0]["correlation_id"]
+    fields = {
+        "event": "controller_turn_stop_failed",
+        "request_id": correlation_id,
+        "turn_id": correlation_id,
+        "reason": "channel_turn_ended",
+    }
+    assert [{name: getattr(r, name) for name in fields} for r in records] == [fields]
     assert isinstance(records[0].exc_info[1], ConnectionError)
+    assert_log_fields(logged.output(), **fields)

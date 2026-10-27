@@ -443,13 +443,15 @@ REMOTE_CANCEL_LITERAL = "cancelled"
 # per-stream-line cancel check needs stream lines to run and none exist
 # before the pod is Running.
 #
-# Ambiguous on its own: a controller replica without a shutdown drain unwinds
-# a rolling deploy's SIGTERM through the same handler (a draining controller
-# ends those turns with "TurnInterrupted" instead), and reading that as a
-# cancel would end the turn with partial text, no error frame and no lookup
-# id — the one failure class that would come out of this change LESS
-# visible. Callers confirm it against the cancel flag before treating it as
-# a Stop.
+# Ambiguous on its own: a controller replica without a shutdown drain also
+# sends it when its whole process is cancelled, as SIGINT in a local run
+# cancels every job task (a draining controller ends those turns with
+# "TurnInterrupted" instead). A hosted SIGTERM never gets there: as PID 1
+# such a controller ignores it until the kubelet kills it, and a peer later
+# reports the turn as lost. Reading this string as a cancel would end the
+# turn with partial text, no error frame and no lookup id: the one failure
+# class that would come out of this change LESS visible. Callers confirm it
+# against the cancel flag before treating it as a Stop.
 REMOTE_CANCEL_VIA_FAIL_JOB = "RuntimeError: cancelled"
 
 # live_pod.py raises a bare RuntimeError from two places when the pod never

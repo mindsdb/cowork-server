@@ -21,12 +21,16 @@ GRACEFUL_SHUTDOWN_FLAG = "--timeout-graceful-shutdown"
 
 
 def image_cmd() -> list[str]:
-    """The Dockerfile's exec-form CMD."""
+    """The exec-form CMD the image runs: the final stage's last one, as
+    Docker takes it. An earlier stage's CMD never reaches the image."""
     lines = DOCKERFILE.read_text().splitlines()
+    final_stage = lines[max(i for i, line in enumerate(lines) if line.startswith("FROM ")):]
     # args alone would replace the CMD after an ENTRYPOINT; with none they
     # are the whole command, which hosted_command assumes.
     assert not [line for line in lines if line.startswith("ENTRYPOINT")], "the image gained an ENTRYPOINT"
-    return next(json.loads(line.removeprefix("CMD ")) for line in lines if line.startswith("CMD ["))
+    commands = [json.loads(line.removeprefix("CMD ")) for line in final_stage if line.startswith("CMD [")]
+    assert commands, "the image's final stage has no exec-form CMD"
+    return commands[-1]
 
 
 def hosted_command(values: Path = CHART_VALUES) -> list[str]:

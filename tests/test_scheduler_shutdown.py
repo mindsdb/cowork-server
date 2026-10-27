@@ -5,19 +5,33 @@ in flight, so no run starts behind that, and then waits for the loop and for
 the runs it already started, so each one records its turn's outcome and
 finishes its run row before the process exits. A run whose turn the server
 refuses because it is shutting down never started, and its schedule is left
-as it was.
+as it was. A run a shutdown cancels mid-turn is saved as failed. The new
+pods a rollout starts together begin polling at random points in the poll
+interval.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from uuid import uuid4
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import pytest
 
 from cowork import scheduler
+from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.streaming.registry import registry
+
+
+@pytest.fixture(autouse=True)
+def _no_scheduler_left(monkeypatch):
+    """A poll loop and runs of the scheduler's own, whatever an earlier test
+    left in its module globals; monkeypatch puts those back afterwards."""
+    monkeypatch.setattr(scheduler, "_scheduler_task", None)
+    monkeypatch.setattr(scheduler, "_scheduled_runs", set())
 
 
 @pytest.fixture
@@ -78,22 +92,105 @@ async def test_stopping_twice_is_safe_and_the_runs_it_started_are_awaited(one_du
     assert not scheduler._scheduled_runs
 
 
+async def test_a_new_poll_loop_waits_a_random_part_of_the_interval_before_its_first_poll(monkeypatch):
+    """Pods a rollout starts together would otherwise poll in step, and two
+    replicas polling together can both start one due schedule."""
+    loop = asyncio.get_running_loop()
+    drawn: list[tuple[float, float]] = []
+    first_poll: list[float] = []
+
+    def uniform(low: float, high: float) -> float:
+        drawn.append((low, high))
+        return 0.1
+
+    async def poll(fn, *, scope):
+        first_poll.append(loop.time())
+        return []
+
+    monkeypatch.setattr(scheduler, "random", SimpleNamespace(uniform=uniform))
+    monkeypatch.setattr(scheduler, "_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "run_db", poll)
+    started = loop.time()
+    polling = asyncio.create_task(scheduler._scheduler_loop())
+    try:
+        await _until(lambda: first_poll)
+    finally:
+        polling.cancel()
+        await asyncio.gather(polling, return_exceptions=True)
+
+    assert drawn == [(0, 0.01)]
+    assert first_poll[0] - started >= 0.1
+
+
 async def test_stopping_a_scheduler_that_never_started_does_nothing():
-    assert scheduler._scheduler_task is None
     assert scheduler.stop_scheduler() is None
     assert await scheduler.wait_for_scheduled_runs(timeout_seconds=1) == 0
 
 
+@dataclass(frozen=True)
+class DueSchedule:
+    """A daily schedule whose slot is due, and a reader for what a run left."""
+
+    id: UUID
+    next_run_at: datetime
+    title: str
+    state: Callable[[], tuple[Schedule, ScheduleRun, list[UUID]]]
+
+
 @pytest.fixture
-def refused_for_shutdown(monkeypatch, caplog):
-    """A daily schedule, a closed registry, and a turn handler that starts its
-    turn through that registry as ResponsesHandler.handle does. Yields the
-    schedule's id and a function that reads back its state."""
-    import cowork.handlers.responses as responses_mod
+def due_schedule():
+    """A daily schedule whose slot is due, under a title of its own. ``state``
+    reads back the schedule, its one run and the conversations under its
+    title. All three are removed afterwards."""
+    from sqlmodel import select
+
     from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
+    from cowork.models.conversation import Conversation
+    from cowork.services.conversations import ConversationService
     from cowork.services.projects import GENERAL_PROJECT_ID
-    from cowork.services.schedules import ScheduleService
+    from cowork.services.schedules import ScheduleRunService, ScheduleService
+
+    title = f"due daily {uuid4()}"
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title=title,
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id, next_run_at = schedule.id, schedule.next_run_at
+    session.close()
+
+    def conversations(check) -> list[UUID]:
+        return list(check.exec(select(Conversation.id).where(Conversation.topic == title)).all())
+
+    def state() -> tuple[Schedule, ScheduleRun, list[UUID]]:
+        check = get_open_session()
+        try:
+            fresh = ScheduleService(ScopedSession(check, SYSTEM_SCOPE)).get_schedule(schedule_id)
+            (run,) = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)
+            return fresh, run, conversations(check)
+        finally:
+            check.close()
+
+    yield DueSchedule(id=schedule_id, next_run_at=next_run_at, title=title, state=state)
+    cleanup = get_open_session()
+    for conversation_id in conversations(cleanup):
+        ConversationService(ScopedSession(cleanup, SYSTEM_SCOPE)).delete_conversation(conversation_id)
+    ScheduleService(ScopedSession(cleanup, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+    cleanup.close()
+
+
+@pytest.fixture
+def refused_for_shutdown(monkeypatch, caplog, due_schedule):
+    """A due schedule, a closed registry, and a turn handler that starts its
+    turn through that registry as ResponsesHandler.handle does."""
+    import cowork.handlers.responses as responses_mod
 
     class ClosedRegistryHandler:
         def __init__(self, *, principal=None, interactive=True):
@@ -110,43 +207,9 @@ def refused_for_shutdown(monkeypatch, caplog):
     # logger that existed before it for the rest of the session.
     monkeypatch.setattr(scheduler.logger, "disabled", False)
     caplog.set_level(logging.INFO, logger=scheduler.logger.name)
-    session = get_open_session()
-    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
-        title="refused for shutdown",
-        prompt="do the thing",
-        cadence="daily",
-        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
-        model="default",
-        timezone="UTC",
-        project_id=GENERAL_PROJECT_ID,
-        enabled=True,
-    )
-    schedule_id, next_run_at = schedule.id, schedule.next_run_at
-    session.close()
     registry.close()
-
-    def state():
-        from sqlmodel import select
-
-        from cowork.models.conversation import Conversation
-        from cowork.services.schedules import ScheduleRunService
-
-        check = get_open_session()
-        try:
-            fresh = ScheduleService(ScopedSession(check, SYSTEM_SCOPE)).get_schedule(schedule_id)
-            (run,) = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)
-            conversations = list(check.exec(
-                select(Conversation.id).where(Conversation.topic == "refused for shutdown")
-            ).all())
-            return fresh, run, conversations
-        finally:
-            check.close()
-
-    yield schedule_id, next_run_at, state
+    yield due_schedule
     registry.reset()
-    cleanup = get_open_session()
-    ScheduleService(ScopedSession(cleanup, SYSTEM_SCOPE)).delete_schedule(schedule_id)
-    cleanup.close()
 
 
 def _scheduler_records(caplog) -> list[tuple[int, str]]:
@@ -164,16 +227,16 @@ async def test_a_run_refused_for_shutdown_leaves_its_slot_due_and_no_empty_conve
     from cowork.common.datetime_utils import ensure_utc
     from cowork.schemas.schedules import RunStatus
 
-    schedule_id, next_run_at, state = refused_for_shutdown
+    schedule = refused_for_shutdown
 
-    await scheduler.execute_schedule(schedule_id, is_manual=False)
+    await scheduler.execute_schedule(schedule.id, is_manual=False)
 
-    fresh, run, conversations = state()
+    fresh, run, conversations = schedule.state()
     assert run.status == RunStatus.failed
     assert run.error == "Run did not start: the server was shutting down."
     assert run.conversation_id is None
     assert fresh.last_error is None
-    assert ensure_utc(fresh.next_run_at) == ensure_utc(next_run_at)
+    assert ensure_utc(fresh.next_run_at) == ensure_utc(schedule.next_run_at)
     assert conversations == []
     assert _scheduler_records(caplog) == [
         (logging.INFO, "Schedule run did not start; the server is shutting down"),
@@ -190,20 +253,64 @@ async def test_a_manual_run_refused_for_shutdown_keeps_the_conversation_its_requ
     from cowork.db.session import get_open_session
     from cowork.services.conversations import ConversationService
 
-    schedule_id, _, state = refused_for_shutdown
+    schedule = refused_for_shutdown
     session = get_open_session()
     conversation_id = ConversationService(ScopedSession(session, SYSTEM_SCOPE)).create_conversation(
-        topic="refused for shutdown",
+        topic=schedule.title,
     ).id
     session.close()
 
-    await scheduler.execute_schedule(schedule_id, is_manual=True, conversation_id=conversation_id)
+    await scheduler.execute_schedule(schedule.id, is_manual=True, conversation_id=conversation_id)
 
-    fresh, run, conversations = state()
+    fresh, run, conversations = schedule.state()
     assert run.error == "Run did not start: the server was shutting down."
     assert run.conversation_id == conversation_id
     assert fresh.last_error is None
     assert conversations == [conversation_id]
-    cleanup = get_open_session()
-    ConversationService(ScopedSession(cleanup, SYSTEM_SCOPE)).delete_conversation(conversation_id)
-    cleanup.close()
+
+
+@pytest.mark.parametrize("is_manual", [False, True], ids=["cron", "run-now"])
+async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_stays_due(
+    monkeypatch, due_schedule, is_manual,
+):
+    """Uvicorn's request drain cancels a Run now request at its bound, and the
+    event loop's close cancels a cron run still going. The run is saved as
+    failed, not success, so the next poll still runs the slot: the freshness
+    guard skips a slot only after a successful run."""
+    import cowork.handlers.responses as responses_mod
+    from cowork.common.datetime_utils import ensure_utc
+    from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.schemas.schedules import RunStatus
+
+    streaming = asyncio.Event()
+
+    class MidTurnHandler:
+        def __init__(self, *, principal=None, interactive=True):
+            pass
+
+        async def handle(self, request):
+            async def stream():
+                yield "event: response.output_text.delta\ndata: {}\n\n"
+                streaming.set()
+                await asyncio.Event().wait()
+
+            return stream()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", MidTurnHandler)
+    run = asyncio.create_task(scheduler.execute_schedule(due_schedule.id, is_manual=is_manual))
+    await asyncio.wait_for(streaming.wait(), timeout=5)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    fresh, finished, _ = due_schedule.state()
+    assert finished.status == RunStatus.failed
+    assert finished.error == "Run was interrupted: the server shut down before it finished."
+    assert ensure_utc(fresh.next_run_at) == ensure_utc(due_schedule.next_run_at)
+    poll = get_open_session()
+    try:
+        due = scheduler._due_schedules(ScopedSession(poll, SYSTEM_SCOPE), datetime.now(timezone.utc))
+    finally:
+        poll.close()
+    assert due_schedule.id in [schedule.id for schedule in due]

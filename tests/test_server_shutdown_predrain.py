@@ -28,6 +28,9 @@ from cowork.streaming.registry import (
     RunHandle, RunIdentity, ServerShuttingDown, TurnLifecycle, registry,
 )
 from cowork.turnqueue.redis_client import cancel_flag_key
+from tests._logging_assertions import assert_log_fields
+
+from test_turn_shutdown_lifecycle import _FakeBuffer
 
 SERVER_LOGGER = "cowork.common.logger"
 
@@ -56,8 +59,8 @@ async def _until(condition) -> None:
             await asyncio.sleep(0)
 
 
-def _server_records(caplog, level: int) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.name == SERVER_LOGGER and r.levelno == level]
+def _server_records(caplog, level: int) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == SERVER_LOGGER and r.levelno == level]
 
 
 async def test_the_first_sigterm_ends_turns_before_uvicorn_sees_it(monkeypatch):
@@ -106,38 +109,89 @@ async def test_a_failed_pre_drain_still_hands_sigterm_on(monkeypatch, caplog):
         await _until(lambda: handed_on)
 
     assert handed_on == [signal.SIGTERM]
-    assert _server_records(caplog, logging.ERROR) == ["Ending turns before shutdown failed"]
-
-
-@pytest.mark.parametrize("previous", [signal.SIG_IGN, signal.SIG_DFL], ids=["ignored", "default"])
-async def test_nothing_is_installed_without_a_handler_to_hand_on_to(previous, caplog):
-    signal.signal(signal.SIGTERM, previous)
-
-    with caplog.at_level(logging.WARNING, logger=SERVER_LOGGER):
-        server._end_remote_turns_on_sigterm()
-
-    assert signal.getsignal(signal.SIGTERM) == previous
-    assert _server_records(caplog, logging.WARNING) == [
-        f"SIGTERM handler is {previous!r}, not one to hand the signal on to; turns in "
-        "progress are ended only after the server's request drain"
+    assert [(r.getMessage(), r.event) for r in _server_records(caplog, logging.ERROR)] == [
+        ("Ending turns before shutdown failed", "shutdown_predrain_failed"),
     ]
 
 
-async def test_nothing_is_installed_off_the_main_thread(caplog):
+@pytest.mark.parametrize("previous", [signal.SIG_IGN, signal.SIG_DFL], ids=["ignored", "default"])
+async def test_nothing_is_installed_without_a_handler_to_hand_on_to(previous, caplog, owned_logger):
+    """The hosted log formatter drops a message's arguments, so the handler
+    found is a field."""
+    signal.signal(signal.SIGTERM, previous)
+    logged = owned_logger(SERVER_LOGGER, level=logging.WARNING)
+
+    server._end_remote_turns_on_sigterm()
+
+    assert signal.getsignal(signal.SIGTERM) == previous
+    message = (
+        "SIGTERM handler is not one to hand the signal on to; turns in progress are ended "
+        "only after the server's request drain"
+    )
+    fields = {"event": "shutdown_predrain_not_installed", "reason": previous.name}
+    assert [(r.getMessage(), r.event, r.reason) for r in _server_records(caplog, logging.WARNING)] == [
+        (message, *fields.values()),
+    ]
+    assert_log_fields(logged.output(), message=message, **fields)
+
+
+@pytest.mark.parametrize(
+    "previous", [signal.SIG_DFL, "uvicorn"], ids=["default-handler", "uvicorn-handler"],
+)
+async def test_nothing_is_installed_off_the_main_thread(previous, caplog):
+    """Named for the thread whatever the handler is: off the main thread a
+    default handler is what the main thread still has, not the cause."""
     def uvicorn_handle_exit(signum, frame):
         pass
 
-    signal.signal(signal.SIGTERM, uvicorn_handle_exit)
+    previous = uvicorn_handle_exit if previous == "uvicorn" else previous
+    signal.signal(signal.SIGTERM, previous)
     with caplog.at_level(logging.WARNING, logger=SERVER_LOGGER):
         thread = threading.Thread(target=server._end_remote_turns_on_sigterm)
         thread.start()
         thread.join()
 
-    assert signal.getsignal(signal.SIGTERM) is uvicorn_handle_exit
-    assert _server_records(caplog, logging.WARNING) == [
+    assert signal.getsignal(signal.SIGTERM) is previous
+    assert [(r.getMessage(), r.event, r.reason) for r in _server_records(caplog, logging.WARNING)] == [(
         "Server lifespan runs off the main thread, where no signal handler can be set; "
-        "turns in progress are ended only after the server's request drain"
-    ]
+        "turns in progress are ended only after the server's request drain",
+        "shutdown_predrain_not_installed",
+        "off_main_thread",
+    )]
+
+
+async def test_the_turns_end_outside_the_settings_scope_of_the_task_the_signal_interrupted(
+    monkeypatch,
+):
+    """SIGTERM lands while a turn's task holds one organization's settings
+    scope. The drain, and the tasks it starts, run in the context the handler
+    was installed in, which holds none."""
+    from cowork.common.settings.user_settings import current_settings_scope, use_settings_scope
+    from cowork.db.scoped import TenantScope
+
+    seen: dict[str, object] = {}
+    handed_on: list[int] = []
+
+    async def flag_write():
+        seen["flag write"] = current_settings_scope()
+
+    async def end_remote_turns():
+        seen["drain"] = current_settings_scope()
+        await asyncio.create_task(flag_write())
+
+    signal.signal(signal.SIGTERM, lambda signum, frame: handed_on.append(signum))
+    monkeypatch.setattr(server, "_end_remote_turns", end_remote_turns)
+    server._end_remote_turns_on_sigterm()
+
+    async def org_turn():
+        with use_settings_scope(TenantScope(org_mode=True, org_id="org-a")):
+            signal.raise_signal(signal.SIGTERM)
+            await asyncio.sleep(0)
+
+    await asyncio.create_task(org_turn())
+    await _until(lambda: handed_on)
+
+    assert seen == {"drain": None, "flag write": None}
 
 
 @pytest.fixture
@@ -185,7 +239,7 @@ async def test_only_remote_turns_take_sigterm_from_uvicorn(monkeypatch, quiet_li
 
 
 async def test_ending_remote_turns_refuses_new_ones_and_lets_their_scheduled_runs_finish(
-    monkeypatch, controller_flags, caplog,
+    monkeypatch, controller_flags, caplog, owned_logger,
 ):
     lifecycle = TurnLifecycle(identity=RunIdentity(remote=True))
 
@@ -195,7 +249,7 @@ async def test_ending_remote_turns_refuses_new_ones_and_lets_their_scheduled_run
     turn = asyncio.create_task(relay())
     await asyncio.sleep(0)
     registry._by_cid["c"] = RunHandle(
-        conversation_id="c", turn_id=0, buffer=SimpleNamespace(is_closed=False), task=turn,
+        conversation_id="c", turn_id=0, buffer=_FakeBuffer(), task=turn,
         lifecycle=lifecycle,
     )
     run_saw: list[bool] = []
@@ -212,20 +266,46 @@ async def test_ending_remote_turns_refuses_new_ones_and_lets_their_scheduled_run
     poll_loop = asyncio.create_task(asyncio.Event().wait())
     monkeypatch.setattr(scheduler, "_scheduler_task", poll_loop)
 
-    with caplog.at_level(logging.WARNING, logger=SERVER_LOGGER):
-        await server._end_remote_turns()
-        # The lifespan's teardown runs it again; nothing is left to do.
-        await server._end_remote_turns()
+    logged = owned_logger(SERVER_LOGGER, level=logging.WARNING)
+    await server._end_remote_turns()
+    # The lifespan's teardown runs it again; nothing is left to do.
+    await server._end_remote_turns()
 
     assert poll_loop.cancelled()
     assert turn.cancelled()
     assert run.done() and run_saw == [True]
     assert await controller_flags.exists(cancel_flag_key(lifecycle.identity.correlation_id))
-    assert _server_records(caplog, logging.WARNING) == ["Cancelled 1 in-flight turn(s) for shutdown"]
+    message = "Cancelled in-flight turns for shutdown"
+    assert [(r.getMessage(), r.event, r.count) for r in _server_records(caplog, logging.WARNING)] == [
+        (message, "shutdown_turns_cancelled", 1),
+    ]
+    assert_log_fields(logged.output(), message=message, event="shutdown_turns_cancelled", count=1)
     with pytest.raises(ServerShuttingDown):
         await registry.start(
             conversation_id="d", turn_id=0, open_buffer=None, produce=None,
         )
+
+
+async def test_a_scheduled_run_still_recording_its_outcome_is_counted_in_a_field(
+    monkeypatch, caplog, owned_logger,
+):
+    """The hosted log formatter drops a message's arguments, so the number of
+    runs the shutdown stopped waiting for is a field."""
+    monkeypatch.setattr(server, "TURN_SHUTDOWN_GRACE_SECONDS", 0.05)
+    release = asyncio.Event()
+    run = asyncio.create_task(release.wait())
+    monkeypatch.setattr(scheduler, "_scheduled_runs", {run})
+    logged = owned_logger(SERVER_LOGGER, level=logging.WARNING)
+
+    await server._end_remote_turns()
+
+    message = "Scheduled runs still recording their outcome at shutdown"
+    assert [(r.getMessage(), r.event, r.count) for r in _server_records(caplog, logging.WARNING)] == [
+        (message, "shutdown_scheduled_runs_unfinished", 1),
+    ]
+    assert_log_fields(logged.output(), message=message, event="shutdown_scheduled_runs_unfinished", count=1)
+    release.set()
+    await run
 
 
 async def test_a_poll_reading_the_database_does_not_hold_up_ending_the_turns(
@@ -265,7 +345,7 @@ async def test_a_poll_reading_the_database_does_not_hold_up_ending_the_turns(
     await asyncio.sleep(0)
     monkeypatch.setattr(scheduler, "_scheduler_task", loop_task)
     registry._by_cid["c"] = RunHandle(
-        conversation_id="c", turn_id=0, buffer=SimpleNamespace(is_closed=False), task=turn,
+        conversation_id="c", turn_id=0, buffer=_FakeBuffer(), task=turn,
         lifecycle=lifecycle,
     )
 
@@ -288,7 +368,7 @@ async def test_a_remote_shutdown_that_skipped_sigterm_still_ends_its_turns(
         turn = asyncio.create_task(asyncio.Event().wait())
         await asyncio.sleep(0)
         registry._by_cid["c"] = RunHandle(
-            conversation_id="c", turn_id=0, buffer=SimpleNamespace(is_closed=False), task=turn,
+            conversation_id="c", turn_id=0, buffer=_FakeBuffer(), task=turn,
             lifecycle=lifecycle,
         )
 

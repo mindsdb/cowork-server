@@ -45,7 +45,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from _hosted_command import graceful_shutdown_seconds, hosted_command
+from _hosted_command import graceful_shutdown_seconds, hosted_command, image_cmd
 
 CHART = Path(__file__).resolve().parents[1] / "deployment" / "cowork-server"
 BASE = CHART / "values.yaml"
@@ -207,6 +207,22 @@ def test_no_values_file_replaces_the_images_command(values):
     assert not uvicorn_options, f"{values.name} sets uvicorn options outside the command: {uvicorn_options}"
 
 
+def test_the_image_command_is_the_final_stages_last_cmd(monkeypatch, tmp_path):
+    """Docker runs the final stage's last CMD; a CMD in an earlier stage, or
+    an earlier one in the final stage, never reaches the image."""
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python AS builder\n"
+        'CMD ["builder", "--timeout-graceful-shutdown", "2"]\n'
+        "FROM python AS final\n"
+        'CMD ["replaced"]\n'
+        'CMD ["final", "--timeout-graceful-shutdown", "20"]\n'
+    )
+    monkeypatch.setattr("_hosted_command.DOCKERFILE", dockerfile)
+
+    assert image_cmd() == ["final", "--timeout-graceful-shutdown", "20"]
+
+
 @pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
 def test_the_pod_leaves_the_ingress_before_sigterm(values):
     assert _rendered(values)["lifecycle"] == {"preStop": {"exec": {"command": PRESTOP}}}
@@ -217,8 +233,9 @@ def test_the_pod_leaves_the_ingress_before_sigterm(values):
 def test_the_grace_period_covers_the_whole_shutdown(values):
     """Counted from the pod's deletion: the preStop sleep, the pre-drain that
     ends remote turns before uvicorn sees SIGTERM, uvicorn's drain bound, then
-    the lifespan teardown's bounded waits (another pass over turns, channel
-    tasks, scratchpad closes), and a margin for its unbounded closes.
+    the lifespan teardown's bounded waits (the draft listener's own drain,
+    another pass over turns, channel tasks, scratchpad closes), and a margin
+    for its unbounded closes.
 
     The channel drain's wait_for waits for the tasks it cancels at its
     timeout, and a cancelled channel turn writes its controller cancel flag
@@ -226,12 +243,16 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     own timeout."""
     from cowork.channels.webhooks import drain_background_tasks
     from cowork.common.chat_session import drain_scratchpad_closes
+    from cowork.draft_host.listener import (
+        _GRACEFUL_SHUTDOWN_SECONDS as DRAFT_LISTENER_DRAIN_SECONDS,
+    )
     from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
     from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 
     deployment = _rendered(values)
     teardown = (
-        TURN_SHUTDOWN_GRACE_SECONDS
+        DRAFT_LISTENER_DRAIN_SECONDS
+        + TURN_SHUTDOWN_GRACE_SECONDS
         + _timeout_default(drain_background_tasks) + CANCEL_REQUEST_SECONDS
         + _timeout_default(drain_scratchpad_closes)
     )
