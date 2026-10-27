@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+import cowork.server as cowork_server
 from cowork.api.v1.endpoints.connectors import sharepoint as sharepoint_ep
 from cowork.api.v1.router import api_router
 from cowork.common.settings.app_settings import get_app_settings
@@ -25,7 +26,7 @@ from cowork.services.connectors import sharepoint as sharepoint_service
 from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
 from cowork.services.connectors.layered_vault import (
     SHARED_CONNECTION_REFUSAL,
-    SharedConnectionError,
+    STILL_SHARED_CONNECTION_REFUSAL,
 )
 from cowork.services.connectors.persist import own_vault_for_scope, persist_connection, vault_for_scope
 
@@ -39,6 +40,7 @@ SITE_ID = "contoso.sharepoint.com,aaaa-1111,bbbb-2222"
 TOKEN_URL = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
 BODY = {"name": "corp", "tenant_id": TENANT, "client_id": CLIENT_ID, "client_secret": SECRET, "site_urls": SITE}
 
+AUTH_TOKEN = "sharepoint-routes-test-token"
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 SUB_A = "11111111-1111-4111-8111-111111111111"
 SUB_B = "22222222-2222-4222-8222-222222222222"
@@ -189,12 +191,32 @@ def test_a_create_that_loses_a_race_for_its_name_removes_its_record(monkeypatch,
     assert _record()["fields"]["client_id"] == "99999999-0000-0000-0000-000000000000"
 
 
-@pytest.mark.parametrize("name", ["corp one", "corp_", "_corp", "__", "-", "a" * 65, "corp/x", "naïve"])
+@pytest.mark.parametrize(
+    "name", ["corp one", "corp_", "_corp", "__", "-", "a__b", "a-_b", "a--b", "a" * 65, "corp/x", "naïve"]
+)
 def test_names_the_vault_would_rewrite_are_refused(microsoft, name):
     status, _ = _status(lambda: sharepoint_ep.create_connection({**BODY, "name": name}, LOCAL_SCOPE))
 
     assert status == 422
     assert _names() == []
+
+
+@pytest.mark.parametrize("name", ["corp_one", "CORP-ONE", "Corp_One"])
+def test_a_name_with_the_same_env_prefix_as_an_existing_one_is_taken(microsoft, name):
+    sharepoint_ep.create_connection({**BODY, "name": "corp-one"}, LOCAL_SCOPE)
+
+    status, _ = _status(lambda: sharepoint_ep.create_connection({**BODY, "name": name}, LOCAL_SCOPE))
+
+    assert status == 409
+    assert _names() == ["corp-one"]
+
+
+def test_a_name_of_64_characters_is_accepted(microsoft):
+    name = "a" * 64
+
+    sharepoint_ep.create_connection({**BODY, "name": name}, LOCAL_SCOPE)
+
+    assert _names() == [name]
 
 
 def test_create_refuses_a_kept_secret(microsoft):
@@ -335,7 +357,9 @@ def test_a_connection_shared_with_the_caller_cannot_be_edited(personal_deploymen
     assert vault_for_scope(BOB).load("sharepoint", "corp")["client_secret"] == SECRET
 
 
-def test_a_name_still_shared_from_a_removed_connection_is_refused_not_a_500(personal_deployment, managed_dir, microsoft):
+def test_a_name_still_shared_from_a_removed_connection_is_refused_not_a_500(
+    monkeypatch, personal_deployment, managed_dir, microsoft
+):
     get_app_settings.cache_clear()
     sharepoint_ep.create_connection(dict(BODY), ALICE)
     managed_dir.shared_dir.mkdir(exist_ok=True)
@@ -343,10 +367,18 @@ def test_a_name_still_shared_from_a_removed_connection_is_refused_not_a_500(pers
         json.dumps([{"user_id": SUB_A, "partition_id": ALICE.org_id, "engine": "sharepoint", "name": "corp"}])
     )
     own_vault_for_scope(ALICE).delete("sharepoint", "corp")
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", AUTH_TOKEN)
+    get_app_settings.cache_clear()
+    client = TestClient(cowork_server.create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
 
-    with pytest.raises(SharedConnectionError):
-        sharepoint_ep.create_connection(dict(BODY), ALICE)
+    response = client.post(
+        "/api/v1/connectors/sharepoint/connections",
+        headers={"Authorization": f"Bearer {AUTH_TOKEN}", "X-User-Id": SUB_A, "X-Organization-Id": DEPLOYMENT},
+        json=BODY,
+    )
 
+    assert response.status_code == 403
+    assert response.json() == {"detail": STILL_SHARED_CONNECTION_REFUSAL}
     assert _names(ALICE) == []
 
 

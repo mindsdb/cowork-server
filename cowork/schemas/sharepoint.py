@@ -3,6 +3,8 @@
 Fixed fields only: Graph's own item objects carry pre-authenticated download
 links, which must never reach a response.
 """
+from __future__ import annotations
+
 from typing import Literal
 
 from pydantic import BaseModel

@@ -2,8 +2,10 @@
 
 A connection is created or edited here, never through the generic
 submission: the key is checked against Microsoft (``SharePointClient.check``)
-before anything is stored. Create and edit are separate routes so a create
-can never replace an existing connection. Browse reads only the sites the
+before anything is stored. Create and edit are separate routes: a create
+refuses a name already in use, so it never replaces another key's
+connection (two creates racing for one name with the same key store the
+later secret, as any same-account save does). Browse reads only the sites the
 connection names. Refused in org mode: the hosted app keeps connections in
 auth, not in this vault.
 """
@@ -14,18 +16,20 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 
+from anton.core.datasources.data_vault import LocalDataVault
+
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
-from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
-from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.schemas.sharepoint import (
     SharePointChildrenResponse,
     SharePointItem,
     SharePointLibrariesResponse,
     SharePointLibrary,
 )
+from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
+from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, LayeredDataVault
+from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.sharepoint import (
     AppKey,
     SharePointClient,
@@ -43,9 +47,10 @@ ENGINE = "sharepoint"
 _KEY_FIELDS = ("tenant_id", "client_id", "client_secret", "site_urls")
 _CREATE_FIELDS = frozenset({"name", "user_label", *_KEY_FIELDS})
 _EDIT_FIELDS = frozenset({"user_label", *_KEY_FIELDS})
-# Alphanumeric at both ends, so anton's vault file-name sanitizing leaves it
-# unchanged and two names can't land on one record.
-_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9_-]{0,62}[A-Za-z0-9])?")
+# Letters and digits joined by single - or _, so anton's vault file name and
+# DS_ env prefix keep the name intact and `__` (its field separator) never appears.
+_NAME = re.compile(r"[A-Za-z0-9]+([-_][A-Za-z0-9]+)*")
+_MAX_NAME = 64
 _MAX_CURSOR = 4096
 _KEY_NO_LONGER_WORKS = "This connection's key no longer works. Ask whoever set it up to update it."
 _BROWSE_STATUS = {
@@ -108,7 +113,17 @@ def _check(credentials: dict[str, str]) -> None:
         raise _unprocessable(str(exc)) from exc
 
 
-def _saved(vault, name: str) -> dict[str, Any]:
+def _env_key(name: str) -> str:
+    """The form anton's DS_ env prefix gives a name: two names with one key would overwrite each other's env."""
+    return re.sub(r"[^\w]", "_", name).casefold()
+
+
+def _valid_name(name: str) -> bool:
+    """Whether ``name`` fits the connection name rule."""
+    return len(name) <= _MAX_NAME and bool(_NAME.fullmatch(name))
+
+
+def _saved(vault: LocalDataVault | LayeredDataVault, name: str) -> dict[str, Any]:
     """The response for a saved connection: its name and the label the UI shows."""
     record = vault.read_record(ENGINE, name) or {}
     user_label = str(record.get("fields", {}).get("_user_label", "")).strip() or None
@@ -120,13 +135,15 @@ def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str
     """Create a SharePoint connection once its key opens every site; 409 if the name is taken."""
     fields = _body_fields(body, _CREATE_FIELDS, ("name", *_KEY_FIELDS))
     name = fields["name"]
-    if not _NAME.fullmatch(name):
-        raise _unprocessable("Use letters, digits, - and _ for the name, starting and ending with a letter or digit.")
+    if not _valid_name(name):
+        raise _unprocessable(
+            "Use letters and digits for the name, joined by single - or _, at most 64 characters."
+        )
     if VAULT_KEEP_SENTINEL in fields.values():
         raise _unprocessable("A new connection has no stored secret to keep.")
     vault = vault_for_scope(scope)
-    taken = {c["name"].casefold() for c in vault.list_connections() if c.get("engine") == ENGINE}
-    if name.casefold() in taken:
+    taken = {_env_key(c["name"]) for c in vault.list_connections() if c.get("engine") == ENGINE}
+    if _env_key(name) in taken:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A SharePoint connection with this name already exists.")
     credentials = _credentials(fields)
     _check(credentials)
@@ -149,7 +166,7 @@ def edit_connection(name: str, body: Annotated[Any, Body()], scope: ScopeDep) ->
     """
     fields = _body_fields(body, _EDIT_FIELDS, _KEY_FIELDS)
     vault = vault_for_scope(scope)
-    record = vault.read_record(ENGINE, name) if _NAME.fullmatch(name) else None
+    record = vault.read_record(ENGINE, name) if _valid_name(name) else None
     if record is None or record.get("name") != name:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     if not ConnectionsService(scope).can_change(ENGINE, name):
@@ -196,7 +213,7 @@ def _stored_connection(scope: TenantScope, name: str) -> tuple[AppKey, list[str]
     form), so nothing stored reaches a URL until it passes the same rules a
     create applies.
     """
-    record = vault_for_scope(scope).read_record(ENGINE, name) if _NAME.fullmatch(name) else None
+    record = vault_for_scope(scope).read_record(ENGINE, name) if _valid_name(name) else None
     if record is None or record.get("name") != name:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     fields = record.get("fields") or {}
