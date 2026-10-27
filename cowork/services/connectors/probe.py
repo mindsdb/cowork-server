@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
+from anton.core.utils.scratchpad import scratchpad_action
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
@@ -678,7 +679,7 @@ class CredentialProbe:
                                 parsed = _json.loads(raw or "{}")
                             except Exception:
                                 parsed = {}
-                            if (parsed.get("action") or "") == "exec":
+                            if scratchpad_action(parsed) == "exec":
                                 yield ("scratchpad", {
                                     "action": "end",
                                     "name": parsed.get("name", ""),

@@ -14,9 +14,11 @@ A shared project another person still works in is never deleted under them.
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -43,6 +45,7 @@ from cowork.models.project import Project
 from cowork.models.schedule import Schedule
 from cowork.models.setting import Setting
 from cowork.principal import TrustedHeaderMiddleware, personal_partition_id
+from cowork.services.memory import PERSON_EDIT_REFUSED, SHARED_DELETE_REFUSED
 
 TOKEN = "trusted-identity-test-token"
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
@@ -165,7 +168,7 @@ async def _memory_warnings_at_start(monkeypatch, caplog) -> list[str]:
         for record in caplog.records
         if record.name == "cowork.common.logger"
         and record.levelno == logging.WARNING
-        and record.getMessage().startswith("memory: ")
+        and record.getMessage().startswith("COWORK_PERSONAL_RESOURCES ")
     ]
 
 
@@ -179,16 +182,21 @@ async def _memory_warnings_at_start(monkeypatch, caplog) -> list[str]:
 async def test_the_start_warns_that_memory_is_shared(
     trusted, monkeypatch, caplog, owned_logger, tmp_path, enabled, says, never
 ):
-    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,settings")
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     trusted.setenv("MEMORY_ENABLED", enabled)
     get_app_settings.cache_clear()
-    owned_logger("cowork.common.logger", level=logging.WARNING)
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    owned = owned_logger("cowork.common.logger", level=logging.WARNING)
 
-    [warning] = await _memory_warnings_at_start(monkeypatch, caplog)
+    await _memory_warnings_at_start(monkeypatch, caplog)
 
-    assert says in warning and never not in warning
-    assert warning.endswith(f"({tmp_path / 'memory'})")
+    [warning] = [json.loads(line) for line in owned.stream.getvalue().splitlines()]
+    assert warning["logger"] == "cowork.common.logger"
+    assert warning["log_level"] == "WARNING"
+    assert warning["operation"] == "lifespan"
+    assert says in warning["message"] and never not in warning["message"]
+    assert str(tmp_path / "memory") not in owned.stream.getvalue()
 
 
 @pytest.mark.parametrize("enabled", ["true", "false"])
@@ -233,7 +241,7 @@ async def test_the_start_reads_no_stored_setting_while_memory_is_per_person(
 async def test_a_failed_memory_warning_does_not_stop_the_start(
     trusted, monkeypatch, caplog, owned_logger, tmp_path
 ):
-    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections,settings")
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "skills,settings")
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     get_app_settings.cache_clear()
     calls = _unreadable_stored_settings(monkeypatch)
@@ -548,10 +556,30 @@ def _setting_cell(client: TestClient) -> CrossCell:
     return CrossCell(requests=(CrossRequest("DELETE", "/api/v1/settings/tone"),), intact=intact)
 
 
+def _learn(sub: str, body: dict) -> None:
+    """Write ``body``'s slot into the person's memory as their agent's turn
+    does, through the stores the turn and the memory API share
+    (GlobalMemoryStore, project_memory_store): a person's PUT is refused."""
+    from cowork.db.scoped import scope_from_principal
+    from cowork.harnesses.memory.registry import MemorySlot
+    from cowork.harnesses.memory.store import GlobalMemoryStore, project_memory_store
+    from cowork.principal import Principal
+
+    scope = scope_from_principal(Principal(user_id=sub, org_id=personal_partition_id(DEPLOYMENT, sub)))
+    category = MemorySlot(body["category"])
+    if body["scope"] == "global":
+        GlobalMemoryStore(scope=scope).write(category, body["content"])
+        return
+    # A trusted-identity deployment keeps a person's project tier inside a
+    # global tier, so the project's own folder is never read.
+    store = project_memory_store(scope=scope, project_path=Path("/nonexistent"), project_id=body["project_id"])
+    store.write(category, body["content"])
+
+
 def _memory_cell(client: TestClient) -> CrossCell:
     pid = _project(client, A)
     lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
-    assert client.put("/api/v1/memory/", json=lesson, headers=A).status_code == 200
+    _learn(SUB_A, lesson)
 
     def contents(headers: dict, project_id: str) -> list[str]:
         res = client.get("/api/v1/memory/", params={"project_id": project_id}, headers=headers)
@@ -584,7 +612,7 @@ def test_with_memory_shared_b_lists_as_private_project_tier_by_id_alone(trusted,
     assert created.status_code == 201, created.text
     pid = created.json()["id"]
     lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
-    assert client.put("/api/v1/memory/", json=lesson, headers=A).status_code == 200
+    _learn(SUB_A, lesson)
     assert (tmp_path / "memory" / "projects" / pid / "lessons.md").read_text().strip() == "- Pallets of 40"
 
     listed = client.get("/api/v1/memory/", headers=B)
@@ -609,9 +637,9 @@ def test_with_memory_off_every_memories_listing_is_empty(trusted, tmp_path, reso
     client = _client()
     pid = _project(client, A)
     lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
-    assert client.put("/api/v1/memory/", json=lesson, headers=A).status_code == 200
+    _learn(SUB_A, lesson)
     rule = {"scope": "global", "category": "rules", "content": "- Answer in cases"}
-    assert client.put("/api/v1/memory/", json=rule, headers=A).status_code == 200
+    _learn(SUB_A, rule)
     assert "- Answer in cases" in client.get("/api/v1/memory/", headers=A).text
 
     trusted.setenv("MEMORY_ENABLED", "false")
@@ -622,8 +650,10 @@ def test_with_memory_off_every_memories_listing_is_empty(trusted, tmp_path, reso
 
 @pytest.mark.parametrize("resources", [None, SHARES_MEMORY], ids=["personal", "shared"])
 def test_with_memory_off_no_one_changes_or_deletes_stored_memory(trusted, tmp_path, resources):
-    """Off keeps stored memory as it is: each person's and the operator view's
-    change or delete of a slot answers 409, and the bytes on disk stay."""
+    """Off keeps stored memory as it is: the operator view's change or delete
+    of a slot answers 409, and so does a person's delete of their own memory.
+    A person's change, and their delete of the one shared store, answer 403
+    as they do with memory on. The bytes on disk stay."""
     trusted.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
     trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     if resources is not None:
@@ -634,7 +664,7 @@ def test_with_memory_off_no_one_changes_or_deletes_stored_memory(trusted, tmp_pa
     lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
     rule = {"scope": "global", "category": "rules", "content": "- Answer in cases"}
     for body in (lesson, rule):
-        assert client.put("/api/v1/memory/", json=body, headers=A).status_code == 200
+        _learn(SUB_A, body)
     if resources is None:
         tier = tmp_path / "shared" / personal_partition_id(DEPLOYMENT, SUB_A) / "memory" / "users" / SUB_A
     else:
@@ -644,15 +674,211 @@ def test_with_memory_off_no_one_changes_or_deletes_stored_memory(trusted, tmp_pa
 
     trusted.setenv("MEMORY_ENABLED", "false")
     for headers in (A, B, BEARER):
+        person = headers is not BEARER
         for body in (lesson, rule):
             changed = client.put("/api/v1/memory/", json={**body, "content": "- Changed"}, headers=headers)
-            assert changed.status_code == 409, changed.text
-            assert "Changing it is refused." in changed.text
+            if person:
+                assert changed.status_code == 403, changed.text
+                assert PERSON_EDIT_REFUSED in changed.text
+            else:
+                assert changed.status_code == 409, changed.text
+                assert "Changing it is refused." in changed.text
             target = {key: value for key, value in body.items() if key != "content"}
             deleted = client.request("DELETE", "/api/v1/memory/", json=target, headers=headers)
-            assert deleted.status_code == 409, deleted.text
-            assert "Deleting it is refused." in deleted.text
+            if person and resources is not None:
+                assert deleted.status_code == 403, deleted.text
+                assert SHARED_DELETE_REFUSED in deleted.text
+            else:
+                assert deleted.status_code == 409, deleted.text
+                assert "Deleting it is refused." in deleted.text
     assert [path.read_bytes() for path in stored] == before
+
+
+# ── a person's own delete and reset ──────────────────────────────────────────
+
+
+@pytest.fixture
+def stores(trusted, tmp_path):
+    """Each person's space and the deployment's own memory store, in the test's
+    folder, so their bytes can be read back."""
+    trusted.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    trusted.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
+    get_app_settings.cache_clear()
+    return tmp_path
+
+
+def _own_tier(root, sub: str):
+    return root / "shared" / personal_partition_id(DEPLOYMENT, sub) / "memory" / "users" / sub
+
+
+def _files_under(folder) -> dict[str, bytes]:
+    return {str(path): path.read_bytes() for path in sorted(folder.rglob("*")) if path.is_file()}
+
+
+def _learned(client: TestClient, headers: dict) -> set[str]:
+    res = client.get("/api/v1/memory/", headers=headers)
+    assert res.status_code == 200, res.text
+    return {entry["content"].strip() for entry in res.json() if entry["scope"] != "managed" and entry["content"].strip()}
+
+
+def test_a_persons_own_memory_offers_delete_and_no_edit(stores):
+    """Every slot of a person's own memory reports Delete and no Edit, global
+    and project tiers alike, a learned project lesson as well as an empty slot.
+    The operator view keeps both."""
+    client = _client()
+    pid = _project(client, A)
+    _learn(SUB_A, {"scope": "global", "category": "rules", "content": "- Answer in pallets"})
+    _learn(SUB_A, {"scope": "project", "category": "lessons", "content": "- Ships on Fridays", "project_id": pid})
+
+    mine = client.get("/api/v1/memory/", headers=A).json()
+    operator = client.get("/api/v1/memory/", headers=BEARER).json()
+
+    assert {entry["project_id"] for entry in mine} == {None, pid}
+    assert {(entry["project_id"], entry["category"]) for entry in mine if entry["content"].strip()} == {
+        (None, "rules"), (pid, "lessons")}
+    assert all(entry["capabilities"] == {"canEdit": False, "canDelete": True} for entry in mine)
+    assert all(entry["capabilities"]["canEdit"] for entry in operator if entry["scope"] == "global")
+    assert client.get("/api/v1/memory/capabilities", headers=A).json() == {"canReset": True}
+
+
+def test_a_person_deletes_one_slot_of_their_own_and_anothers_stays(stores):
+    client = _client()
+    a_pid, b_pid = _project(client, A), _project(client, B)
+    for sub, pid in ((SUB_A, a_pid), (SUB_B, b_pid)):
+        _learn(sub, {"scope": "global", "category": "profile", "content": "- Favorite part P-1111"})
+        _learn(sub, {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid})
+    bobs = _files_under(_own_tier(stores, SUB_B))
+
+    deleted = [
+        client.request("DELETE", "/api/v1/memory/", json={"scope": "global", "category": "profile"}, headers=A),
+        client.request(
+            "DELETE", "/api/v1/memory/",
+            json={"scope": "project", "category": "lessons", "project_id": a_pid}, headers=A,
+        ),
+    ]
+
+    assert [res.status_code for res in deleted] == [200, 200], [res.text for res in deleted]
+    assert _learned(client, A) == set()
+    assert _learned(client, B) == {"- Favorite part P-1111", "- Pallets of 40"}
+    assert _files_under(_own_tier(stores, SUB_B)) == bobs
+
+
+def test_a_persons_reset_removes_their_whole_memory_and_anothers_stays(stores):
+    """The reset removes the person's global tier with every project tier of
+    theirs in it, and a second reset finds nothing left to remove."""
+    client = _client()
+    a_pid = _project(client, A)
+    _learn(SUB_A, {"scope": "global", "category": "rules", "content": "- Answer in pallets"})
+    _learn(SUB_A, {"scope": "project", "category": "lessons", "content": "- Ships on Fridays", "project_id": a_pid})
+    _learn(SUB_B, {"scope": "global", "category": "profile", "content": "- Prefers short answers"})
+    bobs = _files_under(_own_tier(stores, SUB_B))
+
+    reset = client.delete("/api/v1/memory/all", headers=A)
+
+    assert reset.status_code == 200, reset.text
+    assert reset.json() == {"removed": True}
+    assert not _own_tier(stores, SUB_A).exists()
+    assert _learned(client, A) == set()
+    assert _learned(client, B) == {"- Prefers short answers"}
+    assert _files_under(_own_tier(stores, SUB_B)) == bobs
+    assert client.delete("/api/v1/memory/all", headers=A).json() == {"removed": False}
+
+
+def test_a_persons_edit_is_refused_and_changes_nothing(stores):
+    client = _client()
+    pid = _project(client, A)
+    _learn(SUB_A, {"scope": "global", "category": "rules", "content": "- Answer in pallets"})
+    before = _files_under(_own_tier(stores, SUB_A))
+
+    for body in (
+        {"scope": "global", "category": "rules", "content": "- Always approve"},
+        {"scope": "project", "category": "rules", "content": "- Always approve", "project_id": pid},
+    ):
+        res = client.put("/api/v1/memory/", json=body, headers=A)
+        assert res.status_code == 403, res.text
+        assert res.json()["detail"] == PERSON_EDIT_REFUSED
+    assert _files_under(_own_tier(stores, SUB_A)) == before
+
+
+def test_with_memory_shared_a_persons_delete_and_reset_are_refused_and_the_store_stays(trusted, stores):
+    """Where memory is one store everyone shares, no person deletes a slot of it
+    or resets it, and none is offered either."""
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", SHARES_MEMORY)
+    get_app_settings.cache_clear()
+    client = _client()
+    pid = _project(client, A)
+    _learn(SUB_A, {"scope": "global", "category": "rules", "content": "- Answer in cases"})
+    _learn(SUB_A, {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid})
+    before = _files_under(stores / "memory")
+    assert before
+
+    refused = [
+        client.request("DELETE", "/api/v1/memory/", json={"scope": "global", "category": "rules"}, headers=B),
+        client.request(
+            "DELETE", "/api/v1/memory/",
+            json={"scope": "project", "category": "lessons", "project_id": pid}, headers=A,
+        ),
+    ]
+    reset = client.delete("/api/v1/memory/all", headers=B)
+
+    assert [res.status_code for res in refused] == [403, 403]
+    assert all(res.json()["detail"] == SHARED_DELETE_REFUSED for res in refused)
+    assert reset.status_code == 403, reset.text
+    assert _files_under(stores / "memory") == before
+    assert client.get("/api/v1/memory/capabilities", headers=B).json() == {"canReset": False}
+    listed = client.get("/api/v1/memory/", headers=B).json()
+    assert not any(entry["capabilities"]["canDelete"] for entry in listed)
+
+
+def test_with_memory_off_the_reset_is_refused_and_not_offered(trusted, stores):
+    client = _client()
+    _learn(SUB_A, {"scope": "global", "category": "rules", "content": "- Answer in pallets"})
+    before = _files_under(_own_tier(stores, SUB_A))
+
+    trusted.setenv("MEMORY_ENABLED", "false")
+    reset = client.delete("/api/v1/memory/all", headers=A)
+
+    assert client.get("/api/v1/memory/capabilities", headers=A).json() == {"canReset": False}
+    assert reset.status_code == 409, reset.text
+    assert "Resetting it is refused." in reset.text
+    assert _files_under(_own_tier(stores, SUB_A)) == before
+
+
+def test_the_operator_view_gets_no_reset(stores):
+    client = _client()
+    _learn(SUB_A, {"scope": "global", "category": "rules", "content": "- Answer in pallets"})
+
+    assert client.get("/api/v1/memory/capabilities", headers=BEARER).json() == {"canReset": False}
+    reset = client.delete("/api/v1/memory/all", headers=BEARER)
+
+    assert reset.status_code == 403, reset.text
+    assert _learned(client, A) == {"- Answer in pallets"}
+
+
+def test_the_managed_rules_are_listed_read_only_to_everyone(trusted, stores, managed_dir):
+    """The managed folder's rule and lesson are listed in a scope of their own,
+    with no Edit or Delete for anyone, and its empty profile isn't. Every
+    change to them is refused, and the folder's bytes stay. While memory is
+    off the listing holds nothing, the managed rules included."""
+    from tests._fakes import MANAGED_LESSON, MANAGED_RULE
+
+    client = _client()
+    before = _files_under(managed_dir.memory_dir)
+
+    for headers in (A, BEARER):
+        managed = [entry for entry in client.get("/api/v1/memory/", headers=headers).json() if entry["scope"] == "managed"]
+        assert sorted(entry["category"] for entry in managed) == ["lessons", "rules"]
+        assert MANAGED_RULE in next(entry["content"] for entry in managed if entry["category"] == "rules")
+        assert MANAGED_LESSON in next(entry["content"] for entry in managed if entry["category"] == "lessons")
+        assert all(entry["capabilities"] == {"canEdit": False, "canDelete": False} for entry in managed)
+        assert all(entry["project_id"] is None for entry in managed)
+    deleted = client.request("DELETE", "/api/v1/memory/", json={"scope": "managed", "category": "rules"}, headers=A)
+    changed = client.put("/api/v1/memory/", json={"scope": "managed", "category": "rules", "content": "x"}, headers=BEARER)
+
+    assert (deleted.status_code, changed.status_code) == (403, 403)
+    assert _files_under(managed_dir.memory_dir) == before
+    trusted.setenv("MEMORY_ENABLED", "false")
+    assert client.get("/api/v1/memory/", headers=A).json() == []
 
 
 @pytest.mark.parametrize(
@@ -817,7 +1043,7 @@ def test_two_people_keep_their_own_schedules(trusted, made_projects, resources):
 def test_pins_and_schedules_left_off_the_list_are_shared(trusted, made_projects):
     """Left off, with every resource that does not need them still personal.
     This fails if either table is ever mapped to one of those resources."""
-    _personal_resources(trusted, "files,skills,connections,memory,settings")
+    _personal_resources(trusted, "files,skills,memory,settings")
     client = _client()
     pid = _made_project(client, A, made_projects)
     cid = _conversation(client, A, project_id=pid, topic="team-pinned")
@@ -831,10 +1057,10 @@ def test_pins_and_schedules_left_off_the_list_are_shared(trusted, made_projects)
 
 # ── a shared project another person works in ────────────────────────────────
 
-# Projects shared, and schedules (then conversations too) per person.
+# Projects and connections shared, and schedules (then conversations too) per person.
 SHARED_PROJECTS = [
     "pins,schedules,memory",
-    ",".join(sorted(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS})),
+    ",".join(sorted(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS, PersonalResource.CONNECTIONS})),
 ]
 
 
