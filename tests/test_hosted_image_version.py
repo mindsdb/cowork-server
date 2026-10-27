@@ -78,11 +78,10 @@ def test_the_image_build_fetches_tags() -> None:
     before this change `build-deploy.yml` contained no `fetch-depth: 0` at all,
     so an unscoped search would have *failed* here, not passed.
 
-    The scoping still earns its keep, for the jobs that do live in this file:
-    `scan`, `deploy-pr-env` and `deploy` each check out too, and none of them
-    needs tags. An unscoped assertion would go green the day any of those gains
-    a `fetch-depth: 0` for an unrelated reason, while the image build regressed
-    to shallow.
+    The scoping still earns its keep, for the other job that does live in this
+    file: `scan` checks out too, and does not need tags. An unscoped assertion
+    would go green the day it gains a `fetch-depth: 0` for an unrelated reason,
+    while the image build regressed to shallow.
     """
     build = _job_block("build")
     assert "actions/checkout" in build, "the build job no longer checks out the repo"

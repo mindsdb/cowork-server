@@ -24,13 +24,11 @@ jobs:
   # One gate answering "should this pipeline run at all", for two reasons that
   # both used to be handled elsewhere or not at all.
   #
-  # FORK PRs. This repo is PUBLIC and `mdb-dev` is a pod inside the newdev cluster
-  # with IRSA into the build/ECR account, so without a guard a pull request from
-  # any GitHub account executes its own code there. Fork PRs get no secrets and a
-  # read-only token, but the runner itself is the prize: cloud credentials, a
-  # network position inside the cluster, and a tool cache later internal jobs
-  # reuse. GitHub's first-time-contributor approval does not cover anyone with a
-  # merged PR.
+  # FORK PRs. The image build pushes to ECR with a role it assumes through GitHub
+  # OIDC. GitHub gives a fork's `pull_request` run a read-only token that cannot
+  # request an OIDC token, so a fork's build could only fail, and skipping it
+  # says why instead. This gate is a courtesy, not the boundary: it lives in the
+  # PR's own workflow text, and the token GitHub issues is what keeps a fork out.
   #
   # PROMOTION PRs. A `staging` -> `main` PR promotes commits the staging pipeline
   # already built and tested, so rebuilding them here produces an image nothing
@@ -56,8 +54,8 @@ jobs:
             {
               echo "### Build skipped: fork pull request"
               echo
-              echo "The image build runs on a self-hosted runner inside our cluster, so it"
-              echo "does not execute code from a fork. The unit tests below still run."
+              echo "The image build pushes to our registry with a role it assumes through"
+              echo "GitHub OIDC, which a fork's run cannot do. The unit tests below still run."
             } >> "$GITHUB_STEP_SUMMARY"
           elif [ "$HEAD_REF" = "staging" ] || [ "$HEAD_REF" = "main" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -100,6 +98,7 @@ jobs:
     if: needs.gate.outputs.run == 'true'
     permissions:
       contents: read
+      id-token: write  # the build assumes its ECR role through GitHub OIDC
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: development
