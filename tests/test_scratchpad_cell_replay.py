@@ -14,6 +14,10 @@ from types import SimpleNamespace
 
 import pytest
 from anton.core.backends.base import Cell, ScratchpadRuntime
+from anton.core.interaction.elicit import AskAnswer, AskRequest
+from anton.core.interaction.emitter import TurnEmitter
+from anton.core.utils.scratchpad import WriteGate, hold_unapproved_write
+from anton.core.utils.write_check import snapshot_project_files
 
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import (
     SCRATCHPAD_REPLAY_ROLES,
@@ -58,10 +62,13 @@ class _StreamedCall:
     result: str | None
 
 
-async def _stored_events(*, calls: list[_StreamedCall], action: str | None = "exec") -> list[dict]:
+async def _stored_events(
+    *, calls: list[_StreamedCall], action: str | None = "exec", interleaved: bool = False,
+) -> list[dict]:
     """The events the real stream formatter stores for ``calls``, each
     streamed and then answered in turn. A None ``action`` leaves it out of
-    each call, as a model can."""
+    each call, as a model can. ``interleaved`` streams every call first and
+    then answers them in reverse order."""
     from anton.core.llm.provider import (
         StreamToolResult,
         StreamToolUseDelta,
@@ -72,6 +79,7 @@ async def _stored_events(*, calls: list[_StreamedCall], action: str | None = "ex
     from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
 
     async def turn():
+        results = []
         for n, streamed in enumerate(calls):
             call = {"name": "main", "code": streamed.code}
             if action is not None:
@@ -88,7 +96,13 @@ async def _stored_events(*, calls: list[_StreamedCall], action: str | None = "ex
             # anton-agent 2.26.10.19.1, the version uv.lock pins, has no
             # scratchpad_action and never runs such a call, so its result is
             # written here as that path writes it.
-            yield StreamToolResult(name="scratchpad", action="exec", content=streamed.result, id=f"t{n}")
+            event = StreamToolResult(name="scratchpad", action="exec", content=streamed.result, id=f"t{n}")
+            if interleaved:
+                results.append(event)
+            else:
+                yield event
+        for event in reversed(results):
+            yield event
 
     stored: list[dict] = []
     async for _ in format_responses_stream(
@@ -96,6 +110,208 @@ async def _stored_events(*, calls: list[_StreamedCall], action: str | None = "ex
     ):
         pass
     return stored
+
+
+def _persisted_cells(events: list[dict]) -> list[Cell]:
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.services.conversations import ConversationService
+
+    with get_open_session() as db:
+        service = ConversationService(ScopedSession(db, LOCAL_SCOPE))
+        conversation = service.create_conversation(topic="long cell replay")
+        service.save_user_message(conversation.id, "prepare the report")
+        service.save_assistant_turn(conversation.id, "prepared", events)
+        conversation_id = conversation.id
+    with get_open_session() as db:
+        service = ConversationService(ScopedSession(db, LOCAL_SCOPE))
+        history = service.get_replay_history(conversation_id, event_roles=SCRATCHPAD_REPLAY_ROLES)
+    return extract_scratchpad_cells(history.events)
+
+
+class _CancelWrites:
+    supported_kinds = ("choice",)
+    timeout_s = None
+
+    def __init__(self) -> None:
+        self.requests: list[AskRequest] = []
+
+    async def begin(self, question_id: str, request: AskRequest) -> None:
+        pass
+
+    async def ask(self, question_id: str, request: AskRequest) -> AskAnswer:
+        self.requests.append(request)
+        return AskAnswer(status="answered", values=("cancel",))
+
+    async def end(self, question_id: str) -> None:
+        pass
+
+
+@pytest.mark.parametrize("character", ["x", "納"], ids=["ascii", "unicode"])
+async def test_long_call_code_survives_storage_and_holds_a_later_bound_write(character):
+    """Both event payloads used to lose the code, hiding the later SQL binding
+    from the next turn's real approval check."""
+    code = f"report = {character * 70_000!r}\nfix_sql = 'DELETE FROM suppliers WHERE id = 7'"
+    result = json.dumps(asdict(Cell(code=code, stdout="", stderr="", error=None)))
+    stored = await _stored_events(calls=[_StreamedCall(code=code, result=result)])
+    elicitor = _CancelWrites()
+    emitter = TurnEmitter()
+    session = SimpleNamespace(
+        _write_gate=WriteGate(), elicitor=elicitor, emitter=emitter, emit=emitter.emit, answer_wait_s=0.0,
+    )
+    cells = _persisted_cells(stored)
+
+    outcome = await hold_unapproved_write(session, pad=SimpleNamespace(cells=cells), code="cur.execute(fix_sql)")
+
+    assert outcome is not None and outcome.reason == "write_not_approved"
+    assert len(elicitor.requests) == 1
+    assert "DELETE FROM suppliers WHERE id = 7" in elicitor.requests[0].prompt
+    assert cells == [Cell(code=code, stdout="", stderr="", error=None)]
+    [end] = [e for e in stored if e.get("thought_role") == "thought.scratchpad.end"]
+    assert json.loads(end["content"])["code"] == code
+    [stored_result] = [e for e in stored if e.get("thought_role") == "thought.scratchpad.result"]
+    assert len(stored_result["content"]) == 65_536
+
+
+@pytest.mark.parametrize("error", [None, "ZeroDivisionError: division by zero", "Cell timed out"])
+@pytest.mark.parametrize("code_size", [1000, 70_000], ids=["error-cut", "code-and-error-cut"])
+async def test_long_cell_failure_survives_storage_without_granting_file_ownership(tmp_path, monkeypatch, error, code_size):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "report.md").write_text("user's report")
+    code = f"report = {'x' * code_size!r}\n"
+    if error:
+        code += "x = 1 / 0\n"
+    code += "open('report.md', 'w').write('draft')"
+    result = json.dumps(asdict(Cell(code=code, stdout="x" * 70_000, stderr="", error=error)))
+    cells = _persisted_cells(await _stored_events(calls=[_StreamedCall(code=code, result=result)]))
+    elicitor = _CancelWrites()
+    emitter = TurnEmitter()
+    session = SimpleNamespace(
+        _write_gate=WriteGate(snapshots=(snapshot_project_files(root=tmp_path, label="project", taken_at=10**10),)),
+        elicitor=elicitor,
+        emitter=emitter,
+        emit=emitter.emit,
+        answer_wait_s=0.0,
+    )
+
+    outcome = await hold_unapproved_write(
+        session, pad=SimpleNamespace(cells=cells), code="open('report.md', 'w').write('replacement')",
+    )
+
+    assert (outcome is not None, len(elicitor.requests)) == (bool(error), int(bool(error)))
+    assert len(cells) == 1 and cells[0].code == code
+    assert bool(cells[0].error) is bool(error)
+
+
+async def test_interleaved_long_calls_keep_their_own_code_and_status_after_storage():
+    calls = [
+        Cell(code=f"first = {'x' * 70_000!r}", stdout="", stderr="", error="ZeroDivisionError"),
+        Cell(code=f"second = {'納' * 70_000!r}", stdout="", stderr="", error=None),
+    ]
+    events = await _stored_events(
+        calls=[_StreamedCall(code=cell.code, result=json.dumps(asdict(cell))) for cell in calls], interleaved=True,
+    )
+
+    cells = _persisted_cells(events)
+
+    assert [cell.code for cell in cells] == [cell.code for cell in reversed(calls)]
+    assert [bool(cell.error) for cell in cells] == [False, True]
+
+
+@pytest.mark.parametrize("status", [None, "ok", "error", "timeout", "unrecognized", ["ok"]])
+@pytest.mark.parametrize("cut", ["code", "stdout", "stderr", "error"], ids=lambda field: f"{field}-cut")
+def test_a_missing_error_uses_only_an_explicit_success_status(status, cut):
+    """A result cut inside any field before its error is whole counts as a
+    failure unless its status says ok, and says how it ended where it knows."""
+    code = "open('report.md', 'w').write('draft')"
+    whole = json.dumps({"code": code, "stdout": "long output", "stderr": "a warning",
+                        "error": "ZeroDivisionError: division by zero"})
+    content = whole[:whole.index(f'"{cut}": ') + len(cut) + 8]
+    result = {**_result(code), "content": content}
+    if status is not None:
+        result["cell_status"] = status
+
+    [cell] = extract_scratchpad_cells([_end("exec", code=code), result])
+
+    assert cell.code == code
+    assert (cell.error is None) is (status == "ok")
+    expected = {"error": "The cell failed", "timeout": "The cell timed out", "ok": None}.get(
+        status if isinstance(status, str) else None, "whether it succeeded is unknown"
+    )
+    assert cell.error is None if expected is None else expected in cell.error
+
+
+@pytest.mark.parametrize("status", [None, "ok", "error", "timeout", "unrecognized"])
+@pytest.mark.parametrize("error", [None, "", "ZeroDivisionError: division by zero"])
+def test_an_explicit_error_field_wins_over_the_event_status(status, error):
+    result = _result("x = 1")
+    result["content"] = json.dumps(asdict(Cell(code="x = 1", stdout="", stderr="", error=error, logs="x" * 70_000)))[:65_536]
+    if status is not None:
+        result["cell_status"] = status
+
+    [cell] = extract_scratchpad_cells([_end("exec"), result])
+
+    assert cell.error == error
+
+
+async def test_only_scratchpad_call_inputs_lose_the_length_cap():
+    from anton.core.llm.provider import StreamToolResult, StreamToolUseDelta, StreamToolUseEnd, StreamToolUseStart
+    from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+    content = "x" * 70_000
+
+    async def turn():
+        yield StreamToolUseStart(id="other", name="recall")
+        yield StreamToolUseDelta(id="other", json_delta=content)
+        yield StreamToolUseEnd(id="other")
+        yield StreamToolResult(name="recall", action="message", content=content, id="other")
+        yield StreamToolResult(name="recall", action="read", content=content, id="other")
+        # An MCP tool named like the scratchpad keeps the cap on its input.
+        yield StreamToolUseStart(id="notes", name="notes__scratchpad_append")
+        yield StreamToolUseDelta(id="notes", json_delta=content)
+        yield StreamToolUseEnd(id="notes")
+
+    stored: list[dict] = []
+    async for _ in format_responses_stream(
+        turn(), model="claude-sonnet-4-6", event_sink=lambda _type, data: stored.append(data),
+    ):
+        pass
+
+    contents = [e["content"] for e in stored if e.get("thought_role") in {
+        "thought.recall.end", "thought.tool_call.message", "thought.scratchpad.result", "thought.scratchpad.end",
+    }]
+    assert contents == [content[:65_536]] * 4
+
+
+@pytest.mark.parametrize("code_size", [1000, 70_000], ids=["error-cut", "code-and-error-cut"])
+async def test_a_replayed_failure_folded_by_compaction_grants_no_file_ownership(tmp_path, monkeypatch, code_size):
+    """A replayed cell that failed while writing the user's report still
+    makes no file the agent's own after compaction folds it."""
+    from anton.core.backends.local import LocalScratchpadRuntime
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "report.md").write_text("user's report")
+    code = f"report = {'x' * code_size!r}\nx = 1 / 0\nopen('report.md', 'w').write('draft')"
+    result = json.dumps(asdict(Cell(code=code, stdout="x" * 70_000, stderr="", error="ZeroDivisionError")))
+    cells = _persisted_cells(await _stored_events(calls=[_StreamedCall(code=code, result=result)]))
+    assert len(cells) == 1 and cells[0].error
+    pad = LocalScratchpadRuntime(
+        name="main", coding_provider="anthropic", coding_model="", coding_api_key="", coding_base_url="",
+        cells=cells, workspace_path=tmp_path, _venvs_base=tmp_path / "venvs",
+    )
+    pad.cells += [Cell(code=f"total_{n} = {n}", stdout="", stderr="", error=None) for n in range(6)]
+    assert pad._compact_cells()
+    assert all(cell.code != code for cell in pad.cells)
+    elicitor = _CancelWrites()
+    emitter = TurnEmitter()
+    session = SimpleNamespace(
+        _write_gate=WriteGate(snapshots=(snapshot_project_files(root=tmp_path, label="project", taken_at=10**10),)),
+        elicitor=elicitor, emitter=emitter, emit=emitter.emit, answer_wait_s=0.0,
+    )
+
+    outcome = await hold_unapproved_write(session, pad=pad, code="open('report.md', 'w').write('replacement')")
+
+    assert outcome is not None and len(elicitor.requests) == 1
 
 
 def test_an_exec_end_and_its_result_make_a_cell():
@@ -203,20 +419,21 @@ def test_a_result_cut_inside_its_code_makes_no_cell_when_its_end_event_was_cut_t
 
 
 @pytest.mark.asyncio
-async def test_a_cell_anton_never_ran_makes_no_cell():
+@pytest.mark.parametrize("padding", ["", "#" + "x" * 70_000 + "\n"], ids=["short", "long"])
+async def test_a_cell_anton_never_ran_makes_no_cell(padding):
     """anton closes a cell it never ran, such as a write the user didn't
     approve, with its reason as plain text. Its end event holds the whole
     code, but the next turn must not see that code as one that ran."""
-    refused = (
-        "Not run: this step would change data in a connected source. That needs the "
-        "user's approval, and they declined it. Nothing in this cell ran."
-    )
+    from anton.core.utils.scratchpad import _refusal
+    from anton.core.utils.write_check import CellWrites
+
+    refused = _refusal(CellWrites(unchecked=True), "cancelled").content
     stored = await _stored_events(calls=[
         _StreamedCall(
             code="print(1)",
             result=json.dumps(asdict(Cell(code="print(1)", stdout="1\n", stderr="", error=None))),
         ),
-        _StreamedCall(code="cur.execute(\"UPDATE suppliers SET lead_time_days = 21\")", result=refused),
+        _StreamedCall(code=padding + "cur.execute(\"UPDATE suppliers SET lead_time_days = 21\")", result=refused),
     ])
 
     results = [e for e in stored if e.get("thought_role") == "thought.scratchpad.result"]
@@ -239,6 +456,25 @@ async def test_a_call_that_left_out_its_action_replays_as_the_exec_anton_ran():
     assert "action" not in json.loads(end["content"])
     assert result["tool_action"] == "exec"
     assert extract_scratchpad_cells(stored) == [Cell(code="x = 1", stdout="1\n", stderr="", error=None)]
+
+
+@pytest.mark.asyncio
+async def test_a_long_call_without_its_action_whose_result_lost_its_error_replays_as_failed():
+    """A long call the model sent with no action, whose stored result is cut
+    before its error, still replays as the exec anton ran, and as a failure."""
+    code = f"report = {'x' * 70_000!r}\nx = 1 / 0"
+    ran = json.dumps(asdict(Cell(code=code, stdout="", stderr="", error="ZeroDivisionError: division by zero")))
+
+    stored = await _stored_events(calls=[_StreamedCall(code=code, result=ran)], action=None)
+
+    [end] = [e for e in stored if e.get("thought_role") == "thought.scratchpad.end"]
+    [result] = [e for e in stored if e.get("thought_role") == "thought.scratchpad.result"]
+    assert json.loads(end["content"]) == {"name": "main", "code": code}
+    assert (result["tool_action"], result["cell_status"]) == ("exec", "error")
+    assert len(result["content"]) == 65_536 and '"error": ' not in result["content"]
+    [cell] = extract_scratchpad_cells(stored)
+    assert cell.code == code
+    assert cell.error and "The cell failed" in cell.error
 
 
 def test_a_call_with_neither_action_nor_code_makes_no_cell():
@@ -472,7 +708,7 @@ def test_each_result_pairs_with_the_call_of_its_own_id():
     """The model can send several calls at once, so every end event comes
     before the first result. Each result makes its own cell, and one cut
     inside its code takes its own call's code."""
-    cut_a = {**_result("a = 1", tool_use_id="a"), "content": json.dumps({"code": "a = 1"})[:12]}
+    cut_a = {**_result("a = 1", tool_use_id="a"), "content": json.dumps({"code": "a = 1"})[:12], "cell_status": "ok"}
 
     cells = extract_scratchpad_cells([
         _end("exec", code="a = 1", tool_use_id="a"),

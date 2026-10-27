@@ -167,6 +167,16 @@ async def test_a_turn_sees_only_the_askers_connections(monkeypatch, stack):
         assert _names(turn.config.data_vault) == set()
 
 
+async def test_same_named_private_connections_resolve_to_the_asker_in_each_turn(monkeypatch, stack):
+    _save_sales(ALICE, secret="alice-secret")
+    _save_sales(BOB, secret="bob-secret")
+    for person, own, other in ((ALICE, "alice-secret", "bob-secret"), (BOB, "bob-secret", "alice-secret")):
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=stack, scope=person) as turn:
+            env = turn.config.data_vault.env_for("postgres", "sales")
+            assert env["DS_POSTGRES_SALES__PASSWORD"] == own
+            assert other not in env.values()
+
+
 async def test_a_turn_bound_to_no_scope_is_refused(monkeypatch, stack):
     """Only connections are personal here, so the vault read is the one step
     of the turn that needs a scope: reading the base vault instead would let
@@ -249,6 +259,14 @@ async def test_a_backend_gets_only_its_owners_connection_secrets(monkeypatch, st
 
     assert "alice-secret" in launched[str(a_folder)].values()
     assert launched[str(b_folder)] == {}
+
+    # The recipient's copy attaches its own same-named connection. Resolving
+    # by the author's scope would pass the missing-connection check above
+    # only if the launch wiring were mocked too broadly.
+    _save_sales(BOB, secret="bob-secret")
+    await artifacts._launch_backend_locked(b_folder, project_root=b_folder.parents[2], scope=BOB)
+    assert "bob-secret" in launched[str(b_folder)].values()
+    assert "alice-secret" not in launched[str(b_folder)].values()
 
 
 # ── local OAuth sign-in ─────────────────────────────────────────────────────

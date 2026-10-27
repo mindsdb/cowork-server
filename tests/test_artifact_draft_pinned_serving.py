@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+from cowork.services import artifact_files
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.comments_layer import ACTIVATION_PARAM
 
@@ -80,7 +81,7 @@ async def test_traversal_never_reaches_a_filesystem_open(
     def unexpected_open(*_args):
         raise AssertionError("invalid path reached the pinned open")
 
-    monkeypatch.setattr(workspace_ep, "_open_pinned_draft_file", unexpected_open)
+    monkeypatch.setattr(artifact_files, "open_pinned_draft_file", unexpected_open)
 
     with pytest.raises(HTTPException) as error:
         await _serve(monkeypatch, source, folder, metadata, rel_path)
@@ -165,8 +166,8 @@ def test_request_components_are_replaced_with_names_read_from_disk(
     requested_file = ("app.js" + "x")[:-1]
     requested = (requested_dir, requested_file)
     opened_names = []
-    original_open_child = workspace_ep.open_pinned_child
-    original_dir_open = workspace_ep.dir_open
+    original_open_child = artifact_files.open_pinned_child
+    original_dir_open = artifact_files.dir_open
 
     def open_child(directory, name):
         opened_names.append(name)
@@ -176,10 +177,10 @@ def test_request_components_are_replaced_with_names_read_from_disk(
         opened_names.append(name)
         return original_dir_open(directory, name, flags, mode)
 
-    monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
-    monkeypatch.setattr(workspace_ep, "dir_open", open_file)
+    monkeypatch.setattr(artifact_files, "open_pinned_child", open_child)
+    monkeypatch.setattr(artifact_files, "dir_open", open_file)
 
-    resources, fd, _file_stat = workspace_ep._open_pinned_draft_file(
+    resources, fd, _file_stat = artifact_files.open_pinned_draft_file(
         source, folder, requested
     )
     try:
@@ -376,7 +377,7 @@ async def test_download_skips_the_comment_layer(tmp_path, monkeypatch):
 async def test_download_filename_cannot_inject_headers(
     tmp_path, monkeypatch, name, ascii_part, encoded_part
 ):
-    """`_relative_file_parts` lets these names through — it only guards the
+    """`relative_file_parts` lets these names through — it only guards the
     filesystem walk. The header builder is the second gate."""
     source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
     (folder / name).write_bytes(b"x")
