@@ -57,5 +57,5 @@ def test_only_the_ui_turn_opts_in():
 
 
 def test_the_session_builder_degrades_on_an_older_anton():
-    source = inspect.getsource(harness.AntonHarness._build_chat_session)
+    source = inspect.getsource(harness.AntonHarness._build_turn_session)
     assert "**supported_kwargs(ChatSessionConfig, tool_messages=tool_messages)" in source

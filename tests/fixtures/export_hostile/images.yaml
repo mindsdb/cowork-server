@@ -1,0 +1,60 @@
+# Images where a converter is easy to fool: inside table cells, nested
+# tables and cell backgrounds, and in srcset and picture sources.
+# Fields and placeholders: see tests/test_export_hostile.py.
+
+- id: table-cell-images
+  html: |
+    <table>
+    <tr><td>chart cell <img src="chart.png" alt="chart"></td><td><img src="../other/secret.png" alt="secret"></td></tr>
+    <tr><td><img src="{server_url}/cell.png" alt="remote"></td><td><img src="{sentinel_file_url}" alt="file"></td></tr>
+    <tr><td background="{server_url}/td-background.png">bg</td><td style="background: url(../other/secret.png)">styled</td></tr>
+    <tr><td><table><tr><td><img src="http://169.254.169.254/latest/meta-data/" alt="nested"></td></tr></table></td><td></td></tr>
+    </table>
+  markdown: |
+    | first | second |
+    | --- | --- |
+    | chart cell ![chart](chart.png) | ![secret](../other/secret.png) |
+    | ![remote]({server_url}/cell.png) | ![file]({sentinel_file_url}) |
+
+    <table>
+    <tr><td background="{server_url}/td-background.png">bg</td><td style="background: url(../other/secret.png)">styled</td></tr>
+    <tr><td><table><tr><td><img src="http://169.254.169.254/latest/meta-data/" alt="nested"></td></tr></table></td><td></td></tr>
+    </table>
+  text: chart cell
+  kept_image: true
+  omitted:
+    - [traversal, ../other/secret.png]
+    - [scheme, "{server_url}/cell.png"]
+    - [scheme, "{sentinel_file_url}"]
+    - [scheme, "{server_url}/td-background.png"]
+    - [traversal, ../other/secret.png]
+    - [scheme, "http://169.254.169.254/latest/meta-data/"]
+
+# Only the first srcset candidate is ever tried, after src.
+- id: srcset
+  html: |
+    <p>sources <img srcset="{server_url}/one.png 1x, chart.png 2x" alt="first remote"></p>
+    <p><img src="../other/secret.png" srcset="{sentinel_file_url} 2x" alt="both out"></p>
+    <p><img srcset="  ..%2Fother%2Fsecret.png 100w" alt="encoded"></p>
+    <p><img src="{server_url}/fallback.png" srcset="chart.png 1x" alt="local srcset"></p>
+    <picture><source srcset="{server_url}/source.webp" type="image/webp"><source srcset="../other/secret.png"><img src="chart.png" alt="picture"></picture>
+  markdown: |
+    sources
+
+    <div>
+    <p><img srcset="{server_url}/one.png 1x, chart.png 2x" alt="first remote"></p>
+    <p><img src="../other/secret.png" srcset="{sentinel_file_url} 2x" alt="both out"></p>
+    <p><img srcset="  ..%2Fother%2Fsecret.png 100w" alt="encoded"></p>
+    <p><img src="{server_url}/fallback.png" srcset="chart.png 1x" alt="local srcset"></p>
+    <picture><source srcset="{server_url}/source.webp" type="image/webp"><source srcset="../other/secret.png"><img src="chart.png" alt="picture"></picture>
+    </div>
+  text: sources
+  kept_image: true
+  omitted:
+    - [scheme, "{server_url}/one.png"]
+    - [traversal, ../other/secret.png]
+    - [scheme, "{sentinel_file_url}"]
+    - [traversal, "..%2Fother%2Fsecret.png"]
+    - [scheme, "{server_url}/fallback.png"]
+    - [scheme, "{server_url}/source.webp"]
+    - [traversal, ../other/secret.png]

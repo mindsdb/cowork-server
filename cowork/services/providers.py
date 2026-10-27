@@ -1484,7 +1484,7 @@ _warned_responses_transport_missing = False
 
 
 def openai_compatible_agent_api() -> OpenAICompatibleAPI:
-    """The API the planning and coding roles call on an openai_compatible provider.
+    """The API all agent roles call on an openai_compatible provider.
 
     COWORK_OPENAI_COMPATIBLE_API asks for it. The Responses API is used only
     when the installed anton reports its Responses path ready, because before
@@ -1505,7 +1505,7 @@ def openai_compatible_agent_api() -> OpenAICompatibleAPI:
         _warned_responses_transport_missing = True
         logger.warning(
             "Installed anton does not report RESPONSES_TRANSPORT_READY; "
-            "openai_compatible planning and coding stay on chat completions "
+            "openai_compatible planning, coding and router stay on chat completions "
             "although COWORK_OPENAI_COMPATIBLE_API=responses"
         )
     return "chat_completions"
@@ -1617,10 +1617,9 @@ def build_llm_client(
     supports_api_key_provider = "api_key_provider" in openai_provider_params
     warned_about_static_runtime_credential = False
 
-    # Passed to the planning and coding builds only. The router stays on chat
-    # completions: the gate's first-event budget is sized for a model that
-    # doesn't reason, and a router model that reasons by default is held to
-    # that with router_reasoning_effort "none".
+    # The router shares this transport with planning and coding: its delegate
+    # function needs Responses on models that reject tools on chat completions.
+    # Its effort remains the operator's choice and its gate budgets still apply.
     agent_api = openai_compatible_agent_api()
 
     def _make_provider(
@@ -1797,7 +1796,7 @@ def build_llm_client(
         if "router_provider" in _params:
             router_kw = {
                 "router_provider": _make_provider(
-                    settings.resolved_router_provider, router_effort
+                    settings.resolved_router_provider, router_effort, api=agent_api
                 ),
                 "router_model": router_model,
             }
