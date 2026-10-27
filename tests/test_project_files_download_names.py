@@ -74,3 +74,33 @@ def test_files_raw_header_literal(local_project, filename, expected):
 
     assert response.status_code == 200, response.text
     assert response.headers["content-disposition"] == expected
+
+
+def test_pinned_stream_closes_descriptor_when_response_cannot_be_built(tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import project_files
+
+    target = tmp_path / "report.txt"
+    target.write_bytes(b"x")
+    exits = []
+    original = project_files._pinned_regular_file
+
+    def tracking(*args, **kwargs):
+        cm, fd, st = original(*args, **kwargs)
+        real_exit = cm.__exit__
+
+        class Tracked:
+            def __exit__(self, *exc):
+                exits.append(exc)
+                return real_exit(*exc)
+
+        return Tracked(), fd, st
+
+    monkeypatch.setattr(project_files, "_pinned_regular_file", tracking)
+
+    with pytest.raises(UnicodeEncodeError):
+        # A header value outside Latin-1 makes the StreamingResponse constructor raise.
+        project_files._pinned_stream(
+            target, tmp_path, media_type="text/plain", headers={"X-Name": "Отчёт"}
+        )
+
+    assert exits == [(None, None, None)]

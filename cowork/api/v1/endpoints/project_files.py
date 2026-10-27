@@ -1062,7 +1062,13 @@ def _pinned_stream(
         finally:
             cm.__exit__(None, None, None)
 
-    return StreamingResponse(_chunks(), media_type=media_type, headers=headers)
+    try:
+        return StreamingResponse(_chunks(), media_type=media_type, headers=headers)
+    except BaseException:
+        # `_chunks` never ran, so its `finally` cannot close the descriptor;
+        # left alone it closes only when the garbage collector gets to `cm`.
+        cm.__exit__(None, None, None)
+        raise
 
 
 @router.get(
