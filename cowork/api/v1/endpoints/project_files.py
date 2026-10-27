@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
 from cowork.common.paths import (
     O_NOFOLLOW,
@@ -1055,19 +1056,22 @@ def _pinned_stream(
     file that keeps growing cannot keep the response open.
     """
     cm, fd, st = _pinned_regular_file(target, base)
+    resources = ExitStack()
+    resources.push(cm)
 
     def _chunks():
         try:
             yield from read_bounded(fd, st.st_size)
         finally:
-            cm.__exit__(None, None, None)
+            resources.close()
 
     try:
-        return StreamingResponse(_chunks(), media_type=media_type, headers=headers)
+        return PinnedStreamingResponse(
+            _chunks(), resources=resources, media_type=media_type, headers=headers
+        )
     except BaseException:
-        # `_chunks` never ran, so its `finally` cannot close the descriptor;
-        # left alone it closes only when the garbage collector gets to `cm`.
-        cm.__exit__(None, None, None)
+        # `_chunks` never ran, so neither it nor the response can close the descriptor.
+        resources.close()
         raise
 
 
