@@ -131,7 +131,7 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
 
-      # mindsdb/deployer rolls a labeled PR's image into its environment on a
+      # The deploy repository rolls a labeled PR's image into its environment on a
       # schedule, so the environment can still serve an older build when this
       # job starts. Test only once it serves this PR's head; the module says how
       # it tells.

@@ -39,7 +39,7 @@ Swap `CI_ENVIRONMENT_SLUG` / `K8S_NAMESPACE` for `staging` or `prod` to target t
 
 ## Image repositories
 
-Images live in two ECR repositories in account `168681354662`:
+Images live in two ECR repositories in the DEV account, which the `AWS_DEV_ACCOUNT_ID` organization secret names:
 
 | Repository | Holds | Pulled by |
 | --- | --- | --- |
@@ -56,20 +56,57 @@ build.
 
 ## Required cluster secrets
 
-The chart references two Secrets that must exist in the target namespace:
+The chart references these Secrets in the target namespace:
 
 - `cowork-db` — key `database_uri`, a Postgres SQLAlchemy URI. Consumed by the
   `db-migrate` initContainer (`alembic upgrade head`) and the app's
   `DATABASE_URI`.
 - `mindsdb-secrets` — provider API keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
   `GEMINI_API_KEY`.
+- `datasource-service-keys` — the producer role of the cloud datasource
+  identities: `DATASOURCE_PRODUCER_KEY_ID` and `DATASOURCE_PRODUCER_KEY`,
+  declared and provisioned by the auth repository's secrets inventory. The
+  references are optional: without the Secret the pod starts and every
+  datasource turn is refused, so the bundle must exist before
+  `COWORK_TURN_DATASOURCE_ENABLED` turns on, not before this deploys. PR
+  environments get it from the keycloak chart's ephemeral secrets.
+
+## Datasource grants for hosted turns
+
+Two switches, both off in `values.yaml`, and both set per environment by the
+release gate as scalars under `deployment:` in `values-<env>.yaml`. Never add
+the env names themselves there: `extraEnvs` appends to the base list, so the
+variable would render twice. `tests/test_chart_values.py` pins which
+environments are on.
+
+- `deployment.datasourceTurnsEnabled`, rendered as
+  `COWORK_TURN_DATASOURCE_ENABLED`: `"true"` registers grants and queues the
+  datasource block for hosted turns.
+- `deployment.datasourceCapabilities`, rendered as
+  `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
+  versioned manifest such as
+  `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. Empty offers
+  none, so with only the first switch on no method is available. A method
+  whose own spec says the adapters cannot run it stays unavailable whatever
+  this lists.
+
+`COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL` is not a switch. It is where this
+server reaches the gateway to check a connection someone just saved, the
+inference Service by name, and the same in every environment.
+
+Turn the switches on only after auth serves the datasource endpoints with the
+bundle above, mindshub_inference serves `/v1/datasources/`, and a scratchpad
+image with the datasource helper is deployed and older pods are recycled.
+Rollback is `datasourceTurnsEnabled` off: no new grants are registered and no
+datasource block is queued; encrypted records stay in auth and OAuth
+connections are unaffected.
 
 ## Required cluster permissions
 
 In `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
 is true in those values files), so whoever runs the upgrade needs
 `create networkpolicies` in the target namespace. Without it the release fails and
-`--atomic` rolls the whole deploy back. The upgrade runs in mindsdb/deployer as
+`--atomic` rolls the whole deploy back. The upgrade runs in the private deploy repository as
 `system:serviceaccount:infrastructure:<env>-gha-runner`, which holds the verb only
 in the namespaces listed under `runner_deploy_namespaces` in
 Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
@@ -155,7 +192,7 @@ Later commits touched `cowork/principal.py`, so expect conflicts there. The
 revert and its conflict resolution go through review like any other change. A
 revert merged to `staging` deploys through `publish-staging.yml`, which has no
 approval gate. Production takes the revert only from `main`: `publish.yml` builds
-the image, and its `build-deploy / deploy` job has mindsdb/deployer roll it out.
+the image, and its `build-deploy / deploy` job has the deploy repository roll it out.
 Neither environment waits for an approval. A push to `main` also syncs into
 `staging`. Unlike
 an image rollback, the revert backs out nothing else, and later deploys keep it.

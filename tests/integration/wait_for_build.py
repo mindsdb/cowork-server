@@ -1,6 +1,6 @@
 """Wait until a PR environment serves this PR's build.
 
-mindsdb/deployer rolls each labeled PR's image into its environment on a
+The deploy repository rolls each labeled PR's image into its environment on a
 schedule, so the integration job can start while the environment still serves
 an older build, or nothing at all. The job runs this module first, and the
 suite starts only once the environment answers with this PR's code.
@@ -15,7 +15,7 @@ A build names its commit in ``server_version``: hatch-vcs appends
 always the merge commit GitHub made for its run. The environment serves this
 PR's build when that commit is this run's merge commit (``GITHUB_SHA``), or an
 earlier merge of the same head. The second case happens when only the base
-branch moved since the environment last rolled: mindsdb/deployer's
+branch moved since the environment last rolled: the deploy repository's
 ``pr-envs.yml`` deploys the ``development-head-<head sha>`` tag, which names the
 same head both times, so it has nothing new to roll.
 
@@ -36,10 +36,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
+from pydantic import BaseModel, Field, ValidationError
 
 from tests.integration.test_post_deploy import BROWSER_UA
 
-# The deployer's schedule, then an Argo CD sync and a rollout, with room for a
+# The deploy repository's schedule, then an Argo CD sync and a rollout, with room for a
 # late scheduled run.
 DEADLINE_S = 50 * 60.0
 POLL_INTERVAL_S = 20.0
@@ -71,6 +72,28 @@ class PullRequestBuild:
             repository=_required("GITHUB_REPOSITORY"),
             github_token=_required("GH_TOKEN"),
         )
+
+
+class _MintedUser(BaseModel):
+    """The mint route's answer, with the one field read here."""
+
+    api_key: str = Field(min_length=1)
+
+
+class _Health(BaseModel):
+    """The health route's answer. A release build's version names no commit."""
+
+    server_version: str | None = None
+
+
+class _Parent(BaseModel):
+    sha: str
+
+
+class _Commit(BaseModel):
+    """A commit as GitHub's commits API returns it, with the field read here."""
+
+    parents: list[_Parent]
 
 
 class _NotServing(Exception):
@@ -107,11 +130,10 @@ def _mint_key(build: PullRequestBuild, client: httpx.Client) -> str:
     )
     if response.status_code != 201:
         raise _NotServing(f"minting a test user answered HTTP {response.status_code}")
-    payload = response.json()
-    api_key = payload.get("api_key") if isinstance(payload, dict) else None
-    if not api_key:
-        raise _NotServing("the minted test user came back without an API key")
-    return api_key
+    try:
+        return _MintedUser.model_validate(response.json()).api_key
+    except ValidationError:
+        raise _NotServing("the minted test user came back without an API key") from None
 
 
 def _served_commit(
@@ -125,10 +147,11 @@ def _served_commit(
         raise _KeyRefused(f"{HEALTH_PATH} refused the minted user's key")
     if response.status_code != 200:
         raise _NotServing(f"{HEALTH_PATH} answered HTTP {response.status_code}")
-    payload = response.json()
-    if not isinstance(payload, dict):
-        return None
-    return build_commit(payload.get("server_version"))
+    try:
+        health = _Health.model_validate(response.json())
+    except ValidationError:
+        raise _NotServing(f"{HEALTH_PATH} answered a body that is not a health report") from None
+    return build_commit(health.server_version)
 
 
 def _merges_head(commit: str, build: PullRequestBuild, client: httpx.Client) -> bool:
@@ -152,8 +175,11 @@ def _merges_head(commit: str, build: PullRequestBuild, client: httpx.Client) -> 
         raise _NotServing(
             f"GitHub answered HTTP {response.status_code} for commit {commit}"
         )
-    parents = [parent["sha"] for parent in response.json()["parents"]]
-    return parents[1:] == [build.head_sha]
+    try:
+        commit_parents = _Commit.model_validate(response.json()).parents
+    except ValidationError:
+        raise _NotServing(f"GitHub answered commit {commit} without its parents") from None
+    return [parent.sha for parent in commit_parents][1:] == [build.head_sha]
 
 
 def _is_this_prs_build(

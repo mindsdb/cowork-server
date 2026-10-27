@@ -1348,3 +1348,71 @@ def test_agent_repair_reports_conflict_when_base_moves_during_turn(artifact):
     assert detail["repair"]["status"] == "conflict"
     assert detail["repair"]["revisionId"] == agent_revision["id"]
     assert agent_revision["commentThreadIds"] == []
+
+
+def test_auto_pick_skips_store_housekeeping_files(tmp_path):
+    for name in ("README.md", "metadata.json", "index.html"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    target, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "index.html"
+    assert target == (tmp_path / "index.html").resolve()
+
+
+def test_auto_pick_skips_generation_inputs(tmp_path):
+    for name in ("prd.md", "report.md"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    _, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "report.md"
+
+
+def test_auto_pick_skips_nested_journal_files(tmp_path):
+    journal = tmp_path / "assets" / ".revisions"
+    journal.mkdir(parents=True)
+    (journal / "a.html").write_text("x", encoding="utf-8")
+    (tmp_path / "b.html").write_text("x", encoding="utf-8")
+
+    _, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "b.html"
+
+
+def test_auto_pick_skips_a_symlinked_source(tmp_path):
+    folder = tmp_path / "linked"
+    folder.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n", encoding="utf-8")
+    (folder / "a.md").symlink_to(outside)
+    (folder / "b.html").write_text("<p>ok</p>", encoding="utf-8")
+
+    target, rel = revision_service.resolve_source(folder, {})
+
+    assert rel == "b.html"
+    assert target.name == "b.html"
+
+
+def test_agent_repair_prompt_says_how_to_find_the_artifact(artifact):
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Fix the title"}],
+        conversation_id="conversation-1",
+    )
+
+    lines = requested["prompt"].splitlines()
+    source = next(i for i, line in enumerate(lines) if line.startswith("Source path: "))
+    hint = lines[source + 1]
+    assert "`list_artifacts`" in hint and "`match`" in hint
+    # The desktop chat reads `Label: value` lines of this prompt into a card;
+    # the hint must not look like one.
+    assert ":" not in hint.split(" ", 1)[0]

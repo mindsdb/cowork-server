@@ -158,6 +158,36 @@ def test_a_failed_github_lookup_is_asked_again_rather_than_read_as_another_build
     assert len(hosts.to("api.github.com")) == 2
 
 
+def test_a_commit_answer_without_its_parents_is_asked_again_rather_than_crashing():
+    hosts = _Hosts(
+        mints=[_minted("mdb_minted")],
+        healths=[_health(EARLIER_MERGE_SHA), _health(EARLIER_MERGE_SHA)],
+        commits={
+            EARLIER_MERGE_SHA[:8]: [
+                httpx.Response(200, json={"sha": EARLIER_MERGE_SHA}),
+                _commit(BASE_SHA, HEAD_SHA),
+            ]
+        },
+    )
+
+    assert _wait(hosts) == EARLIER_MERGE_SHA[:8]
+    assert len(hosts.to("api.github.com")) == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [["not", "a", "report"], {"server_version": 42}],
+    ids=["not-an-object", "version-not-a-string"],
+)
+def test_a_health_answer_that_is_not_a_report_keeps_the_wait_going(body):
+    hosts = _Hosts(
+        mints=[_minted("mdb_minted")],
+        healths=[httpx.Response(200, json=body), _health(MERGE_SHA)],
+    )
+
+    assert _wait(hosts) == MERGE_SHA[:8]
+
+
 def test_mints_a_new_user_after_the_key_is_refused():
     hosts = _Hosts(
         mints=[_minted("mdb_first"), _minted("mdb_second")],

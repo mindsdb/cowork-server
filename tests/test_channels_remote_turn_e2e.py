@@ -23,6 +23,8 @@ from cowork.db.session import get_open_session
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.services.channels import ChannelConfigService
 
+from _fakes import QueuedPipeline
+
 ORG_A = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 SIGNING_SECRET = "test-signing-secret-remote-turn"
 
@@ -108,7 +110,7 @@ def test_slack_message_gets_a_reply_via_the_remote_worker(monkeypatch, org_mode_
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
-        staticmethod(lambda session, conv_id: {}),
+        staticmethod(lambda session, conv_id: None),
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
@@ -201,7 +203,7 @@ def test_a_remote_turn_failure_delivers_an_error_message_not_silence(monkeypatch
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
-        staticmethod(lambda session, conv_id: {}),
+        staticmethod(lambda session, conv_id: None),
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
@@ -297,7 +299,9 @@ class _ReplyOnlyRedis:
     async def sadd(self, key, member): return 1
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1
+    async def xrevrange(self, key, count=None): return []
     async def xadd(self, stream, fields): return "1-0"
+    def pipeline(self, transaction=True): return QueuedPipeline(self)
 
     async def xread(self, streams, count=None, block=None):
         if not self._replies:
@@ -330,7 +334,7 @@ def test_a_remote_allowance_stop_posts_the_allowance_message_not_out_of_credits(
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
-        staticmethod(lambda session, conv_id: {}),
+        staticmethod(lambda session, conv_id: None),
     )
 
     async def fake_llm_block(**kwargs):

@@ -23,7 +23,9 @@ from coding_service_fakes import (
     repository,
     service_with,
     wait_for_status,
+    wait_for_turn_thread,
     wait_for_workspace,
+    wait_for_steerable_turn,
     wait_for_steers,
 )
 
@@ -1631,6 +1633,7 @@ def test_a_queued_read_only_command_does_not_continue_a_completed_task(tmp_path:
     service = service_with(tmp_path, FakeEngine())
     created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt")
     wait_for_status(service, created.id, SessionStatus.completed)
+    wait_for_turn_thread(created.id)
     before = service.get_session(created.id)
     queued = QueuedInstruction(id="queued-status", prompt="/status")
     service.store.update_session(created.id, lambda session: session.queued_instructions.append(queued))
@@ -1653,6 +1656,7 @@ def test_queue_continues_after_an_immediate_command_without_reusing_its_id(tmp_p
         SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
     )
     wait_for_status(service, created.id, SessionStatus.completed)
+    wait_for_turn_thread(created.id)
     first = QueuedInstruction(id="queued-status", prompt="/status")
     second = QueuedInstruction(id="queued-turn", prompt="Second turn")
     service.store.update_session(
@@ -1998,6 +2002,7 @@ def test_failed_queue_promotion_restores_the_instruction(tmp_path: Path) -> None
         SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
     )
     assert engine.started.wait(timeout=1)
+    wait_for_steerable_turn(service, created.id)
 
     queued = service.queue_turn(created.id, "Try this immediately")
     instruction_id = queued.queued_instructions[0].id

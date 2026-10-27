@@ -8,11 +8,11 @@
 # desktop app installs `cowork-server` from PyPI (or git, per channel), so
 # `publish.yml` and `publish-staging.yml` are the real deploy path. The image
 # build exists for the per-PR environments and for the staging/prod Helm deploy,
-# which mindsdb/deployer runs when the `deploy` job below asks it to.
+# which a private deploy repository runs when the `deploy` job below asks it to.
 #
 # Every job here runs on a GitHub-hosted runner, which GitHub recommends for
 # public repositories. The build reaches ECR through GitHub OIDC, and the Helm
-# rollout happens in the private deployer repository.
+# rollout happens in the private deploy repository.
 #
 # ON PERMISSIONS. A called workflow can never exceed its caller's grant, and that
 # cap is checked when the workflow FILE IS LOADED, not when a job runs. A job here
@@ -72,9 +72,15 @@ defaults:
 # repository's `pull_request` subject and the `staging` Environment on
 # `staging`; the prod role trusts only the `prod` Environment on `main`. That is
 # why build and scan name those Environments.
+#
+# Both roles and both repositories live in the account the AWS_DEV_ACCOUNT_ID
+# organization secret names, so the account id stays out of this public
+# repository and GitHub masks it in the log. GitHub also drops a job output
+# that holds a secret, so `build` hands `scan` the image tag, not the full
+# image reference.
 env:
   ECR_REPOSITORY: ${{ inputs.build-environment == 'production' && 'mindsdb-cowork-server' || 'mindsdb-cowork-server-dev' }}
-  ECR_ROLE: ${{ inputs.build-environment == 'production' && 'arn:aws:iam::168681354662:role/gha-cowork-server-ecr-prod' || 'arn:aws:iam::168681354662:role/gha-cowork-server-ecr-dev' }}
+  ECR_ROLE: ${{ inputs.build-environment == 'production' && 'gha-cowork-server-ecr-prod' || 'gha-cowork-server-ecr-dev' }}
 
 jobs:
 
@@ -88,7 +94,8 @@ jobs:
       contents: read
       id-token: write
     outputs:
-      image: ${{ steps.build.outputs.image }}
+      tag: ${{ steps.pushed.outputs.tag }}
+      digest: ${{ steps.pushed.outputs.digest }}
     env:
       AWS_REGION: us-east-1
     steps:
@@ -127,7 +134,7 @@ jobs:
           persist-credentials: false
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ env.ECR_ROLE }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_DEV_ACCOUNT_ID }}:role/${{ env.ECR_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
       - id: build
         uses: mindsdb/github-actions/build-push-ecr@main
@@ -135,13 +142,36 @@ jobs:
           module-name: ${{ env.ECR_REPOSITORY }}
           build-for-environment: ${{ inputs.build-environment }}
           builder: local
+      # The digest this build pushed. The rollout refuses the tag once a later
+      # push has moved it, so a pull request run that pushes the same tag cannot
+      # swap the image this pipeline scanned.
+      - id: pushed
+        name: Read the pushed tag and digest
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          tag="${IMAGE##*:}"
+          digest=$(aws ecr batch-get-image \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$tag" \
+            --query 'images[0].imageId.imageDigest' \
+            --output text)
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::ECR answered '${digest}' for ${ECR_REPOSITORY}:${tag}, which is not an image digest."
+            exit 1
+          fi
+          {
+            echo "tag=${tag}"
+            echo "digest=${digest}"
+          } >> "$GITHUB_OUTPUT"
 
   scan:
     runs-on: ubuntu-latest
     needs: [build]
     name: Scan Minds Image
     # The same Environment and role as the build, which also let it pull the
-    # image it scans.
+    # image it scans, through a pull-only session.
     environment: ${{ inputs.build-environment == 'production' && 'prod' || inputs.build-environment == 'staging' && 'staging' || '' }}
     permissions:
       contents: read
@@ -154,19 +184,39 @@ jobs:
           persist-credentials: false
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ env.ECR_ROLE }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_DEV_ACCOUNT_ID }}:role/${{ env.ECR_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
+          # Pull only. The role can also push to this tier, and the scan runs the
+          # Snyk CLI with these credentials in its environment. A session gets
+          # only what both this policy and the role's own policy allow, so the
+          # scan's session cannot push.
+          inline-session-policy: |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchCheckLayerAvailability"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
       - uses: mindsdb/github-actions/snyk-docker-scan@main
         with:
-          image: ${{ needs.build.outputs.image }}
+          image: ${{ secrets.AWS_DEV_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.tag }}
           snyk-token: ${{ secrets.SNYK_TOKEN }}
           # Advisory on a PR, blocking on a deploy branch: an upstream CVE should
           # not stop someone iterating, and should stop a release.
           allow-vulns: ${{ inputs.pr-environment && 'true' || '' }}
 
   integration-tests-pr-env:
-    # mindsdb/deployer rolls a labeled same-repository PR's image into its
-    # environment on its own schedule; nothing here deploys it. The suite waits
+    # The deploy repository's reconciler rolls a labeled same-repository PR's
+    # image into its environment on its own schedule; nothing here deploys it. The suite waits
     # until the environment serves this build, then tests it with a throwaway
     # user. No `secrets:` line: a PR environment needs none, so this job gets
     # none.
@@ -184,16 +234,18 @@ jobs:
     # needing only `build` meant a failing scan and a rollout ran side by side.
     needs: [build, scan]
     # Only the two long-lived environments have a cluster to deploy to. A
-    # `development` build is either a PR (deployed by mindsdb/deployer) or
+    # `development` build is either a PR (deployed by the deploy repository) or
     # nothing. `deploy-enabled` gates it further: having a cluster is not the
     # same as having something deployed in it, and a rollout into an environment
     # that was never stood up fails every run without saying anything useful.
     if: inputs.deploy-enabled && (inputs.build-environment == 'staging' || inputs.build-environment == 'production')
     env:
-      # `build-environment` names the image flavour (production); the deployer,
-      # namespace and Slack message name the environment (prod). One is not the
-      # other, so map once here rather than at each use.
+      # `build-environment` names the image flavour (production); the deploy
+      # repository, namespace and Slack message name the environment (prod). One
+      # is not the other, so map once here rather than at each use.
       DEPLOY_ENV: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
+      # The branch this environment deploys from.
+      BRANCH: ${{ inputs.build-environment == 'production' && 'main' || 'staging' }}
     environment:
       # Spelled out rather than `env.DEPLOY_ENV`: `environment` is resolved before
       # the job's `env` block exists, and only takes github/needs/strategy/matrix/
@@ -201,10 +253,11 @@ jobs:
       name: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
       url: ${{ vars.MDB_ENV_URL }}
     timeout-minutes: 45
-    # The rollout runs in mindsdb/deployer, from the chart at this commit. This
-    # job only asks for it and waits. The GitHub App token can dispatch and
-    # watch that one repository's workflows, and the job's own token needs
-    # nothing.
+    # The rollout runs in the private deploy repository, from the chart at this
+    # commit. This job only asks for it and waits. The GitHub App token can
+    # dispatch and watch that one repository's workflows, and the job's own
+    # token needs nothing. The repository's name is a secret so the public log
+    # masks it.
     permissions: {}
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -213,16 +266,42 @@ jobs:
           client-id: ${{ vars.DEPLOYER_APP_CLIENT_ID }}
           private-key: ${{ secrets.DEPLOYER_APP_PRIVATE_KEY }}
           owner: mindsdb
-          repositories: deployer
+          repositories: ${{ secrets.DEPLOYER_REPOSITORY }}
           permission-actions: write
-      - name: Deploy through mindsdb/deployer
+      # The deploy repository checks that this commit is the branch head, and
+      # that its image exists with the digest this build pushed, then runs the
+      # helm rollout.
+      - name: Deploy through the deploy repository
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          DEPLOY_REPOSITORY: mindsdb/${{ secrets.DEPLOYER_REPOSITORY }}
+          DIGEST: ${{ needs.build.outputs.digest }}
         run: |
-          # gh >= 2.87 prints the created run's URL. The deployer's jobs run only
-          # from its `main`, so the dispatch names that ref.
-          url=$(gh workflow run deploy.yml -R mindsdb/deployer --ref main -f repo=cowork-server -f env="$DEPLOY_ENV" -f sha="$GITHUB_SHA")
-          gh run watch "${url##*/}" -R mindsdb/deployer --exit-status
+          set -euo pipefail
+          # gh >= 2.87 prints the created run's URL. The deploy repository's
+          # jobs run only from its `main`, so the dispatch names that ref.
+          url=$(gh workflow run deploy.yml -R "$DEPLOY_REPOSITORY" --ref main \
+            -f repo=cowork-server -f env="$DEPLOY_ENV" -f sha="$GITHUB_SHA" -f digest="$DIGEST")
+          # gh prints nothing when the API answers without the run's details, and
+          # then there is no run to watch.
+          run_id="${url##*/}"
+          if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::gh workflow run did not report the deploy run it created (output: '${url}'), so there is nothing to watch."
+            exit 1
+          fi
+          if gh run watch "$run_id" -R "$DEPLOY_REPOSITORY" --exit-status; then
+            exit 0
+          fi
+          # The deploy repository deploys only the branch head. When a newer
+          # commit landed while this run built, the rollout refuses this one,
+          # and the newer commit's own pipeline deploys and reports instead.
+          head=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/${BRANCH}" | cut -f1)
+          if [[ "$head" =~ ^[0-9a-f]{40}$ && "$head" != "$GITHUB_SHA" ]]; then
+            conclusion=$(gh run view "$run_id" -R "$DEPLOY_REPOSITORY" --json conclusion --jq .conclusion)
+            echo "::notice::${BRANCH} moved to ${head} while this run built, so its rollout ended '${conclusion}' and ${head} deploys in its own run."
+            exit 0
+          fi
+          exit 1
 
   integration-tests:
     needs: [deploy]

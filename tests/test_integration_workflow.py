@@ -45,7 +45,8 @@ def test_no_job_defined_here_requests_a_self_hosted_runner() -> None:
         for job_id, job in yaml.safe_load(text).get("jobs", {}).items():
             runs_on = job.get("runs-on", job.get("with", {}).get("runs-on"))
             if runs_on is not None:
-                assert runs_on == "ubuntu-latest", f"{path.name}:{job_id} {runs_on!r}"
+                # The Windows export tests need Windows' own file rename.
+                assert runs_on in {"ubuntu-latest", "windows-latest"}, f"{path.name}:{job_id} {runs_on!r}"
                 checked.append(f"{path.name}:{job_id}")
     assert "tests-integration.yml:integration-tests" in checked
     assert "build-deploy.yml:deploy" in checked

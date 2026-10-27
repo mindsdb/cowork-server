@@ -50,6 +50,20 @@ def wait_for_status(service: CodingService, session_id: str, status: SessionStat
     return session
 
 
+def wait_for_turn_thread(session_id: str) -> None:
+    """Wait for a task's turn thread to exit.
+
+    The thread reports the turn's end, then drains the task's queue
+    (``Turns._continue_queue``). A test that queues work as soon as it sees
+    ``completed`` races that drain for the task's reservation, so it waits
+    here first.
+    """
+    for thread in threading.enumerate():
+        if thread.name == f"coding-turn-{session_id[:8]}":
+            thread.join(timeout=3)
+            assert not thread.is_alive(), "the turn thread did not exit"
+
+
 def wait_for_workspace(service: CodingService, session_id: str) -> CodingSession:
     """Wait for a new task's background preparation to give it a workspace."""
     deadline = time.monotonic() + 3
@@ -61,6 +75,22 @@ def wait_for_workspace(service: CodingService, session_id: str) -> CodingSession
     session = service.get_session(session_id)
     assert session.workspace_path, "the task workspace was not prepared"
     return session
+
+
+def wait_for_steerable_turn(service: CodingService, session_id: str) -> None:
+    """Wait until the running turn routes a steer straight to its engine.
+
+    ``FakeEngine.started`` fires inside ``start_turn``, before the turn records
+    its id. A steer sent in that gap is held for the turn instead of reaching
+    the engine, so a test that needs the engine's answer waits here first.
+    """
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        running = service._running.get(session_id)
+        if running is not None and running.engine is not None and running.turn_id:
+            return
+        time.sleep(0.01)
+    raise AssertionError("the turn did not become ready for steering")
 
 
 def wait_for_steers(engine: FakeEngine) -> None:

@@ -14,8 +14,7 @@ Rejection is always all-or-nothing. tool_use/tool_result pairing is a property
 of the SET, not of a single row, so dropping one bad row would leave an orphan
 block and make every subsequent turn fail with a 400 from the provider. Dropping
 the whole set costs that one turn its tool detail and nothing else: it replays
-text-only, exactly the degradation the in-process harness already applies after
-a mid-turn compaction.
+text-only, as a turn that compacted its context mid-way does on either path.
 
 The one exception is an oversized tool_result, where the payload is replaced by
 a placeholder instead of the row being dropped — the call stays visible and
@@ -35,6 +34,8 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
+
+from cowork.harnesses.anton_harness.stream_formatter import TurnHistory
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,8 @@ def reject_unreplayable_tool_rows(rows: object) -> list[dict]:
     All-or-nothing, for the same reason ENG-1808 gives: tool_use/tool_result
     pairing is a property of the SET, so dropping one bad row would leave an
     orphan and make every later turn fail — the outcome being prevented. An
-    empty result replays text-only, which is a degradation the in-process
-    harness already applies after a mid-turn compaction.
+    empty result replays text-only, as a turn that compacted its context
+    mid-way does.
 
     `rows: object`, like its sibling: both call sites feed it
     `data.get("rows") or []` off an untyped dict, and the first statement here
@@ -205,3 +206,24 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
         return _reject("rows are %d bytes, over the %d-byte turn cap",
                        total, _MAX_TURN_BYTES)
     return clean
+
+
+def remote_turn_history(*, pod_rows: object, compacted: bool) -> TurnHistory | None:
+    """A pod's history frame as the formatter takes it: `rows` are what the
+    turn stores, `read` the rows as the pod sent them, which the formatter
+    finds the answer's figures in before the replay caps trimmed them. None
+    when there is nothing to pass on.
+
+    A turn that did not compact stores its rows sanitized
+    (`sanitize_turn_history_rows`). A turn that compacted or hard-truncated
+    its context, which the pod reports before this frame, ran near or over
+    the model's context window, so it stores no rows and the next turn
+    replays it as text only, as an in-process turn that compacted does. Its
+    frame whose rows are not a list carries none, so it gives None and the
+    formatter treats the turn as one no rows arrived for, as from a pod that
+    sends no frame.
+    """
+    read = pod_rows if isinstance(pod_rows, list) else None
+    if compacted:
+        return None if read is None else TurnHistory(rows=[], read=read)
+    return TurnHistory(rows=sanitize_turn_history_rows(pod_rows), read=read)

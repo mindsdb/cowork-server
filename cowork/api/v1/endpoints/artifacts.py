@@ -14,8 +14,9 @@ import secrets
 import stat as stat_module
 import subprocess
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -25,7 +26,13 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.services.product_permissions import require_product_permission
-from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
+from cowork.db.scoped import (
+    ScopedSession,
+    ScopedSessionDep,
+    TenantScope,
+    get_scoped_session,
+    get_tenant_scope,
+)
 from cowork.db.session import get_session
 from cowork.principal import Principal, get_principal
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
@@ -39,31 +46,45 @@ from cowork.api.v1.artifact_scope import (
     artifact_sources_for_request,
     scoped_project_id_for_request,
 )
+from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
+from cowork.api.v1.endpoints.live_apps import LiveAppRoute
+from cowork.schemas.live_apps import (
+    LiveAppCopyRef,
+    LiveAppDuplicateRequest,
+    LiveAppShareRequest,
+    LiveAppShareResponse,
+    SharedLiveAppResponse,
+)
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
     artifacts_sources_for_scan,
 )
 from cowork.services.artifacts import (
+    BackendPreviewRefused,
     ExecutionRefused,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
     delete_artifact as _delete_artifact,
     delete_artifact_from_source as _delete_artifact_from_source,
-    get_preview_mount,
     list_artifacts as _list_artifacts,
     mount_preview,
     preview_artifact as _preview_artifact,
+    preview_mount_for,
     resolve_artifact_path,
     reveal_in_file_manager,
 )
 from cowork.services.projects import ProjectService
 
+if TYPE_CHECKING:
+    from cowork.services.live_apps import CopyOfShare
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 class _PathBody(BaseModel):
@@ -155,6 +176,7 @@ def _artifact_cards(session, sources) -> list[dict]:
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
     cards = _list_artifacts(sources)
+    from cowork.services.artifact_export import card_export_source
     from cowork.services.artifact_ownership import resolve_artifact_owners
     from cowork.services.artifact_permissions import artifact_capabilities
 
@@ -173,9 +195,38 @@ def _artifact_cards(session, sources) -> list[dict]:
         resolutions = resolve_artifact_owners(session, source, [slug for slug, _ in entries])
         for slug, card in entries:
             card["capabilities"] = artifact_capabilities(
-                session, source, slug, resolution=resolutions[slug]
+                session,
+                source,
+                slug,
+                resolution=resolutions[slug],
+                export_source=card_export_source(card),
             )
+    _mark_received_live_apps(session, cards_by_base, by_base, cards)
     return cards
+
+
+def _mark_received_live_apps(session, cards_by_base, by_base, cards: list[dict]) -> None:
+    """With live apps on, give each card ``receivedFrom``: the owner's email
+    for a copy the caller duplicated from a share, from the server's own
+    record of the copy (cowork.services.live_apps.received_from), else None."""
+    from cowork.code_sandbox import live_apps_on
+
+    scope = getattr(session, "scope", None)
+    if not live_apps_on() or scope is None or not scope.personal:
+        return
+    from cowork.services.live_apps import received_from
+
+    received = received_from(session, partition_id=scope.org_id)
+    for card in cards:
+        card["receivedFrom"] = None
+    for base, entries in cards_by_base.items():
+        project_id = by_base[base].project_id
+        if not project_id:
+            continue
+        for slug, card in entries:
+            owner_email = received.get((UUID(str(project_id)), slug))
+            if owner_email:
+                card["receivedFrom"] = {"email": owner_email}
 
 
 def _scoped_project_sources(session, project_id: UUID | str):
@@ -220,7 +271,7 @@ def _scoped_project_cards(session, project_ref: str) -> list[dict]:
     the scoped server catalog, so root discovery still receives server-owned
     identity rather than the request string.
     """
-    _server_project_id, sources = _scoped_project_sources(session, project_ref)
+    server_project_id, sources = _scoped_project_sources(session, project_ref)
     return _artifact_cards(session, sources)
 
 
@@ -274,15 +325,18 @@ class _DesktopSourceCatalogEntry:
     source: object
 
 
-def _desktop_registered_path_catalog() -> tuple[_DesktopSourceCatalogEntry, ...]:
-    """Build the complete legacy source catalog without an HTTP selector."""
+def _desktop_registered_path_catalog(
+    *, scope: TenantScope | None
+) -> tuple[_DesktopSourceCatalogEntry, ...]:
+    """Build the complete legacy source catalog of ``scope``'s projects
+    without an HTTP selector."""
     return tuple(
         _DesktopSourceCatalogEntry(
             path_key=path_key,
             project_name=os.path.basename(str(Path(source.base).parent.parent)),
             source=source,
         )
-        for source in artifacts_sources_for_scan()
+        for source in artifacts_sources_for_scan(scope=scope)
         for path_key in sorted(_desktop_source_path_keys(source))
     )
 
@@ -316,7 +370,7 @@ def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict
     retained in that catalog keeps ``project_id=None``, preserving local draft
     URLs and card addressing.
     """
-    catalog = _desktop_registered_path_catalog()
+    catalog = _desktop_registered_path_catalog(scope=session.scope)
     if not project_path or "\x00" in project_path:
         return []
     requested = os.path.normpath(os.path.expanduser(project_path))
@@ -512,8 +566,8 @@ def _pinned_loose_match(
     return None
 
 
-def _desktop_artifact_status_for_path(path: str) -> dict:
-    """Match a legacy path only against entries scanned from discovered roots.
+def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -> dict:
+    """Match a legacy path only against entries scanned from ``scope``'s roots.
 
     The request is reduced to a string lookup key. Every card and folder key is
     built first from server-discovered ``ProjectArtifacts`` roots, so no
@@ -536,7 +590,7 @@ def _desktop_artifact_status_for_path(path: str) -> dict:
     )
     from cowork.services.artifacts import card_for_folder
 
-    for source in artifacts_sources_for_scan():
+    for source in artifacts_sources_for_scan(scope=scope):
         source_base = Path(source.base)
         try:
             with opened_artifact_root(source) as root:
@@ -594,6 +648,7 @@ def _desktop_artifact_status_for_path(path: str) -> dict:
                                 continue
                             card = card_for_folder(
                                 logical,
+                                scope=scope,
                                 project_id=source.project_id,
                                 project_name=source.project_name,
                                 _pinned_folder=folder,
@@ -629,7 +684,9 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
-            catalog = await run_in_threadpool(_desktop_registered_path_catalog)
+            catalog = await run_in_threadpool(
+                _desktop_registered_path_catalog, scope=session.scope
+            )
             if not project_path or "\x00" in project_path:
                 return []
             requested = os.path.normpath(os.path.expanduser(project_path))
@@ -812,6 +869,7 @@ async def delete_artifact_for_request(
             expected_artifact_id=expected_artifact_id,
             api_key=api_key,
             publish_url=publish_url,
+            scope=session.scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -839,28 +897,35 @@ async def delete_artifact_for_request(
         )
     except Exception:
         logger.warning(
-            "Could not drop the owner of deleted artifact %s", folder_name, exc_info=True
+            "Could not drop the owner of a deleted artifact",
+            exc_info=True,
+            extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
         )
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which
-# IS the require_local_tenancy guard: it 403s them outright in org mode, so they only
-# ever run on desktop, where there is no multi-tenant identity concept to
-# check in the first place. /proxy is the exception and says so at its own
-# definition. A comment covering a range of routes only holds while the range
-# does; each route carries the declaration itself, so inserting one here
-# cannot inherit this paragraph by accident.
+# IS the require_local_tenancy guard: it 403s them outright in org mode, so they
+# only ever run in local tenancy. There the request's scope is LOCAL_SCOPE, or,
+# on a deployment that trusts identity headers, a person's partition, so each
+# route takes the scope and resolves a path only inside that scope's artifacts
+# roots: another person's path answers 404, as an unknown one does. /proxy is
+# the exception and says so at its own definition. A comment covering a range
+# of routes only holds while the range does; each route carries the
+# declaration itself, so inserting one here cannot inherit this paragraph by
+# accident.
 @router.get("/status", dependencies=[Depends(require(DesktopOnly))])
-async def artifact_status(path: str = Query(..., min_length=1, max_length=4096)):
+async def artifact_status(
+    scope: ScopeDep, path: str = Query(..., min_length=1, max_length=4096)
+):
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
-    return _desktop_artifact_status_for_path(path)
+    return _desktop_artifact_status_for_path(path, scope=scope)
 
 
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
-async def preview_artifact(path: str = Query(...)):
+async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
     try:
-        artifact = resolve_artifact_path(path)
+        artifact = resolve_artifact_path(path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -873,66 +938,18 @@ async def preview_artifact(path: str = Query(...)):
         raise HTTPException(status_code=500, detail="Could not read artifact") from e
 
 
-class _ExportBody(BaseModel):
-    path: str
-    format: str  # 'pdf' | 'docx' | 'html'
-
-
-@router.post("/export", dependencies=[Depends(require(DesktopOnly))])
-async def export_artifact_endpoint(req: _ExportBody):
-    """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
-    the result into the same artifact folder. Returns the new file's path so
-    the client can open or download it.
-
-    The route-level `DesktopOnly` is broader than the pdf/docx refusal
-    inside: it takes `req.path`, an absolute server path, and nothing in an org
-    deployment can say which organization that path belongs to. The inner check
-    stays because it is the one the direct-call tests exercise, and because it
-    documents WHY those two formats are unsafe even where a path is trusted.
-    """
-    from fastapi.concurrency import run_in_threadpool
-
-    from cowork.services.artifact_export import ExportError, export_artifact
-    from cowork.services.artifacts import _org_mode
-
-    fmt = (req.format or "").lower().lstrip(".")
-    if fmt in ("pdf", "docx") and _org_mode():
-        # Both converters resolve URIs referenced in the source HTML to embed
-        # them in the output: xhtml2pdf fetches <img>/<link>/@import for PDF;
-        # htmldocx's image handling calls urllib.request.urlopen for docx. The
-        # source HTML is artifact content from the shared filesystem, written
-        # by any org's agent, so this is an SSRF and local-file-read primitive
-        # (including other orgs' trees) into a file the requester downloads.
-        # Plain HTML export does no such resolution, so it stays available.
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="PDF and Word export are not available on this deployment. Export to HTML instead.",
-        )
-    try:
-        source = resolve_artifact_path(req.path)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    try:
-        out = await run_in_threadpool(export_artifact, source, req.format)
-    except ExportError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Export failed") from e
-    return {"path": str(out), "filename": out.name}
-
-
 @router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
-async def preview_mount_endpoint(req: _PathBody, request: Request):
+async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeDep):
     try:
-        artifact = resolve_artifact_path(req.path)
+        artifact = resolve_artifact_path(req.path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        payload = await mount_preview(artifact)
+        payload = await mount_preview(artifact, scope=scope)
+    except BackendPreviewRefused as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
 
@@ -950,8 +967,8 @@ async def preview_mount_endpoint(req: _PathBody, request: Request):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require(DesktopOnly))])
-async def preview_asset(token: str, rel_path: str, request: Request):
-    parent = get_preview_mount(token)
+async def preview_asset(token: str, rel_path: str, request: Request, scope: ScopeDep):
+    parent = preview_mount_for(token, scope=scope)
     if parent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preview mount has expired or is unknown")
     try:
@@ -1010,13 +1027,16 @@ def serve_artifact_file(
 
 
 @router.post("/open", dependencies=[Depends(require(DesktopOnly))])
-async def open_artifact(req: _PathBody):
+async def open_artifact(req: _PathBody, scope: ScopeDep):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
-    if _org_mode():
+    # A person's partition refuses too: the server is not that person's
+    # machine, so opening a file runs a program on a host they don't sit at.
+    # Both refuse before the path resolves, so the answer says nothing about it.
+    if _org_mode() or scope.personal:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     try:
-        artifact = resolve_artifact_path(req.path)
+        artifact = resolve_artifact_path(req.path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -1030,7 +1050,7 @@ async def open_artifact(req: _PathBody):
 
 def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     try:
-        return resolve_artifact_path(path)
+        return resolve_artifact_path(path, scope=session.scope)
     except FileNotFoundError:
         pass
     except ValueError as e:
@@ -1072,6 +1092,12 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
 
 @router.post("/reveal", dependencies=[Depends(require(DesktopOnly))])
 async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
+    if session.scope.personal:
+        # Same refusal as /open, before the path resolves: the server's file
+        # manager is not on a person's machine.
+        from cowork.services.artifacts import _NO_EXEC_DETAIL
+
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EXEC_DETAIL)
     target = _resolve_reveal_path(req.path, session)
     try:
         reveal_in_file_manager(target)
@@ -1092,7 +1118,7 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     dependencies=[Depends(require(OpenByDesign))],
 )
-async def proxy(token: str, rel_path: str, request: Request):
+async def proxy(token: str, rel_path: str, request: Request, scope: ScopeDep):
     """HTTP forwarder for fullstack-artifact previews.
 
     Streams the request to the artifact's backend running on
@@ -1101,35 +1127,333 @@ async def proxy(token: str, rel_path: str, request: Request):
 
     OpenByDesign, not `DesktopOnly` like its siblings: the token is the
     real guard here, not tenancy. `_PREVIEW_MOUNTS` (see
-    `cowork.services.artifacts.get_preview_mount`) is only ever populated by
+    `cowork.services.artifacts.preview_mount_for`) is only ever populated by
     `/preview-mount`, which IS `DesktopOnly` — so in org mode
     this dict is permanently empty and any token 404s here regardless, by
-    construction rather than by a declared guard.
+    construction rather than by a declared guard. The token resolves only
+    inside the caller's own artifacts roots, as on `/preview-asset`.
     """
     from cowork.services.preview_proxy import proxy_artifact_request
-    return await proxy_artifact_request(token, rel_path, request)
+    return await proxy_artifact_request(token, rel_path, request, scope=scope)
 
 
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])
-def delete_artifact_endpoint(path: str = Query(...)):
+def delete_artifact_endpoint(scope: ScopeDep, path: str = Query(...)):
     try:
         from cowork.services.publish import (
             desktop_artifact_and_base,
             desktop_publish_credential,
         )
 
-        artifact, artifacts_base = desktop_artifact_and_base(path)
+        found = desktop_artifact_and_base(path, scope=scope)
         # Credential resolved after the path so an unresolvable artifact still
         # reports 404 rather than "configure your API key". Only needed at all
         # because delete unpublishes first.
         api_key, publish_url = desktop_publish_credential()
         _delete_artifact(
-            artifact, artifacts_base=artifacts_base,
-            api_key=api_key, publish_url=publish_url,
+            found.artifact, artifacts_base=found.artifacts_base,
+            api_key=api_key, publish_url=publish_url, scope=scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except HTTPException:
+        # An owner refusal (409) or unavailable ownership (503) keeps its status.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
+
+
+# ── live apps: share and duplicate ──────────────────────────────────────────
+# Only with live apps on (cowork.code_sandbox.live_apps_on), which create_app
+# allows only on a trusted-identity deployment with personal projects; 404
+# everywhere else, before the request is read (LiveAppRoute). Their own
+# router, mounted at /artifacts beside this one.
+
+live_app_router = APIRouter(route_class=LiveAppRoute)
+
+_SHARE_ONE_WAY = "Choose one address, or everyone on this stack."
+_NOT_AN_EMAIL = "Enter a valid email address."
+_OWN_ADDRESS = "That's your own address."
+_NOT_A_LIVE_APP = "Only full-stack apps can be duplicated this way."
+_NO_SUCH_ARTIFACT = "No artifact by that name in this project."
+_NOT_CONFIRMED = "Confirm the disclaimer first."
+_NO_LONGER_SHARED = "You can no longer duplicate this app."
+_NO_SUCH_PROJECT = "No project by that id."
+_SHARE_GONE = "That permission no longer exists."
+_ALREADY_COPIED = "You already have a copy of this app. Open it, or delete it to duplicate the app again."
+_NO_EMAIL = "Live apps need an email address on your account. Ask the operator to add one."
+
+_LIVE_APP_ROUTE = [Depends(require(AuthenticatedInOrgMode))]
+
+
+def _live_app_caller(principal: Principal | None):
+    """The caller of a live-app route that changes something: 403 for a
+    caller with no verified email (live_app_person), who can neither share
+    nor be shared with."""
+    from cowork.services.live_apps import live_app_person
+
+    person = live_app_person(principal)
+    if person is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_EMAIL)
+    return person
+
+
+def _project_dir(session: ScopedSession, *, project_id: UUID) -> Path | None:
+    """Project ``project_id``'s folder in the session's own scope, or None."""
+    from cowork.services.projects import ProjectNotFoundError
+
+    try:
+        return Path(ProjectService(session).get_project(project_id).path)
+    except ProjectNotFoundError:
+        return None
+
+
+async def _require_own_live_app(principal: Principal | None, *, project_id: UUID, slug: str) -> None:
+    """Refuse unless ``slug`` in the caller's own project ``project_id`` is a
+    full-stack app: 404 for a project outside their space or a missing
+    artifact, 400 for another type, 422 for a folder the copy rule refuses."""
+    from cowork.db.scoped import scope_from_principal
+    from cowork.db.units import run_db
+    from cowork.services.live_apps import LiveAppCopyRefused, LiveAppGone, NotALiveApp, read_app_metadata
+
+    project_dir = await run_db(partial(_project_dir, project_id=project_id), scope=scope_from_principal(principal))
+    if project_dir is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_PROJECT)
+    try:
+        await run_in_threadpool(read_app_metadata, project_dir, slug)
+    except LiveAppGone:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_ARTIFACT) from None
+    except NotALiveApp:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_NOT_A_LIVE_APP) from None
+    except LiveAppCopyRefused as refusal:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(refusal)) from None
+
+
+def _share_response(share) -> LiveAppShareResponse:
+    return LiveAppShareResponse(
+        share_id=share.share_id,
+        slug=share.slug,
+        email=share.recipient_email,
+        everyone=share.recipient_email is None,
+        shared_at=share.shared_at,
+    )
+
+
+@live_app_router.post("/live-app-share", dependencies=_LIVE_APP_ROUTE)
+async def share_live_app(
+    body: LiveAppShareRequest, principal: Principal | None = Depends(get_principal)
+) -> LiveAppShareResponse:
+    """Share one of the caller's full-stack apps with one colleague's address,
+    or with everyone on the stack. Sharing it the same way again returns the
+    same share."""
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_db
+    from cowork.services.live_apps import is_email, normalized_email, record_share
+
+    owner = _live_app_caller(principal)
+    if (body.email is None) == (not body.everyone):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_SHARE_ONE_WAY)
+    recipient_email = None
+    if body.email is not None:
+        recipient_email = normalized_email(body.email)
+        if not is_email(recipient_email):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_NOT_AN_EMAIL)
+        if recipient_email == owner.email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_OWN_ADDRESS)
+    await _require_own_live_app(principal, project_id=body.project_id, slug=body.slug)
+    share = await run_db(
+        partial(
+            record_share,
+            owner=owner,
+            project_id=body.project_id,
+            slug=body.slug,
+            recipient_email=recipient_email,
+        ),
+        scope=SYSTEM_SCOPE,
+    )
+    return _share_response(share)
+
+
+@live_app_router.get("/live-app-shares", dependencies=_LIVE_APP_ROUTE)
+async def live_app_shares(
+    project_id: Annotated[UUID, Query(alias="projectId")],
+    slug: Annotated[str, Query(min_length=1, max_length=255)],
+    principal: Principal | None = Depends(get_principal),
+) -> list[LiveAppShareResponse]:
+    """Every share the caller made of their app ``slug`` in project
+    ``projectId``, newest first, for the share dialog's "Stop sharing" list."""
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_db
+    from cowork.services.live_apps import live_app_person, shares_of_app
+
+    owner = live_app_person(principal)
+    if owner is None:
+        return []
+    await _require_own_live_app(principal, project_id=project_id, slug=slug)
+    shares = await run_db(partial(shares_of_app, owner=owner, project_id=project_id, slug=slug), scope=SYSTEM_SCOPE)
+    return [_share_response(share) for share in shares]
+
+
+@live_app_router.delete("/live-app-share/{share_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_LIVE_APP_ROUTE)
+async def withdraw_live_app_share(share_id: UUID, principal: Principal | None = Depends(get_principal)) -> None:
+    """Stop sharing: remove one of the caller's own shares. The recipients'
+    lists drop it at once; copies already made stay theirs."""
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_db
+    from cowork.services.live_apps import delete_share
+
+    owner = _live_app_caller(principal)
+    if not await run_db(partial(delete_share, owner=owner, share_id=share_id), scope=SYSTEM_SCOPE):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_SHARE_GONE)
+
+
+@live_app_router.get("/shared-live-apps", dependencies=_LIVE_APP_ROUTE)
+async def shared_live_apps(
+    session: ScopedSession = Depends(get_scoped_session),
+    principal: Principal | None = Depends(get_principal),
+) -> list[SharedLiveAppResponse]:
+    """The apps other people let the caller duplicate, by address or for
+    everyone, newest first, each once, with the caller's copy from each while
+    its folder is there. An app whose owner deleted it, or whose folder no
+    longer holds a full-stack app the server can read, drops out."""
+    from cowork.db.scoped import SYSTEM_SCOPE, scope_for_identity
+    from cowork.db.units import run_db
+    from cowork.services.live_apps import (
+        LiveAppCopyRefused,
+        LiveAppGone,
+        copies_of_shares,
+        live_app_person,
+        read_app_metadata,
+        shared_text,
+        shares_with,
+    )
+
+    recipient = live_app_person(principal)
+    if recipient is None:
+        return []
+    shares = await run_db(partial(shares_with, recipient=recipient), scope=SYSTEM_SCOPE)
+    copies = await run_db(partial(copies_of_shares, recipient=recipient), scope=SYSTEM_SCOPE)
+    listed = []
+    for share in shares:
+        owner_scope = scope_for_identity(org_id=share.owner_partition_id, user_id=share.owner_user_id)
+        project_dir = await run_db(partial(_project_dir, project_id=share.project_id), scope=owner_scope)
+        if project_dir is None:
+            continue
+        try:
+            metadata = await run_in_threadpool(read_app_metadata, project_dir, share.slug)
+        except (LiveAppGone, LiveAppCopyRefused):
+            continue
+        kept = await _kept_copy_of(session, copies.get(share.share_id, []))
+        listed.append(
+            SharedLiveAppResponse(
+                share_id=share.share_id,
+                slug=share.slug,
+                name=shared_text(metadata.name) or share.slug,
+                description=shared_text(metadata.description),
+                owner_email=share.owner_email,
+                everyone=share.everyone,
+                shared_at=share.shared_at,
+                your_copy=None if kept is None else LiveAppCopyRef(project_id=kept.project_id, slug=kept.slug),
+            )
+        )
+    return listed
+
+
+async def _kept_copy_of(session: ScopedSession, copies: list[CopyOfShare]) -> CopyOfShare | None:
+    """The caller's copy among ``copies`` whose folder is still there, in a
+    project of theirs (``session``'s scope)."""
+    from cowork.services.live_apps import kept_copy
+
+    project_dirs = {}
+    for copy in copies:
+        project_dirs[copy.project_id] = await run_in_threadpool(_project_dir, session, project_id=copy.project_id)
+    return await run_in_threadpool(kept_copy, project_dirs, copies)
+
+
+@live_app_router.post("/live-app-duplicate", dependencies=_LIVE_APP_ROUTE)
+async def duplicate_live_app(
+    body: LiveAppDuplicateRequest,
+    session: ScopedSession = Depends(get_scoped_session),
+    principal: Principal | None = Depends(get_principal),
+) -> dict:
+    """Copy an app someone let the caller duplicate into a project of the
+    caller's own, after the caller confirmed the disclaimer, and answer the
+    copy's card. One copy per person per share: while the caller's copy from
+    this share still has its folder, another call answers 409."""
+    from cowork.db.scoped import SYSTEM_SCOPE, scope_for_identity
+    from cowork.db.units import run_db
+    from cowork.services.artifact_ownership import record_artifact_owner
+    from cowork.services.live_apps import (
+        LiveAppCopyRefused,
+        LiveAppGone,
+        copies_of_shares,
+        forget_copy,
+        read_shared_app,
+        record_copy,
+        remove_app_copy,
+        share_for_recipient,
+        write_app_copy,
+    )
+
+    recipient = _live_app_caller(principal)
+    if not body.confirmed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_NOT_CONFIRMED)
+    share = await run_db(
+        partial(share_for_recipient, share_id=body.share_id, recipient=recipient), scope=SYSTEM_SCOPE
+    )
+    if share is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED)
+    copies = await run_db(partial(copies_of_shares, recipient=recipient), scope=SYSTEM_SCOPE)
+    if await _kept_copy_of(session, copies.get(share.share_id, [])) is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ALREADY_COPIED)
+    owner_scope = scope_for_identity(org_id=share.owner_partition_id, user_id=share.owner_user_id)
+    owner_dir = await run_db(partial(_project_dir, project_id=share.project_id), scope=owner_scope)
+    if owner_dir is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED)
+    target_dir = await run_in_threadpool(_project_dir, session, project_id=body.project_id)
+    if target_dir is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_PROJECT)
+    try:
+        app = await run_in_threadpool(read_shared_app, owner_dir, share.slug)
+    except LiveAppGone:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED) from None
+    except LiveAppCopyRefused as refusal:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(refusal)) from None
+    slug = await run_in_threadpool(write_app_copy, target_dir, app)
+    try:
+        await run_db(
+            partial(record_copy, recipient=recipient, project_id=body.project_id, slug=slug, share=share),
+            scope=SYSTEM_SCOPE,
+        )
+        # Writes no row where live apps run: create_app allows them only in
+        # local tenancy, where the copy is the caller's by the project it
+        # lands in. The one helper for that row, should live apps ever run
+        # in org mode.
+        await run_in_threadpool(
+            record_artifact_owner, session, body.project_id, slug, recipient.user_id, action="live_app_duplicate"
+        )
+    except Exception:
+        # A copy without its received mark would reach the agent as the
+        # person's own code, so it doesn't stay.
+        await run_in_threadpool(remove_app_copy, target_dir, slug)
+        try:
+            await run_db(
+                partial(forget_copy, recipient=recipient, project_id=body.project_id, slug=slug), scope=SYSTEM_SCOPE
+            )
+        except Exception:
+            logger.warning(
+                "Live app copy mark not removed",
+                exc_info=True,
+                extra={
+                    "event": "live_app_copy_mark_unremoved",
+                    **log_context(project_id=body.project_id, artifact_slug=slug),
+                },
+            )
+        raise
+    cards = await run_in_threadpool(_scoped_project_cards, session, str(body.project_id))
+    card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)
+    if card is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The copy has no card")
+    return card

@@ -15,6 +15,7 @@ import cowork.models.file  # noqa: F401
 import cowork.models.message  # noqa: F401
 import cowork.models.message_event  # noqa: F401
 import cowork.models.pin  # noqa: F401
+import cowork.models.published_page  # noqa: F401
 import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
@@ -70,7 +71,7 @@ def run_migrations_online() -> None:
 
     url = _database_url()
     _ensure_sqlite_dir(url)
-    connectable = create_engine(url, poolclass=pool.NullPool)
+    connectable = create_engine(url, poolclass=pool.NullPool, hide_parameters=True)
 
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)

@@ -5,6 +5,7 @@ builds can be fully isolated from a user's production ~/.cowork (ENG-324) by
 setting one env var. These tests pin that contract.
 """
 import ast
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from cowork.common.settings.app_settings import (
     _env_file_chain,
     get_app_settings,
 )
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 
 
@@ -248,6 +250,113 @@ def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):
         get_app_settings.cache_clear()
 
 
+# The test above covers every path resolved through a settings FIELD. It cannot
+# cover the ones computed at import: the dotenv chain baked into
+# `Settings.model_config`, the module-level `_ENV_PATH`s, and the memory
+# migration's source list. Those are exactly the paths a per-account desktop
+# session must not share, so they get a subprocess where COWORK_HOME is set
+# before anything is imported.
+_IMPORT_TIME_PATHS = r"""
+import json, os
+from pathlib import Path
+
+from cowork.common.settings.app_settings import Settings
+import cowork.migrations as migrations
+import cowork.api.v1.endpoints.settings as settings_api
+import cowork.harnesses.memory.migration as memory_migration
+import cowork.services.publish as publish
+from cowork.coding.service import get_coding_service
+from cowork.common.paths import cowork_home
+from cowork.db.scoped import LOCAL_SCOPE
+
+paths = {
+    # model_config, not _env_file_chain(): this is the value pydantic-settings
+    # reads, so appending a shared path straight to model_config cannot slip
+    # past this probe.
+    "dotenv_chain": [
+        str(p) for p in (Settings.model_config.get("env_file") or ()) if os.path.isabs(str(p))
+    ],
+    "migrations_env": [str(migrations._ENV_PATH)],
+    "settings_endpoint_env": [str(settings_api._ENV_PATH)],
+    "memory_sources": [str(p) for p, _ in memory_migration._MIGRATION_SOURCES],
+    "publish_state": [str(publish._state_path(scope=LOCAL_SCOPE))],
+    "coding_root": [str(get_coding_service().root)],
+    "home": [str(cowork_home())],
+}
+print("PATHS" + json.dumps(paths))
+"""
+
+
+def _import_time_paths(home: Path) -> dict[str, list[str]]:
+    import json
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    # The parent environment comes along for PATH and the interpreter, so the
+    # overrides that would redirect a probed path have to go, exactly as
+    # test_all_settings_paths_derive_from_cowork_home clears them. Without this
+    # the test fails on a machine that legitimately sets one of them, while
+    # production behaviour is correct.
+    for var in (*_PER_RESOURCE_OVERRIDES, "ANTON_COWORK_STATE_DIR"):
+        env.pop(var, None)
+    env["COWORK_HOME"] = str(home)
+    env["COWORK_TENANCY_MODE"] = "local"
+    result = subprocess.run(
+        [sys.executable, "-c", _IMPORT_TIME_PATHS],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+    line = next((ln for ln in result.stdout.splitlines() if ln.startswith("PATHS")), None)
+    assert line, f"probe failed\nstdout:{result.stdout[-2000:]}\nstderr:{result.stderr[-2000:]}"
+    return json.loads(line[len("PATHS"):])
+
+
+def test_import_time_paths_follow_cowork_home(tmp_path):
+    """Nothing a desktop session reads may sit outside its own COWORK_HOME.
+
+    This is the invariant per-account isolation rests on: pointing one variable
+    at an account's root has to take the whole world with it, including the
+    dotenv chain, or an account reads another's provider secrets.
+    """
+    home = tmp_path / "account-root"
+    home.mkdir()
+    paths = _import_time_paths(home)
+
+    # Resolved components, not a string prefix: `<home>-shared/state.json` and
+    # `<home>/../shared/state.json` both START WITH str(home) while sitting
+    # outside it, so a regression onto either would have passed.
+    resolved_home = home.resolve()
+    outside = {
+        name: [p for p in group if not Path(p).resolve().is_relative_to(resolved_home)]
+        for name, group in paths.items()
+    }
+    outside = {name: group for name, group in outside.items() if group}
+    assert not outside, (
+        "path(s) resolved outside COWORK_HOME, so two accounts would share them: "
+        f"{outside}"
+    )
+
+
+def test_import_time_paths_move_with_cowork_home(tmp_path):
+    """The control: the same probe against a different root must follow it, so a
+    passing run above cannot just mean the probe found nothing."""
+    first = tmp_path / "root-a"
+    second = tmp_path / "root-b"
+    first.mkdir()
+    second.mkdir()
+
+    a = _import_time_paths(first)
+    b = _import_time_paths(second)
+
+    assert a["dotenv_chain"] != b["dotenv_chain"]
+    assert a["migrations_env"] != b["migrations_env"]
+    assert a["memory_sources"] != b["memory_sources"]
+    assert a["coding_root"] != b["coding_root"]
+
+
 # The desktop app gives each organization its own stores by overriding the
 # paths below, one per cowork_home()-derived store. A store added here without
 # an override there is shared across organizations silently, which is the whole
@@ -302,6 +411,26 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
             "cowork/services/connectors/probe.py",
             "_probe_tmp_dir",
             "pod_local_only(cowork_home() / 'tmp', 'tmp')",
+        ),
+        # The code sandbox runs only with COWORK_CODE_SANDBOX=landlock, on a
+        # self-hosted Linux stack, never on the desktop that switches
+        # organizations. Its stores are keyed per person by scoped_storage_root.
+        ("cowork/code_sandbox.py", "shared_files_dir", "cowork_home() / 'shared-files'"),
+        (
+            "cowork/code_sandbox.py",
+            "_sandbox_root",
+            "scoped_storage_root(cowork_home() / 'sandbox', scope, store='sandbox')",
+        ),
+        ("cowork/code_sandbox.py", "_forbidden_roots.forbidden", "cowork_home()"),
+        ("cowork/code_sandbox.py", "_trusted_roots", "cowork_home()"),
+        ("cowork/code_sandbox.py", "_run_self_test.scratch", "cowork_home() / 'tmp'"),
+        ("cowork/code_sandbox.py", "_refuse_linked_cowork_home_entries.entry", "cowork_home() / name"),
+        # This local-only backfill reads shared history solely to reject
+        # unattributed page ids; it never runs on an org deployment.
+        (
+            "cowork/services/published_page_owner_backfill.py",
+            "_candidates.global_root",
+            "Path(os.environ.get('ANTON_COWORK_STATE_DIR') or cowork_home()).expanduser()",
         ),
         # These are read-only sources for a one-time legacy import.
         *(
@@ -514,7 +643,7 @@ def test_publish_state_dir_is_overridable_per_organization(monkeypatch, tmp_path
     monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("ANTON_COWORK_STATE_DIR", str(tmp_path / "orgs" / "org-b"))
 
-    assert publish._cowork_state_dir() == tmp_path / "orgs" / "org-b"
+    assert publish._cowork_state_dir(scope=LOCAL_SCOPE) == tmp_path / "orgs" / "org-b"
 
 
 def test_every_per_organization_override_is_a_real_knob(monkeypatch, tmp_path):
@@ -535,7 +664,7 @@ def test_every_per_organization_override_is_a_real_knob(monkeypatch, tmp_path):
         "AntonHarnessSettings.skills_root_dir": lambda: AntonHarnessSettings(
             _env_file=None
         ).skills_root_dir,
-        "_cowork_state_dir.path": publish._cowork_state_dir,
+        "_cowork_state_dir.path": lambda: publish._cowork_state_dir(scope=LOCAL_SCOPE),
     }
     owners = {
         callsite.split(":", 1)[1].split("[", 1)[0]

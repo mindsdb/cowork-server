@@ -185,6 +185,8 @@ def test_shared_resource_authorization_and_contract_through_http(client):
         "canRename": True,
         "canDelete": True,
         "canEditInstructions": True,
+        "canRun": True,
+        "canWriteFiles": True,
         # Org deployments never adopt a folder, so this is always False there.
         "directoryIsExternal": False,
     }
@@ -223,7 +225,9 @@ def test_shared_resource_authorization_and_contract_through_http(client):
     assert skill_created.status_code == 201, skill_created.text
     skill = skill_created.json()
     assert skill["attribution"]["createdBy"]["userId"] == USER_A
-    assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable"}
+    assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable", "canShare"}
+    # Hosted org tenancy shares no skill one at a time.
+    assert skill["capabilities"]["canShare"] is False
     denied = client.put(
         f"/api/v1/skills/{skill['id']}",
         json={"instructions": "Peer overwrite"},
@@ -370,6 +374,42 @@ def test_conversation_move_to_foreign_project(client):
     assert b_cid not in [c["id"] for c in a_convs["conversations"]]
 
 
+# -- posting a turn ---------------------------------------------------------------
+
+def test_turn_into_a_foreign_conversation_is_404_not_500(client, granted_product_permissions):
+    """B's turn into A's conversation id. B's scope can't see the row, so the
+    turn tries to adopt the id as a new conversation, the insert collides with
+    A's row, and the re-read under B's scope finds nothing again. That ends as
+    404. An unknown id is adopted instead, so the two answers differ; ids are
+    random UUIDs, so the difference reveals nothing guessable."""
+    cid = _conversation(client, A, topic="a-turn-target")
+
+    res = client.post(
+        "/api/v1/responses/", headers=B,
+        json={"input": "hi", "stream": True, "conversation": cid},
+    )
+
+    assert res.status_code == 404, res.text
+    assert res.json() == {"detail": "Conversation not found"}
+    # A's conversation is untouched: same title, still no messages.
+    assert client.get(f"/api/v1/conversations/{cid}", headers=A).json()["title"] == "a-turn-target"
+    assert client.get(f"/api/v1/conversations/{cid}/items", headers=A).json() == []
+
+
+def test_turn_under_a_foreign_project_id_is_404(client, granted_product_permissions):
+    """A new conversation under A's project id answers B exactly as an unknown
+    project id does: 404, and nothing created under A's project."""
+    a_pid = _project(client, A)
+
+    _same_as_missing_body(
+        client, "POST", "/api/v1/responses/",
+        lambda i: {"input": "intruder", "stream": True, "project_id": i}, a_pid,
+    )
+
+    a_convs = client.get(f"/api/v1/conversations/?project_id={a_pid}", headers=A).json()
+    assert a_convs["conversations"] == []
+
+
 # -- schedules -------------------------------------------------------------------
 
 def _schedule_body(project_id: str, title="a-sched") -> dict:
@@ -502,11 +542,14 @@ class _LiveHandle:
         latest_seq = 3
 
     def __init__(self, conversation_id: str, org_id: str, user_id: str) -> None:
+        from cowork.streaming.registry import TurnLifecycle
+
         self.conversation_id = conversation_id
         self.org_id = org_id
         self.user_id = user_id
         self.turn_id = 1
         self.buffer = self._Buffer()
+        self.lifecycle = TurnLifecycle()
         self.cancelled = False
 
     @property
@@ -594,3 +637,25 @@ def test_org_settings_writes_require_admin_role(client):
     assert client.put(
         "/api/v1/settings/", json={"values": {"openai_api_key": "***", "greeting": "hi"}}, headers=A
     ).status_code == 200
+
+
+def test_member_can_save_and_clear_favicon_without_changing_peers(client):
+    favicon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E"
+    assert _setting(client, A, "favicon")["value"] == ""
+
+    saved = client.put(
+        "/api/v1/settings/", json={"values": {"favicon": favicon}}, headers=A
+    )
+    assert saved.status_code == 200, saved.text
+    setting = _setting(client, A, "favicon")
+    assert setting["value"] == favicon
+    assert setting["is_sensitive"] is False
+    assert setting["is_set"] is True
+    assert _setting(client, A_PEER, "favicon")["value"] == ""
+    assert _setting(client, B, "favicon")["value"] == ""
+
+    cleared = client.put(
+        "/api/v1/settings/", json={"values": {"favicon": ""}}, headers=A
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert _setting(client, A, "favicon")["value"] == ""

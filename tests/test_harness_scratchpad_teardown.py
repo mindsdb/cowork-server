@@ -32,8 +32,9 @@ from anton.core.backends.manager import ScratchpadManager
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.connectors.probe as probe_module
 import cowork.services.task_objects as task_objects
+from cowork.harnesses.anton_harness import harness as harness_module
 from cowork.common.chat_session import close_session_scratchpads, drain_scratchpad_closes
-from cowork.harnesses.anton_harness.harness import AntonHarness
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession
 
 #: How long a turn's pad may outlive the turn. Generous so a loaded CI runner
 #: does not flake; a leaked pad never exits, so the bound only has to be finite.
@@ -140,7 +141,10 @@ async def _raises():
 
 def _stub_artifact_steps(monkeypatch) -> None:
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
+    monkeypatch.setattr(
+        task_objects, "turn_artifact_changes",
+        lambda *_a, **_k: task_objects.ArtifactChanges(created=[], touched=set()),
+    )
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):
@@ -169,7 +173,7 @@ async def turns(monkeypatch, tmp_path):
     async def _fake_build(self, conversation, **_kwargs):
         session = _Session(pads, bodies.pop(0), tmp_path)
         sessions.append(session)
-        return session, None, None
+        return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(
@@ -245,17 +249,32 @@ async def test_stopped_turn_closes_its_pad(turns):
     _assert_backend_and_snapshot_survive(turns)
 
 
-async def test_pad_closes_even_when_artifact_indexing_raises(turns, monkeypatch):
+async def test_pad_closes_even_when_skill_draft_cleanup_raises(turns, monkeypatch):
     """The close runs before the finally's other steps, so a step that raises
     cannot skip it."""
 
+    def _cleanup_fails(*_a, **_k):
+        raise OSError("drafts dir unreadable")
+
+    monkeypatch.setattr(task_objects, "finalize_turn_skill_drafts", _cleanup_fails)
+    with pytest.raises(OSError, match="drafts dir unreadable"):
+        await _drain(turns.run(_completes))
+    await _assert_exits(turns.pads[0].proc, "the turn's scratchpad")
+
+
+async def test_pad_closes_when_artifact_indexing_logs_its_failure(turns, monkeypatch, caplog):
     def _indexing_fails(*_a, **_k):
         raise OSError("artifacts dir unreadable")
 
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", _indexing_fails)
-    with pytest.raises(OSError, match="artifacts dir unreadable"):
-        await _drain(turns.run(_completes))
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", _indexing_fails)
+    await _drain(turns.run(_completes))
     await _assert_exits(turns.pads[0].proc, "the turn's scratchpad")
+    assert any(
+        record.name == harness_module.logger.name
+        and record.getMessage() == "Could not index artifacts created this turn"
+        and record.exc_info and isinstance(record.exc_info[1], OSError)
+        for record in caplog.records
+    )
 
 
 async def test_every_pad_the_turn_started_closes(turns):
@@ -516,7 +535,7 @@ async def test_real_pad_exits_its_descriptors_close_and_the_next_turn_restores_i
             yield
 
     async def _fake_build(self, conversation, **_kwargs):
-        return _RealPadSession(), None, None
+        return BuiltChatSession(session=_RealPadSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

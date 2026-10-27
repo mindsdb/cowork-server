@@ -396,6 +396,31 @@ def test_git_runner_rejects_an_unavailable_working_directory_before_spawning(
         GitRunner().run(tmp_path / "missing", "status")
 
 
+@pytest.mark.parametrize(
+    ("platform", "expected_prefix"),
+    [
+        ("win32", ["git", "-c", "core.longpaths=true", "status"]),
+        ("darwin", ["git", "status"]),
+        ("linux", ["git", "status"]),
+    ],
+)
+def test_git_runner_enables_long_paths_only_on_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str, expected_prefix: list[str]
+) -> None:
+    calls: list[list[str]] = []
+
+    def record(argv: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(workspace_module.sys, "platform", platform)
+    monkeypatch.setattr(subprocess, "run", record)
+
+    GitRunner().run(tmp_path, "status")
+
+    assert calls == [expected_prefix]
+
+
 def test_local_folder_does_not_require_git_to_be_installed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

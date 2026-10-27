@@ -8,29 +8,35 @@ import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, func, tuple_
+from pydantic import ValidationError
+from sqlalchemy import Text, case, cast, func, or_, tuple_
 from sqlalchemy import select as sa_select
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     dir_lstat,
     dir_rmtree,
     dir_unlink,
     opened_subdir_nofollow,
 )
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope
+from cowork.db.units import run_db
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
+from cowork.schemas.figure_sources import EarlierAnswer
 from cowork.schemas.responses import Role
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
+from cowork.streaming.answer_text import coalesce_text_deltas
 
 # Defaults/bounds for GET /conversations/{id}/items's opt-in pagination
 # (see get_messages_page). Omitting both limit and before keeps the route's
@@ -50,6 +56,10 @@ _SCAN_CAP_MULTIPLIER = 10
 # trip on the unbounded get_messages branch a 1,000+ message conversation
 # can reach.
 _EVENTS_IN_CHUNK_SIZE = 500
+# The most recent answers whose figures a turn checks its own figures
+# against, to mark one an earlier answer gave as repeated
+# (read_earlier_answers).
+MAX_EARLIER_ANSWERS = 20
 # Upper bound for a decoded cursor's `seq`. Not the column's limit (`seq` is
 # INTEGER, so 2**31-1 on Postgres) — this is what the drivers tolerate. sqlite3
 # raises OverflowError rather than bind an int wider than 64 bits, and that
@@ -81,6 +91,9 @@ _MESSAGE_ORDER = (
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
+# The exact reverse of _MESSAGE_ORDER, for reads that walk back from the newest
+# row: id is unique, so every row has one place in either direction.
+_MESSAGE_ORDER_NEWEST_FIRST = tuple(column.desc() for column in _MESSAGE_ORDER)
 
 
 def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
@@ -116,6 +129,19 @@ def _decode_message_cursor(cursor: str) -> tuple[int, int, UUID]:
     if not 0 <= seq <= _MAX_CURSOR_SEQ or role_rank not in (0, 1):
         raise InvalidPaginationParams("Malformed pagination cursor")
     return (seq, role_rank, message_id)
+
+
+@dataclass(frozen=True)
+class ReplayHistory:
+    """What a harness replays into a turn, read in one unit.
+
+    ``messages`` is the history get_ordered_messages returns. ``events`` holds
+    the stored events of those messages that carry one of the requested
+    thought roles, in history order and each message's event order.
+    """
+
+    messages: list[Message]
+    events: list[dict]
 
 
 @dataclass(frozen=True)
@@ -343,6 +369,13 @@ class ConversationService:
 
         Idempotent: a no-op when nothing matches.
         """
+        if self.clear_pending(conversation_id, message_id=message_id):
+            self.session.commit()
+
+    def clear_pending(self, conversation_id: UUID, *, message_id: UUID | None = None) -> bool:
+        """finalize_pending without the commit: the flags are cleared in the
+        session, and the caller's next commit lands them with whatever else it
+        writes. Whether any row matched."""
         stmt = (
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -351,12 +384,10 @@ class ConversationService:
         if message_id is not None:
             stmt = stmt.where(Message.id == message_id)
         pending_rows = self.session.exec(stmt).all()
-        if not pending_rows:
-            return
         for message in pending_rows:
             message.pending = False
             self.session.add(message)
-        self.session.commit()
+        return bool(pending_rows)
 
     def repair_image_content(self, conversation_id: UUID) -> list[UUID]:
         """Strip image content blocks from every stored message in a
@@ -874,6 +905,9 @@ class ConversationService:
         one commit (hence one `created_at`); `seq` fixes their order, since the
         role tiebreak in _MESSAGE_ORDER would otherwise sort tool_result (user)
         ahead of tool_use (assistant). Hidden from the UI by `get_messages`.
+
+        `events` are stored with each run of adjacent plain text deltas merged
+        into one row (coalesce_text_deltas); the live stream stays per delta.
         """
         # Persist when there's body text OR any events — an artifact-only turn
         # (the agent writes a file and says little/nothing) carries no text but
@@ -908,7 +942,7 @@ class ConversationService:
         # Flush for foreign-key ordering, but commit the text and its events
         # together: a crash must not leave an answer without its failure marker.
         self.session.flush()
-        for event_seq, event_data in enumerate(events):
+        for event_seq, event_data in enumerate(coalesce_text_deltas(events)):
             self.session.add(
                 MessageEvent(
                     message_id=assistant_msg.id,
@@ -1024,6 +1058,146 @@ class ConversationService:
         the LLM-history read, and the current turn's input arrives separately, so
         replaying it here would double-feed it. Pass include_pending=True only if a
         caller genuinely needs the not-yet-finalized row."""
+        stmt = self._ordered_messages(conversation_id, include_pending=include_pending)
+        return list(self.session.exec(stmt).all())
+
+    def message_count(self, conversation: Conversation) -> int:
+        """How many rows the conversation stores, pending and hidden tool rows
+        included: the number a new turn's stream buffer is keyed by, and the
+        index boot recovery reads that turn's question at.
+
+        Counted in SQL rather than by loading every row. Takes the
+        conversation the caller already resolved through this session, as
+        len(conversation.messages) did, so it adds no anchor query. Not
+        max(seq) + 1: seq can repeat, and the buffer key must be the count."""
+        return self.session.exec(
+            self.session.select(Message)
+            .with_only_columns(func.count())
+            .where(Message.conversation_id == conversation.id)
+        ).one()
+
+    def get_recent_messages(
+        self, conversation_id: UUID, *, roles: tuple[Role, ...], limit: int
+    ) -> list[Message]:
+        """The last `limit` messages with one of `roles` in the history
+        get_ordered_messages returns, oldest first, read without loading the
+        rest of the conversation."""
+        stmt = self._ordered_messages(conversation_id, include_pending=False, newest_first=True)
+        rows = self.session.exec(stmt.where(Message.role.in_(roles)).limit(limit)).all()
+        return list(reversed(rows))
+
+    def get_replay_history(
+        self, conversation_id: UUID, *, event_roles: tuple[str, ...]
+    ) -> ReplayHistory:
+        """The history get_ordered_messages returns, with the stored events of
+        those messages whose thought_role is one of `event_roles`.
+
+        For a reader that replays the history after its session has closed, as
+        the harness does with what its database unit read. The events are
+        prefiltered in SQL, so a long conversation does not load every text
+        delta and progress event it ever stored only to have them skipped."""
+        stmt = self._ordered_messages(conversation_id, include_pending=False)
+        messages = list(self.session.exec(stmt).all())
+        if not messages:
+            return ReplayHistory(messages=[], events=[])
+        rows = self.session.exec(self._replay_events(conversation_id, event_roles=event_roles)).all()
+        # A channel answer can commit between these reads. Keep its events
+        # out until its message is part of the history we replay with them.
+        message_ids = {message.id for message in messages}
+        events = [
+            row.event_data for row in rows
+            if row.message_id in message_ids
+            and isinstance(row.event_data, dict)
+            and row.event_data.get("thought_role") in event_roles
+        ]
+        return ReplayHistory(messages=messages, events=events)
+
+    def get_earlier_answers(self, conversation_id: UUID, *, answers: int) -> list[EarlierAnswer]:
+        """The figures the conversation's last ``answers`` answers list in
+        their saved response.figure_sources events, newest answer first.
+
+        An answer is a visible assistant message that is not pending; one
+        without the event (no figures, or a turn that stopped or failed)
+        still takes one of the places. An event whose figures do not read is
+        skipped with a warning. Raises ValueError, as get_conversation does,
+        for a conversation the caller does not own."""
+        # Anchor the parent: Message has no org_id, so tenancy comes from
+        # resolving the conversation through the scoped session.
+        self.get_conversation(conversation_id)
+        earlier = []
+        for row in self.session.exec(self._earlier_answer_events(conversation_id, answers=answers)).all():
+            # The SQL filter finds the type, quotes and all, anywhere in an
+            # event's text, so a text delta whose whole text is the type
+            # matches too, and would read as an event with no figures.
+            if not (isinstance(row.event_data, dict) and row.event_data.get("type") == "response.figure_sources"):
+                continue
+            # EarlierAnswer reads only the figures and ignores the steps, so a
+            # step whose kind this build lacks does not skip the answer.
+            try:
+                answer = EarlierAnswer.model_validate(row.event_data)
+            except ValidationError:
+                logger.warning(
+                    "Skipped an earlier answer's figure_sources event that does not read as one",
+                    extra=log_context(conversation_id=conversation_id),
+                )
+                continue
+            earlier.append(answer)
+        return earlier
+
+    def _earlier_answer_events(self, conversation_id: UUID, *, answers: int) -> ScopedSelect:
+        # The last `answers` answers, read on the messages index: assistant
+        # rows that are not pending and carry an event. A hidden tool row
+        # carries none, so it takes no place. A plain select, since a scoped
+        # one can't be passed to in_; the conversation was resolved through
+        # the scoped session before this runs.
+        last_answers = (
+            sa_select(Message.id)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.role == Role.assistant)
+            .where(Message.pending == False)  # noqa: E712 (a SQL boolean column, not Python identity)
+            .where(sa_select(MessageEvent.message_id).where(MessageEvent.message_id == Message.id).exists())
+            .order_by(*_MESSAGE_ORDER_NEWEST_FIRST)
+            .limit(answers)
+        )
+        # The type is found in each event's stored text, for the reason
+        # _replay_events gives: no JSON is parsed in SQL. autoescape keeps the
+        # _ in it from matching any character.
+        stored_text = cast(MessageEvent.event_data, Text)
+        return (
+            self.session.select(MessageEvent)
+            .join(Message, Message.id == MessageEvent.message_id)
+            .where(Message.conversation_id == conversation_id)
+            .where(MessageEvent.message_id.in_(last_answers))
+            .where(stored_text.contains('"response.figure_sources"', autoescape=True))
+            .order_by(*_MESSAGE_ORDER_NEWEST_FIRST, MessageEvent.sequence_number)
+        )
+
+    def _replay_events(self, conversation_id: UUID, *, event_roles: tuple[str, ...]):
+        # The relationship orders each message's events by sequence_number, so
+        # history order then sequence_number is the order a per-message read
+        # gives.
+        #
+        # The filter looks for each role in the event's stored JSON text, where
+        # json.dumps writes a plain ASCII role unescaped, and get_replay_history
+        # then keeps only the events whose thought_role is one of them. No JSON
+        # is parsed in SQL: Postgres's ->> decodes every string escape in the
+        # document and raises on a \u0000 or a lone surrogate anywhere in it,
+        # both of which a json column stores as written, and SQLite before 3.42
+        # rejects a bare NaN. Postgres's json::text and SQLite's TEXT both
+        # return the text as stored.
+        stored_text = cast(MessageEvent.event_data, Text)
+        return (
+            self.session.select(MessageEvent)
+            .join(Message, Message.id == MessageEvent.message_id)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
+            .where(or_(*(stored_text.contains(role) for role in event_roles)))
+            .order_by(*_MESSAGE_ORDER, MessageEvent.sequence_number)
+        )
+
+    def _ordered_messages(
+        self, conversation_id: UUID, *, include_pending: bool, newest_first: bool = False
+    ):
         # Anchor the parent: Message has no org_id, so tenancy comes from
         # resolving the conversation through the scoped session — a foreign
         # id must answer like a nonexistent one, not leak another org's
@@ -1034,7 +1208,7 @@ class ConversationService:
         )
         if not include_pending:
             stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
-        return list(self.session.exec(stmt.order_by(*_MESSAGE_ORDER)).all())
+        return stmt.order_by(*(_MESSAGE_ORDER_NEWEST_FIRST if newest_first else _MESSAGE_ORDER))
 
     def _hydrate_message_items(self, messages: Iterable[Message]) -> list[dict]:
         """Turn ordered Message rows into the UI-facing item-dict shape,
@@ -1120,7 +1294,7 @@ class ConversationService:
         # silently — a fourth column added to _MESSAGE_ORDER would widen the
         # cursor while this stayed at three, and the walk would start skipping
         # rows while the unbounded read looked fine.
-        stmt = stmt.order_by(*[column.desc() for column in _MESSAGE_ORDER])
+        stmt = stmt.order_by(*_MESSAGE_ORDER_NEWEST_FIRST)
 
         scan_cap = limit * _SCAN_CAP_MULTIPLIER
         raw_rows = list(self.session.exec(stmt.limit(scan_cap + 1)).all())
@@ -1151,3 +1325,25 @@ class ConversationService:
 
         items = self._hydrate_message_items(list(reversed(visible)))
         return ConversationItemsPage(items=items, has_more=has_more, next_before=next_before)
+
+
+def _earlier_answers(session: ScopedSession, *, conversation_id: UUID) -> list[EarlierAnswer]:
+    return ConversationService(session).get_earlier_answers(conversation_id, answers=MAX_EARLIER_ANSWERS)
+
+
+async def read_earlier_answers(*, conversation_id: UUID, scope: TenantScope) -> tuple[EarlierAnswer, ...]:
+    """The conversation's last MAX_EARLIER_ANSWERS answers' figures
+    (ConversationService.get_earlier_answers), read in a database unit of
+    its own, so a failed read can't abort another unit's transaction. A
+    failed read (a database error, no connection in time, or a conversation
+    the caller does not own) is logged and finds none, so the turn runs on
+    and marks no figure as repeated."""
+    try:
+        return tuple(await run_db(partial(_earlier_answers, conversation_id=conversation_id), scope=scope))
+    except Exception:
+        logger.warning(
+            "Could not read the earlier answers; no figure is marked as repeated",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id),
+        )
+        return ()

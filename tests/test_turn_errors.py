@@ -66,11 +66,9 @@ def test_returns_none_for_unmapped_error():
 # ── content-shaped rejections (ENG-1992) ──────────────────────────────
 
 def test_detects_content_validation_via_anton_type():
-    provider = pytest.importorskip("anton.core.llm.provider")
-    error_cls = getattr(provider, "ContentValidationError", None)
-    if error_cls is None:
-        pytest.skip("installed anton predates ContentValidationError (ENG-1992)")
-    assert te.is_content_validation_error(error_cls("boom")) is True
+    from anton.core.llm.provider import ContentValidationError
+
+    assert te.is_content_validation_error(ContentValidationError("boom")) is True
 
 
 def test_detects_openai_responses_dialect():
@@ -139,21 +137,13 @@ def test_remote_content_validation_error_maps_to_curated_copy():
 # ── ENG-2689: too-large is its own card, and still repairs the conversation ──
 
 
-# anton's REAL parent type, deliberately. cowork-server pins anton from a git
-# branch, so `ContentTooLargeError` is not installed here yet — but production's
-# object is a real subclass of a real `ContentValidationError`, and that is the
-# whole point: BOTH detectors match it, so only their ORDER decides the card.
-# A hand-rolled stand-in would satisfy neither detector's isinstance check and
-# these tests would pass without the ordering ever being exercised.
+# anton's REAL types, deliberately. Production's object is anton's
+# `ContentTooLargeError`, a subclass of `ContentValidationError`, and that is
+# the whole point: BOTH detectors match it, so only their ORDER decides the
+# card. A hand-rolled stand-in would satisfy neither detector's isinstance
+# check and these tests would pass without the ordering ever being exercised.
+from anton.core.llm.provider import ContentTooLargeError
 from anton.core.llm.provider import ContentValidationError as _AntonContentValidationError
-
-
-class ContentTooLargeError(_AntonContentValidationError):
-    """Named to match anton's class exactly — the name is the discriminator on
-    both transports (the remote wire carries only "<Type>: <message>")."""
-
-    def __init__(self, message, code="content_too_large"):
-        super().__init__(message, code=code)
 
 
 _RESIZE_COPY = (
@@ -274,12 +264,12 @@ def test_the_real_shape_dialects_still_qualify():
 
 def test_every_repair_guard_consults_the_shared_set():
     """The two tests above cover the local streaming and non-streaming sites
-    behaviourally. The remote site (`_produce_remote`) needs a producer session,
-    seeded history, an artifact snapshot and a memory read before it reaches its
-    guard — mocking all of that would produce a test that passes for reasons
-    unrelated to the guard, which is the failure mode this whole exercise is
-    about. So that third site is pinned structurally instead, in the same style
-    as `test_no_return_emits_a_literal_code` below.
+    behaviourally. The remote site (`_produce_remote`) needs staged files, a
+    saved question, seeded history, an artifact snapshot and a memory read
+    before it reaches its guard. Mocking all of that would produce a test that
+    passes for reasons unrelated to the guard, which is the failure mode this
+    whole exercise is about. So that third site is pinned structurally
+    instead, in the same style as `test_no_return_emits_a_literal_code` below.
 
     This is the exact mutation that went undetected: replacing the three guards
     with `code == "content_recovery"` while leaving `CONTENT_REPAIR_CODES`
@@ -355,7 +345,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None,
+        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None,
     ):
         if False:
             yield
@@ -383,10 +373,8 @@ async def _collect_produce_sse(handler: ResponsesHandler) -> list[str]:
             pass
 
     conv_id = uuid4()
-    mock_session = MagicMock()
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=mock_session),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -420,7 +408,7 @@ async def test_stream_emits_friendly_failed_event_for_image_error():
 async def test_produce_pending_persist_failure_does_not_clear_all_pending():
     # ENG-1231 hardening (in-process _produce, mirror of the _produce_remote test):
     # if the pending user persist raises before its id is captured, this turn owns
-    # no pending row — persist() must NOT fall back to finalize_pending(conv, None),
+    # no pending row — persist() must NOT fall back to clear_pending(conv, message_id=None),
     # which would clear a pending row stranded by an earlier crashed turn.
     from unittest.mock import MagicMock, patch
 
@@ -434,7 +422,6 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             pass
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -450,9 +437,39 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             harness_id="anton",
             buffer=_Buffer(),
         )
-        # No row was persisted for this turn → finalize must not have run at all,
+        # No row was persisted for this turn → clearing must not have run at all,
         # in particular never the clear-all (message_id=None) form.
-        conv_svc.return_value.finalize_pending.assert_not_called()
+        conv_svc.return_value.clear_pending.assert_not_called()
+
+
+def test_a_full_pool_maps_to_server_busy():
+    """A pool that freed no connection in time is not a provider failure: it
+    gets its own code and a sentence that names the wait."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    from cowork.db.units import DatabaseBusy
+
+    busy = (te.SERVER_BUSY_CODE, "Cowork is busy. Try again in about 5 seconds.")
+    assert te.friendly_turn_error(PoolTimeoutError("QueuePool limit of size 20 overflow 20 reached")) == busy
+    assert te.friendly_turn_error(DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")) == busy
+
+
+async def test_stream_fails_a_turn_that_finds_the_pool_full_with_a_timed_retry():
+    """Inside a stream a full pool is one response.failed frame, carrying the
+    wait the way rate_limited does, so a card can gate its Retry on it."""
+    from cowork.db.units import DatabaseBusy
+
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(DatabaseBusy("no database connection freed within POOL_TIMEOUT"))
+    )
+
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.SERVER_BUSY_CODE
+    assert payload["error"] == "Cowork is busy. Try again in about 5 seconds."
+    assert payload["retry_after"] == 5
+    assert payload["retry_at"].endswith("Z")
 
 
 async def test_stream_redacts_generic_error():
@@ -517,10 +534,11 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     # it failed with no id at all: the user got the generic message and the log
     # line named neither the turn nor a reference to quote.
     handler = _handler_with_raising_formatter(Exception("kaboom"))
+    conversation_id = uuid4()
     with _records_from("cowork.handlers.responses") as records:
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(
-                stream=None, conversation_id=uuid4(), model="anton", original_content="hi",
+                stream=None, conversation_id=conversation_id, model="anton", original_content="hi",
             ))
 
     request_id = err.value.detail["request_id"]
@@ -528,6 +546,10 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     deployed = [r for r in records if r.levelno >= logging.WARNING]
     assert deployed
     assert all(getattr(r, "request_id", None) == request_id for r in deployed)
+    # The conversation travels beside the id, so a database error's sanitized
+    # line still names it.
+    [failed] = [r for r in deployed if r.getMessage() == "[responses] turn failed"]
+    assert failed.conversation_id == str(conversation_id)
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
@@ -576,7 +598,6 @@ def test_stream_repairs_conversation_on_content_validation_error(make_exc):
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -609,7 +630,6 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -629,11 +649,13 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
 @pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
 def test_collect_repairs_conversation_on_content_validation_error(make_exc):
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
+
+    from cowork.db.scoped import LOCAL_SCOPE
 
     exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
-    handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
+    handler.scope = LOCAL_SCOPE  # __init__ bypassed; _collect's repair unit needs this
     conv_id = uuid4()
 
     with patch("cowork.handlers.responses.ConversationService") as conv_svc:
@@ -796,8 +818,10 @@ async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
 
     exc = ProviderAuthError("provider rejected the credential")
     exc.role = "coding"
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -822,8 +846,10 @@ async def test_auth_reconnectable_uses_planning_role_in_a_mixed_config():
     with patch(
         "cowork.handlers.responses.get_user_settings",
         return_value=_MixedSettings(),
-    ):
+    ) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     failed = next(f for f in frames if "response.failed" in f)
     payload = json.loads(failed.split("data: ", 1)[1].strip())
@@ -851,8 +877,10 @@ async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():
     # LLMClient's confirmation wrappers set it.
     exc = ProviderAuthError("provider rejected the credential")
     assert exc.role is None
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -873,8 +901,10 @@ async def test_auth_without_a_role_still_names_an_unambiguous_provider():
         resolved_router_provider = Provider.OPENAI
 
     exc = ProviderAuthError("provider rejected the credential")
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -1147,9 +1177,8 @@ def test_reset_at_rides_the_failed_payload_only_when_present():
 #
 # The gate trips `free_air_daily_spend_fuse_exceeded` (429) when the day's free
 # MindsHub Air budget is spent fleet-wide, and denies every org whose wallet
-# cannot pay until the end of the UTC day. Unmapped, it fell to the bare-status
-# 429 rule and told the user they were out of credits, which misnames a stop
-# they did nothing to cause.
+# cannot pay until the end of the UTC day. It must not read as out of credits,
+# which misnames a stop the user did nothing to cause.
 
 _FUSE_REASON = "free_air_daily_spend_fuse_exceeded"
 _FUSE_RESET_AT = "2026-09-25T00:00:00Z"
@@ -1175,17 +1204,17 @@ def _fuse_via_header():
     return exc
 
 
-# anton's REAL parent type, as for ContentTooLargeError above. The pinned anton
-# predates MindsHubBillingStop, but production's stop IS a TokenLimitExceeded,
-# and that is what sends it to the out-of-credits rung when the body code goes
-# unread. A stand-in without the parent would pass for the wrong reason.
+# A legacy parent-type fixture for the raw body-code origin checks. It is not
+# one of Anton's trusted billing subclasses; those are tested with the real
+# mindshub_billing_stop factory below. Keeping the parent exercises the broader
+# token-limit rung when the body code goes unread.
 from anton.core.llm.provider import TokenLimitExceeded as _AntonTokenLimitExceeded
 
 
-class MindsHubBillingStop(_AntonTokenLimitExceeded):
-    """Named to match anton's base of WalletEmptyError, AllowanceExhaustedError
-    and FreeServingPausedError. Like them it carries the gate's status and no
-    ``.response``: the response stays on the SDK error it is raised from."""
+class _LegacyBillingStop(_AntonTokenLimitExceeded):
+    """A plain anton TokenLimitExceeded raised with the gate's status. Like
+    anton's billing subclasses it carries the status and no ``.response``: the
+    response stays on the SDK error it is raised from."""
 
     def __init__(self, message, *, reason, status_code=429):
         super().__init__(message)
@@ -1193,8 +1222,8 @@ class MindsHubBillingStop(_AntonTokenLimitExceeded):
         self.status_code = status_code
 
 
-def _typed_stop_via_body_code(reason, *, url=None):
-    """The billing stop anton raises today, on a lane that lost X-MindsHub-Reason.
+def _legacy_stop_via_body_code(reason, *, url=None):
+    """A legacy parent-type stop on a lane that lost X-MindsHub-Reason.
 
     The SDK error it is raised from still holds the response, the body `code`
     and the reset header. ``url`` defaults to the configured gateway.
@@ -1203,7 +1232,7 @@ def _typed_stop_via_body_code(reason, *, url=None):
         429, {"X-MindsHub-Reset-At": _FUSE_RESET_AT}, url=url or _minds_gateway_url()
     )
     inner.body = {"error": {"code": reason, "message": "Denied"}}
-    stop = MindsHubBillingStop(f"Server returned 429: {reason}", reason=reason)
+    stop = _LegacyBillingStop(f"Server returned 429: {reason}", reason=reason)
     stop.__cause__ = inner
     return stop
 
@@ -1216,18 +1245,17 @@ def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
 
 
 def test_fuse_body_code_maps_when_the_header_is_lost():
-    # Without the body carrier this lane falls to the bare-status 429 rule and
-    # renders as out-of-credits.
+    # The body supplies the reason even when the header did not survive.
     code, message = te.friendly_turn_error(_fuse_via_body_code())
     assert code == te.FREE_SERVING_PAUSED_CODE
     assert message == te.FREE_SERVING_PAUSED_USER_MESSAGE
 
 
-def test_the_typed_stop_fixture_is_the_shape_that_cards_as_out_of_credits():
-    """Guards the typed-stop tests below from passing for the wrong reason. If
+def test_the_legacy_stop_fixture_is_the_shape_that_cards_as_out_of_credits():
+    """Guards the legacy-stop tests below from passing for the wrong reason. If
     this fails, the fixture stopped being a TokenLimitExceeded with a status
     and no response, and those tests no longer exercise the lost host."""
-    exc = _typed_stop_via_body_code(_FUSE_REASON)
+    exc = _legacy_stop_via_body_code(_FUSE_REASON)
     assert te.is_token_limit_error(exc)
     assert exc.status_code == 429
     assert not hasattr(exc, "response")
@@ -1243,31 +1271,31 @@ def test_the_typed_stop_fixture_is_the_shape_that_cards_as_out_of_credits():
         ),
     ],
 )
-def test_antons_typed_stop_maps_from_the_body_code_when_the_header_is_lost(
+def test_a_legacy_stop_maps_from_the_body_code_when_the_header_is_lost(
     reason, expected_code, expected_message
 ):
     # The stop carries the gate's status but no response, so the gateway host
     # sits one link down the chain. Read off the stop, the host was None, the
     # body code never counted, and both stops carded as "You're out of
     # credits", naming the wrong limit.
-    exc = _typed_stop_via_body_code(reason)
+    exc = _legacy_stop_via_body_code(reason)
     assert te.friendly_turn_error(exc) == (expected_code, expected_message)
 
 
 @pytest.mark.parametrize("reason", [_FUSE_REASON, "included_allowance_exhausted"])
-def test_the_probe_classifier_reads_a_typed_stops_body_code(reason):
+def test_the_probe_classifier_reads_a_legacy_stops_body_code(reason):
     # gateway_denial reads the body code by the same rule, so it names the
-    # limit for the typed stop too.
-    assert te.gateway_denial(exc=_typed_stop_via_body_code(reason)) == te.GatewayDenial(
+    # limit for the legacy stop too.
+    assert te.gateway_denial(exc=_legacy_stop_via_body_code(reason)) == te.GatewayDenial(
         reason=reason, reset_at=_FUSE_RESET_AT,
     )
 
 
 @pytest.mark.parametrize("reason", [_FUSE_REASON, "included_allowance_exhausted"])
-def test_a_third_party_body_under_a_typed_stop_still_selects_nothing(reason):
+def test_a_third_party_body_under_a_legacy_stop_still_selects_nothing(reason):
     # The body counts only when the response that carried it came from the
     # configured gateway, however deep in the chain that response sits.
-    exc = _typed_stop_via_body_code(reason, url="https://openrouter.ai/api/v1/x")
+    exc = _legacy_stop_via_body_code(reason, url="https://openrouter.ai/api/v1/x")
     code, _ = te.friendly_turn_error(exc)
     assert code not in (te.FREE_SERVING_PAUSED_CODE, te.ALLOWANCE_EXHAUSTED_CODE)
     assert te.gateway_denial(exc=exc) is None
@@ -1406,11 +1434,11 @@ def test_the_allowance_stop_copy_claims_no_refill_or_window(make_message):
             id="allowance-header",
         ),
         pytest.param(
-            lambda: _typed_stop_via_body_code(_FUSE_REASON), te.FREE_SERVING_PAUSED_CODE,
+            lambda: _legacy_stop_via_body_code(_FUSE_REASON), te.FREE_SERVING_PAUSED_CODE,
             te.FREE_SERVING_PAUSED_USER_MESSAGE, id="typed-fuse-body-code",
         ),
         pytest.param(
-            lambda: _typed_stop_via_body_code("included_allowance_exhausted"),
+            lambda: _legacy_stop_via_body_code("included_allowance_exhausted"),
             te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
             id="typed-allowance-body-code",
         ),
@@ -1452,10 +1480,9 @@ def _with_reset_at(exc):
 
 
 def test_velocity_rate_limit_is_not_out_of_credits():
-    # THE defect. `rate_limited` was the one gateway reason this module didn't
-    # know, so it fell to the bare-status 429 rule and rendered as
-    # "You're out of credits. Add credits to keep working." — advertising a
-    # purchase that cannot lift a per-minute token ceiling.
+    # A velocity limit must never render as "You're out of credits. Add credits
+    # to keep working.", which advertises a purchase that cannot lift a
+    # per-minute token ceiling.
     code, message = te.friendly_turn_error(_gateway_failure(429, reason="rate_limited"))
     assert code == te.RATE_LIMITED_CODE
     assert message == te.RATE_LIMITED_USER_MESSAGE
@@ -1467,8 +1494,8 @@ def test_velocity_rate_limit_is_not_out_of_credits():
 def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
     # ENG-1363: the Anthropic /v1/messages lane strips X-MindsHub-* headers.
     # The gateway sets `code` and `reason` to the same value, so the body is a
-    # second carrier for the identical decision — without it, that lane would
-    # fall to the bare-status rule and show the credits card again.
+    # second carrier for the identical decision; without it this lane would
+    # lose the specific rate-limit verdict.
     exc = ConnectionError("Server returned 429")
     exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
     inner.body = {"error": {"code": "rate_limited", "message": "Rate limit exceeded"}}
@@ -1509,20 +1536,19 @@ def test_the_gateways_own_body_code_still_maps():
     assert te.friendly_turn_error(exc)[0] == te.RATE_LIMITED_CODE
 
 
-def test_exhausted_rate_limit_wait_keeps_its_code_over_the_bare_status_rule():
-    # ENG-1537: when anton's wait budget runs out it re-raises with
-    # code="rate_limited", but the ORIGINAL 429 is still in the cause chain —
-    # so the bare-status rule would relabel the honest "waiting didn't clear
-    # it" failure as out-of-credits, undoing the whole point of the wait.
+def test_exhausted_rate_limit_wait_keeps_its_code_without_a_reason_carrier():
+    # When anton's wait budget runs out it re-raises with code="rate_limited",
+    # and the original 429 is still in the cause chain. The honest "waiting
+    # didn't clear it" verdict must survive that.
     exhausted = _FakeOverloadedErr(
         "Too many requests too quickly — the rate limit didn't clear in time.",
         code="rate_limited",
         model="sonnet",
     )
-    # NO reason header and NO body code: the ONLY thing that can save this from
-    # the bare-status 429 rule is the hoisted code check. The earlier version of
-    # this test passed the header, so it never exercised the hoist it is named
-    # after — deleting the whole block left it green (ENG-1537 review).
+    # NO reason header and NO body code: only the hoisted code check maps this.
+    # Without it the duck-typed error falls through to the generic message. The
+    # earlier version of this test passed the header, so it never exercised the
+    # hoist it is named after.
     exhausted.__cause__ = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
     code, _ = te.friendly_turn_error(exhausted)
     assert code == te.RATE_LIMITED_CODE
@@ -1593,13 +1619,115 @@ def test_retry_after_rides_the_failed_payload_only_when_present():
     assert "retry_after" not in te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
 
 
-def test_reasonless_gateway_429_still_cards_as_credits():
-    # A gateway old enough to omit the header only ever meant "allowance" by a
-    # 429, so the legacy assumption is preserved for a 429 carrying neither a
-    # reason nor a body code. Narrowing this instead would have stripped the
-    # credits card from a real allowance exhaustion.
-    code, _ = te.friendly_turn_error(_gateway_failure(429))
-    assert code == te.TOKEN_LIMIT_CODE
+def test_reasonless_gateway_429_stays_generic():
+    # The status alone cannot distinguish allowance exhaustion from a velocity
+    # limit or another refusal. A missing discriminator must not invent one.
+    assert te.friendly_turn_error(_gateway_failure(429)) is None
+
+
+@pytest.mark.parametrize("reason", ["future_billing_limit", "unknown_limit"])
+def test_unrecognized_gateway_429_reason_stays_generic(reason):
+    assert te.friendly_turn_error(_gateway_failure(429, reason=reason)) is None
+
+
+from anton.core.llm.provider import (
+    AllowanceExhaustedError as _AntonAllowanceExhaustedError,
+    FreeServingPausedError as _AntonFreeServingPausedError,
+    WalletEmptyError as _AntonWalletEmptyError,
+)
+
+_MINDSHUB_COMPLETIONS_URL = "https://api.mindshub.ai/v1/chat/completions"
+
+
+def _anton_billing_stop(*, carrier, reason, status):
+    """anton's billing stop from a MindsHub response, raised from the SDK error.
+
+    ``header`` and ``body`` build it the way anton's request-time mappers do.
+    ``mid_stream`` builds it the way anton's stream lane does: from a bare
+    ``openai.APIError`` with the real request and no response, so there is no
+    status, no header and no host cowork-server can read.
+    """
+    import httpx
+    import openai
+    from anton.core.llm.provider import mindshub_billing_stop
+
+    request = httpx.Request("POST", _MINDSHUB_COMPLETIONS_URL)
+    if carrier == "mid_stream":
+        sdk_error = openai.APIError("Stream refused", request, body={"code": reason})
+        stop = mindshub_billing_stop(exc=sdk_error, body=sdk_error.body, status_code=None)
+    else:
+        headers = {"X-MindsHub-Reset-At": _FUSE_RESET_AT}
+        body = {"code": reason}
+        if carrier == "header":
+            headers["X-MindsHub-Reason"] = reason
+            body = {}
+        response = httpx.Response(status, headers=headers, request=request)
+        sdk_error = openai.APIStatusError("Request refused", response=response, body=body)
+        stop = mindshub_billing_stop(exc=sdk_error, body=body, status_code=status)
+    stop.__cause__ = sdk_error
+    return stop
+
+
+@pytest.mark.parametrize("minds_url", ["https://minds.invalid", "https://api.mindshub.ai"])
+@pytest.mark.parametrize("carrier", ["header", "body", "mid_stream"])
+@pytest.mark.parametrize(
+    ("reason", "status", "expected_type", "expected_code"),
+    [
+        ("wallet_empty", 402, _AntonWalletEmptyError, te.TOKEN_LIMIT_CODE),
+        (
+            "included_allowance_exhausted", 429,
+            _AntonAllowanceExhaustedError, te.ALLOWANCE_EXHAUSTED_CODE,
+        ),
+        (
+            "free_air_daily_spend_fuse_exceeded", 429,
+            _AntonFreeServingPausedError, te.FREE_SERVING_PAUSED_CODE,
+        ),
+    ],
+)
+def test_real_billing_subclass_maps_like_the_remote_path(
+    self_hosted_minds_url, minds_url, carrier, reason, status, expected_type, expected_code,
+):
+    self_hosted_minds_url.minds_url = minds_url
+    stop = _anton_billing_stop(carrier=carrier, reason=reason, status=status)
+    assert type(stop) is expected_type
+
+    assert te.friendly_turn_error(stop) == te.remote_turn_error(
+        f"{expected_type.__name__}: {stop}"
+    )
+    assert te.friendly_turn_error(stop)[0] == expected_code
+
+
+def test_unknown_reason_429_after_antons_retries_is_provider_overloaded():
+    # The shape a real in-process turn produces. anton classifies a gateway 429
+    # it cannot confirm as a velocity limit as a TransientProviderError, retries
+    # it, then raises ProviderOverloadedError from it. The unknown reason header
+    # sits on the SDK error at the bottom of the chain, from the configured
+    # gateway. A 429's status alone never picks a billing code.
+    import httpx
+    import openai
+    from anton.core.llm.provider import ProviderOverloadedError, classify_transient
+
+    response = httpx.Response(
+        429, headers={"X-MindsHub-Reason": "future_billing_limit"},
+        request=httpx.Request("POST", _minds_gateway_url()),
+    )
+    sdk_error = openai.APIStatusError("Request refused", response=response, body={})
+    transient = classify_transient(429, {}, provider="The model provider", model="mindshub_air")
+    transient.__cause__ = sdk_error
+    exhausted = ProviderOverloadedError(
+        f"{transient} It did not recover after 3 attempts.", model="mindshub_air",
+    )
+    exhausted.__cause__ = transient
+
+    code, _ = te.friendly_turn_error(exhausted)
+    assert code == te.PROVIDER_OVERLOADED_CODE
+
+
+def test_billing_class_name_and_reason_attributes_are_not_authoritative(self_hosted_minds_url):
+    lookalike = type("AllowanceExhaustedError", (Exception,), {})("Request refused")
+    lookalike.reason = "included_allowance_exhausted"
+    lookalike.status_code = 429
+    assert te.friendly_turn_error(lookalike) is None
 
 
 def test_reason_header_policy_unavailable_is_transient_not_out_of_credits():
@@ -1668,9 +1796,21 @@ def test_bare_402_status_maps_to_out_of_credits_without_header():
     assert code == te.TOKEN_LIMIT_CODE
 
 
-def test_bare_429_status_maps_to_out_of_credits_without_header():
-    code, _ = te.friendly_turn_error(_gateway_failure(429))
-    assert code == te.TOKEN_LIMIT_CODE
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    [(402, te.TOKEN_LIMIT_CODE), (503, te.POLICY_UNAVAILABLE_CODE)],
+)
+def test_gateway_status_rule_still_maps_an_unrecognized_reason(status, expected_code):
+    # Only 429 left the bare-status rule. A gateway 402 or 503 whose reason
+    # this module does not know keeps its existing card.
+    code, _ = te.friendly_turn_error(_gateway_failure(status, reason="future_reason"))
+    assert code == expected_code
+
+
+def test_gateway_429_with_unrecognized_body_code_stays_generic():
+    exc = _gateway_failure(429)
+    exc.__cause__.body = {"error": {"code": "future_billing_limit"}}
+    assert te.friendly_turn_error(exc) is None
 
 
 def test_bare_503_status_maps_to_transient_without_header():
@@ -1727,7 +1867,7 @@ def test_raising_url_property_never_escapes_the_error_handler():
 
 
 def test_bare_404_stays_generic_even_from_the_gateway():
-    # Deliberate asymmetry vs 402/429/503: a header-less 404 is any missing
+    # Deliberate asymmetry vs 402/503: a header-less 404 is any missing
     # route/resource, not necessarily an unknown model, so it is never mapped
     # to unknown_model on status alone.
     assert te.friendly_turn_error(_gateway_failure(404)) is None
@@ -1863,8 +2003,10 @@ async def test_overloaded_reconnectable_keys_on_the_failing_model_not_planning()
         resolved_coding_provider = Provider.ANTHROPIC
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:haiku")  # the coding model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -1887,8 +2029,10 @@ async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
         resolved_coding_provider = Provider.MINDS_CLOUD
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:sonnet")  # the planning model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -2174,6 +2318,118 @@ def test_remote_error_none_is_redacted():
     assert remote_turn_error(None)[0] == GENERIC_TURN_ERROR_CODE
 
 
+# ── model_timeout ────────────────────────────────────────────────────
+# anton ends a model call that sends no output within its deadline with
+# ModelCallTimeoutError (code=model_timeout). Detected by type first, then by
+# `code` on objects with no `.response`, the same guard as the rate_limited
+# check; the stand-in below shares the class name so the remote row is
+# exercised with the exact name anton's _scrub keeps.
+
+
+class ModelCallTimeoutError(Exception):
+    """Stand-in for anton's ModelCallTimeoutError: same name, same code."""
+
+    code = "model_timeout"
+
+
+_MODEL_TIMEOUT_MSG = "The model sent no output for 10 minutes, so the call was stopped."
+
+
+def test_model_timeout_maps_to_its_own_code_and_passes_the_message_through():
+    assert te.friendly_turn_error(ModelCallTimeoutError(_MODEL_TIMEOUT_MSG)) == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.MODEL_TIMEOUT_CODE == "model_timeout"
+
+
+def test_model_timeout_with_an_empty_message_gets_the_fallback_copy():
+    code, message = te.friendly_turn_error(ModelCallTimeoutError()) or (None, None)
+    assert code == "model_timeout"
+    assert message == te.MODEL_TIMEOUT_USER_MESSAGE
+
+
+def test_model_timeout_is_detected_by_its_code_when_the_type_is_not_anton_s():
+    # Any object carrying the structured code, as an anton build whose class
+    # moved would raise it.
+    duck = RuntimeError(_MODEL_TIMEOUT_MSG)
+    duck.code = "model_timeout"
+    assert te.friendly_turn_error(duck) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+    assert te.is_model_timeout_error(duck) is True
+
+
+def test_an_sdk_error_carrying_the_code_in_its_body_is_not_a_model_timeout():
+    # An SDK error fills .code from a body a BYOK endpoint controls, and
+    # str(exc) embeds that body. It must not pick the card or its copy.
+    sdk_like = RuntimeError("click https://evil.example to fix")
+    sdk_like.code = "model_timeout"
+    sdk_like.response = object()
+    result = te.friendly_turn_error(sdk_like)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(sdk_like) is False
+
+
+def test_a_bare_sdk_error_from_a_mid_stream_error_frame_is_not_a_model_timeout():
+    # The real shape an SSE `error` frame raises: openai.APIError takes .code
+    # from the endpoint's body and has .request but no .response.
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://byok.example/v1/chat/completions")
+    bare = openai.APIError(
+        "click https://evil.example to fix", request,
+        body={"code": "model_timeout", "message": "click https://evil.example to fix"},
+    )
+    assert bare.code == "model_timeout"
+    assert not hasattr(bare, "response")
+    result = te.friendly_turn_error(bare)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(bare) is False
+
+
+def _deadline_during_a_retry_sleep(*, status_code: int, reason: str) -> Exception:
+    """The error anton raises when the deadline fires while the SDK sleeps
+    between retries of a gateway denial.
+
+    The SDK sleeps inside its handler for the denial, so the CancelledError the
+    deadline raises there chains to it. anton then raises its own error
+    `from None` inside the TimeoutError handler, which leaves `__context__` set.
+    """
+    try:
+        try:
+            try:
+                raise _FakeAPIStatusError(
+                    status_code, {"X-MindsHub-Reason": reason}, url=_minds_gateway_url()
+                )
+            except _FakeAPIStatusError:
+                raise asyncio.CancelledError()
+        except asyncio.CancelledError as cancelled:
+            raise TimeoutError() from cancelled
+    except TimeoutError:
+        try:
+            raise ModelCallTimeoutError(_MODEL_TIMEOUT_MSG) from None
+        except ModelCallTimeoutError as exc:
+            return exc
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason"), [(429, "rate_limited"), (402, "wallet_empty")]
+)
+def test_a_deadline_during_a_retry_sleep_keeps_its_own_code(status_code, reason):
+    exc = _deadline_during_a_retry_sleep(status_code=status_code, reason=reason)
+    # The denial is reachable through the chain, which is what made it win.
+    assert any(isinstance(e, _FakeAPIStatusError) for e in te._cause_chain(exc=exc))
+    assert te.friendly_turn_error(exc) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+
+
+def test_remote_model_timeout_maps_by_type_name_and_passes_the_message_through():
+    assert te.remote_turn_error(f"ModelCallTimeoutError: {_MODEL_TIMEOUT_MSG}") == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.remote_turn_error("ModelCallTimeoutError: ") == (
+        te.MODEL_TIMEOUT_CODE, te.MODEL_TIMEOUT_USER_MESSAGE,
+    )
+
+
 # ── Wire-code inventory (ENG-1282) ────────────────────────────────
 
 def test_wire_code_inventory_matches_the_renderer_contract():
@@ -2230,6 +2486,19 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # another model is a way forward. The renderer branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "model_restricted",
+        # No database connection freed within the pool timeout. A renderer
+        # without a branch for it shows the frame's `error` in its generic
+        # alert, and that sentence already names the wait, so the next step
+        # survives until the card lands in mindsdb/cowork's ChatView.jsx.
+        "server_busy",
+        # A model call sent no output within anton's deadline. Split off
+        # anton_error because the model went silent, not the agent, and the
+        # card says so and offers Try again.
+        "model_timeout",
+        # The UI heard nothing for its idle window and cancelled the turn.
+        # Saved as a failure so a reload shows the stall card instead of a
+        # partial answer that reads like a Stop.
+        "stalled",
         "anton_error",
     }
 
@@ -2316,17 +2585,23 @@ def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, ex
             Exception("'image_url' does not match the expected tags: 'image'"),
             te.IMAGE_FORMAT_CODE, id="image_format",
         ),
+        pytest.param(
+            ModelCallTimeoutError(_MODEL_TIMEOUT_MSG), "model_timeout", id="model_timeout",
+        ),
     ],
 )
 def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
     """The rungs below the gateway header, asserted on the 400 it raises.
 
-    Three of the inventory's codes are absent from both sweeps, each pinned
-    elsewhere or unreachable. ``content_recovery`` runs the conversation-repair
-    branch and is pinned by its own test above. ``anton_error`` is the
-    unmapped fallback, pinned by the 500 test above and by the wire test's
-    ``unmapped-500`` row. ``worker_unresponsive`` comes from
+    The inventory's codes absent from both sweeps are each pinned elsewhere
+    or unreachable here. ``content_recovery`` and ``content_too_large`` run
+    the conversation-repair branch, pinned by its own tests above.
+    ``anton_error`` is the unmapped fallback, pinned by the 500 test above and
+    by the wire test's ``unmapped-500`` row. ``worker_unresponsive`` comes from
     ``remote_turn_error``, a different mapper that this path never calls.
+    ``model_restricted`` is pinned by its own mapping tests. ``stalled`` is
+    saved by the streaming producer when the UI cancels a turn, never by
+    ``friendly_turn_error``.
     """
     handler = _handler_with_raising_formatter(exc)
     with pytest.raises(HTTPException) as err:
@@ -2704,8 +2979,9 @@ def test_remote_error_unmapped_type_still_falls_through_to_generic():
 # with a 403 whose reason stays `permission_denied`, so an older client keeps
 # reading a plain 403, and names the rule on X-MindsHub-Deny-Detail and in the
 # body's `error.deny_detail`. Unmapped, the turn read as a generic error (or,
-# with the pinned anton, as "try again in a moment"), which tells the member
-# nothing about why the model is refused or what would work instead.
+# on an anton without ModelRestrictedError, as "try again in a moment"), which
+# tells the member nothing about why the model is refused or what would work
+# instead.
 
 _RESTRICTED_COPY = (
     "An admin in your organization restricted the model 'sonnet'. "
@@ -2829,9 +3105,9 @@ async def test_stream_names_the_restricted_model_on_the_failure_frame():
 
 
 async def test_stream_maps_the_restricted_403_from_an_untyped_anton():
-    # The pinned anton raises a bare ConnectionError for this 403. The header
-    # still decides the code; with no typed error there is no model to name,
-    # so the card falls back to its unnamed copy.
+    # An anton without ModelRestrictedError raises a bare ConnectionError for
+    # this 403. The header still decides the code; with no typed error there
+    # is no model to name, so the card falls back to its unnamed copy.
     exc = _restricted_failure(url=_minds_gateway_url())
     frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
     payload = json.loads(
