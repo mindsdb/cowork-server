@@ -12,6 +12,7 @@ import ntpath
 import os
 import secrets
 import stat
+import threading
 import time
 import unicodedata
 from collections import deque
@@ -23,11 +24,16 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.endpoints.connectors.sharepoint import (
+    _KEY_NO_LONGER_WORKS,
+    _granted_site,
+    _stored_connection,
+)
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
 
 from cowork.common.paths import (
     O_NOFOLLOW,
@@ -65,7 +71,18 @@ from cowork.schemas.project_files import (
     ProjectInstructionsResponse,
 )
 from cowork.schemas.shared_resources import MutableResourceCapabilities
+from cowork.schemas.sharepoint import (
+    SharePointImportedFile,
+    SharePointImportResponse,
+    SharePointSkippedItem,
+)
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+from cowork.services.connectors.sharepoint import (
+    DownloadBudget,
+    SharePointClient,
+    SharePointError,
+    SharePointErrorKind,
+)
 from cowork.services.projects import ProjectService
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
@@ -1840,6 +1857,178 @@ async def upload_project_files(
                     {"name": safe_name, "ok": False, "error": "File write failed"}
                 )
     return {"results": results}
+
+
+_SHAREPOINT_IMPORT_FIELDS = frozenset({"connection", "site", "drive_id", "folder", "item_ids"})
+_RESERVED_IMPORT_FOLDERS = frozenset({CONVERSATIONS_DIRNAME, "skills"})
+_IMPORTS_RUNNING: set[UUID] = set()
+_IMPORTS_LOCK = threading.Lock()
+_SHAREPOINT_IMPORT_STATUS = {
+    SharePointErrorKind.INVALID: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.TENANT_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.APP_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.KEY_REJECTED: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.SITE_NOT_GRANTED: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.ITEM_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.THROTTLED: status.HTTP_429_TOO_MANY_REQUESTS,
+    SharePointErrorKind.UNREACHABLE: status.HTTP_502_BAD_GATEWAY,
+    SharePointErrorKind.TOO_MANY_FILES: status.HTTP_413_CONTENT_TOO_LARGE,
+    SharePointErrorKind.TOO_LARGE: status.HTTP_413_CONTENT_TOO_LARGE,
+    SharePointErrorKind.BAD_NAME: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    SharePointErrorKind.PLAN_TOO_SLOW: status.HTTP_504_GATEWAY_TIMEOUT,
+    SharePointErrorKind.IMPORT_TOO_SLOW: status.HTTP_504_GATEWAY_TIMEOUT,
+}
+_IMPORT_WRITE_STATUS: dict[type[_ImportWriteError], int] = {
+    _ImportConflict: status.HTTP_409_CONFLICT,
+    _ImportFileInUse: status.HTTP_409_CONFLICT,
+    _ImportDiskError: status.HTTP_507_INSUFFICIENT_STORAGE,
+    _ImportRestoreFailed: status.HTTP_500_INTERNAL_SERVER_ERROR,
+}
+
+
+@dataclass(frozen=True)
+class _SharePointImportRequest:
+    connection: str
+    site: str
+    drive_id: str
+    folder: str
+    item_ids: list[str]
+
+
+def _sharepoint_import_request(body: Any) -> _SharePointImportRequest:
+    """Validate the import body: exactly its fields, strings, and 1 to 100 distinct item ids.
+
+    Every refusal is a fixed message, never an echo of the body.
+    """
+    invalid = HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail="Send connection, site, drive_id, folder and item_ids (a list of 1 to 100 ids).",
+    )
+    if not isinstance(body, dict) or set(body) != _SHAREPOINT_IMPORT_FIELDS:
+        raise invalid
+    text = {name: body[name] for name in ("connection", "site", "drive_id", "folder")}
+    item_ids = body["item_ids"]
+    if not all(isinstance(value, str) for value in text.values()):
+        raise invalid
+    if not isinstance(item_ids, list) or not all(isinstance(value, str) for value in item_ids):
+        raise invalid
+    distinct = list(dict.fromkeys(item_ids))
+    if not 1 <= len(distinct) <= 100:
+        raise invalid
+    return _SharePointImportRequest(item_ids=distinct, **text)
+
+
+def _reserved_import_folder(name: str) -> bool:
+    """Whether a top-level project folder is Cowork's own and closed to imports."""
+    return name.casefold() in _RESERVED_IMPORT_FOLDERS
+
+
+def _import_folder_parts(folder: str, scoped: ScopedSession) -> tuple[str, ...]:
+    """The destination folder as path parts; ``""`` is the project root."""
+    if folder == "":
+        return ()
+    path = _validated_project_path(folder)
+    if any(part.startswith(".") for part in path.parts):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid path")
+    if _reserved_import_folder(path.parts[0]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This folder is reserved for Cowork.")
+    _require_workspace_path(path, scoped)
+    return path.parts
+
+
+def _detached_root(directory: PinnedDir) -> PinnedDir:
+    """A second handle on a pinned project root that outlives the inventory that opened it."""
+    if directory.fd is None:
+        return PinnedDir(None, directory.path)
+    return PinnedDir(os.dup(directory.fd), directory.path)
+
+
+def _sharepoint_import_error(exc: SharePointError) -> HTTPException:
+    """The import response for a SharePoint failure; a stored key that stopped working is one message."""
+    detail = str(exc)
+    if exc.kind in {
+        SharePointErrorKind.TENANT_NOT_FOUND,
+        SharePointErrorKind.APP_NOT_FOUND,
+        SharePointErrorKind.KEY_REJECTED,
+    }:
+        detail = _KEY_NO_LONGER_WORKS
+    return HTTPException(status_code=_SHAREPOINT_IMPORT_STATUS[exc.kind], detail=detail)
+
+
+@contextmanager
+def _project_import_lock(project_id: UUID) -> Iterator[None]:
+    """Let one import at a time run into a project; a second one is refused, not queued."""
+    with _IMPORTS_LOCK:
+        if project_id in _IMPORTS_RUNNING:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Another import into this project is still running.",
+            )
+        _IMPORTS_RUNNING.add(project_id)
+    try:
+        yield
+    finally:
+        with _IMPORTS_LOCK:
+            _IMPORTS_RUNNING.discard(project_id)
+
+
+@router.post(
+    "/{project_name}/files/import/sharepoint",
+    dependencies=[Depends(require(DesktopOnly))],
+    response_model=SharePointImportResponse,
+)
+def import_sharepoint_files(
+    project_name: str,
+    body: Annotated[Any, Body()],
+    scoped: ScopedSessionDep,
+) -> SharePointImportResponse:
+    """Copy picked files and folders from a SharePoint site into a project.
+
+    Every check that needs the database runs first, then the session is
+    closed: the walk and the downloads can take minutes. Files land together
+    or not at all (``_ProjectImport``). Desktop only.
+    """
+    request = _sharepoint_import_request(body)
+    key, sites = _stored_connection(scoped.scope, request.connection)
+    site_url = _granted_site(request.site, sites)
+    folder = _import_folder_parts(request.folder, scoped)
+    project = _project_for_name(project_name, scoped)
+    with _project_import_lock(project.id), ExitStack() as held:
+        with _opened_selected_project_directory(project_name, scoped) as directory:
+            root = _detached_root(directory)
+        held.callback(root.close)
+        scoped.close()
+        try:
+            with SharePointClient(key) as client:
+                deadline = client.import_deadline()
+                plan = client.plan_import(site_url, request.drive_id, request.item_ids)
+                if not folder and any(_reserved_import_folder(f.parts[0]) for f in plan.files):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST, detail="This folder is reserved for Cowork."
+                    )
+                budget = DownloadBudget()
+                sizes: list[int] = []
+                with _ProjectImport(root, [(*folder, *f.parts) for f in plan.files]) as writer:
+                    writer.check()
+                    for index, planned in enumerate(plan.files):
+                        writer.stage(
+                            index,
+                            lambda sink, item_id=planned.item_id: sizes.append(
+                                client.download(plan.site, plan.drive_id, item_id, sink, budget, deadline)
+                            ),
+                        )
+                    writer.commit()
+        except SharePointError as exc:
+            raise _sharepoint_import_error(exc) from exc
+        except _ImportWriteError as exc:
+            raise HTTPException(status_code=_IMPORT_WRITE_STATUS[type(exc)], detail=str(exc)) from exc
+    return SharePointImportResponse(
+        imported=[
+            SharePointImportedFile(path="/".join((*folder, *planned.parts)), size=size)
+            for planned, size in zip(plan.files, sizes, strict=True)
+        ],
+        skipped=[SharePointSkippedItem(path=item.path, reason=item.reason) for item in plan.skipped],
+    )
 
 
 @router.delete(
