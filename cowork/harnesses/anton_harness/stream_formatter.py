@@ -488,6 +488,73 @@ class ToolRows:
         return steps
 
 
+# The renderer's rule for a form block (cowork parseFormSpec.js extractFormSpec),
+# so the server sees the same blocks the side panel does.
+_FORM_BLOCK = re.compile(r"```data-vault-form[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```")
+_FORM_FENCE_OPEN = re.compile(r"```data-vault-form[ \t]*\r?\n")
+# Matched in the block's text, not parsed: the renderer opens loosely written
+# JSON that json.loads refuses.
+_FORM_ID = re.compile(r'"form_id"\s*:\s*"([^"]*)"')
+
+
+@dataclass(frozen=True)
+class RequestedForm:
+    """The connection form a `request_credentials` call returned: the fenced
+    block as the tool wrote it, and its form id."""
+
+    block: str
+    form_id: str
+
+
+def requested_form(tool_rows: Sequence[object]) -> RequestedForm | None:
+    """The form of the turn's last `request_credentials` call that returned
+    one, read from the turn's history rows (anton streams no result for this
+    tool). None when no call did: a refused call returns text with no block,
+    and a call anton marked is_error never ran.
+
+    The block is searched for anywhere in the result, since anton can add an
+    error-tracking note after it."""
+    rows = ToolRows.read(rows=tool_rows)
+    found: RequestedForm | None = None
+    for tool_use_id, call in rows.calls.items():
+        result = rows.results.get(tool_use_id)
+        if call.name != "request_credentials" or result is None or result.is_error:
+            continue
+        blocks = list(_FORM_BLOCK.finditer(result.text))
+        form_id = _FORM_ID.search(blocks[-1].group(1)) if blocks else None
+        if form_id is not None:
+            found = RequestedForm(block=blocks[-1].group(0), form_id=form_id.group(1))
+    return found
+
+
+def missing_form_text(answer: str, form: RequestedForm) -> str:
+    """The text that puts ``form`` at the end of ``answer`` so the side panel
+    opens it, or "" when the answer already shows it.
+
+    The panel opens the answer's last form block, so the form counts as shown
+    only when that block has its id. A form fence the answer left open (a
+    paste cut off) is closed first; otherwise the renderer would end it at the
+    added block's opening line and read neither form."""
+    blocks = list(_FORM_BLOCK.finditer(answer))
+    if blocks:
+        last_id = _FORM_ID.search(blocks[-1].group(1))
+        if last_id is not None and last_id.group(1) == form.form_id:
+            return ""
+    rest = answer[blocks[-1].end():] if blocks else answer
+    text = answer
+    closing = ""
+    if _FORM_FENCE_OPEN.search(rest):
+        closing = "\n```"
+        text += closing
+    if not text or text.endswith("\n\n"):
+        gap = ""
+    elif text.endswith("\n"):
+        gap = "\n"
+    else:
+        gap = "\n\n"
+    return f"{closing}{gap}{form.block}\n"
+
+
 async def find_answer_sources(evidence: TurnEvidence) -> FigureSources:
     """The figures in an answer and the steps they came from.
 
@@ -589,6 +656,8 @@ async def format_responses_stream(
     event_stream: AsyncIterator,
     model: str,
     event_sink: Optional[Callable[[str, dict], None]] = None,
+    *,
+    form_blocks: bool = False,
 ) -> AsyncIterator[str]:
     """Yield Responses-API SSE strings derived from ChatSession events.
 
@@ -597,6 +666,12 @@ async def format_responses_stream(
     route to capture a per-turn event log to disk so the client can
     rebuild the Thinking block + scratchpad cells when the conversation
     is reopened (without keeping localStorage state).
+
+    `form_blocks` is for a turn shown in the Cowork UI. With it on, a
+    connection form the turn's `request_credentials` returned and the answer
+    left out is added to the end of the answer as one more text delta, so the
+    side panel opens it and the saved answer keeps it. A channel or a
+    non-streaming caller leaves it off: it has no side panel.
     """
     from anton.core.llm.provider import (
         StreamAskUser,
@@ -1151,6 +1226,20 @@ async def format_responses_stream(
 
         elif isinstance(event, StreamTurnEnded):
             ended_by = event.ended_by
+
+    # Models that rank the system prompt's "summarize tool output" above the
+    # tool's "paste this block" leave the form out of their answer.
+    form = requested_form(tool_rows) if form_blocks and not failure_reply else None
+    added = missing_form_text("".join(collected_text), form) if form is not None else ""
+    if added:
+        collected_text.append(added)
+        seq += 1
+        yield _event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "sequence_number": seq,
+            "item_id": msg_id,
+            "delta": added,
+        })
 
     full_text = "".join(collected_text)
     # A turn the user stops, or one that fails or stalls, never reaches this
