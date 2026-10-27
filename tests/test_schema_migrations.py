@@ -757,6 +757,8 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
     uri = _sqlite_uri(db_path)
     engine = create_engine(uri)
     previous = "e3618a102301"
+    # Its own revision, not head: later migrations change other tables.
+    previews = "f3733a102501"
     _upgrade_to(engine, uri, previous)
     assert not _has_table(db_path, "live_app_previews")
     assert not _has_table(db_path, "live_app_preview_owners")
@@ -777,8 +779,8 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         shares_before = connection.execute("SELECT * FROM live_app_shares").fetchall()
     schema_before = persistent_schema()
 
-    _upgrade_to(engine, uri, "head")
-    assert _alembic_version(db_path) == expected_head()
+    _upgrade_to(engine, uri, previews)
+    assert _alembic_version(db_path) == previews
     expected_columns = {
         "id", "created_at", "modified_at", "owner_partition_id", "owner_user_id",
         "owner_email", "viewer_cookie", "position", "launch_id", "origin",
@@ -832,8 +834,8 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
         assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
 
-    _upgrade_to(engine, uri, "head")
-    assert _alembic_version(db_path) == expected_head()
+    _upgrade_to(engine, uri, previews)
+    assert _alembic_version(db_path) == previews
     assert _table_columns(db_path, "live_app_previews") == expected_columns
     assert _table_columns(db_path, "live_app_preview_owners") == {"id", "created_at", "modified_at", "marker", "revision"}
     assert persistent_schema() == schema_before
