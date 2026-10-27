@@ -189,16 +189,16 @@ class ScheduleService:
         for field in given:
             if hasattr(schedule, field):
                 setattr(schedule, field, kwargs[field])
+        number = self.current_version_number(schedule.id)
         if any(field in VERSION_FIELDS for field in changed):
             # Written in the edit's own commit, so a claim reads the old
             # version or this one, never a mix of the two.
-            number = (self.current_version_number(schedule.id) or 0) + 1
+            number = (number or 0) + 1
             _new_version(self.session, schedule, number)
         if changed:
-            record_schedule_event(
-                self.session, schedule.id, "edited",
-                {"fields": changed, "version": self.current_version_number(schedule.id)},
-            )
+            # The number assigned above: the new row isn't flushed yet, so
+            # reading it back would return the previous version.
+            record_schedule_event(self.session, schedule.id, "edited", {"fields": changed, "version": number})
         if {"cadence", "timezone", "next_run_at"} & given:
             # The slot follows the edit at once, rather than firing on the old
             # cadence or reading a start already in the past as a missed run.
@@ -280,13 +280,15 @@ class ScheduleService:
         waiting to run, and a slot claimed but not yet started. An attempt
         already running finishes; nothing follows it."""
         now = datetime.now(timezone_.utc)
+        already_paused = schedule.paused_at is not None
         schedule.enabled = False
-        if schedule.paused_at is None:
+        if not already_paused:
             schedule.paused_at = now
         self.session.add(schedule)
         self.session.flush()
         cancelled = ScheduleOccurrenceService(self.session).cancel_pending(schedule.id, error="Paused before it ran.")
-        record_schedule_event(self.session, schedule.id, "paused", {"cancelled_pending": cancelled})
+        if not already_paused:
+            record_schedule_event(self.session, schedule.id, "paused", {"cancelled_pending": cancelled})
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
