@@ -207,10 +207,7 @@ class TestConnectionsAndSaves:
     async def test_the_connections_list_names_a_custom_connection(self, engine, tmp_path, monkeypatch):
         vault_dir = Path(tmp_path) / "vault"
         LocalDataVault(vault_dir).save("httpbin", "httpbin-1a2b3c4d", {"token": "t"}, secure_keys=["token"])
-        monkeypatch.setattr(
-            "cowork.services.connectors.connections.ConnectorSettings",
-            lambda: type("S", (), {"vault_dir": str(vault_dir)})(),
-        )
+        monkeypatch.setenv("COWORK_VAULT_DIR", str(vault_dir))
 
         [card] = await connections_endpoints.list_connections(LOCAL_SCOPE, FakeRequest())
 
@@ -221,20 +218,14 @@ class TestConnectionsAndSaves:
     def test_the_service_defaults_to_the_static_registry(self, tmp_path, monkeypatch):
         vault_dir = Path(tmp_path) / "vault"
         LocalDataVault(vault_dir).save("postgres", "db", {"host": "h"}, secure_keys=[])
-        monkeypatch.setattr(
-            "cowork.services.connectors.connections.ConnectorSettings",
-            lambda: type("S", (), {"vault_dir": str(vault_dir)})(),
-        )
+        monkeypatch.setenv("COWORK_VAULT_DIR", str(vault_dir))
 
         [card] = ConnectionsService(LOCAL_SCOPE).list()
 
         assert card.label and card.custom is False
 
     def test_direct_save_accepts_a_custom_connector(self, engine, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
-            lambda: type("S", (), {"vault_dir": str(Path(tmp_path) / "vault")})(),
-        )
+        monkeypatch.setenv("COWORK_VAULT_DIR", str(Path(tmp_path) / "vault"))
         body = DirectSaveRequest(connector_id="httpbin", values={"token": "any-token"})
 
         result = connections_endpoints.save_connection_direct(body, LOCAL_SCOPE)
@@ -315,10 +306,7 @@ class TestSecretFieldsFromNonRegistrySpecs:
                 connector_id="signer", label="Signer", spec=self.FORM, description="",
             ))
             session.commit()
-        monkeypatch.setattr(
-            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
-            lambda: type("S", (), {"vault_dir": str(Path(tmp_path) / "vault")})(),
-        )
+        monkeypatch.setenv("COWORK_VAULT_DIR", str(Path(tmp_path) / "vault"))
         body = DirectSaveRequest(connector_id="signer", values={"account": "a1", "signing_material": "m"})
 
         result = connections_endpoints.save_connection_direct(body, LOCAL_SCOPE)

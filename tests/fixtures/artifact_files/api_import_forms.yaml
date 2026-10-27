@@ -1,0 +1,37 @@
+# Import statements as they would appear in a module directly inside
+# cowork/services/. `flagged` says whether the check that keeps the services
+# package off the API package must report the statement.
+
+- id: import-the-package
+  source: "import cowork.api"
+  flagged: true
+- id: import-a-submodule
+  source: "import cowork.api.v1.endpoints as endpoints"
+  flagged: true
+- id: from-the-package
+  source: "from cowork.api import v1"
+  flagged: true
+- id: from-a-submodule
+  source: "from cowork.api.v1.endpoints import artifact_workspace"
+  flagged: true
+- id: the-package-as-a-name
+  source: "from cowork import api"
+  flagged: true
+- id: the-package-among-other-names
+  source: "from cowork import common, api"
+  flagged: true
+- id: relative-the-package-as-a-name
+  source: "from .. import api"
+  flagged: true
+- id: relative-from-a-submodule
+  source: "from ..api.v1 import endpoints"
+  flagged: true
+- id: a-sibling-package
+  source: "from cowork import common"
+  flagged: false
+- id: a-name-that-only-starts-with-api
+  source: "from cowork import apis"
+  flagged: false
+- id: a-services-module-named-api
+  source: "from . import api"
+  flagged: false

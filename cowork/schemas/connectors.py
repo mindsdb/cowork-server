@@ -310,6 +310,14 @@ class ConnectionSummaryResponse(BaseModel):
     status: str | None = None
     # The connection's connector is a custom one built in Cowork.
     custom: bool = False
+    # The caller can't change it: the operator's own, or one someone else
+    # shares (ConnectionsService.can_change).
+    managed: bool = False
+    # Shared with the caller rather than theirs to change: in the
+    # shared-connection registry (its creator sees it shared too), or, where
+    # connections are left shared, another person's base-vault entry the caller
+    # didn't create (LayeredDataVault.is_shared).
+    shared: bool = False
 
 
 class ConnectionDetailResponse(BaseModel):
@@ -327,6 +335,14 @@ class ConnectionDetailResponse(BaseModel):
     # Names of fields in `fields` that were masked with VAULT_KEEP_SENTINEL —
     # lets the client show a "saved" indicator instead of the raw sentinel.
     secure_keys: list[str] = Field(default_factory=list, serialization_alias="secureKeys")
+    # The caller can't change it: the operator's own, or one someone else
+    # shares (ConnectionsService.can_change).
+    managed: bool = False
+    # Shared with the caller rather than theirs to change: in the
+    # shared-connection registry (its creator sees it shared too), or, where
+    # connections are left shared, another person's base-vault entry the caller
+    # didn't create (LayeredDataVault.is_shared).
+    shared: bool = False
 
 
 class DirectSaveRequest(BaseModel):

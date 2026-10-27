@@ -136,8 +136,8 @@ def test_direct_openai_uses_the_responses_transport(build):
 def test_direct_openai_stays_generic_on_an_anton_without_a_ready_transport(
     build, monkeypatch
 ):
-    # cowork-server pins anton to a branch; an older build's Responses path
-    # drops truncation, tool_result images and trace headers.
+    # An older anton's Responses path drops truncation, tool_result images and
+    # trace headers.
     import anton.core.llm.openai as anton_openai
 
     monkeypatch.setattr(anton_openai.OpenAIProvider, "RESPONSES_TRANSPORT_READY", False)
@@ -637,9 +637,9 @@ def test_router_effort_stays_with_the_model_it_was_chosen_for(build):
     assert "reasoning_effort" not in calls["openai"][0]
 
 
-# ── COWORK_OPENAI_COMPATIBLE_API: planning and coding on the Responses API ──
+# ── COWORK_OPENAI_COMPATIBLE_API: all compatible roles on the Responses API ──
 
-def test_switch_moves_planning_and_coding_to_the_responses_flavor(
+def test_switch_moves_all_openai_compatible_roles_to_the_responses_flavor(
     build, openai_compatible_api, anton_responses_ready
 ):
     openai_compatible_api("responses")
@@ -648,10 +648,7 @@ def test_switch_moves_planning_and_coding_to_the_responses_flavor(
     router, planning, coding = calls["openai"]
     assert planning["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
     assert coding["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
-    # The router stays on chat completions, as a provider of its own. A router
-    # build error would hand the role to the coding provider, which is now on
-    # the Responses path, without logging anything.
-    assert "flavor" not in router
+    assert router["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
     assert client.router_provider is not client.coding_provider
 
 
@@ -671,7 +668,7 @@ def test_switch_covers_a_keyless_openai_compatible_endpoint(
     router, planning, coding = calls["openai"]
     assert planning["api_key"] == f"{Provider.OPENAI_COMPATIBLE.value}-no-auth"
     assert planning["flavor"] == coding["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
-    assert "flavor" not in router
+    assert router["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
 
 
 def test_switch_leaves_gemini_on_chat_completions(
@@ -712,9 +709,8 @@ def _provider_warnings(caplog) -> list[str]:
 def test_a_switch_the_installed_anton_cannot_serve_is_logged_once(
     build, openai_compatible_api, anton_responses_ready, monkeypatch, caplog
 ):
-    # Planning and coding then stay on chat completions, where an effort other
-    # than none refuses every tool call. The line names the cause once per
-    # process, however many clients are built.
+    # All compatible roles stay on chat completions. The line names the cause
+    # once per process, however many clients are built.
     monkeypatch.setattr(providers, "_warned_responses_transport_missing", False, raising=False)
     openai_compatible_api("responses")
     anton_responses_ready(False)
@@ -726,6 +722,7 @@ def test_a_switch_the_installed_anton_cannot_serve_is_logged_once(
     (line,) = _provider_warnings(caplog)
     assert "COWORK_OPENAI_COMPATIBLE_API=responses" in line
     assert "RESPONSES_TRANSPORT_READY" in line
+    assert "planning, coding and router" in line
     assert "chat completions" in line
     assert all("flavor" not in kw for kw in calls["openai"])
 

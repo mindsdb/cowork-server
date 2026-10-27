@@ -109,10 +109,7 @@ def test_an_invalid_form_is_a_422(engine):
 async def test_delete_removes_the_definition_but_keeps_connections(engine, tmp_path, monkeypatch):
     vault_dir = Path(tmp_path) / "vault"
     LocalDataVault(vault_dir).save("httpbin", "httpbin-1a2b3c4d", {"token": "t"}, secure_keys=["token"])
-    monkeypatch.setattr(
-        "cowork.services.connectors.connections.ConnectorSettings",
-        lambda: type("S", (), {"vault_dir": str(vault_dir)})(),
-    )
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(vault_dir))
 
     async def run_db(fn, *, scope):
         with Session(engine) as session:

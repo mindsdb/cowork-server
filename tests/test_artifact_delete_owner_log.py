@@ -2,6 +2,7 @@
 artifact. Slugs are unique only within a project, so the slug alone does not
 say which project kept a stale owner row."""
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import logging
 
@@ -10,10 +11,9 @@ from sqlalchemy.exc import OperationalError
 
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.services import artifact_ownership as ownership
-from test_artifact_permissions import (  # noqa: F401  (world, org_deployment and no_publish_side_effects are fixtures)
+from test_artifact_permissions import (  # noqa: F401  (world and no_publish_side_effects are fixtures)
     _write,
     no_publish_side_effects,
-    org_deployment,
     scoped,
     world,
 )
@@ -46,5 +46,5 @@ async def test_a_failed_owner_drop_names_the_project_and_the_artifact(
     assert record.getMessage().startswith("Database operation failed: error_type=OperationalError ")
     assert (record.project_id, record.artifact_slug) == (str(project.id), "mine")
     output = logged.output()
-    assert f"[Project:{project.id}][Artifact:'mine']: Database operation failed" in output
+    assert_log_fields(output, project_id=str(project.id), artifact_slug="mine", error_type="OperationalError")
     assert DRIVER_TEXT not in output

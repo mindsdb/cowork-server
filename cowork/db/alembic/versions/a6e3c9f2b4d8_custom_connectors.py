@@ -5,7 +5,7 @@ usage notes) so it is listed beside the static registry. One definition per
 connector id per org, or one local definition when org_id is NULL.
 
 Revision ID: a6e3c9f2b4d8
-Revises: 3e4b5f7586d3
+Revises: f3733a102501
 Create Date: 2026-10-08 12:00:00.000000
 
 """
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a6e3c9f2b4d8"
-down_revision: Union[str, Sequence[str], None] = "3e4b5f7586d3"
+down_revision: Union[str, Sequence[str], None] = "f3733a102501"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

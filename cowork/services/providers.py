@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
+from cowork.build_info import surface
+from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
@@ -44,6 +46,25 @@ MINDS_PROBE_MODEL = "mindshub_air"
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
 MINDS_REQUEST_KIND_PROBE = "probe"
+
+# Langfuse tag on every MindsHub connectivity probe. The gateway files a call
+# with no Langfuse headers as direct-API use, so without it a user who only
+# opened Settings is counted as an API user. Tags alone make the gateway treat
+# the call as first-party; no `harness` is claimed because no agent runs here,
+# and no session or turn because a ping belongs to no conversation.
+PROBE_TRACE_TAG = "provider-ping"
+
+
+def _minds_probe_headers() -> dict[str, str]:
+    """The probe marker plus the probe's Langfuse identity, for a MindsHub host only."""
+    resolved_surface = surface()
+    tags = [PROBE_TRACE_TAG]
+    headers = {MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE}
+    if resolved_surface:
+        tags.append(f"{SURFACE_TAG_PREFIX}{resolved_surface}")
+        headers["Langfuse-Metadata"] = json.dumps({"surface": resolved_surface}, separators=(",", ":"))
+    headers["Langfuse-Tags"] = ",".join(tags)
+    return headers
 
 
 def minds_chat_base_url(minds_url: str) -> str:
@@ -1286,7 +1307,7 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
                 {
                     "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 MINDS_PROBE_MODEL,
             )
@@ -1357,7 +1378,7 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
@@ -1405,7 +1426,7 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
         # meaningless to an arbitrary endpoint, and only MindsHub reads it to hide
         # the probe from the Traces list.
         if is_minds_host(normalized):
-            headers[MINDS_REQUEST_KIND_HEADER] = MINDS_REQUEST_KIND_PROBE
+            headers.update(_minds_probe_headers())
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(chat_url, headers=headers, json=payload)
             if r.status_code in (200, 201):
@@ -1463,7 +1484,7 @@ _warned_responses_transport_missing = False
 
 
 def openai_compatible_agent_api() -> OpenAICompatibleAPI:
-    """The API the planning and coding roles call on an openai_compatible provider.
+    """The API all agent roles call on an openai_compatible provider.
 
     COWORK_OPENAI_COMPATIBLE_API asks for it. The Responses API is used only
     when the installed anton reports its Responses path ready, because before
@@ -1484,7 +1505,7 @@ def openai_compatible_agent_api() -> OpenAICompatibleAPI:
         _warned_responses_transport_missing = True
         logger.warning(
             "Installed anton does not report RESPONSES_TRANSPORT_READY; "
-            "openai_compatible planning and coding stay on chat completions "
+            "openai_compatible planning, coding and router stay on chat completions "
             "although COWORK_OPENAI_COMPATIBLE_API=responses"
         )
     return "chat_completions"
@@ -1582,11 +1603,13 @@ def build_llm_client(
         else settings.resolved_router_model
     )
 
-    # The published package still permits Anton releases from before ENG-2116.
-    # Inspect the constructor once per client build so those versions keep
-    # working without pretending they can refresh a credential per request.
-    # A signature we cannot inspect is treated as unsupported: omitting a new
-    # kwarg is safer than raising TypeError on every MindsHub turn.
+    # Inspect OpenAIProvider's constructor once per client build for
+    # api_key_provider (ENG-2116). Every anton this server can start with has
+    # it: it predates the anton.core.artifacts.internal_files constants the
+    # server imports at startup. So the check serves only an anton too old to
+    # start this server. A signature we cannot inspect is treated as
+    # unsupported: omitting a new kwarg is safer than raising TypeError on
+    # every MindsHub turn.
     try:
         openai_provider_params = inspect.signature(OpenAIProvider).parameters
     except (TypeError, ValueError):
@@ -1594,10 +1617,9 @@ def build_llm_client(
     supports_api_key_provider = "api_key_provider" in openai_provider_params
     warned_about_static_runtime_credential = False
 
-    # Passed to the planning and coding builds only. The router stays on chat
-    # completions: the gate's first-event budget is sized for a model that
-    # doesn't reason, and a router model that reasons by default is held to
-    # that with router_reasoning_effort "none".
+    # The router shares this transport with planning and coding: its delegate
+    # function needs Responses on models that reject tools on chat completions.
+    # Its effort remains the operator's choice and its gate budgets still apply.
     agent_api = openai_compatible_agent_api()
 
     def _make_provider(
@@ -1634,10 +1656,11 @@ def build_llm_client(
             # this callback unset and keep their existing lifetime.
             #
             # The live supplier is available only when Anton advertises the
-            # constructor kwarg. Older versions allowed by the package metadata
-            # keep the construction-time credential and log that they cannot
-            # adopt desktop refreshes; passing the unsupported kwarg would
-            # TypeError on every signed-in MindsHub turn.
+            # constructor kwarg. An anton without it (none can start this
+            # server; see supports_api_key_provider above) keeps the
+            # construction-time credential and logs that it cannot adopt
+            # desktop refreshes; passing the unsupported kwarg would TypeError
+            # on every signed-in MindsHub turn.
             #
             # This refreshes the MAIN-PROCESS provider only. anton snapshots
             # export_connection_info().api_key once per ChatSession and hands
@@ -1773,7 +1796,7 @@ def build_llm_client(
         if "router_provider" in _params:
             router_kw = {
                 "router_provider": _make_provider(
-                    settings.resolved_router_provider, router_effort
+                    settings.resolved_router_provider, router_effort, api=agent_api
                 ),
                 "router_model": router_model,
             }

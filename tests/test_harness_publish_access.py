@@ -1,13 +1,15 @@
 """Harness publish tool forwards access + preserves previous (ENG-322 follow-up)."""
 
+import hashlib
 import json
 from pathlib import Path
 from unittest import mock
 
 import pytest
+from fastapi import HTTPException
 
 from cowork.harnesses.anton_harness import tools as htools
-from cowork.services.publish import PublishOwnedByOtherUser
+from cowork.services.publish import PublishOwnedByOtherUser, UploadServiceUnavailable
 
 
 def _artifact(tmp_path: Path) -> Path:
@@ -271,3 +273,88 @@ def test_publish_description_says_what_to_pass_not_where_artifacts_live():
     assert "`create_artifact`" in description
     assert "`generate_artifact`" in description
     assert "open_artifact" not in description
+
+
+# The publish tool's description and prompt at staging 8b1ecf4, before
+# deployment identity support. Hosts without COWORK_DEPLOYMENT_KIND keep them.
+DEFAULT_DESCRIPTION_SHA256 = "5bae1e84c433d3e09c5b572e6b1e60221143a30086a8e71b4898e2239149a6b1"
+DEFAULT_PROMPT_SHA256 = "5e040dfeaca047ee2307d953989e2282106f6972c8d7aaf4655301e50ec1e73a"
+
+
+@pytest.mark.asyncio
+async def test_default_hosts_keep_the_publish_tool_text(project):
+    base, artifact, _ = project
+    publish = htools.build_cowork_publish_tool()
+    assert hashlib.sha256(publish.description.encode()).hexdigest() == DEFAULT_DESCRIPTION_SHA256
+    assert hashlib.sha256(publish.prompt.encode()).hexdigest() == DEFAULT_PROMPT_SHA256
+    assert await _ask(base, SLUG) == (
+        f"Dashboard is at {artifact} and visible in the Live Artifacts panel. It has NOT been "
+        "published to the public web yet. If the user asks to publish / share / make it public, "
+        "call this tool again with action='publish' — MindsHub publishing works directly from "
+        "chat in the desktop app, no slash command needed."
+    )
+
+
+@pytest.mark.asyncio
+async def test_harness_tells_the_agent_not_to_retry_a_too_large_artifact(tmp_path):
+    from cowork.services.publish import PublishTooLarge
+
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=PublishTooLarge())
+    with mock.patch.object(htools, "_publish_artifact", fake):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path),
+            {"file_path": str(f), "action": "publish", "access_mode": "public"},
+        )
+
+    assert out.ok is False
+    assert out.reason == "too_large"
+    message = json.loads(out.content)["message"]
+    assert message.startswith("PUBLISH FAILED: This artifact is too large to publish.")
+    assert "Do not retry with the same files." in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc, reason, text", [
+    (UploadServiceUnavailable(), "publish_unavailable",
+     "The publishing service is temporarily unavailable. Try again in a moment."),
+    (HTTPException(503, detail="Publishing is busy right now."), "http_error", "Publishing is busy right now."),
+    (HTTPException(400, detail={"code": "bad"}), "bad", "{'code': 'bad'}"),
+])
+async def test_harness_passes_a_typed_refusal_on_without_a_traceback(tmp_path, caplog, exc, reason, text):
+    import logging
+
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=exc)
+    with caplog.at_level(logging.INFO, logger="cowork.harnesses.anton_harness.tools"):
+        with mock.patch.object(htools, "_publish_artifact", fake):
+            out = await htools._cowork_publish_or_preview(
+                _session(tmp_path),
+                {"file_path": str(f), "action": "publish", "access_mode": "public"},
+            )
+
+    assert out.ok is False
+    assert out.reason == reason
+    assert json.loads(out.content)["message"] == f"PUBLISH FAILED: {text}"
+    assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_harness_reports_a_rejected_publish_without_a_second_traceback(tmp_path, caplog):
+    import logging
+
+    from cowork.services.publish import PublishRejected
+
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=PublishRejected("Publishing failed: This organization is archived."))
+    with caplog.at_level(logging.INFO, logger="cowork.harnesses.anton_harness.tools"):
+        with mock.patch.object(htools, "_publish_artifact", fake):
+            out = await htools._cowork_publish_or_preview(
+                _session(tmp_path),
+                {"file_path": str(f), "action": "publish", "access_mode": "public"},
+            )
+
+    assert out.ok is False
+    assert out.reason == "PublishRejected"
+    assert json.loads(out.content)["message"] == "PUBLISH FAILED: Publishing failed: This organization is archived."
+    assert "Traceback" not in caplog.text

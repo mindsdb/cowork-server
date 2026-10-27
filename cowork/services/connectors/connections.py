@@ -4,13 +4,14 @@ import json
 
 from anton.core.datasources.data_vault import is_secret_key
 
-from cowork.common.settings.app_settings import ConnectorSettings
-from cowork.db.scoped import TenantScope, scoped_storage_root
+from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
 )
+from cowork.services.connectors.layered_vault import CREATED_BY_FIELD, LayeredDataVault
+from cowork.services.connectors.persist import own_vault_root, vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.vault_lock import discard_lock, lock_for
 
@@ -23,15 +24,40 @@ class ConnectionsService:
     must be supplied by the caller (a request's ``TenantScope``, not
     recovered from anywhere else). The module-level ``service`` singleton
     below is LOCAL-MODE ONLY and must never be used to serve an org request.
+
+    Every read and write goes through vault_for_scope, so a scope lists and
+    reads the operator's managed connections and the ones others share with
+    it beside its own. ``managed`` marks a connection the caller can't
+    change, ``shared`` one shared with the caller (LayeredDataVault.is_shared),
+    and every write to one the caller can't change raises
+    SharedConnectionError.
     """
 
     def __init__(self, scope: TenantScope | None = None) -> None:
         self.scope = scope
 
     def _vault(self):
-        from pathlib import Path
-        from anton.core.datasources.data_vault import LocalDataVault
-        return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), self.scope, store="data-vault"))
+        return vault_for_scope(self.scope)
+
+    def _lock(self, engine: str, name: str):
+        """The record lock every read-modify-write here takes, keyed by this
+        scope's own vault (vault_lock)."""
+        return lock_for(vault_root=own_vault_root(self.scope), engine=engine, name=name)
+
+    @staticmethod
+    def _can_change_in(vault, engine: str, name: str) -> bool:
+        return not isinstance(vault, LayeredDataVault) or vault.can_change(engine, name)
+
+    @staticmethod
+    def _is_shared_in(vault, engine: str, name: str) -> bool:
+        return isinstance(vault, LayeredDataVault) and vault.is_shared(engine, name)
+
+    def can_change(self, engine: str, name: str) -> bool:
+        """Whether the caller may save or delete this connection: false for
+        the operator's managed ones, for one someone else shares, and where
+        connections are shared for one the caller didn't create
+        (LayeredDataVault.can_change). True for one that doesn't exist."""
+        return self._can_change_in(self._vault(), engine, name)
 
     def _read_record(self, vault, engine: str, name: str) -> dict | None:
         """Full on-disk record via read_record() when the vault supports
@@ -87,6 +113,8 @@ class ConnectionsService:
                 logo_color=spec.get("logo_color"),
                 status=(fields or {}).get("status"),
                 custom=bool(spec.get("custom")),
+                managed=not self._can_change_in(vault, engine, name),
+                shared=self._is_shared_in(vault, engine, name),
             ))
         return result
 
@@ -122,6 +150,8 @@ class ConnectionsService:
         # again and treat it as an explicit value, closing an unintended loop.
         fields.pop("_user_label", None)
         fields.pop("_label", None)
+        # Who created it is the vault's bookkeeping, not a credential field.
+        fields.pop(CREATED_BY_FIELD, None)
         return ConnectionDetailResponse(
             engine=record.get("engine", engine),
             name=record.get("name", name),
@@ -133,6 +163,8 @@ class ConnectionsService:
             method=fields.pop("_method", None),
             fields=fields,
             secure_keys=masked_keys,
+            managed=not self._can_change_in(vault, engine, name),
+            shared=self._is_shared_in(vault, engine, name),
         )
 
     def runtime_fields(self, engine: str, name: str) -> dict | None:
@@ -164,7 +196,7 @@ class ConnectionsService:
         Returns ``False`` if the entry does not exist.
         """
         vault = self._vault()
-        with lock_for(engine, name):
+        with self._lock(engine, name):
             record = self._read_record(vault, engine, name)
             if record is None:
                 return False
@@ -201,7 +233,7 @@ class ConnectionsService:
         Returns the merged list, or None if the connection doesn't exist.
         """
         vault = self._vault()
-        with lock_for(engine, name):
+        with self._lock(engine, name):
             record = self._read_record(vault, engine, name)
             if record is None:
                 return None
@@ -243,7 +275,7 @@ class ConnectionsService:
         Returns the resulting list, or None if the connection doesn't exist.
         """
         vault = self._vault()
-        with lock_for(engine, name):
+        with self._lock(engine, name):
             record = self._read_record(vault, engine, name)
             if record is None:
                 return None
@@ -297,7 +329,7 @@ class ConnectionsService:
 
     def delete(self, engine: str, name: str) -> bool:
         deleted = self._vault().delete(engine, name)
-        discard_lock(engine, name)
+        discard_lock(vault_root=own_vault_root(self.scope), engine=engine, name=name)
         return deleted
 
 

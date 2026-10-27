@@ -1,15 +1,32 @@
+from __future__ import annotations
+
+import json
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import (
+    AliasChoices,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.schemas.artifact_export import ExportPdfSettings
+
+if TYPE_CHECKING:
+    from anton.core.llm.identity import DeploymentIdentity
 
 
 # ── Global model catalog ───────────────────────────────────────────────
@@ -163,6 +180,30 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 # interpolated into a bogus hostname like api.<garbage>.mindshub.ai.
 _KNOWN_ENV_SLUGS = ("staging", "dev")
 
+# A draft-link token is readable by the artifact's own script and by anyone who
+# can read an access log, so a short signing secret could be brute-forced offline.
+_DRAFT_KEY_MIN_CHARS = 32
+
+# scheme://host[:port] and one optional trailing slash, nothing else: no inner
+# whitespace, userinfo, path, query, fragment, wildcard, or the `;` and `,` that
+# would end or extend a CSP source list this value is written into.
+_BARE_ORIGIN = re.compile(
+    r"(?P<scheme>https?)://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?/?",
+    re.IGNORECASE,
+)
+
+
+def _bare_origin(value: str) -> tuple[str, str] | None:
+    """``(origin, host)`` of a bare http(s) origin, lower-cased; None otherwise.
+
+    Whitespace around the value (a newline from a mounted secret) is ignored.
+    """
+    match = _BARE_ORIGIN.fullmatch(value.strip())
+    if match is None:
+        return None
+    host = match["host"].lower().rstrip(".")
+    return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
+
 
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
@@ -187,6 +228,12 @@ def default_minds_url() -> str:
     return f"{default_minds_api_host()}/v1"
 
 
+def _pr_namespace() -> str:
+    """This pod's per-PR namespace (``pr-...``) from the downward API, else ''."""
+    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
+    return ns if ns.startswith("pr-") else ""
+
+
 def default_turn_minds_api_host() -> str:
     """MindsHub API host for the POD's turn — this deployment's OWN inference.
 
@@ -200,10 +247,22 @@ def default_turn_minds_api_host() -> str:
     Everything else — dev, staging, prod, desktop — keeps the ENV-slug host,
     which is already correct (notably prod, which has no slug at all).
     """
-    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
-    if ns.startswith("pr-"):
+    ns = _pr_namespace()
+    if ns:
         return f"https://api-{ns}.dev.mindshub.ai"
     return default_minds_api_host()
+
+
+def default_draft_env_label() -> str:
+    """The environment a draft-preview token is issued for and accepted in.
+
+    The same split as ``default_turn_minds_api_host``, as a label: a per-PR env
+    by its namespace (they all run ENV=development and likely share dev's draft
+    key, so the namespace is what tells them apart), otherwise the ENV slug,
+    and ``prod`` for everything else. Read from the downward API, never from a
+    request.
+    """
+    return _pr_namespace() or _env_slug() or "prod"
 
 
 def default_minds_auth_host() -> str:
@@ -378,13 +437,19 @@ class CodingSettings(Settings):
 
 
 class StorageSettings(Settings):
-    # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
-    # mountable subtree per org). Local mode never reads this; in org mode the
-    # per-store *_DIR overrides are inert.
+    # Org mode and personal partitions: stores live under
+    # <shared_root>/<org_id>/<store>/ (one mountable subtree per org or
+    # person). The desktop never reads this; in org mode the per-store *_DIR
+    # overrides are inert.
     shared_root: str = Field(
         default_factory=lambda: str(cowork_home()),
         validation_alias=AliasChoices("COWORK_SHARED_DIR", "STORAGE_SHARED_ROOT"),
-        description="Root of the org-keyed shared storage tree (org mode only)",
+        description=(
+            "Root of the org-keyed shared storage tree (org mode and personal "
+            "partitions). Where skills are personal, it also holds "
+            "shared/skills.json, the skills people share, which Cowork writes "
+            "(cowork.shared_skills)."
+        ),
     )
 
 
@@ -567,6 +632,15 @@ class TurnQueueSettings(Settings):
             "both together."
         ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    pod_shared_mount_root: str = Field(
+        default="/mnt/cowork-shared",
+        description=(
+            "Where a cloud pod mounts its organization's shared tree, as "
+            "scratchpad-controller's SHARED_MOUNT_ROOT sets it. With a persistent "
+            "workspace the pod's scratchpad runs in "
+            "<root>/<project path in the organization>/conversations/<conversation id>."
+        ),
+    )  # COWORK_TURN_POD_SHARED_MOUNT_ROOT
     minds_base_url: str = Field(
         default="",
         description=(
@@ -624,11 +698,30 @@ class TurnQueueSettings(Settings):
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
 
 
-# The OpenAI API an openai_compatible provider's planning and coding roles call.
+# The OpenAI API an openai_compatible provider's planning, coding and router roles call.
 OpenAICompatibleAPI = Literal["chat_completions", "responses"]
 
 
 class AppSettings(Settings):
+    # Loaded by create_app before accepting turns. A private snapshot cannot
+    # become a member-editable setting or change when a mounted pack changes.
+    _deployment_identity: DeploymentIdentity | None = PrivateAttr(default=None)
+    _deployment_identity_initialized: bool = PrivateAttr(default=False)
+
+    deployment_kind: Literal["self-hosted"] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_DEPLOYMENT_KIND"),
+        description="Explicit self-hosted agent identity. Unset keeps the desktop and hosted defaults.",
+    )
+    deployment_brand_file: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_DEPLOYMENT_BRAND_FILE"),
+        description=(
+            "Absolute path to the operator's read-only branding pack.json. Its name is the "
+            "agent's product name when COWORK_DEPLOYMENT_KIND=self-hosted. Read once at startup."
+        ),
+    )
+
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 
     port: int = Field(
@@ -716,6 +809,14 @@ class AppSettings(Settings):
             "Only checked when COWORK_REQUIRE_AUTH=true. Auto-generated if empty."
         ),
     )
+    publish_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUBLISH_TOKEN"),
+        description=(
+            "Bearer sent to the publish service (ANTON_PUBLISH_URL) in place of the "
+            "provider's key, on every provider. Blank means unset."
+        ),
+    )
     tenancy_mode: Literal["local", "org"] = Field(
         default="local",
         validation_alias=AliasChoices("COWORK_TENANCY_MODE"),
@@ -795,14 +896,145 @@ class AppSettings(Settings):
         default="enforce",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
-            "Org-mode identity enforcement. 'enforce' (default): a request "
+            "Identity enforcement in org mode, and in local tenancy with "
+            "COWORK_TRUST_IDENTITY_HEADERS on. 'enforce' (default): a request "
             "without identity headers is rejected with 401. 'audit': it is "
             "logged and allowed through, which is the rollout mode the org "
-            "cutover needed and now has to be asked for. Dropping the env var "
-            "must not reopen the no-principal path, so the default is the "
+            "cutover needed and now has to be asked for; with trusted "
+            "identity headers it is served as the operator view, and a pair "
+            "that is present but broken is still rejected. Dropping the env "
+            "var must not reopen the no-principal path, so the default is the "
             "closed one."
         ),
     )
+    trust_identity_headers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_TRUST_IDENTITY_HEADERS"),
+        description=(
+            "Local tenancy only. Read X-User-Id and X-Organization-Id on a "
+            "request that passed the bearer token, and give each (organization, "
+            "user) pair its own partition, keyed by "
+            "cowork.principal.personal_partition_id. Only for a deployment "
+            "behind a proxy that verifies each person and strips client copies "
+            "of those headers. create_app refuses it in org tenancy, when "
+            "COWORK_REQUIRE_AUTH is off, with COWORK_TURN_BACKEND=remote, with "
+            "COWORK_CODE_SANDBOX off, and without COWORK_AUTH_TOKEN in the "
+            "environment; with it on, the token is never copied into "
+            "cowork-home's .env. "
+            "COWORK_IDENTITY_ENFORCE applies: 'enforce' answers 401 without a "
+            "valid pair, and 'audit' serves a request carrying no pair as the "
+            "operator view, with no person; a pair that is present but broken "
+            "answers 401 under either."
+        ),
+    )
+    personal_resources: Annotated[frozenset[PersonalResource], NoDecode] = Field(
+        default=ALL_PERSONAL_RESOURCES,
+        validation_alias=AliasChoices("COWORK_PERSONAL_RESOURCES"),
+        description=(
+            "Comma-separated resources each person keeps in their own "
+            "partition while COWORK_TRUST_IDENTITY_HEADERS is on: "
+            "conversations, projects, files, skills, connections, schedules, "
+            "pins, memory, settings. Default: all of them. Blank: none. A "
+            "resource left off stays shared across the deployment, as with the "
+            "setting off. An unknown name fails settings load. Memory left "
+            "off is one store every person's turns read and learn into, "
+            "profile included: its global tier is COWORK_MEMORY_DIR, and each "
+            "project's tier sits under it at projects/<project id>/, never in "
+            "the project's .anton/memory. Each turn reads only its current "
+            "project's tier. The server logs a warning at start that memory is "
+            "shared (MemoryPolicy.start_warning in "
+            "cowork.harnesses.memory.policy). create_app refuses a list that "
+            "breaks a dependency: projects requires conversations, and "
+            "conversations requires files, pins and schedules. Ignored while "
+            "COWORK_TRUST_IDENTITY_HEADERS is off."
+        ),
+    )
+
+    @field_validator("personal_resources", mode="before")
+    @classmethod
+    def _split_personal_resources(cls, value: object) -> object:
+        if isinstance(value, str):
+            return frozenset(name.strip() for name in value.split(",") if name.strip())
+        return value
+
+    managed_dir: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_MANAGED_DIR"),
+        description=(
+            "The operator's managed folder (cowork.managed.ManagedFolder): "
+            "memory/ with rules and lessons every turn reads, skills/ with the "
+            "operator's own skills every person sees as built-in, data-vault/ "
+            "with the operator's own connections every turn can use, and an "
+            "optional shared/connections.json listing the connections people "
+            "share. Cowork never writes it. Blank or unset: none. create_app "
+            "refuses it in org tenancy, with COWORK_TURN_BACKEND=remote, when "
+            "the folder or any of memory/, skills/ and data-vault/ is missing, "
+            "when the server's user can't read and search memory/, when "
+            "shared/connections.json is malformed, and when the installed "
+            "anton's Cortex takes no managed_hc."
+        ),
+    )
+
+    @field_validator("managed_dir", mode="before")
+    @classmethod
+    def _blank_managed_dir_is_none(cls, value: object) -> object:
+        # A blank value read as a Path is ".", the working directory, which
+        # exists: the missing-folder refusal would then pass on a typo.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    code_sandbox: Literal["off", "landlock"] = Field(
+        default="off",
+        validation_alias=AliasChoices("COWORK_CODE_SANDBOX"),
+        description=(
+            "How the agent's code runs (cowork.code_sandbox). 'off' (default): "
+            "every cell, install and check starts as today, with the server's "
+            "environment and files. 'landlock': each one starts through anton's "
+            "launcher, which locks it with Landlock to the conversation's "
+            "project, the asker's own HOME and TMPDIR, the skills and "
+            "attachments of the turn, the shared folder and the system's "
+            "read-only files, with an allowlisted environment. create_app "
+            "refuses COWORK_TRUST_IDENTITY_HEADERS with it off, and refuses "
+            "'landlock' in org tenancy, with COWORK_TURN_BACKEND=remote, on an "
+            "anton without the launcher, below Landlock ABI 3 (Linux 6.2), and "
+            "when its startup self-test can't confirm a denied path is denied. "
+            "Under 'landlock', app backends and Code mode are refused."
+        ),
+    )
+    live_apps_viewer_login_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_VIEWER_LOGIN_URL"),
+        description=(
+            "With live apps on (anton's ANTON_LIVE_APP_SLOTS), the viewer "
+            "sign-in this server asks who opens an app, for example "
+            "http://viewer-login:4180: its /oauth2/userinfo names the signed-in "
+            "visitor (cowork.services.live_apps). create_app refuses live apps "
+            "without it."
+        ),
+    )
+    live_apps_viewer_public_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_VIEWER_PUBLIC_URL"),
+        description=(
+            "The same viewer sign-in at the address a browser reaches, for "
+            "example http://view.localhost:8080. A live app's preview in the "
+            "web UI sends its sign-in window there; without it a preview is "
+            "refused, and the pane offers only Open in browser."
+        ),
+    )
+    live_apps_launch_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_LAUNCH_TOKEN"),
+        description=(
+            "With live apps on, the token anton sends each app slot with a "
+            "launch; each slot holds only its SHA-256. Agent code never "
+            "receives it: anton's launcher passes a cell no COWORK_ variable "
+            "(anton.core.backends.sandbox._ENV_NEVER_PREFIXES). create_app "
+            "refuses live apps with fewer than 32 characters."
+        ),
+    )
+
     organization_switch_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
@@ -814,6 +1046,115 @@ class AppSettings(Settings):
             "Defaults off so deploying protocol support cannot expose it."
         ),
     )
+    # Draft-preview links. Org web only. All six values together turn the
+    # signed draft links on; any one missing leaves previews on the srcdoc
+    # path (see draft_links_enabled).
+    draft_hosts: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_HOSTS"),
+        description=(
+            "Comma-separated host names of the draft-preview host (e.g. "
+            "draft.mindshub.co). The draft listener answers 404 to any other "
+            "Host. Empty (default) serves no draft host."
+        ),
+    )  # COWORK_DRAFT_HOSTS
+    draft_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_ORIGIN"),
+        description="Origin draft links point at, e.g. https://draft.mindshub.co.",
+    )  # COWORK_DRAFT_ORIGIN
+    draft_link_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KEYS"),
+        description=(
+            "Draft-link signing keys as a JSON map {kid: secret}, from the "
+            "mindsdb-secrets Secret. Two kids can be live during a rotation. "
+            "A secret shorter than 32 characters is ignored."
+        ),
+    )  # COWORK_DRAFT_LINK_KEYS
+    draft_link_kid: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KID"),
+        description="The kid in COWORK_DRAFT_LINK_KEYS that signs new draft links.",
+    )  # COWORK_DRAFT_LINK_KID
+    web_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_WEB_ORIGIN"),
+        description=(
+            "Origin of the cowork web app, e.g. https://cowork.mindshub.ai: the "
+            "only page allowed to frame a draft (CSP frame-ancestors)."
+        ),
+    )  # COWORK_WEB_ORIGIN
+    draft_port: int = Field(
+        default=0,
+        ge=0,
+        le=65535,
+        validation_alias=AliasChoices("COWORK_DRAFT_PORT"),
+        description=(
+            "Port of the draft listener: a second server in this process that "
+            "serves only the draft sub-app, so the draft Ingress, which routes "
+            "to this port alone, can never reach the API app. 0 (default) "
+            "starts no listener."
+        ),
+    )  # COWORK_DRAFT_PORT
+
+    @field_validator("draft_port", mode="before")
+    @classmethod
+    def _empty_draft_port_is_off(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return 0
+        return v
+
+    def draft_host_names(self) -> frozenset[str]:
+        """COWORK_DRAFT_HOSTS as lower-case host names, without a trailing dot."""
+        return frozenset(
+            name.strip().lower().rstrip(".")
+            for name in self.draft_hosts.split(",")
+            if name.strip()
+        )
+
+    def draft_link_keyring(self) -> dict[str, str]:
+        """COWORK_DRAFT_LINK_KEYS parsed; an unreadable value is no keys at all.
+
+        A secret shorter than 32 characters is dropped like a non-string one.
+        """
+        try:
+            parsed = json.loads(self.draft_link_keys)
+        except ValueError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            kid: secret
+            for kid, secret in parsed.items()
+            if kid and isinstance(secret, str) and len(secret) >= _DRAFT_KEY_MIN_CHARS
+        }
+
+    def draft_link_origin(self) -> str:
+        """COWORK_DRAFT_ORIGIN as a bare origin, or '' when it is not one."""
+        parsed = _bare_origin(self.draft_origin)
+        return parsed[0] if parsed else ""
+
+    def draft_frame_origin(self) -> str:
+        """COWORK_WEB_ORIGIN as a bare origin, or '' when it is not one.
+
+        The only value written into the draft host's CSP frame-ancestors.
+        """
+        parsed = _bare_origin(self.web_origin)
+        return parsed[0] if parsed else ""
+
+    def draft_links_enabled(self) -> bool:
+        """Whether this server issues and serves signed draft links."""
+        link_origin = _bare_origin(self.draft_origin)
+        return (
+            self.tenancy_mode == "org"
+            and link_origin is not None
+            and link_origin[1] in self.draft_host_names()
+            and bool(self.draft_frame_origin())
+            and self.draft_link_kid in self.draft_link_keyring()
+            and self.draft_port > 0
+        )
+
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(
@@ -825,6 +1166,20 @@ class AppSettings(Settings):
     )  # COWORK_SERVER_OWNER
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
+    # The same switch that turns on anton's per-call usage log. Set by evals only.
+    usage_log: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ANTON_USAGE_LOG"),
+        description="Read delegated gate streams to their end so the call's usage is recorded.",
+    )
+
+    @field_validator("usage_log", mode="before")
+    @classmethod
+    def _read_usage_log_as_anton_does(cls, v: object) -> object:
+        # anton reads any other value as off; failing startup here would split the two.
+        if isinstance(v, str):
+            return v.strip().lower() in {"1", "true", "yes", "on"}
+        return v
 
     master_key: str = Field(
         default="",
@@ -878,16 +1233,16 @@ class AppSettings(Settings):
         default="chat_completions",
         validation_alias=AliasChoices("COWORK_OPENAI_COMPATIBLE_API"),
         description=(
-            "The API the planning and coding roles call on an openai_compatible "
+            "The API the planning, coding and router roles call on an openai_compatible "
             "provider. 'chat_completions' (default) calls {base}/chat/completions. "
             "'responses' calls {base}/responses through anton's openai flavor, "
             "where OpenAI and Azure accept function tools together with a "
             "reasoning effort. It applies only when the installed anton reports "
-            "RESPONSES_TRANSPORT_READY; with an older anton both roles stay on "
+            "RESPONSES_TRANSPORT_READY; with an older anton all three roles stay on "
             "chat completions and one warning says so. On the Responses path the "
             "agent loop runs without web tools, since OpenAI's hosted web_search "
             "reads the web from the provider's side, outside the deployment's "
-            "egress controls. The router and Gemini stay on chat completions. "
+            "egress controls. Gemini is unaffected. "
             "Deployment-wide; get_app_settings() is cached, so a change needs a "
             "restart."
         ),
@@ -948,3 +1303,59 @@ class AppSettings(Settings):
 def get_app_settings() -> AppSettings:
     """Get cached application settings."""
     return AppSettings()
+
+
+EXPORT_PDF_ENGINE_VAR = "COWORK_EXPORT_PDF_ENGINE"
+EXPORT_RENDER_URL_VAR = "COWORK_EXPORT_RENDER_URL"
+
+
+def load_export_pdf_settings(*, environ: Mapping[str, str]) -> ExportPdfSettings:
+    """Read the PDF export settings from ``environ``, the process environment.
+
+    They never come from the ``.env`` chain the settings above read. On the
+    desktop, ``POST /settings/raw`` writes ``<COWORK_HOME>/.env``, so a render
+    URL taken from there would send every exported document wherever that
+    write pointed it.
+
+    An unset or blank engine means no PDF. Any other engine than "render"
+    raises ValueError, and so does "render" without an http(s) URL, which
+    stops the server's start.
+    """
+    engine = environ.get(EXPORT_PDF_ENGINE_VAR, "").strip()
+    if not engine:
+        return ExportPdfSettings(engine=None, render_url=None)
+    if engine != "render":
+        raise ValueError(f"{EXPORT_PDF_ENGINE_VAR} must be 'render' or unset, not {engine!r}.")
+    url = environ.get(EXPORT_RENDER_URL_VAR, "").strip()
+    if not url:
+        raise ValueError(
+            f"{EXPORT_PDF_ENGINE_VAR}=render needs {EXPORT_RENDER_URL_VAR}, the http(s) base "
+            "address of the render service. Set it, or unset the engine to turn PDF export off."
+        )
+    # The URL itself stays out of these messages: it may carry credentials.
+    try:
+        settings = ExportPdfSettings(engine="render", render_url=url)
+    except ValidationError:
+        raise ValueError(
+            f"{EXPORT_RENDER_URL_VAR} must be an http:// or https:// address with a host."
+        ) from None
+    render_url = settings.render_url
+    # A bare "?" or "#" parses as an empty query or fragment, not None, and
+    # still moves /v1/pdf out of the path.
+    if render_url is not None and (render_url.query is not None or render_url.fragment is not None):
+        raise ValueError(
+            f"{EXPORT_RENDER_URL_VAR} must be the render service's base address, with no "
+            "query or fragment: the server adds /v1/pdf to it."
+        )
+    return settings
+
+
+@lru_cache
+def get_export_pdf_settings() -> ExportPdfSettings:
+    """The process's PDF export settings, read once.
+
+    ``cowork.cli.main`` reads them before it loads a ``.env`` file into the
+    environment, so a value only in a ``.env`` file never reaches them, and
+    ``create_app`` reads them so a bad value stops the start.
+    """
+    return load_export_pdf_settings(environ=os.environ)

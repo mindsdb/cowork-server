@@ -240,3 +240,28 @@ def test_a_loopback_permission_still_refuses_a_remote_caller():
         return {"ok": True}
 
     assert TestClient(app).get("/guarded").status_code == 403
+
+
+# ── the skill sharing route ──────────────────────────────────────────
+
+
+def test_the_skill_sharing_route_declares_authenticated_and_401s_with_no_principal():
+    """A person shares their own skill, so the route declares Authenticated
+    beside the skills router's AuthenticatedInOrgMode: a caller with no
+    principal, the desktop or the operator view, gets a 401 in either mode,
+    before anything is read or written."""
+    from cowork.api.v1.endpoints import skills
+    from cowork.api.v1.route_walker import declared_permissions, route_key
+    from cowork.api.v1.router import api_router
+
+    (route,) = [
+        route
+        for route in api_router.routes
+        if route_key(route) == ("/api/v1/skills/{skill_id}/sharing", ("PUT",))
+    ]
+    assert declared_permissions(route) == [AuthenticatedInOrgMode, Authenticated]
+
+    app = FastAPI()
+    app.include_router(skills.router, prefix="/skills")
+    response = TestClient(app).put("/skills/my-notes/sharing", json={"shared": True})
+    assert (response.status_code, response.json()) == (401, {"detail": "Unauthorized"})
