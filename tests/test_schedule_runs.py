@@ -1125,6 +1125,79 @@ def test_reap_orphaned_runs_leaves_finished_runs_untouched():
     assert run.error is None
 
 
+def _started_at(session: Session, run_id, when: datetime) -> None:
+    from cowork.models.schedule import ScheduleRun
+
+    run = session.get(ScheduleRun, run_id)
+    run.started_at = when
+    session.add(run)
+    session.commit()
+
+
+def test_reap_orphaned_runs_started_before_leaves_younger_runs():
+    session = _session()
+    old_schedule = _schedule(session, title="old")
+    live_schedule = _schedule(session, title="live")
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    now = datetime.now(timezone.utc)
+    old = run_service.create_run(old_schedule.id)
+    live = run_service.create_run(live_schedule.id)
+    _started_at(session, old.id, now - timedelta(hours=2))
+    _started_at(session, live.id, now - timedelta(minutes=5))
+
+    assert run_service.reap_orphaned_runs(started_before=now - timedelta(hours=1)) == 1
+
+    session.refresh(old)
+    session.refresh(live)
+    assert old.status == RunStatus.failed
+    assert live.status == RunStatus.running
+
+
+def test_boot_reap_cutoff_reaps_everything_only_on_the_desktop():
+    from cowork.scheduler import _ORPHANED_RUN_AGE_SECONDS, boot_reap_cutoff
+
+    now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+
+    assert boot_reap_cutoff(org_mode=False, now=now) is None
+    # A replica booting next to one mid-run must leave that run alone.
+    assert boot_reap_cutoff(org_mode=True, now=now) == now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
+    assert _ORPHANED_RUN_AGE_SECONDS > 600
+
+
+def test_poll_reaps_a_run_whose_process_died_and_fires_its_slot():
+    from cowork.scheduler import _ORPHANED_RUN_AGE_SECONDS, _poll
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    schedule = _schedule(session, next_run_at=now - timedelta(minutes=1))
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    run = run_service.create_run(schedule.id)
+    _started_at(session, run.id, now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS + 60))
+
+    due = _poll(ScopedSession(session, SYSTEM_SCOPE))
+
+    session.refresh(run)
+    assert run.status == RunStatus.failed
+    assert due == [schedule.id]
+
+
+def test_poll_leaves_a_run_another_replica_may_still_own():
+    from cowork.scheduler import _poll
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    schedule = _schedule(session, next_run_at=now - timedelta(minutes=1))
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    run = run_service.create_run(schedule.id)
+    _started_at(session, run.id, now - timedelta(minutes=5))
+
+    due = _poll(ScopedSession(session, SYSTEM_SCOPE))
+
+    session.refresh(run)
+    assert run.status == RunStatus.running
+    assert due == []
+
+
 def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
     """Staging audit P0: schedules are personal (created_by) but CRUD/list
     filtered by org only, so coworkers saw/paused/deleted each other's."""
