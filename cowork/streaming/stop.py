@@ -6,8 +6,23 @@ from __future__ import annotations
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import CANCEL_FLAG_TTL_SECONDS, request_cancel
 from cowork.streaming.registry import RunHandle
+from cowork.streaming.turn_index import get_turn
 
-__all__ = ["CANCEL_FLAG_TTL_SECONDS", "remote_backend", "stop_turn"]
+__all__ = ["CANCEL_FLAG_TTL_SECONDS", "cancel_conversation_turn", "remote_backend", "stop_turn"]
+
+
+async def cancel_conversation_turn(conversation_id: str) -> bool:
+    """Ask the pod running this conversation's current turn to stop, from any
+    replica and without its local producer. Returns whether a cancel was
+    issued: never on the in-process backend, where no pod outlives the
+    process that ran the turn, nor when no turn is recorded for it."""
+    if not remote_backend():
+        return False
+    turn = await get_turn(conversation_id)
+    if turn is None:
+        return False
+    await request_cancel(turn["correlation_id"])
+    return True
 
 
 async def stop_turn(handle: RunHandle, *, timed_out: bool = False) -> bool:
