@@ -5,6 +5,7 @@ This is not necessarily final state — it was migrated to eliminate
 compat stubs and may be refactored later.
 """
 
+import errno
 import logging
 import mimetypes
 import ntpath
@@ -12,10 +13,11 @@ import os
 import secrets
 import stat
 import time
+import unicodedata
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -34,6 +36,7 @@ from cowork.common.paths import (
     dir_mkdir,
     dir_open,
     dir_replace,
+    dir_rmdir,
     dir_rmtree,
     dir_scandir,
     dir_unlink,
@@ -958,6 +961,336 @@ def _write_bytes_at_project_root(
             except FileNotFoundError:
                 pass
 
+
+
+_IMPORT_PREFIX = ".cowork-import-"
+_IMPORT_MAX_DEPTH = 32
+_IMPORT_STALE_SECONDS = 60 * 60
+_IMPORT_TEMP_NAME_LENGTH = len(_IMPORT_PREFIX) + 24 + len(".tmp")
+_WINDOWS_MAX_PATH = 259
+_WINDOWS_MAX_FOLDER = 247
+_MOVE_TRIES = 3
+_MOVE_RETRY_SECONDS = 0.35
+
+
+class _ImportWriteError(Exception):
+    """An import could not change the project; ``path`` is relative to the project root."""
+
+    def __init__(self, message: str, path: str) -> None:
+        """Keep a user-safe message and the project-relative path it is about."""
+        super().__init__(message)
+        self.path = path
+
+
+class _ImportConflict(_ImportWriteError):
+    """A target can't be written as asked; found before any byte is written."""
+
+
+class _ImportFileInUse(_ImportWriteError):
+    """Windows refused to replace a file another program holds open."""
+
+
+class _ImportDiskError(_ImportWriteError):
+    """The project folder refused a write, a move or a folder."""
+
+
+class _ImportRestoreFailed(_ImportWriteError):
+    """A failed import could not put a file back; ``kept`` is where its old copy still is."""
+
+    def __init__(self, message: str, path: str, kept: str | None) -> None:
+        """Name the file that could not be restored and the old copy kept beside it."""
+        super().__init__(message, path)
+        self.kept = kept
+
+
+@dataclass
+class _ImportTarget:
+    parts: tuple[str, ...]
+    old_mode: int | None = None
+    temporary: str | None = None
+    backup: str | None = None
+    state: str = "untouched"
+
+    @property
+    def path(self) -> str:
+        """The target as a project-relative path."""
+        return "/".join(self.parts)
+
+    @property
+    def folder(self) -> str:
+        """The target's folder as a project-relative path, ``""`` for the root."""
+        return "/".join(self.parts[:-1])
+
+
+def _folded(name: str) -> str:
+    """A name as a case-insensitive, Unicode-normalising filesystem compares it."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _utf16_length(path: str) -> int:
+    """A path's length as Windows counts it."""
+    return len(path.encode("utf-16-le")) // 2
+
+
+class _ProjectImport:
+    """Write a set of files into a project so that all of them land or none do.
+
+    ``check`` refuses every conflict before a byte is written. ``stage`` writes
+    one file's bytes to a temporary entry beside its target. ``commit`` moves
+    each old copy to a backup and each temporary onto its target, and only
+    after all of them moved removes the backups. Leaving the ``with`` block
+    with an exception undoes everything: files walked back in reverse, every
+    temporary removed, folders this import created removed if empty. A backup
+    is kept whenever its file could not be put back.
+
+    An old copy is only ever an entry with exactly the target's name: a name
+    the filesystem matches by folding case or Unicode form is a conflict, so
+    no file is touched that the import was not asked to replace.
+    """
+
+    def __init__(
+        self,
+        root: PinnedDir,
+        targets: list[tuple[str, ...]],
+        *,
+        windows: bool = os.name == "nt",
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Hold the pinned project root and each target's path below it."""
+        self._root = root
+        self._targets = [_ImportTarget(tuple(parts)) for parts in targets]
+        self._windows = windows
+        self._clock = clock
+        self._sleep = sleep
+        self._created: list[tuple[str, ...]] = []
+        self._swept: set[tuple[str, ...]] = set()
+
+    def __enter__(self) -> "_ProjectImport":
+        """Start an import; leaving with an exception rolls it back."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: BaseException | None, _tb: object) -> bool:
+        """On an exception, undo everything; a file that could not be put back replaces the error."""
+        if exc is None:
+            return False
+        failure = self._roll_back()
+        if failure is not None:
+            raise failure
+        return False
+
+    def check(self) -> None:
+        """Refuse any target that can't be written as asked, before anything is written."""
+        files: set[tuple[str, ...]] = set()
+        folders: set[tuple[str, ...]] = set()
+        for target in self._targets:
+            if not target.parts or len(target.parts) > _IMPORT_MAX_DEPTH:
+                raise _ImportConflict(f"{target.path} is more than {_IMPORT_MAX_DEPTH} folders deep.", target.path)
+            key = tuple(_folded(part) for part in target.parts)
+            if key in files:
+                raise _ImportConflict(f"Two picked files would both be saved as {target.path}.", target.path)
+            files.add(key)
+            folders.update(key[:depth] for depth in range(1, len(key)))
+        for target in self._targets:
+            if tuple(_folded(part) for part in target.parts) in folders:
+                raise _ImportConflict(f"{target.path} would be both a file and a folder.", target.path)
+        if self._windows:
+            self._check_windows_lengths()
+        for target in self._targets:
+            try:
+                self._check_on_disk(target)
+            except OSError as exc:
+                raise _ImportDiskError(f"Couldn't read {target.path} in the project folder.", target.path) from exc
+
+    def stage(self, index: int, feed: Callable[[Callable[[bytes], None]], object]) -> None:
+        """Write one target's bytes to a new temporary entry beside it.
+
+        ``feed`` is called with a sink and pushes the file's bytes into it.
+        Errors from ``feed`` itself propagate; a write error becomes a disk error.
+        """
+        target = self._targets[index]
+        try:
+            with _opened_pinned_descendant(
+                self._root, target.parts[:-1], create=True, created=self._created
+            ) as parent:
+                self._sweep(parent, target.parts[:-1])
+                mode = target.old_mode if target.old_mode is not None else 0o644
+                temporary, fd = _create_project_temp(parent, _IMPORT_PREFIX, mode)
+                target.temporary = temporary
+                try:
+                    if target.old_mode is not None and hasattr(os, "fchmod"):
+                        os.fchmod(fd, mode)
+                    feed(lambda chunk: _write_all(fd, chunk))
+                finally:
+                    os.close(fd)
+        except (OSError, ValueError) as exc:
+            raise _ImportDiskError(f"Couldn't write {target.path} to the project folder.", target.path) from exc
+
+    def commit(self) -> None:
+        """Move every staged file into place, then drop the backups of the files it replaced."""
+        for target in self._targets:
+            try:
+                with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                    name = target.parts[-1]
+                    if target.old_mode is not None:
+                        backup = f"{_IMPORT_PREFIX}{secrets.token_hex(12)}.bak"
+                        # A held old copy means the user has it open, so it is not retried.
+                        dir_replace(parent, name, backup)
+                        target.backup = backup
+                        target.state = "backed_up"
+                    self._retrying(lambda: dir_replace(parent, target.temporary, name))
+                    target.temporary = None
+                    target.state = "replaced"
+            except (OSError, ValueError) as exc:
+                if self._windows and isinstance(exc, PermissionError):
+                    raise _ImportFileInUse(
+                        f"{target.path} is open in another program. Close it and import again.", target.path
+                    ) from exc
+                raise _ImportDiskError(f"Couldn't move {target.path} into place.", target.path) from exc
+        for target in self._targets:
+            if target.backup is not None:
+                self._discard(target, target.backup)
+                target.backup = None
+
+    def _check_windows_lengths(self) -> None:
+        """Refuse a target whose path, temporary entry or new folder would pass Windows' limits."""
+        base = str(self._root.path)
+        for target in self._targets:
+            folder = os.path.join(base, *target.parts[:-1])
+            if (
+                _utf16_length(os.path.join(base, *target.parts)) > _WINDOWS_MAX_PATH
+                or _utf16_length(folder) + 1 + _IMPORT_TEMP_NAME_LENGTH > _WINDOWS_MAX_PATH
+                or any(
+                    _utf16_length(os.path.join(base, *target.parts[:depth])) > _WINDOWS_MAX_FOLDER
+                    for depth in range(1, len(target.parts))
+                )
+            ):
+                raise _ImportConflict(f"{target.path} would be too long a path for Windows.", target.path)
+
+    def _check_on_disk(self, target: _ImportTarget) -> None:
+        """Refuse links, folders and case or Unicode variants in the way; note an old copy's mode."""
+        with ExitStack() as opened:
+            current = self._root
+            for depth, name in enumerate(target.parts, start=1):
+                shown = "/".join(target.parts[:depth])
+                if not name or os.path.basename(name) != name or name in {".", ".."}:
+                    raise _ImportConflict(f"{shown} isn't a valid name.", target.path)
+                try:
+                    found = dir_lstat(current, name)
+                except FileNotFoundError:
+                    return
+                if stat.S_ISLNK(found.st_mode):
+                    raise _ImportConflict(f"{shown} is a link, so the import won't write through it.", target.path)
+                try:
+                    _existing_entry_name(current, name)
+                except FileNotFoundError:
+                    raise _ImportConflict(
+                        f"{shown} matches an existing name that differs only in case or accents. Rename one of them.",
+                        target.path,
+                    ) from None
+                if depth < len(target.parts):
+                    if not stat.S_ISDIR(found.st_mode):
+                        raise _ImportConflict(f"{shown} is a file, but the import needs a folder there.", target.path)
+                    current = open_pinned_child(current, name)
+                    opened.callback(current.close)
+                elif stat.S_ISDIR(found.st_mode):
+                    raise _ImportConflict(f"{shown} is a folder, so the file can't be saved there.", target.path)
+                elif not stat.S_ISREG(found.st_mode):
+                    raise _ImportConflict(f"{shown} isn't a regular file.", target.path)
+                else:
+                    target.old_mode = stat.S_IMODE(found.st_mode)
+
+    def _sweep(self, parent: PinnedDir, folder: tuple[str, ...]) -> None:
+        """Remove import temporaries a killed import left in this folder over an hour ago."""
+        if folder in self._swept:
+            return
+        self._swept.add(folder)
+        cutoff = self._clock() - _IMPORT_STALE_SECONDS
+        with dir_scandir(parent) as entries:
+            names = [e.name for e in entries if e.name.startswith(_IMPORT_PREFIX) and e.name.endswith(".tmp")]
+        for name in names:
+            try:
+                found = dir_lstat(parent, name)
+                if stat.S_ISREG(found.st_mode) and found.st_mtime < cutoff:
+                    dir_unlink(parent, name)
+            except OSError as exc:
+                logger.warning("Could not remove a stale import temporary in %r: %s", "/".join(folder), exc)
+
+    def _retrying(self, action: Callable[[], None]) -> None:
+        """Run a move or removal, retrying briefly on Windows where a scanner may hold the file."""
+        tries = _MOVE_TRIES if self._windows else 1
+        for attempt in range(tries):
+            try:
+                action()
+                return
+            except PermissionError:
+                if attempt == tries - 1:
+                    raise
+                self._sleep(_MOVE_RETRY_SECONDS)
+
+    def _discard(self, target: _ImportTarget, name: str) -> None:
+        """Remove a temporary or backup beside ``target``; a failure is logged, not raised."""
+        try:
+            with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                self._retrying(lambda: dir_unlink(parent, name))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            logger.warning("Import could not remove %r beside %r: %s", name, target.path, exc)
+
+    def _roll_back(self) -> _ImportRestoreFailed | None:
+        """Undo every target in reverse, then remove the folders this import made; return the first restore failure."""
+        failure: _ImportRestoreFailed | None = None
+        for target in reversed(self._targets):
+            failed = self._undo(target)
+            if failure is None:
+                failure = failed
+        for parts in sorted(self._created, key=len, reverse=True):
+            try:
+                with _opened_pinned_descendant(self._root, parts[:-1], create=False) as parent:
+                    dir_rmdir(parent, parts[-1])
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                    logger.warning("Import could not remove the folder %r it created: %s", "/".join(parts), exc)
+        return failure
+
+    def _undo(self, target: _ImportTarget) -> _ImportRestoreFailed | None:
+        """Put one target back as it was and remove its temporary; report a file that stays changed."""
+        name = target.parts[-1]
+        try:
+            if target.state != "untouched":
+                with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                    if target.backup is not None:
+                        backup = target.backup
+                        self._retrying(lambda: dir_replace(parent, backup, name))
+                        target.backup = None
+                    else:
+                        self._retrying(lambda: dir_unlink(parent, name))
+                    target.state = "untouched"
+        except (OSError, ValueError) as exc:
+            if target.backup is not None:
+                kept = "/".join((*target.parts[:-1], target.backup))
+                failure = _ImportRestoreFailed(
+                    f"The import failed and {target.path} couldn't be put back. "
+                    f"Its old copy was kept as {kept}.",
+                    target.path,
+                    kept,
+                )
+            else:
+                failure = _ImportRestoreFailed(
+                    f"The import failed and couldn't remove {target.path}, which it had added.",
+                    target.path,
+                    None,
+                )
+            failure.__cause__ = exc
+            return failure
+        finally:
+            if target.temporary is not None:
+                self._discard(target, target.temporary)
+                target.temporary = None
+        return None
 
 
 def _write_project_bytes(
