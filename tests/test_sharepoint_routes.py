@@ -38,6 +38,7 @@ SITE = "https://contoso.sharepoint.com/sites/team"
 SITE_2 = "https://contoso.sharepoint.com/sites/ops"
 SITE_ID = "contoso.sharepoint.com,aaaa-1111,bbbb-2222"
 TOKEN_URL = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+OTHER_CLIENT = "99999999-0000-0000-0000-000000000000"
 BODY = {"name": "corp", "tenant_id": TENANT, "client_id": CLIENT_ID, "client_secret": SECRET, "site_urls": SITE}
 
 AUTH_TOKEN = "sharepoint-routes-test-token"
@@ -173,22 +174,57 @@ def test_create_onto_an_existing_name_is_refused_and_leaves_it_unchanged(microso
     assert _names() == ["corp"]
 
 
-def test_a_create_that_loses_a_race_for_its_name_removes_its_record(monkeypatch, microsoft):
+def _create_during_the_check(monkeypatch, name: str, credentials_override: dict) -> None:
+    """While the key is checked, another writer saves ``name``; the lock is not held meanwhile."""
     real_check = sharepoint_ep._check
 
     def check_while_someone_else_creates(credentials):
+        assert not sharepoint_ep._CREATE_LOCK.locked()
         real_check(credentials)
-        persist_connection(
-            "sharepoint", None, "corp", {**credentials, "client_id": "99999999-0000-0000-0000-000000000000"}, scope=LOCAL_SCOPE,
-        )
+        persist_connection("sharepoint", None, name, {**credentials, **credentials_override}, scope=LOCAL_SCOPE)
 
     monkeypatch.setattr(sharepoint_ep, "_check", check_while_someone_else_creates)
+
+
+def test_a_create_that_loses_a_race_for_its_name_leaves_the_winner_alone(monkeypatch, microsoft):
+    _create_during_the_check(monkeypatch, "corp", {"client_id": OTHER_CLIENT})
 
     status, _ = _status(lambda: sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE))
 
     assert status == 409
     assert _names() == ["corp"]
-    assert _record()["fields"]["client_id"] == "99999999-0000-0000-0000-000000000000"
+    assert _record()["fields"]["client_id"] == OTHER_CLIENT
+
+
+def test_a_create_racing_the_same_key_for_its_name_is_refused_too(monkeypatch, microsoft):
+    _create_during_the_check(monkeypatch, "corp", {"client_secret": NEW_SECRET})
+
+    status, _ = _status(lambda: sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE))
+
+    assert status == 409
+    assert _names() == ["corp"]
+    assert _record()["fields"]["client_secret"] == NEW_SECRET
+
+
+def test_a_lost_race_never_touches_an_existing_suffixed_connection(monkeypatch, microsoft):
+    sharepoint_ep.create_connection({**BODY, "name": "corp-2"}, LOCAL_SCOPE)
+    before = _record("corp-2")
+    _create_during_the_check(monkeypatch, "corp", {"client_id": OTHER_CLIENT})
+
+    status, _ = _status(lambda: sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE))
+
+    assert status == 409
+    assert sorted(_names()) == ["corp", "corp-2"]
+    assert _record("corp-2") == before
+
+
+def test_a_name_sharing_an_env_prefix_taken_during_the_check_is_refused(monkeypatch, microsoft):
+    _create_during_the_check(monkeypatch, "corp_one", {"client_id": OTHER_CLIENT})
+
+    status, _ = _status(lambda: sharepoint_ep.create_connection({**BODY, "name": "corp-one"}, LOCAL_SCOPE))
+
+    assert status == 409
+    assert _names() == ["corp_one"]
 
 
 @pytest.mark.parametrize(

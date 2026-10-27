@@ -4,14 +4,17 @@ A connection is created or edited here, never through the generic
 submission: the key is checked against Microsoft (``SharePointClient.check``)
 before anything is stored. Create and edit are separate routes: a create
 refuses a name already in use, so it never replaces another key's
-connection (two creates racing for one name with the same key store the
-later secret, as any same-account save does). Browse reads only the sites the
+connection. Creates take one lock while they check the name again and save,
+so a name or env prefix taken during the key check is refused, not
+overwritten. Browse reads only the sites the
 connection names. Refused in org mode: the hosted app keeps connections in
 auth, not in this vault.
 """
 from __future__ import annotations
 
+import logging
 import re
+import threading
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
@@ -40,6 +43,7 @@ from cowork.services.connectors.sharepoint import (
     validate_tenant_id,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
@@ -53,6 +57,9 @@ _NAME = re.compile(r"[A-Za-z0-9]+([-_][A-Za-z0-9]+)*")
 _MAX_NAME = 64
 _MAX_CURSOR = 4096
 _KEY_NO_LONGER_WORKS = "This connection's key no longer works. Ask whoever set it up to update it."
+_NAME_TAKEN = "A SharePoint connection with this name already exists."
+# One server process serves the desktop and self-hosted; org mode is refused.
+_CREATE_LOCK = threading.Lock()
 _BROWSE_STATUS = {
     SharePointErrorKind.INVALID: status.HTTP_400_BAD_REQUEST,
     SharePointErrorKind.TENANT_NOT_FOUND: status.HTTP_409_CONFLICT,
@@ -118,6 +125,12 @@ def _env_key(name: str) -> str:
     return re.sub(r"[^\w]", "_", name).casefold()
 
 
+def _name_taken(vault: LocalDataVault | LayeredDataVault, name: str) -> bool:
+    """Whether a SharePoint connection already holds ``name`` or its env prefix."""
+    taken = {_env_key(c["name"]) for c in vault.list_connections() if c.get("engine") == ENGINE}
+    return _env_key(name) in taken
+
+
 def _valid_name(name: str) -> bool:
     """Whether ``name`` fits the connection name rule."""
     return len(name) <= _MAX_NAME and bool(_NAME.fullmatch(name))
@@ -142,18 +155,23 @@ def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str
     if VAULT_KEEP_SENTINEL in fields.values():
         raise _unprocessable("A new connection has no stored secret to keep.")
     vault = vault_for_scope(scope)
-    taken = {_env_key(c["name"]) for c in vault.list_connections() if c.get("engine") == ENGINE}
-    if _env_key(name) in taken:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A SharePoint connection with this name already exists.")
+    if _name_taken(vault, name):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN)
     credentials = _credentials(fields)
     _check(credentials)
-    slug = persist_connection(
-        ENGINE, None, name, credentials, user_label=fields.get("user_label") or None, vault=vault, scope=scope,
-    )
+    # The key check can take a minute, so the name is checked again under the
+    # lock every create holds while it saves.
+    with _CREATE_LOCK:
+        if _name_taken(vault, name):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN)
+        slug = persist_connection(
+            ENGINE, None, name, credentials, user_label=fields.get("user_label") or None, vault=vault, scope=scope,
+        )
     if slug != name:
-        # Another create took this name while the key was being checked.
-        ConnectionsService(scope).delete(ENGINE, slug)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A SharePoint connection with this name already exists.")
+        # Only a writer outside these routes gets here. The record it saved
+        # to may have existed before this request, so nothing is deleted.
+        logger.warning("A SharePoint create for %r was saved as %r by another writer's race", name, slug)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN)
     return _saved(vault, slug)
 
 
