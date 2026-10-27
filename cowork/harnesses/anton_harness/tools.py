@@ -27,12 +27,14 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT
 from cowork.services.connectors.specs._registry import registry
 
 logger = logging.getLogger(__name__)
@@ -480,6 +482,25 @@ def _lookup_score(query: str, c: dict) -> float:
     return score
 
 
+def _sharepoint_instruction() -> str:
+    """What the agent tells a person who wants SharePoint, instead of collecting its key.
+
+    SharePoint is saved only by its own form in Customize, which checks the
+    key with Microsoft first, and that form exists only outside org mode.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return (
+            "Don't ask for SharePoint's key in chat. Tell the person SharePoint is "
+            "available in the desktop app."
+        )
+    return (
+        "Don't ask for SharePoint's key in chat and don't call request_credentials for it. "
+        "Tell the person to set it up in Customize, under Connections, where Cowork checks "
+        "the key with Microsoft. Once it is connected, they bring files into a project with "
+        "\"Add files from SharePoint\"."
+    )
+
+
 async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
     """Tool handler for `lookup_connector`.
 
@@ -503,6 +524,17 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
         return "lookup_connector: provide either `id` (a connector slug) or `query` (a natural-language name)."
 
     def _present(connector: dict, confidence: float, stage: str) -> str:
+        if connector.get("id") == SHAREPOINT:
+            # No form: there is nothing for request_credentials to render.
+            return json.dumps({
+                "id": connector.get("id"),
+                "label": connector.get("label"),
+                "description": connector.get("description"),
+                "category": connector.get("category"),
+                "confidence": confidence,
+                "stage": stage,
+                "next_step": _sharepoint_instruction(),
+            })
         # Stamp `_connector_id` into the form blob so the LLM doesn't
         # have to remember to copy it across. The vault save endpoint
         # uses this to route through POST /v1/connectors/{id}/save
@@ -767,6 +799,8 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         validate_engine_id(connector_id)
     except InvalidConnectorIdError as e:
         return f"request_credentials: {e}"
+    if connector_id == SHAREPOINT:
+        return f"request_credentials: {_sharepoint_instruction()}"
     # For a registry id the server validates and saves against the registry
     # spec, not this form, so a handcrafted form for one can't be honoured.
     is_builtin = registry.get_connector(connector_id) is not None
