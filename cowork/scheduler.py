@@ -91,7 +91,10 @@ _STOP_GRACE_SECONDS = 30
 _REMOTE_STOP_GRACE_SECONDS = CANCEL_FLAG_TTL_SECONDS
 _scheduler_task: asyncio.Task | None = None
 
-_RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
+_RECURRING_CADENCES = {
+    Cadence.every_15_minutes, Cadence.every_30_minutes, Cadence.hourly,
+    Cadence.daily, Cadence.weekly, Cadence.weekdays,
+}
 
 # A one-off may start up to this late on its own. At this lateness or more
 # (the app was not running when its time came) it is shown as missed, and
@@ -105,7 +108,8 @@ _MISSED_RUN_LOOKBACK = timedelta(days=7)
 # recently before a due cron slot, the slot is skipped instead of executed,
 # so both runs don't publish the same output twice. Only manual runs count:
 # a cron run is its own slot. Hourly gets a tighter window so a run
-# finishing mid-hour never suppresses the next slot.
+# finishing mid-hour never suppresses the next slot. Shorter cadences get
+# none: at every 15 or 30 minutes, a slot right after a manual run is wanted.
 _FRESHNESS_WINDOW_SECONDS = {
     Cadence.once: 60 * 60,
     Cadence.hourly: 30 * 60,

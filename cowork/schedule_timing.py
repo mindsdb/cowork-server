@@ -12,6 +12,13 @@ from cowork.schemas.schedules import Cadence
 
 logger = get_logger(__name__)
 
+# Cadences a fixed elapsed time apart, whatever the zone or the date.
+FIXED_INTERVALS = {
+    Cadence.every_15_minutes: timedelta(minutes=15),
+    Cadence.every_30_minutes: timedelta(minutes=30),
+    Cadence.hourly: timedelta(hours=1),
+}
+
 
 def resolve_timezone(name: str | None) -> ZoneInfo:
     if not name:
@@ -43,8 +50,9 @@ def advance_occurrence(cadence: str, at: datetime, timezone_name: str) -> dateti
     if current is None:
         raise ValueError("at must be a datetime")
 
-    if cadence == Cadence.hourly:
-        return current + timedelta(hours=1)
+    interval = FIXED_INTERVALS.get(cadence)
+    if interval is not None:
+        return current + interval
 
     tz = resolve_timezone(timezone_name)
     local = current.astimezone(tz)
@@ -134,14 +142,15 @@ def missed_slots(
     overdue: list[datetime] = []
     count = 0
     first: datetime | None = None
-    if cadence == Cadence.hourly and cursor < floor - timedelta(hours=1):
-        # Hourly slots are a fixed hour apart in UTC, so the ones well before
-        # the floor are counted, not walked: a schedule a year behind would
-        # otherwise step through thousands of slots.
+    interval = FIXED_INTERVALS.get(cadence)
+    if interval is not None and cursor < floor - interval:
+        # Fixed-interval slots are evenly spaced in UTC, so the ones well
+        # before the floor are counted, not walked: a schedule a year behind
+        # would otherwise step through thousands of slots.
         first = cursor
-        jumped = int((floor - cursor) // timedelta(hours=1)) - 1
+        jumped = int((floor - cursor) // interval) - 1
         count += jumped
-        cursor += timedelta(hours=jumped)
+        cursor += interval * jumped
     while cursor <= reference:
         count += 1
         if first is None:
