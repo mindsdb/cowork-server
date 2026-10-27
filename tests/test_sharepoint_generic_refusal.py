@@ -99,7 +99,15 @@ def test_in_org_mode_the_refusal_points_to_the_desktop_app(stores, monkeypatch):
     assert len(store._store) == staged_before
 
 
-def test_other_connectors_still_reach_the_generic_path(stores):
-    response = _client().post("/api/v1/connectors/submissions/", json={"connector_id": "no_such_connector_x", "values": {}})
+def test_other_connectors_still_save_through_the_generic_path(stores):
+    values = {"host": "db.example.com", "user": "demo", "password": "pg-generic-secret-5e1a"}
 
-    assert response.status_code == 404
+    response = _client().post(
+        "/api/v1/connectors/connections/save",
+        json={"connector_id": "postgres", "method": "host-port", "name": "corp", "values": values},
+    )
+
+    assert response.status_code == 200, response.text
+    record = vault_for_scope(LOCAL_SCOPE).read_record("postgres", "corp")
+    assert record is not None
+    assert record["fields"]["host"] == "db.example.com"
