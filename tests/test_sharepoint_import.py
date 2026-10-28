@@ -449,3 +449,33 @@ def test_a_skipped_item_is_reported_under_the_outer_pick_whatever_the_pick_order
         "imported": [{"path": "Reports/Old/a.txt", "size": 1}],
         "skipped": [{"path": "Reports/Old/.DS_Store", "reason": "its name starts with a dot"}],
     }
+
+
+def _paths(entries: list[dict]) -> list[str]:
+    return sorted(entry["path"] for entry in entries)
+
+
+def test_a_folder_absorbed_twice_reports_its_skipped_items_under_the_outermost_pick(microsoft, project):
+    name, _id, _folder = project
+    inner = microsoft.folder("01C", "C", [microsoft.file("01c", "c.txt", b"c"), microsoft.file("01x", ".c", b"x")])
+    middle = microsoft.folder("01B", "B", [microsoft.file("01b", "b.txt", b"b"), microsoft.file("01y", ".b", b"y"), inner])
+    microsoft.folder("01A", "A", [microsoft.file("01z", ".a", b"z"), middle])
+
+    response = _import(name, ["01C", "01B", "01A"])
+
+    assert response.status_code == 200, response.text
+    assert _paths(response.json()["imported"]) == ["A/B/C/c.txt", "A/B/b.txt"]
+    assert _paths(response.json()["skipped"]) == ["A/.a", "A/B/.b", "A/B/C/.c"]
+
+
+def test_two_sibling_picks_absorbed_by_their_parent_report_skipped_items_under_it(microsoft, project):
+    name, _id, _folder = project
+    first = microsoft.folder("01X", "X1", [microsoft.file("01f", "f1.txt", b"f"), microsoft.file("01u", ".x1", b"u")])
+    second = microsoft.folder("01Y", "X2", [microsoft.file("01g", "f2.txt", b"g"), microsoft.file("01v", ".x2", b"v")])
+    microsoft.folder("01P", "P", [first, microsoft.file("01w", ".p", b"w"), second])
+
+    response = _import(name, ["01X", "01Y", "01P"])
+
+    assert response.status_code == 200, response.text
+    assert _paths(response.json()["imported"]) == ["P/X1/f1.txt", "P/X2/f2.txt"]
+    assert _paths(response.json()["skipped"]) == ["P/.p", "P/X1/.x1", "P/X2/.x2"]
