@@ -20,6 +20,7 @@
   "description": "Query and write blocks and pages in a Roam Research graph via its official Backend API.",
   "category": "productivity",
   "logo": "brain",
+  "logo_url": "logos/roam_research.svg",
   "logo_color": "#4A66E0",
   "usage_notes": "Base URL is `https://api.roamresearch.com/api/graph/{graph_name}/`; read with `POST .../q` (EDN Datalog in `{\"query\": ...}`) or `.../pull`, write with `POST .../write`. Send `Authorization: Bearer {api_token}` and `Content-Type: application/json`. `/write` takes one JSON object per request, such as `{\"action\": \"create-page\", \"page\": {\"title\": ...}}` or `create-block` with `\"location\": {\"parent-uid\": ..., \"order\": \"last\"}`; send several as `{\"action\": \"batch-actions\", \"actions\": [...]}`, because a bare JSON array is rejected. A successful single-action write answers 200 with an empty body, so check the status instead of parsing JSON. `/q` returns `{\"result\": [[...], ...]}`, one list per row. Calls answer 308 with a `Location` on a per-graph peer host whose subdomain and port change between calls, so never hardcode a peer. Most HTTP clients follow it but drop the Authorization header because the host changes: re-send the request to the `Location` URL yourself with the header re-attached. `{\"message\": \"You are not authenticated\"}` means the header was dropped on that redirect, not that the token is bad. `graph_name` is case-sensitive; `You don't have read access to <graph>` can mean a miscased graph name, an unrecognized token, or a token without read scope. `You don't have write access to <graph>` on a token whose reads work means the user chose a read-only token: tell them writes need a new read & edit token instead of retrying.",
   "form": {
@@ -27,6 +28,7 @@
     "title": "Connect Roam Research",
     "subtitle": "Paste a graph API token to connect one Roam Research graph. What Anton can do with it is fixed by the token's access scope — read-only, or read & edit for writes. Roam has no OAuth, so this is the only supported connection method.",
     "logo": "brain",
+    "logo_url": "logos/roam_research.svg",
     "logo_color": "#4A66E0",
     "methods": [
       {
