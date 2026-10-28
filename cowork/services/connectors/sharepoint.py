@@ -115,7 +115,7 @@ class SharePointError(Exception):
 class AppKey:
     tenant_id: str
     client_id: str
-    client_secret: str
+    client_secret: str = field(repr=False)
 
     def cache_key(self) -> tuple[str, str, str]:
         """Identify this key in the token cache without holding the secret itself."""

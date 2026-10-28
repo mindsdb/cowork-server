@@ -1233,3 +1233,9 @@ def test_a_skipped_item_picked_by_two_ids_is_listed_once():
 
     assert plan.files == []
     assert [s.path for s in plan.skipped] == [".DS_Store"]
+
+
+def test_an_app_keys_repr_never_shows_the_secret():
+    assert SECRET not in repr(KEY)
+    assert SECRET not in str(KEY)
+    assert KEY.client_id in repr(KEY)
