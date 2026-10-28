@@ -172,6 +172,14 @@ class ImportPlan:
 
 
 @dataclass
+class _WalkedFolder:
+    """One picked folder's planned files and skipped items, paths starting at its own name."""
+
+    files: list[PlannedFile]
+    skipped: list[tuple[tuple[str, ...], str]]
+
+
+@dataclass
 class _ImportBudget:
     """What one import plan has spent; each method refuses as soon as a limit is crossed."""
 
@@ -641,11 +649,13 @@ class SharePointClient:
                 continue
             picks.append(item)
         covered: set[str] = set()
-        walked: dict[str, list[PlannedFile]] = {}
+        walked: dict[str, _WalkedFolder] = {}
         for pick in picks:
             if pick.kind == "folder" and pick.id not in covered:
                 walked[pick.id] = self._walk(site, drive_id, pick, deadline, budget, walked, picked_ids, covered)
-        files = [planned for folder_files in walked.values() for planned in folder_files]
+        files = [planned for folder in walked.values() for planned in folder.files]
+        for folder in walked.values():
+            budget.skipped.extend(SkippedItem(path="/".join(parts), reason=reason) for parts, reason in folder.skipped)
         for pick in picks:
             if pick.kind == "file" and pick.id not in covered:
                 budget.add_file(pick.size)
@@ -661,17 +671,19 @@ class SharePointClient:
         folder: Item,
         deadline: _Deadline,
         budget: _ImportBudget,
-        walked: dict[str, list[PlannedFile]],
+        walked: dict[str, _WalkedFolder],
         picked_ids: set[str],
         covered: set[str],
-    ) -> list[PlannedFile]:
+    ) -> _WalkedFolder:
         """Plan every file under one picked folder, with paths starting at the folder's own name.
 
         A picked folder already walked is taken over, not walked again: its
-        files move under this folder and it leaves ``walked``. Any pick met
-        here is marked covered so it is not placed on its own.
+        files and skipped items move under this folder and it leaves
+        ``walked``. Any pick met here is marked covered so it is not placed on
+        its own.
         """
         files: list[PlannedFile] = []
+        skipped: list[tuple[tuple[str, ...], str]] = []
         queue: deque[tuple[str, tuple[str, ...]]] = deque([(folder.id, (folder.name,))])
         while queue:
             folder_id, prefix = queue.popleft()
@@ -692,11 +704,13 @@ class SharePointClient:
                         covered.add(child.id)
                     reason = _skip_reason(child)
                     if reason is not None:
-                        budget.skipped.append(SkippedItem(path="/".join(path), reason=reason))
+                        skipped.append((path, reason))
                         continue
                     if child.kind == "folder" and child.id in walked:
-                        for planned in walked.pop(child.id):
+                        taken = walked.pop(child.id)
+                        for planned in taken.files:
                             files.append(PlannedFile(_within_depth((*prefix, *planned.parts)), planned.item_id, planned.size))
+                        skipped.extend(((*prefix, *parts), reason) for parts, reason in taken.skipped)
                     elif child.kind == "folder":
                         queue.append((child.id, _within_depth(path)))
                     else:
@@ -705,7 +719,7 @@ class SharePointClient:
                 cursor = page.cursor
                 if cursor is None:
                     break
-        return files
+        return _WalkedFolder(files=files, skipped=skipped)
 
     def _get_item(self, site: Site, drive_id: str, item_id: str, deadline: _Deadline) -> Item:
         """Read one picked item of a library already checked against the site."""
