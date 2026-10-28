@@ -1,0 +1,123 @@
+# What export_formats offers, by the artifact's primary file and the caller,
+# in the order html, docx, pdf. A case leaves out what it doesn't change:
+# is_backend defaults to false, can_edit to true and pdf to no engine.
+render_service: &render_service
+  engine: render
+  render_url: "http://render.internal:8080"
+
+cases:
+  - id: markdown
+    source_name: report.md
+    expected: [html, docx]
+  - id: markdown-long-suffix
+    source_name: report.markdown
+    expected: [html, docx]
+  - id: text
+    source_name: notes.txt
+    expected: [html, docx]
+  - id: suffix-in-capitals
+    source_name: REPORT.MD
+    expected: [html, docx]
+  - id: markdown-in-a-subfolder
+    source_name: docs/report.md
+    expected: [html, docx]
+  - id: html
+    source_name: index.html
+    expected: [docx]
+  - id: htm-in-capitals
+    source_name: page.HTM
+    expected: [docx]
+  - id: spreadsheet
+    source_name: data.csv
+    expected: []
+  - id: word-file
+    source_name: report.docx
+    expected: []
+  - id: no-suffix
+    source_name: Makefile
+    expected: []
+  - id: no-primary
+    source_name: ""
+    expected: []
+  - id: full-stack-app
+    source_name: static/index.html
+    is_backend: true
+    expected: []
+  - id: caller-who-cannot-edit
+    source_name: report.md
+    can_edit: false
+    expected: []
+  - id: housekeeping-readme
+    source_name: README.md
+    expected: []
+  - id: housekeeping-name-casefolded
+    source_name: Readme.MD
+    expected: []
+  - id: generation-input
+    source_name: prd.md
+    expected: []
+  # As on the read: README.md and the generation inputs are content inside a
+  # subfolder, and only the store-owned names are refused at any depth.
+  - id: readme-in-a-subfolder
+    source_name: docs/README.md
+    expected: [html, docx]
+  - id: generation-input-in-a-subfolder
+    source_name: docs/prd.md
+    expected: [html, docx]
+  - id: store-owned-name-in-a-subfolder
+    source_name: docs/metadata.json/report.md
+    expected: []
+  - id: store-owned-name-casefolded-in-a-subfolder
+    source_name: docs/Metadata.JSON/report.md
+    expected: []
+  - id: under-revisions
+    source_name: .revisions/report.md
+    expected: []
+  - id: under-revisions-casefolded-in-a-subfolder
+    source_name: docs/.Revisions/report.md
+    expected: []
+  - id: windows-separators-under-revisions
+    source_name: '.revisions\report.md'
+    expected: []
+  # The export's read refuses a name Windows would read as another file,
+  # on every platform, so no format is offered for one.
+  - id: windows-device-name
+    source_name: aux.md
+    expected: []
+  - id: windows-device-name-in-a-subfolder
+    source_name: docs/nul/report.md
+    expected: []
+  - id: alternate-data-stream
+    source_name: "notes:q3.md"
+    expected: []
+  - id: trailing-space-in-a-subfolder
+    source_name: "docs /report.md"
+    expected: []
+  - id: render-service-markdown
+    source_name: report.md
+    pdf: *render_service
+    expected: [html, docx, pdf]
+  - id: render-service-html
+    source_name: index.html
+    pdf: *render_service
+    expected: [docx, pdf]
+  - id: render-service-spreadsheet
+    source_name: data.csv
+    pdf: *render_service
+    expected: []
+  - id: render-service-caller-who-cannot-edit
+    source_name: report.md
+    can_edit: false
+    pdf: *render_service
+    expected: []
+  - id: render-service-full-stack-app
+    source_name: static/index.html
+    is_backend: true
+    pdf: *render_service
+    expected: []
+  - id: render-engine-without-a-url
+    source_name: report.md
+    pdf:
+      engine: render
+      render_url: null
+    expected: [html, docx]

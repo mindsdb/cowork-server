@@ -216,7 +216,7 @@ class TestStampReachesTheHarness:
                 captured.update(kwargs)
                 return None
 
-            async def formatter(self, stream, model, event_sink):
+            async def formatter(self, stream, model, event_sink, **_kwargs):
                 event_sink(
                     "response.output_text.delta",
                     {"type": "response.output_text.delta", "delta": "ok"},
@@ -397,7 +397,7 @@ class TestOverlayFallbackAtAnOldPin:
 
         # Compiled names rather than source text: a commented-out call still
         # reads as present in the source, and renames are not the risk here.
-        names = AntonHarness._build_chat_session.__code__.co_names
+        names = AntonHarness._build_turn_session.__code__.co_names
         assert "_apply_overlay_fallback" in names
 
     def test_the_fallback_applies_only_when_the_kwarg_was_dropped(self):
