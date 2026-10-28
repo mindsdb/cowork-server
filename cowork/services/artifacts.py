@@ -714,11 +714,14 @@ def _artifacts_base_in(project_dir: Path) -> Path | None:
     `/serve` checks containment against this folder resolved, so a link in
     either component would make every file the link reaches servable.
     """
-    from cowork.services.artifact_roots import _storage_components_are_safe
+    from cowork.services.artifact_roots import (
+        _ARTIFACTS_SUBPATH,
+        _storage_components_are_safe,
+    )
 
     if not _storage_components_are_safe(project_dir, may_be_absent=False):
         return None
-    return project_dir / ".anton" / "artifacts"
+    return project_dir.joinpath(*_ARTIFACTS_SUBPATH)
 
 
 def _external_project_dir(

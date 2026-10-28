@@ -342,40 +342,25 @@ def test_serve_refuses_an_adopted_folders_anton_linked_elsewhere(projects_root, 
     assert "outside the project" not in served.text
 
 
+@pytest.mark.parametrize("dangling", [False, True], ids=["no-artifacts", "dangling-link"])
 def test_serve_does_not_take_a_root_folder_of_the_same_name_for_an_adopted_project(
-    projects_root, tmp_path
+    projects_root, tmp_path, dangling
 ):
     """The scan lists every directory in the projects root, so falling through
-    to it would serve a leftover folder under the adopted project's name."""
+    to it would serve a leftover folder under the adopted project's name. A
+    dangling link at the adopted folder's path is not a stale row either."""
     import shutil
 
     folder = tmp_path / "Documents" / "notes"
     folder.mkdir(parents=True)
     client = _local_client()
-    name = _adopt(client, folder, "same-name")
-    shutil.rmtree(folder / ".anton", ignore_errors=True)
-    page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
-    page.parent.mkdir(parents=True)
-    page.write_text("<html>leftover in the root</html>")
-
-    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
-
-    assert served.status_code == 404
-    assert "leftover in the root" not in served.text
-
-
-def test_serve_does_not_take_a_root_folder_for_an_adopted_path_left_as_a_dangling_link(
-    projects_root, tmp_path
-):
-    """A dangling link at the adopted folder's path is not a stale row."""
-    import shutil
-
-    folder = tmp_path / "Documents" / "notes"
-    folder.mkdir(parents=True)
-    client = _local_client()
-    name = _adopt(client, folder, "dangling")
-    shutil.rmtree(folder)
-    folder.symlink_to(tmp_path / "nowhere", target_is_directory=True)
+    # Rows outlive the test in the app's database, so each case needs its own name.
+    name = _adopt(client, folder, "dangling" if dangling else "same-name")
+    if dangling:
+        shutil.rmtree(folder)
+        folder.symlink_to(tmp_path / "nowhere", target_is_directory=True)
+    else:
+        shutil.rmtree(folder / ".anton", ignore_errors=True)
     page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
     page.parent.mkdir(parents=True)
     page.write_text("<html>leftover in the root</html>")
