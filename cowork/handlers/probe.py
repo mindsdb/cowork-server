@@ -22,7 +22,6 @@ from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
-from cowork.services.connectors.identity import secure_keys_for
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
@@ -553,12 +552,15 @@ class ProbeHandler:
             if grant_slug:
                 saved_slug, saved_user_label = grant_slug, grant_user_label
             elif final_outcome.status == "success":
+                # A connector the static registry lacks has only this form to
+                # say which fields are secret.
+                builtin = registry.get_connector(connector_id) is not None
                 try:
                     vault = vault_for_scope(self.scope)
                     slug = persist_connection(
                         connector_id, method, extends_name or name, credentials,
                         label=connection_label, user_label=connection_user_label,
-                        extends=bool(extends_name), spec_form=form_spec if registry.get_connector(connector_id) is None else None,
+                        extends=bool(extends_name), spec_form=None if builtin else form_spec,
                         vault=vault, scope=self.scope,
                     )
                     saved_slug = slug
@@ -573,7 +575,7 @@ class ProbeHandler:
                 summary = final_outcome.summary or "Connection works."
                 yield _delta(f"\n\n{summary}\n\nSaved as `{saved_slug}`.\n")
                 if spec is None and not extends_name:
-                    note = await self._save_definition(connector_id, form_spec, method, credentials)
+                    note = await self._save_definition(connector_id, form_spec)
                     if note:
                         yield _delta(note)
                 yield _patch_delta({
@@ -638,9 +640,7 @@ class ProbeHandler:
             if _temp_workspace_dir:
                 shutil.rmtree(_temp_workspace_dir, ignore_errors=True)
 
-    async def _save_definition(
-        self, connector_id: str, form_spec: dict, method: str | None, credentials: dict,
-    ) -> str | None:
+    async def _save_definition(self, connector_id: str, form_spec: dict) -> str | None:
         """Store a tested handcrafted form as the scope's custom connector.
 
         Local installs only for now: who may publish a connector to a whole
@@ -649,9 +649,6 @@ class ProbeHandler:
         Args:
             connector_id: The engine id the connection was saved under.
             form_spec: The handcrafted form that passed its test.
-            method: The form method the user submitted, if any.
-            credentials: The submitted values; the secret ones must not reappear
-                in the shared usage notes.
 
         Returns:
             None when saved or skipped, else a line telling the user the
@@ -659,14 +656,9 @@ class ProbeHandler:
         """
         if self.scope.org_mode:
             return None
-        secret_values = [
-            str(credentials[key]) for key in secure_keys_for(connector_id, method, credentials, form_spec)
-        ]
         try:
             await run_db(
-                lambda session: CustomConnectorService(session).upsert_from_form(
-                    connector_id, form_spec, secret_values=secret_values,
-                ),
+                lambda session: CustomConnectorService(session).upsert_from_form(connector_id, form_spec),
                 scope=self.scope,
             )
         except UnstorableFormError as e:

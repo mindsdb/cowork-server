@@ -15,6 +15,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoints
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.models.custom_connector import CustomConnector
@@ -26,6 +27,10 @@ from cowork.services.connectors.probe import ProbeOutcome
 from cowork.services.connectors.submissions import store
 
 ORG = TenantScope(org_mode=True, org_id="org-a", user_id="user-a")
+SHARED_CONNECTIONS = TenantScope(
+    org_id="partition-a", user_id="person-a", personal=True,
+    personal_resources=ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS},
+)
 
 HTTPBIN_FORM = {
     "form_id": "fm_aaaaaaaaaa",
@@ -102,7 +107,7 @@ async def _probe(form_spec: dict, values: dict, *, scope=LOCAL_SCOPE, method=Non
 class TestService:
     def test_a_form_becomes_a_featured_definition_with_a_stable_form_id(self, engine):
         with Session(engine) as session:
-            row = CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", HTTPBIN_FORM, secret_values=())
+            row = CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", HTTPBIN_FORM)
 
             assert row.label == "httpbin"
             assert row.category == "developer"
@@ -115,12 +120,12 @@ class TestService:
     def test_saving_again_updates_the_definition_and_keeps_it_unfeatured(self, engine):
         with Session(engine) as session:
             service = CustomConnectorService(ScopedSession(session, LOCAL_SCOPE))
-            first = service.upsert_from_form("httpbin", HTTPBIN_FORM, secret_values=())
+            first = service.upsert_from_form("httpbin", HTTPBIN_FORM)
             first.featured = False
             session.add(first)
             session.commit()
 
-            again = service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "subtitle": "Updated"}, secret_values=())
+            again = service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "subtitle": "Updated"})
 
             assert again.id == first.id
             assert again.description == "Updated"
@@ -131,7 +136,7 @@ class TestService:
         with Session(engine) as session:
             with pytest.raises(UnstorableFormError):
                 CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form(
-                    "httpbin", {"form_id": "x", "fields": [{"name": "token"}]}, secret_values=(),
+                    "httpbin", {"form_id": "x", "fields": [{"name": "token"}]},
                 )
 
 
@@ -208,7 +213,7 @@ class TestProbeStream:
             {"name": "account_code", "label": "Account code", "type": "text", "secret": True},
         ]}
         with Session(engine) as session:
-            CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", form, secret_values=())
+            CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", form)
             stored = ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("httpbin")
         submission_id = store.stage(
             form_id=stored.form.form_id, connector_id="httpbin", conversation_id=None,
@@ -222,17 +227,16 @@ class TestProbeStream:
         assert "account_code" in record["secure_keys"]
 
     @pytest.mark.asyncio
-    async def test_notes_that_repeat_a_submitted_secret_are_not_stored(self, engine, vault):
+    async def test_notes_are_not_stored_where_another_person_could_read_them(self, engine, vault):
         _Probe.verdict = "success"
-        token = "9f3c2a7b1e5d4c8a9f3c2a7b1e5d4c8a"
-        form = {**HTTPBIN_FORM, "connector": {**HTTPBIN_FORM["connector"], "usage_notes": f"Send X-Api-Key: {token}"}}
+        token = "9f3c2a7b+e5d/4c8a9f3c2a7b1e5d4c8a"
+        form = {**HTTPBIN_FORM, "connector": {**HTTPBIN_FORM["connector"], "usage_notes": f"Key %2B {token}"}}
 
-        stream = await _probe(form, {"token": token})
+        await _probe(form, {"token": token}, scope=SHARED_CONNECTIONS)
 
-        assert len(vault.list_connections()) == 1
-        assert _rows(engine) == []
-        assert "not added to your connectors list" in stream
-        assert token not in stream
+        [row] = _rows(engine)
+        assert row.connector_id == "httpbin"
+        assert row.usage_notes is None
 
     @pytest.mark.asyncio
     async def test_the_probe_runs_without_notes_when_they_cannot_be_read(self, engine, vault, monkeypatch):
@@ -353,9 +357,10 @@ class TestUnstorableForms:
             "usage_notes": "Send Authorization: Bearer abcdef0123456789abcdef on every call.",
         }}, "credential"),
         ({**HTTPBIN_FORM, "connector": {"usage_notes": "Key: sk-proj-abcdefghijklmnopqrstuvwx"}}, "credential"),
-        ({**HTTPBIN_FORM, "connector": {
-            "usage_notes": "Base URL https://admin:Zq8vL2mN4pR7sT1@api.example.com/v1",
-        }}, "credential"),
+        ({**HTTPBIN_FORM, "help_url": "https://[::1 port 8080/help"}, "help_url"),
+        ({**HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "oauth": {
+            "auth_url": "https://[fe80::1%eth0]x/auth", "token_url": "https://example.com/token",
+        }}]}, "oauth.auth_url"),
         ({**HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "id": "apiKey"}]}, "not valid"),
     ])
     def test_check_refuses(self, form, why):
@@ -365,10 +370,13 @@ class TestUnstorableForms:
     def test_a_safe_form_passes(self):
         check_handcrafted_form({**HTTPBIN_FORM, "help_url": "https://example.com/help", "methods": [OAUTH_METHOD]})
 
-    def test_notes_that_name_a_placeholder_pass(self):
-        check_handcrafted_form({**HTTPBIN_FORM, "connector": {
-            "usage_notes": "Base URL https://api.example.com. Send Authorization: Bearer <token>.",
-        }})
+    @pytest.mark.parametrize("notes", [
+        "Base URL https://api.example.com. Send Authorization: Bearer <token>.",
+        "Local dev at http://[::1 port 8080.",
+        "Connect with postgres://USER:PASSWORD@host:5432/db.",
+    ], ids=["placeholder", "malformed url", "placeholder dsn"])
+    def test_notes_that_hold_no_credential_pass(self, notes):
+        check_handcrafted_form({**HTTPBIN_FORM, "connector": {"usage_notes": notes}})
 
     @pytest.mark.asyncio
     async def test_the_tool_refuses_before_the_form_renders(self, engine, monkeypatch):

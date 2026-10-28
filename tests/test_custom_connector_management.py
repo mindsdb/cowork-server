@@ -99,6 +99,22 @@ def test_a_new_form_applies_its_connector_block(engine):
     assert ConnectorCatalog(_scoped(engine)).get_connectors()["httpbin"]["usage_notes"] == "Call /bearer."
 
 
+def test_a_field_sent_on_its_own_wins_over_the_connector_block(engine):
+    new_form = {**FORM, "connector": {"label": "From the form", "category": "crm"}}
+
+    sent = update_custom_connector(
+        "httpbin", CustomConnectorUpdate(spec=new_form, label="Sent"), _scoped(engine),
+    )
+    kept = update_custom_connector(
+        "httpbin", CustomConnectorUpdate.model_validate({"spec": new_form, "label": None, "category": None}),
+        _scoped(engine),
+    )
+
+    assert sent.label == "Sent"
+    assert kept.label == "Sent"
+    assert kept.category == "other"
+
+
 def test_replace_the_form(engine):
     new_form = {**FORM, "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}]}
 

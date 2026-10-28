@@ -102,8 +102,8 @@ class TestCatalog:
     def test_a_personal_scope_sees_and_updates_its_own_saved_connector(self, engine):
         with Session(engine) as session:
             service = CustomConnectorService(ScopedSession(session, PERSON_A))
-            service.upsert_from_form("httpbin", HTTPBIN_FORM, secret_values=())
-            service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "title": "Connect httpbin again"}, secret_values=())
+            service.upsert_from_form("httpbin", HTTPBIN_FORM)
+            service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "title": "Connect httpbin again"})
 
         assert _catalog(engine, PERSON_A).get_connector("httpbin").label == "Connect httpbin again"
         assert _catalog(engine, PERSON_B).get_connector("httpbin") is None
