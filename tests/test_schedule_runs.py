@@ -772,6 +772,59 @@ def test_manual_run_that_raises_leaves_the_cron_slot(monkeypatch):
     assert state["next_advanced"] is False
 
 
+def _permission_check_raises(monkeypatch, exc_type):
+    import cowork.services.product_permissions as permissions_mod
+
+    async def _check(*_args, **_kwargs):
+        raise exc_type()
+
+    monkeypatch.setattr(permissions_mod, "require_product_permission", _check)
+
+
+def test_auth_outage_before_the_turn_keeps_the_slot_due(monkeypatch):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    _permission_check_raises(monkeypatch, ProductPermissionUnavailable)
+    state = _execute_with_terminal(monkeypatch, None)
+    assert state["run_status"] == RunStatus.failed
+    # The outage clears on its own; the next poll runs the occurrence.
+    assert state["next_advanced"] is False
+
+
+def test_revoked_permission_consumes_the_slot(monkeypatch):
+    from cowork.services.product_permissions import ProductPermissionDenied
+
+    _permission_check_raises(monkeypatch, ProductPermissionDenied)
+    state = _execute_with_terminal(monkeypatch, None)
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is True
+
+
+def test_pool_timeout_before_the_turn_keeps_the_slot_due(monkeypatch):
+    import cowork.scheduler as scheduler_mod
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    def _read_schedule(*_args, **_kwargs):
+        raise PoolTimeoutError("pool full")
+
+    monkeypatch.setattr(scheduler_mod, "_read_schedule", _read_schedule)
+    state = _execute_with_terminal(monkeypatch, None)
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is False
+
+
+def test_pool_timeout_inside_the_turn_consumes_the_slot(monkeypatch):
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    async def _turn_pool_timeout():
+        raise PoolTimeoutError("pool full")
+
+    # The agent may already have acted, so running it again is not safe.
+    state = _execute_with_terminal(monkeypatch, None, turn=_turn_pool_timeout)
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is True
+
+
 def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversation(
     monkeypatch, caplog, owned_logger,
 ):
