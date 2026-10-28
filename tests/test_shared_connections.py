@@ -27,6 +27,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 
 import pytest
@@ -45,6 +46,7 @@ from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, scope_from_principal, service_principal_for
 from cowork.db.session import get_open_session
+from cowork.handlers import probe as probe_handler
 from cowork.handlers.probe import ProbeHandler
 from cowork.harnesses.anton_harness.tools import _cowork_label_connection, _cowork_request_credentials
 from cowork.models.conversation import Conversation
@@ -67,6 +69,7 @@ from cowork.services.connectors.persist import (
     turn_vault_for_scope,
     vault_for_scope,
 )
+from cowork.services.connectors.probe import ProbeOutcome
 from tests._fakes import FakeRequest
 from tests._turns import built_turn, connect_in_chat
 
@@ -364,6 +367,23 @@ def _share_alices_acme(managed_dir) -> None:
     )
 
 
+@pytest.fixture
+def accepting_probe(monkeypatch):
+    """A handcrafted step is probed before it is saved; this probe accepts, so
+    the save and its sharing rules decide the outcome."""
+
+    class AcceptingProbe:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def run(self):
+            yield "verdict", ProbeOutcome(status="success", summary="Connection works.")
+
+    monkeypatch.setattr(probe_handler, "CredentialProbe", AcceptingProbe)
+    monkeypatch.setattr(ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
+    monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
+
+
 def _grant_step(name: str) -> SubmitFormRequest:
     """The connect's second form, adding the grant's tokens to ``name``."""
     return SubmitFormRequest(
@@ -372,6 +392,7 @@ def _grant_step(name: str) -> SubmitFormRequest:
         form_spec={
             "form_id": "fm_acmegrant1",
             "engine": "acme_crm",
+            "title": "Acme CRM",
             "fields": [],
             "_extends_connection": name,
             "_existing_name": name,
@@ -388,7 +409,7 @@ def _vault_files(scope: TenantScope) -> dict[str, bytes]:
     return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
-async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharing, monkeypatch):
+async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharing, accepting_probe, monkeypatch):
     """Bob's vault reads Alice's shared connection, so its record would
     merge into his step. The submission answers 403 before anything is
     staged; the save itself is refused too, so the probe saves nothing.
@@ -407,7 +428,8 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     probed = "".join(
         [event async for event in ProbeHandler(scope=BOB).run(submission_id, "acme_crm", None, "acme", None)]
     )
-    assert f"Could not save: `{SHARED_CONNECTION_REFUSAL}`" in probed
+    assert f"Probe succeeded but save failed: {SHARED_CONNECTION_REFUSAL}" in probed
+    assert "Saved as" not in probed
     staged: list = []
     monkeypatch.setattr(submissions_ep.store, "stage", lambda **kwargs: staged.append(kwargs))
 
@@ -418,7 +440,7 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     assert own_vault_for_scope(BOB).list_connections() == []
 
 
-async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing):
+async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing, accepting_probe):
     _share_alices_acme(sharing)
 
     response = await submissions_ep.submit_form(_grant_step("acme"), ALICE)
@@ -430,7 +452,7 @@ async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing):
     assert vault_for_scope(BOB).load("acme_crm", "acme")["access_token"] == ACME_GRANT["access_token"]
 
 
-async def test_a_later_step_adds_to_a_persons_own_connection(trusted):
+async def test_a_later_step_adds_to_a_persons_own_connection(trusted, accepting_probe):
     persist_connection("acme_crm", "app", "acme", dict(ACME_APP), scope=BOB)
 
     response = await submissions_ep.submit_form(_grant_step("acme"), BOB)
