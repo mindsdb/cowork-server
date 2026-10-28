@@ -19,6 +19,7 @@
     "components"
   ],
   "description": "Access Figma design files, prototypes, and components via the Figma REST API.",
+  "usage_notes": "Base URL `https://api.figma.com`. Auth depends on the connection's fields: with `ACCESS_TOKEN` (Figma sign-in) send `Authorization: Bearer <ACCESS_TOKEN>`; with `PERSONAL_ACCESS_TOKEN` send `X-Figma-Token: <PERSONAL_ACCESS_TOKEN>`. The wrong header returns 401.\nThere is no call that lists all of a user's files, so ask for a team or file link. A team link (`figma.com/files/team/<team_id>/...`) gives a team id: list its folders with `GET /v2/teams/{team_id}/folders`, then each folder's files with `GET /v2/folders/{folder_id}/files`. Do not use the deprecated `/v1/teams/{team_id}/projects` or `/v1/projects/{id}/files`; they return 403 for this connection.\nA file link (`figma.com/design/<key>/...` or `/file/<key>/...`) gives a file key: `GET /v1/files/{key}` returns the whole document tree, so pass `depth=1` or `depth=2`, or read specific nodes with `GET /v1/files/{key}/nodes?ids=<id>,<id>` (a link's `node-id=1-2` is id `1:2`). Rendered images come from `GET /v1/images/{key}?ids=...`, comments from `GET /v1/files/{key}/comments`.\nUsers on a View or Collab seat get only a few file reads a month, so read only what the question needs and reuse what you already fetched.",
   "category": "engineering",
   "logo": "image",
   "logo_color": "#F24E1E",
@@ -30,10 +31,39 @@
     "logo_color": "#F24E1E",
     "methods": [
       {
+        "id": "browser_oauth_builtin",
+        "label": "In-Browser Connect",
+        "description": "Opens Figma sign-in in your browser. No credentials required — just click Connect. Gives read-only access to the files you can see in Figma.",
+        "recommended": true,
+        "fields": [],
+        "oauth": {
+          "auth_url": "https://www.figma.com/oauth",
+          "token_url": "https://api.figma.com/v1/oauth/token",
+          "scopes": [
+            "current_user:read",
+            "file_content:read",
+            "file_metadata:read",
+            "file_versions:read",
+            "file_comments:read",
+            "library_content:read",
+            "library_assets:read",
+            "team_library_content:read",
+            "file_dev_resources:read",
+            "folders:read"
+          ],
+          "extra_auth_params": {},
+          "service_id": "figma",
+          "supports_refresh": true,
+          "supports_revoke": false,
+          "token_auth_style": "basic",
+          "redirect_port": 47295
+        }
+      },
+      {
         "id": "personal-access-token",
         "label": "Personal Access Token",
         "description": "Generate a token in Figma Settings → Personal access tokens and paste it here. No OAuth setup required — the fastest way to connect.",
-        "recommended": true,
+        "recommended": false,
         "how_to": "## Generate a Figma Personal Access Token\n\nFigma personal access tokens are scoped credentials you can create directly from your account settings. No admin access or OAuth app required.\n\n### Steps\n\n1. Open [Figma](https://www.figma.com) and log in.\n2. Click your **avatar** in the top-left corner → **Settings**.\n3. Scroll down to the **Personal access tokens** section.\n4. Click **Generate new token**.\n5. Give the token a descriptive name like `Anton`.\n6. Choose an expiration (or set to **No expiration** for a long-lived token).\n7. Click **Generate token**. Figma shows the token **once** — copy it immediately.\n8. Paste the token into the **Personal Access Token** field below.\n\n### Notes\n\n- The token inherits your account's access level — it can read any file or project you can access.\n- If you lose the token before pasting it, just delete it in Settings and generate a new one.\n- To revoke access later, return to **Settings → Personal access tokens** and delete the `Anton` entry.\n- Tokens are scoped to your personal account; for team-wide access consider using an org service account.\n",
         "help_url": "https://www.figma.com/developers/api#access-tokens",
         "fields": [
@@ -82,10 +112,13 @@
             "placeholder": "your-figma-client-secret",
             "description": "From Figma Developer Console → your app → Client secret. Keep this private."
           }
-        ]
+        ],
+        "hidden": true
       }
     ],
     "logo_url": "logos/figma.svg"
   },
-  "logo_url": "logos/figma.svg"
+  "logo_url": "logos/figma.svg",
+  "featured": true,
+  "notice": "Our Figma app is awaiting Figma's approval. Until it is approved, connecting may not work for your Figma account."
 }
