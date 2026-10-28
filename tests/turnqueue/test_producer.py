@@ -1,11 +1,13 @@
 import asyncio
 import json
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from cowork.handlers import turn_errors as te
+from cowork.services import providers as pv
 from cowork.turnqueue import producer as prod
 
 from _fakes import QueuedPipeline
@@ -459,6 +461,144 @@ async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeyp
     without = json.loads(fake.added[1][1]["payload"])["params"]
     assert with_it["started_at"] == "2026-09-01T08:15:00"
     assert "started_at" not in without
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_reasoning_effort_only_when_selected(monkeypatch):
+    """Absent when unset, so a legacy job is unchanged for an older controller."""
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        reasoning_effort="some-future-level",
+    ))
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    with_it = json.loads(fake.added[0][1]["payload"])["params"]
+    without = json.loads(fake.added[1][1]["payload"])["params"]
+    assert with_it["reasoning_effort"] == "some-future-level"
+    assert "reasoning_effort" not in without
+
+
+def _seed_org_catalog(monkeypatch, rows):
+    """Fill the real org catalog cache for o1/u1 from a faked gateway answer."""
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"data": rows}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None, **kw):
+            return _Response()
+
+    monkeypatch.setattr(pv.httpx, "AsyncClient", lambda *a, **k: _Client())
+    monkeypatch.setattr(pv, "_minds_models_cache", OrderedDict())
+    return pv.fetch_org_model_catalog(org_id="o1", user_id="u1", bearer_token="jwt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("model", "selected", "queued"), [
+    ("gemini", "max", "absent"),
+    ("gemini", "high", "high"),
+    ("no-levels", "low", "absent"),
+    ("unlisted", "max", "max"),
+])
+async def test_an_effort_the_model_does_not_offer_is_left_out_of_the_job(
+    monkeypatch, model, selected, queued,
+):
+    """The pod would send it on and the provider would refuse the turn, so the
+    job runs at the default. A model missing from the listing leaves the
+    gateway to judge."""
+    await _seed_org_catalog(monkeypatch, [
+        {"id": "gemini", "reasoning_efforts": ["low", "medium", "high"]},
+        {"id": "no-levels"},
+    ])
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model=model,
+        reasoning_effort=selected,
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("reasoning_effort", "absent") == queued
+
+
+class _PerStreamRedis(FakeRedis):
+    """Answers each conversation's reply stream from its own queue."""
+
+    def __init__(self, replies_by_stream):
+        super().__init__(replies=[], workspace_mode=None)
+        self._by_stream = replies_by_stream
+
+    async def xread(self, streams, count=None, block=None):
+        for stream in streams:
+            if self._by_stream.get(stream):
+                return [[stream, [["9-0", self._by_stream[stream].pop(0)]]]]
+        await asyncio.sleep(0)
+        return None
+
+
+def _reply_for(corr, kind, data):
+    return {"payload": json.dumps({"correlation_id": corr, "kind": kind, "data": data})}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_turns_keep_their_own_reasoning_effort(monkeypatch):
+    authorized = {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+    fake = _PerStreamRedis({
+        f"scratchpad:reply:conv-{c}": [
+            _reply_for(f"r-{c}", "progress", authorized),
+            _reply_for(f"r-{c}", "turn_completed", {}),
+        ]
+        for c in ("a", "b")
+    })
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await asyncio.gather(*(
+        _drain(prod.stream_remote_replies(
+            conversation_id=f"conv-{c}", org_id=f"org-{c}", user_id=f"u-{c}", input_text=c,
+            model="m", correlation_id=f"r-{c}", reasoning_effort=effort,
+        ))
+        for c, effort in (("a", "low"), ("b", "high"))
+    ))
+    by_input = {
+        job["params"]["input"]: job["params"].get("reasoning_effort")
+        for job in (json.loads(fields["payload"]) for _, fields in fake.added)
+    }
+    assert by_input == {"a": "low", "b": "high"}
 
 
 @pytest.mark.asyncio

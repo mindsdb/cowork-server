@@ -24,7 +24,8 @@ from cowork.handlers.turn_errors import (
     remote_error_label,
     remote_turn_error,
 )
-from cowork.services.providers import minds_chat_base_url
+from cowork.coding.reasoning import advertised_levels
+from cowork.services.providers import cached_org_model_catalog, minds_chat_base_url
 from cowork.db.scoped import scope_for_identity
 from cowork.services import product_permissions
 from cowork.services.connectors.specs._registry import registry
@@ -509,6 +510,23 @@ def step_stream_events(data: dict) -> list:
     return []
 
 
+def _offered_effort(model: str, effort: str | None, *, org_id: str | None,
+                    user_id: str | None) -> str | None:
+    """``effort`` when ``model`` advertises it, else None so the pod keeps its default.
+
+    Reads the org's cached model listing, the one the composer offered levels
+    from. Without a listing the effort is kept; the pod falls back to its
+    configured effort if the provider refuses it.
+    """
+    if not effort or not org_id or not user_id:
+        return effort or None
+    offered = advertised_levels(model, cached_org_model_catalog(org_id=org_id, user_id=user_id))
+    if offered is None or effort in offered:
+        return effort
+    logger.warning("dropping the selected reasoning effort: model %s does not offer it", model)
+    return None
+
+
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
@@ -523,7 +541,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
-                                tool_messages: bool = False):
+                                tool_messages: bool = False,
+                                reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -536,7 +555,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
     `workspace` is the project the turn runs in; None runs it in the org's
-    default project with no project on the job."""
+    default project with no project on the job.
+    `reasoning_effort` is the composer's pick for this turn; None leaves the
+    pod's configured default."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -559,6 +580,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
         model = get_user_settings(scope).resolved_planning_model
+    reasoning_effort = _offered_effort(model, reasoning_effort, org_id=org_id, user_id=user_id)
 
     # Independent network round trips (llm's turn-key mint, oauth's active-
     # connections list) — run concurrently rather than paying both latencies
@@ -652,6 +674,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
+              # Already dropped above when the model does not offer it; the pod
+              # applies the rest to the planning model only.
+              **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its

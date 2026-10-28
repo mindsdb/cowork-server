@@ -1514,6 +1514,7 @@ class ResponsesHandler:
                 input_text=prompt_text(harness_input),
                 original_content=original_content,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 harness_id=harness_id,
                 buffer=buffer,
                 turn_id=turn_id,
@@ -1909,6 +1910,7 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
         disabled: list[dict] | None = None,
+        reasoning_effort: str | None = None,
         first_take: FirstTake | None = None,
     ) -> None:
         """Remote-backend counterpart of _run_turn: pipe the pod's replies
@@ -2248,6 +2250,7 @@ class ResponsesHandler:
                 user_id=self.scope.user_id,
                 input_text=input_text,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 turn_id=turn_id,
                 history=seed.history,
                 # Global memory and skills use read-only mounts. Project
