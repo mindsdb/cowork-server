@@ -452,3 +452,38 @@ def test_boot_warm_is_bounded_and_fail_open(monkeypatch):
     finally:
         _clear(session, "minds_api_key", "minds_url", "minds_model_enabled")
         session.close()
+
+
+def test_a_pinned_desktop_warms_the_map_with_its_turn_key(monkeypatch):
+    # The billed organization's flags, not those of whatever org the browser picked.
+    from datetime import datetime, timedelta, timezone
+
+    from cowork.common.settings import runtime_credential
+    from cowork.services import providers
+
+    keys = []
+
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+        keys.append(key)
+        return _listing(FREE_ENABLED)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
+    monkeypatch.setattr(runtime_credential, "_minds_credential", "session-jwt")
+    monkeypatch.setattr(runtime_credential, "_organization_id", "org-a")
+    monkeypatch.setattr(
+        runtime_credential,
+        "_inference_key",
+        runtime_credential.InferenceKey(
+            value="mdb_turn",
+            organization_id="org-a",
+            instance_id="desktop-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ),
+    )
+    session = _fresh_session()
+    try:
+        _set(session, minds_url="https://minds.example/v1")
+        asyncio.run(providers.warm_enabled_model_map(session))
+        assert keys == ["mdb_turn"]
+    finally:
+        _clear(session, "minds_url", "minds_model_enabled")
