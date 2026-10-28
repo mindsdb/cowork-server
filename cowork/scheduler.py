@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID
@@ -25,7 +26,7 @@ from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import ScheduleRunService, ScheduleService
-from cowork.streaming.registry import registry
+from cowork.streaming.registry import ServerShuttingDown, registry
 
 if TYPE_CHECKING:
     from cowork.principal import Principal
@@ -47,7 +48,29 @@ _MAX_RUN_DURATION_SECONDS = 600
 # keeps a refusal that comes back at once from spinning.
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
+# How old a run still at `running` must be before a booting replica may reap
+# it: its turn is cut off at _MAX_RUN_DURATION_SECONDS and its last writes
+# (the outcome, then the finish) each give up after
+# _BOOKKEEPING_DEADLINE_SECONDS, plus slack for the units before the turn
+# starts. An error path with a third last write can use up that slack, which
+# is harmless: the run's own finish overwrites a reaped status. Age is only a
+# heuristic, since a database unit that stalls holds a run past any deadline,
+# so only boot uses it, not every poll.
+_ORPHANED_RUN_AGE_SECONDS = _MAX_RUN_DURATION_SECONDS + 2 * _BOOKKEEPING_DEADLINE_SECONDS + 10 * 60
 _scheduler_task: asyncio.Task | None = None
+# A run's error when its turn was refused because the server was shutting
+# down. The run never started, so the schedule's own last_error is left alone.
+_SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
+# A run's error when a shutdown cancelled it before it recorded its turn's
+# outcome. Saved as failed, not success, so a cron slot it did not consume
+# stays due, and the freshness guard skips no slot because of it.
+_INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it finished."
+# The runs the poll loop started and nothing awaits. A shutdown waits for them
+# (wait_for_scheduled_runs) so each run's last writes land before the process
+# exits. A manual run belongs to its request instead. Uvicorn's request drain
+# waits for that request only up to --timeout-graceful-shutdown, then cancels
+# it, and the run is saved as interrupted (_INTERRUPTED_RUN_ERROR).
+_scheduled_runs: set[asyncio.Task] = set()
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
 
@@ -253,6 +276,20 @@ def _link_conversation(
     return conversation_id
 
 
+def _delete_unstarted_conversation(
+    session: ScopedSession, *, scheduled: _ScheduledTurn, conversation_id: UUID,
+) -> None:
+    """Delete the conversation _link_conversation made for a run whose turn
+    never started, so it is not left empty in its owner's list. Under the
+    schedule's own scope, as it was created."""
+    from cowork.services.conversations import ConversationService
+
+    conv_session = ScopedSession(
+        unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
+    )
+    ConversationService(conv_session).delete_conversation(conversation_id)
+
+
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
 ) -> _RunOutcome:
@@ -298,10 +335,13 @@ def _record_turn_outcome(
     return outcome
 
 
-def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str) -> None:
+def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool) -> None:
     schedule = ScheduleService(session).get_schedule(schedule_id)
     schedule.last_error = error
     session.add(schedule)
+    # A run that disabled its schedule has already stopped the re-fire.
+    if consume_slot and schedule.enabled:
+        _advance_next_run_at(schedule, session)
 
 
 def _finish_run(
@@ -350,7 +390,7 @@ async def execute_schedule(
     """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
-    from cowork.services.product_permissions import require_product_permission
+    from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
 
     try:
         run_id = await run_db(
@@ -367,6 +407,8 @@ async def execute_schedule(
 
     error: str | None = None
     final_status: RunStatus | None = None
+    created_conversation = conversation_id is None
+    turn_started = False
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -405,12 +447,41 @@ async def execute_schedule(
             async for _ in stream:
                 pass
 
+        turn_started = True
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
             ) from exc
+        except ServerShuttingDown:
+            # This replica is ending its turns for a shutdown and refused the
+            # run's turn before it started. Nothing ran, so the schedule keeps
+            # its last_error, and _record_turn_outcome never consumes the cron
+            # slot: it stays due for the next poll, on a replica still
+            # serving. The finally below finishes the run row.
+            error = _SHUTDOWN_RUN_ERROR
+            logger.info(
+                "Schedule run did not start; the server is shutting down",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
+            if created_conversation:
+                try:
+                    await run_db(
+                        partial(
+                            _delete_unstarted_conversation,
+                            scheduled=scheduled, conversation_id=conversation_id,
+                        ),
+                        scope=SYSTEM_SCOPE,
+                    )
+                    conversation_id = None
+                except Exception:
+                    logger.warning(
+                        "Could not delete the empty conversation of a run that did not start",
+                        exc_info=True,
+                        extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+                    )
+            return
 
         # A cancel or a producer failure closes the stream normally from the
         # consumer's side (the producer runs detached and even swallows its
@@ -427,6 +498,12 @@ async def execute_schedule(
         )
         final_status, error = outcome.status, outcome.error
 
+    except asyncio.CancelledError:
+        # A shutdown cut the run: Uvicorn's request drain cancels a manual
+        # run's request at its bound, and the event loop's close cancels a
+        # cron run still going. The finally saves it as failed.
+        error = _INTERRUPTED_RUN_ERROR
+        raise
     except Exception as exc:
         error = str(exc)
         # The ids travel as record attributes: a database error's sanitized
@@ -435,12 +512,26 @@ async def execute_schedule(
             "Schedule run failed: %s", error,
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
+        # A run that raised consumes its cron slot like one that failed inside
+        # its turn. Left due, the next poll starts it again, and a failure that
+        # repeats (a timeout, a revoked permission) re-fires every poll. A busy
+        # pool or an auth outage before the turn starts is the exception: it
+        # clears on its own, the agent has done nothing yet, and skipping the
+        # slot would drop a daily or weekly occurrence over a short blip.
+        transient = not turn_started and isinstance(exc, (PoolTimeoutError, ProductPermissionUnavailable))
         try:
-            await run_db(
-                partial(_record_schedule_error, schedule_id=schedule_id, error=error), scope=SYSTEM_SCOPE,
+            await _until_it_lands(
+                partial(
+                    _record_schedule_error, schedule_id=schedule_id, error=error,
+                    consume_slot=not is_manual and not transient,
+                ),
+                schedule_id=schedule_id,
             )
         except Exception:
-            pass
+            logger.exception(
+                "Failed to record the scheduled run's error",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
     finally:
         try:
             # This write must always land or the run strands at `running` and
@@ -530,6 +621,18 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     return due
 
 
+def boot_reap_cutoff(now: datetime | None = None) -> datetime | None:
+    """Which running runs a starting server may reap: all of them on the
+    desktop, where it is the only process, or in org mode, where other
+    replicas may still be running them, only runs old enough to be presumed
+    dead."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    if get_app_settings().tenancy_mode != "org":
+        return None
+    return (now or datetime.now(timezone.utc)) - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
+
+
 def _poll(session: ScopedSession) -> list[UUID]:
     """One poll's unit: settle missed runs, then the ids of the schedules due now."""
     _handle_missed_runs(session)
@@ -538,6 +641,9 @@ def _poll(session: ScopedSession) -> list[UUID]:
 
 async def _scheduler_loop() -> None:
     logger.info("Scheduler loop started")
+    # Replicas a rollout starts together would otherwise poll in step, and two
+    # replicas polling together can both start one due schedule.
+    await asyncio.sleep(random.uniform(0, _POLL_INTERVAL_SECONDS))
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         try:
@@ -553,7 +659,9 @@ async def _scheduler_loop() -> None:
             due = []
 
         for schedule_id in due:
-            asyncio.create_task(execute_schedule(schedule_id, is_manual=False))
+            run = asyncio.create_task(execute_schedule(schedule_id, is_manual=False))
+            _scheduled_runs.add(run)
+            run.add_done_callback(_scheduled_runs.discard)
 
 
 def start_scheduler() -> None:
@@ -562,3 +670,37 @@ def start_scheduler() -> None:
         return
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     logger.info("Scheduler background task created")
+
+
+def stop_scheduler() -> asyncio.Task | None:
+    """Cancel the poll loop, so it starts no more runs, without waiting for it.
+
+    A poll reading the database finishes that read first: run_db re-raises
+    the cancel once the read ends, so the loop never reaches the line that
+    starts a run. Returns the cancelled loop for the caller to wait on once
+    it has done what must not wait behind that read, or None when no loop
+    was running, as on a second call.
+    """
+    global _scheduler_task
+    task, _scheduler_task = _scheduler_task, None
+    if task is None or task.done():
+        return None
+    task.cancel()
+    logger.info("Scheduler stopped")
+    return task
+
+
+async def wait_for_scheduled_runs(*, timeout_seconds: float) -> int:
+    """Wait up to ``timeout_seconds`` for the runs the poll loop started.
+
+    For a shutdown, after the server has ended their turns: each run then
+    records the turn's outcome and finishes its run row. A row left at
+    `running` stops its schedule firing until a boot reaps it
+    (ScheduleRunService.reap_orphaned_runs). Returns how many runs were still
+    going when the wait ended; they go on until the process exits.
+    """
+    runs = [run for run in _scheduled_runs if not run.done()]
+    if not runs:
+        return 0
+    _, pending = await asyncio.wait(runs, timeout=timeout_seconds)
+    return len(pending)

@@ -677,3 +677,29 @@ def test_publish_artifact_requires_project_id_in_org_mode(scope, project_root_ar
 
 
 pytestmark = pytest.mark.usefixtures("granted_product_permissions")
+
+
+def test_org_publish_reports_the_lambda_echo_when_it_differs(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    # Org comment routing never reads the record, so the echo is the only way
+    # the renderer reaches the scope the published page uses.
+    _session, project, _conversation, folder = owned_artifact
+    echoed = f"artifact/{uuid4()}"
+    monkeypatch.setattr(
+        "anton.publisher.publish",
+        lambda _source, **_kwargs: {
+            "artifact_key": echoed,
+            "report_id": "report-1",
+            "view_url": "https://view.test/1",
+        },
+    )
+    result = publish_artifact(
+        folder,
+        artifacts_base=folder.parent,
+        api_key="key",
+        publish_url="https://view.test",
+        scope=scope,
+        project_id=str(project.id),
+    )
+    assert result["artifactKey"] == echoed

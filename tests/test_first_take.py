@@ -711,7 +711,7 @@ async def test_anton_speaking_does_not_clear_it_the_turns_end_does():
 
     take = _take(_Provider(["Pulling your sales now."])).start()
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         await asyncio.sleep(0.05)  # Anton's first model call, still silent
         yield 'event: response.in_progress\ndata: {"thought_role": "thought.progress"}\n\n'
