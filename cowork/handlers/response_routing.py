@@ -52,6 +52,7 @@ _GATE_IDLE_SECONDS = 5.0
 # number to tune once traces show what a completed direct answer costs.  Note
 # an answer near `_DIRECT_MAX_TOKENS` cannot finish inside it and so delegates
 # on time rather than on tokens; both outcomes are `delegated_agentic`.
+# Remote turns pass COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS instead.
 _GATE_TOTAL_SECONDS = 10.0
 
 # The two-action contract (answer, or call `delegate`) is this module's own.
@@ -363,7 +364,9 @@ def _spawn_drain(events, *, deadline: float, model: str) -> None:
     task.add_done_callback(_drain_tasks.discard)
 
 
-async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
+async def _gate(
+    binding: RouterBinding, *, history: list[dict], total_seconds: float | None = None
+) -> str | None:
     """One gating call on the router role, streamed, decided when it ends.
 
     Returns the direct answer, or None to delegate — on a tool call (as an
@@ -385,7 +388,9 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
 
     Raises ``TimeoutError`` when the first event misses
     ``_GATE_FIRST_EVENT_SECONDS``, a later one misses ``_GATE_IDLE_SECONDS``,
-    or the call as a whole misses ``_GATE_TOTAL_SECONDS``.
+    or the call as a whole misses ``total_seconds`` (``_GATE_TOTAL_SECONDS``
+    when None). Closing the stream after
+    that is awaited and is not bounded by it.
     """
     from anton.core.llm.provider import StreamComplete, StreamTextDelta, StreamToolUseStart
 
@@ -397,7 +402,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
         max_tokens=_DIRECT_MAX_TOKENS,
     )
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _GATE_TOTAL_SECONDS
+    deadline = loop.time() + (_GATE_TOTAL_SECONDS if total_seconds is None else total_seconds)
     per_event = _GATE_FIRST_EVENT_SECONDS
     text = ""
     drain = False
@@ -637,12 +642,14 @@ async def decide_route(
     has_disabled_connections: bool,
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
+    gate_total_seconds: float | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation on the gate's own model.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
     request's lazy `binding_factory`. Resolve only after the eligibility checks.
+    `gate_total_seconds` is the gate's wall-clock budget; None keeps the default.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
     A database pool that freed no connection in time is not a gate failure: it
@@ -675,7 +682,7 @@ async def decide_route(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
             )
         try:
-            text = await _gate(binding, history=messages)
+            text = await _gate(binding, history=messages, total_seconds=gate_total_seconds)
         except TimeoutError:
             return RouteDecision(
                 route=DELEGATED_AGENTIC,

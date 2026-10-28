@@ -411,7 +411,7 @@ async def test_first_take_and_gate_build_one_provider_per_request(monkeypatch):
         providers.append(provider)
         return SimpleNamespace(router_provider=provider)
 
-    async def gate(binding, *, history):
+    async def gate(binding, *, history, total_seconds=None):
         gated.append(binding)
         await _settle()
         return None
