@@ -225,6 +225,12 @@ class ConnectorSpecResponse(ConnectorMetadataResponse):
     usage_notes: str | None = Field(default=None, exclude=True)
 
 
+class CustomConnectorAvailability(BaseModel):
+    """Whether the caller can build a custom connector that is kept for reuse."""
+
+    can_build: bool
+
+
 class MatchRequest(BaseModel):
     query: str
     max_candidates: int = Field(default=3, ge=1, le=5)

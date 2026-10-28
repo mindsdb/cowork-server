@@ -903,7 +903,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
         },
         "connector": {
             "type": "object",
-            "description": "Only when building a new custom connector: how it is listed for reuse once its connection test passes.",
+            "description": "Only when building a new custom connector: how it is listed for reuse, where lookup_connector says one can be saved, once its connection test passes.",
             "properties": {
                 "label": {"type": "string", "description": "Display name (e.g. 'Acme Planner')."},
                 "description": {"type": "string", "description": "One line on what it connects to."},

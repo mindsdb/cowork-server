@@ -11,10 +11,12 @@ from cowork.db.units import run_db
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
     ConnectorSpecResponse,
+    CustomConnectorAvailability,
     MatchRequest,
     MatchResponse,
 )
 from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.services.connectors.custom_connectors import scope_is_one_persons
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.specs._registry import registry
 
@@ -23,6 +25,22 @@ router = APIRouter()
 # Same alias as connections.py/oauth.py: the vault/relay choice is per-request
 # tenancy context, not a bare settings flag.
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
+
+# Registered before /{connector_id}, which would otherwise take the path.
+# AuthenticatedInOrgMode: the answer depends on the caller's scope.
+@router.get(
+    "/custom-availability",
+    response_model=CustomConnectorAvailability,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def custom_connector_availability(scope: ScopeDep) -> CustomConnectorAvailability:
+    """Say whether the caller can build a custom connector kept for reuse.
+
+    True only in one person's scope (scope_is_one_persons); the picker shows
+    its build entries only then.
+    """
+    return CustomConnectorAvailability(can_build=scope_is_one_persons(scope))
 
 
 # AuthenticatedInOrgMode, not OpenByDesign: in org mode this forwards to
