@@ -132,6 +132,12 @@ class TestService:
             assert again.featured is False
         assert len(_rows(engine)) == 1
 
+    def test_org_mode_keeps_no_definition(self, engine):
+        with Session(engine) as session:
+            with pytest.raises(UnstorableFormError):
+                CustomConnectorService(ScopedSession(session, ORG)).upsert_from_form("httpbin", HTTPBIN_FORM)
+        assert _rows(engine) == []
+
     def test_an_invalid_form_is_refused(self, engine):
         with Session(engine) as session:
             with pytest.raises(UnstorableFormError):

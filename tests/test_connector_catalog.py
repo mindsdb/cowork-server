@@ -146,7 +146,7 @@ class TestCatalog:
         catalog = _catalog(engine, scope)
 
         assert catalog.usage_notes_for(["httpbin"]) == ({"httpbin": "Call /bearer."} if own else {})
-        assert catalog.get_connectors()["httpbin"]["usage_notes"] == "Call /bearer."
+        assert catalog.get_connectors()["httpbin"]["usage_notes"] == ("Call /bearer." if own else None)
 
     def test_custom_usage_notes_are_scrubbed_before_an_agent_reads_them(self, engine):
         _add_with_notes(engine, "Old key sk-proj-abcdefghijklmnopqrstuvwx, now rotated.")

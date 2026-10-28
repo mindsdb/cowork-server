@@ -19,7 +19,8 @@ from cowork.api.v1.endpoints.connectors import connections as connections_endpoi
 from cowork.api.v1.endpoints.connectors import oauth as oauth_endpoints
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoints
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.harnesses.anton_harness import tools
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import DirectSaveRequest, SubmitFormRequest
@@ -386,3 +387,17 @@ class TestBuildFlowPrompt:
         assert result["match"] == "none"
         assert "custom connector" in result["message"]
         assert "request_credentials" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_a_shared_scope_is_not_offered_a_custom_connector(self, engine, monkeypatch):
+        shared = TenantScope(
+            org_id="partition-a", user_id="person-a", personal=True,
+            personal_resources=ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS},
+        )
+        monkeypatch.setattr(tools, "current_settings_scope", lambda: shared)
+
+        result = json.loads(await tools._cowork_lookup_connector(None, {"query": "acme planner"}))
+
+        assert result["match"] == "none"
+        assert "can't be saved for reuse" in result["message"]
+        assert "Build a custom connector" not in result["message"]

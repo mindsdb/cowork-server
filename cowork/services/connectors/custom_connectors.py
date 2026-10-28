@@ -104,9 +104,9 @@ def scope_is_one_persons(scope: TenantScope) -> bool:
 
     Everything in a definition (label, description, help text, the form,
     usage notes) is model-written and may hold what its builder typed, in
-    any encoding. Custom connectors are therefore built and served outside
-    org mode only where this is True, so none reaches another person.
-    Sharing them across people is not built yet.
+    any encoding. Custom connectors are therefore built only where this is
+    True, and served outside org mode only there, so none reaches another
+    person. Sharing them across people (org mode included) is not built yet.
     """
     if scope.personal:
         return scope.partitioned_for(PersonalResource.CONNECTIONS)
@@ -176,6 +176,12 @@ class CustomConnectorService:
         """
         self.session = session
 
+    def _kept_notes(self, notes: Any) -> str | None:
+        """``notes`` as stored: the text in one person's scope, else None.
+        In org mode a definition is served to every member, and its notes
+        were typed by one of them."""
+        return _text(notes) if scope_is_one_persons(self.session.scope) else None
+
     def get(self, connector_id: str) -> CustomConnector | None:
         """Return the scope's definition for ``connector_id``, or None."""
         stmt = scope_definitions(self.session).where(CustomConnector.connector_id == connector_id)
@@ -195,14 +201,14 @@ class CustomConnectorService:
 
         Raises:
             UnstorableFormError: when the form is invalid or unsafe to keep,
-                or the scope is shared by several people outside org mode
+                or the scope is shared by several people, org mode included
                 (scope_is_one_persons), where a definition would reach them all.
 
         Side effects:
             Commits the session.
         """
         scope = self.session.scope
-        if not scope.org_mode and not scope_is_one_persons(scope):
+        if not scope_is_one_persons(scope):
             raise UnstorableFormError(
                 "custom connectors are kept only for one person's own connections on this deployment."
             )
@@ -212,7 +218,7 @@ class CustomConnectorService:
             "description": _text(meta.get("description")) or _text(form_spec.get("subtitle")) or "",
             "category": _text(meta.get("category"), 64),
             "logo_color": _text(form_spec.get("logo_color"), 32),
-            "usage_notes": _text(meta.get("usage_notes")),
+            "usage_notes": self._kept_notes(meta.get("usage_notes")),
             "spec": stored_form(connector_id, form_spec),
         }
         row = self.get(connector_id)
@@ -259,7 +265,7 @@ class CustomConnectorService:
             meta = changes.spec.get("connector")
             if isinstance(meta, dict):
                 if "usage_notes" in meta:
-                    row.usage_notes = _text(meta["usage_notes"])
+                    row.usage_notes = self._kept_notes(meta["usage_notes"])
                 for key, limit in (("label", 255), ("description", None), ("category", 64)):
                     if key not in sent and _text(meta.get(key), limit):
                         setattr(row, key, _text(meta[key], limit))

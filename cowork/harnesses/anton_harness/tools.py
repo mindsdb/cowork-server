@@ -39,6 +39,7 @@ from cowork.services.connectors.custom_connectors import (
     UnstorableFormError,
     check_handcrafted_form,
     handcrafted_form_allowed,
+    scope_is_one_persons,
 )
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
@@ -553,7 +554,7 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
                 "match": "none",
                 "message": (
                     f"No connector with id `{cid}`. Retry with a `query` "
-                    f"(natural-language), or: {_BUILD_CUSTOM_CONNECTOR}"
+                    f"(natural-language), or: {_no_match_hint()}"
                 ),
                 "available_ids": sorted(connectors),
             })
@@ -583,7 +584,7 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
             "match": "none",
             "message": (
                 "No connector matched the query. If the user may have meant a "
-                f"listed one, ask them to clarify. Otherwise: {_BUILD_CUSTOM_CONNECTOR}"
+                f"listed one, ask them to clarify. Otherwise: {_no_match_hint()}"
             ),
             "available_ids": sorted(connectors),
         })
@@ -676,6 +677,20 @@ _BUILD_CUSTOM_CONNECTOR = (
     "to `request_credentials`. Credentials go only through that form, never chat. "
     "Once its connection test passes it is saved for reuse."
 )
+_NO_CUSTOM_CONNECTOR = (
+    "No built-in or saved connector matches, and custom connectors can't be "
+    "saved for reuse on this deployment. Tell the user so. A handcrafted form "
+    "passed to `request_credentials` still saves this connection once its test "
+    "passes, but it won't be listed with the connectors."
+)
+
+
+def _no_match_hint() -> str:
+    """What lookup_connector tells the agent when nothing matches: build a
+    custom connector where one can be kept (scope_is_one_persons), else that
+    none can be."""
+    scope = current_settings_scope() or LOCAL_SCOPE
+    return _BUILD_CUSTOM_CONNECTOR if scope_is_one_persons(scope) else _NO_CUSTOM_CONNECTOR
 
 
 async def _read_scope_catalog(read: Callable[[ConnectorSpecRegistry], T]) -> T:

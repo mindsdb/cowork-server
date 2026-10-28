@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import connections as connections_endpoints
 from cowork.api.v1.endpoints.connectors.custom import delete_custom_connector, update_custom_connector
@@ -183,6 +183,16 @@ def test_an_org_admin_changes_only_their_own_orgs_row(engine):
 
     assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("httpbin").label == "Org copy"
     assert ConnectorCatalog(_scoped(engine)).get_connector("httpbin").label == "httpbin"
+
+
+def test_org_mode_keeps_no_usage_notes_from_a_new_form(engine):
+    new_form = {**FORM, "connector": {"usage_notes": "Send the team token in X-Team-Key."}}
+
+    update_custom_connector("httpbin", CustomConnectorUpdate(spec=new_form), _scoped(engine, ORG_A))
+
+    with Session(engine) as session:
+        rows = session.exec(select(CustomConnector).where(CustomConnector.org_id == "org-a")).all()
+    assert [r.usage_notes for r in rows] == [None]
 
 
 def _org_client(engine, principal) -> TestClient:

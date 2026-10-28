@@ -100,10 +100,13 @@ class ConnectorCatalog(ConnectorSpecRegistry):
 
         Returns:
             The registry's specs plus this scope's custom ones, computed once
-            per catalog instance.
+            per catalog instance. Outside one person's scope a custom spec is
+            served without its usage notes, rows stored before that rule
+            included.
         """
         if self._cache is None:
             merged = dict(self._base.get_connectors())
+            own = scope_is_one_persons(self._session.scope)
             for row in self._custom_rows():
                 if row.connector_id in merged:
                     logger.warning(
@@ -112,6 +115,9 @@ class ConnectorCatalog(ConnectorSpecRegistry):
                         row.connector_id,
                     )
                     continue
-                merged[row.connector_id] = custom_connector_spec(row)
+                spec = custom_connector_spec(row)
+                if not own:
+                    spec["usage_notes"] = None
+                merged[row.connector_id] = spec
             self._cache = merged
         return self._cache
