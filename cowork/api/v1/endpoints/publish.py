@@ -7,15 +7,17 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 
+from cowork.services import artifact_stats as _stats
 from cowork.services.publish import (
     PublisherUnavailable,
     activate_version as _activate_version,
     desktop_publish_context as _desktop_context,
+    desktop_publish_credential as _desktop_credential,
     list_publishable,
     list_versions as _list_versions,
     publish_artifact as _publish,
@@ -64,6 +66,11 @@ class _UpdateBody(BaseModel):
 class _ActivateBody(BaseModel):
     path: str
     md5: str
+
+
+class _StatsTrackingBody(BaseModel):
+    path: str
+    enabled: StrictBool
 
 
 @router.get("/")
@@ -163,3 +170,46 @@ async def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
         raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+def _stats_credential() -> tuple[str, str]:
+    """(api_key, publish_url), or the code the stats panel shows as "Reconnect".
+
+    Only the credential lookup's ValueError gets the code; a ValueError from
+    path resolution stays an ordinary 400.
+    """
+    try:
+        return _desktop_credential()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": _stats.PUBLISH_CREDENTIAL_MISSING_CODE, "message": str(e)},
+        ) from e
+
+
+# Plain `def` routes: FastAPI runs them in its threadpool, so the call to the
+# publishing service does not block the event loop.
+@router.get("/stats")
+def artifact_stats_endpoint(
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(path, scope=scope)
+        return _stats.fetch_stats(publish_url=publish_url, key=api_key, report_id=report_id)
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+
+
+@router.put("/stats/tracking")
+def set_stats_tracking_endpoint(req: _StatsTrackingBody, scope: ScopeDep):
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(req.path, scope=scope)
+        tracking = _stats.set_tracking(
+            publish_url=publish_url, key=api_key, report_id=report_id, enabled=req.enabled,
+        )
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+    return {"tracking": tracking}
