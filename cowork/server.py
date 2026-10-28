@@ -247,9 +247,9 @@ async def lifespan(app: FastAPI):
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
     # run and never fires that schedule again. In org mode other replicas
-    # share the database and may still be running theirs, so only runs too
-    # old to be live are released here; the scheduler's poll releases the
-    # rest once they age out.
+    # share the database and may still be running theirs, so only runs old
+    # enough to be presumed dead are released here; a later boot releases
+    # the rest.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session

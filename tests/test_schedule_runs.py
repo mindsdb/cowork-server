@@ -1164,40 +1164,6 @@ def test_boot_reap_cutoff_reaps_everything_only_on_the_desktop():
     assert _ORPHANED_RUN_AGE_SECONDS > 600
 
 
-def test_poll_reaps_a_run_whose_process_died_and_fires_its_slot():
-    from cowork.scheduler import _ORPHANED_RUN_AGE_SECONDS, _poll
-
-    session = _session()
-    now = datetime.now(timezone.utc)
-    schedule = _schedule(session, next_run_at=now - timedelta(minutes=1))
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-    run = run_service.create_run(schedule.id)
-    _started_at(session, run.id, now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS + 60))
-
-    due = _poll(ScopedSession(session, SYSTEM_SCOPE))
-
-    session.refresh(run)
-    assert run.status == RunStatus.failed
-    assert due == [schedule.id]
-
-
-def test_poll_leaves_a_run_another_replica_may_still_own():
-    from cowork.scheduler import _poll
-
-    session = _session()
-    now = datetime.now(timezone.utc)
-    schedule = _schedule(session, next_run_at=now - timedelta(minutes=1))
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-    run = run_service.create_run(schedule.id)
-    _started_at(session, run.id, now - timedelta(minutes=5))
-
-    due = _poll(ScopedSession(session, SYSTEM_SCOPE))
-
-    session.refresh(run)
-    assert run.status == RunStatus.running
-    assert due == []
-
-
 def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
     """Staging audit P0: schedules are personal (created_by) but CRUD/list
     filtered by org only, so coworkers saw/paused/deleted each other's."""

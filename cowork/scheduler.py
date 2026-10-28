@@ -47,11 +47,11 @@ _MAX_RUN_DURATION_SECONDS = 600
 # keeps a refusal that comes back at once from spinning.
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
-# How long after it started a run still at `running` is known to be orphaned:
-# its turn is cut off at _MAX_RUN_DURATION_SECONDS and its two last writes
+# How old a run still at `running` must be before a booting replica may reap
+# it: its turn is cut off at _MAX_RUN_DURATION_SECONDS and its two last writes
 # each give up after _BOOKKEEPING_DEADLINE_SECONDS, plus slack for the units
-# before the turn starts. No live process can still own a run older than this,
-# so any process may reap it, including one of several replicas.
+# before the turn starts. Age is only a heuristic, since a database unit that
+# stalls holds a run past any deadline, so only boot uses it, not every poll.
 _ORPHANED_RUN_AGE_SECONDS = _MAX_RUN_DURATION_SECONDS + 2 * _BOOKKEEPING_DEADLINE_SECONDS + 10 * 60
 _scheduler_task: asyncio.Task | None = None
 
@@ -536,33 +536,20 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     return due
 
 
-def _orphaned_run_cutoff(now: datetime) -> datetime:
-    return now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
-
-
 def boot_reap_cutoff(org_mode: bool, now: datetime | None = None) -> datetime | None:
     """Which running runs a starting server may reap: all of them on the
     desktop, where it is the only process, or in org mode, where other
-    replicas may still be running them, only runs too old to be live."""
+    replicas may still be running them, only runs old enough to be presumed
+    dead."""
     if not org_mode:
         return None
-    return _orphaned_run_cutoff(now or datetime.now(timezone.utc))
+    return (now or datetime.now(timezone.utc)) - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
 
 
 def _poll(session: ScopedSession) -> list[UUID]:
-    """One poll's unit: release runs whose process died, settle missed runs,
-    then the ids of the schedules due now."""
-    now = datetime.now(timezone.utc)
-    # A replica stopped mid-run (scale-down, eviction) leaves its run at
-    # `running`, and no other replica's boot reaps a run that young.
-    reaped = ScheduleRunService(session).reap_orphaned_runs(
-        error="Run stopped reporting before it completed.",
-        started_before=_orphaned_run_cutoff(now),
-    )
-    if reaped:
-        logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
+    """One poll's unit: settle missed runs, then the ids of the schedules due now."""
     _handle_missed_runs(session)
-    return [schedule.id for schedule in _due_schedules(session, now)]
+    return [schedule.id for schedule in _due_schedules(session, datetime.now(timezone.utc))]
 
 
 async def _scheduler_loop() -> None:
