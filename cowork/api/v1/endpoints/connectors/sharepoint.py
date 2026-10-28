@@ -168,10 +168,9 @@ def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str
             ENGINE, None, name, credentials, user_label=fields.get("user_label") or None, vault=vault, scope=scope,
         )
     if slug != name:
-        # Only a writer outside these routes gets here. The record it saved
-        # to may have existed before this request, so nothing is deleted.
+        # Only a writer outside these routes gets here. The checked key was
+        # saved under another name, so the reply names it; nothing is deleted.
         logger.warning("A SharePoint create for %r was saved as %r by another writer's race", name, slug)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN)
     return _saved(vault, slug)
 
 

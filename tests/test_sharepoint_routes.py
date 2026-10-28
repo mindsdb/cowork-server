@@ -218,6 +218,24 @@ def test_a_lost_race_never_touches_an_existing_suffixed_connection(monkeypatch, 
     assert _record("corp-2") == before
 
 
+def test_a_create_whose_name_is_taken_during_the_save_reports_the_name_it_was_saved_under(monkeypatch, microsoft):
+    real_persist = sharepoint_ep.persist_connection
+
+    def persist_after_another_writer(engine, method, name, credentials, **kwargs):
+        persist_connection("sharepoint", None, name, {**credentials, "client_id": OTHER_CLIENT}, scope=LOCAL_SCOPE)
+        return real_persist(engine, method, name, credentials, **kwargs)
+
+    monkeypatch.setattr(sharepoint_ep, "persist_connection", persist_after_another_writer)
+
+    response = sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE)
+
+    assert response["name"] == "corp-2"
+    assert sorted(_names()) == ["corp", "corp-2"]
+    assert _record("corp")["fields"]["client_id"] == OTHER_CLIENT
+    assert _record("corp-2")["fields"]["client_id"] == CLIENT_ID
+    assert _record("corp-2")["fields"]["client_secret"] == SECRET
+
+
 def test_a_name_sharing_an_env_prefix_taken_during_the_check_is_refused(monkeypatch, microsoft):
     _create_during_the_check(monkeypatch, "corp_one", {"client_id": OTHER_CLIENT})
 
