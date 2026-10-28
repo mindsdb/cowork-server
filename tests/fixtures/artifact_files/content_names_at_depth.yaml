@@ -1,0 +1,19 @@
+# Names anton keeps out of an artifact's content only as the first segment:
+# the generation inputs, README.md and backend.log. Inside a subfolder they
+# are the user's own files, so a read and the drafts route serve them, in any
+# case. `rel_path` is the path in the request.
+
+- id: readme
+  rel_path: docs/README.md
+- id: readme-recased
+  rel_path: docs/Readme.md
+- id: product-requirements
+  rel_path: docs/prd.md
+- id: technical-spec
+  rel_path: docs/spec.md
+- id: api-spec-in-a-public-folder
+  rel_path: static/openapi.json
+- id: discovery-state
+  rel_path: data/discovery.json
+- id: backend-log
+  rel_path: logs/backend.log

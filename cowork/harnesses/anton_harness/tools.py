@@ -150,8 +150,17 @@ COWORK_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY (desktop chat):",
     from_chat="publishing works straight from chat when MindsHub is configured",
 )
-SELF_HOSTED_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
-    panel="The user can also publish from the Live Artifacts panel",
+# A self-hosted deployment publishes to its own publisher, which takes HTML
+# and Markdown only: `publish_artifact` refuses a full-stack artifact there
+# (`FULLSTACK_PUBLISH_UNSUPPORTED`). The agent hears it before it builds one.
+_SELF_HOSTED_FULLSTACK_EXCEPTION = (
+    "Full-stack apps (a backend with its frontend) can't be published from this "
+    "deployment: publish an HTML page or a Markdown document."
+)
+SELF_HOSTED_PUBLISH_DESCRIPTION = (
+    _PUBLISH_DESCRIPTION.format(panel="The user can also publish from the Live Artifacts panel")
+    + " "
+    + _SELF_HOSTED_FULLSTACK_EXCEPTION
 )
 SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
     heading="CONTENT SHARING POLICY:",

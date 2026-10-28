@@ -1,0 +1,28 @@
+# XML 1.0 forbids C0 controls other than tab, newline and carriage return,
+# lone surrogates and U+FFFE/U+FFFF. The writer strips them from text,
+# attributes and titles; "text" is the paragraph text that remains.
+- name: raw_controls_in_text
+  html: "<p>a\x01b\x08c\x0bd\x0ce\x1ff\x7fg</p>"
+  text: "abcdef\x7fg"
+- name: character_references
+  html: "<p>a&#1;b&#x0B;c&#xFFFE;d&#xFFFF;e</p>"
+  text: "abcde"
+- name: lone_surrogate
+  html: "<p>a\ud800b\udfffc</p>"
+  text: "abc"
+- name: nul_byte
+  html: "<p>a\0b</p>"
+  text: "ab"
+- name: controls_in_alt
+  html: "<p><img src=\"data:image/svg+xml;base64,PHN2Zy8+\" alt=\"x\x02y&#3;z\"></p>"
+  text: "[image: xyz]"
+  text_before_libxml2_2_12: "[image: xy]"
+- name: controls_in_link
+  html: "<p><a href=\"https://example.com/\x01a&#2;b\">l\x03ink</a></p>"
+  text: "link"
+- name: controls_in_pre
+  html: "<pre>one\x01\n\x02two</pre>"
+  text: "one\ntwo"
+- name: controls_in_table_cell
+  html: "<table><tr><td>c\x04ell</td></tr></table>"
+  table_text: "cell"

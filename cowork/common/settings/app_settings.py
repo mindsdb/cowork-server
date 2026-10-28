@@ -1,18 +1,29 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.schemas.artifact_export import ExportPdfSettings
 
 if TYPE_CHECKING:
     from anton.core.llm.identity import DeploymentIdentity
@@ -169,6 +180,30 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 # interpolated into a bogus hostname like api.<garbage>.mindshub.ai.
 _KNOWN_ENV_SLUGS = ("staging", "dev")
 
+# A draft-link token is readable by the artifact's own script and by anyone who
+# can read an access log, so a short signing secret could be brute-forced offline.
+_DRAFT_KEY_MIN_CHARS = 32
+
+# scheme://host[:port] and one optional trailing slash, nothing else: no inner
+# whitespace, userinfo, path, query, fragment, wildcard, or the `;` and `,` that
+# would end or extend a CSP source list this value is written into.
+_BARE_ORIGIN = re.compile(
+    r"(?P<scheme>https?)://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?/?",
+    re.IGNORECASE,
+)
+
+
+def _bare_origin(value: str) -> tuple[str, str] | None:
+    """``(origin, host)`` of a bare http(s) origin, lower-cased; None otherwise.
+
+    Whitespace around the value (a newline from a mounted secret) is ignored.
+    """
+    match = _BARE_ORIGIN.fullmatch(value.strip())
+    if match is None:
+        return None
+    host = match["host"].lower().rstrip(".")
+    return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
+
 
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
@@ -193,6 +228,12 @@ def default_minds_url() -> str:
     return f"{default_minds_api_host()}/v1"
 
 
+def _pr_namespace() -> str:
+    """This pod's per-PR namespace (``pr-...``) from the downward API, else ''."""
+    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
+    return ns if ns.startswith("pr-") else ""
+
+
 def default_turn_minds_api_host() -> str:
     """MindsHub API host for the POD's turn — this deployment's OWN inference.
 
@@ -206,10 +247,22 @@ def default_turn_minds_api_host() -> str:
     Everything else — dev, staging, prod, desktop — keeps the ENV-slug host,
     which is already correct (notably prod, which has no slug at all).
     """
-    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
-    if ns.startswith("pr-"):
+    ns = _pr_namespace()
+    if ns:
         return f"https://api-{ns}.dev.mindshub.ai"
     return default_minds_api_host()
+
+
+def default_draft_env_label() -> str:
+    """The environment a draft-preview token is issued for and accepted in.
+
+    The same split as ``default_turn_minds_api_host``, as a label: a per-PR env
+    by its namespace (they all run ENV=development and likely share dev's draft
+    key, so the namespace is what tells them apart), otherwise the ENV slug,
+    and ``prod`` for everything else. Read from the downward API, never from a
+    request.
+    """
+    return _pr_namespace() or _env_slug() or "prod"
 
 
 def default_minds_auth_host() -> str:
@@ -649,7 +702,7 @@ class TurnQueueSettings(Settings):
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
 
 
-# The OpenAI API an openai_compatible provider's planning and coding roles call.
+# The OpenAI API an openai_compatible provider's planning, coding and router roles call.
 OpenAICompatibleAPI = Literal["chat_completions", "responses"]
 
 
@@ -953,6 +1006,38 @@ class AppSettings(Settings):
             "Under 'landlock', app backends and Code mode are refused."
         ),
     )
+    live_apps_viewer_login_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_VIEWER_LOGIN_URL"),
+        description=(
+            "With live apps on (anton's ANTON_LIVE_APP_SLOTS), the viewer "
+            "sign-in this server asks who opens an app, for example "
+            "http://viewer-login:4180: its /oauth2/userinfo names the signed-in "
+            "visitor (cowork.services.live_apps). create_app refuses live apps "
+            "without it."
+        ),
+    )
+    live_apps_viewer_public_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_VIEWER_PUBLIC_URL"),
+        description=(
+            "The same viewer sign-in at the address a browser reaches, for "
+            "example http://view.localhost:8080. A live app's preview in the "
+            "web UI sends its sign-in window there; without it a preview is "
+            "refused, and the pane offers only Open in browser."
+        ),
+    )
+    live_apps_launch_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("COWORK_LIVE_APPS_LAUNCH_TOKEN"),
+        description=(
+            "With live apps on, the token anton sends each app slot with a "
+            "launch; each slot holds only its SHA-256. Agent code never "
+            "receives it: anton's launcher passes a cell no COWORK_ variable "
+            "(anton.core.backends.sandbox._ENV_NEVER_PREFIXES). create_app "
+            "refuses live apps with fewer than 32 characters."
+        ),
+    )
 
     organization_switch_enabled: bool = Field(
         default=False,
@@ -965,6 +1050,115 @@ class AppSettings(Settings):
             "Defaults off so deploying protocol support cannot expose it."
         ),
     )
+    # Draft-preview links. Org web only. All six values together turn the
+    # signed draft links on; any one missing leaves previews on the srcdoc
+    # path (see draft_links_enabled).
+    draft_hosts: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_HOSTS"),
+        description=(
+            "Comma-separated host names of the draft-preview host (e.g. "
+            "draft.mindshub.co). The draft listener answers 404 to any other "
+            "Host. Empty (default) serves no draft host."
+        ),
+    )  # COWORK_DRAFT_HOSTS
+    draft_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_ORIGIN"),
+        description="Origin draft links point at, e.g. https://draft.mindshub.co.",
+    )  # COWORK_DRAFT_ORIGIN
+    draft_link_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KEYS"),
+        description=(
+            "Draft-link signing keys as a JSON map {kid: secret}, from the "
+            "mindsdb-secrets Secret. Two kids can be live during a rotation. "
+            "A secret shorter than 32 characters is ignored."
+        ),
+    )  # COWORK_DRAFT_LINK_KEYS
+    draft_link_kid: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KID"),
+        description="The kid in COWORK_DRAFT_LINK_KEYS that signs new draft links.",
+    )  # COWORK_DRAFT_LINK_KID
+    web_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_WEB_ORIGIN"),
+        description=(
+            "Origin of the cowork web app, e.g. https://cowork.mindshub.ai: the "
+            "only page allowed to frame a draft (CSP frame-ancestors)."
+        ),
+    )  # COWORK_WEB_ORIGIN
+    draft_port: int = Field(
+        default=0,
+        ge=0,
+        le=65535,
+        validation_alias=AliasChoices("COWORK_DRAFT_PORT"),
+        description=(
+            "Port of the draft listener: a second server in this process that "
+            "serves only the draft sub-app, so the draft Ingress, which routes "
+            "to this port alone, can never reach the API app. 0 (default) "
+            "starts no listener."
+        ),
+    )  # COWORK_DRAFT_PORT
+
+    @field_validator("draft_port", mode="before")
+    @classmethod
+    def _empty_draft_port_is_off(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return 0
+        return v
+
+    def draft_host_names(self) -> frozenset[str]:
+        """COWORK_DRAFT_HOSTS as lower-case host names, without a trailing dot."""
+        return frozenset(
+            name.strip().lower().rstrip(".")
+            for name in self.draft_hosts.split(",")
+            if name.strip()
+        )
+
+    def draft_link_keyring(self) -> dict[str, str]:
+        """COWORK_DRAFT_LINK_KEYS parsed; an unreadable value is no keys at all.
+
+        A secret shorter than 32 characters is dropped like a non-string one.
+        """
+        try:
+            parsed = json.loads(self.draft_link_keys)
+        except ValueError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            kid: secret
+            for kid, secret in parsed.items()
+            if kid and isinstance(secret, str) and len(secret) >= _DRAFT_KEY_MIN_CHARS
+        }
+
+    def draft_link_origin(self) -> str:
+        """COWORK_DRAFT_ORIGIN as a bare origin, or '' when it is not one."""
+        parsed = _bare_origin(self.draft_origin)
+        return parsed[0] if parsed else ""
+
+    def draft_frame_origin(self) -> str:
+        """COWORK_WEB_ORIGIN as a bare origin, or '' when it is not one.
+
+        The only value written into the draft host's CSP frame-ancestors.
+        """
+        parsed = _bare_origin(self.web_origin)
+        return parsed[0] if parsed else ""
+
+    def draft_links_enabled(self) -> bool:
+        """Whether this server issues and serves signed draft links."""
+        link_origin = _bare_origin(self.draft_origin)
+        return (
+            self.tenancy_mode == "org"
+            and link_origin is not None
+            and link_origin[1] in self.draft_host_names()
+            and bool(self.draft_frame_origin())
+            and self.draft_link_kid in self.draft_link_keyring()
+            and self.draft_port > 0
+        )
+
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(
@@ -1043,16 +1237,16 @@ class AppSettings(Settings):
         default="chat_completions",
         validation_alias=AliasChoices("COWORK_OPENAI_COMPATIBLE_API"),
         description=(
-            "The API the planning and coding roles call on an openai_compatible "
+            "The API the planning, coding and router roles call on an openai_compatible "
             "provider. 'chat_completions' (default) calls {base}/chat/completions. "
             "'responses' calls {base}/responses through anton's openai flavor, "
             "where OpenAI and Azure accept function tools together with a "
             "reasoning effort. It applies only when the installed anton reports "
-            "RESPONSES_TRANSPORT_READY; with an older anton both roles stay on "
+            "RESPONSES_TRANSPORT_READY; with an older anton all three roles stay on "
             "chat completions and one warning says so. On the Responses path the "
             "agent loop runs without web tools, since OpenAI's hosted web_search "
             "reads the web from the provider's side, outside the deployment's "
-            "egress controls. The router and Gemini stay on chat completions. "
+            "egress controls. Gemini is unaffected. "
             "Deployment-wide; get_app_settings() is cached, so a change needs a "
             "restart."
         ),
@@ -1113,3 +1307,59 @@ class AppSettings(Settings):
 def get_app_settings() -> AppSettings:
     """Get cached application settings."""
     return AppSettings()
+
+
+EXPORT_PDF_ENGINE_VAR = "COWORK_EXPORT_PDF_ENGINE"
+EXPORT_RENDER_URL_VAR = "COWORK_EXPORT_RENDER_URL"
+
+
+def load_export_pdf_settings(*, environ: Mapping[str, str]) -> ExportPdfSettings:
+    """Read the PDF export settings from ``environ``, the process environment.
+
+    They never come from the ``.env`` chain the settings above read. On the
+    desktop, ``POST /settings/raw`` writes ``<COWORK_HOME>/.env``, so a render
+    URL taken from there would send every exported document wherever that
+    write pointed it.
+
+    An unset or blank engine means no PDF. Any other engine than "render"
+    raises ValueError, and so does "render" without an http(s) URL, which
+    stops the server's start.
+    """
+    engine = environ.get(EXPORT_PDF_ENGINE_VAR, "").strip()
+    if not engine:
+        return ExportPdfSettings(engine=None, render_url=None)
+    if engine != "render":
+        raise ValueError(f"{EXPORT_PDF_ENGINE_VAR} must be 'render' or unset, not {engine!r}.")
+    url = environ.get(EXPORT_RENDER_URL_VAR, "").strip()
+    if not url:
+        raise ValueError(
+            f"{EXPORT_PDF_ENGINE_VAR}=render needs {EXPORT_RENDER_URL_VAR}, the http(s) base "
+            "address of the render service. Set it, or unset the engine to turn PDF export off."
+        )
+    # The URL itself stays out of these messages: it may carry credentials.
+    try:
+        settings = ExportPdfSettings(engine="render", render_url=url)
+    except ValidationError:
+        raise ValueError(
+            f"{EXPORT_RENDER_URL_VAR} must be an http:// or https:// address with a host."
+        ) from None
+    render_url = settings.render_url
+    # A bare "?" or "#" parses as an empty query or fragment, not None, and
+    # still moves /v1/pdf out of the path.
+    if render_url is not None and (render_url.query is not None or render_url.fragment is not None):
+        raise ValueError(
+            f"{EXPORT_RENDER_URL_VAR} must be the render service's base address, with no "
+            "query or fragment: the server adds /v1/pdf to it."
+        )
+    return settings
+
+
+@lru_cache
+def get_export_pdf_settings() -> ExportPdfSettings:
+    """The process's PDF export settings, read once.
+
+    ``cowork.cli.main`` reads them before it loads a ``.env`` file into the
+    environment, so a value only in a ``.env`` file never reaches them, and
+    ``create_app`` reads them so a bad value stops the start.
+    """
+    return load_export_pdf_settings(environ=os.environ)

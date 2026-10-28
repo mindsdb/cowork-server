@@ -37,7 +37,7 @@ def test_reading_needs_no_permission(act_first):
 
 
 def test_project_context_uses_the_session_setting():
-    source = inspect.getsource(harness.AntonHarness._build_chat_session)
+    source = inspect.getsource(harness.AntonHarness._build_turn_session)
     assert "_project_file_actions_rule(anton_settings.act_first)" in source
     assert "ask the user for permission first" not in source
     assert "You can freely read" not in source
