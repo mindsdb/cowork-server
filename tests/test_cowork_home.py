@@ -425,6 +425,13 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
         ("cowork/code_sandbox.py", "_trusted_roots", "cowork_home()"),
         ("cowork/code_sandbox.py", "_run_self_test.scratch", "cowork_home() / 'tmp'"),
         ("cowork/code_sandbox.py", "_refuse_linked_cowork_home_entries.entry", "cowork_home() / name"),
+        # This local-only backfill reads shared history solely to reject
+        # unattributed page ids; it never runs on an org deployment.
+        (
+            "cowork/services/published_page_owner_backfill.py",
+            "_candidates.global_root",
+            "Path(os.environ.get('ANTON_COWORK_STATE_DIR') or cowork_home()).expanduser()",
+        ),
         # These are read-only sources for a one-time legacy import.
         *(
             ("cowork/harnesses/memory/migration.py", "_MIGRATION_SOURCES", f"cowork_home() / '{path}'")

@@ -77,6 +77,22 @@ def wait_for_workspace(service: CodingService, session_id: str) -> CodingSession
     return session
 
 
+def wait_for_steerable_turn(service: CodingService, session_id: str) -> None:
+    """Wait until the running turn routes a steer straight to its engine.
+
+    ``FakeEngine.started`` fires inside ``start_turn``, before the turn records
+    its id. A steer sent in that gap is held for the turn instead of reaching
+    the engine, so a test that needs the engine's answer waits here first.
+    """
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        running = service._running.get(session_id)
+        if running is not None and running.engine is not None and running.turn_id:
+            return
+        time.sleep(0.01)
+    raise AssertionError("the turn did not become ready for steering")
+
+
 def wait_for_steers(engine: FakeEngine) -> None:
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline and not engine.steers:
