@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_db, unit_session
 from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
@@ -18,6 +19,7 @@ from cowork.schemas.connectors import (
     DirectSaveResponse,
     PatchPickedFilesBody,
 )
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
@@ -30,7 +32,6 @@ from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
-from cowork.services.connectors.specs._registry import registry
 
 _log = logging.getLogger("cowork.connectors.connections")
 router = APIRouter()
@@ -72,7 +73,8 @@ async def list_connections(scope: ScopeDep, request: Request):
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
         ]
-    return ConnectionsService(scope).list()
+    specs = await run_db(lambda session: ConnectorCatalog(session).get_connectors(), scope=scope)
+    return ConnectionsService(scope).list(specs)
 
 
 # Non-secret fields surfaced from auth's connection-detail response —
@@ -176,7 +178,9 @@ def _persist_direct_connection(
     values: dict,
 ) -> dict[str, object]:
     _refuse_sharepoint(body.connector_id, scope)
-    if registry.get_connector(body.connector_id) is None:
+    with unit_session(scope=scope) as session:
+        known = ConnectorCatalog(session).get_connector(body.connector_id)
+    if known is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
     if body.name.strip():
         _refuse_unchangeable(scope, body.connector_id, body.name.strip())
@@ -199,6 +203,7 @@ def _persist_direct_connection(
             body.name,
             values,
             replace_existing=body.replace_existing,
+            spec_form=known.form.model_dump() if known.custom else None,
             default_label=oauth_default_label(values, body.connector_id),
             # HubSpot's MCP connector has no connect-time read/write/none
             # picker (see the HubSpot blueprint tab, Stage 0) — every new
