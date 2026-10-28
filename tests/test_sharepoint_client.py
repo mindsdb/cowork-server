@@ -563,3 +563,9 @@ def test_a_401_during_a_passing_check_caches_the_token_that_worked():
 def test_every_error_kind_has_a_standard_message():
     for kind in SharePointErrorKind:
         assert str(SharePointError(kind))
+
+
+def test_an_app_keys_repr_never_shows_the_secret():
+    assert SECRET not in repr(KEY)
+    assert SECRET not in str(KEY)
+    assert KEY.client_id in repr(KEY)

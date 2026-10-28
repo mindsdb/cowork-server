@@ -14,7 +14,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
@@ -85,7 +85,7 @@ class SharePointError(Exception):
 class AppKey:
     tenant_id: str
     client_id: str
-    client_secret: str
+    client_secret: str = field(repr=False)
 
     def cache_key(self) -> tuple[str, str, str]:
         """Identify this key in the token cache without holding the secret itself."""
