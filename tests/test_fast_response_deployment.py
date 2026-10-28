@@ -15,9 +15,9 @@ from cowork.server import create_app
 
 
 PRODUCT = "Acme & Co's $workbench"
-# Exact prompts at staging 8b1ecf4, before deployment identity support. These
-# compatibility assertions exercise provider requests, not just the constants.
-DEFAULT_GATE_SHA256 = "e77c722af7fd7011d9ffc717120760c7cb369b6612bd533addb2b90628b66f6d"
+# Exact unbranded prompts the providers receive; a deliberate prompt edit updates
+# its hash here. These assertions exercise provider requests, not just the constants.
+DEFAULT_GATE_SHA256 = "d5a82b2d225fa95ac77409e7adac8b2066362b0cb622eac4121acae636120151"
 DEFAULT_TAKE_SHA256 = "423cf10dd88589f84adadb158b7851a89cfd32da4bad967c473062f07a51427a"
 
 

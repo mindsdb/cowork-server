@@ -12,6 +12,7 @@ import pkgutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
@@ -107,6 +108,25 @@ def close_coding_services():
     from coding_service_fakes import close_services
 
     close_services()
+
+
+@pytest.fixture(autouse=True)
+def gate_own_budgets():
+    """Gate timing tests patch the gate's budgets; a developer's exported or
+    ./.env COWORK_GATE_FIRST_EVENT_SECONDS must not override them.
+
+    Not through ``monkeypatch``: an autouse conftest fixture that requests it
+    sets it up before module fixtures, so its undo would run after their
+    teardown, which then sees the test's patches still in place.
+    """
+    from cowork.handlers import response_routing
+
+    original = response_routing.get_app_settings
+    response_routing.get_app_settings = lambda: SimpleNamespace(
+        usage_log=False, gate_first_event_seconds=None,
+    )
+    yield
+    response_routing.get_app_settings = original
 
 
 @pytest.fixture(scope="session", autouse=True)

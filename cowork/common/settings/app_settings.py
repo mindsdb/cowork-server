@@ -1181,6 +1181,28 @@ class AppSettings(Settings):
             return v.strip().lower() in {"1", "true", "yes", "on"}
         return v
 
+    # For an eval run far from the gateway, where the gate's own decision budget
+    # measures the network rather than the gate. Unset keeps the gate's own budget.
+    gate_first_event_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices("COWORK_GATE_FIRST_EVENT_SECONDS"),
+        description=(
+            "Seconds the route gate waits for its decision before delegating. "
+            "Replaces the gate's own budget, so a smaller value lowers it; a "
+            "larger one also extends the gate's total budget by the difference."
+        ),
+    )
+
+    @field_validator("gate_first_event_seconds", mode="before")
+    @classmethod
+    def _blank_gate_budget_is_unset(cls, v: object) -> object:
+        # A template that renders an empty value means "not set", not a bad number.
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
     master_key: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_MASTER_KEY"),

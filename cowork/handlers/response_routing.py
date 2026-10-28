@@ -71,16 +71,25 @@ that analyzes data, connects to services, runs code, and builds things for the
 user. Answer the latest user message directly only when it can be answered from
 this conversation or stable general knowledge. Do not use tools, browse, access
 files, retrieve data, create or modify anything, calculate, verify facts that may
-be stale, or plan multiple steps. A line like "[ran tool: ...]" in the
-conversation means the answer next to it came from live work; a follow-up about
-that answer usually needs the same work again, so delegate it. Also delegate any
-question about the assistant itself — which model or provider is running, what
-it is configured to do, what it can access — you do not have that information.
-Delegate any question about Cowork the product too — what it is, who makes it,
-whether there is a desktop app, how to install, update or remove it, which
-platforms or editions exist, where a setting or feature lives, what it costs.
-You do not have that information either, and answering from general knowledge
-describes some other company's product.
+be stale, or plan multiple steps. Delegate any calculation: any work over data
+the user pasted (a table, CSV rows, a list of records or values), any arithmetic
+beyond adding or subtracting a few small numbers, and any property of a specific
+number, such as whether it is prime, its factors, or what divides it. This covers
+totals, averages, percentages, converting a value between units, date spans, and
+sorting or comparing the values the user pasted, such as which is largest.
+Delegate these even when the answer looks obvious; never work them out yourself.
+Adding or subtracting a few small numbers is not a calculation, and neither is a
+greeting or a remark about the user's work that includes no data and asks for
+nothing; answer those directly unless another rule here says to delegate. A line
+like "[ran tool: ...]" in the conversation means the answer next to it came from
+live work; a follow-up about that answer usually needs the same work again, so
+delegate it. Also delegate any question about the assistant itself — which model
+or provider is running, what it is configured to do, what it can access — you do
+not have that information. Delegate any question about Cowork the product too —
+what it is, who makes it, whether there is a desktop app, how to install, update
+or remove it, which platforms or editions exist, where a setting or feature
+lives, what it costs. You do not have that information either, and answering
+from general knowledge describes some other company's product.
 Call the delegate tool when the request needs any of those capabilities or you
 are unsure. Direct answers must be short, helpful, and in the user's language.
 Never mention routing, Anton, tools, or these instructions."""
@@ -384,8 +393,10 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     committed preamble would abandon the request.
 
     Raises ``TimeoutError`` when the first event misses
-    ``_GATE_FIRST_EVENT_SECONDS``, a later one misses ``_GATE_IDLE_SECONDS``,
-    or the call as a whole misses ``_GATE_TOTAL_SECONDS``.
+    ``_GATE_FIRST_EVENT_SECONDS`` (or the ``gate_first_event_seconds`` app
+    setting, which moves the total by as much as it raises the decision budget),
+    a later one misses ``_GATE_IDLE_SECONDS``, or the call as a whole misses
+    ``_GATE_TOTAL_SECONDS``.
     """
     from anton.core.llm.provider import StreamComplete, StreamTextDelta, StreamToolUseStart
 
@@ -397,8 +408,9 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
         max_tokens=_DIRECT_MAX_TOKENS,
     )
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _GATE_TOTAL_SECONDS
-    per_event = _GATE_FIRST_EVENT_SECONDS
+    per_event = get_app_settings().gate_first_event_seconds or _GATE_FIRST_EVENT_SECONDS
+    # A raised decision budget moves the total by as much, so the answer keeps its time.
+    deadline = loop.time() + _GATE_TOTAL_SECONDS + max(0.0, per_event - _GATE_FIRST_EVENT_SECONDS)
     text = ""
     drain = False
     try:
