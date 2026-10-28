@@ -46,3 +46,13 @@ def test_without_create_only_another_account_still_gets_a_suffix(vault):
     slug = persist_connection("postgres", None, "corp", SECOND, vault=vault)
 
     assert slug == "corp-2"
+
+
+def test_a_name_clash_is_not_caught_as_a_disk_error(vault):
+    persist_connection("postgres", None, "corp", FIRST, vault=vault)
+
+    with pytest.raises(ConnectionExistsError):
+        try:
+            persist_connection("postgres", None, "corp", SECOND, create_only=True, vault=vault)
+        except OSError:
+            pytest.fail("a name clash was caught as OSError")

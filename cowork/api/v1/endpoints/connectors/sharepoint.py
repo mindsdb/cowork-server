@@ -6,8 +6,10 @@ before anything is stored. Create and edit are separate routes: a create
 refuses a name already in use, so it never replaces another key's
 connection. Creates take one lock while they check the name again and save,
 so a name or env prefix taken during the key check is refused, not
-overwritten; the save itself refuses a name another writer took meanwhile,
-never saving under a suffix. Browse reads only the sites the
+overwritten; the save itself refuses the exact name if another writer took
+it meanwhile, never saving under a suffix. Env prefix uniqueness holds among
+creates on these routes; a twin name written elsewhere during the save is not
+caught. Browse reads only the sites the
 connection names. Refused in org mode: the hosted app keeps connections in
 auth, not in this vault.
 """

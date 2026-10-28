@@ -45,7 +45,7 @@ class ConnectionNotFoundError(LookupError):
     """An ``extends`` save named a connection that does not exist."""
 
 
-class ConnectionExistsError(FileExistsError):
+class ConnectionExistsError(Exception):
     """A ``create_only`` save named a connection that already exists."""
 
 
