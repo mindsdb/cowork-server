@@ -42,20 +42,6 @@ ALICE = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_
 BOB = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_B), user_id=SUB_B, personal_resources=ALL_PERSONAL_RESOURCES)
 
 
-@pytest.fixture
-def stores(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
-    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
-    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
-    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
-    get_app_settings.cache_clear()
-    sharepoint_service._TOKENS.clear()
-    yield tmp_path
-    sharepoint_service._TOKENS.clear()
-    get_app_settings.cache_clear()
-
-
 def _file(n: int) -> dict:
     return {
         "id": f"01F{n:04d}",
@@ -98,7 +84,7 @@ class Graph:
 
 
 @pytest.fixture
-def graph(monkeypatch, stores):
+def graph(monkeypatch, sharepoint_stores):
     fake = Graph()
     monkeypatch.setattr(
         sharepoint_ep,

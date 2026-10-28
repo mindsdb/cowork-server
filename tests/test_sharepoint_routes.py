@@ -49,20 +49,6 @@ ALICE = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_
 BOB = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_B), user_id=SUB_B, personal_resources=ALL_PERSONAL_RESOURCES)
 
 
-@pytest.fixture
-def stores(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
-    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
-    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
-    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
-    get_app_settings.cache_clear()
-    sharepoint_service._TOKENS.clear()
-    yield tmp_path
-    sharepoint_service._TOKENS.clear()
-    get_app_settings.cache_clear()
-
-
 class Microsoft:
     """Answers the token call and the site and library lookups the check makes."""
 
@@ -88,7 +74,7 @@ class Microsoft:
 
 
 @pytest.fixture
-def microsoft(monkeypatch, stores):
+def microsoft(monkeypatch, sharepoint_stores):
     ms = Microsoft()
     monkeypatch.setattr(
         sharepoint_ep,
@@ -147,7 +133,7 @@ def test_create_saves_the_connection_after_the_key_opens_every_site(microsoft):
         (Microsoft(site_status=403), f"The app can't open {SITE}"),
     ],
 )
-def test_each_failed_check_answers_its_own_message_and_saves_nothing(monkeypatch, stores, ms, message):
+def test_each_failed_check_answers_its_own_message_and_saves_nothing(monkeypatch, sharepoint_stores, ms, message):
     monkeypatch.setattr(
         sharepoint_ep,
         "SharePointClient",
