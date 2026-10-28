@@ -1,12 +1,14 @@
 """The self-hosted router probe runs after bootstrap without delaying readiness."""
 
 import asyncio
+import signal
 from unittest.mock import AsyncMock
 
 import pytest
 
 from cowork import server
 from cowork.services import router_probe
+from cowork.streaming import registry
 
 
 @pytest.fixture
@@ -45,7 +47,12 @@ def boot(monkeypatch):
         monkeypatch.setenv("COWORK_TURN_BACKEND", backend)
         return app, order, router_probe
 
-    return configure
+    original = signal.getsignal(signal.SIGTERM)
+    yield configure
+    # A remote-mode lifespan closes the process-wide registry at shutdown and
+    # may install its SIGTERM handler; later tests need neither.
+    signal.signal(signal.SIGTERM, original)
+    registry.reset()
 
 
 async def test_probe_starts_after_bootstrap_without_blocking_and_is_drained_at_shutdown(

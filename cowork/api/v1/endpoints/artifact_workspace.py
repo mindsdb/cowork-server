@@ -15,11 +15,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
+from cowork.api.v1.content_disposition import attachment_disposition
+from cowork.api.v1.pinned_response import PinnedStreamingResponse
 from cowork.common.paths import (
     dir_lstat,
     open_pinned_child,
@@ -88,36 +90,6 @@ _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
 # walk refuses them there casefolded too, and the store-owned ones at any
 # depth (`artifact_files.refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
-
-
-def _attachment_disposition(filename: str) -> str:
-    """``Content-Disposition`` for saving ``filename``, safe to put on the wire.
-
-    The name is a request-derived path component. ``relative_file_parts``
-    rejects NUL, separators and ``..``, but a quote, CR or LF still pass — and
-    any of them interpolated raw into a header is a header-injection vector
-    (``project_files.download_project_file`` has exactly that shape; ENG-2044).
-
-    Two spellings so every client gets a usable name: an ASCII ``filename=``
-    with quotes and backslashes escaped and non-printables dropped, and an
-    RFC 5987 ``filename*=UTF-8''…`` carrying the exact name percent-encoded,
-    which is what current browsers read first.
-    """
-    cleaned = "".join(ch for ch in filename if ch.isprintable())
-    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii")
-    ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"').strip() or "download"
-    # A fully non-ASCII stem leaves only the extension(s) behind — "报告.xlsx"
-    # -> ".xlsx", "报告.tar.gz" -> ".tar.gz" — a HIDDEN dotfile on macOS/Linux.
-    # Prefix rather than rpartition: splitting on the last dot rescued only
-    # single-extension names (review pass 2 on #413). Distinct artifacts can
-    # still degrade to the same "download.xlsx" — acceptable, since the ASCII
-    # spelling is a fallback and `filename*` below carries the exact name.
-    if ascii_name.startswith("."):
-        ascii_name = "download" + ascii_name
-    return (
-        f'attachment; filename="{ascii_name}"; '
-        f"filename*=UTF-8''{quote(cleaned or 'download', safe='')}"
-    )
 
 
 def _artifact_folder_component(source, folder: Path) -> str:
@@ -270,30 +242,12 @@ def _draft_stream(
         finally:
             resources.close()
 
-    return _PinnedDraftResponse(
+    return PinnedStreamingResponse(
         chunks(),
         resources=resources,
         media_type=media_type,
         headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
-
-
-class _PinnedDraftResponse(StreamingResponse):
-    """Always release draft descriptors, including before iteration starts."""
-
-    def __init__(self, *args, resources: ExitStack, **kwargs):
-        self._resources = resources
-        super().__init__(*args, **kwargs)
-
-    async def __call__(self, scope, receive, send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            # StreamingResponse does not run a BackgroundTask when the ASGI
-            # send callable raises before body iteration. This outer finally
-            # covers that disconnect path; ExitStack.close is idempotent with
-            # the generator's normal cleanup.
-            self._resources.close()
 
 
 def _draft_selectors(project_ref: str, artifact_id: str) -> tuple[str, str]:
@@ -397,7 +351,7 @@ def _draft_file_response(
                 resources.close()
                 return response
         extra = (
-            {"Content-Disposition": _attachment_disposition(parts[-1])}
+            {"Content-Disposition": attachment_disposition(parts[-1])}
             if download else None
         )
         return _draft_stream(

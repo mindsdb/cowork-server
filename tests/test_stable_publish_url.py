@@ -85,9 +85,18 @@ def _patch_publish_scan(container: Path):
     return patch.object(publish_mod, "_scan_artifact_dirs", lambda *, scope: [container])
 
 
-def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", report_id="uuid-1"):
-    """Context-manager stack patching everything publish_artifact touches."""
+def _patched_publish(
+    container: Path, view_url="https://4nton.ai/a/uuid-1", report_id="uuid-1", artifact_key=None
+):
+    """Context-manager stack patching everything publish_artifact touches.
+
+    `artifact_key` is what the fake lambda echoes; None sends no echo.
+    """
     from contextlib import ExitStack
+
+    echo = {"view_url": view_url, "report_id": report_id, "md5": "m1"}
+    if artifact_key is not None:
+        echo["artifact_key"] = artifact_key
 
     stack = ExitStack()
     stack.enter_context(_patch_scan(container))
@@ -100,7 +109,7 @@ def _patched_publish(container: Path, view_url="https://4nton.ai/a/uuid-1", repo
     stack.enter_context(
         patch(
             "anton.publisher.publish",
-            lambda *a, **k: {"view_url": view_url, "report_id": report_id, "md5": "m1"},
+            lambda *a, **k: dict(echo),
         )
     )
     return stack
@@ -484,3 +493,38 @@ def test_unpublish_folder_skips_soft_deleted(tmp_path: Path):
         _unpublish_folder(root, artifacts_base=tmp_path, api_key="k",
                           publish_url="https://4nton.ai")
     assert called == []
+
+
+def test_publish_reports_the_cards_key_when_the_lambda_echoes_another(tmp_path: Path):
+    # The renderer addresses comments by the returned key. A public publication
+    # keeps its threads in the local journal, which only knows the local id.
+    from cowork.services.artifact_identity import artifact_key
+
+    local_id = "b42e023a003845af9efcf41518163c4d"
+    lambda_key = "artifact/6671fe2e-9784-4402-a5d3-5edb2ac9dbac"
+    root = tmp_path / "ascii-animal-b42e023a"
+    root.mkdir()
+    (root / "metadata.json").write_text(
+        json.dumps({"id": local_id, "type": "html-app", "primary": "index.html"}),
+        encoding="utf-8",
+    )
+    (root / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    with _patched_publish(tmp_path, artifact_key=lambda_key):
+        result = publish_mod.publish_artifact(
+            root / "index.html", artifacts_base=tmp_path,
+            api_key="fake-key", publish_url="https://4nton.ai",
+        )
+    assert result["artifactKey"] == artifact_key(local_id)
+    # The record keeps the lambda's key, which restricted comments route to.
+    assert _read_map(root)["index.html"]["lambda_artifact_key"] == lambda_key
+
+
+def test_publish_of_a_loose_file_reports_the_lambda_key(tmp_path: Path):
+    page = tmp_path / "page.html"
+    page.write_text("<h1>hi</h1>", encoding="utf-8")
+    with _patched_publish(tmp_path, artifact_key="u/r1"):
+        result = publish_mod.publish_artifact(
+            page, artifacts_base=tmp_path,
+            api_key="fake-key", publish_url="https://4nton.ai",
+        )
+    assert result["artifactKey"] == "u/r1"

@@ -488,6 +488,128 @@ class ToolRows:
         return steps
 
 
+# The renderer's rule for a form block (cowork parseFormSpec.js extractFormSpec),
+# so the server sees the same blocks the side panel does.
+_FORM_BLOCK = re.compile(r"```data-vault-form[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```")
+# A form fence glued to the end of a sentence, which the renderer moves onto
+# its own line (MarkdownContent.jsx _normalizeFormFences).
+_GLUED_FORM_FENCE = re.compile(r"(?<=[^\n])```data-vault-form")
+# A CommonMark code fence line: up to three spaces, then three or more
+# backticks or tildes, then the info string.
+_FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+# Cleanups the renderer's _looseClean (cowork parseFormSpec.js) applies before
+# its second JSON.parse. Its comment stripping is not copied.
+_STRAY_FENCE_OPEN = re.compile(r"^\s*```(?:json|data-vault-form|js|javascript)?\s*\n")
+_STRAY_FENCE_CLOSE = re.compile(r"\n\s*```\s*$")
+_SMART_QUOTES = str.maketrans({c: "'" for c in "‘’‚‛′‵"} | {c: '"' for c in "“”„‟″‶"})
+_SINGLE_QUOTED_VALUE = re.compile(r"(:\s*|,\s*|\[\s*)'((?:[^'\\]|\\.)*)'")
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
+def _loose_json(body: str) -> str:
+    """``body`` after the renderer's cheap cleanups for model-written JSON."""
+    out = _STRAY_FENCE_CLOSE.sub("", _STRAY_FENCE_OPEN.sub("", body))
+    out = out.translate(_SMART_QUOTES)
+    out = _SINGLE_QUOTED_VALUE.sub(
+        lambda m: m.group(0) if '"' in m.group(2) else f'{m.group(1)}"{m.group(2)}"', out,
+    )
+    return _TRAILING_COMMA.sub(r"\1", out)
+
+
+def _form_id_in(body: str) -> str | None:
+    """The form id of a form block's body when the body parses, strictly or
+    after the renderer's cheap cleanups, or None.
+
+    A body that does not parse counts as no form, so a broken paste never
+    stands in for the form; the panel would show its parse error instead."""
+    for text in (body, _loose_json(body)):
+        try:
+            spec = json.loads(text)
+        except ValueError:
+            continue
+        form_id = spec.get("form_id") if isinstance(spec, dict) else None
+        return form_id if isinstance(form_id, str) else None
+    return None
+
+
+@dataclass(frozen=True)
+class RequestedForm:
+    """The connection form a `request_credentials` call returned: the fenced
+    block as the tool wrote it, and its form id."""
+
+    block: str
+    form_id: str
+
+
+def requested_form(tool_rows: Sequence[object]) -> RequestedForm | None:
+    """The form of the turn's last `request_credentials` call that returned
+    one, read from the turn's history rows (anton streams no result for this
+    tool). None when no call did: a refused call returns text with no block,
+    and a call anton marked is_error never ran.
+
+    The block is searched for anywhere in the result, since anton can add an
+    error-tracking note after it."""
+    rows = ToolRows.read(rows=tool_rows)
+    found: RequestedForm | None = None
+    for tool_use_id, call in rows.calls.items():
+        result = rows.results.get(tool_use_id)
+        if call.name != "request_credentials" or result is None or result.is_error:
+            continue
+        blocks = list(_FORM_BLOCK.finditer(result.text))
+        form_id = _form_id_in(blocks[-1].group(1)) if blocks else None
+        if form_id is not None:
+            found = RequestedForm(block=blocks[-1].group(0), form_id=form_id)
+    return found
+
+
+def _open_fence(answer: str) -> str | None:
+    """The opening fence of the code block ``answer`` ends inside, with its
+    indent, or None when it ends outside every code block.
+
+    Follows CommonMark's fence rules: a backtick fence whose info string holds
+    a backtick is inline code, and a block closes only on a fence of the same
+    character, at least as long, with nothing after it. The indent is kept so
+    a closing fence stays inside the list item its block belongs to."""
+    open_indent, open_fence = "", ""
+    lines = _GLUED_FORM_FENCE.sub("\n```data-vault-form", answer).split("\n")
+    for line in (line.rstrip("\r") for line in lines):
+        match = _FENCE.match(line)
+        if match is None:
+            continue
+        indent, fence, info = match.groups()
+        if not open_fence:
+            if not (fence[0] == "`" and "`" in info):
+                open_indent, open_fence = indent, fence
+        elif fence[0] == open_fence[0] and len(fence) >= len(open_fence) and not info.strip():
+            open_indent, open_fence = "", ""
+    return open_indent + open_fence if open_fence else None
+
+
+def missing_form_text(answer: str, form: RequestedForm) -> str:
+    """The text that puts ``form`` at the end of ``answer`` so the side panel
+    opens it, or "" when the answer already shows it.
+
+    The panel opens the answer's last form block, so the form counts as shown
+    only when that block has its id. A code fence the answer left open (an
+    answer cut off) is closed first. Otherwise the renderer would end an open
+    form fence at the added block's opening line and read neither form. After
+    a reload, the markdown would also show the added block as code, not as a
+    form card."""
+    blocks = list(_FORM_BLOCK.finditer(answer))
+    if blocks and _form_id_in(blocks[-1].group(1)) == form.form_id:
+        return ""
+    open_fence = _open_fence(answer)
+    closing = f"\n{open_fence}" if open_fence else ""
+    text = answer + closing
+    if not text or text.endswith("\n\n"):
+        gap = ""
+    elif text.endswith("\n"):
+        gap = "\n"
+    else:
+        gap = "\n\n"
+    return f"{closing}{gap}{form.block}\n"
+
+
 async def find_answer_sources(evidence: TurnEvidence) -> FigureSources:
     """The figures in an answer and the steps they came from.
 
@@ -589,6 +711,8 @@ async def format_responses_stream(
     event_stream: AsyncIterator,
     model: str,
     event_sink: Optional[Callable[[str, dict], None]] = None,
+    *,
+    form_blocks: bool = False,
 ) -> AsyncIterator[str]:
     """Yield Responses-API SSE strings derived from ChatSession events.
 
@@ -597,6 +721,12 @@ async def format_responses_stream(
     route to capture a per-turn event log to disk so the client can
     rebuild the Thinking block + scratchpad cells when the conversation
     is reopened (without keeping localStorage state).
+
+    `form_blocks` is for a turn shown in the Cowork UI. With it on, a
+    connection form the turn's `request_credentials` returned and the answer
+    left out is added to the end of the answer as one more text delta, so the
+    side panel opens it and the saved answer keeps it. A channel or a
+    non-streaming caller leaves it off: it has no side panel.
     """
     from anton.core.llm.provider import (
         StreamAskUser,
@@ -1151,6 +1281,20 @@ async def format_responses_stream(
 
         elif isinstance(event, StreamTurnEnded):
             ended_by = event.ended_by
+
+    # Models that rank the system prompt's "summarize tool output" above the
+    # tool's "paste this block" leave the form out of their answer.
+    form = requested_form(tool_rows) if form_blocks and not failure_reply else None
+    added = missing_form_text("".join(collected_text), form) if form is not None else ""
+    if added:
+        collected_text.append(added)
+        seq += 1
+        yield _event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "sequence_number": seq,
+            "item_id": msg_id,
+            "delta": added,
+        })
 
     full_text = "".join(collected_text)
     # A turn the user stops, or one that fails or stalls, never reaches this

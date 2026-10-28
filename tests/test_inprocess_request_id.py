@@ -82,7 +82,7 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
         def close(self):
             pass
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         raise exc
         yield  # pragma: no cover - makes this an async generator
 
