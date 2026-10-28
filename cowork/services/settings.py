@@ -13,8 +13,10 @@ from cowork.common.settings.user_settings import (
     reject_unknown_harness,
     UserSettings,
     invalidate_user_settings_cache,
+    setting_is_operator_pinned,
     setting_is_org_scoped,
 )
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope
 from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
@@ -48,9 +50,17 @@ class SettingService:
     A key's write scope comes from ``setting_is_org_scoped``; reads resolve
     user → org → global (NULL-scope legacy/env row) → field default. Scope is
     explicit here, not inherited from ScopedSession (``settings`` stays in
-    ``_TENANCY_DEFERRED_TABLES``). No scope → operates on global rows only, the
-    pre-split desktop behavior. Admin gating on org-key writes is an endpoint
-    concern; this layer only routes.
+    ``_TENANCY_DEFERRED_TABLES``). No scope, or a scope that keeps settings
+    shared → operates on global rows only, the pre-split desktop behavior.
+
+    A personal partition (a trusted-identity deployment with settings per
+    person) routes like an org whose ``org_id`` is the person's partition, with
+    one exception: an operator-pinned key (``setting_is_operator_pinned``: the
+    model, its endpoint, memory and cost, and how the agent acts: act_first,
+    proactive_dashboards) reads and writes the global row only,
+    so it resolves from that row, then the environment, and a person's own row
+    for it is ignored. Admin gating on org-key writes is an endpoint concern;
+    this layer only routes.
     """
 
     def __init__(self, session: Session, scope: TenantScope | None = None) -> None:
@@ -58,7 +68,17 @@ class SettingService:
         self.scope = scope
 
     def _org_active(self) -> bool:
-        return bool(self.scope and self.scope.org_mode and self.scope.org_id)
+        """Whether rows are keyed by the scope's org or partition."""
+        return bool(
+            self.scope
+            and self.scope.partitioned_for(PersonalResource.SETTINGS)
+            and self.scope.org_id
+        )
+
+    def _deployment_wide(self, key: str) -> bool:
+        """Whether ``key`` resolves on the global row alone in this scope: an
+        operator-pinned key inside a personal partition."""
+        return bool(self.scope and self.scope.personal and setting_is_operator_pinned(key))
 
     def _global_row(self, key: str) -> Setting | None:
         return self.session.exec(
@@ -76,7 +96,7 @@ class SettingService:
     def _fetch_row(self, key: str) -> Setting | None:
         """Winning row for read: user → org → global. A user row is identified
         by (org_id, user_id) — the same person in another org must not match."""
-        if not self._org_active():
+        if not self._org_active() or self._deployment_wide(key):
             return self._global_row(key)
         if self.scope.user_id:
             row = self._scoped_row(key, "user", org_id=self.scope.org_id, user_id=self.scope.user_id)
@@ -89,8 +109,10 @@ class SettingService:
 
     def _own_row(self, key: str) -> Setting | None:
         """Row at the key's own write scope, no fallback — delete/clear act on
-        this so a tenant removes its own override, never a deployment row."""
-        if not self._org_active():
+        this so a tenant removes its own override, never a deployment row.
+        An operator-pinned key in a personal partition has no override of its
+        own, so its own row is the global one."""
+        if not self._org_active() or self._deployment_wide(key):
             return self._global_row(key)
         if not setting_is_org_scoped(key) and self.scope.user_id:
             return self._scoped_row(key, "user", org_id=self.scope.org_id, user_id=self.scope.user_id)
@@ -108,7 +130,8 @@ class SettingService:
         for row in self.session.exec(
             select(Setting).where(Setting.scope == "org", Setting.org_id == self.scope.org_id)
         ).all():
-            by_key[row.key] = row
+            if not self._deployment_wide(row.key):
+                by_key[row.key] = row
         if self.scope.user_id:
             for row in self.session.exec(
                 select(Setting).where(
@@ -117,26 +140,37 @@ class SettingService:
                     Setting.user_id == self.scope.user_id,
                 )
             ).all():
-                by_key[row.key] = row
+                if not self._deployment_wide(row.key):
+                    by_key[row.key] = row
         return list(by_key.values())
 
     def _require_writable(self) -> None:
-        """Mutations fail closed in org mode with no org in scope: a write would
-        otherwise land in a global row visible to every tenant. Reads keep their
-        global fallback — this guards writes/deletes only."""
-        if self.scope and self.scope.org_mode and not self.scope.org_id:
+        """Mutations fail closed where settings are partitioned but no org (or
+        partition) is in scope: a write would otherwise land in a global row
+        visible to every tenant. Reads keep their global fallback — this guards
+        writes/deletes only."""
+        if (
+            self.scope
+            and self.scope.partitioned_for(PersonalResource.SETTINGS)
+            and not self.scope.org_id
+        ):
             from cowork.db.scoped import MissingTenantScopeError
             raise MissingTenantScopeError("settings write requires an organization in scope")
 
     def _require_write_target(self, key: str) -> None:
         """A personal-key write needs a user in scope — checked up front so a
         batch resolves every target BEFORE staging any row (all-or-nothing)."""
-        if self._org_active() and not setting_is_org_scoped(key) and not self.scope.user_id:
+        if (
+            self._org_active()
+            and not self._deployment_wide(key)
+            and not setting_is_org_scoped(key)
+            and not self.scope.user_id
+        ):
             raise ValueError(f"'{key}' is a personal setting but no user is in scope")
 
     def _new_row(self, key: str, store_val: str) -> Setting:
         """A fresh Setting stamped for the key's write scope."""
-        if not self._org_active():
+        if not self._org_active() or self._deployment_wide(key):
             return Setting(key=key, value=store_val)
         if setting_is_org_scoped(key):
             return Setting(key=key, value=store_val, scope="org", org_id=self.scope.org_id)

@@ -20,6 +20,7 @@ from cowork.schemas.shared_resources import ProjectCapabilities
 from cowork.api.v1.endpoints.guards import require_local
 from cowork.services.projects import (
     GENERAL_PROJECT,
+    ProjectInUseError,
     ProjectNameLockBusyError,
     ProjectNotFoundError,
     ProjectPathNotAllowedError,
@@ -37,6 +38,7 @@ from cowork.services.shared_resources import (
     project_resource_key,
 )
 from cowork.services.skills import SkillService
+from cowork.services.shared_projects import SharedProjectFiles
 
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -249,7 +251,8 @@ def list_projects(
     # the first listing (no-op in local mode / once claimed).
     service.ensure_general_for_scope()
     access = SharedResourceAccess(session, principal)
-    return [_project_response(project, access) for project in service.list_projects()]
+    owned = [_project_response(project, access) for project in service.list_projects()]
+    return [*owned, *SharedProjectFiles(session).list_projects()]
 
 
 def _is_loopback_address(host: str | None) -> bool:
@@ -868,6 +871,8 @@ def delete_project(
     # children, which then answered "not found" for a project that exists.
     except ProjectNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ProjectInUseError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     finally:
         for row, token in pending_guards:
             try:

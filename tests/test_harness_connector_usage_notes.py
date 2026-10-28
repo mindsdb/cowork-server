@@ -73,9 +73,8 @@ async def _session_config(monkeypatch, vault, *, vault_factory=None, **build_kwa
         conversation = ConversationService(ScopedSession(db, LOCAL_SCOPE)).create_conversation(
             topic="usage-notes"
         )
-        config, temp_vault_dir, _ = await harness.AntonHarness()._build_chat_session(
-            conversation, **build_kwargs
-        )
+        built = await harness.AntonHarness()._build_chat_session(conversation, **build_kwargs)
+        config, temp_vault_dir = built.session, built.turn_scratch_dir
         try:
             yield config
         finally:

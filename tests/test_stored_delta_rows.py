@@ -30,7 +30,7 @@ def _forget_turns():
 class _ThreeDeltas(PausedHarness):
     """Answers at once, in three deltas of one output item."""
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         yield sse_frame("response.created", {"type": "response.created"})
         for seq, text in enumerate(("Hello", " ", "there"), start=1):
             delta = {"type": _DELTA, "sequence_number": seq, "item_id": "msg-1", "delta": text, "at_ms": 1000 + seq}

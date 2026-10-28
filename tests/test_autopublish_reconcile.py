@@ -607,3 +607,48 @@ async def test_a_report_owned_by_another_account_is_skipped_not_failed(base, ena
     assert "result=failed" not in caplog.text
     assert not (base / "rep" / ".published.json").exists()
     assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_too_large_artifact_is_skipped_without_a_traceback(base, enabled, key, monkeypatch, caplog):
+    import logging
+
+    from cowork.services.publish import PublishTooLarge
+
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    def too_large(artifact, **kwargs):
+        raise PublishTooLarge()
+
+    monkeypatch.setattr(ap, "publish_artifact", too_large)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == set()
+    assert "result=skipped slug=rep reason=too_large" in caplog.text
+    assert "result=failed" not in caplog.text
+    assert "artifact autopublish failed" not in caplog.text
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_rejected_publish_fails_without_a_second_traceback(base, enabled, key, monkeypatch, caplog):
+    """publish_artifact already logged the traceback; the failure line stays."""
+    import logging
+
+    from cowork.services.publish import PublishRejected
+
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    def rejected(artifact, **kwargs):
+        raise PublishRejected("Publishing failed: pip install failed: no wheel")
+
+    monkeypatch.setattr(ap, "publish_artifact", rejected)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == set()
+    assert "result=failed slug=rep error=PublishRejected" in caplog.text
+    record = next(r for r in caplog.records if "artifact autopublish failed" in r.getMessage())
+    assert not record.exc_info
+    assert locks.acquire(base, "rep", ttl_s=600) is True

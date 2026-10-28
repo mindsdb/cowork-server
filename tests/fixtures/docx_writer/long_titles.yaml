@@ -1,0 +1,10 @@
+# python-docx refuses a core property longer than 255 characters, so a
+# longer title is cut to 255 and loses the spaces left at the cut. The title
+# is "unit" repeated "repeat" times, set in the head's <title> (source: head)
+# or passed as the title argument (source: argument); core_length is the
+# core title's length.
+- {name: long_head_title, source: head, unit: T, repeat: 300, core_length: 255}
+- {name: long_title_argument, source: argument, unit: A, repeat: 300, core_length: 255}
+- {name: head_title_at_the_limit, source: head, unit: T, repeat: 255, core_length: 255}
+- {name: cut_lands_after_a_space, source: head, unit: "abcd ", repeat: 60, core_length: 254}
+- {name: astral_characters_count_once, source: argument, unit: "\U0001F600", repeat: 300, core_length: 255}

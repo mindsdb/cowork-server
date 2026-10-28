@@ -159,3 +159,32 @@ def test_persisted_vault_is_unchanged_on_desktop(local_deployment, monkeypatch):
     from cowork.services.connectors.persist import vault_for_scope
 
     assert Path(vault_for_scope(None)._dir) == local_deployment / "data-vault"
+
+
+@pytest.mark.parametrize("org_id", ["..", ".", "../escape", "a/b", "a\\b", "/etc"])
+def test_a_partition_id_that_leaves_its_folder_is_refused(org_deployment, org_id):
+    """The middleware normalizes every request's org id to a UUID, and the
+    partition must not rest on that alone: "../escape" would put the vault
+    beside the shared root, "/etc" would replace the shared root, and "."
+    would put it at the shared root itself."""
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id="u1")
+    with pytest.raises(ValueError, match="invalid storage partition segment"):
+        scoped_storage_root(org_deployment / "data-vault", scope, store="data-vault")
+
+
+@pytest.mark.parametrize("store", ["", "..", ".", "a/b", "a\\b", "/etc"])
+def test_a_store_that_leaves_its_partition_is_refused(org_deployment, store):
+    scope = TenantScope(org_mode=True, org_id=ORG_A, user_id="u1")
+    with pytest.raises(ValueError, match="invalid storage store segment"):
+        scoped_storage_root(org_deployment / "x", scope, store=store)
+
+
+@pytest.mark.parametrize("user_id", ["..", ".", "../u2", "a/b", "a\\b", "/etc"])
+def test_a_user_id_that_is_not_one_folder_name_is_refused(org_deployment, user_id):
+    """The per-person tier is <shared>/<org>/<store>/users/<user_id>, so a
+    user id that is not one folder name lands outside its own tier: in
+    another person's ("a/b"), on the users folder or the store (".", ".."),
+    beside the users folder ("../u2"), or anywhere ("/etc")."""
+    scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=user_id)
+    with pytest.raises(ValueError, match="invalid storage user segment"):
+        scoped_user_storage_root(org_deployment / "memory", scope, store="memory")

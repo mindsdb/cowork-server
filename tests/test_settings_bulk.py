@@ -166,3 +166,20 @@ async def test_bulk_upsert_skips_none_values():
     finally:
         _cleanup(session, "greeting", "tone")
         session.close()
+
+
+async def test_bulk_endpoint_saves_show_figure_sources():
+    session = get_open_session()
+    try:
+        _cleanup(session, "show_figure_sources")
+        result = await bulk_upsert_settings(
+            SettingsBulkUpsertRequest(values={"show_figure_sources": "false"}),
+            session,
+            LOCAL_SCOPE,
+            None,
+        )
+        assert result["updated"] == ["show_figure_sources"]
+        assert SettingService(session).load().show_figure_sources is False
+    finally:
+        _cleanup(session, "show_figure_sources")
+        session.close()

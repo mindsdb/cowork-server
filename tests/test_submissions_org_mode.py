@@ -310,7 +310,7 @@ def test_a_method_the_specs_call_unverified_is_refused_however_it_is_configured(
     "body",
     [
         pytest.param(submission(method="connection-string"), id="connection-string"),
-        pytest.param(submission(connector_id="not-a-connector"), id="unknown-connector"),
+        pytest.param(submission(connector_id="not_a_connector"), id="unknown-connector"),
         pytest.param(submission(method=None), id="no-method"),
         pytest.param(
             {

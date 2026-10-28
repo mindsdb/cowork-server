@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.models.skill import Skill
@@ -52,7 +53,7 @@ class _PersonalSkillRoute(APIRoute):
 
 router = APIRouter(
     route_class=_PersonalSkillRoute,
-    dependencies=[Depends(require(LoopbackDesktopOnly))],
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(refuse_code_mode_in_sandbox)],
 )
 
 

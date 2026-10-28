@@ -49,7 +49,7 @@ class FakeHarness:
         if False:
             yield
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         async for _ in stream:
             pass
         if self.delay:

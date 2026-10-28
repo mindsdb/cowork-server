@@ -5,6 +5,7 @@ takes a prefixed slug there. The record's project and slug name that folder,
 not the destination's unrelated original.
 """
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import logging
 from uuid import uuid4
@@ -84,7 +85,7 @@ def test_a_database_failure_on_a_rekey_logs_the_moved_folder_and_the_next_rekey_
     )
     assert record.getMessage().startswith("Database operation failed: error_type=OperationalError ")
     output = logged.output()
-    assert f"[Project:{dest.id}][Conversation:{conversation_id}][Artifact:{moved_slug!r}]: " in output
+    assert_log_fields(output, project_id=str(dest.id), conversation_id=str(conversation_id), artifact_slug=moved_slug)
     assert DRIVER_TEXT not in output
 
 
@@ -109,4 +110,4 @@ def test_a_failed_rekey_outside_the_database_names_both_slugs(tmp_path, monkeypa
         str(dest.id), str(conversation_id), moved_slug,
     )
     assert record.getMessage() == f"Could not move the owner of artifact 'report' to project {dest.name!r}"
-    assert f"[Project:{dest.id}][Conversation:{conversation_id}][Artifact:{moved_slug!r}]: " in logged.output()
+    assert_log_fields(logged.output(), project_id=str(dest.id), conversation_id=str(conversation_id), artifact_slug=moved_slug)

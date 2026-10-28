@@ -177,13 +177,19 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
     predates the field). Anything else means the cost is not known yet, and
     showing $0.00 would be wrong. Fall back to the wallet's ``credit_spend``
     block, which older auth versions serve, and give up rather than guess.
+
+    ``totals.billed_usd`` is the invoice, set only for the organization's own
+    view of a cycle, and heads the console there; elsewhere it is null and the
+    stamped ``cost.total_usd`` is the figure.
     """
     if isinstance(summary, dict):
         meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
         totals = summary.get("totals") if isinstance(summary.get("totals"), dict) else {}
         cost = totals.get("cost") if isinstance(totals.get("cost"), dict) else {}
         rng = summary.get("range") if isinstance(summary.get("range"), dict) else {}
-        usd = _usd(cost.get("total_usd"))
+        usd = _usd(totals.get("billed_usd"))
+        if usd is None:
+            usd = _usd(cost.get("total_usd"))
         source = meta.get("cost_source")
         if usd is not None and source in (None, "metronome_invoice"):
             return HubCreditSpend(

@@ -270,6 +270,61 @@ def test_minds_fallback_stamps_probe_kind_header(monkeypatch):
     assert _CapturingClient.captured["headers"].get(MINDS_REQUEST_KIND_HEADER) == MINDS_REQUEST_KIND_PROBE
 
 
+# ── The probe's Langfuse identity ──────
+#
+# The gateway files a call with no Langfuse headers as direct-API use, so a user
+# who only opened Settings was counted as an API user. Every MindsHub probe
+# names itself instead: a tag and the surface, never a session, turn or harness,
+# because a ping is no agent's work and belongs to no conversation.
+
+
+def _probe_identity(headers):
+    return headers.get("Langfuse-Tags"), headers.get("Langfuse-Metadata")
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        lambda: ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}),
+        lambda: validate_minds("mdb_x", "https://api.mindshub.ai"),
+        lambda: validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", None),
+    ],
+    ids=["ping_provider", "validate_minds", "minds_fallback"],
+)
+def test_every_minds_probe_names_itself_and_its_surface(monkeypatch, probe):
+    _patch(monkeypatch)
+    monkeypatch.setattr(providers, "surface", lambda: "desktop")
+    asyncio.run(probe())
+    headers = _CapturingClient.captured["headers"]
+    assert _probe_identity(headers) == ("provider-ping,surface:desktop", '{"surface":"desktop"}')
+    assert not {"Langfuse-Session-Id", "Langfuse-Trace-Id"} & set(headers)
+
+
+def test_a_web_probe_reports_the_web_surface(monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setattr(providers, "surface", lambda: "web")
+    asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}))
+    assert _probe_identity(_CapturingClient.captured["headers"]) == (
+        "provider-ping,surface:web",
+        '{"surface":"web"}',
+    )
+
+
+def test_an_unknown_surface_still_names_the_probe(monkeypatch):
+    # The tag alone is what keeps the ping out of the direct-API count, so it is
+    # sent even when the surface cannot be resolved.
+    _patch(monkeypatch)
+    monkeypatch.setattr(providers, "surface", lambda: None)
+    asyncio.run(validate_minds("mdb_x", "https://api.mindshub.ai"))
+    assert _probe_identity(_CapturingClient.captured["headers"]) == ("provider-ping", None)
+
+
+def test_a_non_minds_probe_sends_no_langfuse_headers(monkeypatch):
+    _patch(monkeypatch)
+    asyncio.run(validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", "gpt-4o"))
+    assert not any(h.startswith("Langfuse-") for h in _CapturingClient.captured["headers"])
+
+
 def test_non_minds_probe_does_not_stamp_probe_kind_header(monkeypatch):
     # The marker is our own header and means nothing to a third-party endpoint, so
     # a non-MindsHub probe must not send it.

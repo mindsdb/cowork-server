@@ -182,7 +182,7 @@ def test_workflow_runs_only_the_read_only_selection_and_notifies() -> None:
         text=True,
     )
     assert dry_run.stdout == (
-        "uv run python -m pytest -v "
+        "uv run --locked python -m pytest -v "
         "tests/integration/test_production_read_only.py\n"
     )
 

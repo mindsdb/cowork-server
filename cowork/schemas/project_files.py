@@ -5,6 +5,15 @@ from cowork.schemas.shared_resources import (
     ResourceAttribution,
 )
 
+# The project's memory files, by their path parts in the project: anton keeps
+# the project's rules and lessons in .anton/memory.
+CANONICAL_PROJECT_MEMORY_PATHS = frozenset(
+    {
+        (".anton", "memory", "rules.md"),
+        (".anton", "memory", "lessons.md"),
+    }
+)
+
 
 class ProjectFileMetadata(BaseModel):
     path: str

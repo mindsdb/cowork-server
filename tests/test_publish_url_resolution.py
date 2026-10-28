@@ -83,5 +83,50 @@ def test_other_urls_are_kept(url):
 )
 def test_resolve_publish_endpoint(monkeypatch, env_url, setting_url, minds_url, expected):
     monkeypatch.setenv("ANTON_PUBLISH_URL", env_url)
+    _publish_token(monkeypatch, None)
     settings = _settings(publish_url=setting_url, minds_url=minds_url)
     assert publish._resolve_publish_endpoint(settings) == (expected, "mdb_key")
+
+
+MINDSHUB = "https://api.mindshub.ai/v1"
+ROUTED = "http://model-route:8000/v1"
+# The key each provider sends without COWORK_PUBLISH_TOKEN: a MindsHub endpoint
+# sends its own model key, any other endpoint the MindsHub slot's key.
+KEY_WITHOUT_TOKEN = {MINDSHUB: "mindshub_model_key", ROUTED: "mdb_key"}
+
+
+def _provider_settings(openai_base_url: str):
+    return SimpleNamespace(
+        openai_base_url=openai_base_url,
+        openai_compatible_api_key=SecretStr("mindshub_model_key"),
+        openai_api_key=None,
+        minds_url="https://minds.invalid",
+        minds_api_key=SecretStr("mdb_key"),
+        publish_url="",
+    )
+
+
+def _publish_token(monkeypatch, token: SecretStr | None) -> None:
+    """AppSettings.publish_token, which COWORK_PUBLISH_TOKEN sets; get_app_settings is cached."""
+    monkeypatch.setattr(publish, "get_app_settings", lambda: SimpleNamespace(publish_token=token))
+
+
+@pytest.mark.parametrize("openai_base_url", [MINDSHUB, ROUTED], ids=["mindshub", "routed"])
+def test_the_publish_token_replaces_the_provider_key(monkeypatch, openai_base_url):
+    monkeypatch.setenv("ANTON_PUBLISH_URL", "http://publisher-api:8081")
+    _publish_token(monkeypatch, SecretStr(" mdb_publish_token\n"))
+
+    assert publish._resolve_publish_endpoint(_provider_settings(openai_base_url)) == (
+        "http://publisher-api:8081", "mdb_publish_token",
+    )
+
+
+@pytest.mark.parametrize("token", [None, "", "  "], ids=["unset", "empty", "blank"])
+@pytest.mark.parametrize("openai_base_url", [MINDSHUB, ROUTED], ids=["mindshub", "routed"])
+def test_without_a_publish_token_the_provider_key_is_sent(monkeypatch, openai_base_url, token):
+    monkeypatch.setenv("ANTON_PUBLISH_URL", "http://publisher-api:8081")
+    _publish_token(monkeypatch, None if token is None else SecretStr(token))
+
+    assert publish._resolve_publish_endpoint(_provider_settings(openai_base_url)) == (
+        "http://publisher-api:8081", KEY_WITHOUT_TOKEN[openai_base_url],
+    )

@@ -28,6 +28,70 @@ For example, the Responses API has been updated to allow for file inputs along w
 
 Further details regarding this design can be found in this document: [Cowork Server API for Agents](https://docs.google.com/document/d/1YBgr59GoO47wvLtZAO7wbNL8DKrigww_PYeUlcMDgos/edit?usp=sharing).
 
+## Disconnect ownership and exact-run cancellation
+
+A streaming POST owns its optional `cancel_on_disconnect` policy. The default remains
+detached execution, so a browser can reload and tail an answer. A tail is an observer;
+closing it never cancels the producer. Normal completion and server shutdown have their
+own outcomes and must not be recorded as a client abandoning an answer.
+
+The request captures its own run before exposing it to clients. A fresh `run_id` UUID
+identifies that execution on its handle, its shared index and its `response.created` event.
+The conversation's turn number can be reused after a run saved nothing, so it is not a
+safe cancellation guard. The formatter's response ID retains its existing meaning.
+
+An automatic cancel supplies `expected_run_id` to `/api/v1/responses/cancel`. Authorization
+and the run guard are checked before cancellation. The cancellation path retains the
+captured local handle and remote correlation identity across awaits; it never combines
+an old handle with the conversation index's newer correlation. Remote dispatch must not
+clear a cancellation after that execution becomes visible. Another replica relays the
+request to the owning process or worker using the same immutable identity.
+
+The self-hosted proxy owns the connection from its downstream client. It consumes the
+option and leaves its upstream connection detached, then calls the guarded endpoint when
+that client leaves. Keeping the upstream connection open lets it record the actual final
+event. A failed cancel request is an attempt with a failed outcome, not a cancelled answer.
+
+### Default behavior
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy
+    participant Server
+    participant Run
+    Client->>Proxy: streaming question
+    Proxy->>Server: detached question
+    Server->>Run: start execution
+    Client--xProxy: disconnect
+    Note over Proxy,Run: no cancellation requested
+    Run-->>Server: completed
+    Server-->>Proxy: final events for the record
+```
+
+### Opted-in behavior
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy
+    participant Server
+    participant Run
+    Client->>Proxy: streaming question with opt-in
+    Proxy->>Server: detached question
+    Server->>Run: start execution with unique run_id
+    Server-->>Proxy: response.created with run_id
+    Client--xProxy: disconnect
+    Proxy->>Server: cancel with expected_run_id
+    Server->>Run: cancel captured execution
+    Run-->>Server: terminal outcome
+    Server-->>Proxy: final events for the record
+```
+
+For direct clients, cowork-server owns the originating connection and invokes the same
+cancellation path without a proxy request. If the client leaves during preparation, cleanup
+must prevent that request from leaving a live producer behind.
+
 ## Turn liveness and idle bounds
 
 TLDR; A turn that sends nothing for too long is ended by whichever idle bound fires first. While anton waits on a model call that sends no output, cowork-server (in cloud, the anton pod) writes a `model_wait` progress frame every 20 to 25 seconds, so no bound fires until anton's own 10-minute model-call deadline ends the call. In cloud, the controller's 600 s hard cap can end the turn first. A non-streamed call through MindsHub is ended sooner, by the gateway's 110 s budget.
@@ -40,7 +104,7 @@ Each bound watches a different wire. A bound restarts only on activity it can se
 | -- | -- | -- | -- | -- |
 | UI idle cut | 300 s. After a `response.ask_user` frame: the question's `timeout_s` plus 300 s | cowork `src/renderer/cowork/api.js`, `STREAM_IDLE_TIMEOUT_MS` | Any SSE event with a `data:` line. The server's `: keepalive` comments do not count | The UI aborts the stream, calls `POST /api/v1/responses/cancel` with `reason: "stalled"` and shows "The response stalled and was ended." |
 | SSE keepalive comment | Every 20 s of quiet | `SSE_KEEPALIVE_SECONDS` in `cowork/handlers/responses.py` | Not a bound | Keeps proxies from closing an idle connection. It never keeps a turn alive, so a hung server still meets the UI cut |
-| Idle watchdog | 600 s, checked every 15 s | `COWORK_MAX_TURN_IDLE_SECONDS`, `cowork/streaming/registry.py` | Any record appended to the turn's buffer | The producer is cancelled and saves `response.failed` with code `anton_error` and "The response was interrupted before it finished." The buffer closes `interrupted` |
+| Idle watchdog | 600 s, checked every 15 s | `COWORK_MAX_TURN_IDLE_SECONDS`, `cowork/streaming/registry.py` | Any record appended to the turn's buffer | The producer is cancelled and saves `response.failed` with code `anton_error` and "The response was interrupted before it finished. Please try again." The buffer closes `interrupted` |
 | Redis tail | 300 s | `REDIS_TAIL_IDLE_TIMEOUT_SECONDS`, `cowork/streaming/buffer.py`. Only with `COWORK_STREAM_BACKEND=redis` | Any record in the turn's Redis stream | The reader writes an `Interrupted` terminal record and logs "went quiet for 300s" |
 | Reply idle | 600 s | `COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS`. Only for remote turns | Any reply for this turn on the controller's reply stream | The turn fails with code `worker_unresponsive` |
 | Controller stall window | 120 s | scratchpad-controller `turn_stall_timeout_seconds` | Any line from the turn's pod, including its heartbeat every 5 s | The controller ends the turn, and the user sees "This turn stopped producing output and was ended." |
@@ -103,8 +167,8 @@ The UI's idle cut and the Stop button call the same endpoint. The optional `reas
 
 - **Stop** (no `reason`). The server saves the partial answer and its events with no terminal event, and the buffer closes `cancelled`. The live UI receives `response.cancelled`. A reload shows the partial answer with no error row.
 - **Stall** (`reason: "stalled"`). `cancel_response` sets `TurnLifecycle.stalled` before it cancels the producer, and every later cancel sets it again from its own reason. So a Stop after a stall cancel the turn swallowed, such as one a running cell caught, saves as a Stop. The producer saves the partial answer, retires any open question, and appends `response.failed` with code `stalled` and "The response stalled and was ended. Please try sending again." The buffer closes `interrupted`, with no `response.cancelled`. A reload shows the stall card with Try again.
-- **Stall on a replica that does not own a cloud turn.** That replica can only write Redis keys. In one transaction it sets `cowork:cancel_cause:<correlation_id>` = `stalled` and the cancel flag, both with a 300 s TTL. Any other cancel deletes the cause in the same transaction as its flag, so the latest cancel decides. The controller stops the pod, reports `turn_failed "cancelled"`, and its `_clear_cancel` deletes the flag. The owning replica reads the cause key when that report arrives and saves the stall record. If it cannot read the key, it logs an error and saves the turn as a Stop. The producer clears a stale cause key beside the stale flag before each turn.
-- **Watchdog or shutdown.** These win over a stall. The turn saves `response.failed` with code `anton_error` and "The response was interrupted before it finished.", and closes `interrupted`.
+- **Stall on a replica that does not own a cloud turn.** That replica can only write Redis keys. In one transaction it sets `cowork:cancel_cause:<correlation_id>` = `stalled` and the cancel flag, both with a 300 s TTL. A client-disconnect cancel stores `client_gone`; other cancels delete the cause in the same transaction as the flag, so the latest cancel decides. The controller stops the pod, reports `turn_failed "cancelled"`, and its `_clear_cancel` deletes the flag. The owning replica reads the cause key when that report arrives and saves the stall record. If it cannot read the key, it logs an error and saves the turn as a Stop. Registry-owned runs publish a unique correlation ID before dispatch and preserve its cancel flag and cause throughout startup. Legacy callers without a run ID clear stale flags before publishing their turn.
+- **Watchdog or shutdown.** These win over a stall. The turn saves `response.failed` with code `anton_error` and "The response was interrupted before it finished. Please try again.", and closes `interrupted`. A shutdown first writes a cloud turn's cancel flag, deleting any cause, so the controller stops the pod too; the owning replica saves the turn as interrupted whatever the controller then reports (`RunRegistry.shutdown`). A hosted replica does this on SIGTERM, before Uvicorn's drain, so the frame reaches the open stream (`deployment/cowork-server/README.md`).
 - **Model-call deadline.** The turn saves `response.failed` with code `model_timeout` and anton's message, and closes `error`.
 
 Any other `reason` value is accepted and ignored, so the turn saves as a Stop. A UI that sends no reason saves its stalls as a Stop. If a stall's cancel never reaches the server and the turn then completes, a reload shows the full answer.

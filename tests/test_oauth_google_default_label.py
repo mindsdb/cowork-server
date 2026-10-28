@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from cowork.common.settings.app_settings import OAuthSettings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.connectors.oauth.google import OAuthService
 
 
@@ -74,7 +75,7 @@ def _run_gmail_callback(monkeypatch, *, userinfo: dict[str, str]) -> dict[str, A
 
     monkeypatch.setattr("cowork.services.connectors.oauth.google.persist_connection", _fake_persist)
 
-    html = svc.callback("gmail", code="auth-code", state="s-1", error="", settings=OAuthSettings(_env_file=None))
+    html = svc.callback("gmail", code="auth-code", state="s-1", error="", settings=OAuthSettings(_env_file=None), scope=LOCAL_SCOPE)
     assert "connected" in html.lower()
     return captured
 

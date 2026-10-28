@@ -1,0 +1,32 @@
+# What a PDF export answers when the render service doesn't give back a usable
+# PDF. Each answer is one response, in order; "status" and "detail" are what
+# the route sends.
+cases:
+  - id: busy-twice
+    answers: [{status: 503}, {status: 503}]
+    status: 503
+    detail: "PDF export is busy; try again."
+  - id: refuses-the-size
+    answers: [{status: 413}]
+    status: 413
+    detail: "This file can't be exported."
+  - id: refuses-the-request
+    answers: [{status: 422}]
+    status: 422
+    detail: "This file can't be exported."
+  - id: redirects
+    answers: [{status: 302, location: "http://127.0.0.1:9/elsewhere"}]
+    status: 502
+    detail: "Couldn't export this file."
+  - id: answers-500
+    answers: [{status: 500}]
+    status: 502
+    detail: "Couldn't export this file."
+  - id: sends-bytes-that-are-not-a-pdf
+    answers: [{status: 200, pdf_base64: "bm90IGEgcGRm"}]
+    status: 502
+    detail: "Couldn't export this file."
+  - id: sends-invalid-json
+    answers: [{status: 200, raw: "{not json"}]
+    status: 502
+    detail: "Couldn't export this file."

@@ -7,7 +7,14 @@ and all necessary configurations for the Cowork service.
 
 import asyncio
 import contextlib
+import contextvars
+import os
+import signal
+import stat
+import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import FrameType
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -19,19 +26,46 @@ from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclar
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
-from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.auth_middleware import (
+    BearerTokenMiddleware,
+    ensure_auth_token,
+    remove_auth_token,
+    sync_auth_token,
+)
+from cowork.code_sandbox import check_startup as check_code_sandbox_startup
 from cowork.coding.inference_proxy import INFERENCE_PATHS
+from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.draft_host.listener import start_draft_listener, stop_draft_listener
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
+from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
+from cowork.harnesses.memory.policy import memory_start_warning
+from cowork.managed import (
+    ManagedFolder,
+    SharedRegistryError,
+    cortex_takes_managed_layer,
+    managed_folder,
+)
+from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
+from cowork.services.live_apps import live_app_slot_paths
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
-from cowork.streaming import TurnInProgress
+from cowork.services.connectors.layered_vault import SharedConnectionError
+from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
+from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
+from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
+from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
 from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import (
+    TurnQueueSettings,
+    get_app_settings,
+    get_export_pdf_settings,
+)
 from cowork.dev_setup import run_dev_setup
-from cowork.scheduler import start_scheduler
+from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
+from cowork.services.pending_credential_clear import consume_pending_credential_clear
 
 
 # Set up logging
@@ -110,6 +144,131 @@ async def _cancel_and_wait(task: asyncio.Task | None) -> None:
         await task
 
 
+async def _end_remote_turns() -> None:
+    """End this replica's turns for a shutdown, where turns run remotely.
+
+    Refuses new turns and cancels the scheduler's poll loop, then ends every
+    turn in flight: RunRegistry.shutdown writes each remote turn's controller
+    cancel flag, and the turn's relay saves it as interrupted and writes
+    response.failed to its stream. Only then does it wait for the poll loop,
+    which finishes a database read it was in before it stops, and for the
+    scheduled runs those turns belonged to, so each run's record lands.
+    TURN_SHUTDOWN_GRACE_SECONDS bounds all of it. Each step does nothing for
+    what an earlier call ended.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + TURN_SHUTDOWN_GRACE_SECONDS
+
+    def remaining() -> float:
+        return max(0.0, deadline - loop.time())
+
+    registry.close()
+    poll_loop = stop_scheduler()
+    _log_cancelled_turns(await registry.shutdown(timeout_seconds=remaining()))
+    if poll_loop is not None:
+        await asyncio.wait([poll_loop], timeout=remaining())
+    unfinished = await wait_for_scheduled_runs(timeout_seconds=remaining())
+    if unfinished:
+        logger.warning(
+            "Scheduled runs still recording their outcome at shutdown",
+            extra={"event": "shutdown_scheduled_runs_unfinished", "count": unfinished},
+        )
+
+
+def _log_cancelled_turns(cancelled: int) -> None:
+    """The WARNING naming how many turns a shutdown ended. The count is a
+    field: the hosted log formatter drops a message's arguments."""
+    if cancelled:
+        logger.warning(
+            "Cancelled in-flight turns for shutdown",
+            extra={"event": "shutdown_turns_cancelled", "count": cancelled},
+        )
+
+
+def _server_busy(*, retry_after: int, status_code: int) -> JSONResponse:
+    """The refusal a client reads as "Cowork is busy": a sentence naming the
+    wait, its code, and Retry-After, which the web UI waits for before it
+    offers a retry."""
+    return JSONResponse(
+        Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+        status_code=status_code,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+# Another replica already serves while this one shuts down, so the retry needs
+# no longer than the client's own round trip.
+_SHUTDOWN_RETRY_AFTER_SECONDS = 1
+
+
+def _end_remote_turns_on_sigterm() -> None:
+    """Run _end_remote_turns on the first SIGTERM, then hand the signal on.
+
+    Uvicorn sets its own SIGTERM handler before lifespan startup runs
+    (Server.capture_signals), so the handler found here is Uvicorn's. On
+    SIGTERM it closes the listeners, waits at most --timeout-graceful-shutdown
+    for open responses, cuts the ones still open mid-stream, and only then
+    runs the lifespan's shutdown. Ending the turns first lets each open answer
+    stream carry its response.failed frame and end cleanly before that cut.
+    A second SIGTERM goes straight to Uvicorn.
+
+    The turns end in the context lifespan startup installed the handler in,
+    not in that of whatever task the signal interrupted, which may hold one
+    organization's settings scope.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "Server lifespan runs off the main thread, where no signal handler can be set; "
+            "turns in progress are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": "off_main_thread"},
+        )
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        # SIG_DFL or SIG_IGN, or None for a handler not set from Python.
+        reason = previous.name if isinstance(previous, signal.Handlers) else "not_set_from_python"
+        logger.warning(
+            "SIGTERM handler is not one to hand the signal on to; turns in progress "
+            "are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": reason},
+        )
+        return
+    loop = asyncio.get_running_loop()
+    drain_context = contextvars.copy_context()
+    signalled = False
+    # Held here because the event loop keeps only a weak reference to a task.
+    drain: asyncio.Task | None = None
+
+    def on_sigterm(signum: int, frame: FrameType | None) -> None:
+        nonlocal signalled
+        if signalled:
+            previous(signum, frame)
+            return
+        signalled = True
+
+        def hand_on(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(
+                    "Ending turns before shutdown failed",
+                    exc_info=task.exception(),
+                    extra={"event": "shutdown_predrain_failed"},
+                )
+            previous(signum, frame)
+
+        def begin() -> None:
+            nonlocal drain
+            drain = loop.create_task(_end_remote_turns())
+            drain.add_done_callback(hand_on)
+
+        # A signal handler runs between two bytecodes of whatever the loop was
+        # doing, possibly while it waits in select(); call_soon_threadsafe
+        # wakes it to run begin(). Without a context it would run begin() in a
+        # copy of the interrupted task's, and the drain task would inherit it.
+        loop.call_soon_threadsafe(begin, context=drain_context)
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
+
 async def _run_artifact_owner_backfill() -> None:
     """Background, one-time owner backfill (ENG-2961). Never affects startup."""
     try:
@@ -147,6 +306,34 @@ def _warm_agent_runtime() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # After migrations and the .env seed, before anything reads a credential.
+    app_settings = get_app_settings()
+    consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    # Ownership recovery runs before the first request can mint a page. A pass
+    # that cannot read publish history or verify the publisher does not stop
+    # Cowork: published_page_ownership._require_backfill retries it on each
+    # protected publish, unpublish or delete and answers 503 until it completes.
+    from cowork.services.published_page_owner_backfill import (
+        PublishedPageBackfillUnavailable,
+        run_published_page_owner_backfill,
+    )
+
+    try:
+        await asyncio.to_thread(run_published_page_owner_backfill)
+    except PublishedPageBackfillUnavailable as exc:
+        # Its messages are fixed text, raised without the underlying error.
+        logger.error(
+            "Published page ownership backfill did not finish; publishing answers 503 and retries it",
+            extra={"event": "published_page_backfill_unavailable", "reason": str(exc)},
+        )
+    # After the clear, since resolving MEMORY_ENABLED where memory is shared
+    # loads the stored settings.
+    try:
+        memory_warning = memory_start_warning()
+        if memory_warning is not None:
+            logger.warning(memory_warning)
+    except Exception:
+        logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
     # History recovery also retries buffers sealed by an earlier failed sweep.
@@ -190,17 +377,24 @@ async def lifespan(app: FastAPI):
         logger.exception("scratchpad-session boot sweep failed (non-fatal)")
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
-    # run and never fires that schedule again.
+    # run and never fires that schedule again. In org mode other replicas
+    # share the database and may still be running theirs, so only runs old
+    # enough to be presumed dead are released here. A younger run left by a
+    # hard-killed pod, including this one, stays `running` and wedges its
+    # schedule until a replica boots after it ages past the cutoff.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
+        from cowork.scheduler import boot_reap_cutoff
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
-            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
+            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
+                started_before=boot_reap_cutoff(),
+            )
             if reaped:
-                logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
+                logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:
             recovery_session.close()
     except Exception:
@@ -225,9 +419,30 @@ async def lifespan(app: FastAPI):
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
         )
+    app.state.router_startup_probe = None
+    if (
+        app_settings.deployment_kind == "self-hosted"
+        and app_settings.tenancy_mode == "local"
+        and not TurnQueueSettings().is_remote
+    ):
+        from cowork.services.router_probe import run_router_startup_probe
+
+        # Bootstrap and credential clearing finish first; provider checks must
+        # not delay readiness while the configured endpoint is unavailable.
+        app.state.router_startup_probe = asyncio.create_task(run_router_startup_probe())
+    draft_listener = None
+    # Only where turns run remotely: desktop and in-process deployments keep
+    # Uvicorn's own SIGTERM handling and end their turns in the teardown below.
+    remote_turns = TurnQueueSettings().is_remote
+    if remote_turns:
+        _end_remote_turns_on_sigterm()
     try:
+        draft_listener = await start_draft_listener()
         yield
     finally:
+        # First, so no draft request is still reading files or the database
+        # while the steps below close them.
+        await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
@@ -235,16 +450,20 @@ async def lifespan(app: FastAPI):
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
-        from cowork.streaming.registry import registry
 
         # Uvicorn's request drain is bounded by the image command. Persist
         # interrupted turns before their database and runtime resources close.
-        cancelled = await registry.shutdown()
-        if cancelled:
-            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+        # Remote turns were usually ended already, by the SIGTERM handler while
+        # their streams were still open, and each step then does nothing; this
+        # covers a shutdown that began any other way.
+        if remote_turns:
+            await _end_remote_turns()
+        else:
+            _log_cancelled_turns(await registry.shutdown())
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
+        await _cancel_and_wait(getattr(app.state, "router_startup_probe", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
@@ -309,6 +528,90 @@ class _NoStoreMiddleware:
         await self.app(scope, receive, send_with_no_store)
 
 
+def _refuse_unreadable_managed_stores(managed: ManagedFolder) -> None:
+    """Refuse to start when the server's user can't read the managed skills or
+    data-vault folder, or a managed skill folder or its SKILL.md. Each would
+    otherwise crash a page, a turn, or the restart the runbook names as the
+    remedy, rather than surface here with the path and the fix."""
+    from anton.core.tools.skill_format import SKILL_FILE
+
+    folder = managed.skills_dir
+    if not os.access(folder, os.R_OK | os.X_OK):
+        raise RuntimeError(
+            f"COWORK_MANAGED_DIR's {folder.name} folder {folder} can't be read: the "
+            "server's user needs read and search permission on it. Run "
+            f"`chmod -R a+rX {folder}` on the host copy (and `chown -R 1000:1000 "
+            f"{folder}` if it is owned by another user)."
+        )
+    for slug_dir in sorted(managed.skills_dir.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        if not os.access(slug_dir, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's skill folder {slug_dir} can't be read: run "
+                f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
+            )
+        skill_file = slug_dir / SKILL_FILE
+        if skill_file.exists() and not os.access(skill_file, os.R_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's skill file {skill_file} can't be read: run "
+                f"`chmod -R a+rX {managed.skills_dir}` on the host copy."
+            )
+    _refuse_unreadable_managed_connections(managed.vault_dir)
+
+
+def _refuse_unreadable_managed_connections(vault_dir: Path) -> None:
+    """Probe as the server's user, without loading credentials or logging a record.
+
+    A bind mount can pass os.access but still deny open. Refuse startup before
+    LocalDataVault silently skips that connection and exposes a lower layer.
+    """
+    try:
+        if not os.access(vault_dir, os.R_OK | os.X_OK):
+            raise PermissionError
+        with pinned_dir(vault_dir) as directory:
+            with dir_scandir(directory) as entries:
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                try:
+                    if not stat.S_ISREG(dir_stat(directory, name).st_mode):
+                        continue
+                    fd = dir_open(directory, name, os.O_RDONLY | O_NONBLOCK)
+                    try:
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            raise OSError("Managed connection is no longer a regular file")
+                    finally:
+                        os.close(fd)
+                except FileNotFoundError:
+                    continue  # The operator may remove a connection during the scan.
+                except OSError as error:
+                    logger.error(
+                        "Cowork cannot read a managed connection; check its ownership "
+                        "and permissions before restarting.",
+                        extra={
+                            "event": "managed_connection_unreadable",
+                            "reason": "file_unreadable",
+                            "managed_connection_file": name,
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    raise RuntimeError(
+                        f"COWORK_MANAGED_DIR's connection file {vault_dir / name} can't be read: "
+                        f"run `chown 1000:1000 {vault_dir / name}` on the host copy."
+                    ) from None
+    except OSError as error:
+        logger.error(
+            "Cowork cannot read the managed data-vault directory; check its ownership "
+            "and permissions before restarting.",
+            extra={
+                "event": "managed_connection_unreadable",
+                "reason": "vault_unreadable",
+                "error_type": type(error).__name__,
+            },
+        )
+        raise RuntimeError("COWORK_MANAGED_DIR's data-vault folder can't be read") from None
+
+
 def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -318,9 +621,16 @@ def create_app() -> FastAPI:
     """
 
     settings = get_app_settings()
+    # PDF export settings come from the process environment alone. An engine
+    # other than "render", or "render" without an http(s) URL, stops the start.
+    get_export_pdf_settings()
+
+    from cowork.deployment_identity import initialize_deployment_identity
+
+    initialize_deployment_identity(settings, remote_turns=TurnQueueSettings().is_remote)
 
     # Create FastAPI app
-    app = FastAPI(
+    app = RequestLoggingApp(
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
@@ -351,21 +661,32 @@ def create_app() -> FastAPI:
     # a retry, and the sentence names the wait for clients that don't read it.
     @app.exception_handler(PoolTimeoutError)
     async def _database_busy(request, exc):
-        retry_after = busy_retry_seconds()
         logger.warning(
             "%s %s refused with 503: no database connection freed in time",
             request.method, request.url.path,
         )
-        return JSONResponse(
-            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
-            status_code=DatabaseBusy.status_code,
-            headers={"Retry-After": str(retry_after)},
-        )
+        return _server_busy(retry_after=busy_retry_seconds(), status_code=DatabaseBusy.status_code)
+
+    # A question that reached a replica already ending its turns for a
+    # shutdown (RunRegistry.close). Refused as a busy server is: the client
+    # waits Retry-After, and its retry reaches another replica, which the
+    # rollout made ready before it stopped this one.
+    @app.exception_handler(ServerShuttingDown)
+    async def _shutting_down(request, exc: ServerShuttingDown):
+        return _server_busy(retry_after=_SHUTDOWN_RETRY_AFTER_SECONDS, status_code=exc.status_code)
 
     # A second question into a conversation whose turn is still answering.
     @app.exception_handler(TurnInProgress)
     async def _turn_in_progress(request, exc):
         return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
+
+    # A save or delete that reached a connection the caller can't change, or
+    # a create under a name the registry still shares (LayeredDataVault). The
+    # connections routes refuse a change up front; this answers the same for
+    # a save whose derived name lands on one, and the create.
+    @app.exception_handler(SharedConnectionError)
+    async def _shared_connection(request, exc: SharedConnectionError):
+        return JSONResponse({"detail": exc.detail}, status_code=403)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when
@@ -382,15 +703,136 @@ def create_app() -> FastAPI:
     # layer lets them through.
     channel_webhook_paths: set[str] = set()
 
-    # Org mode: build a per-request Principal from gateway-injected identity
-    # headers. Added first so it sits inner of the bearer/CORS layers.
-    if settings.tenancy_mode == "org":
+    # Trusted identity headers name a person in local tenancy. Only a request
+    # that already passed the bearer token may name one, and each person's
+    # partition needs every resource its rows point at. Memory left off the
+    # list is one store everyone shares, which the lifespan reports.
+    if settings.trust_identity_headers:
+        if settings.tenancy_mode == "org":
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS is not supported in org tenancy mode: "
+                "org deployments already build each request's principal from the "
+                "gateway's identity headers."
+            )
+        if not settings.require_auth:
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS requires COWORK_REQUIRE_AUTH: without the "
+                "bearer token check, any caller could name any person in the identity headers."
+            )
+        check_personal_resource_dependencies(settings.personal_resources)
+
+    # The operator's managed folder reaches every turn read-only. A missing
+    # folder stops the start: its skill and connection names would otherwise
+    # stop being reserved, and its rules would silently reach no turn.
+    managed = managed_folder()
+    if managed is not None:
+        if settings.tenancy_mode == "org":
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR is not supported in org tenancy mode: turns run on "
+                "remote workers, which receive none of the managed folder."
+            )
+        missing = managed.missing_dirs()
+        if missing:
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR names missing folders: "
+                + ", ".join(str(path) for path in missing)
+                + ". Create or mount each one; the managed folder needs memory/, "
+                "skills/ and data-vault/."
+            )
+        # anton reads memory/ on every turn, and a folder it can't search
+        # fails each turn on its first rule.
+        if not os.access(managed.memory_dir, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's memory folder {managed.memory_dir} can't be read: "
+                "the server's user needs read and search permission on it (for example "
+                "chmod 755), or every turn fails reading its rules."
+            )
+        # A skills/ or data-vault/ folder the server's user can't read, or a
+        # managed skill folder or its SKILL.md it can't read, would crash every
+        # person's Skills or Connections page and every turn. Refuse at start,
+        # with the path and the fix, rather than loop on a crash.
+        _refuse_unreadable_managed_stores(managed)
+        if not cortex_takes_managed_layer():
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR needs an anton whose Cortex takes managed_hc, the "
+                "read-only memory layer. The installed anton has none, so the "
+                "managed rules would reach no turn."
+            )
+        # A malformed connection registry stops the start, where the operator
+        # sees it. One broken later shares nothing until fixed
+        # (SharedRegistry.read_live).
+        try:
+            shared_connections = managed.shared_connections()
+        except SharedRegistryError as error:
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's shared registry is malformed: {error}. "
+                "Fix or remove the file; a missing one shares nothing."
+            ) from error
+        from anton.core.datasources.data_vault import LocalDataVault
+
+        logger.info(
+            "managed folder: %s (%d skills, %d connections, %d shared connections)",
+            managed.root,
+            len(managed.skill_slugs()),
+            len(LocalDataVault(managed.vault_dir).list_connections()),
+            len(shared_connections.root),
+        )
+
+    # The skills people share, which Cowork writes itself. A malformed list
+    # never stops the start: it shares nothing, with a warning naming the
+    # file (read_shared_skills), until the next share or hide replaces it.
+    if settings.trust_identity_headers and PersonalResource.SKILLS in settings.personal_resources:
+        logger.info(
+            "shared skills: %d in %s", len(read_shared_skills().root), shared_skills_file()
+        )
+
+    # A remote turn runs on a worker that reads and learns memory in the
+    # project's own folder, not in a person's tier, and receives none of the
+    # managed folder.
+    if TurnQueueSettings().is_remote and (settings.trust_identity_headers or managed is not None):
+        raise RuntimeError(
+            "COWORK_TURN_BACKEND=remote is not supported with COWORK_TRUST_IDENTITY_HEADERS "
+            "or COWORK_MANAGED_DIR: remote turns keep memory in each project's own folder, "
+            "not in each person's, and receive none of the managed folder. Leave "
+            "COWORK_TURN_BACKEND unset to run turns in this process."
+        )
+
+    # Identity headers need the code sandbox, and the sandbox needs a kernel
+    # and an anton that hold it (cowork.code_sandbox.check_startup).
+    check_code_sandbox_startup(settings, remote_turns=TurnQueueSettings().is_remote)
+    # The edge's access check and stopped page for each live-app slot carry
+    # only the visitor's viewer sign-in cookie, and a slot's stop report
+    # carries nothing; each route checks its caller itself
+    # (cowork.services.live_apps.live_app_slot_paths).
+    channel_webhook_paths.update(live_app_slot_paths())
+    # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
+    # turns in this process (check_write_approval_startup).
+    check_write_approval_startup(
+        settings=AntonHarnessSettings(),
+        ask_user_enabled=settings.ask_user_enabled,
+        remote_turns=TurnQueueSettings().is_remote,
+    )
+
+    # Org mode, or local tenancy that trusts identity headers: build a
+    # per-request Principal from the identity headers. Added first so it sits
+    # inner of the bearer/CORS layers: in local tenancy it reads the headers
+    # only on a request that passed the bearer token.
+    if settings.tenancy_mode == "org" or settings.trust_identity_headers:
         enforce = settings.identity_enforce == "enforce"
         app.add_middleware(
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
+            personal_partitions=settings.trust_identity_headers,
         )
+    if settings.trust_identity_headers:
+        logger.info(
+            "auth: local tenancy, trusted identity headers enabled "
+            "(identity=%s, personal resources=%s)",
+            settings.identity_enforce,
+            ",".join(sorted(settings.personal_resources)) or "none",
+        )
+    elif settings.tenancy_mode == "org":
         logger.info(
             "auth: org tenancy mode — principal middleware enabled "
             "(identity=%s)",
@@ -422,8 +864,24 @@ def create_app() -> FastAPI:
                 "Org deployments authenticate at the ingress instead."
             )
         env_path = cowork_home() / ".env"
-        token = settings.auth_token or ensure_auth_token(env_path)
-        sync_auth_token(env_path, token)
+        if settings.trust_identity_headers:
+            # With identity headers on, the token acts as any person, and the
+            # desktop app, which reads the copy in cowork-home's .env, never
+            # runs here. The token comes from the process environment alone,
+            # never settings.auth_token, which cowork-home's .env also fills,
+            # and a copy an earlier start wrote there is removed.
+            token = os.environ.get("COWORK_AUTH_TOKEN", "")
+            if not token:
+                raise RuntimeError(
+                    "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's "
+                    "environment: with identity headers on, the token acts as any person, "
+                    "so Cowork neither generates it nor keeps a copy in cowork-home's .env. "
+                    "Set COWORK_AUTH_TOKEN where the server starts."
+                )
+            remove_auth_token(env_path)
+        else:
+            token = settings.auth_token or ensure_auth_token(env_path)
+            sync_auth_token(env_path, token)
         # Codex has a separate, process-local inference credential, not the
         # desktop's API token. These exact routes retain their own constant-time
         # credential check and LoopbackDesktopOnly guard. Do not exempt the

@@ -80,19 +80,10 @@ class TestToolProgressRoleMapping:
         # handler exception), and with no verdict attached every consumer
         # has no choice but to treat "it fired" as "it succeeded"
         # (anton PR #304 review).
-        #
-        # Set post-construction, not via the constructor: the anton-agent
-        # version this repo's uv.lock resolves today predates the `ok`
-        # field (it's added on the anton side of this same fix and hasn't
-        # been promoted past `main` yet — see the design doc's rollout
-        # notes). `getattr(event, "ok", None)` in the formatter already
-        # handles an anton without the field at all; this only needs to
-        # simulate an anton new enough to *set* it.
         tool_done = StreamTaskProgress(
             phase="tool_done", message="streaming_probe",
-            eta_seconds=0.5, id="tc_1",
+            eta_seconds=0.5, id="tc_1", ok=False,
         )
-        tool_done.ok = False
         chunks = [
             c async for c in format_responses_stream(
                 _events(

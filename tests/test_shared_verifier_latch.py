@@ -71,7 +71,7 @@ async def _chat_session_config(monkeypatch):
         conversation = ConversationService(
             ScopedSession(db, LOCAL_SCOPE)
         ).create_conversation(topic="verifier latch")
-        config, _, _ = await harness.AntonHarness()._build_chat_session(conversation)
+        config = (await harness.AntonHarness()._build_chat_session(conversation)).session
     return config
 
 

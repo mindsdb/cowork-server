@@ -1,24 +1,33 @@
-"""Tenant-scoped query layer for org (multi-tenant) deployments.
+"""Tenant-scoped query layer for partitioned deployments.
 
 Services receive a ScopedSession instead of a raw Session. Statements are
 built with ``scoped.select(Model)`` — when the model is org-scoped (has an
-``org_id`` column) and the deployment runs in org mode, the org filter is
+``org_id`` column) and the scope partitions it, the org filter is
 pre-applied and cannot be forgotten. ``exec()`` only runs statements built
 that way; there is no raw execution path on this object.
 
-Fail-closed rule: in org mode, touching an org-scoped model without an org
-in scope raises MissingTenantScopeError. Models without an ``org_id`` column
+Two scopes partition. Org mode (hosted org tenancy) partitions every model
+by organization. A personal scope (local tenancy with
+COWORK_TRUST_IDENTITY_HEADERS on) keys its partition by the person's
+partition id, and partitions only the resources COWORK_PERSONAL_RESOURCES
+lists (cowork.db.personal_resources); every other model behaves as in local
+mode.
+
+Fail-closed rule: a scope that partitions an org-scoped model but has no
+org in it raises MissingTenantScopeError. Models without an ``org_id`` column
 pass through untouched, so the helper is inert until the tenancy migrations
 land and turns on per table as columns arrive.
 
-Local mode (the desktop sidecar) never filters — today's behavior.
+Local mode (the desktop sidecar, and the operator view of a trusted-identity
+deployment) never filters — today's behavior.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, Request
 from sqlalchemy import event, inspect
@@ -26,12 +35,13 @@ from sqlalchemy.sql import Select
 from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.personal_resources import MODEL_RESOURCE, STORE_RESOURCE, PersonalResource
 from cowork.db.session import get_session
 from cowork.principal import Principal, get_principal
 
 
 class MissingTenantScopeError(RuntimeError):
-    """Org-scoped data touched in org mode without an org in scope."""
+    """Partitioned data touched without an org (or partition) in scope."""
 
 
 class TenantMismatchError(RuntimeError):
@@ -40,11 +50,35 @@ class TenantMismatchError(RuntimeError):
 
 @dataclass(frozen=True)
 class TenantScope:
-    """Tenancy context for one request."""
+    """Tenancy context for one request.
+
+    ``org_mode`` is hosted org tenancy: every resource is keyed by ``org_id``.
+    ``personal`` is one person's partition on a local deployment that trusts
+    identity headers: ``org_id`` is their partition id
+    (cowork.principal.personal_partition_id), ``user_id`` their ``sub``, and
+    only ``personal_resources`` are keyed by ``org_id``. The others stay shared,
+    as LOCAL_SCOPE has them.
+    """
 
     org_mode: bool = False
     org_id: str | None = None
     user_id: str | None = None
+    personal: bool = False
+    personal_resources: frozenset[PersonalResource] = frozenset()
+
+    @property
+    def partitioned(self) -> bool:
+        """True in org mode and in a personal scope, whatever its resources."""
+        return self.org_mode or self.personal
+
+    def partitioned_for(self, resource: PersonalResource) -> bool:
+        """True when ``resource`` is keyed by ``org_id`` in this scope."""
+        return self.org_mode or (self.personal and resource in self.personal_resources)
+
+    def for_resource(self, resource: PersonalResource) -> TenantScope:
+        """This scope where ``resource`` is partitioned, else LOCAL_SCOPE, the
+        deployment-wide view a shared resource keeps."""
+        return self if self.partitioned_for(resource) else LOCAL_SCOPE
 
 
 LOCAL_SCOPE = TenantScope()
@@ -53,24 +87,60 @@ LOCAL_SCOPE = TenantScope()
 SYSTEM_SCOPE = LOCAL_SCOPE
 
 
+def tenant_scope_required() -> bool:
+    """True when code with no scope must refuse rather than fall back to
+    LOCAL_SCOPE or a base storage root: in org tenancy, and on a local
+    deployment that trusts identity headers. There LOCAL_SCOPE is the operator
+    view, which lists every person's conversations, running answers,
+    projects, files, schedules and pins, and reads skills, connections,
+    artifacts and memory from the deployment's own stores."""
+    settings = get_app_settings()
+    return settings.tenancy_mode == "org" or settings.trust_identity_headers
+
+
 def scope_from_principal(principal: Principal | None) -> TenantScope:
-    """The single way a TenantScope is built — request DI and background
-    holders of a principal (e.g. ResponsesHandler) both go through here."""
-    if get_app_settings().tenancy_mode != "org":
+    """The single way a request's TenantScope is built — request DI and
+    background holders of a principal (e.g. ResponsesHandler) both go through
+    here. Org tenancy without a principal gives an org scope with no org, which
+    fails closed; local tenancy without one gives LOCAL_SCOPE, the operator view
+    when identity headers are trusted."""
+    if principal is None:
+        if get_app_settings().tenancy_mode == "org":
+            return TenantScope(org_mode=True)
         return LOCAL_SCOPE
-    return TenantScope(
-        org_mode=True,
-        org_id=principal.org_id if principal else None,
-        user_id=principal.user_id if principal else None,
-    )
+    return scope_for_identity(org_id=principal.org_id, user_id=principal.user_id)
+
+
+def scope_for_identity(*, org_id: str | None, user_id: str | None) -> TenantScope:
+    """Scope for a known (org_id, user_id), as a principal or a stored row
+    carries it. On a trusted-identity deployment ``org_id`` is the partition id
+    the middleware derived, never the raw X-Organization-Id.
+
+    Org tenancy → an org scope. Local tenancy with trusted identity headers and
+    an org_id → that person's partition (``user_id`` may be None for a
+    partition-owned background operation). Anything else → LOCAL_SCOPE: an
+    org_id alone never turns org mode on in local tenancy.
+    """
+    settings = get_app_settings()
+    if settings.tenancy_mode == "org":
+        return TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
+    if settings.trust_identity_headers and org_id:
+        return TenantScope(
+            personal=True,
+            org_id=org_id,
+            user_id=user_id,
+            personal_resources=settings.personal_resources,
+        )
+    return LOCAL_SCOPE
 
 
 def scope_for_org(org_id: str | None) -> TenantScope:
     """Scope for a background or webhook-routed operation with a known org_id.
-    Local mode (no org) returns LOCAL_SCOPE; org mode returns an org-scoped
-    TenantScope. Replaces the inline pattern:
+    No org returns LOCAL_SCOPE; an org_id returns its org scope in org tenancy
+    and its partition on a trusted-identity deployment (scope_for_identity).
+    Replaces the inline pattern:
     `SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)`."""
-    return LOCAL_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+    return LOCAL_SCOPE if org_id is None else scope_for_identity(org_id=org_id, user_id=None)
 
 
 def get_tenant_scope(request: Request) -> TenantScope:
@@ -102,12 +172,20 @@ def service_principal_for(org_id: str | None, user_id: str | None) -> Principal 
     one from, but the row already carries who owns it from when it was created
     through the normal request-scoped path.
 
-    Local mode → None (nothing to scope). Org mode → Principal from the row's own
-    identity, or fail closed if the row predates org stamping (a legacy/local row
-    with no org_id or created_by) — same "fail loud, never invisible" rule as
-    `scope_for_background_context`.
+    Desktop, and a trusted-identity deployment whose schedules are shared → None
+    (nothing to scope). Org mode, and a trusted-identity deployment whose
+    schedules are personal → Principal from the row's own identity, so the job
+    acts as its creator, or fail closed if the row predates stamping (a
+    legacy/local row with no org_id or created_by) — same "fail loud, never
+    invisible" rule as `scope_for_background_context`. The stored org_id is
+    already a partition id there and is used as it is, never derived again.
     """
-    if get_app_settings().tenancy_mode != "org":
+    settings = get_app_settings()
+    personal_schedules = (
+        settings.trust_identity_headers
+        and PersonalResource.SCHEDULES in settings.personal_resources
+    )
+    if settings.tenancy_mode != "org" and not personal_schedules:
         return None
     if not org_id or not user_id:
         raise MissingTenantScopeError(
@@ -116,69 +194,128 @@ def service_principal_for(org_id: str | None, user_id: str | None) -> Principal 
     return Principal(user_id=user_id, org_id=org_id)
 
 
-def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
-    """``base`` in local mode, ``<shared_root>/<org_id>/<store>`` in org mode,
-    fail-closed without an org. Org-first so each org is one mountable/GC-able
-    subtree. org_id is a normalized UUID (TrustedHeaderMiddleware), so it's
-    path-safe. ``store`` is required — deriving it from ``base`` would let a
-    *_DIR env override silently rename an org's store.
+def _partitions_store(scope: TenantScope, store: str) -> bool:
+    resource = STORE_RESOURCE.get(store)
+    # Mapped to None (the sandbox store), or unmapped: partitioned wherever
+    # anything is, so a new store is never shared by omission.
+    # tests/test_personal_resources.py keeps the map whole.
+    return scope.partitioned if resource is None else scope.partitioned_for(resource)
 
-    ``scope=None`` fail-closes on an org deployment. It cannot mean "no
-    tenancy" there: ``base`` is the shared root every organization can read, so
-    returning it verbatim hands a caller that merely forgot to thread its scope
-    a path outside any org's subtree. That is how the persisted connector vault
-    ended up unpartitioned. A missing scope in org mode is a bug at the call
-    site, and this is where it surfaces."""
+
+def _partitions_model(scope: TenantScope, model: type) -> bool:
+    resource = MODEL_RESOURCE.get(getattr(model, "__tablename__", ""))
+    # Unmapped: partitioned wherever anything is, as for stores above.
+    return scope.partitioned if resource is None else scope.partitioned_for(resource)
+
+
+def storage_segment(value: str, *, what: Literal["partition", "store", "user"]) -> str:
+    """``value`` as one folder name below a storage root: returned as it is,
+    or ValueError naming ``what`` (the partition, store or user).
+
+    A segment must be its own base name. "" is dropped by pathlib, so the
+    path collapses onto the folder above; "." and ".." name a folder that is
+    not below; a separator names a folder further down, maybe in another
+    partition, and an absolute value replaces the root. A backslash is refused
+    too, so a value never means one thing here and another on a host that
+    reads it as a separator."""
+    segment = os.path.basename(value)
+    if segment != value or segment in ("", ".", "..") or "\\" in segment:
+        raise ValueError(f"invalid storage {what} segment: {value!r}")
+    return segment
+
+
+def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
+    """``base`` where the scope leaves ``store`` shared, ``<shared_root>/<org_id>/<store>``
+    where it partitions it (org mode, or a personal scope whose resources include
+    the store's, see STORE_RESOURCE), fail-closed without an org. Org-first so
+    each org or partition is one mountable/GC-able subtree. org_id is a
+    normalized UUID (TrustedHeaderMiddleware, personal_partition_id), and
+    storage_segment refuses one that would leave its folder all the same, so
+    the partition never rests on the middleware alone. ``store`` is required:
+    deriving it from ``base`` would let a *_DIR env override silently rename an
+    org's store.
+
+    ``scope=None`` fail-closes on a partitioned deployment (tenant_scope_required).
+    It cannot mean "no tenancy" there: ``base`` is the shared root every
+    organization or person can read, so returning it verbatim hands a caller
+    that merely forgot to thread its scope a path outside any partition. That is
+    how the persisted connector vault ended up unpartitioned. A missing scope
+    there is a bug at the call site, and this is where it surfaces."""
     if scope is None:
-        if get_app_settings().tenancy_mode == "org":
+        if tenant_scope_required():
             raise MissingTenantScopeError(
-                f"filesystem store {store!r} requires a TenantScope on an org deployment; "
-                "the caller must thread one through rather than defaulting to the shared root"
+                f"filesystem store {store!r} requires a TenantScope on a partitioned "
+                "deployment; the caller must thread one through rather than defaulting "
+                "to the shared root"
             )
         return base
-    if not scope.org_mode:
+    if not _partitions_store(scope, store):
         return base
     if not scope.org_id:
         raise MissingTenantScopeError(
             "filesystem store requires an organization in scope"
         )
-    # "" is silently dropped by pathlib (store collapses onto the org root);
-    # "."/".."/separators would escape it.
-    if not store or store in (".", "..") or "/" in store or "\\" in store:
-        raise ValueError(f"invalid storage store segment: {store!r}")
+    partition = storage_segment(scope.org_id, what="partition")
+    store = storage_segment(store, what="store")
     shared = Path(get_app_settings().storage.shared_root)
-    return shared / scope.org_id / store
+    return shared / partition / store
+
+
+# The segment under a store's partition that holds the per-person tiers.
+USER_STORE_TIER_SEGMENT = "users"
+
+
+def user_store_tiers_segments(partition: str, *, store: str) -> tuple[str, ...]:
+    """The path segments, below the shared root, of the folder holding every
+    person's ``store`` tier in one partition: ``(<partition>, <store>, "users")``."""
+    return (partition, store, USER_STORE_TIER_SEGMENT)
+
+
+def user_store_segments(partition: str, user_id: str, *, store: str) -> tuple[str, ...]:
+    """The path segments, below the shared root, of one person's ``store`` tier:
+    ``(<partition>, <store>, "users", <user_id>)``. scoped_user_storage_root and
+    the per-person tier walks (remove_project_memory_tiers) both build their
+    paths from these segments, so the layout is spelled once."""
+    return (*user_store_tiers_segments(partition, store=store), user_id)
 
 
 def scoped_user_storage_root(
     base: Path, scope: TenantScope | None, *, store: str
 ) -> Path:
     """``<shared_root>/<org_id>/<store>/users/<user_id>``, for stores that are one
-    person's rather than the org's. ``base`` in local mode (one user per machine);
-    org mode fail-closes without BOTH ids, since silently sharing one person's
-    store across an org is a correctness bug, not a lenient default (ADR-0002).
-    Id checks run before any settings resolution.
+    person's rather than the org's. ``base`` where the scope leaves ``store``
+    shared (local mode, one user per machine, or a resource a personal scope
+    keeps shared); a partitioned store fail-closes without BOTH ids, since
+    silently sharing one person's store across an org is a correctness bug, not
+    a lenient default (ADR-0002). Id checks run before any settings resolution.
 
-    ``scope=None`` fail-closes on an org deployment for the same reason it does
-    in ``scoped_storage_root``: ``base`` is the shared namespace root there, so
-    returning it verbatim gives an unscoped caller a path outside every org's
-    subtree. This matters most for the in-process harness memory root, whose
-    caller reads an ambient scope that is None outside a bound turn."""
+    ``scope=None`` fail-closes on a partitioned deployment for the same reason
+    it does in ``scoped_storage_root``: ``base`` is the shared namespace root
+    there, so returning it verbatim gives an unscoped caller a path outside
+    every partition. This matters most for the in-process harness memory root,
+    whose caller reads an ambient scope that is None outside a bound turn."""
     if scope is None:
-        if get_app_settings().tenancy_mode == "org":
+        if tenant_scope_required():
             raise MissingTenantScopeError(
-                f"per-user filesystem store {store!r} requires a TenantScope on an org "
-                "deployment; the caller must thread one through rather than defaulting "
-                "to the shared root"
+                f"per-user filesystem store {store!r} requires a TenantScope on a "
+                "partitioned deployment; the caller must thread one through rather "
+                "than defaulting to the shared root"
             )
         return base
-    if not scope.org_mode:
+    if not _partitions_store(scope, store):
         return base
     if not scope.user_id:
         raise MissingTenantScopeError(
             "per-user filesystem store requires a user in scope"
         )
-    return scoped_storage_root(base, scope, store=store) / "users" / scope.user_id
+    user_id = storage_segment(scope.user_id, what="user")
+    # scoped_storage_root checks the org and the store segment. The path below
+    # joins only the values storage_segment returned, never the raw ids.
+    scoped_storage_root(base, scope, store=store)
+    partition = storage_segment(scope.org_id, what="partition")
+    return Path(get_app_settings().storage.shared_root).joinpath(
+        *user_store_segments(partition, user_id, store=store)
+    )
 
 
 def scope_of_session(session: Session) -> TenantScope | None:
@@ -187,7 +324,7 @@ def scope_of_session(session: Session) -> TenantScope | None:
     Recovers the ORIGINAL scope (stored at wrap time) so downstream code that
     only holds a raw session — e.g. via object_session(row) — can re-wrap with
     the same authorization context instead of deriving one from row data.
-    Local-mode wraps store nothing; returns None.
+    Unpartitioned wraps (LOCAL_SCOPE) store nothing; returns None.
     """
     return session.info.get("tenant_scope")
 
@@ -227,7 +364,12 @@ class ScopedSelect:
 
 
 class ScopedSession:
-    """Session wrapper that makes org scoping structural, not remembered."""
+    """Session wrapper that makes org scoping structural, not remembered.
+
+    Each model is filtered, stamped and checked only where the scope partitions
+    it: every org-scoped model in org mode, and in a personal scope the models
+    whose resource (MODEL_RESOURCE) is personal.
+    """
 
     def __init__(self, session: Session, scope: TenantScope) -> None:
         if isinstance(session, ScopedSession):
@@ -237,7 +379,7 @@ class ScopedSession:
             )
         self._session = session
         self.scope = scope
-        if scope.org_mode:
+        if scope.partitioned:
             # One scope per raw session: re-wrapping with the same scope is a
             # no-op (request DI + handler paths share the request session);
             # a different scope is a bug — two tenants on one session.
@@ -258,8 +400,7 @@ class ScopedSession:
         # always a bug. Deletes of NULL-org rows are allowed — pre-sweep
         # rows being cleaned up by their own tenant (e.g. cascades).
         for row in [*session.new, *session.dirty]:
-            if _is_org_scoped(type(row)):
-                self._require_org(type(row))
+            if self._partitions(type(row)):
                 if row.org_id is None:
                     row.org_id = self.scope.org_id
                 elif row.org_id != self.scope.org_id:
@@ -269,28 +410,34 @@ class ScopedSession:
                         f"org_id={self.scope.org_id!r}"
                     )
         for row in session.new:
-            if self.scope.user_id and getattr(row, "created_by", "missing") is None:
+            if (
+                self.scope.user_id
+                and getattr(row, "created_by", "missing") is None
+                and _partitions_model(self.scope, type(row))
+            ):
                 row.created_by = self.scope.user_id
         for row in session.deleted:
-            if _is_org_scoped(type(row)):
-                self._require_org(type(row))
+            if self._partitions(type(row)):
                 if row.org_id is not None and row.org_id != self.scope.org_id:
                     raise TenantMismatchError(
                         f"cannot delete {type(row).__name__} belonging to another org"
                     )
 
-    def _require_org(self, model: type) -> None:
-        if self.scope.org_mode and self.scope.org_id is None:
+    def _partitions(self, model: type) -> bool:
+        """True when this scope keys ``model``'s rows by org_id. Fails closed
+        when it would but has no org to key them by."""
+        if not (_is_org_scoped(model) and _partitions_model(self.scope, model)):
+            return False
+        if self.scope.org_id is None:
             raise MissingTenantScopeError(
                 f"{model.__name__} is org-scoped but the request has no org in scope"
             )
+        return True
 
     def select(self, model: type) -> ScopedSelect:
         stmt = select(model)
-        if _is_org_scoped(model):
-            self._require_org(model)
-            if self.scope.org_mode:
-                stmt = stmt.where(model.org_id == self.scope.org_id)
+        if self._partitions(model):
+            stmt = stmt.where(model.org_id == self.scope.org_id)
         return ScopedSelect(stmt)
 
     def exec(self, stmt: ScopedSelect) -> Any:
@@ -301,21 +448,15 @@ class ScopedSession:
         return self._session.exec(stmt._stmt)
 
     def get(self, model: type, ident: Any) -> Any:
-        if _is_org_scoped(model):
-            self._require_org(model)
+        if self._partitions(model):
             row = self._session.get(model, ident)
-            if (
-                row is not None
-                and self.scope.org_mode
-                and row.org_id != self.scope.org_id
-            ):
+            if row is not None and row.org_id != self.scope.org_id:
                 return None
             return row
         return self._session.get(model, ident)
 
     def add(self, row: Any) -> Any:
-        if _is_org_scoped(type(row)) and self.scope.org_mode:
-            self._require_org(type(row))
+        if self._partitions(type(row)):
             if row.org_id is None:
                 row.org_id = self.scope.org_id
             elif row.org_id != self.scope.org_id:
@@ -324,20 +465,20 @@ class ScopedSession:
                     f"org_id={self.scope.org_id!r}"
                 )
         # Attribution: stamp the author on any model carrying created_by
-        # (covers child rows like messages that have no org_id of their own).
+        # (covers child rows like messages that have no org_id of their own),
+        # where the scope partitions that model's resource.
         if (
-            self.scope.org_mode
-            and self.scope.user_id
+            self.scope.user_id
             and inspect(row).transient
             and getattr(row, "created_by", "missing") is None
+            and _partitions_model(self.scope, type(row))
         ):
             row.created_by = self.scope.user_id
         self._session.add(row)
         return row
 
     def delete(self, row: Any) -> None:
-        if _is_org_scoped(type(row)) and self.scope.org_mode:
-            self._require_org(type(row))
+        if self._partitions(type(row)):
             if row.org_id != self.scope.org_id:
                 raise TenantMismatchError(
                     f"cannot delete {type(row).__name__} belonging to another org"
@@ -379,8 +520,8 @@ def unsafe_unscoped_session(scoped: ScopedSession) -> Session:
 
 def adopt_scoped_session(session: Session) -> ScopedSession:
     """Wrap an existing raw Session in a ScopedSession, reusing the scope it was
-    opened under. Org mode stamps that scope into `session.info` (see
-    ScopedSession.__init__); local mode has none, so fall back to LOCAL_SCOPE.
+    opened under. A partitioned scope is stamped into `session.info` (see
+    ScopedSession.__init__); LOCAL_SCOPE has none, so fall back to LOCAL_SCOPE.
 
     Lets code holding only `object_session(row)` (e.g. harnesses replaying
     conversation history) reach the scoped query API without re-deriving the

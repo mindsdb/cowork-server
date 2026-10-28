@@ -114,7 +114,7 @@ def test_well_formed_body_still_reaches_the_handler(client):
     """The change is about what a 422 says, not about rejecting more requests."""
     res = client.post(
         "/api/v1/connectors/submissions/",
-        json={"connector_id": "not-a-real-connector", "name": "x", "values": {}},
+        json={"connector_id": "not_a_real_connector", "name": "x", "values": {}},
     )
 
     assert res.status_code == 404

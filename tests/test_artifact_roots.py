@@ -215,11 +215,11 @@ def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monke
     called = []
     monkeypatch.setattr(
         "cowork.services.artifact_roots.artifacts_sources_for_scan",
-        lambda: called.append(1) or [],
+        lambda *, scope: called.append(scope) or [],
     )
 
     assert artifacts_sources_for_scope(ScopedSession(session, LOCAL_SCOPE)) == []
-    assert called == [1]
+    assert called == [LOCAL_SCOPE]
 
 
 # ─── the turn-end root ─────────────────────────────────────────────────────
@@ -310,47 +310,99 @@ def test_the_unfiltered_scan_yields_nothing_for_an_org_project(session, tmp_path
     """A tripwire, not a behaviour test.
 
     `artifacts_sources_for_scan` is this module's third public resolver and the
-    only one taking no session, so it applies no org filter and no owner filter.
-    `/api/v1/search` calls it unconditionally, in every tenancy mode.
+    only one taking no session, so it applies no owner filter. It walks
+    `_projects_root(scope=...)`, the scope's own projects root: an org's is
+    `<shared_root>/<org_id>/projects`, so the org filter is the root itself.
+    `/api/v1/search` skips the scan in org mode explicitly.
 
-    Nothing leaks today, for two reasons and neither of them is a check. It
-    walks `_projects_root()`, which is deliberately unkeyed and so empty in org
-    mode because org projects live at `<shared_root>/<org_id>/projects`
-    (services/artifacts.py carries its own TODO to org-scope it). And
-    `_scan_artifact_dirs` looks only for `<project>/.anton/artifacts`, the
-    desktop layout, while an org project's LEGACY artifacts sit one level
-    deeper under `conversations/<id>/`.
+    The owner filter is not a check either. `_scan_artifact_dirs` looks only
+    for `<project>/.anton/artifacts`, the desktop layout, while an org
+    project's LEGACY artifacts sit one level deeper under `conversations/<id>/`.
+    Since ENG-2056 new org artifacts land at `<project>/.anton/artifacts`,
+    project-wide by decision, so there is no cross-MEMBER read to reopen there.
 
-    Since ENG-2056 new org artifacts land at `<project>/.anton/artifacts` —
-    the same shape the scan looks for — so for THEM only the first reason (the
-    unkeyed, empty root) stands between the scan and another org's tree. That
-    is a smaller loss than it sounds: artifacts are project-wide by decision
-    now, so within one org there is no cross-MEMBER read left to reopen — the
-    remaining stake is cross-ORG, held by the empty root.
-
-    So this points the scan straight at an org project's real tree, defeating
-    the first reason, and asserts the second still holds for the legacy layout.
-    Whoever org-scopes the root or teaches the scan the conversation layout
-    changes that calculus, and this fails when they do.
+    So this points the scan straight at an org project's real tree and asserts
+    the legacy layout is still skipped. Whoever teaches the scan the
+    conversation layout changes that calculus, and this fails when they do.
     """
     from cowork.services import artifacts as artifacts_service
     from cowork.services.artifact_roots import artifacts_sources_for_scan
 
+    org_scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
     project = _project(session, tmp_path, name="scanned", org_id=ORG_A)
     _conversation(session, project, owner=USER_A2)
     monkeypatch.setattr(
-        artifacts_service, "_projects_root", lambda: Path(project.path).parent
+        artifacts_service, "_projects_root", lambda *, scope: Path(project.path).parent
     )
 
-    assert artifacts_sources_for_scan() == [], (
-        "the scan reached an org project's conversation workspaces; /api/v1/search "
-        "would now surface a co-member's artifacts"
+    assert artifacts_sources_for_scan(scope=org_scope) == [], (
+        "the scan reached an org project's conversation workspaces; a co-member's "
+        "legacy artifacts would surface wherever the scan is used"
     )
 
     # Not vacuous: the same scan, same root, does find a desktop-layout tree, so
     # the empty result above is the org layout being skipped rather than the
     # scan being broken or the root being wrong.
     (Path(project.path) / ".anton" / "artifacts").mkdir(parents=True)
-    assert [s.base for s in artifacts_sources_for_scan()] == [
+    assert [s.base for s in artifacts_sources_for_scan(scope=org_scope)] == [
         Path(project.path).resolve() / ".anton" / "artifacts"
     ]
+
+
+# ─── personal partitions ───────────────────────────────────────────────────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _personal(*, partition: str, user: str, resources=None) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=user,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def test_sources_for_scope_lists_only_the_persons_own_projects(session, tmp_path, monkeypatch):
+    """A person's list reads their project rows, as org mode does, so each
+    card carries its project id; the scan of their partition's projects root
+    would leave cards path-addressed. Another person's project is not among
+    them."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots.artifacts_sources_for_scan",
+        lambda *, scope: pytest.fail("a personal partition must not fall back to the scan"),
+    )
+    mine = _project(session, tmp_path, name="alice-notes", org_id=PARTITION_A)
+    _project(session, tmp_path, name="bob-notes", org_id=PARTITION_B)
+
+    sources = artifacts_sources_for_scope(ScopedSession(session, _personal(partition=PARTITION_A, user=USER_A)))
+
+    assert [s.project_name for s in sources] == ["alice-notes"]
+    # The in-process layout: one project-wide root, no conversation segment.
+    assert [s.base for s in sources] == [_project_base(mine)]
+    assert sources[0].project_id == str(mine.id)
+
+
+def test_sources_for_scope_scans_when_projects_are_shared(session, monkeypatch):
+    """Projects left off the personal list stay in the unkeyed root, so the
+    person's list is the desktop scan, as on today's shared stack."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+    called = []
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots.artifacts_sources_for_scan",
+        lambda *, scope: called.append("scan") or [],
+    )
+    # Earlier tests leave project rows behind in the shared database; the
+    # adopted-folder half of the desktop path is not what this pins.
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots._sources_outside_the_projects_root",
+        lambda _session: called.append("adopted") or [],
+    )
+
+    scope = _personal(partition=PARTITION_A, user=USER_A, resources=frozenset())
+    assert artifacts_sources_for_scope(ScopedSession(session, scope)) == []
+    assert called == ["scan", "adopted"]

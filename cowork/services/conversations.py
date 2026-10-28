@@ -8,24 +8,29 @@ import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import Text, case, cast, func, or_, tuple_
 from sqlalchemy import select as sa_select
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     dir_lstat,
     dir_rmtree,
     dir_unlink,
     opened_subdir_nofollow,
 )
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope
+from cowork.db.units import run_db
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
+from cowork.schemas.figure_sources import EarlierAnswer
 from cowork.schemas.responses import Role
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
@@ -51,6 +56,10 @@ _SCAN_CAP_MULTIPLIER = 10
 # trip on the unbounded get_messages branch a 1,000+ message conversation
 # can reach.
 _EVENTS_IN_CHUNK_SIZE = 500
+# The most recent answers whose figures a turn checks its own figures
+# against, to mark one an earlier answer gave as repeated
+# (read_earlier_answers).
+MAX_EARLIER_ANSWERS = 20
 # Upper bound for a decoded cursor's `seq`. Not the column's limit (`seq` is
 # INTEGER, so 2**31-1 on Postgres) — this is what the drivers tolerate. sqlite3
 # raises OverflowError rather than bind an int wider than 64 bits, and that
@@ -1103,6 +1112,66 @@ class ConversationService:
         ]
         return ReplayHistory(messages=messages, events=events)
 
+    def get_earlier_answers(self, conversation_id: UUID, *, answers: int) -> list[EarlierAnswer]:
+        """The figures the conversation's last ``answers`` answers list in
+        their saved response.figure_sources events, newest answer first.
+
+        An answer is a visible assistant message that is not pending; one
+        without the event (no figures, or a turn that stopped or failed)
+        still takes one of the places. An event whose figures do not read is
+        skipped with a warning. Raises ValueError, as get_conversation does,
+        for a conversation the caller does not own."""
+        # Anchor the parent: Message has no org_id, so tenancy comes from
+        # resolving the conversation through the scoped session.
+        self.get_conversation(conversation_id)
+        earlier = []
+        for row in self.session.exec(self._earlier_answer_events(conversation_id, answers=answers)).all():
+            # The SQL filter finds the type, quotes and all, anywhere in an
+            # event's text, so a text delta whose whole text is the type
+            # matches too, and would read as an event with no figures.
+            if not (isinstance(row.event_data, dict) and row.event_data.get("type") == "response.figure_sources"):
+                continue
+            # EarlierAnswer reads only the figures and ignores the steps, so a
+            # step whose kind this build lacks does not skip the answer.
+            try:
+                answer = EarlierAnswer.model_validate(row.event_data)
+            except ValidationError:
+                logger.warning(
+                    "Skipped an earlier answer's figure_sources event that does not read as one",
+                    extra=log_context(conversation_id=conversation_id),
+                )
+                continue
+            earlier.append(answer)
+        return earlier
+
+    def _earlier_answer_events(self, conversation_id: UUID, *, answers: int) -> ScopedSelect:
+        # The last `answers` answers, read on the messages index: assistant
+        # rows that are not pending and carry an event. A hidden tool row
+        # carries none, so it takes no place. A plain select, since a scoped
+        # one can't be passed to in_; the conversation was resolved through
+        # the scoped session before this runs.
+        last_answers = (
+            sa_select(Message.id)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.role == Role.assistant)
+            .where(Message.pending == False)  # noqa: E712 (a SQL boolean column, not Python identity)
+            .where(sa_select(MessageEvent.message_id).where(MessageEvent.message_id == Message.id).exists())
+            .order_by(*_MESSAGE_ORDER_NEWEST_FIRST)
+            .limit(answers)
+        )
+        # The type is found in each event's stored text, for the reason
+        # _replay_events gives: no JSON is parsed in SQL. autoescape keeps the
+        # _ in it from matching any character.
+        stored_text = cast(MessageEvent.event_data, Text)
+        return (
+            self.session.select(MessageEvent)
+            .join(Message, Message.id == MessageEvent.message_id)
+            .where(Message.conversation_id == conversation_id)
+            .where(MessageEvent.message_id.in_(last_answers))
+            .where(stored_text.contains('"response.figure_sources"', autoescape=True))
+            .order_by(*_MESSAGE_ORDER_NEWEST_FIRST, MessageEvent.sequence_number)
+        )
+
     def _replay_events(self, conversation_id: UUID, *, event_roles: tuple[str, ...]):
         # The relationship orders each message's events by sequence_number, so
         # history order then sequence_number is the order a per-message read
@@ -1256,3 +1325,25 @@ class ConversationService:
 
         items = self._hydrate_message_items(list(reversed(visible)))
         return ConversationItemsPage(items=items, has_more=has_more, next_before=next_before)
+
+
+def _earlier_answers(session: ScopedSession, *, conversation_id: UUID) -> list[EarlierAnswer]:
+    return ConversationService(session).get_earlier_answers(conversation_id, answers=MAX_EARLIER_ANSWERS)
+
+
+async def read_earlier_answers(*, conversation_id: UUID, scope: TenantScope) -> tuple[EarlierAnswer, ...]:
+    """The conversation's last MAX_EARLIER_ANSWERS answers' figures
+    (ConversationService.get_earlier_answers), read in a database unit of
+    its own, so a failed read can't abort another unit's transaction. A
+    failed read (a database error, no connection in time, or a conversation
+    the caller does not own) is logged and finds none, so the turn runs on
+    and marks no figure as repeated."""
+    try:
+        return tuple(await run_db(partial(_earlier_answers, conversation_id=conversation_id), scope=scope))
+    except Exception:
+        logger.warning(
+            "Could not read the earlier answers; no figure is marked as repeated",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id),
+        )
+        return ()

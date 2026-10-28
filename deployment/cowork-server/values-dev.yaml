@@ -21,8 +21,11 @@ deployment:
     - name: ENV
       value: "dev"
 
+    - name: ACCESS_LOG_MODE
+      value: "errors"
+
     - name: LOG_LEVEL
-      value: "INFO"
+      value: "WARNING"
 
     # Org-mode identity enforcement. 'enforce': requests without identity
     # headers are rejected with 401.

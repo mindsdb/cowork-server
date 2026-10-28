@@ -1,4 +1,7 @@
 import logging
+from cowork.common.structured_logging import (
+    AccessLogFilter, ServerDiagnosticFilter, make_formatter, safe_exception_traceback,
+)
 
 # Add logging import for rotating file handler
 import logging.handlers
@@ -160,6 +163,9 @@ class DatabaseErrorFilter(logging.Filter):
                 msg="Database operation failed: error_type=%s sqlstate=%s site=%s",
                 args=(type(error).__name__, sqlstate, _failure_site(record=record, error=error)),
             )
+            record._diagnostic_safe_template = True
+            record.error_type = type(error).__name__
+            record.sqlstate = sqlstate
             break
         return True
 
@@ -226,13 +232,18 @@ class ProviderErrorFilter(logging.Filter):
                 msg="Provider operation failed: error_type=%s provider_error=%s status=%s",
                 args=(type(exc).__name__, type(provider_error).__name__, _provider_status(error=provider_error)),
             )
+            record._diagnostic_safe_template = True
+            record.error_type = type(exc).__name__
+            record.provider_error = type(provider_error).__name__
+            if not hasattr(record, "status_code"):
+                record.status_code = _own_http_status(error=provider_error)
             break
         return True
 
 
 def _add_privacy_filters(*, target: logging.Filterer) -> None:
-    """Attach the database and provider filters to a handler or logger, once each."""
-    for filter_type in (DatabaseErrorFilter, ProviderErrorFilter):
+    """Deduplicate before privacy filters clear the exception's diagnostic marker."""
+    for filter_type in (ServerDiagnosticFilter, DatabaseErrorFilter, ProviderErrorFilter):
         if not any(isinstance(existing, filter_type) for existing in target.filters):
             target.addFilter(filter_type())
 
@@ -335,6 +346,9 @@ class CustomFormatter(logging.Formatter):
     absent.
     """
 
+    def formatException(self, exc_info):
+        return safe_exception_traceback(exc_info) or ""
+
     def format(self, record):
         # None is absent, not a value: a producer with no id to offer still
         # passes the key, and ``[Req:None]`` is worse than no prefix at all.
@@ -434,29 +448,15 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
     _add_privacy_filters(target=error_handler)
     handlers.append(error_handler)
 
+    for handler in handlers:
+        handler.setFormatter(make_formatter())
     return handlers
 
 
 def setup_console_handler():
-    """Setup console handler with colors and rich formatting if available"""
-    if HAS_RICH and os.getenv("RICH_LOGGING", "false").lower() == "true":
-        console = Console(stderr=True)
-        handler = RichHandler(
-            console=console,
-            show_path=False,
-            show_time=True,
-            rich_tracebacks=True,
-            tracebacks_show_locals=True,
-        )
-        # CustomFormatter for the same reason the other branch uses one: this
-        # is a console stream too, and the desktop tails it.
-        handler.setFormatter(CustomFormatter(
-            "[%(name)s]%(request_context)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
-        ))
-    else:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(get_colored_formatter())
-
+    """JSON and local text output share the same exception privacy rules."""
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(make_formatter())
     _add_privacy_filters(target=handler)
     return handler
 
@@ -523,33 +523,37 @@ def setup_logging():
     if enable_file_logging:
         file_handlers = setup_file_logging(log_dir)
         for handler in file_handlers:
-            handler.setLevel(log_level)
+            handler.setLevel(max(handler.level, log_level))
             handlers.append(handler)
 
     # Configure root logger
     logging.basicConfig(level=log_level, handlers=handlers, force=True)
 
-    # Uvicorn's handlers come from whichever log config the launcher chose: the
-    # cowork-server CLI, `python -m uvicorn` in this repo's image, or `uvicorn
-    # spa_wrapper:app` in the web image. Uvicorn's default config gives the
-    # `uvicorn` logger its own unfiltered handler and no propagation to root.
-    # A filter on each logger Uvicorn writes to runs before any of those
-    # handlers, and a later dictConfig keeps it. The levels stay as the
-    # launcher set them, so lifecycle lines such as "Finished server process"
-    # still print. A logger filter misses a record that a child logger
-    # propagates, so when the launcher configured Uvicorn first, each handler
-    # it already installed gets the filters too.
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
-        uvicorn_logger = logging.getLogger(logger_name)
-        _add_privacy_filters(target=uvicorn_logger)
-        for handler in uvicorn_logger.handlers:
-            _add_privacy_filters(target=handler)
-
-    # Uvicorn logs access lines straight to `uvicorn.access`, so its logger
-    # filter sees every one.
+    # Replace launcher-owned handlers too: application imports can follow
+    # Uvicorn's dictConfig in the CLI, container and desktop launch paths.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.asgi"):
+        server_logger = logging.getLogger(name)
+        server_logger.handlers = [h for h in server_logger.handlers if type(h) is not logging.StreamHandler]
+        server_logger.addHandler(console_handler)
+        _add_privacy_filters(target=server_logger)
+        server_logger.setLevel(log_level)
+        server_logger.propagate = False
+    access_handler = setup_console_handler()
+    access_handler.addFilter(AccessLogFilter())
     access_logger = logging.getLogger("uvicorn.access")
-    if not any(isinstance(existing, AccessQueryFilter) for existing in access_logger.filters):
+    access_logger.handlers = [access_handler]
+    _add_privacy_filters(target=access_logger)
+    if not any(isinstance(item, AccessQueryFilter) for item in access_logger.filters):
         access_logger.addFilter(AccessQueryFilter())
+    access_logger.setLevel(logging.INFO)
+    access_logger.propagate = False
+    # Usage evidence is independent of diagnostic verbosity.
+    usage = logging.getLogger("anton.usage")
+    usage.setLevel(logging.INFO)
+    usage_handler = logging.StreamHandler(sys.stderr)
+    usage_handler.setFormatter(logging.Formatter("%(message)s"))
+    usage.handlers = [usage_handler]
+    usage.propagate = False
 
     # Suppress verbose logging from third-party libraries
     third_party_loggers = [

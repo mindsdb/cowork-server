@@ -1,0 +1,33 @@
+# Each source joins `parts`, each a [text, count] pair repeated count times,
+# encoded with `encoding` (utf-8 unless named). None may raise, in any mode.
+
+- id: empty
+  parts: []
+
+- id: binary
+  encoding: latin-1
+  parts: [["\0\xff\xfe", 200]]
+
+- id: deep-elements
+  parts: [['<div>', 5000], ['x', 1]]
+
+- id: deep-foreign-content
+  parts: [['<svg>', 2000], ['<math>', 2000]]
+
+- id: many-attributes
+  parts: [['<p ', 1], ['a="1" ', 5000], ['>x', 1]]
+
+- id: unclosed-css-blocks
+  parts: [['<style>', 1], ['(', 100000], ['</style>', 1]]
+
+- id: unclosed-css-urls
+  parts: [['<p style="', 1], ['url(', 10000], ['">x', 1]]
+
+- id: control-characters
+  parts: [["<p title=\"a&#1;b\">x&#1;&#0;y&#xfffe;</p><style>p::after{content:\"\x01\x0c\"}</style>", 1]]
+
+- id: control-characters-in-unwrapped-text
+  parts: [["<p>a\x01b<font>c\x01</font>d\x0be<noscript>n</noscript>f\x02g</p>", 1]]
+
+- id: control-character-in-an-attribute-name
+  parts: [["<p a\x01b=\"1\">x</p><img a\x02=\"1\" src=\"x\"><svg><rect a\x03=\"1\"/></svg>", 1]]
