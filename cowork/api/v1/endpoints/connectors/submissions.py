@@ -16,7 +16,11 @@ from cowork.db.units import run_db
 from cowork.handlers.probe import ProbeHandler
 from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.catalog import ConnectorCatalog
-from cowork.services.connectors.custom_connectors import UnstorableFormError, check_handcrafted_form
+from cowork.services.connectors.custom_connectors import (
+    UnstorableFormError,
+    check_handcrafted_form,
+    handcrafted_form_allowed,
+)
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import vault_for_scope
@@ -103,7 +107,10 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="`extends_connection` applies only to handcrafted forms.",
         )
-    if known is not None and not stamped and not (is_custom and extends_name is not None):
+    handcrafted = handcrafted_form_allowed(
+        known=known is not None, custom=is_custom, extends=extends_name is not None,
+    )
+    if not stamped and not handcrafted:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"{connector_id!r} is already a connector; submit the form lookup_connector returns for it.",

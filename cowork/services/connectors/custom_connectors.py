@@ -25,6 +25,23 @@ class UnstorableFormError(ValueError):
     """A handcrafted form that cannot be kept as a custom connector."""
 
 
+def handcrafted_form_allowed(*, known: bool, custom: bool, extends: bool) -> bool:
+    """Whether a connector id may take a handcrafted form instead of its stored one.
+
+    Args:
+        known: The id is a built-in or a custom connector in the scope.
+        custom: It is a custom connector.
+        extends: The form is a follow-up step that adds fields to a saved
+            connection.
+
+    Returns:
+        True for an unknown id, and for a follow-up step of a custom
+        connector. A known id is otherwise checked and saved against its
+        stored form, so a handcrafted one would skip that check.
+    """
+    return not known or (custom and extends)
+
+
 def _require_https(value: Any, what: str) -> None:
     if value is None:
         return

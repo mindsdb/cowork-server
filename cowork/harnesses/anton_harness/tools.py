@@ -35,7 +35,11 @@ from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.custom_connectors import UnstorableFormError, check_handcrafted_form
+from cowork.services.connectors.custom_connectors import (
+    UnstorableFormError,
+    check_handcrafted_form,
+    handcrafted_form_allowed,
+)
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
@@ -807,12 +811,12 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         validate_engine_id(connector_id)
     except InvalidConnectorIdError as e:
         return f"request_credentials: {e}"
-    # A known id is validated and saved against its stored spec, not this
-    # form; only a handcrafted follow-up step of a custom connector may reuse one.
     known = (await _scope_connectors()).get(connector_id)
     extends_name = spec.get("extends_connection")
-    extending_custom = bool(known and known.get("custom")) and extends_name is not None
-    if not spec.get("_connector_id") and known is not None and not extending_custom:
+    handcrafted = handcrafted_form_allowed(
+        known=known is not None, custom=bool(known and known.get("custom")), extends=extends_name is not None,
+    )
+    if not spec.get("_connector_id") and not handcrafted:
         return (
             f"request_credentials: {connector_id!r} is already a connector. Call "
             f"lookup_connector with id {connector_id!r} and pass its form, with "
@@ -842,7 +846,7 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         spec["_existing_name"] = extends_name.strip()
 
     spec = _scrub_secret_values(_ensure_form_id(spec))
-    if known is None or extending_custom:
+    if handcrafted:
         # Checked before the form renders, so the user never fills in a form
         # the server would refuse.
         try:
