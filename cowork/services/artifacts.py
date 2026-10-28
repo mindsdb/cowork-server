@@ -709,6 +709,20 @@ def _published_access_for(
     return out
 
 
+def _artifacts_base_in(project_dir: Path) -> Path | None:
+    """`<project_dir>/.anton/artifacts` when `.anton` and `artifacts` are both
+    real directories, else None.
+
+    `/serve` checks containment against this folder resolved, so a link in
+    either component would make every file the link reaches servable.
+    """
+    from cowork.services.artifact_roots import _storage_components_are_safe
+
+    if not _storage_components_are_safe(project_dir, may_be_absent=False):
+        return None
+    return project_dir / ".anton" / "artifacts"
+
+
 def _external_project_artifacts_base(
     project_name: str, session: ScopedSession
 ) -> Path | None:
@@ -763,8 +777,7 @@ def _project_artifacts_base(
         return None
     if candidate not in registered:
         return None
-    base = candidate / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    return _artifacts_base_in(candidate)
 
 
 def serve_url_for(
