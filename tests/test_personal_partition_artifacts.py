@@ -496,7 +496,8 @@ def test_serve_refuses_a_link_into_another_persons_anton(two_people, bobs_link, 
 
 
 def test_serve_refuses_a_link_inside_an_artifact_folder_that_leads_out(two_people):
-    """Passes before the fix too: a regression guard for the containment check."""
+    """Passes before the fix too: a regression guard for the containment check,
+    which answers 400."""
     dash, _notes = two_people
     general = _general(ALICE)
     (general / ".anton" / ".env").write_text(_SECRET, encoding="utf-8")
@@ -505,7 +506,7 @@ def test_serve_refuses_a_link_inside_an_artifact_folder_that_leads_out(two_peopl
 
     served = client.get("/api/v1/artifacts/serve/general/dash/leak.txt", headers=A)
 
-    assert served.status_code != 200
+    assert served.status_code == 400
     assert _SECRET not in served.text
 
 

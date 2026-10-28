@@ -364,6 +364,47 @@ def test_serve_does_not_take_a_root_folder_of_the_same_name_for_an_adopted_proje
     assert "leftover in the root" not in served.text
 
 
+def test_serve_does_not_take_a_root_folder_for_an_adopted_path_left_as_a_dangling_link(
+    projects_root, tmp_path
+):
+    """A dangling link at the adopted folder's path is not a stale row."""
+    import shutil
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    client = _local_client()
+    name = _adopt(client, folder, "dangling")
+    shutil.rmtree(folder)
+    folder.symlink_to(tmp_path / "nowhere", target_is_directory=True)
+    page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>leftover in the root</html>")
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+
+    assert served.status_code == 404
+    assert "leftover in the root" not in served.text
+
+
+def test_serve_reads_an_adopted_folder_reached_through_a_link(projects_root, tmp_path):
+    """Only `.anton` and `.anton/artifacts` must be real directories; the
+    adopted folder itself may be an alias."""
+    real = tmp_path / "real" / "notes"
+    page = real / ".anton" / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>through the alias</html>")
+    alias = tmp_path / "Documents" / "notes"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(real, target_is_directory=True)
+    client = _local_client()
+    name = _adopt(client, alias, "aliased")
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+
+    assert served.status_code == 200, served.text
+    assert "through the alias" in served.text
+
+
 def test_serve_finds_a_stale_rows_project_in_the_projects_root(projects_root, tmp_path):
     """A row created before the projects root moved points at a folder that is
     gone; the project now lives under the new root, where the scan finds it.

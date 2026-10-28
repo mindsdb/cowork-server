@@ -298,12 +298,10 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
     against these dirs, so a link to another person's folder would make it
     the caller's.
     """
-    from cowork.services.artifact_roots import _storage_components_are_safe
-
     dirs: dict[str, Path] = {}
     for project_dir in _registered_project_dirs(scope=scope):
-        if _storage_components_are_safe(project_dir, may_be_absent=False):
-            candidate = project_dir / ".anton" / "artifacts"
+        candidate = _artifacts_base_in(project_dir)
+        if candidate is not None:
             dirs[str(candidate.resolve())] = candidate
     return list(dirs.values())
 
@@ -740,7 +738,9 @@ def _external_project_dir(
     if project is None or not service.directory_is_external(project):
         return None
     folder = Path(project.path)
-    return folder if folder.is_dir() else None
+    # lexists, not is_dir: a dangling link at the folder's path is not a
+    # stale row, and must not hand the name to a folder in the projects root.
+    return folder if os.path.lexists(folder) else None
 
 
 def _project_artifacts_base(
