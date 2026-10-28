@@ -22,6 +22,15 @@ def test_google_drive_spec_carries_the_drive_api_rules():
     assert "corpora='allDrives'" in notes
 
 
+def test_roam_research_spec_carries_the_redirect_rule():
+    notes = registry.usage_notes_for(["roam_research"])["roam_research"]
+
+    assert "308" in notes
+    assert "Location" in notes
+    assert "re-attached" in notes
+    assert "case-sensitive" in notes
+
+
 def test_picker_guidance_lists_files_but_no_longer_the_drive_api_rules():
     text = harness._picked_files_guidance({
         "work": [{"id": "f1", "name": "Roadmap.gdoc", "resourceKey": "rk1"}],
@@ -129,3 +138,12 @@ async def test_disabled_connection_gets_no_notes(monkeypatch, tmp_path, disabled
         disabled_connections=disabled,
     ) as config:
         assert ("google_drive" in config.connector_usage_notes) is expect_notes
+
+
+async def test_roam_research_notes_reach_the_session_config(monkeypatch, tmp_path):
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("roam_research", "mygraph", {"api_token": "tok", "graph_name": "MyGraph"})
+    async with _session_config(monkeypatch, vault) as config:
+        assert "308" in config.connector_usage_notes["roam_research"]
