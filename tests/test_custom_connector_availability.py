@@ -17,20 +17,25 @@ from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 TOKEN = "custom-connector-availability-token"
 
 
-def test_the_route_answers_on_a_single_user_install(monkeypatch):
+@pytest.fixture()
+def client(monkeypatch):
+    """The app, with a known auth token; the settings cache is cleared after
+    the test whatever its outcome, so the token never leaks into later tests."""
     monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
     get_app_settings.cache_clear()
-    client = TestClient(
+    yield TestClient(
         cowork_server.create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321)
     )
+    get_app_settings.cache_clear()
 
+
+def test_the_route_answers_on_a_single_user_install(client):
     response = client.get(
         "/api/v1/connectors/specs/custom-availability", headers={"Authorization": f"Bearer {TOKEN}"},
     )
 
     assert response.status_code == 200
     assert response.json() == {"can_build": True}
-    get_app_settings.cache_clear()
 
 
 @pytest.mark.parametrize("scope, can_build", [
