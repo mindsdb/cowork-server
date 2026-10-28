@@ -4,7 +4,7 @@ import asyncio
 import random
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID
@@ -48,6 +48,15 @@ _MAX_RUN_DURATION_SECONDS = 600
 # keeps a refusal that comes back at once from spinning.
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
+# How old a run still at `running` must be before a booting replica may reap
+# it: its turn is cut off at _MAX_RUN_DURATION_SECONDS and its last writes
+# (the outcome, then the finish) each give up after
+# _BOOKKEEPING_DEADLINE_SECONDS, plus slack for the units before the turn
+# starts. An error path with a third last write can use up that slack, which
+# is harmless: the run's own finish overwrites a reaped status. Age is only a
+# heuristic, since a database unit that stalls holds a run past any deadline,
+# so only boot uses it, not every poll.
+_ORPHANED_RUN_AGE_SECONDS = _MAX_RUN_DURATION_SECONDS + 2 * _BOOKKEEPING_DEADLINE_SECONDS + 10 * 60
 _scheduler_task: asyncio.Task | None = None
 # A run's error when its turn was refused because the server was shutting
 # down. The run never started, so the schedule's own last_error is left alone.
@@ -591,6 +600,18 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     if skipped:
         session.commit()
     return due
+
+
+def boot_reap_cutoff(now: datetime | None = None) -> datetime | None:
+    """Which running runs a starting server may reap: all of them on the
+    desktop, where it is the only process, or in org mode, where other
+    replicas may still be running them, only runs old enough to be presumed
+    dead."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    if get_app_settings().tenancy_mode != "org":
+        return None
+    return (now or datetime.now(timezone.utc)) - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
 
 
 def _poll(session: ScopedSession) -> list[UUID]:
