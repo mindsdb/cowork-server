@@ -307,6 +307,96 @@ def resolve_keep_sentinels(
     return resolved, had_sentinel
 
 
+KEPT_SECRET_MOVED = (
+    "The saved secret can't be reused with these connection details. "
+    "Enter the secret again to change these connection details."
+)
+
+
+# Non-secret fields a save may change while it keeps a stored secret, by
+# (connector id, method). Every other non-secret field must match the record.
+_DATABRICKS_SQL_SAFE_FIELDS = frozenset({"http_path", "catalog", "schema", "session_configuration"})
+SAFE_WITH_KEPT_SECRET = {
+    ("databricks", "personal-access-token"): _DATABRICKS_SQL_SAFE_FIELDS,
+    ("databricks", "service-principal-oauth"): _DATABRICKS_SQL_SAFE_FIELDS,
+    ("databricks", "genie-mcp"): frozenset({"genie_space_id"}),
+}
+
+
+def kept_secret_keys(
+    credentials: dict, existing_record: dict | None, connector_id: str, method: str | None
+) -> list[str]:
+    """The secret fields ``credentials`` keep from ``existing_record`` with the keep sentinel.
+
+    A field counts as secret when the record lists it in ``secure_keys`` or
+    secure_keys_for classifies it. A sentinel for a field the record does not
+    hold keeps nothing, so it is not listed. Pure; reads nothing.
+    """
+    record = existing_record or {}
+    prior = record.get("fields") or {}
+    secure = set(secure_keys_for(connector_id, method, prior)) | set(record.get("secure_keys") or [])
+    return [
+        key for key, value in credentials.items()
+        if value == VAULT_KEEP_SENTINEL and key in prior and key in secure
+    ]
+
+
+def keeps_secret_for_another_account(
+    credentials: dict, existing_record: dict | None, connector_id: str, method: str | None
+) -> bool:
+    """True when ``credentials`` keep a stored secret but send it somewhere else.
+
+    The sentinels are resolved first, then the result is compared with the
+    record by kept_secret_moved, so a kept secret is never sent to
+    another host or used as another account. Pure; reads nothing.
+    """
+    if not kept_secret_keys(credentials, existing_record, connector_id, method):
+        return False
+    resolved, _ = resolve_keep_sentinels(credentials, existing_record)
+    return kept_secret_moved(existing_record, resolved, connector_id, method)
+
+
+def kept_secret_moved(
+    existing_record: dict | None, payload: dict, connector_id: str, method: str | None
+) -> bool:
+    """True when ``payload`` differs from ``existing_record`` in a field a kept secret is bound to.
+
+    Every non-secret field is compared as is_same_account compares it,
+    including one only ``payload`` holds, except the connector's
+    SAFE_WITH_KEPT_SECRET fields. ``_`` bookkeeping is never compared.
+    Pure; reads nothing.
+    """
+    record = existing_record or {}
+    secure = sorted(set(secure_keys_for(connector_id, method, payload)) | set(record.get("secure_keys") or []))
+    safe = SAFE_WITH_KEPT_SECRET.get((connector_id, method), frozenset())
+    stored = _nonsecret_identity(record.get("fields") or {}, secure)
+    given = _nonsecret_identity(payload, secure)
+    return {k: v for k, v in stored.items() if k not in safe} != {k: v for k, v in given.items() if k not in safe}
+
+
+def extends_step_moves_stored_secret(
+    existing_record: dict | None, submitted: dict, connector_id: str, method: str | None
+) -> bool:
+    """True when a later step of a multi-step save keeps a stored secret and changes a stored field.
+
+    The step keeps every stored secret it does not resubmit. A field the step
+    adds is the step's purpose and is not compared; a non-secret field the
+    record already holds must keep its value unless the connector's
+    SAFE_WITH_KEPT_SECRET lists it. Pure; reads nothing.
+    """
+    record = existing_record or {}
+    prior = record.get("fields") or {}
+    secure = sorted(set(secure_keys_for(connector_id, method, prior)) | set(record.get("secure_keys") or []))
+    if not any(key in secure and key not in submitted and prior.get(key) for key in prior):
+        return False
+    safe = SAFE_WITH_KEPT_SECRET.get((connector_id, method), frozenset())
+    return any(
+        key in submitted and submitted[key] != value
+        for key, value in _nonsecret_identity(prior, secure).items()
+        if key not in safe
+    )
+
+
 def resolve_unique_slug(
     vault, engine: str, base_slug: str, payload: dict, secure_keys: list[str]
 ) -> str:

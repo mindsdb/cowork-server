@@ -25,7 +25,11 @@ from cowork.managed import (
     reads_shared_registry,
 )
 from cowork.services.connectors.identity import (
+    KEPT_SECRET_MOVED,
     derive_connection_name,
+    extends_step_moves_stored_secret,
+    keeps_secret_for_another_account,
+    kept_secret_moved,
     resolve_keep_sentinels,
     resolve_unique_slug,
     secure_keys_for,
@@ -43,6 +47,15 @@ logger = logging.getLogger(__name__)
 
 class ConnectionNotFoundError(LookupError):
     """An ``extends`` save named a connection that does not exist."""
+
+
+class KeptSecretMovedError(ValueError):
+    """A save keeps a stored secret for another host or account; ``message`` is the fixed text."""
+
+    def __init__(self, message: str = KEPT_SECRET_MOVED) -> None:
+        """Keep ``message`` as both the error text and its ``message`` attribute."""
+        super().__init__(message)
+        self.message = message
 
 
 def own_vault_root(scope: "TenantScope | None" = None) -> Path:
@@ -246,6 +259,13 @@ def persist_connection(
     refresh/re-auth reaching this same save path must not clobber a value the
     user already upgraded to ``"write"``).
 
+    A save that keeps a stored secret, by the keep sentinel or by leaving it
+    out of a save that replaces or ``extends`` the record (for extends,
+    extends_step_moves_stored_secret), while a non-secret field outside
+    the connector's SAFE_WITH_KEPT_SECRET differs from the record raises
+    KeptSecretMovedError before anything is written (kept_secret_moved), so
+    a save can't send the stored secret elsewhere.
+
     ``scope`` names the vault saved into and the record lock the save takes
     (own_vault_root); a caller passing ``vault`` passes the scope it built
     that vault for.
@@ -282,8 +302,12 @@ def persist_connection(
                 raise ConnectionNotFoundError(
                     f"No {connector_id} connection named {base_slug!r} to add these fields to."
                 )
+            if extends_step_moves_stored_secret(target, cred, connector_id, method):
+                raise KeptSecretMovedError()
             stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
             cred = {**stored, **cred}
+        if keeps_secret_for_another_account(cred, target, connector_id, method):
+            raise KeptSecretMovedError()
         cred, is_edit = resolve_keep_sentinels(cred, target)
         payload = {**cred, "_connector_id": connector_id}
         if method:
@@ -307,9 +331,16 @@ def persist_connection(
         # from `existing`, the record this save replaces: the record at
         # `base_slug` can belong to a different account that shares the slug.
         existing_fields = (existing or {}).get("fields", {})
-        for key in secure_keys_for(connector_id, method, existing_fields):
-            if key not in payload and existing_fields.get(key):
-                payload[key] = existing_fields[key]
+        carried = [
+            key for key in secure_keys_for(connector_id, method, existing_fields)
+            if key not in payload and existing_fields.get(key)
+        ]
+        # A carried secret is kept as a sentinel's is, so it is bound the same way.
+        # An extends step adds fields by design; its own check ran before the merge.
+        if carried and not extends and kept_secret_moved(existing, payload, connector_id, method):
+            raise KeptSecretMovedError()
+        for key in carried:
+            payload[key] = existing_fields[key]
         secure_keys = secure_keys_for(connector_id, method, payload)
         if extends:
             # A field the record already held as a secret stays one, even if

@@ -151,6 +151,9 @@ class ConnectorMethod(BaseModel):
     help_url: str | None = None
     fields: list[ConnectorField] = []
     cloud: CloudMethod | None = None
+    # Field name, or names, that identify a saved connection. Declared so the
+    # key is a real part of the schema; identity resolution reads the raw spec.
+    name_from: str | list[str] | None = None
 
     @field_validator("id")
     @classmethod
