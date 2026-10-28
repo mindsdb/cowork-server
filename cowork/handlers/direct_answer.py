@@ -169,7 +169,10 @@ async def start_answer(binding: RouterBinding, *, history: list[dict]) -> Direct
             if isinstance(event, StreamTextDelta) and event.text.strip():
                 return DirectAnswer(first_text=event.text, _events=events)
     except TimeoutError:
-        logger.warning("[direct] no answer within %.0fs; delegating", _FIRST_EVENT_SECONDS)
+        logger.warning(
+            "Direct answer did not start in time; delegating",
+            extra={"event": "direct_answer_timeout", "timeout_seconds": _FIRST_EVENT_SECONDS},
+        )
     except Exception:
         logger.warning("[direct] answer failed before it started; delegating", exc_info=True)
     await _close(events)

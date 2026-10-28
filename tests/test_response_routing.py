@@ -10,6 +10,7 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
+from tests._logging_assertions import assert_log_fields
 
 
 class _Provider:
@@ -462,6 +463,112 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reason", "fallback"),
+    [
+        ("provider", "router_unavailable", True),
+        ("timeout", "router_timeout", True),
+        ("binding", "router_unavailable", True),
+        ("no_model", "router_model_unavailable", True),
+        ("history", "router_unavailable", True),
+        (None, "router_declined_direct_response", False),
+    ],
+)
+async def test_handle_logs_every_router_fallback_at_default_level(
+    monkeypatch, caplog, owned_logger, failure, reason, fallback,
+):
+    """Exercise the request boundary, including failures before the gate runs."""
+    import logging
+    from uuid import uuid4
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    private = "private-provider-response-and-prompt"
+
+    def history(*_args, **_kwargs):
+        if failure == "history":
+            raise RuntimeError(private)
+        return []
+
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
+            message_count=lambda _conversation: 0,
+            get_recent_messages=history,
+        ),
+    )
+    binding = RouterBinding(provider=object(), model="router-model", label="openai_compatible")
+
+    async def resolve_binding():
+        if failure == "binding":
+            raise RuntimeError(private)
+        return (None if failure == "no_model" else binding), None
+
+    async def gate(_binding, *, history):
+        if failure == "provider":
+            raise RuntimeError(private)
+        if failure == "timeout":
+            raise TimeoutError
+        return None
+
+    monkeypatch.setattr(handler, "_router_binding", resolve_binding)
+    # responses.py resolves a turn's binding through its own import.
+    monkeypatch.setattr(routing, "_settings_binding", lambda: None)
+    monkeypatch.setattr(responses, "_settings_binding", lambda: None)
+    monkeypatch.setattr(routing, "_gate", gate)
+
+    class StopBeforeAgent(Exception):
+        pass
+
+    def stop_before_agent():
+        raise StopBeforeAgent
+
+    monkeypatch.setattr(handler, "_get_harness", stop_before_agent)
+    logged = owned_logger(responses.__name__, level=logging.INFO)
+    with pytest.raises(StopBeforeAgent):
+        await handler.handle(
+            ResponsesRequest(input="Hello", conversation=str(conv_id), stream=False)
+        )
+
+    event = "router_fallback" if fallback else "router_route"
+    (record,) = [
+        row for row in caplog.records
+        if row.name == responses.__name__ and getattr(row, "event", None) == event
+    ]
+    assert record.levelno == (logging.WARNING if fallback else logging.INFO)
+    assert record.exc_info is None
+    # The serialized line, as the server writes it, carries every value.
+    output = logged.output()
+    assert_log_fields(
+        output,
+        event=event,
+        log_level="WARNING" if fallback else "INFO",
+        outcome=DELEGATED_AGENTIC,
+        reason=reason,
+        conversation_id=str(conv_id),
+    )
+    if failure in {None, "provider", "timeout"}:
+        # The gate ran, so its own summary names the same outcome.
+        assert_log_fields(
+            output,
+            event="router_gate_decided",
+            log_level="WARNING",
+            outcome=DELEGATED_AGENTIC,
+            reason=reason,
+            conversation_id=str(conv_id),
+        )
+    router_lines = [line for line in output.splitlines() if '"event":"router_' in line]
+    assert router_lines and all("%s" not in line for line in router_lines)
+    assert private not in output
+
+
+@pytest.mark.asyncio
 async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeypatch):
     """ENG-1851: the composer's per-conversation pick drives Anton's turn, not
     the gate. `_route_request` no longer accepts or forwards it."""
@@ -886,6 +993,7 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
         question="Hello",
         route=route,
         buffer=buffer,
+        request_id="direct-test",
     )
 
     assert buffer.closed == "completed"
@@ -942,6 +1050,7 @@ async def test_produce_direct_answers_a_full_pool_with_a_timed_retry(monkeypatch
         question="Hello",
         route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi."),
         buffer=buffer,
+        request_id="direct-test",
     )
 
     assert buffer.closed == "error"
@@ -1080,6 +1189,7 @@ async def _produce_direct_answer(
         question=_OVERTIME_QUESTION,
         route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=text),
         buffer=buffer,
+        request_id="direct-test",
     )
     return buffer
 
@@ -1467,9 +1577,9 @@ def _gate_warnings(caplog):
 
 
 @pytest.mark.asyncio
-async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog):
+async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog, owned_logger):
     """OpenAI refuses the gate's function tool on chat completions when the
-    router model reasons. The [gate] line names that refusal by class and
+    router model reasons. The failure line names that refusal by class and
     status. Provider text can quote the request or echo a credential."""
     import logging
 
@@ -1488,9 +1598,9 @@ async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypat
         "code": None,
     })
 
+    logged = owned_logger("cowork.handlers.response_routing", level=logging.WARNING)
     try:
-        with caplog.at_level(logging.WARNING, logger="cowork.handlers.response_routing"):
-            decision = await _route_on(provider)
+        decision = await _route_on(provider)
     finally:
         await provider.aclose()
 
@@ -1503,19 +1613,27 @@ async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypat
         fallback=True,
     )
     (record,) = _gate_warnings(caplog)
-    line = record.getMessage()
-    assert line.startswith("[gate] reason=router_unavailable ")
     expected_error = (
         "RequestRefusedError" if hasattr(anton_provider, "RequestRefusedError") else "BadRequestError"
     )
-    assert f"error={expected_error}" in line
-    assert "status=400" in line
-    assert "type=" not in line
-    assert "param=" not in line
-    assert "code=" not in line
-    assert echoed_key not in line
-    assert "Function tools" not in line
+    assert (record.event, record.reason) == ("router_call_failed", "router_unavailable")
+    assert (record.error_type, record.status_code) == (expected_error, 400)
     assert record.exc_info is None
+    # The serialized line, as the server writes it, keeps the class and status
+    # and none of the provider's text.
+    output = logged.output()
+    assert_log_fields(
+        output,
+        event="router_call_failed",
+        reason="router_unavailable",
+        provider="openai_compatible",
+        error_type=expected_error,
+        status_code=400,
+    )
+    assert "%s" not in output
+    assert echoed_key not in output
+    assert "Function tools" not in output
+    assert "invalid_request_error" not in output
 
 
 @pytest.mark.asyncio
@@ -1554,11 +1672,11 @@ async def test_router_unavailable_keeps_only_status_under_a_status_bearing_wrapp
 
     assert decision.reason == "router_unavailable"
     (record,) = _gate_warnings(caplog)
-    assert record.getMessage() == (
-        "[gate] reason=router_unavailable error=RequestRefusedError status=400"
+    assert (record.event, record.error_type, record.status_code) == (
+        "router_call_failed", "RequestRefusedError", 400
     )
     assert secret not in repr(record.__dict__)
-    assert record.args == ("RequestRefusedError", 400)
+    assert record.args == ()
     assert record.exc_info is None
 
 
@@ -1590,8 +1708,10 @@ async def test_router_unavailable_drops_arbitrary_status_and_provider_body_field
     assert decision.reason == "router_unavailable"
     assert decision.fallback is True
     (record,) = _gate_warnings(caplog)
-    assert record.getMessage() == "[gate] reason=router_unavailable error=BadRequestError status=unknown"
-    assert record.args == ("BadRequestError", "unknown")
+    assert (record.event, record.error_type, record.status_code) == (
+        "router_call_failed", "BadRequestError", None
+    )
+    assert record.args == ()
     assert record.exc_info is None
     assert private not in repr(record.__dict__)
     assert "private_status_marker" not in repr(record.__dict__)
@@ -1619,11 +1739,10 @@ async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeyp
 
     assert decision.reason == "router_unavailable"
     (record,) = _gate_warnings(caplog)
-    line = record.getMessage()
-    assert "error=NotFoundError" not in line  # the class is anton's, not the SDK's
-    assert "status=404" in line
-    assert "code=" not in line
-    assert "does not exist" not in line
+    assert record.error_type != "NotFoundError"  # the class is anton's, not the SDK's
+    assert record.status_code == 404
+    assert "DeploymentNotFound" not in repr(record.__dict__)
+    assert "does not exist" not in repr(record.__dict__)
 
 
 # --- the streamed gate: budget the decision, not the answer (ENG-1851) -------

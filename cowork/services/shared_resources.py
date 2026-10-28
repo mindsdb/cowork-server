@@ -347,10 +347,12 @@ class SharedResourceAccess:
             # Nobody else's authorship to report. Outside org mode no claim row
             # exists, and the only ids a fallback can carry are the caller's
             # own (creator_id answers actor_id there, built-ins included) or
-            # the creator of a row in the caller's own partition. Principal
-            # carries no email on a trusted-identity deployment, so naming
-            # either would render as "Another member". The desktop has no
-            # actor at all, so it reports none either way.
+            # the creator of a row in the caller's own partition. On a
+            # trusted-identity deployment Principal carries an email only
+            # where the live-apps overlay sends X-User-Email, and only
+            # cowork.services.live_apps reads it there, so nothing here names
+            # anyone outside org mode. The desktop has no actor at all, so it
+            # reports none either way.
             return ResourceAttribution(
                 created_by=None,
                 last_modified_by=None,

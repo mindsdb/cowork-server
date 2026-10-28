@@ -477,7 +477,7 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
     return direct_answer.DirectAnswer(first_text=first.text, _events=stream)
 
 
-async def _produce(monkeypatch, conversation_id, answer, *, delegate=None):
+async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None):
     from cowork.streaming.registry import TurnLifecycle
 
     async def fake_start(_binding, *, history):
@@ -488,7 +488,7 @@ async def _produce(monkeypatch, conversation_id, answer, *, delegate=None):
     handler.harness_name = "anton"
     buffer = _Buffer()
     coro = handler._produce_answer(
-        lifecycle=TurnLifecycle(),
+        lifecycle=lifecycle or TurnLifecycle(),
         conv_id=conversation_id,
         original_content="what were those headline numbers again?",
         question="what were those headline numbers again?",
@@ -581,6 +581,8 @@ async def test_produce_answer_reports_a_failure_part_way_and_keeps_the_text(monk
 
     assert buffer.status == "error"
     assert _events(buffer)[-1] == "response.failed"
+    # The turn's correlation id is the reference a user can quote.
+    assert _payload(buffer.frames[-1])["request_id"]
     rows = await _rows(conversation_id)
     assert [r[2] for r in rows] == [False, False]
     assert rows[1][1] == "Revenue was $4.81M"
@@ -670,3 +672,31 @@ def test_decision_model_key_is_an_admin_owned_secret():
     assert UserSettings.field_is_sensitive("decision_model_api_key")
     for key in ("decision_model_api_key", "decision_model_url", "decision_model", "jev_decisions_enabled"):
         assert setting_is_org_scoped(key), key
+
+
+@pytest.mark.asyncio
+async def test_produce_answer_ended_by_a_shutdown_reads_as_interrupted(monkeypatch):
+    """A turn the server ended is not the user's Stop: it says so, carries its
+    request id, and keeps what was written."""
+    from cowork.streaming.registry import RunIdentity, TurnLifecycle
+
+    conversation_id = await _conversation()
+    answer = await _answer(["Revenue was ", "$4.81M", " and more"], delay=0.05)
+    lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id="corr-direct"))
+    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, answer, lifecycle=lifecycle)
+
+    task = asyncio.create_task(coro)
+    while not any(f.startswith("event: response.output_text.delta") for f in buffer.frames):
+        await asyncio.sleep(0.01)
+    lifecycle.shutting_down = True
+    lifecycle.shutdown_frame_deadline = asyncio.get_running_loop().time() + 5
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert buffer.status == "interrupted"
+    failed = _payload(buffer.frames[-1])
+    assert _events(buffer)[-1] == "response.failed"
+    assert failed["request_id"] == "corr-direct"
+    rows = await _rows(conversation_id)
+    assert rows[1][1].startswith("Revenue was")
+    assert failed.get("assistant_message_id")

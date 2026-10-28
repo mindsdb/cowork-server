@@ -749,11 +749,17 @@ async def decide_route(
     except Exception as exc:
         # Provider body fields (including type/code/param) can echo private
         # request content. Only the class and a validated HTTP status are safe.
+        # They ride as fields: the log formatter drops a template's values.
         status = exception_http_status(exc=exc)
         logger.warning(
-            "[gate] reason=router_unavailable error=%s status=%s",
-            type(exc).__name__,
-            "unknown" if status is None else status,
+            "Router call failed; the agent takes the turn",
+            extra={
+                "event": "router_call_failed",
+                "reason": "router_unavailable",
+                "provider": binding.label if binding is not None else None,
+                "error_type": type(exc).__name__,
+                "status_code": status,
+            },
         )
         # Attribution survives the failure: a 402 on a paid router pick is
         # only diagnosable in the traces if the model that failed is named.

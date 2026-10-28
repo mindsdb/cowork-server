@@ -624,8 +624,9 @@ class UserSettings(Settings):
             "shares the router's provider but runs resolved_gate_model, so the "
             "effort is sent only while that is the router model: always on "
             "openai-compatible, elsewhere only at the provider's default router "
-            "model. On openai-compatible, a router model that reasons by default "
-            "takes the gate's function tool on chat completions only at 'none'."
+            "model. Choose an effort supported by the model and the deployment's "
+            "API. Some models require Responses for the gate's function tool, "
+            "and some reject 'none'. Cowork sends the configured effort unchanged."
         ),
     )
     # Router role: the cheap front-model that runs history summarization (and
