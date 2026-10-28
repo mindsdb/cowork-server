@@ -178,9 +178,15 @@ def _create_during_the_check(monkeypatch, name: str, credentials_override: dict)
     """While the key is checked, another writer saves ``name``; the lock is not held meanwhile."""
     real_check = sharepoint_ep._check
 
-    def check_while_someone_else_creates(credentials):
+    def check_while_someone_else_creates(key, sites):
         assert not sharepoint_ep._CREATE_LOCK.locked()
-        real_check(credentials)
+        real_check(key, sites)
+        credentials = {
+            "tenant_id": key.tenant_id,
+            "client_id": key.client_id,
+            "client_secret": key.client_secret,
+            "site_urls": "\n".join(sites),
+        }
         persist_connection("sharepoint", None, name, {**credentials, **credentials_override}, scope=LOCAL_SCOPE)
 
     monkeypatch.setattr(sharepoint_ep, "_check", check_while_someone_else_creates)

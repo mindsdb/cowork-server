@@ -224,7 +224,12 @@ def _retry_after_seconds(response: httpx.Response) -> float:
 
 
 class _Deadline:
-    """One operation's time budget, shared by every request and retry wait in it."""
+    """One operation's time budget, shared by every request and retry wait in it.
+
+    It is checked before each request and caps each request's timeout, but
+    httpx applies that timeout per phase and restarts the read timeout on
+    every chunk, so a slow reply can run past it: a soft budget, not a hard cap.
+    """
 
     def __init__(self, clock: Callable[[], float], seconds: float) -> None:
         """Start the budget of ``seconds`` now, by ``clock``."""
@@ -376,7 +381,7 @@ class SharePointClient:
         response = self._send("GET", url, deadline, params=params, token=self._current_token(deadline))
         if response.status_code == 401:
             if self._fresh_only:
-                # The check never reads or writes the cache, even on a retry.
+                # The check never reads the cache; it writes it only after every site passed.
                 self._token, _ = self._fetch_token(deadline)
             else:
                 self._evict_token()
