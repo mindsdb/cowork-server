@@ -49,20 +49,6 @@ ALICE = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_
 BOB = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_B), user_id=SUB_B, personal_resources=ALL_PERSONAL_RESOURCES)
 
 
-@pytest.fixture
-def stores(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
-    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
-    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
-    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
-    get_app_settings.cache_clear()
-    sharepoint_service._TOKENS.clear()
-    yield tmp_path
-    sharepoint_service._TOKENS.clear()
-    get_app_settings.cache_clear()
-
-
 class Microsoft:
     """Answers the token call and the site and library lookups the check makes."""
 
@@ -88,7 +74,7 @@ class Microsoft:
 
 
 @pytest.fixture
-def microsoft(monkeypatch, stores):
+def microsoft(monkeypatch, sharepoint_stores):
     ms = Microsoft()
     monkeypatch.setattr(
         sharepoint_ep,
@@ -147,7 +133,7 @@ def test_create_saves_the_connection_after_the_key_opens_every_site(microsoft):
         (Microsoft(site_status=403), f"The app can't open {SITE}"),
     ],
 )
-def test_each_failed_check_answers_its_own_message_and_saves_nothing(monkeypatch, stores, ms, message):
+def test_each_failed_check_answers_its_own_message_and_saves_nothing(monkeypatch, sharepoint_stores, ms, message):
     monkeypatch.setattr(
         sharepoint_ep,
         "SharePointClient",
@@ -178,9 +164,15 @@ def _create_during_the_check(monkeypatch, name: str, credentials_override: dict)
     """While the key is checked, another writer saves ``name``; the lock is not held meanwhile."""
     real_check = sharepoint_ep._check
 
-    def check_while_someone_else_creates(credentials):
+    def check_while_someone_else_creates(key, sites):
         assert not sharepoint_ep._CREATE_LOCK.locked()
-        real_check(credentials)
+        real_check(key, sites)
+        credentials = {
+            "tenant_id": key.tenant_id,
+            "client_id": key.client_id,
+            "client_secret": key.client_secret,
+            "site_urls": "\n".join(sites),
+        }
         persist_connection("sharepoint", None, name, {**credentials, **credentials_override}, scope=LOCAL_SCOPE)
 
     monkeypatch.setattr(sharepoint_ep, "_check", check_while_someone_else_creates)
@@ -216,6 +208,24 @@ def test_a_lost_race_never_touches_an_existing_suffixed_connection(monkeypatch, 
     assert status == 409
     assert sorted(_names()) == ["corp", "corp-2"]
     assert _record("corp-2") == before
+
+
+def test_a_create_whose_name_is_taken_during_the_save_reports_the_name_it_was_saved_under(monkeypatch, microsoft):
+    real_persist = sharepoint_ep.persist_connection
+
+    def persist_after_another_writer(engine, method, name, credentials, **kwargs):
+        persist_connection("sharepoint", None, name, {**credentials, "client_id": OTHER_CLIENT}, scope=LOCAL_SCOPE)
+        return real_persist(engine, method, name, credentials, **kwargs)
+
+    monkeypatch.setattr(sharepoint_ep, "persist_connection", persist_after_another_writer)
+
+    response = sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE)
+
+    assert response["name"] == "corp-2"
+    assert sorted(_names()) == ["corp", "corp-2"]
+    assert _record("corp")["fields"]["client_id"] == OTHER_CLIENT
+    assert _record("corp-2")["fields"]["client_id"] == CLIENT_ID
+    assert _record("corp-2")["fields"]["client_secret"] == SECRET
 
 
 def test_a_name_sharing_an_env_prefix_taken_during_the_check_is_refused(monkeypatch, microsoft):

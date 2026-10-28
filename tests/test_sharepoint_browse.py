@@ -42,20 +42,6 @@ ALICE = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_
 BOB = TenantScope(personal=True, org_id=personal_partition_id(DEPLOYMENT, SUB_B), user_id=SUB_B, personal_resources=ALL_PERSONAL_RESOURCES)
 
 
-@pytest.fixture
-def stores(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
-    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
-    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
-    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
-    get_app_settings.cache_clear()
-    sharepoint_service._TOKENS.clear()
-    yield tmp_path
-    sharepoint_service._TOKENS.clear()
-    get_app_settings.cache_clear()
-
-
 def _file(n: int) -> dict:
     return {
         "id": f"01F{n:04d}",
@@ -87,6 +73,8 @@ class Graph:
         if path == CHILDREN_PATH:
             if request.url.params.get("$skiptoken") == "p2":
                 return httpx.Response(200, json={"value": [_file(200)]})
+            if request.url.params.get("$skiptoken") == "stale":
+                return httpx.Response(400, json={"error": {"code": "invalidRequest"}})
             next_link = f"https://graph.microsoft.com{CHILDREN_PATH}?$top=200&$skiptoken=p2"
             return httpx.Response(200, json={"value": [_file(n) for n in range(200)], "@odata.nextLink": next_link})
         return httpx.Response(404, json={"error": {"code": "itemNotFound"}})
@@ -96,7 +84,7 @@ class Graph:
 
 
 @pytest.fixture
-def graph(monkeypatch, stores):
+def graph(monkeypatch, sharepoint_stores):
     fake = Graph()
     monkeypatch.setattr(
         sharepoint_ep,
@@ -119,7 +107,7 @@ def _save(fields: dict = STORED, name: str = "corp", scope: TenantScope = LOCAL_
 def test_libraries_of_a_named_site_are_listed(graph):
     _save()
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": "https://Contoso.sharepoint.com/sites/Team/"})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": "https://Contoso.sharepoint.com/sites/Team/"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {"libraries": [{"id": DRIVE_ID, "name": "Documents"}]}
@@ -175,7 +163,7 @@ def test_a_forged_cursor_cannot_change_the_request_path(graph, cursor):
 def test_a_site_the_connection_does_not_name_is_refused_before_any_graph_call(graph):
     _save()
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": OTHER_SITE})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": OTHER_SITE})
 
     assert response.status_code == 403
     assert graph.requests == []
@@ -200,6 +188,15 @@ def test_ids_outside_graphs_charset_are_refused(graph, drive_id, item_id):
     assert not any(path.endswith("/children") for path in graph.graph_paths())
 
 
+def test_a_cursor_graph_no_longer_accepts_asks_to_reopen_the_folder(graph):
+    _save()
+
+    response = _client().get(f"{BASE}/corp/children", params={"site": SITE, "drive_id": DRIVE_ID, "cursor": "stale"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "This folder listing is out of date. Open the folder again."
+
+
 def test_an_overlong_cursor_is_refused(graph):
     _save()
 
@@ -213,7 +210,7 @@ def test_an_overlong_cursor_is_refused(graph):
 def test_a_name_that_is_not_exactly_stored_is_not_found(graph, name):
     _save()
 
-    response = _client().get(f"{BASE}/{name}/drives", params={"site": SITE})
+    response = _client().get(f"{BASE}/{name}/libraries", params={"site": SITE})
 
     assert response.status_code == 404
     assert graph.requests == []
@@ -231,7 +228,7 @@ def test_a_name_that_is_not_exactly_stored_is_not_found(graph, name):
 def test_a_stored_record_that_fails_validation_is_refused_before_any_request(graph, fields):
     _save(fields)
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": SITE})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": SITE})
 
     assert response.status_code == 409
     assert graph.requests == []
@@ -253,7 +250,7 @@ def test_graph_failures_map_to_browse_statuses(graph, token_response, site_respo
         graph.token_response = token_response
     graph.site_response = site_response
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": SITE})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": SITE})
 
     assert response.status_code == expected
     assert SECRET not in response.text
@@ -292,10 +289,10 @@ def test_org_mode_refuses_browse(monkeypatch, graph):
     get_app_settings.cache_clear()
     client = _client()
 
-    drives = client.get(f"{BASE}/corp/drives", params={"site": SITE})
+    libraries = client.get(f"{BASE}/corp/libraries", params={"site": SITE})
     children = client.get(f"{BASE}/corp/children", params={"site": SITE, "drive_id": DRIVE_ID})
 
-    assert drives.status_code == 403
+    assert libraries.status_code == 403
     assert children.status_code == 403
     assert graph.requests == []
 

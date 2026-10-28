@@ -103,26 +103,12 @@ class FakeTime:
 
 
 @pytest.fixture
-def stores(monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
-    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
-    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
-    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
-    get_app_settings.cache_clear()
-    sharepoint_service._TOKENS.clear()
-    yield tmp_path
-    sharepoint_service._TOKENS.clear()
-    get_app_settings.cache_clear()
-
-
-@pytest.fixture
 def fake_time() -> FakeTime:
     return FakeTime()
 
 
 @pytest.fixture
-def microsoft(monkeypatch, stores, fake_time):
+def microsoft(monkeypatch, sharepoint_stores, fake_time):
     fake = SharePoint()
     monkeypatch.setattr(
         project_files,
@@ -136,10 +122,10 @@ def microsoft(monkeypatch, stores, fake_time):
 
 
 @pytest.fixture
-def project(stores):
+def project(sharepoint_stores):
     """A real project row and folder; returns (name, id, folder)."""
     name = f"import-{uuid.uuid4().hex[:8]}"
-    folder = stores / "projects" / name
+    folder = sharepoint_stores / "projects" / name
     folder.mkdir(parents=True)
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:

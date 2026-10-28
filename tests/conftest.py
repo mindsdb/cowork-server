@@ -271,6 +271,27 @@ def managed_dir(monkeypatch, tmp_path):
 
 
 @pytest.fixture
+def sharepoint_stores(monkeypatch, tmp_path):
+    """Fresh home, shared, vault, skills and memory folders and an empty SharePoint token cache, for one test.
+
+    Yields ``tmp_path``, the folders' root.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services.connectors import sharepoint as sharepoint_service
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
+    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
+    get_app_settings.cache_clear()
+    sharepoint_service._TOKENS.clear()
+    yield tmp_path
+    sharepoint_service._TOKENS.clear()
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
 def stored_memory_enabled():
     """Store ``memory_enabled`` for one test as the operator's Settings write
     does (SettingService), and remove the row afterwards.
