@@ -275,3 +275,111 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
     # Every HTML preview now carries the storage shim (see preview_html.py);
     # this route is not what's under test here, only that it resolves at all.
     assert "anton-preview" in served.text
+
+
+# -- serving through links and stale rows ------------------------------------
+
+_SECRET = "SECRET_TOKEN=do-not-serve-7f3a"
+
+
+def _local_client():
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    # base_url sets scope["server"], which the chosen-folder gate reads.
+    return TestClient(
+        create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321)
+    )
+
+
+def _adopt(client, folder: Path, name: str) -> str:
+    created = client.post("/api/v1/projects/", json={"name": name, "path": str(folder)})
+    assert created.status_code == 201, created.text
+    return created.json()["name"]
+
+
+def _replace_with_link(path: Path, target: Path) -> None:
+    """Replace a folder with a symlink, as a pre-sandbox cell could."""
+    import shutil
+
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(target, target_is_directory=True)
+
+
+def test_serve_refuses_an_adopted_folders_artifacts_linked_to_its_anton(projects_root, tmp_path):
+    folder = tmp_path / "Documents" / "notes"
+    (folder / ".anton").mkdir(parents=True)
+    (folder / ".anton" / ".env").write_text(_SECRET)
+    client = _local_client()
+    name = _adopt(client, folder, "linked-artifacts")
+    _replace_with_link(folder / ".anton" / "artifacts", folder / ".anton")
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/.env")
+
+    assert _SECRET not in served.text, (served.status_code, served.text[:200])
+    assert served.status_code == 404
+
+
+def test_serve_refuses_an_adopted_folders_anton_linked_elsewhere(projects_root, tmp_path):
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    page = elsewhere / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>outside the project</html>")
+    client = _local_client()
+    name = _adopt(client, folder, "linked-anton")
+    _replace_with_link(folder / ".anton", elsewhere)
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+
+    assert served.status_code == 404
+    assert "outside the project" not in served.text
+
+
+def test_serve_does_not_take_a_root_folder_of_the_same_name_for_an_adopted_project(
+    projects_root, tmp_path
+):
+    """The scan lists every directory in the projects root, so falling through
+    to it would serve a leftover folder under the adopted project's name."""
+    import shutil
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    client = _local_client()
+    name = _adopt(client, folder, "same-name")
+    shutil.rmtree(folder / ".anton", ignore_errors=True)
+    page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>leftover in the root</html>")
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+
+    assert served.status_code == 404
+    assert "leftover in the root" not in served.text
+
+
+def test_serve_finds_a_stale_rows_project_in_the_projects_root(projects_root, tmp_path):
+    """A row created before the projects root moved points at a folder that is
+    gone; the project now lives under the new root, where the scan finds it.
+    Passes before the fix too: a regression guard."""
+    import shutil
+
+    folder = tmp_path / "old-root" / "moved"
+    folder.mkdir(parents=True)
+    client = _local_client()
+    name = _adopt(client, folder, "moved")
+    shutil.rmtree(folder)
+    page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>moved with the root</html>")
+
+    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+
+    assert served.status_code == 200, served.text
+    assert "moved with the root" in served.text

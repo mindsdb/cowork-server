@@ -70,7 +70,7 @@ def test_project_base_accepts_registered_path_through_symlink(tmp_path):
         "cowork.services.artifacts._projects_root",
         return_value=alias_root,
     ), patch(
-        "cowork.services.artifacts._external_project_artifacts_base",
+        "cowork.services.artifacts._external_project_dir",
         return_value=None,
     ):
         assert _project_artifacts_base("proj", session) == artifacts.resolve()

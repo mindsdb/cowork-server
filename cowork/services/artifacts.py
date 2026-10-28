@@ -723,14 +723,15 @@ def _artifacts_base_in(project_dir: Path) -> Path | None:
     return project_dir / ".anton" / "artifacts"
 
 
-def _external_project_artifacts_base(
+def _external_project_dir(
     project_name: str, session: ScopedSession
 ) -> Path | None:
-    """The artifacts dir of an adopted-folder project, addressed by row name.
+    """The folder of an adopted-folder project, addressed by row name.
 
     Scoped read, so it cannot reach another tenant's project. Returns None for
-    every project the filesystem scan already resolves, leaving that path
-    untouched.
+    every project the filesystem scan resolves, and for a row whose folder is
+    gone: a row created before the projects root moved still looks adopted,
+    and its folder now lives under the new root, where the scan finds it.
     """
     from cowork.services.projects import ProjectService
 
@@ -738,28 +739,32 @@ def _external_project_artifacts_base(
     project = service.get_project_by_name_or_none(project_name)
     if project is None or not service.directory_is_external(project):
         return None
-    base = Path(project.path) / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    folder = Path(project.path)
+    return folder if folder.is_dir() else None
 
 
 def _project_artifacts_base(
     project_name: str, session: ScopedSession
 ) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
-    maps to a registered project of the session's scope. Returns None for
-    unknown projects or path-traversal attempts.
+    maps to a registered project of the session's scope and neither `.anton`
+    nor `.anton/artifacts` is a link. Returns None for unknown projects,
+    path-traversal attempts and linked folders.
 
     The scan below derives the directory as `<root>/<name>`, which is only true
     for a project the scan can see. A project pointed at a folder the user
-    chose is resolved from its row instead.
+    chose is resolved from its row instead. A row whose folder is gone, such
+    as one created before the projects root moved, is resolved by the scan.
     """
     if (not project_name or "\x00" in project_name
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
         return None
-    base = _external_project_artifacts_base(project_name, session)
-    if base is not None:
-        return base
+    external = _external_project_dir(project_name, session)
+    if external is not None:
+        # Final: the scan lists every folder in the projects root, so falling
+        # through would serve a same-named folder there instead.
+        return _artifacts_base_in(external)
     # Compare canonical paths on both sides. On macOS, temporary and user
     # paths commonly cross aliases such as /var -> /private/var; comparing a
     # resolved candidate with raw registry entries incorrectly rejects a
