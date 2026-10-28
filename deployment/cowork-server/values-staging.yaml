@@ -74,6 +74,11 @@ deployment:
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.staging.mindshub.ai/v1"
 
+    # Server-side compaction of cloud memory after a turn saves to it. On here
+    # first; prod turns it on after staging shows it keeps what it should.
+    - name: COWORK_TURN_MEMORY_COMPACTION_ENABLED
+      value: "true"
+
     # Agent tool budgets — deployment-level DEFAULTS for users who never set
     # the per-user setting (hosted has no Settings UI; inference cost lands on
     # the operator). Uncommented values below equal the code defaults, so

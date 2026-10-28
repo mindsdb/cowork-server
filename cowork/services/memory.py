@@ -61,6 +61,7 @@ from cowork.services.shared_resources import (
 )
 
 if TYPE_CHECKING:
+    from anton.core.memory.cortex import CompactionPlan
     from anton.core.memory.hippocampus import Hippocampus
 
 
@@ -237,6 +238,23 @@ def _validated_engrams(entries: list[dict]) -> list[_WireEngram]:
             continue
         validated.append(entry.model_copy(update={"text": text}))
     return validated
+
+
+@dataclass(frozen=True)
+class TurnMemoryWrite:
+    """Where a remote turn's memory went: the conversation's project, and how
+    many valid entries the turn sent to the person's own memory and to the
+    project's. Sent, not kept: a write may be a duplicate or refused."""
+
+    project_id: UUID
+    personal: int
+    project: int
+
+
+def turn_memory_write(entries: list[dict], project_id: UUID) -> TurnMemoryWrite:
+    validated = _validated_engrams(entries)
+    project = sum(1 for entry in validated if entry.targets_project)
+    return TurnMemoryWrite(project_id=project_id, personal=len(validated) - project, project=project)
 
 
 def _encode_engram(hippocampus: "Hippocampus", entry: _WireEngram) -> None:
@@ -472,6 +490,72 @@ def _apply_project_engram(
                     logger.exception("Could not release a failed project-memory claim")
             raise
     return True
+
+
+def project_slots_to_compact(
+    session: ScopedSession, *, principal: Principal | None, project_id: UUID
+) -> tuple[Path, list[MemorySlot]] | None:
+    """The project's memory folder and the slots this person may rewrite, checked
+    before anything is minted so a refused author costs no model call. None when
+    the project is gone."""
+    project = session.get(Project, project_id)
+    if project is None:
+        return None
+    access = SharedResourceAccess(session, principal)
+    slots = [
+        slot
+        for slot in PROJECT_SLOTS
+        if access.can_change(
+            access.creator_id(PROJECT_MEMORY, project_memory_resource_key(project.id, slot.value))
+        )
+    ]
+    return _project_store(scope=session.scope, project=project).root, slots
+
+
+def apply_project_compaction(
+    session: ScopedSession,
+    *,
+    principal: Principal | None,
+    project_id: UUID,
+    planned_root: Path,
+    plans: list[tuple[MemorySlot, CompactionPlan]],
+) -> bool:
+    """Write compaction plans into a project's memory under the locks, author
+    check and audit an edit from the memory editor takes.
+
+    A project renamed or deleted since the plan, a file changed since the plan,
+    or a slot this person may no longer change is skipped. Returns whether any
+    slot was rewritten.
+    """
+    from anton.core.memory.hippocampus import Hippocampus
+
+    access = SharedResourceAccess(session, principal)
+    written = False
+    for slot, plan in plans:
+        try:
+            with _project_slot_coordination(session, access, project_id, slot) as (_project, store, key):
+                if store.root != planned_root:
+                    continue
+                with access.mutation_lock(
+                    PROJECT_MEMORY,
+                    key,
+                    resource_exists=lambda: _slot_holds_content(store.read_state(slot)),
+                ) as attribution:
+                    if attribution is not None and not access.can_change(attribution.created_by_id):
+                        continue
+                    before = store.read_state(slot)
+                    if not plan.apply(Hippocampus(store.root)):
+                        continue
+                    try:
+                        access.record_update(PROJECT_MEMORY, key, action="update")
+                    except Exception:
+                        _restore_project_slot(store, slot, before)
+                        raise
+                    written = True
+        except (ValueError, HTTPException) as exc:
+            # The project is gone, or the slot is gone or still being claimed.
+            logger.info("memory-compaction: project %s slot skipped (%s)", slot.value, type(exc).__name__)
+    return written
 
 
 class PersonMemoryResetError(ValueError):

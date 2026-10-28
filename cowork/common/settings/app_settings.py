@@ -663,6 +663,16 @@ class TurnQueueSettings(Settings):
             "responses._spawn_jev_shadow_probe logs."
         ),
     )  # COWORK_TURN_JEV_SHADOW_ENABLED
+    memory_compaction_enabled: bool = Field(
+        default=False,
+        description=(
+            "Compact a person's or a project's memory on the server after a remote turn "
+            "saved to it, once it holds more than 20 rules and lessons and grew by 10 since "
+            "the last attempt (cowork.services.memory_compaction). One coding-model call on "
+            "a turn key minted for that person. Off by default while it rolls out: a "
+            "compaction deletes entries for good."
+        ),
+    )  # COWORK_TURN_MEMORY_COMPACTION_ENABLED
     jev_shadow_model: str = Field(
         default="jev",
         description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
