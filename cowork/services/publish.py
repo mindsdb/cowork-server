@@ -803,8 +803,10 @@ def publish_artifact(
             "accessEmails": owner_side.get("emails", []),
             "orgAllowed": bool(owner_side.get("org_allowed")),
             "ownerOnly": bool(owner_side.get("owner_only")),
-            # Composite comments scope for the panel (Plan 5).
-            "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
+            # The renderer keys comment requests off this, so it must match the
+            # card's key. The lambda may echo a different key it bound to this
+            # report earlier; comments routing finds that one in the record.
+            "artifactKey": canonical_artifact_key or result.get("artifact_key") or "",
             "result": {k: v for k, v in result.items() if k != "file_payload"},
         }
 

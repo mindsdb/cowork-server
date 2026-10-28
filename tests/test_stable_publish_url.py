@@ -484,3 +484,42 @@ def test_unpublish_folder_skips_soft_deleted(tmp_path: Path):
         _unpublish_folder(root, artifacts_base=tmp_path, api_key="k",
                           publish_url="https://4nton.ai")
     assert called == []
+
+
+def test_publish_reports_the_cards_key_when_the_lambda_echoes_another(tmp_path: Path):
+    # The renderer addresses comments by the returned key. A public publication
+    # keeps its threads in the local journal, which only knows the local id.
+    from uuid import UUID
+
+    from cowork.services.artifact_identity import artifact_key
+
+    local_id = "b42e023a003845af9efcf41518163c4d"
+    lambda_key = "artifact/6671fe2e-9784-4402-a5d3-5edb2ac9dbac"
+    root = tmp_path / "ascii-animal-b42e023a"
+    root.mkdir()
+    (root / "metadata.json").write_text(
+        json.dumps({"id": local_id, "type": "html-app", "primary": "index.html"}),
+        encoding="utf-8",
+    )
+    (root / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    echo = {"view_url": "https://x/view/u/r1", "report_id": "r1", "md5": "m1", "artifact_key": lambda_key}
+    with _patched_publish(tmp_path), patch("anton.publisher.publish", lambda *a, **k: echo):
+        result = publish_mod.publish_artifact(
+            root / "index.html", artifacts_base=tmp_path,
+            api_key="fake-key", publish_url="https://4nton.ai",
+        )
+    assert result["artifactKey"] == artifact_key(local_id) == f"artifact/{UUID(local_id)}"
+    # The record keeps the lambda's key, which restricted comments route to.
+    assert _read_map(root)["index.html"]["lambda_artifact_key"] == lambda_key
+
+
+def test_publish_of_a_loose_file_reports_the_lambda_key(tmp_path: Path):
+    page = tmp_path / "page.html"
+    page.write_text("<h1>hi</h1>", encoding="utf-8")
+    echo = {"view_url": "https://x/view/u/r1", "report_id": "r1", "md5": "m1", "artifact_key": "u/r1"}
+    with _patched_publish(tmp_path), patch("anton.publisher.publish", lambda *a, **k: echo):
+        result = publish_mod.publish_artifact(
+            page, artifacts_base=tmp_path,
+            api_key="fake-key", publish_url="https://4nton.ai",
+        )
+    assert result["artifactKey"] == "u/r1"
