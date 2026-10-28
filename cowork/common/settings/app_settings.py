@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -179,6 +180,30 @@ DIRECT_EFFORT_CATALOG: dict[str, dict] = {
 # interpolated into a bogus hostname like api.<garbage>.mindshub.ai.
 _KNOWN_ENV_SLUGS = ("staging", "dev")
 
+# A draft-link token is readable by the artifact's own script and by anyone who
+# can read an access log, so a short signing secret could be brute-forced offline.
+_DRAFT_KEY_MIN_CHARS = 32
+
+# scheme://host[:port] and one optional trailing slash, nothing else: no inner
+# whitespace, userinfo, path, query, fragment, wildcard, or the `;` and `,` that
+# would end or extend a CSP source list this value is written into.
+_BARE_ORIGIN = re.compile(
+    r"(?P<scheme>https?)://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?/?",
+    re.IGNORECASE,
+)
+
+
+def _bare_origin(value: str) -> tuple[str, str] | None:
+    """``(origin, host)`` of a bare http(s) origin, lower-cased; None otherwise.
+
+    Whitespace around the value (a newline from a mounted secret) is ignored.
+    """
+    match = _BARE_ORIGIN.fullmatch(value.strip())
+    if match is None:
+        return None
+    host = match["host"].lower().rstrip(".")
+    return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
+
 
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
@@ -203,6 +228,12 @@ def default_minds_url() -> str:
     return f"{default_minds_api_host()}/v1"
 
 
+def _pr_namespace() -> str:
+    """This pod's per-PR namespace (``pr-...``) from the downward API, else ''."""
+    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
+    return ns if ns.startswith("pr-") else ""
+
+
 def default_turn_minds_api_host() -> str:
     """MindsHub API host for the POD's turn — this deployment's OWN inference.
 
@@ -216,10 +247,22 @@ def default_turn_minds_api_host() -> str:
     Everything else — dev, staging, prod, desktop — keeps the ENV-slug host,
     which is already correct (notably prod, which has no slug at all).
     """
-    ns = (os.environ.get("POD_NAMESPACE") or os.environ.get("NAMESPACE") or "").strip()
-    if ns.startswith("pr-"):
+    ns = _pr_namespace()
+    if ns:
         return f"https://api-{ns}.dev.mindshub.ai"
     return default_minds_api_host()
+
+
+def default_draft_env_label() -> str:
+    """The environment a draft-preview token is issued for and accepted in.
+
+    The same split as ``default_turn_minds_api_host``, as a label: a per-PR env
+    by its namespace (they all run ENV=development and likely share dev's draft
+    key, so the namespace is what tells them apart), otherwise the ENV slug,
+    and ``prod`` for everything else. Read from the downward API, never from a
+    request.
+    """
+    return _pr_namespace() or _env_slug() or "prod"
 
 
 def default_minds_auth_host() -> str:
@@ -1003,6 +1046,115 @@ class AppSettings(Settings):
             "Defaults off so deploying protocol support cannot expose it."
         ),
     )
+    # Draft-preview links. Org web only. All six values together turn the
+    # signed draft links on; any one missing leaves previews on the srcdoc
+    # path (see draft_links_enabled).
+    draft_hosts: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_HOSTS"),
+        description=(
+            "Comma-separated host names of the draft-preview host (e.g. "
+            "draft.mindshub.co). The draft listener answers 404 to any other "
+            "Host. Empty (default) serves no draft host."
+        ),
+    )  # COWORK_DRAFT_HOSTS
+    draft_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_ORIGIN"),
+        description="Origin draft links point at, e.g. https://draft.mindshub.co.",
+    )  # COWORK_DRAFT_ORIGIN
+    draft_link_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KEYS"),
+        description=(
+            "Draft-link signing keys as a JSON map {kid: secret}, from the "
+            "mindsdb-secrets Secret. Two kids can be live during a rotation. "
+            "A secret shorter than 32 characters is ignored."
+        ),
+    )  # COWORK_DRAFT_LINK_KEYS
+    draft_link_kid: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DRAFT_LINK_KID"),
+        description="The kid in COWORK_DRAFT_LINK_KEYS that signs new draft links.",
+    )  # COWORK_DRAFT_LINK_KID
+    web_origin: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_WEB_ORIGIN"),
+        description=(
+            "Origin of the cowork web app, e.g. https://cowork.mindshub.ai: the "
+            "only page allowed to frame a draft (CSP frame-ancestors)."
+        ),
+    )  # COWORK_WEB_ORIGIN
+    draft_port: int = Field(
+        default=0,
+        ge=0,
+        le=65535,
+        validation_alias=AliasChoices("COWORK_DRAFT_PORT"),
+        description=(
+            "Port of the draft listener: a second server in this process that "
+            "serves only the draft sub-app, so the draft Ingress, which routes "
+            "to this port alone, can never reach the API app. 0 (default) "
+            "starts no listener."
+        ),
+    )  # COWORK_DRAFT_PORT
+
+    @field_validator("draft_port", mode="before")
+    @classmethod
+    def _empty_draft_port_is_off(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return 0
+        return v
+
+    def draft_host_names(self) -> frozenset[str]:
+        """COWORK_DRAFT_HOSTS as lower-case host names, without a trailing dot."""
+        return frozenset(
+            name.strip().lower().rstrip(".")
+            for name in self.draft_hosts.split(",")
+            if name.strip()
+        )
+
+    def draft_link_keyring(self) -> dict[str, str]:
+        """COWORK_DRAFT_LINK_KEYS parsed; an unreadable value is no keys at all.
+
+        A secret shorter than 32 characters is dropped like a non-string one.
+        """
+        try:
+            parsed = json.loads(self.draft_link_keys)
+        except ValueError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            kid: secret
+            for kid, secret in parsed.items()
+            if kid and isinstance(secret, str) and len(secret) >= _DRAFT_KEY_MIN_CHARS
+        }
+
+    def draft_link_origin(self) -> str:
+        """COWORK_DRAFT_ORIGIN as a bare origin, or '' when it is not one."""
+        parsed = _bare_origin(self.draft_origin)
+        return parsed[0] if parsed else ""
+
+    def draft_frame_origin(self) -> str:
+        """COWORK_WEB_ORIGIN as a bare origin, or '' when it is not one.
+
+        The only value written into the draft host's CSP frame-ancestors.
+        """
+        parsed = _bare_origin(self.web_origin)
+        return parsed[0] if parsed else ""
+
+    def draft_links_enabled(self) -> bool:
+        """Whether this server issues and serves signed draft links."""
+        link_origin = _bare_origin(self.draft_origin)
+        return (
+            self.tenancy_mode == "org"
+            and link_origin is not None
+            and link_origin[1] in self.draft_host_names()
+            and bool(self.draft_frame_origin())
+            and self.draft_link_kid in self.draft_link_keyring()
+            and self.draft_port > 0
+        )
+
     owner: str = Field(
         default=os.environ.get("COWORK_SERVER_OWNER", ""),
         description=(

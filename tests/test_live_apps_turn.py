@@ -384,7 +384,7 @@ def test_a_non_streaming_turn_runs_with_its_principals_launcher(live):
             seen.append(current_live_app_launcher())
             return None
 
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             event_sink("response.output_text.delta", {"type": "response.output_text.delta", "delta": "ok"})
             if False:
                 yield
