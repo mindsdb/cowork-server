@@ -1217,6 +1217,7 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
         question="Hello",
         route=route,
         buffer=buffer,
+        request_id="direct-test",
     )
 
     assert buffer.closed == "completed"
@@ -1273,6 +1274,7 @@ async def test_produce_direct_answers_a_full_pool_with_a_timed_retry(monkeypatch
         question="Hello",
         route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi."),
         buffer=buffer,
+        request_id="direct-test",
     )
 
     assert buffer.closed == "error"
@@ -1411,6 +1413,7 @@ async def _produce_direct_answer(
         question=_OVERTIME_QUESTION,
         route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=text),
         buffer=buffer,
+        request_id="direct-test",
     )
     return buffer
 

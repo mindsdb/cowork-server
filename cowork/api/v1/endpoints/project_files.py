@@ -28,12 +28,14 @@ from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, s
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.api.v1.endpoints.connectors.sharepoint import (
     _KEY_NO_LONGER_WORKS,
     _granted_site,
     _stored_connection,
 )
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
+from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
 from cowork.common.paths import (
     O_NOFOLLOW,
@@ -1436,14 +1438,23 @@ def _pinned_stream(
     file that keeps growing cannot keep the response open.
     """
     cm, fd, st = _pinned_regular_file(target, base)
+    resources = ExitStack()
+    resources.push(cm)
 
     def _chunks():
         try:
             yield from read_bounded(fd, st.st_size)
         finally:
-            cm.__exit__(None, None, None)
+            resources.close()
 
-    return StreamingResponse(_chunks(), media_type=media_type, headers=headers)
+    try:
+        return PinnedStreamingResponse(
+            _chunks(), resources=resources, media_type=media_type, headers=headers
+        )
+    except BaseException:
+        # `_chunks` never ran, so neither it nor the response can close the descriptor.
+        resources.close()
+        raise
 
 
 @router.get(
@@ -2266,5 +2277,5 @@ def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep
         target,
         base,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+        headers={"Content-Disposition": attachment_disposition(target.name)},
     )
