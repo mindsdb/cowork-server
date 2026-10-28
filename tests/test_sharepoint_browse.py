@@ -121,7 +121,7 @@ def _save(fields: dict = STORED, name: str = "corp", scope: TenantScope = LOCAL_
 def test_libraries_of_a_named_site_are_listed(graph):
     _save()
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": "https://Contoso.sharepoint.com/sites/Team/"})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": "https://Contoso.sharepoint.com/sites/Team/"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {"libraries": [{"id": DRIVE_ID, "name": "Documents"}]}
@@ -177,7 +177,7 @@ def test_a_forged_cursor_cannot_change_the_request_path(graph, cursor):
 def test_a_site_the_connection_does_not_name_is_refused_before_any_graph_call(graph):
     _save()
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": OTHER_SITE})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": OTHER_SITE})
 
     assert response.status_code == 403
     assert graph.requests == []
@@ -224,7 +224,7 @@ def test_an_overlong_cursor_is_refused(graph):
 def test_a_name_that_is_not_exactly_stored_is_not_found(graph, name):
     _save()
 
-    response = _client().get(f"{BASE}/{name}/drives", params={"site": SITE})
+    response = _client().get(f"{BASE}/{name}/libraries", params={"site": SITE})
 
     assert response.status_code == 404
     assert graph.requests == []
@@ -242,7 +242,7 @@ def test_a_name_that_is_not_exactly_stored_is_not_found(graph, name):
 def test_a_stored_record_that_fails_validation_is_refused_before_any_request(graph, fields):
     _save(fields)
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": SITE})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": SITE})
 
     assert response.status_code == 409
     assert graph.requests == []
@@ -264,7 +264,7 @@ def test_graph_failures_map_to_browse_statuses(graph, token_response, site_respo
         graph.token_response = token_response
     graph.site_response = site_response
 
-    response = _client().get(f"{BASE}/corp/drives", params={"site": SITE})
+    response = _client().get(f"{BASE}/corp/libraries", params={"site": SITE})
 
     assert response.status_code == expected
     assert SECRET not in response.text
@@ -303,9 +303,9 @@ def test_org_mode_refuses_browse(monkeypatch, graph):
     get_app_settings.cache_clear()
     client = _client()
 
-    drives = client.get(f"{BASE}/corp/drives", params={"site": SITE})
+    libraries = client.get(f"{BASE}/corp/libraries", params={"site": SITE})
     children = client.get(f"{BASE}/corp/children", params={"site": SITE, "drive_id": DRIVE_ID})
 
-    assert drives.status_code == 403
+    assert libraries.status_code == 403
     assert children.status_code == 403
     assert graph.requests == []

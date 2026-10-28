@@ -259,14 +259,14 @@ def _granted_site(site: str, sites: list[str]) -> str:
     return canonical
 
 
-@router.get("/connections/{name}/drives", response_model=SharePointLibrariesResponse)
+@router.get("/connections/{name}/libraries", response_model=SharePointLibrariesResponse)
 def list_libraries(name: str, site: str, scope: ScopeDep) -> SharePointLibrariesResponse:
     """List the document libraries of one site the connection names."""
     key, sites = _stored_connection(scope, name)
     url = _granted_site(site, sites)
     try:
         with SharePointClient(key) as client:
-            libraries = client.list_drives(url)
+            libraries = client.list_libraries(url)
     except SharePointError as exc:
         raise _browse_error(exc) from exc
     return SharePointLibrariesResponse(

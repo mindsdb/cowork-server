@@ -139,9 +139,9 @@ def test_browse_reuses_a_cached_token_within_its_lifetime():
     fake_time = FakeTime()
 
     with _client(ms, fake_time) as client:
-        client.list_drives(SITE_URL)
+        client.list_libraries(SITE_URL)
     with _client(ms, fake_time) as client:
-        client.list_drives(SITE_URL)
+        client.list_libraries(SITE_URL)
 
     assert ms.token_count == 1
 
@@ -200,7 +200,7 @@ def test_root_site_uses_the_host_only_form():
     ms.on("GET", DRIVES_URL, httpx.Response(200, json={"value": [{"id": DRIVE_ID, "name": "Documents"}]}))
 
     with _client(ms) as client:
-        libraries = client.list_drives("https://Contoso.SharePoint.com/")
+        libraries = client.list_libraries("https://Contoso.SharePoint.com/")
 
     assert [library.id for library in libraries] == [DRIVE_ID]
     assert [str(r.url.copy_with(query=None)) for r in ms.graph_requests()] == [root, DRIVES_URL]
@@ -228,7 +228,7 @@ def test_site_urls_outside_the_allowed_shapes_are_refused_before_any_request(url
     ms = FakeMicrosoft()
 
     with _client(ms) as client, pytest.raises(SharePointError) as raised:
-        client.list_drives(url)
+        client.list_libraries(url)
 
     assert raised.value.kind is SharePointErrorKind.INVALID
     assert ms.requests == []
@@ -374,7 +374,7 @@ def test_libraries_are_read_across_pages():
     )
 
     with _client(ms) as client:
-        libraries = client.list_drives(SITE_URL)
+        libraries = client.list_libraries(SITE_URL)
 
     assert [library.id for library in libraries] == ["b!first", DRIVE_ID]
     assert ms.graph_requests()[-1].url.params["$skiptoken"] == "d2"
@@ -386,7 +386,7 @@ def test_a_retry_after_longer_than_the_time_left_fails_at_once():
     fake_time = FakeTime()
 
     with _client(ms, fake_time) as client, pytest.raises(SharePointError) as raised:
-        client.list_drives(SITE_URL)
+        client.list_libraries(SITE_URL)
 
     assert raised.value.kind is SharePointErrorKind.THROTTLED
     assert fake_time.slept == []
@@ -401,7 +401,7 @@ def test_a_short_retry_after_is_waited_out(status):
     fake_time = FakeTime()
 
     with _client(ms, fake_time) as client:
-        libraries = client.list_drives(SITE_URL)
+        libraries = client.list_libraries(SITE_URL)
 
     assert [library.id for library in libraries] == [DRIVE_ID]
     assert fake_time.slept == [2.0]
@@ -413,7 +413,7 @@ def test_throttling_gives_up_after_three_tries():
     fake_time = FakeTime()
 
     with _client(ms, fake_time) as client, pytest.raises(SharePointError) as raised:
-        client.list_drives(SITE_URL)
+        client.list_libraries(SITE_URL)
 
     assert raised.value.kind is SharePointErrorKind.THROTTLED
     assert len(ms.graph_requests()) == 3
@@ -427,7 +427,7 @@ def test_a_401_from_graph_refetches_the_token_once():
     sharepoint._TOKENS[KEY.cache_key()] = ("revoked-token", 10**9)
 
     with _client(ms) as client:
-        libraries = client.list_drives(SITE_URL)
+        libraries = client.list_libraries(SITE_URL)
 
     assert [library.id for library in libraries] == [DRIVE_ID]
     first, second, _ = ms.graph_requests()
@@ -494,7 +494,7 @@ def test_one_browse_call_shares_one_deadline_across_its_requests():
     fake_time = FakeTime()
 
     with _client(ms, fake_time) as client, pytest.raises(SharePointError) as raised:
-        client.list_drives(SITE_URL)
+        client.list_libraries(SITE_URL)
 
     assert raised.value.kind is SharePointErrorKind.THROTTLED
     assert fake_time.slept == [25.0]
@@ -507,7 +507,7 @@ def test_an_unusable_retry_after_waits_the_default(header):
     fake_time = FakeTime()
 
     with _client(ms, fake_time) as client, pytest.raises(SharePointError) as raised:
-        client.list_drives(SITE_URL)
+        client.list_libraries(SITE_URL)
 
     assert raised.value.kind is SharePointErrorKind.THROTTLED
     assert fake_time.slept == [1.0, 1.0]
