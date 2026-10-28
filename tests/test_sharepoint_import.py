@@ -49,6 +49,7 @@ class SharePoint:
         self.children: dict[str, list[dict]] = {}
         self.bytes: dict[str, bytes] = {}
         self.fail_download: set[str] = set()
+        self.stale_second_page: set[str] = set()
         self.on_content = None
 
     def file(self, item_id: str, name: str, data: bytes, size: int | None = None) -> dict:
@@ -80,6 +81,11 @@ class SharePoint:
         if path.startswith(f"{ITEMS_PATH}/"):
             item_id, _, rest = path[len(ITEMS_PATH) + 1:].partition("/")
             if rest == "children":
+                if item_id in self.stale_second_page:
+                    if request.url.params.get("$skiptoken") == "p2":
+                        return httpx.Response(400, json={"error": {"code": "invalidRequest"}})
+                    next_link = f"https://graph.microsoft.com{ITEMS_PATH}/{item_id}/children?$skiptoken=p2"
+                    return httpx.Response(200, json={"value": self.children[item_id], "@odata.nextLink": next_link})
                 return httpx.Response(200, json={"value": self.children.get(item_id, [])})
             if rest == "content" and item_id in self.bytes:
                 if self.on_content is not None:
@@ -399,3 +405,16 @@ def test_every_failure_kind_maps_to_an_import_status():
         project_files._ImportRestoreFailed,
     }
     assert set(project_files._IMPORT_WRITE_STATUS) == writer_errors
+
+
+def test_a_folder_that_changes_while_it_is_read_asks_to_retry_the_import(microsoft, project):
+    name, _id, folder = project
+    microsoft.folder("01R", "Reports", [microsoft.file("01a", "q3.xlsx", b"xlsx bytes")])
+    microsoft.stale_second_page.add("01R")
+
+    response = _import(name, ["01R"])
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "The folder changed while it was read. Try the import again."
+    assert _tree(folder) == {}
+    assert microsoft.content_requests() == []
