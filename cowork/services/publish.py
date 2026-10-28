@@ -754,6 +754,7 @@ def publish_artifact(
                         returned_report_id, view_url,
                     )
                 raise
+        echoed_key = _lambda_artifact_key(result)
         if returned_report_id:
             history_item = {
                 "artifact": str(publish_target),
@@ -778,7 +779,7 @@ def publish_artifact(
                 # Decides which scope the published page uses for comments; see
                 # services/comments_scope. Deliberately NOT merged with the field
                 # above, whose canonical fallback would read as an echo.
-                "lambda_artifact_key": _lambda_artifact_key(result),
+                "lambda_artifact_key": echoed_key,
                 "last_md5": result.get("md5", ""),
                 # Snapshot of the artifact's content mtime at publish time — the
                 # cheap gate for the `modified` badge (see card_for_folder). Uses
@@ -795,15 +796,12 @@ def publish_artifact(
             state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
             _save_state(state, scope=scope)
 
-        echoed_key = result.get("artifact_key") or ""
         if scope is not None and scope.org_mode:
             # Org comment routing never reads the record, so only the echo can
             # point the renderer at the scope the published page uses.
             response_key = echoed_key or canonical_artifact_key or ""
         else:
-            # Desktop routing resolves the local id and takes the cloud scope
-            # from the record, so this has to be the card's key: the lambda may
-            # echo another one, and the local journal knows only the local id.
+            # The card's key: desktop routing finds the cloud scope in the record.
             response_key = canonical_artifact_key or echoed_key
         return {
             "status": "ok",
