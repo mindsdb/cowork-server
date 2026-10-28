@@ -295,3 +295,10 @@ def test_org_mode_refuses_browse(monkeypatch, graph):
     assert libraries.status_code == 403
     assert children.status_code == 403
     assert graph.requests == []
+
+
+def test_every_error_kind_maps_to_a_browse_status():
+    for kind in sharepoint_service.SharePointErrorKind:
+        error = sharepoint_ep._browse_error(sharepoint_service.SharePointError(kind))
+        assert isinstance(error, HTTPException)
+        assert 400 <= error.status_code < 600

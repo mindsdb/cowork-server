@@ -30,3 +30,18 @@ class SharePointItem(BaseModel):
 class SharePointChildrenResponse(BaseModel):
     items: list[SharePointItem]
     cursor: str | None
+
+
+class SharePointImportedFile(BaseModel):
+    path: str
+    size: int
+
+
+class SharePointSkippedItem(BaseModel):
+    path: str
+    reason: str
+
+
+class SharePointImportResponse(BaseModel):
+    imported: list[SharePointImportedFile]
+    skipped: list[SharePointSkippedItem]
