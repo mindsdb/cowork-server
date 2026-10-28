@@ -33,6 +33,7 @@ _MAX_DRIVE_PAGES = 10
 _TOKEN_MARGIN_SECONDS = 60.0
 _DEFAULT_RETRY_SECONDS = 1.0
 _CHILD_FIELDS = "id,name,size,file,folder,lastModifiedDateTime"
+_STALE_CURSOR = "This folder listing is out of date. Open the folder again."
 
 _GUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 _DOMAIN = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
@@ -316,6 +317,8 @@ class SharePointClient:
         if cursor:
             params["$skiptoken"] = cursor
         response = self._graph_get(url, params, deadline)
+        if cursor and response.status_code == 400:
+            raise SharePointError(SharePointErrorKind.INVALID, _STALE_CURSOR)
         if response.status_code in {400, 403, 404}:
             raise SharePointError(SharePointErrorKind.ITEM_NOT_FOUND)
         payload = self._json(response)

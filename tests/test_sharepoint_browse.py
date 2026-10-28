@@ -87,6 +87,8 @@ class Graph:
         if path == CHILDREN_PATH:
             if request.url.params.get("$skiptoken") == "p2":
                 return httpx.Response(200, json={"value": [_file(200)]})
+            if request.url.params.get("$skiptoken") == "stale":
+                return httpx.Response(400, json={"error": {"code": "invalidRequest"}})
             next_link = f"https://graph.microsoft.com{CHILDREN_PATH}?$top=200&$skiptoken=p2"
             return httpx.Response(200, json={"value": [_file(n) for n in range(200)], "@odata.nextLink": next_link})
         return httpx.Response(404, json={"error": {"code": "itemNotFound"}})
@@ -198,6 +200,15 @@ def test_ids_outside_graphs_charset_are_refused(graph, drive_id, item_id):
 
     assert response.status_code == 400
     assert not any(path.endswith("/children") for path in graph.graph_paths())
+
+
+def test_a_cursor_graph_no_longer_accepts_asks_to_reopen_the_folder(graph):
+    _save()
+
+    response = _client().get(f"{BASE}/corp/children", params={"site": SITE, "drive_id": DRIVE_ID, "cursor": "stale"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "This folder listing is out of date. Open the folder again."
 
 
 def test_an_overlong_cursor_is_refused(graph):
