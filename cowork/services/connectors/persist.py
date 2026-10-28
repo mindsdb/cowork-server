@@ -45,6 +45,10 @@ class ConnectionNotFoundError(LookupError):
     """An ``extends`` save named a connection that does not exist."""
 
 
+class ConnectionExistsError(Exception):
+    """A ``create_only`` save named a connection that already exists."""
+
+
 def own_vault_root(scope: "TenantScope | None" = None) -> Path:
     """The folder of the vault ``scope`` saves into (own_vault_for_scope), and
     the root its record locks are keyed by (vault_lock)."""
@@ -202,6 +206,7 @@ def persist_connection(
     replace_existing: bool = False,
     extends: bool = False,
     spec_form: dict | None = None,
+    create_only: bool = False,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
     vault=None,
@@ -243,6 +248,10 @@ def persist_connection(
     doesn't hold (custom or handcrafted), so its ``secret: true`` fields are
     masked even when their names don't look secret.
 
+    ``create_only`` saves under ``name`` only if no record holds it, checked
+    under the same record lock as the write; it never falls back to a ``-N``
+    suffix. Raises ``ConnectionExistsError`` when the name is taken.
+
     ``default_fields`` generalizes the same "default once, then sticky"
     behavior ``default_label``/``user_label`` already have, for any other
     per-connector bookkeeping key a caller wants seeded on a genuinely new
@@ -282,6 +291,8 @@ def persist_connection(
         # updated, so an unchanged secret keeps its stored value instead of
         # persisting the literal sentinel.
         target = vault.read_record(connector_id, base_slug)
+        if create_only and target is not None:
+            raise ConnectionExistsError(f"A {connector_id} connection named {base_slug!r} already exists.")
         if extends:
             if not (name or "").strip() or target is None:
                 raise ConnectionNotFoundError(

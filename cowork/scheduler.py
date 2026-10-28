@@ -4,7 +4,7 @@ import asyncio
 import random
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID
@@ -48,6 +48,15 @@ _MAX_RUN_DURATION_SECONDS = 600
 # keeps a refusal that comes back at once from spinning.
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
+# How old a run still at `running` must be before a booting replica may reap
+# it: its turn is cut off at _MAX_RUN_DURATION_SECONDS and its last writes
+# (the outcome, then the finish) each give up after
+# _BOOKKEEPING_DEADLINE_SECONDS, plus slack for the units before the turn
+# starts. An error path with a third last write can use up that slack, which
+# is harmless: the run's own finish overwrites a reaped status. Age is only a
+# heuristic, since a database unit that stalls holds a run past any deadline,
+# so only boot uses it, not every poll.
+_ORPHANED_RUN_AGE_SECONDS = _MAX_RUN_DURATION_SECONDS + 2 * _BOOKKEEPING_DEADLINE_SECONDS + 10 * 60
 _scheduler_task: asyncio.Task | None = None
 # A run's error when its turn was refused because the server was shutting
 # down. The run never started, so the schedule's own last_error is left alone.
@@ -326,10 +335,13 @@ def _record_turn_outcome(
     return outcome
 
 
-def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str) -> None:
+def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool) -> None:
     schedule = ScheduleService(session).get_schedule(schedule_id)
     schedule.last_error = error
     session.add(schedule)
+    # A run that disabled its schedule has already stopped the re-fire.
+    if consume_slot and schedule.enabled:
+        _advance_next_run_at(schedule, session)
 
 
 def _finish_run(
@@ -378,7 +390,7 @@ async def execute_schedule(
     """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
-    from cowork.services.product_permissions import require_product_permission
+    from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
 
     try:
         run_id = await run_db(
@@ -396,6 +408,7 @@ async def execute_schedule(
     error: str | None = None
     final_status: RunStatus | None = None
     created_conversation = conversation_id is None
+    turn_started = False
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -434,6 +447,7 @@ async def execute_schedule(
             async for _ in stream:
                 pass
 
+        turn_started = True
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
@@ -498,12 +512,26 @@ async def execute_schedule(
             "Schedule run failed: %s", error,
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
+        # A run that raised consumes its cron slot like one that failed inside
+        # its turn. Left due, the next poll starts it again, and a failure that
+        # repeats (a timeout, a revoked permission) re-fires every poll. A busy
+        # pool or an auth outage before the turn starts is the exception: it
+        # clears on its own, the agent has done nothing yet, and skipping the
+        # slot would drop a daily or weekly occurrence over a short blip.
+        transient = not turn_started and isinstance(exc, (PoolTimeoutError, ProductPermissionUnavailable))
         try:
-            await run_db(
-                partial(_record_schedule_error, schedule_id=schedule_id, error=error), scope=SYSTEM_SCOPE,
+            await _until_it_lands(
+                partial(
+                    _record_schedule_error, schedule_id=schedule_id, error=error,
+                    consume_slot=not is_manual and not transient,
+                ),
+                schedule_id=schedule_id,
             )
         except Exception:
-            pass
+            logger.exception(
+                "Failed to record the scheduled run's error",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
     finally:
         try:
             # This write must always land or the run strands at `running` and
@@ -591,6 +619,18 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     if skipped:
         session.commit()
     return due
+
+
+def boot_reap_cutoff(now: datetime | None = None) -> datetime | None:
+    """Which running runs a starting server may reap: all of them on the
+    desktop, where it is the only process, or in org mode, where other
+    replicas may still be running them, only runs old enough to be presumed
+    dead."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    if get_app_settings().tenancy_mode != "org":
+        return None
+    return (now or datetime.now(timezone.utc)) - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
 
 
 def _poll(session: ScopedSession) -> list[UUID]:
