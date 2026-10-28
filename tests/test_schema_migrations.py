@@ -1,10 +1,11 @@
 import sqlite3
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from alembic import command
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel
 
@@ -19,10 +20,15 @@ import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
 import cowork.models.shared_resource  # noqa: F401
 import cowork.models.skill  # noqa: F401
+from cowork.common.settings import app_settings
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db import migrations
 from cowork.db.migrations import (
+    INITIAL_REVISION,
+    MIGRATION_LOCK_KEY,
     DatabaseSchemaAheadError,
     _alembic_config,
+    lock_migrations,
     run_schema_migrations,
 )
 
@@ -94,6 +100,56 @@ def test_migration_graph_has_single_head():
         "Add a merge revision joining them: alembic merge -m '<why>' "
         + " ".join(sorted(heads))
     )
+
+
+@pytest.mark.parametrize("path", ["startup", "alembic-command"])
+def test_migrations_take_the_migration_lock_in_their_transaction_before_alembic_starts(
+    tmp_path, monkeypatch, path,
+):
+    """Every new pod's db-migrate init container runs `alembic upgrade head`
+    (env.py's own engine), and startup migrates on a connection it supplies.
+    Both take the lock once, before Alembic has written the revision table.
+    On PostgreSQL that is inside the transaction Alembic's begin_transaction
+    opens, which SQLite, with no transactional DDL, does not open here."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    uri = _sqlite_uri(tmp_path / "locked.db")
+    revision_table_at_lock: list[bool] = []
+
+    def record(connection):
+        revision_table_at_lock.append(inspect(connection).has_table("alembic_version"))
+
+    monkeypatch.setattr(migrations, "lock_migrations", record)
+    if path == "startup":
+        run_schema_migrations(create_engine(uri), uri)
+    else:
+        settings = get_app_settings().model_copy(deep=True)
+        settings.database.uri = uri
+        monkeypatch.setattr(app_settings, "get_app_settings", lambda: settings)
+        command.upgrade(_alembic_config(uri), INITIAL_REVISION)
+
+    assert revision_table_at_lock == [False]
+
+
+class _RecordingConnection:
+    def __init__(self, dialect: str) -> None:
+        self.dialect = SimpleNamespace(name=dialect)
+        self.executed: list[tuple[str, dict]] = []
+
+    def execute(self, statement, parameters):
+        self.executed.append((str(statement), parameters))
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "sqlite"])
+def test_only_postgresql_migrations_wait_for_the_migration_lock(dialect):
+    """Pods a rollout starts together migrate one at a time on PostgreSQL. The
+    desktop's SQLite has one process and no advisory locks."""
+    connection = _RecordingConnection(dialect)
+
+    lock_migrations(connection)
+
+    expected = [("SELECT pg_advisory_xact_lock(:key)", {"key": MIGRATION_LOCK_KEY})]
+    assert connection.executed == (expected if dialect == "postgresql" else [])
 
 
 def test_schema_migrations_create_new_database(tmp_path, monkeypatch):

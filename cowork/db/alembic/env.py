@@ -23,6 +23,7 @@ import cowork.models.setting  # noqa: F401
 import cowork.models.shared_resource  # noqa: F401
 import cowork.models.skill  # noqa: F401
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.migrations import lock_migrations
 
 
 def _ensure_sqlite_dir(url: str) -> None:
@@ -67,6 +68,7 @@ def run_migrations_online() -> None:
     if connection is not None:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
         with context.begin_transaction():
+            lock_migrations(connection)
             context.run_migrations()
         return
 
@@ -78,6 +80,7 @@ def run_migrations_online() -> None:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
 
         with context.begin_transaction():
+            lock_migrations(connection)
             context.run_migrations()
 
 
