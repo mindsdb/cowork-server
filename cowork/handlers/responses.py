@@ -2707,7 +2707,7 @@ class ResponsesHandler:
             # The ticker stops before finish() or any branch below closes the
             # buffer, so it can never write after the terminal record.
             async with model_wait.running(buffer=buffer):
-                async for sse_string in harness.formatter(stream, model, event_sink):
+                async for sse_string in harness.formatter(stream, model, event_sink, form_blocks=True):
                     if lifecycle.discarded:
                         # A frame sent after a turn delete's cancel landed, such
                         # as the turn's memory record: the delete removed this

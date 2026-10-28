@@ -63,7 +63,7 @@ async def _start_channels(app):
     app.state.channel_adapters = SimpleNamespace(shutdown=_noop)
 
 
-async def _formatter(stream, model, event_sink):
+async def _formatter(stream, model, event_sink, **_kwargs):
     yield sse_frame("response.created", {"type": "response.created"})
     payload = {"type": "response.output_text.delta", "delta": PARTIAL}
     event_sink(payload["type"], payload)
