@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import specs as specs_endpoints
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -102,8 +102,8 @@ class TestCatalog:
     def test_a_personal_scope_sees_and_updates_its_own_saved_connector(self, engine):
         with Session(engine) as session:
             service = CustomConnectorService(ScopedSession(session, PERSON_A))
-            service.upsert_from_form("httpbin", HTTPBIN_FORM)
-            service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "title": "Connect httpbin again"})
+            service.upsert_from_form("httpbin", HTTPBIN_FORM, secret_values=())
+            service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "title": "Connect httpbin again"}, secret_values=())
 
         assert _catalog(engine, PERSON_A).get_connector("httpbin").label == "Connect httpbin again"
         assert _catalog(engine, PERSON_B).get_connector("httpbin") is None
@@ -116,6 +116,36 @@ class TestCatalog:
         catalog = _catalog(engine, PERSON_SHARED)
         assert catalog.get_connector("httpbin") is not None
         assert catalog.get_connector("private") is None
+
+    @pytest.mark.parametrize("scope, row_org, own", [
+        (LOCAL_SCOPE, None, True),
+        (PERSON_A, "partition-a", True),
+        (PERSON_SHARED, None, False),
+        (ORG_A, "org-a", False),
+    ], ids=["single-user install", "personal connections", "shared connections", "org mode"])
+    def test_custom_usage_notes_reach_an_agent_only_in_ones_own_scope(self, engine, scope, row_org, own):
+        _add(engine, org_id=row_org)
+        with Session(engine) as session:
+            row = session.exec(select(CustomConnector)).one()
+            row.usage_notes = "Call /bearer."
+            session.add(row)
+            session.commit()
+
+        catalog = _catalog(engine, scope)
+        notes = catalog.usage_notes_for(["httpbin"])
+
+        assert notes == ({"httpbin": "Call /bearer."} if own else {})
+        assert catalog.get_connectors()["httpbin"]["usage_notes"] == "Call /bearer."
+
+    def test_custom_usage_notes_stay_out_of_the_operator_view(self, engine, personal_deployment):
+        _add(engine)
+        with Session(engine) as session:
+            row = session.exec(select(CustomConnector)).one()
+            row.usage_notes = "Call /bearer."
+            session.add(row)
+            session.commit()
+
+        assert _catalog(engine, LOCAL_SCOPE).usage_notes_for(["httpbin"]) == {}
 
     def test_a_builtin_id_wins_over_a_custom_row(self, engine, monkeypatch):
         warnings = []

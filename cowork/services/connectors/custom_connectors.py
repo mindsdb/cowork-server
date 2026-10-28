@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -9,7 +10,7 @@ from anton.utils.datasources import scrub_output
 from pydantic import ValidationError
 
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.scoped import ScopedSelect, ScopedSession
+from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorForm, CustomConnectorUpdate
 
@@ -19,6 +20,11 @@ _KEPT_FORM_KEYS = ("how_to", "help_url")
 _COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?")
 # Matches the cap agent-facing usage notes have on built-in specs.
 USAGE_NOTES_MAX = 1600
+_URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>`]+")
+_NOTES_HOLD_A_CREDENTIAL = (
+    "connector.usage_notes looks like it holds a credential value. "
+    "Say how to authenticate (header name, scheme) without the value."
+)
 
 
 class UnstorableFormError(ValueError):
@@ -81,11 +87,39 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
         raise UnstorableFormError(f"connector.usage_notes must be at most {USAGE_NOTES_MAX} characters.")
     # Everyone in the scope reads the notes; anton's output scrubber knows the
     # key and token shapes. Best effort: an unknown shape gets through.
-    if scrub_output(notes) != notes:
-        raise UnstorableFormError(
-            "connector.usage_notes looks like it holds a credential value. "
-            "Say how to authenticate (header name, scheme) without the value."
-        )
+    if scrub_output(notes) != notes or any(urlsplit(url).password for url in _URL.findall(notes)):
+        raise UnstorableFormError(_NOTES_HOLD_A_CREDENTIAL)
+
+
+def refuse_notes_holding(form_spec: dict[str, Any], secret_values: Iterable[str]) -> None:
+    """Refuse a form whose usage notes repeat a secret value submitted with it.
+
+    The shape check above cannot know the user's own values; the notes are
+    shared with the whole scope, so one copied into them would leak.
+
+    Raises:
+        UnstorableFormError: when a value of ``secret_values`` (four or more
+            characters, so a short field cannot match ordinary prose) is in the notes.
+    """
+    meta = form_spec.get("connector") if isinstance(form_spec.get("connector"), dict) else {}
+    notes = str(meta.get("usage_notes") or "")
+    if any(len(v) >= 4 and v in notes for v in secret_values if isinstance(v, str)):
+        raise UnstorableFormError(_NOTES_HOLD_A_CREDENTIAL)
+
+
+def notes_are_the_callers_own(scope: TenantScope) -> bool:
+    """Whether ``scope``'s custom connector definitions belong to one person.
+
+    True on a single-user install, and in a personal scope whose connections
+    are personal. False in org mode, where an organization shares them, in a
+    personal scope with shared connections, and in the operator view of a
+    deployment that trusts identity headers. Their usage notes are written by
+    whoever's model built the connector, so another person's notes are data,
+    not guidance to put in front of an agent holding this caller's credentials.
+    """
+    if scope.personal:
+        return scope.partitioned_for(PersonalResource.CONNECTIONS)
+    return not scope.org_mode and not tenant_scope_required()
 
 
 def _text(value: Any, limit: int | None = None) -> str | None:
@@ -151,21 +185,30 @@ class CustomConnectorService:
         stmt = scope_definitions(self.session).where(CustomConnector.connector_id == connector_id)
         return self.session.exec(stmt).first()
 
-    def upsert_from_form(self, connector_id: str, form_spec: dict[str, Any]) -> CustomConnector:
+    def upsert_from_form(
+        self, connector_id: str, form_spec: dict[str, Any], *, secret_values: Iterable[str],
+    ) -> CustomConnector:
         """Save a handcrafted form as the scope's definition for ``connector_id``.
 
         Args:
             connector_id: The engine id the connection was saved under.
             form_spec: The handcrafted form, with its optional ``connector``
                 block (label, description, category, usage_notes).
+            secret_values: The values of the form's secret fields as submitted;
+                notes that repeat one are refused.
 
         Returns:
             The stored row. An existing definition is updated in place; one an
             admin unfeatured stays unfeatured.
 
+        Raises:
+            UnstorableFormError: when the form is unsafe to keep, its notes
+                included.
+
         Side effects:
             Commits the session.
         """
+        refuse_notes_holding(form_spec, secret_values)
         meta = form_spec.get("connector") if isinstance(form_spec.get("connector"), dict) else {}
         values = {
             "label": _text(meta.get("label"), 255) or _text(form_spec.get("title"), 255) or connector_id,
@@ -194,6 +237,9 @@ class CustomConnectorService:
             changes: The fields the caller set. A null ``category`` or
                 ``description`` clears it; a null ``label``, ``featured`` or
                 ``spec`` leaves it as it is, since none of them can be empty.
+                A ``spec`` with a ``connector`` block also sets the usage
+                notes, and any of label, description and category not sent
+                on their own, as the first save does.
 
         Returns:
             The updated row, or None when the scope has no such definition.
@@ -213,6 +259,13 @@ class CustomConnectorService:
             # The directory tile reads the column, so a new form color moves it too.
             if changes.spec.get("logo_color"):
                 row.logo_color = _text(changes.spec["logo_color"], 32)
+            meta = changes.spec.get("connector")
+            if isinstance(meta, dict):
+                if "usage_notes" in meta:
+                    row.usage_notes = _text(meta["usage_notes"])
+                for key, limit in (("label", 255), ("description", None), ("category", 64)):
+                    if key not in sent and _text(meta.get(key), limit):
+                        setattr(row, key, _text(meta[key], limit))
         if changes.label is not None:
             row.label = changes.label
         if changes.featured is not None:

@@ -87,6 +87,18 @@ def test_a_null_category_or_description_clears_it(engine):
     assert result.label == "httpbin" and result.featured is True
 
 
+def test_a_new_form_applies_its_connector_block(engine):
+    new_form = {**FORM, "connector": {"label": "httpbin v2", "usage_notes": "Call /bearer."}}
+
+    result = update_custom_connector(
+        "httpbin", CustomConnectorUpdate(spec=new_form, category="developer"), _scoped(engine),
+    )
+
+    assert result.label == "httpbin v2"
+    assert result.category == "developer"
+    assert ConnectorCatalog(_scoped(engine)).get_connectors()["httpbin"]["usage_notes"] == "Call /bearer."
+
+
 def test_replace_the_form(engine):
     new_form = {**FORM, "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}]}
 

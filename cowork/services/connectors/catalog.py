@@ -6,12 +6,13 @@ needs "is this a connector?" answers the same way for built-in and custom ids.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 from cowork.db.scoped import ScopedSession
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorSpecResponse
-from cowork.services.connectors.custom_connectors import scope_definitions
+from cowork.services.connectors.custom_connectors import notes_are_the_callers_own, scope_definitions
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,18 @@ class ConnectorCatalog(ConnectorSpecRegistry):
             custom spec, else None.
         """
         return self._base.get_connector(connector_id) or super().get_connector(connector_id)
+
+    def usage_notes_for(self, engines: Iterable[str]) -> dict[str, str]:
+        """Return engine -> usage notes for the turn context and the probe.
+
+        A custom connector's notes are model-written and, there, read with the
+        caller's credentials in reach, so they are used only when this scope's
+        definitions are its person's own (notes_are_the_callers_own). Otherwise
+        only the built-ins' notes; lookup_connector still shows the rest as data.
+        """
+        if notes_are_the_callers_own(self._session.scope):
+            return super().usage_notes_for(engines)
+        return self._base.usage_notes_for(engines)
 
     def get_connectors(self) -> dict[str, dict]:
         """Return built-in and custom specs keyed by connector id.

@@ -102,7 +102,7 @@ async def _probe(form_spec: dict, values: dict, *, scope=LOCAL_SCOPE, method=Non
 class TestService:
     def test_a_form_becomes_a_featured_definition_with_a_stable_form_id(self, engine):
         with Session(engine) as session:
-            row = CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", HTTPBIN_FORM)
+            row = CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", HTTPBIN_FORM, secret_values=())
 
             assert row.label == "httpbin"
             assert row.category == "developer"
@@ -115,12 +115,12 @@ class TestService:
     def test_saving_again_updates_the_definition_and_keeps_it_unfeatured(self, engine):
         with Session(engine) as session:
             service = CustomConnectorService(ScopedSession(session, LOCAL_SCOPE))
-            first = service.upsert_from_form("httpbin", HTTPBIN_FORM)
+            first = service.upsert_from_form("httpbin", HTTPBIN_FORM, secret_values=())
             first.featured = False
             session.add(first)
             session.commit()
 
-            again = service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "subtitle": "Updated"})
+            again = service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "subtitle": "Updated"}, secret_values=())
 
             assert again.id == first.id
             assert again.description == "Updated"
@@ -131,7 +131,7 @@ class TestService:
         with Session(engine) as session:
             with pytest.raises(UnstorableFormError):
                 CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form(
-                    "httpbin", {"form_id": "x", "fields": [{"name": "token"}]},
+                    "httpbin", {"form_id": "x", "fields": [{"name": "token"}]}, secret_values=(),
                 )
 
 
@@ -201,6 +201,63 @@ class TestProbeStream:
         assert _rows(engine) == []
         assert "not added to your connectors list" in stream
 
+    @pytest.mark.asyncio
+    async def test_a_stored_custom_form_still_masks_its_secret_fields(self, engine, vault):
+        _Probe.verdict = "success"
+        form = {**HTTPBIN_FORM, "fields": [
+            {"name": "account_code", "label": "Account code", "type": "text", "secret": True},
+        ]}
+        with Session(engine) as session:
+            CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", form, secret_values=())
+            stored = ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("httpbin")
+        submission_id = store.stage(
+            form_id=stored.form.form_id, connector_id="httpbin", conversation_id=None,
+            values={"account_code": "ac-123"}, custom_spec=stored.model_dump(),
+        )
+
+        _ = [e async for e in probe_handler.ProbeHandler(scope=LOCAL_SCOPE).run(submission_id, "httpbin", None, "", None)]
+
+        [connection] = vault.list_connections()
+        record = vault.read_record("httpbin", connection["name"])
+        assert "account_code" in record["secure_keys"]
+
+    @pytest.mark.asyncio
+    async def test_notes_that_repeat_a_submitted_secret_are_not_stored(self, engine, vault):
+        _Probe.verdict = "success"
+        token = "9f3c2a7b1e5d4c8a9f3c2a7b1e5d4c8a"
+        form = {**HTTPBIN_FORM, "connector": {**HTTPBIN_FORM["connector"], "usage_notes": f"Send X-Api-Key: {token}"}}
+
+        stream = await _probe(form, {"token": token})
+
+        assert len(vault.list_connections()) == 1
+        assert _rows(engine) == []
+        assert "not added to your connectors list" in stream
+        assert token not in stream
+
+    @pytest.mark.asyncio
+    async def test_the_probe_runs_without_notes_when_they_cannot_be_read(self, engine, vault, monkeypatch):
+        _Probe.verdict = "success"
+
+        def failing_notes(self, engines):
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(probe_handler.ConnectorCatalog, "usage_notes_for", failing_notes)
+
+        stream = await _probe(HTTPBIN_FORM, {"token": "a"})
+
+        assert _Probe.built[-1]["usage_notes"] is None
+        assert "Saved as" in stream
+
+    @pytest.mark.asyncio
+    async def test_a_grant_whose_probe_cannot_start_is_saved_but_not_listed(self, engine, vault, monkeypatch):
+        monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: None))
+
+        stream = await _probe(OAUTH_FORM, {"access_token": "t", "refresh_token": "r"}, method="oauth")
+
+        assert _Probe.runs == 0
+        assert len(vault.list_connections()) == 1
+        assert _rows(engine) == []
+        assert "not added to your connectors list" in stream
 
     @pytest.mark.asyncio
     async def test_the_probe_reads_a_custom_connectors_usage_notes(self, engine, vault):
@@ -296,6 +353,9 @@ class TestUnstorableForms:
             "usage_notes": "Send Authorization: Bearer abcdef0123456789abcdef on every call.",
         }}, "credential"),
         ({**HTTPBIN_FORM, "connector": {"usage_notes": "Key: sk-proj-abcdefghijklmnopqrstuvwx"}}, "credential"),
+        ({**HTTPBIN_FORM, "connector": {
+            "usage_notes": "Base URL https://admin:Zq8vL2mN4pR7sT1@api.example.com/v1",
+        }}, "credential"),
         ({**HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "id": "apiKey"}]}, "not valid"),
     ])
     def test_check_refuses(self, form, why):

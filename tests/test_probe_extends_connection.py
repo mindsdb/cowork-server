@@ -44,7 +44,7 @@ def probes(monkeypatch):
 def definitions(monkeypatch):
     saved: list[str] = []
 
-    async def save_definition(self, connector_id, form_spec):
+    async def save_definition(self, connector_id, form_spec, method, credentials):
         saved.append(connector_id)
 
     monkeypatch.setattr(ProbeHandler, "_save_definition", save_definition)
