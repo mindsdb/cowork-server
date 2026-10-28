@@ -198,7 +198,7 @@ def test_a_create_racing_the_same_key_for_its_name_is_refused_too(monkeypatch, m
     assert _record()["fields"]["client_secret"] == NEW_SECRET
 
 
-def test_a_lost_race_never_touches_an_existing_suffixed_connection(monkeypatch, microsoft):
+def test_a_name_taken_during_the_key_check_leaves_an_existing_suffixed_connection_alone(monkeypatch, microsoft):
     sharepoint_ep.create_connection({**BODY, "name": "corp-2"}, LOCAL_SCOPE)
     before = _record("corp-2")
     _create_during_the_check(monkeypatch, "corp", {"client_id": OTHER_CLIENT})
@@ -210,22 +210,49 @@ def test_a_lost_race_never_touches_an_existing_suffixed_connection(monkeypatch, 
     assert _record("corp-2") == before
 
 
-def test_a_create_whose_name_is_taken_during_the_save_reports_the_name_it_was_saved_under(monkeypatch, microsoft):
+def _create_during_the_save(monkeypatch, name: str, credentials_override: dict) -> None:
+    """Another writer saves ``name`` after the locked recheck, just before this create's save."""
     real_persist = sharepoint_ep.persist_connection
 
-    def persist_after_another_writer(engine, method, name, credentials, **kwargs):
-        persist_connection("sharepoint", None, name, {**credentials, "client_id": OTHER_CLIENT}, scope=LOCAL_SCOPE)
-        return real_persist(engine, method, name, credentials, **kwargs)
+    def persist_after_another_writer(engine, method, created, credentials, **kwargs):
+        persist_connection("sharepoint", None, name, {**credentials, **credentials_override}, scope=LOCAL_SCOPE)
+        return real_persist(engine, method, created, credentials, **kwargs)
 
     monkeypatch.setattr(sharepoint_ep, "persist_connection", persist_after_another_writer)
 
-    response = sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE)
 
-    assert response["name"] == "corp-2"
+def test_a_name_taken_during_the_save_is_refused_and_nothing_is_saved_under_a_suffix(monkeypatch, microsoft):
+    _create_during_the_save(monkeypatch, "corp", {"client_id": OTHER_CLIENT})
+
+    status, _ = _status(lambda: sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE))
+
+    assert status == 409
+    assert _names() == ["corp"]
+    assert _record()["fields"]["client_id"] == OTHER_CLIENT
+
+
+def test_a_name_taken_during_the_save_never_overwrites_a_same_account_suffixed_connection(monkeypatch, microsoft):
+    sharepoint_ep.create_connection({**BODY, "name": "corp-2", "user_label": "Old label"}, LOCAL_SCOPE)
+    before = _record("corp-2")
+    _create_during_the_save(monkeypatch, "corp", {"client_id": OTHER_CLIENT})
+
+    status, _ = _status(
+        lambda: sharepoint_ep.create_connection({**BODY, "client_secret": NEW_SECRET, "user_label": "New label"}, LOCAL_SCOPE)
+    )
+
+    assert status == 409
     assert sorted(_names()) == ["corp", "corp-2"]
-    assert _record("corp")["fields"]["client_id"] == OTHER_CLIENT
-    assert _record("corp-2")["fields"]["client_id"] == CLIENT_ID
-    assert _record("corp-2")["fields"]["client_secret"] == SECRET
+    assert _record("corp-2") == before
+
+
+def test_a_name_taken_during_the_save_never_creates_an_env_prefix_twin(monkeypatch, microsoft):
+    sharepoint_ep.create_connection({**BODY, "name": "corp_2"}, LOCAL_SCOPE)
+    _create_during_the_save(monkeypatch, "corp", {"client_id": OTHER_CLIENT})
+
+    status, _ = _status(lambda: sharepoint_ep.create_connection(dict(BODY), LOCAL_SCOPE))
+
+    assert status == 409
+    assert sorted(_names()) == ["corp", "corp_2"]
 
 
 def test_a_name_sharing_an_env_prefix_taken_during_the_check_is_refused(monkeypatch, microsoft):
