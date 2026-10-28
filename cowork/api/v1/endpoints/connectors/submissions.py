@@ -7,24 +7,25 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.handlers.datasource_relay import relay_cloud_submission
 from cowork.handlers.probe import ProbeHandler
 from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
-from cowork.services.connectors.submissions import store
+from cowork.services.connectors.submissions import missing_required_fields, store
 
 # AuthenticatedInOrgMode: in org mode a request with no verified principal is
 # refused with 401 before the form is read. The stream holds no request
-# session: the probe handler's database units open their own tenant-scoped
-# sessions, so no connection stays checked out while the probe waits on the
-# model.
+# session: the probe handler's and the cloud relay's database units open
+# their own tenant-scoped sessions, so no connection stays checked out while
+# the probe waits on the model or the relay waits on auth.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
@@ -62,18 +63,8 @@ def _fields_from_spec_dict(form_spec: dict, method_id: str | None) -> list[Conne
     return fields
 
 
-def _missing_required(fields: list, values: dict, skipped: list[str]) -> list[str]:
-    skipped_set = set(skipped)
-    return [
-        f.name for f in fields
-        if f.required
-        and f.name not in skipped_set
-        and (values.get(f.name) is None or str(values.get(f.name, "")).strip() == "")
-    ]
-
-
 @router.post("/")
-async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> StreamingResponse:
+async def submit_form(req: SubmitFormRequest, request: Request, scope: TenantScopeDep) -> StreamingResponse:
     try:
         connector_id = req.resolve_connector_id()
     except InvalidConnectorIdError as e:
@@ -82,6 +73,13 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     method = req.resolve_method()
+
+    # Cloud: the credential belongs in auth's encrypted store, so the branch
+    # comes before anything local — staging, the probe and the vault are all
+    # downstream of here. Everything this deployment has not enabled as a
+    # cloud method is refused there, not saved by a fallback.
+    if scope.org_mode:
+        return await relay_cloud_submission(req, connector_id, method, scope, request)
 
     spec = registry.get_connector(connector_id)
     if spec:
@@ -129,7 +127,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
             # staged. The vault refuses the save itself too.
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_CONNECTION_REFUSAL)
 
-    missing = _missing_required(fields, req.values, req.skipped)
+    missing = missing_required_fields(fields, req.values, req.skipped)
     if missing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
