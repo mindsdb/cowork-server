@@ -339,7 +339,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
     handler = object.__new__(ResponsesHandler)
     handler.principal = None  # __init__ bypassed; local-mode producer scope
 
-    async def _formatter(stream, model, event_sink):
+    async def _formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         raise exc
 

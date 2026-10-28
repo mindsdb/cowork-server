@@ -102,11 +102,11 @@ def test_remote_producer_publishes_only_after_the_reply_stream_ends_cleanly():
 
 
 def test_remote_producer_records_artifacts_on_every_other_exit():
-    """Every exit that is not a clean finish ends through end_turn, which
-    records the artifacts before it saves the answer, and a deleted turn
+    """Every exit that is not a clean finish ends through end_turn, whose
+    save records the artifacts before it saves the answer, and a deleted turn
     still records them before it drops the rest."""
     src = _norm(r.ResponsesHandler._run_remote_turn)
-    assert "await record_artifacts(completed_cleanly=False) saved = await persist(clean=False)" in src
+    assert "await record_artifacts(completed_cleanly=False) return await persist(clean=False)" in src
     assert "await record_artifacts(completed_cleanly=False) return" in src
 
 

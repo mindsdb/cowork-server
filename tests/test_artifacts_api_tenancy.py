@@ -326,7 +326,7 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
     enabled = await workspace_ep.enable_artifact_comments(
         str(row.id), card["id"], _scoped(session, org_id)
     )
-    assert enabled["enabled"] is True
+    assert enabled.enabled is True
     return row, folder, card
 
 

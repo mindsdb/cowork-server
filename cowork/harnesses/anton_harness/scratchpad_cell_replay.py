@@ -11,6 +11,8 @@ from typing import Any
 
 from anton.core.backends.base import Cell
 
+from cowork.harnesses.anton_harness.stream_formatter import CellStatus
+
 _SCRATCHPAD_END = "thought.scratchpad.end"
 _SCRATCHPAD_RESULT = "thought.scratchpad.result"
 
@@ -19,8 +21,18 @@ _SCRATCHPAD_RESULT = "thought.scratchpad.result"
 # read has to be added here too, or its events never reach it.
 SCRATCHPAD_REPLAY_ROLES = (_SCRATCHPAD_END, _SCRATCHPAD_RESULT)
 
-# Cell's outputs that have no default, for a result cut before them.
-_NO_OUTPUT = {"stdout": "", "stderr": "", "error": None}
+# Cell's stdout and stderr, which have no default, for a result cut before
+# them. Its error, which has no default either, comes from the stored status.
+_NO_OUTPUT = {"stdout": "", "stderr": ""}
+
+# What a replayed cell whose saved result lost its error field reads as, by the
+# status classify_cell_status gave the whole result: a known failure says so,
+# and a cell with no status (an event saved before statuses were) is unknown.
+_LOST_ERROR = {
+    CellStatus.error: "The cell failed; its saved result was cut before the error text.",
+    CellStatus.timeout: "The cell timed out; its saved result was cut before the error text.",
+}
+_UNCONFIRMED = "The saved result was cut before the cell's outcome, so whether it succeeded is unknown."
 
 # JSON's whitespace between tokens.
 _SPACE = re.compile(r"[ \t\n\r]*")
@@ -54,7 +66,7 @@ def _parse_json(raw: Any) -> dict[str, Any] | None:
 def _whole_fields(*, text: str) -> dict[str, Any]:
     """The fields of a JSON object cut short that the cut left whole.
 
-    The stream formatter stores at most 65,536 characters of each event, so a
+    The stream formatter stores at most 65,536 characters of each result, so a
     cell with long output, most often its logs, is stored as JSON that no
     longer parses. json.dumps(asdict(cell)) writes ``code`` first and ``logs``
     last, so ``code`` and the fields after it up to the cut still read whole.
@@ -114,16 +126,17 @@ def _ran_action(*, call: _SentCall, result_action: Any) -> str | None:
     return result_action if isinstance(result_action, str) else None
 
 
-def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
+def _ran_cell(*, content: Any, sent_code: str | None, cell_status: str | None) -> Cell | None:
     """The cell an exec result reports, or None for a result that is no cell.
 
     Plain text is none: anton closes a cell it never ran, such as a write the
     user didn't approve, with its "Not run: ..." reason as plain text. A
     result cut before its code ends (see _whole_fields) makes a cell from the
-    code the model sent, `sent_code`, with no outputs, when the call's end
-    event kept that code whole. It often does: json.dumps escapes each
-    non-ASCII character to six, while the end event keeps the model's tool
-    input as written.
+    code the model sent, `sent_code`, with empty stdout and stderr, when the
+    call's end event kept that code whole. New end events from turns this
+    process runs keep the full input; older stored events, and a remote pod's,
+    may have cut it too. A result cut before its error field counts as failed
+    unless `cell_status` is "ok".
     """
     payload = _parse_json(content)
     if payload is None:
@@ -131,6 +144,11 @@ def _ran_cell(*, content: Any, sent_code: str | None) -> Cell | None:
         if not (cut_in_code and sent_code is not None):
             return None
         payload = {"code": sent_code}
+    if "error" not in payload:
+        # format_responses_stream sets cell_status from classify_cell_status on
+        # the whole result, before it cuts the stored content. Only confirmed
+        # success lets an earlier write establish file ownership.
+        payload["error"] = None if cell_status == CellStatus.ok else _LOST_ERROR.get(cell_status, _UNCONFIRMED)
     # A result cut before its outputs still makes a cell, so the write check
     # sees the code it ran.
     with contextlib.suppress(TypeError, ValueError):
@@ -183,7 +201,9 @@ def extract_scratchpad_cells(events: Iterable[Any]) -> list[Cell]:
             call = sent.pop(tool_use_id, None) if tool_use_id else last
             last = None
             if call is not None and _ran_action(call=call, result_action=data.get("tool_action")) == "exec":
-                cell = _ran_cell(content=data.get("content"), sent_code=call.code)
+                status = data.get("cell_status")
+                cell = _ran_cell(content=data.get("content"), sent_code=call.code,
+                                 cell_status=status if isinstance(status, str) else None)
                 if cell is not None:
                     cells.append(cell)
 
