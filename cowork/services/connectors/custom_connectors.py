@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 from anton.utils.datasources import scrub_output
 from pydantic import ValidationError
+from sqlalchemy import false
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
@@ -84,8 +85,8 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
     notes = str(meta.get("usage_notes") or "")
     if len(notes) > USAGE_NOTES_MAX:
         raise UnstorableFormError(f"connector.usage_notes must be at most {USAGE_NOTES_MAX} characters.")
-    # Hygiene for the notes' author: anton's output scrubber knows the key and
-    # token shapes. Notes never reach anyone else (notes_are_the_callers_own).
+    # Hygiene for the builder's own prompt: anton's output scrubber knows the key
+    # and token shapes. No one else reads a definition (scope_is_one_persons).
     if scrub_output(notes) != notes:
         raise UnstorableFormError(
             "connector.usage_notes looks like it holds a credential value. "
@@ -93,7 +94,7 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
         )
 
 
-def notes_are_the_callers_own(scope: TenantScope) -> bool:
+def scope_is_one_persons(scope: TenantScope) -> bool:
     """Whether ``scope``'s custom connector definitions belong to one person.
 
     True on a single-user install, and in a personal scope whose connections
@@ -101,9 +102,11 @@ def notes_are_the_callers_own(scope: TenantScope) -> bool:
     personal scope with shared connections, and in the operator view of a
     deployment that trusts identity headers.
 
-    Usage notes are model-written and may hold what the builder typed, in any
-    encoding, so they are stored, and used in a turn or a probe, only where
-    this is True: they then never reach a person other than their author.
+    Everything in a definition (label, description, help text, the form,
+    usage notes) is model-written and may hold what its builder typed, in
+    any encoding. Custom connectors are therefore built and served outside
+    org mode only where this is True, so none reaches another person.
+    Sharing them across people is not built yet.
     """
     if scope.personal:
         return scope.partitioned_for(PersonalResource.CONNECTIONS)
@@ -150,9 +153,14 @@ def scope_definitions(session: ScopedSession) -> ScopedSelect:
     connections are personal), the scoped session already keys rows by the
     scope's org_id. Elsewhere the session adds no filter, so only the shared
     rows (org_id NULL) are the scope's; another scope's rows are left out.
+    Outside org mode, a scope that is not one person's sees none
+    (scope_is_one_persons), rows written before that rule included.
     """
+    scope = session.scope
     stmt = session.select(CustomConnector)
-    if not session.scope.partitioned_for(PersonalResource.CONNECTIONS):
+    if not scope.org_mode and not scope_is_one_persons(scope):
+        return stmt.where(false())
+    if not scope.partitioned_for(PersonalResource.CONNECTIONS):
         stmt = stmt.where(CustomConnector.org_id.is_(None))
     return stmt
 
@@ -168,11 +176,6 @@ class CustomConnectorService:
         """
         self.session = session
 
-    def _kept_notes(self, notes: Any) -> str | None:
-        """``notes`` as stored: the text in a scope that is one person's,
-        else None, so nothing the builder typed reaches anyone else."""
-        return _text(notes) if notes_are_the_callers_own(self.session.scope) else None
-
     def get(self, connector_id: str) -> CustomConnector | None:
         """Return the scope's definition for ``connector_id``, or None."""
         stmt = scope_definitions(self.session).where(CustomConnector.connector_id == connector_id)
@@ -184,27 +187,32 @@ class CustomConnectorService:
         Args:
             connector_id: The engine id the connection was saved under.
             form_spec: The handcrafted form, with its optional ``connector``
-                block (label, description, category, usage_notes). Its usage
-                notes are kept only in a scope that is one person's
-                (notes_are_the_callers_own).
+                block (label, description, category, usage_notes).
 
         Returns:
             The stored row. An existing definition is updated in place; one an
             admin unfeatured stays unfeatured.
 
         Raises:
-            UnstorableFormError: when the form is invalid or unsafe to keep.
+            UnstorableFormError: when the form is invalid or unsafe to keep,
+                or the scope is shared by several people outside org mode
+                (scope_is_one_persons), where a definition would reach them all.
 
         Side effects:
             Commits the session.
         """
+        scope = self.session.scope
+        if not scope.org_mode and not scope_is_one_persons(scope):
+            raise UnstorableFormError(
+                "custom connectors are kept only for one person's own connections on this deployment."
+            )
         meta = form_spec.get("connector") if isinstance(form_spec.get("connector"), dict) else {}
         values = {
             "label": _text(meta.get("label"), 255) or _text(form_spec.get("title"), 255) or connector_id,
             "description": _text(meta.get("description")) or _text(form_spec.get("subtitle")) or "",
             "category": _text(meta.get("category"), 64),
             "logo_color": _text(form_spec.get("logo_color"), 32),
-            "usage_notes": self._kept_notes(meta.get("usage_notes")),
+            "usage_notes": _text(meta.get("usage_notes")),
             "spec": stored_form(connector_id, form_spec),
         }
         row = self.get(connector_id)
@@ -251,7 +259,7 @@ class CustomConnectorService:
             meta = changes.spec.get("connector")
             if isinstance(meta, dict):
                 if "usage_notes" in meta:
-                    row.usage_notes = self._kept_notes(meta["usage_notes"])
+                    row.usage_notes = _text(meta["usage_notes"])
                 for key, limit in (("label", 255), ("description", None), ("category", 64)):
                     if key not in sent and _text(meta.get(key), limit):
                         setattr(row, key, _text(meta[key], limit))

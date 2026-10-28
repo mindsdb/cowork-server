@@ -57,6 +57,16 @@ def _add(engine, *, connector_id="httpbin", org_id=None, featured=True, label="h
         session.commit()
 
 
+def _add_with_notes(engine, notes, *, org_id=None):
+    """Store the httpbin definition with ``notes`` as its usage notes."""
+    _add(engine, org_id=org_id)
+    with Session(engine) as session:
+        row = session.exec(select(CustomConnector)).one()
+        row.usage_notes = notes
+        session.add(row)
+        session.commit()
+
+
 def _catalog(engine, scope) -> ConnectorCatalog:
     return ConnectorCatalog(ScopedSession(Session(engine), scope))
 
@@ -109,43 +119,42 @@ class TestCatalog:
         assert _catalog(engine, PERSON_B).get_connector("httpbin") is None
         assert _catalog(engine, LOCAL_SCOPE).get_connector("httpbin") is None
 
-    def test_a_personal_scope_with_shared_connections_sees_only_shared_rows(self, engine):
+    def test_a_scope_shared_by_several_people_sees_no_custom_connector(self, engine):
         _add(engine)
         _add(engine, connector_id="private", org_id=PERSON_A.org_id)
 
         catalog = _catalog(engine, PERSON_SHARED)
-        assert catalog.get_connector("httpbin") is not None
+        assert catalog.get_connector("httpbin") is None
         assert catalog.get_connector("private") is None
+        assert not any(c.custom for c in catalog.list_connectors())
+
+    def test_the_operator_view_sees_no_custom_connector(self, engine, personal_deployment):
+        _add(engine)
+
+        catalog = _catalog(engine, LOCAL_SCOPE)
+        assert catalog.get_connector("httpbin") is None
+        assert catalog.usage_notes_for(["httpbin"]) == {}
 
     @pytest.mark.parametrize("scope, row_org, own", [
         (LOCAL_SCOPE, None, True),
         (PERSON_A, "partition-a", True),
-        (PERSON_SHARED, None, False),
         (ORG_A, "org-a", False),
-    ], ids=["single-user install", "personal connections", "shared connections", "org mode"])
+    ], ids=["single-user install", "personal connections", "org mode"])
     def test_custom_usage_notes_reach_an_agent_only_in_ones_own_scope(self, engine, scope, row_org, own):
-        _add(engine, org_id=row_org)
-        with Session(engine) as session:
-            row = session.exec(select(CustomConnector)).one()
-            row.usage_notes = "Call /bearer."
-            session.add(row)
-            session.commit()
+        _add_with_notes(engine, "Call /bearer.", org_id=row_org)
 
         catalog = _catalog(engine, scope)
-        notes = catalog.usage_notes_for(["httpbin"])
 
-        assert notes == ({"httpbin": "Call /bearer."} if own else {})
+        assert catalog.usage_notes_for(["httpbin"]) == ({"httpbin": "Call /bearer."} if own else {})
         assert catalog.get_connectors()["httpbin"]["usage_notes"] == "Call /bearer."
 
-    def test_custom_usage_notes_stay_out_of_the_operator_view(self, engine, personal_deployment):
-        _add(engine)
-        with Session(engine) as session:
-            row = session.exec(select(CustomConnector)).one()
-            row.usage_notes = "Call /bearer."
-            session.add(row)
-            session.commit()
+    def test_custom_usage_notes_are_scrubbed_before_an_agent_reads_them(self, engine):
+        _add_with_notes(engine, "Old key sk-proj-abcdefghijklmnopqrstuvwx, now rotated.")
 
-        assert _catalog(engine, LOCAL_SCOPE).usage_notes_for(["httpbin"]) == {}
+        notes = _catalog(engine, LOCAL_SCOPE).usage_notes_for(["httpbin"])
+
+        assert "sk-proj-abcdefghijklmnopqrstuvwx" not in notes["httpbin"]
+        assert notes["httpbin"].endswith(", now rotated.")
 
     def test_a_builtin_id_wins_over_a_custom_row(self, engine, monkeypatch):
         warnings = []

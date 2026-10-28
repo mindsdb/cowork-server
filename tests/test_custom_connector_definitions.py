@@ -227,16 +227,19 @@ class TestProbeStream:
         assert "account_code" in record["secure_keys"]
 
     @pytest.mark.asyncio
-    async def test_notes_are_not_stored_where_another_person_could_read_them(self, engine, vault):
+    async def test_a_scope_shared_by_several_people_saves_the_connection_but_no_definition(self, engine, vault):
         _Probe.verdict = "success"
         token = "9f3c2a7b+e5d/4c8a9f3c2a7b1e5d4c8a"
-        form = {**HTTPBIN_FORM, "connector": {**HTTPBIN_FORM["connector"], "usage_notes": f"Key %2B {token}"}}
+        form = {
+            **HTTPBIN_FORM, "how_to": f"Paste {token}",
+            "connector": {**HTTPBIN_FORM["connector"], "description": token, "usage_notes": f"Key %2B {token}"},
+        }
 
-        await _probe(form, {"token": token}, scope=SHARED_CONNECTIONS)
+        stream = await _probe(form, {"token": token}, scope=SHARED_CONNECTIONS)
 
-        [row] = _rows(engine)
-        assert row.connector_id == "httpbin"
-        assert row.usage_notes is None
+        assert len(vault.list_connections()) == 1
+        assert _rows(engine) == []
+        assert "not added to your connectors list" in stream
 
     @pytest.mark.asyncio
     async def test_the_probe_runs_without_notes_when_they_cannot_be_read(self, engine, vault, monkeypatch):
