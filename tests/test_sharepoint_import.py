@@ -428,5 +428,24 @@ def test_a_later_page_that_is_throttled_keeps_its_own_error(microsoft, project):
     response = _import(name, ["01R"])
 
     assert response.status_code == 429
-    assert "The folder changed" not in response.json()["detail"]
+    assert response.json()["detail"] == "SharePoint is busy right now. Try again in a minute."
     assert _tree(folder) == {}
+    assert microsoft.content_requests() == []
+
+
+@pytest.mark.parametrize("picks", [["01O", "01R"], ["01R", "01O"]], ids=["inner-first", "outer-first"])
+def test_a_skipped_item_is_reported_under_the_outer_pick_whatever_the_pick_order(microsoft, project, picks):
+    name, _id, folder = project
+    microsoft.folder(
+        "01R",
+        "Reports",
+        [microsoft.folder("01O", "Old", [microsoft.file("01a", "a.txt", b"a"), microsoft.file("01d", ".DS_Store", b"mac")])],
+    )
+
+    response = _import(name, picks)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "imported": [{"path": "Reports/Old/a.txt", "size": 1}],
+        "skipped": [{"path": "Reports/Old/.DS_Store", "reason": "its name starts with a dot"}],
+    }
