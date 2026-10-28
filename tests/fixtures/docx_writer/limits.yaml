@@ -1,0 +1,7 @@
+# The Word writer's limits as specified. The module's constants must match,
+# so a changed limit fails a test instead of passing silently.
+max_depth: 256
+max_nodes: 200000
+deadline_seconds: 10.0
+max_table_columns: 63
+max_table_cells: 20000

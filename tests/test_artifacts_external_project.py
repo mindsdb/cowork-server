@@ -140,7 +140,7 @@ def test_the_serve_url_uses_the_row_name(projects_root, tmp_path):
     target = base / "report" / "index.html"
     target.write_text("<p>x</p>")
 
-    url = serve_url_for(target, artifacts_base=base, project_name="notes-2")
+    url = serve_url_for(target, artifacts_base=base, project_name="notes-2", scope=LOCAL_SCOPE)
     assert url == "/api/v1/artifacts/serve/notes-2/report/index.html"
 
 

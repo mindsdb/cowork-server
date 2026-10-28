@@ -2,6 +2,7 @@
 a failed slug is rolled back and logged as an error naming it, and the slugs
 after it are still recorded."""
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import logging
 from types import SimpleNamespace
@@ -85,7 +86,7 @@ def test_a_failed_slug_is_logged_as_an_error_and_the_next_slug_is_recorded(tmp_p
     lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
     assert len(lines) == 2
     for line in lines:
-        assert f"[Project:{project.id}][Conversation:{conversation_id}][Artifact:{FAILING!r}]" in line
+        assert_log_fields(line, project_id=str(project.id), conversation_id=str(conversation_id), artifact_slug=FAILING)
         assert "b-report" not in line
     assert DRIVER_TEXT not in logged.output()
 
@@ -128,7 +129,4 @@ def test_a_refused_index_session_names_the_conversation_project_and_slugs(monkey
     assert (record.conversation_id, record.project_id, record.artifact_slugs) == (
         conversation_id, project_id, ("sales-report", "chart"),
     )
-    assert (
-        f"[Project:{project_id}][Conversation:{conversation_id}][Artifacts:'sales-report', 'chart']: "
-        "Database operation failed"
-    ) in logged.output()
+    assert_log_fields(logged.output(), project_id=str(project_id), conversation_id=str(conversation_id), artifact_slugs=["sales-report", "chart"])

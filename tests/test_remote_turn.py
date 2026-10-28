@@ -2,12 +2,20 @@
 ResponsesHandler is replaced wholesale per test; its helpers have coverage elsewhere."""
 from __future__ import annotations
 
+import asyncio
+import json
 from uuid import uuid4
 
 import pytest
 
 import cowork.turnqueue.remote_turn as remote_turn_mod
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
+from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
+from cowork.turnqueue.producer import RemoteWorkspace
+from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
+from tests._logging_assertions import assert_log_fields
 
 
 class _FakeScope:
@@ -20,16 +28,25 @@ class _FakeSession:
 
 
 def _fake_handler(
-    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None
+    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
+    remote_agent_files=None, remote_workspace=None, earlier_answers=None,
 ):
     """Replace ResponsesHandler with a stand-in exposing only the methods
-    remote_turn_events calls, resolved at call time like every other name here."""
+    remote_turn_events calls, resolved at call time like every other name here.
+    The earlier answers' read is replaced too, by ``earlier_answers`` or by
+    one that finds none."""
+
+    async def no_earlier_answers(*, conversation_id, scope):
+        return ()
+
+    monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
             "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
             "_persist_remote_compaction": staticmethod(lambda s, *, conv_id, data, seed_info: None),
-            "_remote_workspace": staticmethod(lambda s, c: {}),
+            "_remote_workspace": staticmethod(remote_workspace or (lambda s, c: None)),
+            "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c, *, workspace: None)),
             "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
         },
@@ -37,13 +54,84 @@ def _fake_handler(
 
 
 async def _drain(gen):
+    """The turn's events after the context every turn opens with, which
+    test_the_turn_opens_with_its_context pins."""
     events = []
     try:
         async for event in gen:
-            events.append(event)
+            if not isinstance(event, TurnContext):
+                events.append(event)
     except RemoteTurnFailed as exc:
         return events, exc
     return events, None
+
+
+@pytest.mark.asyncio
+async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
+    conv_id = uuid4()
+    files = AgentFiles.in_cloud_pod(tmp_path, conversation_id=conv_id, workspace_rel_path="projects/general")
+    earlier = EarlierAnswer(figures=[Figure(start=0, end=5, text="4,600", origin=FigureOrigin.step)])
+    session = _FakeSession()
+    reads = []
+
+    async def read_earlier_answers(*, conversation_id, scope):
+        reads.append((conversation_id, scope))
+        return (earlier,)
+
+    _fake_handler(
+        monkeypatch, remote_agent_files=lambda s, c, *, workspace: files if c == conv_id else None,
+        earlier_answers=read_earlier_answers,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "There are 250."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    events = [event async for event in remote_turn_events(
+        session=session, conv_id=conv_id, org_id="org-123", user_id=None,
+        input_text="How many at S1?", model="anton", turn_rows=[],
+    )]
+
+    assert events[0] == TurnContext(question="How many at S1?", files=files, earlier_answers=(earlier,))
+    assert not any(isinstance(event, TurnContext) for event in events[1:])
+    # Read in a unit of its own under the channel's scope, never on the
+    # channel's shared session.
+    assert reads == [(conv_id, session.scope)]
+
+
+@pytest.mark.asyncio
+async def test_the_turn_looks_up_its_workspace_once(monkeypatch):
+    """The job and the pod's files are placed by the same project path."""
+    workspace = RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/proj")
+    looked_up: list[object] = []
+    placed: list[RemoteWorkspace | None] = []
+    sent: list[RemoteWorkspace | None] = []
+
+    def remote_workspace(session, conv_id):
+        looked_up.append(conv_id)
+        return workspace
+
+    def remote_agent_files(session, conv_id, *, workspace):
+        placed.append(workspace)
+
+    _fake_handler(monkeypatch, remote_workspace=remote_workspace, remote_agent_files=remote_agent_files)
+
+    async def fake_replies(**kwargs):
+        sent.append(kwargs["workspace"])
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert len(looked_up) == 1
+    assert placed == [workspace]
+    assert sent == [workspace]
 
 
 @pytest.mark.asyncio
@@ -134,6 +222,125 @@ async def test_turn_history_mutates_the_callers_turn_rows_list(monkeypatch):
     ))
 
     assert turn_rows == rows
+
+
+@pytest.mark.asyncio
+async def test_turn_history_reaches_the_formatter_as_the_pod_sent_it(monkeypatch):
+    """The formatter finds the answer's figures in every tool's result, so it
+    reads the rows before the replay caps trim them; the caller saves the
+    trimmed ones."""
+    _fake_handler(monkeypatch)
+    page = "Overtime rate: $42 per hour.\n" + "filler " * 4_000
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "w1", "name": "web_fetch", "input": {"url": "https://example.com/rates"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w1", "content": page}]},
+    ]
+
+    async def fake_replies(**kwargs):
+        yield "turn_history", {"rows": rows}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    turn_rows = []
+    events, _ = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
+    ))
+
+    [history] = [event for event in events if isinstance(event, TurnHistory)]
+    assert history.read == rows
+    assert history.rows == turn_rows
+    assert turn_rows[1]["content"][0]["content"].startswith("[tool output omitted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["compaction-reply", "compacted-step"])
+async def test_a_compacted_turns_history_reaches_the_formatter_and_none_is_kept(monkeypatch, signal):
+    """A turn that compacted ran near or over the context window, so its rows
+    are read for the answer's figures and not kept for replay. A summary
+    sends both signals; a hard truncation sends only the step. The pod goes
+    on streaming the turn's rounds after the compaction."""
+    _fake_handler(monkeypatch)
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "w1", "name": "web_fetch", "input": {"url": "https://example.com/rates"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w1", "content": "Overtime: $42"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "w4", "name": "web_fetch", "input": {"url": "https://example.com/lines"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w4", "content": "9 lines"}]},
+    ]
+
+    async def fake_replies(**kwargs):
+        if signal == "compacted-step":
+            yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        yield "turn_step", {"step": "tool_start", "id": "w4", "name": "web_fetch"}
+        yield "turn_step", {"step": "tool_end", "id": "w4", "args": json.dumps({"url": "https://example.com/lines"})}
+        yield "turn_step", {"step": "progress", "phase": "tool_done", "id": "w4", "ok": True}
+        if signal == "compaction-reply":
+            yield "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}
+        yield "turn_history", {"rows": rows}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    turn_rows = []
+    events, _ = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
+    ))
+
+    [history] = [event for event in events if isinstance(event, TurnHistory)]
+    assert history.read == rows
+    assert history.rows == []
+    assert turn_rows == []
+
+
+@pytest.mark.asyncio
+async def test_a_compacted_turns_history_frame_without_a_list_of_rows_reaches_the_formatter_as_no_rows(monkeypatch):
+    """A compacted turn's rows reach the formatter only as the pod sent
+    them, so a frame whose rows are not a list carries none: the formatter
+    hears of no rows, as from a pod that sends no frame after a compaction."""
+    _fake_handler(monkeypatch)
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        yield "turn_history", {"rows": "not a list"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    turn_rows = []
+    events, _ = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
+    ))
+
+    assert [event for event in events if isinstance(event, TurnHistory)] == []
+    assert turn_rows == []
+
+
+@pytest.mark.asyncio
+async def test_the_turns_context_carries_the_history_the_pod_is_seeded_with(monkeypatch):
+    seeded = [
+        {"role": "user", "content": "What is at S1?"},
+        {"role": "assistant", "content": "S1 holds 250 units."},
+    ]
+    _fake_handler(monkeypatch, remote_seed_history=lambda s, c: (seeded, None))
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    events = [event async for event in remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="And at S2?", model="anton", turn_rows=[],
+    )]
+
+    assert isinstance(events[0], TurnContext)
+    assert events[0].history == seeded
 
 
 @pytest.mark.asyncio
@@ -263,3 +470,141 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
     ))
     assert index.call_args.kwargs["attribute_by_provenance"] is True
     assert index.call_args.kwargs["completed_cleanly"] is (not failed)
+
+
+@pytest.fixture
+def controller_flags(monkeypatch):
+    """The Redis the controller's cancel flags are written to."""
+    import fakeredis.aioredis
+
+    from cowork.streaming import cancellation
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(cancellation, "get_redis", lambda: client)
+    return client
+
+
+def _replies_that_wait(sent: list[dict]):
+    """A controller that answers with one delta, then runs on with no terminal."""
+    started = asyncio.Event()
+
+    async def replies(**kwargs):
+        sent.append(kwargs)
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "partial"}
+        started.set()
+        await asyncio.Event().wait()
+
+    return replies, started
+
+
+@pytest.mark.parametrize("correlation_id", [None, "corr-given"], ids=["minted", "given"])
+async def test_a_cancelled_channel_turn_stops_its_controller_turn(monkeypatch, controller_flags, correlation_id):
+    """Shutdown's drain of channel tasks cancels a channel turn still running.
+    No registry handle covers it, so the turn itself writes the controller's
+    cancel flag, under the correlation id the job went out with."""
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, started = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    turn = asyncio.create_task(_drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[], correlation_id=correlation_id,
+    )))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    sent_id = sent[0]["correlation_id"]
+    assert sent_id, "the job went out with no correlation id"
+    if correlation_id is not None:
+        assert sent_id == correlation_id
+    assert await controller_flags.keys("*") == [cancel_flag_key(sent_id)]
+
+
+async def test_a_channel_turn_its_reader_abandons_stops_its_controller_turn(monkeypatch, controller_flags):
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, _ = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    events = remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    )
+    async for event in events:
+        if getattr(event, "text", None) == "partial":
+            break
+    await events.aclose()
+
+    assert await controller_flags.keys("*") == [cancel_flag_key(sent[0]["correlation_id"])]
+
+
+@pytest.mark.parametrize("terminal", ["turn_completed", "turn_failed"])
+async def test_a_channel_turn_that_reached_its_terminal_writes_no_cancel_flag(
+    monkeypatch, controller_flags, terminal,
+):
+    _fake_handler(monkeypatch)
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "done"}
+        yield terminal, {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert await controller_flags.keys("*") == []
+
+
+async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_written(
+    monkeypatch, caplog, owned_logger,
+):
+    """Redis down at shutdown: the controller cannot be told, which is logged,
+    and the channel task still ends cancelled rather than with the Redis
+    error, which drain_background_tasks would get in place of the cancel. The
+    hosted log line names the turn in fields, since its formatter drops a
+    message's arguments."""
+    import logging
+
+    from cowork.streaming import cancellation
+
+    def unreachable():
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(cancellation, "get_redis", unreachable)
+    logged = owned_logger(cancellation.logger.name, level=logging.WARNING)
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, started = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    turn = asyncio.create_task(_drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    )))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    records = [
+        r for r in caplog.records
+        if r.name == cancellation.logger.name and r.levelno == logging.WARNING
+    ]
+    correlation_id = sent[0]["correlation_id"]
+    fields = {
+        "event": "controller_turn_stop_failed",
+        "request_id": correlation_id,
+        "turn_id": correlation_id,
+        "reason": "channel_turn_ended",
+    }
+    assert [{name: getattr(r, name) for name in fields} for r in records] == [fields]
+    assert isinstance(records[0].exc_info[1], ConnectionError)
+    assert_log_fields(logged.output(), **fields)

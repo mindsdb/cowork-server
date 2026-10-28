@@ -1,11 +1,12 @@
 """The surface kwarg must never be able to fail a turn (ENG-1459).
 
-cowork-server pins anton to a *branch*, so the installed anton can legitimately
-predate anton's half of this change. Passing an unexpected keyword to
-`ChatSessionConfig` would then raise on **every** turn — an unacceptable
-outcome for a telemetry field, and the exact version-skew shape that has bitten
-this seam before (a settings key the server 400s on because the renderer leads
-the server).
+Passing an unexpected keyword to `ChatSessionConfig` raises on **every** turn —
+an unacceptable outcome for a telemetry field, and the exact version-skew shape
+that has bitten this seam before (a settings key the server 400s on because the
+renderer leads the server). Every anton this server can start with declares
+`surface`: anton's half of this change predates the
+`anton.core.artifacts.internal_files` constants the server imports at startup.
+So `surface_kwarg`'s check serves only an anton too old to start this server.
 """
 
 import dataclasses

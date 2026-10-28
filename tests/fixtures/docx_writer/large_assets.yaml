@@ -1,0 +1,56 @@
+# Documents holding more data: URIs than libxml2 reads with huge_tree off:
+# it stops after about 10 MB of large attribute or text tokens. Each case
+# repeats `asset` `count` times in place of {assets} in `html`; {index}
+# numbers the copy and {uri} is that copy's source. Every PNG is distinct
+# and about png_bytes long. The converted document must keep its heading,
+# its last paragraph "END" and `pictures` pictures, with no closing note.
+png_bytes: 1900000
+
+# The writer's own input, with each {uri} a base64 data: URI.
+writer:
+  - name: images_in_the_body
+    html: "<h1>Report</h1>{assets}<p>END</p>"
+    asset: '<p><img src="{uri}" alt="chart {index}"></p>'
+    count: 6
+    pictures: 6
+  - name: css_backgrounds_in_the_head
+    html: "<html><head><style>{assets}</style></head><body><h1>Report</h1><p>END</p></body></html>"
+    asset: ".b{index}{background:url({uri})}"
+    count: 6
+    pictures: 0
+  - name: css_backgrounds_in_style_attributes
+    html: "<h1>Report</h1>{assets}<p>END</p>"
+    asset: '<div style="background:url({uri})">block {index}</div>'
+    count: 6
+    pictures: 0
+
+# Artifacts run through the inliner in Word mode at its byte budget, with
+# each {uri} a file in the artifact folder.
+inliner:
+  - name: images_at_the_word_budget
+    budget: 26214400
+    html: "<h1>Report</h1>{assets}<p>END</p>"
+    asset: '<p><img src="{uri}" alt="chart {index}"></p>'
+    count: 12
+    pictures: 12
+  - name: css_backgrounds_at_the_org_budget
+    budget: 10485760
+    html: "<html><head><style>{assets}</style></head><body><h1>Report</h1><p>END</p></body></html>"
+    asset: ".b{index}{background:url({uri})}"
+    count: 4
+    pictures: 0
+
+# Long data: URIs outside an image source. {uri} is one data: URI of a PNG
+# about png_bytes long, past the length the writer sets aside. Each case's
+# html converts to `paragraphs`.
+restored:
+  png_bytes: 3000
+  cases:
+    # Text, a tail and an alt read back unchanged.
+    - name: text_tail_and_alt
+      html: '<p>{uri}</p><p><b>bold</b> {uri}</p><p><img src="chart.png" alt="{uri}"></p>'
+      paragraphs: ["{uri}", "bold {uri}", "[image: {uri}]"]
+    # The parser accepts attribute names that lxml refuses to set.
+    - name: attribute_names_lxml_refuses
+      html: '<p {="{uri}" {a="{uri}" {}x="{uri}">kept</p>'
+      paragraphs: ["kept"]

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from sqlmodel import Session, select
 
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.project import Project
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID, ProjectService
@@ -562,3 +563,382 @@ def test_delete_project_cascades_all_members_conversations(db):
     with Session(db) as s:
         remaining = s.exec(_select(Conversation).where(Conversation.project_id == proj.id)).all()
     assert remaining == []
+
+
+# ── personal partitions (local tenancy with trusted identity headers) ──────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+SUB_A = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+SUB_B = "8a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+
+
+def _person(*, partition: str, sub: str, resources=None) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=sub,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def test_every_person_gets_their_own_general(db, personal_deployment, tmp_path):
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
+    bob = _svc(db, _person(partition=PARTITION_B, sub=SUB_B))
+
+    ga = alice.ensure_general_for_scope()
+    gb = bob.ensure_general_for_scope()
+
+    assert ga is not None and gb is not None
+    assert ga.id != gb.id and GENERAL_PROJECT_ID not in {ga.id, gb.id}
+    assert (ga.org_id, ga.created_by) == (PARTITION_A, SUB_A)
+    assert (gb.org_id, gb.created_by) == (PARTITION_B, SUB_B)
+    assert Path(ga.path) == tmp_path / PARTITION_A / "projects" / GENERAL_PROJECT
+    assert alice.ensure_general_for_scope().id == ga.id
+    assert [p.id for p in alice.list_projects()] == [ga.id]
+    # The operator view still has the seeded deployment row.
+    assert _svc(db, LOCAL_SCOPE).ensure_general_for_scope().id == GENERAL_PROJECT_ID
+
+
+def test_a_person_with_shared_projects_uses_the_seeded_general(db, personal_deployment):
+    shared = _person(partition=PARTITION_A, sub=SUB_A, resources=frozenset())
+    general = _svc(db, shared).ensure_general_for_scope()
+    assert general is not None and general.id == GENERAL_PROJECT_ID
+    assert general.org_id is None
+
+
+def test_a_partition_refuses_to_adopt_a_server_folder(db, personal_deployment, tmp_path):
+    from cowork.services.projects import ProjectPathNotAllowedError
+
+    chosen = tmp_path / "outside" / "notes"
+    chosen.mkdir(parents=True)
+    with pytest.raises(ProjectPathNotAllowedError):
+        _svc(db, _person(partition=PARTITION_A, sub=SUB_A)).create_project("notes", path=chosen)
+    assert _raw(db).exec(select(Project).where(Project.name == "notes")).first() is None
+
+
+@pytest.mark.parametrize("who", ["person", "operator"])
+def test_a_trusted_deployment_refuses_to_adopt_a_folder_with_projects_shared(
+    db, personal_deployment, tmp_path, who
+):
+    """Projects shared change nothing: skill links reach no adopted folder on
+    a deployment that names people, so its turns would see no saved skills."""
+    from cowork.services.projects import ProjectPathNotAllowedError
+
+    chosen = tmp_path / "outside" / "notes"
+    chosen.mkdir(parents=True)
+    scope = (
+        _person(partition=PARTITION_A, sub=SUB_A, resources=frozenset({PersonalResource.MEMORY}))
+        if who == "person"
+        else LOCAL_SCOPE
+    )
+    with pytest.raises(ProjectPathNotAllowedError):
+        _svc(db, scope).create_project("notes", path=chosen)
+    assert _raw(db).exec(select(Project).where(Project.name == "notes")).first() is None
+
+
+def test_the_desktop_still_adopts_a_folder(db, tmp_path):
+    chosen = tmp_path / "outside" / "notes"
+    chosen.mkdir(parents=True)
+    desktop = _svc(db, LOCAL_SCOPE)
+    project = desktop.create_project("notes", path=chosen)
+    assert Path(project.path) == chosen.resolve()
+    assert desktop.directory_is_external(project) is True
+
+
+def test_no_partition_project_reads_as_an_adopted_folder(db, personal_deployment):
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
+    project = alice.create_project("reports")
+    # Even a row whose path sits outside the partition root is a stale row here,
+    # not a chosen folder.
+    assert alice.directory_is_external(project) is False
+    raw = _raw(db)
+    row = raw.get(Project, project.id)
+    row.path = "/somewhere/else/reports"
+    raw.add(row)
+    raw.commit()
+    assert alice.directory_is_external(alice.get_project(project.id)) is False
+
+
+def test_partition_creates_and_renames_link_no_skills(db, personal_deployment, monkeypatch):
+    """Skill links point from the unkeyed store into the unkeyed projects root,
+    found by name. Two people who both own `notes` must not receive each
+    other's links, so a partition distributes none."""
+    calls = []
+    monkeypatch.setattr(
+        "cowork.services.skill_links.reconcile_project",
+        lambda *args, **kwargs: calls.append(kwargs.get("project_name")),
+    )
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
+    bob = _svc(db, _person(partition=PARTITION_B, sub=SUB_B))
+    bob.create_project("notes")
+    mine = alice.create_project("notes")
+    alice.update_project(mine.id, name="notes-renamed")
+
+    assert calls == []
+
+
+def test_shared_projects_and_skills_keep_todays_links(db, personal_deployment, monkeypatch):
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "")
+    get_app_settings.cache_clear()
+    calls = []
+    monkeypatch.setattr(
+        "cowork.services.skill_links.reconcile_project",
+        lambda *args, **kwargs: calls.append(kwargs.get("project_name")),
+    )
+    shared = _svc(db, _person(partition=PARTITION_A, sub=SUB_A, resources=frozenset()))
+    project = shared.create_project("notes")
+    shared.update_project(project.id, name="notes-renamed")
+
+    assert calls == ["notes", "notes-renamed"]
+
+
+def test_a_partition_still_takes_the_process_name_lock(db, personal_deployment, monkeypatch):
+    """The distributed lock that lets org mode skip this one does nothing
+    outside org mode, so a partition's creates and renames must still queue on
+    the process-local lock."""
+    from cowork.services import projects as projects_module
+
+    monkeypatch.setattr(projects_module, "_NAME_LOCK_TIMEOUT_SECONDS", 0.01)
+    assert projects_module._LOCAL_NAME_LOCK.acquire(timeout=1)
+    try:
+        with pytest.raises(projects_module.ProjectNameLockBusyError):
+            _svc(db, _person(partition=PARTITION_A, sub=SUB_A)).create_project("busy")
+    finally:
+        projects_module._LOCAL_NAME_LOCK.release()
+
+
+def test_a_partition_refuses_adoption_before_touching_the_filesystem(db, personal_deployment, tmp_path):
+    """Refused before any stat: a path that does not exist gets the same
+    refusal as one that does, never "Choose an existing local folder", so the
+    answer says nothing about the server's filesystem."""
+    from cowork.services.projects import ProjectPathNotAllowedError
+
+    missing = tmp_path / "no" / "such" / "folder"
+    with pytest.raises(ProjectPathNotAllowedError):
+        _svc(db, _person(partition=PARTITION_A, sub=SUB_A)).create_project("notes", path=missing)
+    assert not missing.exists()
+
+
+def test_a_partition_row_is_no_adopted_folder_to_the_operator_view(db, personal_deployment, tmp_path):
+    """The operator view reads every row unfiltered. A person's project lives
+    under their partition, outside the unkeyed root, which would read as a
+    folder somebody chose; a row with an org_id never is one."""
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
+    theirs = alice.create_project("reports")
+    operator = _svc(db, LOCAL_SCOPE)
+
+    assert operator.directory_is_external(operator.get_project(theirs.id)) is False
+
+    # A NULL-org row outside the root is still an adopted folder there.
+    chosen = tmp_path / "outside" / "chosen"
+    chosen.mkdir(parents=True)
+    raw = _raw(db)
+    adopted = Project(name="chosen", path=str(chosen), is_active=True)
+    raw.add(adopted)
+    raw.commit()
+    assert operator.directory_is_external(operator.get_project(adopted.id)) is True
+
+
+# ── a deleted project's memory, and a rename's skill store ───────────────────
+
+
+def _lesson_in_tier(scope: TenantScope, project: Project, text: str) -> Path:
+    from cowork.harnesses.memory.registry import MemorySlot
+    from cowork.harnesses.memory.store import project_memory_store
+
+    store = project_memory_store(scope=scope, project_path=Path(project.path), project_id=project.id)
+    store.write(MemorySlot.LESSONS, text)
+    return store.root
+
+
+def test_deleting_a_project_removes_the_persons_memory_tier(db, personal_deployment, tmp_path):
+    """A person's project tier lives under their global tier, outside the
+    project's folder, so it goes with the project rather than staying unlisted."""
+    alice_scope = _person(partition=PARTITION_A, sub=SUB_A)
+    alice = _svc(db, alice_scope)
+    doomed = alice.create_project("doomed")
+    kept = alice.create_project("kept")
+    doomed_tier = _lesson_in_tier(alice_scope, doomed, "- Pallets of 40")
+    kept_tier = _lesson_in_tier(alice_scope, kept, "- Ships on Fridays")
+    assert doomed_tier == tmp_path / PARTITION_A / "memory" / "users" / SUB_A / "projects" / str(doomed.id)
+
+    assert alice.delete_project(doomed.id) is True
+
+    assert not doomed_tier.exists()
+    assert (kept_tier / "lessons.md").read_text().strip() == "- Ships on Fridays"
+
+
+def test_deleting_a_shared_project_removes_every_persons_tier(db, personal_deployment, tmp_path):
+    shared = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS})
+    alice_scope = _person(partition=PARTITION_A, sub=SUB_A, resources=shared)
+    bob_scope = _person(partition=PARTITION_B, sub=SUB_B, resources=shared)
+    alice = _svc(db, alice_scope)
+    team = alice.create_project("team")
+    other = alice.create_project("other")
+    tiers = [_lesson_in_tier(scope, team, "- Mine") for scope in (alice_scope, bob_scope)]
+    other_tier = _lesson_in_tier(bob_scope, other, "- Elsewhere")
+    # A link planted where a person's folder belongs is never followed.
+    outside = tmp_path / "outside-memory" / "projects" / str(team.id)
+    outside.mkdir(parents=True)
+    (tmp_path / PARTITION_B / "memory" / "users" / "planted").symlink_to(tmp_path / "outside-memory")
+
+    assert _svc(db, bob_scope).delete_project(team.id) is True
+
+    assert not any(tier.exists() for tier in tiers)
+    assert other_tier.is_dir() and outside.is_dir()
+
+
+def test_deleting_a_project_with_memory_shared_removes_its_shared_tier_and_kept_personal_ones(
+    db, personal_deployment, monkeypatch, tmp_path
+):
+    """Memory shared: the deleted project's tier in the deployment store goes,
+    and so does a person's tier for it kept from before the switch. Another
+    project's tiers stay, and a link planted in the tier's place is unlinked
+    without being followed."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    shares_memory = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY})
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(shares_memory)))
+    get_app_settings.cache_clear()
+    shared_alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shares_memory)
+    alice = _svc(db, shared_alice)
+    doomed = alice.create_project("doomed")
+    kept = alice.create_project("kept")
+    linked = alice.create_project("linked")
+    kept_personal = _lesson_in_tier(_person(partition=PARTITION_A, sub=SUB_A), doomed, "- From before")
+    shared_doomed = _lesson_in_tier(shared_alice, doomed, "- Shared pallets")
+    shared_kept = _lesson_in_tier(shared_alice, kept, "- Shared Fridays")
+    assert shared_doomed == tmp_path / "memory" / "projects" / str(doomed.id)
+    outside = tmp_path / "outside-memory"
+    outside.mkdir()
+    (outside / "lessons.md").write_text("- Not a tier\n")
+    (tmp_path / "memory" / "projects" / str(linked.id)).symlink_to(outside, target_is_directory=True)
+
+    assert alice.delete_project(doomed.id) is True
+    assert alice.delete_project(linked.id) is True
+
+    assert not shared_doomed.exists() and not kept_personal.exists()
+    assert (shared_kept / "lessons.md").read_text().strip() == "- Shared Fridays"
+    assert not (tmp_path / "memory" / "projects" / str(linked.id)).is_symlink()
+    assert (outside / "lessons.md").read_text() == "- Not a tier\n"
+
+
+def test_deleting_a_project_with_memory_per_person_removes_a_kept_shared_tier(
+    db, personal_deployment, monkeypatch, tmp_path
+):
+    """The tier written into the deployment store while memory was shared stays
+    there after the switch back, and goes when its project is deleted."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    shares_memory = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY})
+    alice_scope = _person(partition=PARTITION_A, sub=SUB_A)
+    alice = _svc(db, alice_scope)
+    doomed = alice.create_project("doomed")
+    kept = alice.create_project("kept")
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(shares_memory)))
+    get_app_settings.cache_clear()
+    shared_scope = _person(partition=PARTITION_A, sub=SUB_A, resources=shares_memory)
+    kept_shared = _lesson_in_tier(shared_scope, doomed, "- From the shared days")
+    assert kept_shared == tmp_path / "memory" / "projects" / str(doomed.id)
+    other_shared = _lesson_in_tier(shared_scope, kept, "- Stays")
+    monkeypatch.delenv("COWORK_PERSONAL_RESOURCES")
+    get_app_settings.cache_clear()
+
+    assert alice.delete_project(doomed.id) is True
+
+    assert not kept_shared.exists()
+    assert (other_shared / "lessons.md").read_text().strip() == "- Stays"
+
+
+def test_one_persons_planted_link_never_keeps_a_deleted_projects_other_tiers(
+    db, personal_deployment, monkeypatch, caplog, tmp_path
+):
+    """Memory and projects shared: a link planted in place of one person's
+    project tiers is refused, never followed, and logged. The deployment's
+    tier for the deleted project still goes, so no one's Memories listing
+    holds it, and so does every other person's kept tier."""
+    import logging
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.harnesses.memory.store import deployment_memory_root, project_tier_ids
+
+    shared_both = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY, PersonalResource.PROJECTS})
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(shared_both)))
+    get_app_settings.cache_clear()
+    shared_alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shared_both)
+    alice = _svc(db, shared_alice)
+    doomed = alice.create_project("doomed")
+    shared_tier = _lesson_in_tier(shared_alice, doomed, "- Shared pallets")
+    assert shared_tier == tmp_path / "memory" / "projects" / str(doomed.id)
+    # Bob kept a tier of his own from when memory was per person.
+    bob_personal = _person(
+        partition=PARTITION_B, sub=SUB_B, resources=ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS}
+    )
+    bobs_kept = _lesson_in_tier(bob_personal, doomed, "- From before")
+    assert bobs_kept == tmp_path / PARTITION_B / "memory" / "users" / SUB_B / "projects" / str(doomed.id)
+    # Alice's partition sorts first, so her refused chain comes before Bob's.
+    outside = tmp_path / "outside-memory"
+    (outside / str(doomed.id)).mkdir(parents=True)
+    (outside / str(doomed.id) / "lessons.md").write_text("- Not a tier\n")
+    alice_users = tmp_path / PARTITION_A / "memory" / "users" / SUB_A
+    alice_users.mkdir(parents=True)
+    (alice_users / "projects").symlink_to(outside, target_is_directory=True)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.memory"):
+        assert alice.delete_project(doomed.id) is True
+
+    assert not shared_tier.exists()
+    assert doomed.id not in project_tier_ids(global_root=deployment_memory_root())
+    assert not bobs_kept.exists()
+    assert (alice_users / "projects").is_symlink()
+    assert (outside / str(doomed.id) / "lessons.md").read_text() == "- Not a tier\n"
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cowork.services.memory" and record.levelno == logging.WARNING
+    ] == [f"memory: could not remove the tier of deleted project {doomed.id} in {alice_users / 'projects'}"]
+
+
+def test_the_desktop_leaves_project_memory_to_the_project_folder(db, tmp_path):
+    """Without trusted identity no project tier lives outside its project, so
+    a delete removes none."""
+    from uuid import uuid4
+
+    from cowork.services.memory import remove_project_memory_tiers
+
+    project_id = uuid4()
+    stray = tmp_path / "memory" / "projects" / str(project_id)
+    stray.mkdir(parents=True)
+
+    assert remove_project_memory_tiers(scope=LOCAL_SCOPE, project_id=project_id) == 0
+    assert stray.is_dir()
+
+
+def test_operator_rename_leaves_a_shared_skill_store_alone(db, personal_deployment, monkeypatch, tmp_path):
+    """Skills shared, projects personal: a v1.2.0 base project and Alice's own
+    share a name, and a shared skill names it. The operator view's rename of
+    the base project must not take the skill from Alice's."""
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services.skills import SkillService
+
+    resources = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.SKILLS})
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(resources)))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    get_app_settings.cache_clear()
+    alice_scope = _person(partition=PARTITION_A, sub=SUB_A, resources=resources)
+    operator = _svc(db, LOCAL_SCOPE)
+    alice = _svc(db, alice_scope)
+    base = operator.create_project("reports")
+    mine = alice.create_project("reports")
+    assert base.name == mine.name == "reports"
+    SkillService(alice_scope).create_skill("sales", "Everyone's.", projects=["reports"])
+
+    renamed = operator.update_project(base.id, name="q4")
+
+    assert renamed.name == "q4"
+    assert SkillService(alice_scope).get_skill("sales").projects == ["reports"]

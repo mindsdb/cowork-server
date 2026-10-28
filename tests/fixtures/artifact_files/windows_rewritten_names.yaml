@@ -1,0 +1,25 @@
+# Entries whose names Windows opens as some other file: it strips a trailing
+# dot or space, reads `name:stream` as an alternate data stream and maps a
+# reserved name to a device. Without a directory descriptor the walk joins
+# each name onto a path, so it refuses these at any depth even though the
+# entry exists. `parts` is the path a caller hands over, and `refused` is the
+# segment that must never reach an lstat or an open.
+
+- id: trailing-dot
+  parts: ["metadata.json."]
+  refused: "metadata.json."
+- id: trailing-space
+  parts: ["notes.txt "]
+  refused: "notes.txt "
+- id: trailing-dot-on-a-directory
+  parts: ["sub.", "notes.txt"]
+  refused: "sub."
+- id: trailing-dot-at-depth
+  parts: ["sub", "README.md."]
+  refused: "README.md."
+- id: alternate-data-stream
+  parts: ["notes.txt:hidden"]
+  refused: "notes.txt:hidden"
+- id: reserved-device-name
+  parts: ["sub", "nul.txt"]
+  refused: "nul.txt"

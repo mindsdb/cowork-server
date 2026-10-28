@@ -10,6 +10,7 @@ import re
 
 import pytest
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.preview_html import prepare_preview_html
 
 _HTML = "<html><head></head><body><h1>Report</h1></body></html>"
@@ -80,6 +81,11 @@ async def test_proxy_root_document_gets_the_shim(tmp_path, monkeypatch, query, e
     (root / "metadata.json").write_text('{"port": 4242}', encoding="utf-8")
     token = "shim-proxy-test-token"
     artifacts._PREVIEW_MOUNTS[token] = root
+    # The mount sits outside every project here; the scope check has its own
+    # tests (tests/test_personal_partition_artifacts.py).
+    monkeypatch.setattr(
+        preview_proxy, "preview_mount_for", lambda t, *, scope: artifacts._PREVIEW_MOUNTS.get(t)
+    )
     try:
         async def receive():
             return {"type": "http.request", "body": b"", "more_body": False}
@@ -88,7 +94,7 @@ async def test_proxy_root_document_gets_the_shim(tmp_path, monkeypatch, query, e
             "type": "http", "method": "GET", "path": "/",
             "headers": [], "query_string": query,
         }, receive)
-        response = await preview_proxy.proxy_artifact_request(token, "", request)
+        response = await preview_proxy.proxy_artifact_request(token, "", request, scope=LOCAL_SCOPE)
     finally:
         del artifacts._PREVIEW_MOUNTS[token]
 

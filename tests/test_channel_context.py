@@ -1,6 +1,6 @@
 """ENG-591: channel turns get support-mode prompt guidance.
 
-The desktop suffix lead must stay byte-identical (it participates in anton's
+The UI suffix lead must stay byte-identical (it participates in anton's
 cache-stable prompt prefix); channel turns swap in chat/support guidance plus
 optional per-binding operator instructions.
 """
@@ -11,11 +11,11 @@ from types import SimpleNamespace
 
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
-from cowork.harnesses.anton_harness.harness import AntonHarness, _turn_style_context
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession, _turn_style_context
 from cowork.harnesses.base import ChannelContext
 
-DESKTOP_LEAD = (
-    "The Anton CoWork desktop UI displays progress, tool usage, and actions "
+UI_LEAD = (
+    "The Cowork UI displays progress, tool usage, and actions "
     "as separate structured activity rows, so do not narrate each step "
     "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
     "open your reply with one short sentence telling the user what you are "
@@ -36,8 +36,8 @@ DESKTOP_LEAD = (
 )
 
 
-def test_desktop_lead_is_byte_stable():
-    assert _turn_style_context(None) == DESKTOP_LEAD
+def test_ui_lead_is_byte_stable():
+    assert _turn_style_context(None) == UI_LEAD
 
 
 def test_desktop_lead_asks_for_an_opening_sentence_not_step_narration():
@@ -113,7 +113,7 @@ def test_stream_response_forwards_channel_context(monkeypatch):
         tool_messages=False,
     ):
         received["channel_context"] = channel_context
-        return _FakeSession(), None, None
+        return BuiltChatSession(session=_FakeSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

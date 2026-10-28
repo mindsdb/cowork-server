@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "handlers": {
+    "console": {"()": "cowork.common.structured_logging.console_handler"},
+    "access": {"()": "cowork.common.structured_logging.console_handler", "access": true}
+  },
+  "root": {"level": "WARNING", "handlers": ["console"]},
+  "loggers": {
+    "cowork": {"level": "DEBUG", "handlers": [], "propagate": true},
+    "uvicorn": {"level": "DEBUG", "handlers": ["console"], "propagate": false},
+    "uvicorn.error": {"level": "DEBUG", "handlers": ["console"], "propagate": false},
+    "uvicorn.access": {"level": "INFO", "handlers": ["access"], "propagate": false},
+    "httpx": {"level": "WARNING"},
+    "httpcore": {"level": "WARNING"},
+    "openai": {"level": "WARNING"},
+    "anthropic": {"level": "WARNING"},
+    "botocore": {"level": "WARNING"},
+    "langfuse": {"level": "WARNING"},
+    "urllib3": {"level": "WARNING"},
+    "mind_castle.stores": {"level": "ERROR"}
+  }
+}

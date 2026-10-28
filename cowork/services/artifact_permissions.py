@@ -4,12 +4,20 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 
 from cowork.principal import Principal, can_manage_org
+from cowork.services.artifact_export import ExportSource, offered_export_formats
 
 _OWNER_ONLY = "Only the artifact owner can change this draft"
 _OWNER_UNKNOWN = "Artifact owner is unknown"
 
 
-def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dict:
+def artifact_capabilities(
+    session,
+    source,
+    slug: str,
+    *,
+    resolution=None,
+    export_source: ExportSource | None = None,
+) -> dict:
     """Return the permissions the API will enforce for this artifact.
 
     Desktop is a single-user boundary. In organization mode the owner is a
@@ -18,10 +26,15 @@ def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dic
     recorded attribution (legacy per-conversation roots: the conversation's
     creator). Project visibility grants review, never source mutation. An
     artifact nobody is recorded as owning says so with ``ownerUnknown``.
+
+    With ``export_source``, ``exportFormats`` lists the formats the export
+    route accepts from this caller, from ``offered_export_formats`` alone:
+    none for a caller who can't edit, and none in organization mode while
+    org export is off.
     """
     scope = getattr(session, "scope", None)
     if not scope or not scope.org_mode:
-        return {
+        capabilities = {
             "role": "owner",
             "canPreview": True,
             "canComment": True,
@@ -29,23 +42,44 @@ def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dic
             "canAddressWithAgent": True,
             "canResolveComments": True,
         }
-    if resolution is None:
-        from cowork.services.artifact_ownership import resolve_artifact_owner
+    else:
+        if resolution is None:
+            from cowork.services.artifact_ownership import resolve_artifact_owner
 
-        resolution = resolve_artifact_owner(session, source, slug)
-    owner_id = resolution.owner_user_id
-    is_owner = bool(owner_id and scope.user_id and str(owner_id) == str(scope.user_id))
-    capabilities = {
-        "role": "owner" if is_owner else "reviewer",
-        "canPreview": True,
-        "canComment": True,
-        "canEdit": is_owner,
-        "canAddressWithAgent": is_owner,
-        "canResolveComments": is_owner,
-    }
-    if resolution.unknown:
-        capabilities["ownerUnknown"] = True
+            resolution = resolve_artifact_owner(session, source, slug)
+        owner_id = resolution.owner_user_id
+        is_owner = bool(owner_id and scope.user_id and str(owner_id) == str(scope.user_id))
+        capabilities = {
+            "role": "owner" if is_owner else "reviewer",
+            "canPreview": True,
+            "canComment": True,
+            "canEdit": is_owner,
+            "canAddressWithAgent": is_owner,
+            "canResolveComments": is_owner,
+        }
+        if resolution.unknown:
+            capabilities["ownerUnknown"] = True
+    if export_source is not None:
+        capabilities = with_export_formats(session, capabilities, export_source)
     return capabilities
+
+
+def with_export_formats(session, capabilities: dict, export_source: ExportSource) -> dict:
+    """*capabilities* with ``exportFormats`` added, as ``artifact_capabilities`` adds it.
+
+    The workspace response already holds its owner's capabilities, so it adds
+    the field through this instead of resolving the owner again. Both answers
+    then decide the list in this one place.
+    """
+    scope = getattr(session, "scope", None)
+    return {
+        **capabilities,
+        "exportFormats": offered_export_formats(
+            source=export_source,
+            can_edit=capabilities["canEdit"],
+            org_mode=bool(scope and scope.org_mode),
+        ),
+    }
 
 
 def require_artifact_owner(session, source, slug: str, *, resolution=None) -> dict:

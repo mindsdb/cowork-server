@@ -144,6 +144,16 @@ def _scope(org_id: str = ORG_A, user_id: str = USER_A) -> TenantScope:
     return TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
 
 
+@pytest.fixture
+def org_tenancy(monkeypatch):
+    """MindsHub workspaces are a hosted (org-mode) feature, so the clear path
+    resolves its scope through org tenancy, as it does in production."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
 def _view(session, scope, bearer: str = "jwt-abc"):
     return asyncio.run(ep._build_view(FakeRequest(bearer), session, scope))
 
@@ -836,7 +846,7 @@ def _stored_pick(scope) -> str:
         return SettingService(s, scope).load().hub_workspace_id
 
 
-def test_a_refused_pick_is_cleared(session):
+def test_a_refused_pick_is_cleared(session, org_tenancy):
     """Grant removed after the pick: the menu already falls back to the default,
     and clearing the stored value makes the turn path agree with it."""
     SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
@@ -846,7 +856,7 @@ def test_a_refused_pick_is_cleared(session):
     assert _stored_pick(_scope()) == ""
 
 
-def test_a_newer_pick_is_not_cleared(session):
+def test_a_newer_pick_is_not_cleared(session, org_tenancy):
     """The person re-picked a live workspace between the turn's read and auth's
     refusal; that newer choice must survive the stale one being cleared."""
     SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_DEFAULT)
@@ -856,7 +866,7 @@ def test_a_newer_pick_is_not_cleared(session):
     assert _stored_pick(_scope()) == WS_DEFAULT
 
 
-def test_clearing_is_scoped_to_the_caller(session):
+def test_clearing_is_scoped_to_the_caller(session, org_tenancy):
     SettingService(session, _scope(ORG_A, USER_A)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
     SettingService(session, _scope(ORG_A, USER_A2)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
 
@@ -864,6 +874,33 @@ def test_clearing_is_scoped_to_the_caller(session):
 
     assert _stored_pick(_scope(ORG_A, USER_A)) == ""
     assert _stored_pick(_scope(ORG_A, USER_A2)) == WS_CLIENT_A
+
+
+def test_a_refused_pick_is_cleared_on_a_local_deployment(session, monkeypatch):
+    """Local tenancy with no trusted identity keeps one settings row for the
+    instance: the clear reaches that row and writes no org- or person-scoped
+    one beside it."""
+    from sqlmodel import select
+
+    from cowork.models.setting import Setting
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    get_app_settings.cache_clear()
+    try:
+        SettingService(session, LOCAL_SCOPE).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
+
+        svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+        assert _stored_pick(LOCAL_SCOPE) == ""
+        engine = get_engine(get_app_settings().database.uri)
+        with Session(engine) as s:
+            scoped_rows = s.exec(
+                select(Setting).where(Setting.key == ep.SETTING_KEY, Setting.org_id == ORG_A)
+            ).all()
+        assert scoped_rows == []
+    finally:
+        get_app_settings.cache_clear()
 
 
 def test_a_failed_clear_does_not_raise(monkeypatch):

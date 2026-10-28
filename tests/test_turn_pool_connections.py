@@ -746,7 +746,7 @@ async def test_a_channel_turns_saves_wait_for_the_conversations_write_lock(monke
         def stream_response(self, **_kwargs):
             return None
 
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             delta = {"type": "response.output_text.delta", "delta": "ok"}
             event_sink(delta["type"], delta)
             yield "event: response.output_text.delta\ndata: {}\n\n"
@@ -809,7 +809,7 @@ async def test_a_channel_turn_does_not_load_the_conversations_history(monkeypatc
         def stream_response(self, **_kwargs):
             return None
 
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             delta = {"type": "response.output_text.delta", "delta": "ok"}
             event_sink(delta["type"], delta)
             yield "event: response.output_text.delta\ndata: {}\n\n"

@@ -1,5 +1,6 @@
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, AsyncIterator, Literal, Protocol
+from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
 
 from cowork.models.conversation import Conversation
@@ -17,6 +18,12 @@ class FileInputBlock(TypedDict):
     type: Literal["file"]
     path: str
     filename: str
+
+
+def prompt_text(blocks: Iterable[Mapping[str, Any]]) -> str:
+    """The text of a turn's input blocks: what the user sent, with any
+    context the client appended to it."""
+    return " ".join(block["text"] for block in blocks if block.get("type") == "text")
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,8 @@ class ChannelContext:
 class HarnessProvider(Protocol):
     id: str
     label: str
+    # Called as formatter(stream, model, event_sink, form_blocks=...); the
+    # in-process UI turn passes form_blocks=True (format_responses_stream).
     formatter: AsyncIterator[str]
     # Whether this harness is offered in org (multi-tenant) deployments.
     # Defaults True for implementers that don't set it (see _harness_options).

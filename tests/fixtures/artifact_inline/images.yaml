@@ -1,0 +1,124 @@
+# Same shape as elements.yaml. `base_parts` places the source document in a
+# folder of the artifact. The type of every data: URI comes from the bytes.
+
+- id: png-file
+  html: '<img src="chart.png" alt="Chart">'
+  present: ['<img alt="Chart" src="data:image/png;base64,{png_b64}">']
+  inlined: [chart.png]
+
+- id: jpeg-file
+  html: '<img src="photo.jpg">'
+  present: ['<img src="data:image/jpeg;base64,{jpeg_b64}">']
+
+- id: gif-file
+  html: '<img src="anim.gif">'
+  present: ['<img src="data:image/gif;base64,{gif_b64}">']
+
+- id: webp-files
+  html: '<img src="lossy.webp"><img src="lossless.webp"><img src="extended.webp">'
+  present: ['<img src="data:image/webp;base64,{webp_vp8_b64}">', '<img src="data:image/webp;base64,{webp_vp8l_b64}">', '<img src="data:image/webp;base64,{webp_vp8x_b64}">']
+
+- id: type-comes-from-bytes-not-the-name
+  html: '<img src="png-named.jpg"><img src="chart-named.svg">'
+  present: ['<img src="data:image/png;base64,{png_b64}"><img src="data:image/png;base64,{png_b64}">']
+
+- id: jpeg-without-a-frame-header
+  html: '<img src="headless.jpg">'
+  present: ['<img>']
+  omitted: [[unsupported_type, headless.jpg]]
+
+- id: zero-size-png
+  html: '<img src="empty-size.png">'
+  omitted: [[unsupported_type, empty-size.png]]
+
+- id: too-many-pixels-from-the-header
+  html: '<img src="huge.png">'
+  omitted: [[too_large, huge.png]]
+
+- id: data-png-is-re-encoded
+  html: '<img src="data:image/png;base64,{png_b64}">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  inlined: [chart.png]
+
+- id: data-uri-type-comes-from-the-bytes
+  html: '<img src="data:text/css;base64,{png_b64}">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+
+- id: data-uri-with-whitespace-and-no-padding
+  html: '<img src="data:image/gif;base64, R0lG ODlh AQABAAAAADs">'
+  present: ['<img src="data:image/gif;base64,R0lGODlhAQABAAAAADs=">']
+
+- id: percent-encoded-data-uri
+  html: '<img src="data:image/gif,GIF89a%01%00%01%00%00%00%00;">'
+  present: ['<img src="data:image/gif;base64,R0lGODlhAQABAAAAADs=">']
+
+- id: data-uris-that-are-not-raster-images
+  html: '<img src="data:image/svg+xml,&lt;svg onload=alert(1)&gt;"><img src="data:text/html,&lt;p&gt;x"><img src="data:image/png;base64,!!!!"><img src="data:image/png">'
+  absent: ['alert', '<p>x']
+  omitted:
+    - [unsupported_type, 'data:image/svg+xml,<svg onload=alert(1)>']
+    - [unsupported_type, 'data:text/html,<p>x']
+    - [unsupported_type, 'data:image/png;base64,!!!!']
+    - [unsupported_type, 'data:image/png']
+
+# src and then the first srcset candidate are tried. Every other reference
+# the image names is listed, whether or not the image got a source.
+- id: srcset-first-candidate
+  html: '<img srcset="chart.png 1x, photo.jpg 2x" sizes="100vw">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  absent: ['srcset', 'sizes', 'jpeg']
+  omitted: [[unsupported_type, photo.jpg]]
+
+- id: srcset-first-candidate-outside
+  html: '<img srcset="{outside}/x.png 1x, chart.png 2x">'
+  present: ['<img>']
+  omitted: [[scheme, '{outside}/x.png'], [unsupported_type, chart.png]]
+
+- id: srcset-data-uri-candidate
+  html: '<img srcset="data:image/png;base64,{png_b64} 1x">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+
+- id: srcset-used-when-src-fails
+  html: '<img src="absent.png" srcset="chart.png">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[missing, absent.png]]
+
+- id: src-wins-and-srcset-is-not-read
+  html: '<img src="chart.png" srcset="{outside}/x.png 2x">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[scheme, '{outside}/x.png']]
+
+- id: srcset-candidates-split-as-a-browser-does
+  html: '<img srcset=" ,chart.png (a, b) 1x,photo.jpg,,, {outside}/x.png 2x , c,d.png">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[unsupported_type, photo.jpg], [scheme, '{outside}/x.png'], [unsupported_type, 'c,d.png']]
+
+# A candidate naming the source the image inlined is used, not left out.
+- id: srcset-candidate-naming-the-inlined-src
+  html: '<img src="chart.png" srcset="chart.png 1x, photo.jpg 2x">'
+  present: ['<img src="data:image/png;base64,{png_b64}">']
+  omitted: [[unsupported_type, photo.jpg]]
+
+- id: table-cell-images
+  html: '<table><tr><td><img src="chart.png"></td><td><img src="http://169.254.169.254/latest"></td></tr></table>'
+  present: ['<td><img src="data:image/png;base64,{png_b64}"></td><td><img></td>']
+  omitted: [[scheme, 'http://169.254.169.254/latest']]
+
+- id: document-in-a-folder
+  base_parts: [sub]
+  html: '<img src="inner.png"><img src="../chart.png"><img src="Metadata.JSON">'
+  present: ['<img src="data:image/png;base64,{inner_b64}"><img><img>']
+  omitted: [[traversal, ../chart.png], [housekeeping, Metadata.JSON]]
+
+- id: empty-src
+  html: '<img src="" alt="e"><img src="   " alt="f">'
+  present: ['<img alt="e"><img alt="f">']
+
+- id: every-occurrence-counts
+  html: '<img src="chart.png"><img src="chart.png"><p style="background:url(chart.png)">x</p>'
+  inlined: [chart.png, chart.png, chart.png]
+
+- id: images-inside-svg-are-unwrapped
+  html: '<svg><img src="{outside}/in-svg.png"></svg>'
+  present: ['<svg></svg>']
+  omitted: [[scheme, '{outside}/in-svg.png']]

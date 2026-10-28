@@ -1,0 +1,6 @@
+{
+  "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Quarterly report</title></head><body><h1>Quarterly report</h1><p>Revenue rose 4% over the quarter.</p><img alt=\"chart\" src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\"></body></html>",
+  "scripts": false,
+  "paper": "letter",
+  "landscape": false
+}

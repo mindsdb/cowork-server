@@ -5,6 +5,7 @@
 conversation's own history, so a reload shows it too.
 """
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import asyncio
 import json
@@ -220,7 +221,7 @@ def test_a_database_error_while_sealing_names_the_conversation(
     )
     assert record.conversation_id == str(conv.id)
     emitted = logged.output()
-    assert f"[Conversation:{conv.id}]: Database operation failed" in emitted
+    assert_log_fields(emitted, conversation_id=str(conv.id), error_type="OperationalError")
     assert secret not in emitted
 
 

@@ -1202,6 +1202,22 @@ def test_approval_ids_are_unique_per_request(tmp_path: Path) -> None:
         uuid.UUID(approval_id.removeprefix(f"approval-{lease.run.id}-"))
 
 
+def test_read_only_remote_task_declines_without_a_card(tmp_path: Path) -> None:
+    lease, start = _remote_lease(tmp_path, "read-only")
+    lease.execution.permission_mode = PermissionMode.read_only
+    client = FakeRuntimeClient(lease, start)
+    runtime = CodeOnlyRuntime(tmp_path / "runtime", client, approval_timeout_seconds=60)
+
+    decision = runtime._approval(lease, "item/fileChange/requestApproval", {"reason": "Append hello"})
+
+    assert decision == {"decision": "decline"}
+    assert [kind for kind, _ in client.events] == ["event"]
+    refusal = client.events[0][1]["event"]
+    assert refusal["type"] == "command_result"
+    assert refusal["phase"] == "failed"
+    assert refusal["title"] == "Declined: this task is Read only"
+
+
 def test_a_failed_remote_turn_reports_its_classified_failure_to_the_control_plane(tmp_path: Path) -> None:
     lease, start = _remote_lease(tmp_path, "no-credits")
     client = FakeRuntimeClient(lease, start)

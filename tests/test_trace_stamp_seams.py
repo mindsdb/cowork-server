@@ -37,11 +37,25 @@ def _call_sites() -> list[tuple[Path, ast.Call]]:
         if _EXEMPT_DIRS & set(path.relative_to(COWORK_ROOT).parts[:-1]):
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
+        # Starlette's StreamingResponse.stream_response sends HTTP body chunks;
+        # it does not originate a model turn despite sharing the method name.
+        http_stream_calls = {
+            id(node)
+            for cls in ast.walk(tree)
+            if isinstance(cls, ast.ClassDef)
+            and any(isinstance(base, ast.Name) and base.id == "StreamingResponse" for base in cls.bases)
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "stream_response"
+        }
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if isinstance(func, ast.Attribute) and func.attr == "stream_response":
+            if isinstance(func, ast.Attribute) and func.attr == "stream_response" and id(node) not in http_stream_calls:
                 sites.append((path, node))
     return sites
 
@@ -192,12 +206,12 @@ def _declares_harness(call: ast.Call) -> bool:
     """A literal ``harness=`` keyword — deliberately NOT the ``**helper()``
     shape that :func:`_declares_surface` also accepts.
 
-    The asymmetry is intentional and load-bearing. ``surface`` is **absent**
-    from the pinned anton (``uv.lock`` → ``466520b``, v2.26.8.20.3), so passing
-    it unconditionally would raise ``TypeError`` on every turn — hence the
-    defensive ``**surface_kwarg(ChatSessionConfig)``. ``harness`` *is* declared
-    at that same commit, so it can be passed as a plain keyword, and requiring
-    the literal keeps this guard exact.
+    The asymmetry is intentional and load-bearing. ``surface`` goes through the
+    defensive ``**surface_kwarg(ChatSessionConfig)``, which drops it on an
+    anton that lacks the field rather than raise ``TypeError`` on every turn.
+    ``harness`` is declared in every anton the ``anton-agent`` floor in
+    ``pyproject.toml`` admits, so it can be passed as a plain keyword, and
+    requiring the literal keeps this guard exact.
 
     If a future change ever needs harness passed defensively too, this
     predicate will reject that shape and must be widened the way

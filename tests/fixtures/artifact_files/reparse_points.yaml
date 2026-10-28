@@ -1,0 +1,27 @@
+# Walks without a directory descriptor, the way Windows runs them, where one
+# segment's lstat reports FILE_ATTRIBUTE_REPARSE_POINT with `reparse_tag`. The
+# test folder holds `junction/secret.txt` and `sub/placeholder.png`.
+# `reparse_name` is that segment. A tag marked as a name surrogate stands for
+# another path and must be refused before any open; any other tag is a file
+# in place and is read.
+
+- id: junction-in-the-middle
+  parts: ["junction", "secret.txt"]
+  reparse_name: junction
+  reparse_tag: 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+  refused: true
+- id: symlink-at-the-leaf
+  parts: ["sub", "placeholder.png"]
+  reparse_name: placeholder.png
+  reparse_tag: 0xA000000C  # IO_REPARSE_TAG_SYMLINK
+  refused: true
+- id: cloud-sync-placeholder
+  parts: ["sub", "placeholder.png"]
+  reparse_name: placeholder.png
+  reparse_tag: 0x9000001A  # IO_REPARSE_TAG_CLOUD_1
+  refused: false
+- id: deduplicated-file
+  parts: ["sub", "placeholder.png"]
+  reparse_name: placeholder.png
+  reparse_tag: 0x80000013  # IO_REPARSE_TAG_DEDUP
+  refused: false

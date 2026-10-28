@@ -266,11 +266,13 @@ def forget_stale_hub_workspace(*, org_id: str, user_id: str, workspace_id: str) 
     read it, and that newer choice must survive. Best effort — the turn has
     already recovered on the default, and the next refusal tries this again.
     """
-    from cowork.db.scoped import TenantScope
+    from cowork.db.scoped import scope_for_identity
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    scope = TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
+    # scope_for_identity picks the org, personal or local scope from the
+    # tenancy settings.
+    scope = scope_for_identity(org_id=org_id, user_id=user_id)
     session = None
     try:
         session = get_open_session()

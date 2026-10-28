@@ -19,7 +19,7 @@ from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
-from cowork.harnesses.anton_harness.harness import AntonHarness
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
 from cowork.services import task_objects as t
 from cowork.services.artifacts import card_for_folder
@@ -55,7 +55,7 @@ def test_card_for_folder_prefers_html_entry_over_alphabetical(tmp_path):
         files={"index.html": "<html></html>", "data/prices.csv": "a,b\n1,2"},
         meta={"slug": "dash", "name": "Dash", "type": "html-app"},
     )
-    card = card_for_folder(tmp_path / "dash")
+    card = card_for_folder(tmp_path / "dash", scope=LOCAL_SCOPE)
     assert card["path"].endswith("index.html")
     assert card["ext"] == ".html"
     assert card["slug"] == "dash"
@@ -66,7 +66,7 @@ def test_card_for_folder_none_on_unreadable_metadata(tmp_path):
     folder = tmp_path / "broken"
     folder.mkdir()
     (folder / "metadata.json").write_text("{ not json")
-    assert card_for_folder(folder) is None
+    assert card_for_folder(folder, scope=LOCAL_SCOPE) is None
 
 
 # ── serve URL: addressed by the project's name, not its label ─────────────
@@ -97,7 +97,7 @@ def _turn_cards(monkeypatch, conversation) -> list[dict]:
             yield
 
     async def _fake_build(self, conversation, **_kwargs):
-        return _Session(), None, None
+        return BuiltChatSession(session=_Session(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     async def _drain():
         return [

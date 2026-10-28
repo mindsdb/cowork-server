@@ -1,0 +1,87 @@
+# Cases for tests/test_render_pdf_client.py and tests/test_export_pdf_settings.py.
+
+# What the export route answers for each status a render service sends
+# instead of 200 or 503. A redirect is never followed.
+upstream_statuses:
+  - {upstream: 201, answer: 502}
+  - {upstream: 301, answer: 502}
+  - {upstream: 302, answer: 502}
+  - {upstream: 303, answer: 502}
+  - {upstream: 307, answer: 502}
+  - {upstream: 308, answer: 502}
+  - {upstream: 400, answer: 502}
+  - {upstream: 404, answer: 502}
+  - {upstream: 413, answer: 413}
+  - {upstream: 422, answer: 422}
+  - {upstream: 429, answer: 502}
+  - {upstream: 500, answer: 502}
+
+# 200 answers that carry no PDF the server accepts. Each one answers 502.
+unusable_bodies:
+  - name: not JSON
+    body: "<html><body>Rendered</body></html>"
+  - name: JSON without the refused list
+    body: '{"pdf_base64": "JVBERi0xLjcK"}'
+  - name: base64 with a character outside its alphabet
+    body: '{"pdf_base64": "JVBERi0x$LjcK", "refused": []}'
+  - name: base64 of HTML
+    body: '{"pdf_base64": "PGh0bWw+PC9odG1sPg==", "refused": []}'
+  - name: a PDF header and nothing after it
+    body: '{"pdf_base64": "JVBERi0xLjcK", "refused": []}'
+
+# Page trees a render service never makes, against the 500-page limit. Each
+# costs a walk of at most 2 * 500 + 2 nodes. shape names the builder in
+# tests/test_render_pdf_client.py; size is its page, node or entry count.
+hostile_page_trees:
+  - {name: one page listed 501 times, shape: one_page_listed, size: 501, answer: 413}
+  - {name: a count of 1 over 501 pages, shape: count_that_lies, size: 501, answer: 413}
+  - {name: a page tree that loops, shape: looping_tree, size: 2, answer: 502}
+  - {name: a chain past the node limit, shape: long_chain, size: 1100, answer: 502}
+  - {name: indirect types over 501 pages, shape: indirect_types, size: 501, answer: 413}
+  - {name: an unknown type with kids, shape: unknown_type_with_kids, size: 501, answer: 502}
+
+# Settings a PDF client refuses to start with: it needs the render engine
+# and a render URL.
+no_client_settings:
+  - {name: engine and URL unset, settings: {engine: null, render_url: null}}
+  - {name: engine unset, settings: {engine: null, render_url: "http://render.test:9000"}}
+  - {name: URL unset, settings: {engine: render, render_url: null}}
+
+# Whether the render service runs the page's scripts, by source file.
+scripts_by_source:
+  - {source_name: page.html, scripts: true}
+  - {source_name: page.htm, scripts: true}
+  - {source_name: PAGE.HTML, scripts: true}
+  - {source_name: sub/page.html, scripts: true}
+  - {source_name: report.md, scripts: false}
+  - {source_name: report.markdown, scripts: false}
+  - {source_name: notes.txt, scripts: false}
+  - {source_name: page.html.md, scripts: false}
+
+# Render URLs the server refuses to start with while the engine is "render".
+refused_render_urls:
+  - ftp://render.internal/
+  - file:///etc/passwd
+  - render.internal:9000
+  - http://
+  - http://render.internal:9000/?token=x
+  - http://render.internal:9000/#top
+  # An empty query or fragment still moves /v1/pdf out of the path.
+  - http://render.internal:9000/?
+  - http://render.internal:9000/#
+  - http://render.internal:9000/base?#
+
+# Render URLs that turn PDF export on while the engine is "render".
+accepted_render_urls:
+  - http://127.0.0.1:9000
+  - https://render.internal/base/
+
+# Proxy variables a client that reads the environment would follow. The
+# render service's client reads none of them.
+proxy_variables:
+  - HTTP_PROXY
+  - HTTPS_PROXY
+  - ALL_PROXY
+  - http_proxy
+  - https_proxy
+  - all_proxy

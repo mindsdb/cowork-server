@@ -207,6 +207,24 @@ def read_full_id(folder: PinnedDir) -> tuple[str, dict]:
     return resolved, normalized
 
 
+def _replaced_mode(folder: PinnedDir, name: str) -> int | None:
+    """The permission bits of the regular file at *name*, which a write replaces.
+
+    The replacement takes them, so whoever could read the old document can
+    read the new one; a document written for the first time stays private.
+    Windows keeps no such bits beyond read-only, so it gets None.
+    """
+    if folder.fd is None:
+        return None
+    try:
+        existing = dir_stat(folder, name, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(existing.st_mode):
+        return None
+    return stat.S_IMODE(existing.st_mode) & 0o777
+
+
 def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:
     name = _component(name)
     tmp = f".{name}.{uuid.uuid4().hex}.tmp"
@@ -220,7 +238,15 @@ def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
             0o600,
         )
+        mode = _replaced_mode(folder, name)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            if mode is not None:
+                try:
+                    os.fchmod(stream.fileno(), mode)
+                except OSError:
+                    # A volume that keeps no modes, such as vfat, refuses the
+                    # change; the document is written all the same.
+                    pass
             stream.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         # `os.replace` acts on the link itself, never its target, so a symlinked
         # `metadata.json` is replaced by the real document instead of writing

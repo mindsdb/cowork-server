@@ -10,7 +10,7 @@ from uuid import UUID
 
 
 from cowork.common.logger import log_context
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session, tenant_scope_required
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
@@ -171,6 +171,14 @@ class TaskObjectService:
         dest_base = _artifacts_base(dest)
         dest_base.mkdir(parents=True, exist_ok=True)
         org_mode = self._org_mode
+        # Lazy, like artifact_ownership below. With live apps on, an app's
+        # shares, received mark and launches name its folder by project and
+        # slug, so they follow the folder.
+        from cowork.code_sandbox import live_apps_on
+
+        live_apps = live_apps_on()
+        if live_apps:
+            from cowork.services.live_apps import follow_moved_app
         creator = str(conversation.created_by) if conversation.created_by else None
         src_root = None
         resolutions: dict = {}
@@ -188,6 +196,7 @@ class TaskObjectService:
                 self.session, src_root, [row.ref for row in rows]
             )
         rekeys: list[tuple[str, str]] = []
+        moved_folders: list[tuple[Path, Path]] = []
         moved = 0
         for row in rows:
             src_folder = src_base / row.ref
@@ -215,11 +224,28 @@ class TaskObjectService:
                 continue
             if org_mode:
                 rekeys.append((row.ref, dest_slug))
+            moved_folders.append((src_folder, dest_base / dest_slug))
+            if live_apps:
+                follow_moved_app(
+                    self.session,
+                    partition_id=str(source.org_id),
+                    source_project_id=source.id,
+                    old_slug=row.ref,
+                    dest_project_id=dest.id,
+                    new_slug=dest_slug,
+                )
             row.project_id = dest.id
             row.ref = dest_slug
             self.session.add(row)
             moved += 1
         self.session.commit()
+        # A published page keeps its link: .published.json moved with the
+        # folder, and its owner record follows. A failed rekey is logged; the
+        # owner's next publish then gets a new link, as a copy would.
+        from cowork.services.published_page_ownership import rekey_published_page_paths
+
+        for old_folder, new_folder in moved_folders:
+            rekey_published_page_paths(old_folder, new_folder)
         # After the index commit: each rekey commits on its own, and must not
         # commit a half-applied batch of index rows along with it.
         if rekeys:
@@ -401,11 +427,12 @@ def _index_new_slugs(
         from cowork.db.session import get_open_session
 
         if scope is None:
-            # Never invent a scope: local mode passes through; org mode without
-            # the caller's scope skips indexing (fail-safe).
-            if get_app_settings().tenancy_mode == "org":
+            # Never invent a scope: desktop passes through; a partitioned
+            # deployment without the caller's scope skips indexing (fail-safe).
+            if tenant_scope_required():
                 logger.warning(
-                    "artifact indexing skipped: no tenant scope provided in org mode (conversation %s)",
+                    "artifact indexing skipped: no tenant scope provided on a partitioned "
+                    "deployment (conversation %s)",
                     conversation_id,
                 )
                 return
@@ -583,6 +610,7 @@ def cards_for_slugs(
     artifacts_base,
     slugs: list[str],
     *,
+    scope: TenantScope | None,
     project_id: str | None = None,
     project_name: str = "",
     project_label: str = "",
@@ -602,7 +630,8 @@ def cards_for_slugs(
     from it, and the serve route resolves that segment by name
     (`services.artifacts._project_artifacts_base`). `project_label` is what the
     card shows instead, when the caller has one
-    (`services.projects.display_label`).
+    (`services.projects.display_label`). `scope` is the turn's; it only finds
+    the serve URL's project by scanning when no `project_name` is given.
     """
     from cowork.services.artifacts import card_for_folder
 
@@ -612,6 +641,7 @@ def cards_for_slugs(
         try:
             card = card_for_folder(
                 base / slug, len(cards),
+                scope=scope,
                 project_id=project_id, project_name=project_name,
                 project_label=project_label,
                 # Without this the inline card's serveUrl is rediscovered by
@@ -678,6 +708,7 @@ async def publish_and_card_turn_artifacts(
         carded = set(touched_slugs)
     return cards_for_slugs(
         artifacts_base, sorted(carded),
+        scope=scope,
         project_id=project_id, project_name=project_name, project_label=project_label,
     )
 
@@ -899,8 +930,8 @@ def _seed_draft_from_store(folder: Path, slug: str) -> None:
     `_skill_draft_payload`, which also skips subdirs.
 
     `slug` is agent-supplied: validate it, and key the store by the turn's
-    ambient scope. Org mode with no scope bound seeds nothing rather than
-    reading the unkeyed root.
+    ambient scope. A partitioned deployment with no scope bound, and org mode
+    with an unpartitioned one, seed nothing rather than reading the unkeyed root.
     """
     from anton.core.tools.skill_format import SKILL_FILE, validate_name
 
@@ -912,7 +943,10 @@ def _seed_draft_from_store(folder: Path, slug: str) -> None:
         validate_name(slug)
         settings = get_app_settings()
         scope = current_settings_scope()
-        if settings.tenancy_mode == "org" and (scope is None or not scope.org_mode):
+        if scope is None:
+            if tenant_scope_required():
+                return
+        elif settings.tenancy_mode == "org" and not scope.org_mode:
             return
         src = scoped_storage_root(Path(settings.skill.root_dir), scope, store="skills") / slug
     except Exception:

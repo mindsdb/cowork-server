@@ -85,7 +85,7 @@ async def _run(handler, *, assistant_message_id, user_message_id=None) -> _Buffe
 async def test_run_turn_completed_frame_carries_the_assistant_message_id():
     real_id = uuid4()
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         yield 'event: response.output_text.delta\ndata: {"delta": "hi"}\n\n'
         yield ('event: response.completed\ndata: {"type": "response.completed", '
@@ -99,7 +99,7 @@ async def test_run_turn_completed_frame_carries_the_assistant_message_id():
 
 @pytest.mark.asyncio
 async def test_run_turn_completed_frame_omits_the_id_when_nothing_persisted():
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield ('event: response.completed\ndata: {"type": "response.completed", '
                '"response": {"output": []}}\n\n')
 
@@ -113,7 +113,7 @@ async def test_run_turn_completed_frame_omits_the_id_when_nothing_persisted():
 async def test_run_turn_failed_frame_carries_the_id_when_something_persisted():
     real_id = uuid4()
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         raise RuntimeError("boom")
 
@@ -135,7 +135,7 @@ async def test_run_turn_ignores_a_delta_frame_whose_text_quotes_a_frame_type_nam
     # over the whole SSE text (rather than the frame's own `event:` line)
     # would mistake this for the terminal frame: persist a partial turn early
     # and rewrite this delta's event line to `response.completed`.
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         yield (
             'event: response.output_text.delta\ndata: '
@@ -174,7 +174,7 @@ async def test_run_turn_ignores_a_delta_frame_whose_text_quotes_a_frame_type_nam
 
 @pytest.mark.asyncio
 async def test_run_turn_failed_frame_omits_the_id_when_nothing_persisted():
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         if False:
             yield  # forces this to be a real async generator, not a bare coroutine
         raise RuntimeError("boom")
@@ -209,8 +209,10 @@ async def _run_direct(*, assistant_message_id, route_text="ok", user_message_id=
             lifecycle=TurnLifecycle(),
             conv_id=uuid4(),
             original_content="hi",
+            question="hi",
             route=route,
             buffer=buffer,
+            request_id="direct-test",
         )
     return buffer
 
@@ -297,7 +299,7 @@ async def test_probe_completed_frame_omits_the_id_when_nothing_persisted():
 async def test_run_turn_created_frame_carries_the_user_message_id():
     user_id = uuid4()
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         yield ('event: response.completed\ndata: {"type": "response.completed", '
                '"response": {"output": [{"content": [{"type": "output_text", "text": "hi"}]}]}}\n\n')
@@ -357,3 +359,59 @@ def test_turn_anchor_falls_back_to_the_user_row_when_nothing_was_persisted():
 
     user_id = uuid4()
     assert _turn_anchor_id(SimpleNamespace(id=user_id), None) == user_id
+
+
+async def _collect_answer(*items):
+    """`_collect` over a turn whose stream yields `items`, through the real
+    formatter, with the conversation's saves faked."""
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+    handler = _handler_with_formatter(format_responses_stream)
+    handler.scope = LOCAL_SCOPE
+
+    async def stream():
+        for item in items:
+            yield item
+
+    with patch("cowork.handlers.responses.ConversationService") as conv_svc:
+        conv_svc.return_value.save_user_message.return_value = SimpleNamespace(id=uuid4())
+        conv_svc.return_value.save_assistant_turn.return_value = SimpleNamespace(id=uuid4())
+        return await handler._collect(stream(), uuid4(), "anton", "How many at S1?")
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_answer_returns_its_figure_sources():
+    from anton.core.llm.provider import StreamTextDelta, StreamToolResult, StreamToolUseDelta, StreamToolUseEnd, StreamToolUseStart
+
+    from cowork.harnesses.anton_harness.stream_formatter import TurnContext
+
+    code = "print(open('stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    response = await _collect_answer(
+        TurnContext(question="How many at S1?"),
+        StreamToolUseStart(id="t1", name="scratchpad"),
+        StreamToolUseDelta(id="t1", json_delta=json.dumps({"action": "exec", "code": code})),
+        StreamToolUseEnd(id="t1"),
+        StreamToolResult(name="scratchpad", content=json.dumps(cell), action="exec", id="t1"),
+        StreamTextDelta(text="S1 holds 250 units."),
+    )
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert [(f["text"], f["sources"]) for f in output["figure_sources"]["figures"]] == [
+        ("250", [{"tool_use_id": "t1", "page": None}]),
+    ]
+    assert [step["label"] for step in output["figure_sources"]["steps"]] == ["stock.csv"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_answer_without_figures_has_no_figure_sources_field():
+    from anton.core.llm.provider import StreamTextDelta
+
+    from cowork.harnesses.anton_harness.stream_formatter import TurnContext
+
+    response = await _collect_answer(TurnContext(question="Hello"), StreamTextDelta(text="Hi there."))
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert "figure_sources" not in output

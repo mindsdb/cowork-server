@@ -1,0 +1,106 @@
+# Paths that read_artifact_file_entry refuses from their text alone, before
+# any file call, with the reason each one records. `parts` is the path already
+# split into segments, the shape a caller hands over.
+
+- id: parent-segment
+  parts: ["..", "secret.txt"]
+  reason: traversal
+- id: parent-segment-at-depth
+  parts: ["sub", "..", "..", "secret.txt"]
+  reason: traversal
+- id: current-segment
+  parts: [".", "chart.png"]
+  reason: traversal
+- id: empty-segment
+  parts: ["sub", "", "chart.png"]
+  reason: traversal
+- id: no-segments
+  parts: []
+  reason: traversal
+- id: separator-inside-a-segment
+  parts: ["sub/chart.png"]
+  reason: traversal
+- id: backslash-inside-a-segment
+  parts: ["sub\\..\\secret.txt"]
+  reason: traversal
+- id: alternate-data-stream
+  parts: ["chart.png:hidden"]
+  reason: traversal
+- id: drive-letter
+  parts: ["C:", "Windows", "win.ini"]
+  reason: traversal
+- id: drive-relative
+  parts: ["C:secret.txt"]
+  reason: traversal
+- id: nul-byte
+  parts: ["chart\0.png"]
+  reason: traversal
+- id: reserved-device-name
+  parts: ["CON"]
+  reason: traversal
+- id: reserved-device-name-with-extension
+  parts: ["sub", "nul.txt"]
+  reason: traversal
+- id: reserved-device-name-any-case
+  parts: ["Com1.log"]
+  reason: traversal
+- id: reserved-printer-port
+  parts: ["lpt9.png"]
+  reason: traversal
+- id: reserved-superscript-port
+  parts: ["COM¹"]
+  reason: traversal
+- id: reserved-name-before-a-space
+  parts: ["aux .txt"]
+  reason: traversal
+- id: trailing-dot
+  parts: ["metadata.json."]
+  reason: traversal
+- id: trailing-dot-at-depth
+  parts: ["sub.", "chart.png"]
+  reason: traversal
+- id: trailing-space
+  parts: ["chart.png "]
+  reason: traversal
+- id: unc-path-from-empty-segments
+  parts: ["", "", "server", "share", "chart.png"]
+  reason: unc_path
+- id: unc-path-in-one-segment
+  parts: ["\\\\server\\share\\chart.png"]
+  reason: unc_path
+- id: unc-path-mixed-separators
+  parts: ["/\\server\\share\\chart.png"]
+  reason: unc_path
+- id: device-path
+  parts: ["\\\\?\\C:\\secret.txt"]
+  reason: unc_path
+- id: device-path-dot
+  parts: ["\\\\.\\PhysicalDrive0"]
+  reason: unc_path
+- id: housekeeping-at-the-root-casefolded
+  parts: ["METADATA.json"]
+  reason: housekeeping
+- id: housekeeping-at-depth-casefolded
+  parts: ["sub", "Metadata.JSON"]
+  reason: housekeeping
+- id: revisions-directory-casefolded
+  parts: [".Revisions", "x"]
+  reason: housekeeping
+- id: revisions-directory-at-depth
+  parts: ["sub", ".revisions", "r1.md"]
+  reason: housekeeping
+- id: generation-input-at-the-root-casefolded
+  parts: ["PRD.md"]
+  reason: housekeeping
+- id: publish-state-at-depth
+  parts: ["sub", ".published.json"]
+  reason: housekeeping
+- id: state-database-at-depth-casefolded
+  parts: ["sub", ".Anton_State.db"]
+  reason: housekeeping
+- id: readme-casefolded
+  parts: ["readme.MD"]
+  reason: housekeeping
+- id: state-database-journal
+  parts: [".anton_state.db-wal"]
+  reason: housekeeping

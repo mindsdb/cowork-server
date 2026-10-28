@@ -8,6 +8,7 @@ in the same UI session. Closed during FastAPI lifespan shutdown.
 from __future__ import annotations
 
 import asyncio
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Optional
 
 import httpx
@@ -21,7 +22,12 @@ def get_proxy_client() -> httpx.AsyncClient:
     """Return the process-wide proxy client, creating it on first use."""
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
+        # Shared by every visitor: a cookie jar here would replay one visitor's
+        # upstream cookies on another's requests, so it accepts nothing.
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+        )
     return _client
 
 
