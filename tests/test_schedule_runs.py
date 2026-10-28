@@ -1153,14 +1153,23 @@ def test_reap_orphaned_runs_started_before_leaves_younger_runs():
     assert live.status == RunStatus.running
 
 
-def test_boot_reap_cutoff_reaps_everything_only_on_the_desktop():
+def test_boot_reap_cutoff_reaps_everything_only_on_the_desktop(monkeypatch):
+    from types import SimpleNamespace
+
     from cowork.scheduler import _ORPHANED_RUN_AGE_SECONDS, boot_reap_cutoff
 
     now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
 
-    assert boot_reap_cutoff(org_mode=False, now=now) is None
+    def _tenancy(mode):
+        monkeypatch.setattr(
+            "cowork.common.settings.app_settings.get_app_settings", lambda: SimpleNamespace(tenancy_mode=mode),
+        )
+
+    _tenancy("local")
+    assert boot_reap_cutoff(now=now) is None
     # A replica booting next to one mid-run must leave that run alone.
-    assert boot_reap_cutoff(org_mode=True, now=now) == now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
+    _tenancy("org")
+    assert boot_reap_cutoff(now=now) == now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
     assert _ORPHANED_RUN_AGE_SECONDS > 600
 
 
