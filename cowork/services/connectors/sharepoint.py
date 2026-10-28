@@ -35,7 +35,7 @@ MAX_IMPORT_BYTES = 2**30
 MAX_IMPORT_DEPTH = 32
 
 _MAX_TRIES = 3
-_MAX_DRIVE_PAGES = 10
+_MAX_LIBRARY_PAGES = 10
 _MAX_IMPORT_FOLDERS = 200
 _MAX_IMPORT_PAGES = 200
 _MAX_NAME_BYTES = 255
@@ -48,6 +48,7 @@ _REFUSED_REDIRECT = "SharePoint sent the download to an address Cowork won't fol
 _SLOW_MARGIN_SECONDS = 1.0
 _CHILD_FIELDS = "id,name,size,file,folder,lastModifiedDateTime"
 _PICK_FIELDS = "id,name,size,file,folder"
+_STALE_CURSOR = "This folder listing is out of date. Open the folder again."
 _WINDOWS_UNSAFE_CHARS = frozenset('<>:"|?*')
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"} | {f"COM{n}" for n in range(1, 10)} | {f"LPT{n}" for n in range(1, 10)}
@@ -336,6 +337,14 @@ def _require_id(value: str, pattern: re.Pattern[str]) -> str:
     return value
 
 
+def _graph_id(value: str, pattern: re.Pattern[str], what: str) -> str:
+    """An id Graph returned, if it fits ``pattern``; a response that breaks the shape is UNREACHABLE."""
+    try:
+        return _require_id(value, pattern)
+    except SharePointError as exc:
+        raise SharePointError(SharePointErrorKind.UNREACHABLE, f"SharePoint returned an unexpected {what} id.") from exc
+
+
 def _skiptoken(next_link: Any) -> str | None:
     """Return the ``$skiptoken`` of an ``@odata.nextLink``, or None when there is no next page.
 
@@ -361,7 +370,12 @@ def _retry_after_seconds(response: httpx.Response) -> float:
 
 
 class _Deadline:
-    """One operation's time budget, shared by every request and retry wait in it."""
+    """One operation's time budget, shared by every request and retry wait in it.
+
+    It is checked before each request and caps each request's timeout, but
+    httpx applies that timeout per phase and restarts the read timeout on
+    every chunk, so a slow reply can run past it: a soft budget, not a hard cap.
+    """
 
     def __init__(self, clock: Callable[[], float], seconds: float) -> None:
         """Start the budget of ``seconds`` now, by ``clock``."""
@@ -417,20 +431,16 @@ class SharePointClient:
         sites = []
         for url in site_urls:
             site = self._resolve_site(url, deadline)
-            self._list_drives(site, deadline)
+            self._list_libraries(site, deadline)
             sites.append(site)
         with _TOKENS_LOCK:
             _TOKENS[self._key.cache_key()] = (self._token, expires_at)
         return sites
 
-    def resolve_site(self, url: str) -> Site:
-        """Resolve one site URL to its Graph site id."""
-        return self._resolve_site(url, _Deadline(self._clock, BROWSE_SECONDS))
-
-    def list_drives(self, site_url: str) -> list[Library]:
+    def list_libraries(self, site_url: str) -> list[Library]:
         """List a site's document libraries, the site lookup included, within one browse budget."""
         deadline = _Deadline(self._clock, BROWSE_SECONDS)
-        return self._list_drives(self._resolve_site(site_url, deadline), deadline)
+        return self._list_libraries(self._resolve_site(site_url, deadline), deadline)
 
     def list_children(self, site_url: str, drive_id: str, item_id: str = "root", cursor: str | None = None) -> Page:
         """List one page of a folder's children; ``cursor`` is the previous page's skiptoken.
@@ -703,7 +713,7 @@ class SharePointClient:
 
     def _require_library(self, site: Site, drive_id: str, deadline: _Deadline) -> None:
         """Refuse a library id that is not one of the site's own."""
-        if drive_id not in {library.id for library in self._list_drives(site, deadline)}:
+        if drive_id not in {library.id for library in self._list_libraries(site, deadline)}:
             raise SharePointError(SharePointErrorKind.ITEM_NOT_FOUND)
 
     def _children_page(
@@ -718,6 +728,8 @@ class SharePointClient:
         if cursor:
             params["$skiptoken"] = cursor
         response = self._graph_get(url, params, deadline)
+        if cursor and response.status_code == 400:
+            raise SharePointError(SharePointErrorKind.INVALID, _STALE_CURSOR)
         if response.status_code in {400, 403, 404}:
             raise SharePointError(SharePointErrorKind.ITEM_NOT_FOUND)
         payload = self._json(response)
@@ -737,19 +749,15 @@ class SharePointClient:
                 SharePointErrorKind.SITE_NOT_GRANTED,
                 f"The app can't open {canonical}. Ask your admin to grant it this site, and check the address.",
             )
-        graph_id = str(self._json(response).get("id") or "")
-        try:
-            _require_id(graph_id, _SITE_ID)
-        except SharePointError as exc:
-            raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned an unexpected site id.") from exc
+        graph_id = _graph_id(str(self._json(response).get("id") or ""), _SITE_ID, "site")
         return Site(url=canonical, graph_id=graph_id)
 
-    def _list_drives(self, site: Site, deadline: _Deadline) -> list[Library]:
-        """Read the site's libraries page by page, at most ``_MAX_DRIVE_PAGES`` pages."""
+    def _list_libraries(self, site: Site, deadline: _Deadline) -> list[Library]:
+        """Read the site's libraries page by page, at most ``_MAX_LIBRARY_PAGES`` pages."""
         base = f"{GRAPH_URL}/sites/{quote(site.graph_id, safe='!,')}/drives"
         libraries: list[Library] = []
         params: dict[str, str] = {"$select": "id,name"}
-        for _ in range(_MAX_DRIVE_PAGES):
+        for _ in range(_MAX_LIBRARY_PAGES):
             response = self._graph_get(base, params, deadline)
             if response.status_code in {403, 404}:
                 raise SharePointError(
@@ -758,11 +766,7 @@ class SharePointClient:
                 )
             payload = self._json(response)
             for entry in payload.get("value", []):
-                drive_id = str(entry.get("id") or "")
-                try:
-                    _require_id(drive_id, _DRIVE_OR_ITEM_ID)
-                except SharePointError as exc:
-                    raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned an unexpected library id.") from exc
+                drive_id = _graph_id(str(entry.get("id") or ""), _DRIVE_OR_ITEM_ID, "library")
                 libraries.append(Library(id=drive_id, name=str(entry.get("name") or "")))
             token = _skiptoken(payload.get("@odata.nextLink"))
             if token is None:
@@ -775,7 +779,7 @@ class SharePointClient:
         response = self._send("GET", url, deadline, params=params, token=self._current_token(deadline))
         if response.status_code == 401:
             if self._fresh_only:
-                # The check never reads or writes the cache, even on a retry.
+                # The check never reads the cache; it writes it only after every site passed.
                 self._token, _ = self._fetch_token(deadline)
             else:
                 self._evict_token()
@@ -877,11 +881,7 @@ class SharePointClient:
             kind = "file"
         else:
             kind = "other"
-        item_id = str(entry.get("id") or "")
-        try:
-            _require_id(item_id, _DRIVE_OR_ITEM_ID)
-        except SharePointError as exc:
-            raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned an unexpected item id.") from exc
+        item_id = _graph_id(str(entry.get("id") or ""), _DRIVE_OR_ITEM_ID, "item")
         size = entry.get("size")
         modified = entry.get("lastModifiedDateTime")
         return Item(

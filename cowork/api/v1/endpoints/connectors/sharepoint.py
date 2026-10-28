@@ -19,7 +19,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 
-from anton.core.datasources.data_vault import LocalDataVault
+from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
 
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
@@ -101,40 +101,39 @@ def _body_fields(body: Any, allowed: frozenset[str], required: tuple[str, ...]) 
     return fields
 
 
-def _credentials(fields: dict[str, str]) -> dict[str, str]:
-    """The stored fields, validated: site URLs normalised and kept one per line."""
+def _credentials(fields: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """The fields to store, validated, and the normalised sites they name (stored one per line)."""
     try:
         tenant_id = validate_tenant_id(fields["tenant_id"])
-        site_urls = "\n".join(parse_site_urls(fields["site_urls"]))
+        sites = parse_site_urls(fields["site_urls"])
     except SharePointError as exc:
         raise _unprocessable(str(exc)) from exc
-    return {
+    stored = {
         "tenant_id": tenant_id,
         "client_id": fields["client_id"],
         "client_secret": fields["client_secret"],
-        "site_urls": site_urls,
+        "site_urls": "\n".join(sites),
     }
+    return stored, sites
 
 
-def _check(credentials: dict[str, str]) -> None:
+def _check(key: AppKey, sites: list[str]) -> None:
     """Refuse with the check's own message unless the key opens every site."""
-    key = AppKey(credentials["tenant_id"], credentials["client_id"], credentials["client_secret"])
     try:
         with SharePointClient(key) as client:
-            client.check(credentials["site_urls"].split("\n"))
+            client.check(sites)
     except SharePointError as exc:
         raise _unprocessable(str(exc)) from exc
 
 
-def _env_key(name: str) -> str:
-    """The form anton's DS_ env prefix gives a name: two names with one key would overwrite each other's env."""
-    return re.sub(r"[^\w]", "_", name).casefold()
-
-
 def _name_taken(vault: LocalDataVault | LayeredDataVault, name: str) -> bool:
-    """Whether a SharePoint connection already holds ``name`` or its env prefix."""
-    taken = {_env_key(c["name"]) for c in vault.list_connections() if c.get("engine") == ENGINE}
-    return _env_key(name) in taken
+    """Whether a SharePoint connection already holds ``name`` or its DS_ env prefix.
+
+    Two names with one prefix would overwrite each other's env, so the
+    comparison uses anton's own prefix rule.
+    """
+    taken = {_slug_env_prefix(ENGINE, c["name"]) for c in vault.list_connections() if c.get("engine") == ENGINE}
+    return _slug_env_prefix(ENGINE, name) in taken
 
 
 def _valid_name(name: str) -> bool:
@@ -149,6 +148,8 @@ def _saved(vault: LocalDataVault | LayeredDataVault, name: str) -> dict[str, Any
     return {"ok": True, "name": name, "user_label": user_label}
 
 
+# Bodies are parsed by hand, not by a Pydantic model: FastAPI's 422 echoes
+# the input, which would put the client secret in the reply.
 @router.post("/connections", status_code=status.HTTP_201_CREATED)
 def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str, Any]:
     """Create a SharePoint connection once its key opens every site; 409 if the name is taken."""
@@ -163,8 +164,8 @@ def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str
     vault = vault_for_scope(scope)
     if _name_taken(vault, name):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN)
-    credentials = _credentials(fields)
-    _check(credentials)
+    credentials, sites = _credentials(fields)
+    _check(AppKey(credentials["tenant_id"], credentials["client_id"], credentials["client_secret"]), sites)
     # The key check can take a minute, so the name is checked again under the
     # lock every create holds while it saves.
     with _CREATE_LOCK:
@@ -174,10 +175,9 @@ def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str
             ENGINE, None, name, credentials, user_label=fields.get("user_label") or None, vault=vault, scope=scope,
         )
     if slug != name:
-        # Only a writer outside these routes gets here. The record it saved
-        # to may have existed before this request, so nothing is deleted.
+        # Only a writer outside these routes gets here. The checked key was
+        # saved under another name, so the reply names it; nothing is deleted.
         logger.warning("A SharePoint create for %r was saved as %r by another writer's race", name, slug)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN)
     return _saved(vault, slug)
 
 
@@ -197,14 +197,13 @@ def edit_connection(name: str, body: Annotated[Any, Body()], scope: ScopeDep) ->
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_CONNECTION_REFUSAL)
     if any(fields[key] == VAULT_KEEP_SENTINEL for key in ("tenant_id", "client_id", "site_urls")):
         raise _unprocessable("Only the client secret can be kept as stored.")
-    credentials = _credentials(fields)
-    checked = dict(credentials)
-    if credentials["client_secret"] == VAULT_KEEP_SENTINEL:
-        stored_secret = str(record.get("fields", {}).get("client_secret") or "")
-        if not stored_secret:
+    credentials, sites = _credentials(fields)
+    secret = credentials["client_secret"]
+    if secret == VAULT_KEEP_SENTINEL:
+        secret = str(record.get("fields", {}).get("client_secret") or "")
+        if not secret:
             raise _unprocessable("This connection has no stored secret to keep. Enter the client secret.")
-        checked["client_secret"] = stored_secret
-    _check(checked)
+    _check(AppKey(credentials["tenant_id"], credentials["client_id"], secret), sites)
     persist_connection(
         ENGINE,
         None,
@@ -266,14 +265,14 @@ def _granted_site(site: str, sites: list[str]) -> str:
     return canonical
 
 
-@router.get("/connections/{name}/drives", response_model=SharePointLibrariesResponse)
+@router.get("/connections/{name}/libraries", response_model=SharePointLibrariesResponse)
 def list_libraries(name: str, site: str, scope: ScopeDep) -> SharePointLibrariesResponse:
     """List the document libraries of one site the connection names."""
     key, sites = _stored_connection(scope, name)
     url = _granted_site(site, sites)
     try:
         with SharePointClient(key) as client:
-            libraries = client.list_drives(url)
+            libraries = client.list_libraries(url)
     except SharePointError as exc:
         raise _browse_error(exc) from exc
     return SharePointLibrariesResponse(
