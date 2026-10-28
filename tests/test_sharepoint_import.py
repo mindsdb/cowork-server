@@ -49,7 +49,7 @@ class SharePoint:
         self.children: dict[str, list[dict]] = {}
         self.bytes: dict[str, bytes] = {}
         self.fail_download: set[str] = set()
-        self.stale_second_page: set[str] = set()
+        self.second_page: dict[str, httpx.Response] = {}
         self.on_content = None
 
     def file(self, item_id: str, name: str, data: bytes, size: int | None = None) -> dict:
@@ -81,9 +81,9 @@ class SharePoint:
         if path.startswith(f"{ITEMS_PATH}/"):
             item_id, _, rest = path[len(ITEMS_PATH) + 1:].partition("/")
             if rest == "children":
-                if item_id in self.stale_second_page:
+                if item_id in self.second_page:
                     if request.url.params.get("$skiptoken") == "p2":
-                        return httpx.Response(400, json={"error": {"code": "invalidRequest"}})
+                        return self.second_page[item_id]
                     next_link = f"https://graph.microsoft.com{ITEMS_PATH}/{item_id}/children?$skiptoken=p2"
                     return httpx.Response(200, json={"value": self.children[item_id], "@odata.nextLink": next_link})
                 return httpx.Response(200, json={"value": self.children.get(item_id, [])})
@@ -410,7 +410,7 @@ def test_every_failure_kind_maps_to_an_import_status():
 def test_a_folder_that_changes_while_it_is_read_asks_to_retry_the_import(microsoft, project):
     name, _id, folder = project
     microsoft.folder("01R", "Reports", [microsoft.file("01a", "q3.xlsx", b"xlsx bytes")])
-    microsoft.stale_second_page.add("01R")
+    microsoft.second_page["01R"] = httpx.Response(400, json={"error": {"code": "invalidRequest"}})
 
     response = _import(name, ["01R"])
 
@@ -418,3 +418,15 @@ def test_a_folder_that_changes_while_it_is_read_asks_to_retry_the_import(microso
     assert response.json()["detail"] == "The folder changed while it was read. Try the import again."
     assert _tree(folder) == {}
     assert microsoft.content_requests() == []
+
+
+def test_a_later_page_that_is_throttled_keeps_its_own_error(microsoft, project):
+    name, _id, folder = project
+    microsoft.folder("01R", "Reports", [microsoft.file("01a", "q3.xlsx", b"xlsx bytes")])
+    microsoft.second_page["01R"] = httpx.Response(429, headers={"Retry-After": "1"})
+
+    response = _import(name, ["01R"])
+
+    assert response.status_code == 429
+    assert "The folder changed" not in response.json()["detail"]
+    assert _tree(folder) == {}
