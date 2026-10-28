@@ -73,6 +73,20 @@ def test_a_null_field_is_left_unchanged(engine):
     assert result.featured is True and result.label == "httpbin"
 
 
+def test_a_null_category_or_description_clears_it(engine):
+    update_custom_connector(
+        "httpbin", CustomConnectorUpdate(category="crm", description="Bearer test API"), _scoped(engine),
+    )
+
+    result = update_custom_connector(
+        "httpbin", CustomConnectorUpdate.model_validate({"category": None, "description": None}), _scoped(engine),
+    )
+
+    assert result.category == "other"
+    assert result.description == ""
+    assert result.label == "httpbin" and result.featured is True
+
+
 def test_replace_the_form(engine):
     new_form = {**FORM, "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}]}
 

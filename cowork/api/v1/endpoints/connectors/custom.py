@@ -4,26 +4,15 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from cowork.api.v1.permissions import AuthenticatedOrgAdmin, require
 from cowork.db.scoped import ScopedSessionDep
-from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorMetadataResponse, CustomConnectorUpdate
+from cowork.services.connectors.catalog import custom_connector_spec
 from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
+from cowork.services.connectors.specs._registry import connector_metadata
 
 # AuthenticatedOrgAdmin: a custom connector is listed for everyone in the
 # organization, so changing or removing one is an admin decision. A no-op on a
 # local install, where the one user owns every definition.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedOrgAdmin))])
-
-
-def _metadata(row: CustomConnector) -> ConnectorMetadataResponse:
-    return ConnectorMetadataResponse(
-        id=row.connector_id,
-        label=row.label,
-        description=row.description,
-        category=row.category or "other",
-        logo_color=row.logo_color,
-        featured=row.featured,
-        custom=True,
-    )
 
 
 @router.patch("/{connector_id}", response_model=ConnectorMetadataResponse)
@@ -37,12 +26,12 @@ def update_custom_connector(
             when ``spec`` is invalid or unsafe to keep.
     """
     try:
-        row = CustomConnectorService(session).update(connector_id, body.model_dump(exclude_none=True))
+        row = CustomConnectorService(session).update(connector_id, body)
     except UnstorableFormError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom connector not found.")
-    return _metadata(row)
+    return connector_metadata(custom_connector_spec(row))
 
 
 @router.delete("/{connector_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -11,6 +11,7 @@ from typing import Any
 from cowork.db.scoped import ScopedSession
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorSpecResponse
+from cowork.services.connectors.custom_connectors import scope_definitions
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
 logger = logging.getLogger(__name__)
@@ -49,24 +50,19 @@ class ConnectorCatalog(ConnectorSpecRegistry):
     the registry is skipped and logged rather than shadowing the built-in.
     """
 
-    def __init__(self, session: ScopedSession, base: ConnectorSpecRegistry = registry) -> None:
+    def __init__(self, session: ScopedSession) -> None:
         """Bind the catalog to a scoped session.
 
         Args:
             session: The request's or tool call's tenant-scoped session.
-            base: The static registry to merge onto; the module singleton by default.
         """
         super().__init__()
         self._session = session
-        self._base = base
+        self._base = registry
 
     def _custom_rows(self) -> list[CustomConnector]:
-        stmt = self._session.select(CustomConnector)
-        # ScopedSession only filters in org mode; a local scope must not read
-        # rows that belong to an org.
-        if not self._session.scope.org_mode:
-            stmt = stmt.where(CustomConnector.org_id.is_(None))
-        return list(self._session.exec(stmt).all())
+        """The scope's stored definitions."""
+        return list(self._session.exec(scope_definitions(self._session)).all())
 
     def get_connector(self, connector_id: str) -> ConnectorSpecResponse | None:
         """Return one connector's spec, the built-in one when the id is both.

@@ -23,13 +23,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 import uuid
 
-from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, tenant_scope_required
 from cowork.db.units import run_db
 from cowork.deployment_identity import identity_for_turn
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
@@ -37,9 +37,10 @@ from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.custom_connectors import UnstorableFormError, check_handcrafted_form
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def _published_state(raw_path: str) -> dict:
@@ -673,21 +674,33 @@ _BUILD_CUSTOM_CONNECTOR = (
 )
 
 
-async def _scope_connectors() -> dict[str, dict]:
-    """Return built-in and custom connector specs visible to this turn's scope.
+async def _read_scope_catalog(read: Callable[[ConnectorSpecRegistry], T]) -> T:
+    """Apply ``read`` to the connectors this turn's scope sees, off the event loop.
 
-    Returns:
-        Raw specs keyed by connector id, read off the event loop. In org mode
-        with no bound scope, built-ins only: falling back to the local scope
-        would read another tenant's rows.
+    With no bound scope where one is required (org mode, or trusted identity
+    headers), ``read`` gets the built-ins only: LOCAL_SCOPE there is the
+    operator's view, not the caller's.
     """
     scope = current_settings_scope()
     if scope is None:
-        if get_app_settings().tenancy_mode == "org":
-            logger.warning("connectors: no tenant scope is bound in org mode; custom connectors skipped")
-            return dict(registry.get_connectors())
+        if tenant_scope_required():
+            logger.warning("connectors: no tenant scope is bound; custom connectors skipped")
+            return read(registry)
         scope = LOCAL_SCOPE
-    return await run_db(lambda session: ConnectorCatalog(session).get_connectors(), scope=scope)
+    return await run_db(lambda session: read(ConnectorCatalog(session)), scope=scope)
+
+
+async def _scope_connectors() -> dict[str, dict]:
+    """Return built-in and custom connector specs visible to this turn's scope,
+    as raw specs keyed by connector id."""
+    return await _read_scope_catalog(lambda catalog: dict(catalog.get_connectors()))
+
+
+async def scope_usage_notes(engines: Iterable[str]) -> dict[str, str]:
+    """Return engine -> agent-facing usage notes for those of ``engines``
+    that declare some, custom connectors included, in this turn's scope."""
+    wanted = list(engines)
+    return await _read_scope_catalog(lambda catalog: catalog.usage_notes_for(wanted))
 
 
 # Request Credentials Tool
@@ -873,7 +886,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
             "type": "object",
             "description": "Only when building a new custom connector: how it is listed for reuse once its connection test passes.",
             "properties": {
-                "label": {"type": "string", "description": "Display name (e.g. 'Aminta Planner')."},
+                "label": {"type": "string", "description": "Display name (e.g. 'Acme Planner')."},
                 "description": {"type": "string", "description": "One line on what it connects to."},
                 "category": {"type": "string", "description": "Picker category (e.g. 'database', 'crm', 'developer')."},
                 "usage_notes": {"type": "string", "description": "Short notes for using it later: base URL, auth header, key endpoints, quirks. Never credential values."},

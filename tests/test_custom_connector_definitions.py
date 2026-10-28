@@ -37,6 +37,13 @@ HTTPBIN_FORM = {
     "connector": {"label": "httpbin", "category": "developer", "usage_notes": "Call /bearer."},
     "fields": [{"name": "token", "label": "Bearer token", "type": "password", "secret": True}],
 }
+OAUTH_FORM = {
+    "form_id": "fm_cccccccccc", "engine": "httpbin", "title": "Connect httpbin",
+    "methods": [{
+        "id": "oauth", "label": "Sign in", "submit_action": "oauth_launch",
+        "oauth": {"auth_url": "https://example.com/auth", "token_url": "https://example.com/token"},
+    }],
+}
 
 
 @pytest.fixture()
@@ -61,9 +68,10 @@ def _rows(engine) -> list[CustomConnector]:
 class _Probe:
     verdict = "success"
     runs = 0
+    built: list[dict] = []
 
-    def __init__(self, **_kwargs) -> None:
-        pass
+    def __init__(self, **kwargs) -> None:
+        type(self).built.append(kwargs)
 
     async def run(self):
         type(self).runs += 1
@@ -73,6 +81,7 @@ class _Probe:
 @pytest.fixture()
 def vault(tmp_path, monkeypatch):
     _Probe.runs = 0
+    _Probe.built = []
     vault = LocalDataVault(Path(tmp_path) / "vault")
     monkeypatch.setattr(probe_handler, "vault_for_scope", lambda scope: vault)
     monkeypatch.setattr(probe_handler, "CredentialProbe", _Probe)
@@ -172,20 +181,35 @@ class TestProbeStream:
         assert row.description == "Second"
 
     @pytest.mark.asyncio
-    async def test_a_handcrafted_oauth_grant_is_saved_without_probing(self, engine, vault):
-        form = {
-            "form_id": "fm_cccccccccc", "engine": "httpbin", "title": "Connect httpbin",
-            "methods": [{
-                "id": "oauth", "label": "Sign in", "submit_action": "oauth_launch",
-                "oauth": {"auth_url": "https://example.com/auth", "token_url": "https://example.com/token"},
-            }],
-        }
+    async def test_a_handcrafted_oauth_grant_is_listed_once_its_token_passes_a_probe(self, engine, vault):
+        _Probe.verdict = "success"
 
-        await _probe(form, {"access_token": "t", "refresh_token": "r"}, method="oauth")
+        await _probe(OAUTH_FORM, {"access_token": "t", "refresh_token": "r"}, method="oauth")
 
-        assert _Probe.runs == 0
+        assert _Probe.runs == 1
         assert len(vault.list_connections()) == 1
         assert [r.connector_id for r in _rows(engine)] == ["httpbin"]
+
+    @pytest.mark.asyncio
+    async def test_a_grant_whose_token_fails_its_probe_is_saved_but_not_listed(self, engine, vault):
+        _Probe.verdict = "failure"
+
+        stream = await _probe(OAUTH_FORM, {"access_token": "made-up", "refresh_token": "r"}, method="oauth")
+
+        assert _Probe.runs == 1
+        assert len(vault.list_connections()) == 1
+        assert _rows(engine) == []
+        assert "not added to your connectors list" in stream
+
+
+    @pytest.mark.asyncio
+    async def test_the_probe_reads_a_custom_connectors_usage_notes(self, engine, vault):
+        _Probe.verdict = "success"
+        await _probe(HTTPBIN_FORM, {"token": "a"})
+
+        await _probe(HTTPBIN_FORM, {"token": "b"})
+
+        assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
 
 
 class TestProbeIsNotSkippedByAModelFlag:
@@ -268,6 +292,10 @@ class TestUnstorableForms:
         }}]}, "oauth.token_url"),
         ({**HTTPBIN_FORM, "logo_color": "red; background: url(x)"}, "logo_color"),
         ({**HTTPBIN_FORM, "connector": {"usage_notes": "x" * 1601}}, "usage_notes"),
+        ({**HTTPBIN_FORM, "connector": {
+            "usage_notes": "Send Authorization: Bearer abcdef0123456789abcdef on every call.",
+        }}, "credential"),
+        ({**HTTPBIN_FORM, "connector": {"usage_notes": "Key: sk-proj-abcdefghijklmnopqrstuvwx"}}, "credential"),
         ({**HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "id": "apiKey"}]}, "not valid"),
     ])
     def test_check_refuses(self, form, why):
@@ -276,6 +304,11 @@ class TestUnstorableForms:
 
     def test_a_safe_form_passes(self):
         check_handcrafted_form({**HTTPBIN_FORM, "help_url": "https://example.com/help", "methods": [OAUTH_METHOD]})
+
+    def test_notes_that_name_a_placeholder_pass(self):
+        check_handcrafted_form({**HTTPBIN_FORM, "connector": {
+            "usage_notes": "Base URL https://api.example.com. Send Authorization: Bearer <token>.",
+        }})
 
     @pytest.mark.asyncio
     async def test_the_tool_refuses_before_the_form_renders(self, engine, monkeypatch):

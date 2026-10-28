@@ -5,11 +5,13 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from anton.utils.datasources import scrub_output
 from pydantic import ValidationError
 
-from cowork.db.scoped import ScopedSession
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import ScopedSelect, ScopedSession
 from cowork.models.custom_connector import CustomConnector
-from cowork.schemas.connectors import ConnectorForm
+from cowork.schemas.connectors import ConnectorForm, CustomConnectorUpdate
 
 # Top-level keys a handcrafted form may carry that ConnectorForm doesn't model
 # but the connect form still renders.
@@ -57,8 +59,16 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
     if color is not None and not _COLOR_PATTERN.fullmatch(str(color)):
         raise UnstorableFormError("logo_color must be a hex color such as #3a7 or #33aa77.")
     meta = form_spec.get("connector") if isinstance(form_spec.get("connector"), dict) else {}
-    if len(str(meta.get("usage_notes") or "")) > USAGE_NOTES_MAX:
+    notes = str(meta.get("usage_notes") or "")
+    if len(notes) > USAGE_NOTES_MAX:
         raise UnstorableFormError(f"connector.usage_notes must be at most {USAGE_NOTES_MAX} characters.")
+    # Everyone in the scope reads the notes; anton's output scrubber knows the
+    # key and token shapes. Best effort: an unknown shape gets through.
+    if scrub_output(notes) != notes:
+        raise UnstorableFormError(
+            "connector.usage_notes looks like it holds a credential value. "
+            "Say how to authenticate (header name, scheme) without the value."
+        )
 
 
 def _text(value: Any, limit: int | None = None) -> str | None:
@@ -94,6 +104,20 @@ def stored_form(connector_id: str, form_spec: dict[str, Any]) -> dict[str, Any]:
     return form
 
 
+def scope_definitions(session: ScopedSession) -> ScopedSelect:
+    """Select the custom connector definitions ``session``'s scope sees.
+
+    Where connections are partitioned (org mode, or a personal scope whose
+    connections are personal), the scoped session already keys rows by the
+    scope's org_id. Elsewhere the session adds no filter, so only the shared
+    rows (org_id NULL) are the scope's; another scope's rows are left out.
+    """
+    stmt = session.select(CustomConnector)
+    if not session.scope.partitioned_for(PersonalResource.CONNECTIONS):
+        stmt = stmt.where(CustomConnector.org_id.is_(None))
+    return stmt
+
+
 class CustomConnectorService:
     """Create, read, change and delete one scope's custom connector definitions."""
 
@@ -107,11 +131,7 @@ class CustomConnectorService:
 
     def get(self, connector_id: str) -> CustomConnector | None:
         """Return the scope's definition for ``connector_id``, or None."""
-        stmt = self.session.select(CustomConnector).where(CustomConnector.connector_id == connector_id)
-        # ScopedSession only filters in org mode; a local scope must not read
-        # or change rows that belong to an org.
-        if not self.session.scope.org_mode:
-            stmt = stmt.where(CustomConnector.org_id.is_(None))
+        stmt = scope_definitions(self.session).where(CustomConnector.connector_id == connector_id)
         return self.session.exec(stmt).first()
 
     def upsert_from_form(self, connector_id: str, form_spec: dict[str, Any]) -> CustomConnector:
@@ -149,13 +169,14 @@ class CustomConnectorService:
         self.session.refresh(row)
         return row
 
-    def update(self, connector_id: str, changes: dict[str, Any]) -> CustomConnector | None:
+    def update(self, connector_id: str, changes: CustomConnectorUpdate) -> CustomConnector | None:
         """Change a definition's display fields, featured flag or form.
 
         Args:
             connector_id: The definition to change.
-            changes: Any of ``label``, ``description``, ``category``,
-                ``featured`` and ``spec`` (a full connection form).
+            changes: The fields the caller set. A null ``category`` or
+                ``description`` clears it; a null ``label``, ``featured`` or
+                ``spec`` leaves it as it is, since none of them can be empty.
 
         Returns:
             The updated row, or None when the scope has no such definition.
@@ -166,17 +187,23 @@ class CustomConnectorService:
         Side effects:
             Commits the session.
         """
+        sent = changes.model_fields_set
         row = self.get(connector_id)
         if row is None:
             return None
-        if "spec" in changes:
-            row.spec = stored_form(connector_id, changes["spec"])
+        if changes.spec is not None:
+            row.spec = stored_form(connector_id, changes.spec)
             # The directory tile reads the column, so a new form color moves it too.
-            if changes["spec"].get("logo_color"):
-                row.logo_color = _text(changes["spec"]["logo_color"], 32)
-        for key in ("label", "description", "category", "featured"):
-            if key in changes:
-                setattr(row, key, changes[key])
+            if changes.spec.get("logo_color"):
+                row.logo_color = _text(changes.spec["logo_color"], 32)
+        if changes.label is not None:
+            row.label = changes.label
+        if changes.featured is not None:
+            row.featured = changes.featured
+        if "description" in sent:
+            row.description = changes.description or ""
+        if "category" in sent:
+            row.category = changes.category
         self.session.add(row)
         self.session.commit()
         self.session.refresh(row)

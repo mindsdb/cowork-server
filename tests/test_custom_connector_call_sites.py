@@ -18,6 +18,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from cowork.api.v1.endpoints.connectors import connections as connections_endpoints
 from cowork.api.v1.endpoints.connectors import oauth as oauth_endpoints
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoints
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.harnesses.anton_harness import tools
 from cowork.models.custom_connector import CustomConnector
@@ -315,11 +316,44 @@ class TestSecretFieldsFromNonRegistrySpecs:
         assert "signing_material" in record["secure_keys"]
 
 
-class TestOrgModeWithoutABoundScope:
+class TestUsageNotes:
     @pytest.mark.asyncio
-    async def test_the_agent_sees_built_ins_only(self, engine, monkeypatch):
+    async def test_the_turn_reads_a_custom_connectors_usage_notes(self, engine, monkeypatch):
         monkeypatch.setattr(tools, "current_settings_scope", lambda: None)
-        monkeypatch.setattr(tools, "get_app_settings", lambda: type("S", (), {"tenancy_mode": "org"})())
+        with Session(engine) as session:
+            row = session.exec(select(CustomConnector)).one()
+            row.usage_notes = "Call /bearer with the token header."
+            session.add(row)
+            session.commit()
+
+        notes = await tools.scope_usage_notes(["httpbin", "not-connected"])
+
+        assert notes == {"httpbin": "Call /bearer with the token header."}
+
+
+class TestWithoutABoundScope:
+    @pytest.fixture()
+    def org_mode(self, monkeypatch):
+        monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+        get_app_settings.cache_clear()
+        yield
+        get_app_settings.cache_clear()
+
+    @pytest.mark.asyncio
+    async def test_org_mode_shows_the_agent_built_ins_only(self, engine, org_mode, monkeypatch):
+        monkeypatch.setattr(tools, "current_settings_scope", lambda: None)
+
+        result = json.loads(await tools._cowork_lookup_connector(None, {"id": "httpbin"}))
+
+        assert result["id"] is None
+        assert "httpbin" not in result["available_ids"]
+        assert "postgres" in result["available_ids"]
+
+    @pytest.mark.asyncio
+    async def test_trusted_identity_headers_show_the_agent_built_ins_only(
+        self, engine, personal_deployment, monkeypatch,
+    ):
+        monkeypatch.setattr(tools, "current_settings_scope", lambda: None)
 
         result = json.loads(await tools._cowork_lookup_connector(None, {"id": "httpbin"}))
 
@@ -332,13 +366,13 @@ class TestBuildFlowPrompt:
     @pytest.mark.asyncio
     async def test_the_connector_block_reaches_the_form(self, engine):
         result = await tools._cowork_request_credentials(None, {
-            "engine": "aminta", "title": "Connect Aminta",
+            "engine": "acme", "title": "Connect Acme",
             "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
-            "connector": {"label": "Aminta", "category": "erp", "usage_notes": "Base URL is per tenant."},
+            "connector": {"label": "Acme", "category": "erp", "usage_notes": "Base URL is per tenant."},
         })
 
         block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
-        assert block["connector"] == {"label": "Aminta", "category": "erp", "usage_notes": "Base URL is per tenant."}
+        assert block["connector"] == {"label": "Acme", "category": "erp", "usage_notes": "Base URL is per tenant."}
 
     def test_the_schema_declares_the_connector_block(self):
         props = tools._REQUEST_CREDENTIALS_SCHEMA["properties"]["connector"]["properties"]
@@ -347,7 +381,7 @@ class TestBuildFlowPrompt:
 
     @pytest.mark.asyncio
     async def test_a_failed_lookup_points_to_building_a_custom_connector(self, engine):
-        result = json.loads(await tools._cowork_lookup_connector(None, {"query": "aminta planner"}))
+        result = json.loads(await tools._cowork_lookup_connector(None, {"query": "acme planner"}))
 
         assert result["match"] == "none"
         assert "custom connector" in result["message"]

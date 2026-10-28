@@ -12,6 +12,23 @@ from cowork.schemas.connectors import (
 )
 
 
+def connector_metadata(c: dict) -> ConnectorMetadataResponse:
+    """Return a raw connector spec's directory entry, defaults filled in."""
+    return ConnectorMetadataResponse(
+        id=c.get("id"),
+        label=c.get("label", c.get("id", "")),
+        description=c.get("description", ""),
+        category=c.get("category", "other"),
+        logo=c.get("logo"),
+        logo_url=c.get("logo_url"),
+        logo_color=c.get("logo_color"),
+        aliases=c.get("aliases", []),
+        featured=c.get("featured", False),
+        notice=c.get("notice"),
+        custom=c.get("custom", False),
+    )
+
+
 class ConnectorSpecRegistry:
     def __init__(self, specs_dir: Path | None = None):
         self._specs_dir = specs_dir or Path(__file__).parent
@@ -57,22 +74,7 @@ class ConnectorSpecRegistry:
         return notes
 
     def list_connectors(self) -> list[ConnectorMetadataResponse]:
-        items = [
-            ConnectorMetadataResponse(
-                id=c.get("id"),
-                label=c.get("label", c.get("id", "")),
-                description=c.get("description", ""),
-                category=c.get("category", "other"),
-                logo=c.get("logo"),
-                logo_url=c.get("logo_url"),
-                logo_color=c.get("logo_color"),
-                aliases=c.get("aliases", []),
-                featured=c.get("featured", False),
-                notice=c.get("notice"),
-                custom=c.get("custom", False),
-            )
-            for c in self.get_connectors().values()
-        ]
+        items = [connector_metadata(c) for c in self.get_connectors().values()]
         items.sort(key=lambda x: (x.label or "").lower())
         return items
 

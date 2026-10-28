@@ -11,15 +11,27 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.api.v1.endpoints.connectors import specs as specs_endpoints
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import MatchRequest
 from cowork.services.connectors import catalog as catalog_module
 from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.services.connectors.custom_connectors import CustomConnectorService
 from tests._fakes import FakeRequest
 
 ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="user-a")
 ORG_B = TenantScope(org_mode=True, org_id="org-b", user_id="user-b")
+PERSON_A = TenantScope(
+    org_id="partition-a", user_id="person-a", personal=True, personal_resources=ALL_PERSONAL_RESOURCES,
+)
+PERSON_B = TenantScope(
+    org_id="partition-b", user_id="person-b", personal=True, personal_resources=ALL_PERSONAL_RESOURCES,
+)
+PERSON_SHARED = TenantScope(
+    org_id="partition-a", user_id="person-a", personal=True,
+    personal_resources=ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS},
+)
 
 HTTPBIN_FORM = {
     "form_id": "httpbin-connector",
@@ -86,6 +98,24 @@ class TestCatalog:
         _add(engine)
 
         assert _catalog(engine, ORG_A).get_connector("httpbin") is None
+
+    def test_a_personal_scope_sees_and_updates_its_own_saved_connector(self, engine):
+        with Session(engine) as session:
+            service = CustomConnectorService(ScopedSession(session, PERSON_A))
+            service.upsert_from_form("httpbin", HTTPBIN_FORM)
+            service.upsert_from_form("httpbin", {**HTTPBIN_FORM, "title": "Connect httpbin again"})
+
+        assert _catalog(engine, PERSON_A).get_connector("httpbin").label == "Connect httpbin again"
+        assert _catalog(engine, PERSON_B).get_connector("httpbin") is None
+        assert _catalog(engine, LOCAL_SCOPE).get_connector("httpbin") is None
+
+    def test_a_personal_scope_with_shared_connections_sees_only_shared_rows(self, engine):
+        _add(engine)
+        _add(engine, connector_id="private", org_id=PERSON_A.org_id)
+
+        catalog = _catalog(engine, PERSON_SHARED)
+        assert catalog.get_connector("httpbin") is not None
+        assert catalog.get_connector("private") is None
 
     def test_a_builtin_id_wins_over_a_custom_row(self, engine, monkeypatch):
         warnings = []

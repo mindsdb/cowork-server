@@ -20,6 +20,7 @@ from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.custom_connectors import CustomConnectorService
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
@@ -103,6 +104,25 @@ def _is_oauth_grant(form_spec: dict, method: str | None, credentials: dict) -> b
         ):
             return True
     return False
+
+
+_GRANT_UNLISTED = (
+    "\n\nThe connection is saved, but it was not added to your connectors list "
+    "because its connection test did not pass: {reason}\n"
+)
+
+
+def _grant_saved_patch(form_id: str, slug: str) -> dict:
+    """The form patch for a connection saved from a provider's grant."""
+    return {
+        "form_id": form_id,
+        "title": f"Saved — {slug}",
+        "subtitle": "Stored in the vault after the provider's authorization.",
+        "status_text": None,
+        "_is_probing": False,
+        "_is_success": True,
+        "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
+    }
 
 
 class ProbeHandler:
@@ -274,7 +294,6 @@ class ProbeHandler:
 
             # Mirrors submit_form: a handcrafted form keeps its own spec, and a
             # custom connector's stored spec arrives staged with the submission.
-            staged_spec = submission.get("form_spec") or {}
             # Only an explicit False from submit_form skips the stored spec, so
             # a submission can never be validated as one connector and saved untested.
             stamped = submission.get("checked_against_stored_spec") is not False
@@ -302,12 +321,15 @@ class ProbeHandler:
                 return
 
             extends_name = form_spec.get("_extends_connection") if spec is None else None
-            # A handcrafted OAuth method arrives after the browser grant, which
-            # is its test; probing again could throw a working grant away.
+            # A handcrafted OAuth method arrives after the browser grant. Its
+            # connection is saved first, so a probe failure never throws a
+            # working grant away; the token is only the client's word, though,
+            # so the shared definition waits for the probe below to pass.
+            grant_slug: str | None = None
+            grant_user_label: str | None = None
             if spec is None and _is_oauth_grant(form_spec, method, credentials):
                 try:
                     vault = vault_for_scope(self.scope)
-                    extends_name = form_spec.get("_extends_connection")
                     slug = persist_connection(
                         connector_id, method, extends_name or name, credentials,
                         label=connection_label, user_label=connection_user_label,
@@ -321,21 +343,11 @@ class ProbeHandler:
                     yield await _completed(db_conversation_id, {"status": "failed"})
                     return
                 yield _delta(f"Saved as `{slug}` (authorized with the provider).\n\n")
-                if not extends_name:
-                    note = await self._save_definition(connector_id, form_spec)
-                    if note:
-                        yield _delta(note)
-                yield _patch_delta({
-                    "form_id": form_id,
-                    "title": f"Saved — {slug}",
-                    "subtitle": "Stored in the vault after the provider's authorization.",
-                    "status_text": None,
-                    "_is_probing": False,
-                    "_is_success": True,
-                    "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
-                })
-                yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
-                return
+                if extends_name:
+                    yield _patch_delta(_grant_saved_patch(form_id, slug))
+                    yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
+                    return
+                grant_slug, grant_user_label = slug, saved_user_label
 
             # A follow-up step is probed with the fields of the connection it
             # extends too; the save below still merges them once, under the vault lock.
@@ -411,6 +423,14 @@ class ProbeHandler:
                 logger.exception("Could not build LLM client for probe")
 
             # Workspace / LLM client availability
+            if (workspace is None or llm_client is None) and grant_slug:
+                yield _delta(_GRANT_UNLISTED.format(reason=init_error))
+                yield _patch_delta(_grant_saved_patch(form_id, grant_slug))
+                yield await _completed(
+                    None if settings_busy else db_conversation_id,
+                    {"status": "success", "user_label": grant_user_label},
+                )
+                return
             if workspace is None or llm_client is None:
                 yield _delta(init_error)
                 yield _patch_delta({"form_id": form_id, "form_error": init_error})
@@ -440,7 +460,7 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
-                usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
+                usage_notes=await self._usage_notes(connector_id),
                 web_tool_kwargs=web_tools,
                 saved_fields=sorted(saved_only_fields),
                 cell_sandbox=cell_sandbox,
@@ -523,14 +543,22 @@ class ProbeHandler:
             # Apply verdict
             saved_slug: str | None = None
             saved_user_label: str | None = None
-            if final_outcome.status == "success":
+            if grant_slug and final_outcome.status != "success":
+                reason = final_outcome.error or final_outcome.follow_up or "its test did not pass"
+                yield _delta(_GRANT_UNLISTED.format(reason=reason))
+                yield _patch_delta(_grant_saved_patch(form_id, grant_slug))
+                yield await _completed(db_conversation_id, {"status": "success", "user_label": grant_user_label})
+                return
+            if grant_slug:
+                saved_slug, saved_user_label = grant_slug, grant_user_label
+            elif final_outcome.status == "success":
                 try:
                     vault = vault_for_scope(self.scope)
                     slug = persist_connection(
                         connector_id, method, extends_name or name, credentials,
                         label=connection_label, user_label=connection_user_label,
-                        extends=bool(extends_name), spec_form=form_spec, vault=vault,
-                        scope=self.scope,
+                        extends=bool(extends_name), spec_form=form_spec if spec is None else None,
+                        vault=vault, scope=self.scope,
                     )
                     saved_slug = slug
                     saved_record = vault.read_record(connector_id, slug) or {}
@@ -630,6 +658,13 @@ class ProbeHandler:
             logger.exception("Could not save the custom connector definition for %s", connector_id)
             return "\nThe connection is saved, but it could not be added to your connectors list.\n"
         return None
+
+    async def _usage_notes(self, connector_id: str) -> str | None:
+        """The connector's agent-facing notes, a custom connector's included."""
+        notes = await run_db(
+            lambda session: ConnectorCatalog(session).usage_notes_for([connector_id]), scope=self.scope,
+        )
+        return notes.get(connector_id)
 
     @staticmethod
     def _build_llm_client(settings=None):
