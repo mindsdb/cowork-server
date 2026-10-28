@@ -199,6 +199,14 @@ def _require_id(value: str, pattern: re.Pattern[str]) -> str:
     return value
 
 
+def _graph_id(value: str, pattern: re.Pattern[str], what: str) -> str:
+    """An id Graph returned, if it fits ``pattern``; a response that breaks the shape is UNREACHABLE."""
+    try:
+        return _require_id(value, pattern)
+    except SharePointError as exc:
+        raise SharePointError(SharePointErrorKind.UNREACHABLE, f"SharePoint returned an unexpected {what} id.") from exc
+
+
 def _skiptoken(next_link: Any) -> str | None:
     """Return the ``$skiptoken`` of an ``@odata.nextLink``, or None when there is no next page.
 
@@ -291,10 +299,6 @@ class SharePointClient:
             _TOKENS[self._key.cache_key()] = (self._token, expires_at)
         return sites
 
-    def resolve_site(self, url: str) -> Site:
-        """Resolve one site URL to its Graph site id."""
-        return self._resolve_site(url, _Deadline(self._clock, BROWSE_SECONDS))
-
     def list_drives(self, site_url: str) -> list[Library]:
         """List a site's document libraries, the site lookup included, within one browse budget."""
         deadline = _Deadline(self._clock, BROWSE_SECONDS)
@@ -343,11 +347,7 @@ class SharePointClient:
                 SharePointErrorKind.SITE_NOT_GRANTED,
                 f"The app can't open {canonical}. Ask your admin to grant it this site, and check the address.",
             )
-        graph_id = str(self._json(response).get("id") or "")
-        try:
-            _require_id(graph_id, _SITE_ID)
-        except SharePointError as exc:
-            raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned an unexpected site id.") from exc
+        graph_id = _graph_id(str(self._json(response).get("id") or ""), _SITE_ID, "site")
         return Site(url=canonical, graph_id=graph_id)
 
     def _list_drives(self, site: Site, deadline: _Deadline) -> list[Library]:
@@ -364,11 +364,7 @@ class SharePointClient:
                 )
             payload = self._json(response)
             for entry in payload.get("value", []):
-                drive_id = str(entry.get("id") or "")
-                try:
-                    _require_id(drive_id, _DRIVE_OR_ITEM_ID)
-                except SharePointError as exc:
-                    raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned an unexpected library id.") from exc
+                drive_id = _graph_id(str(entry.get("id") or ""), _DRIVE_OR_ITEM_ID, "library")
                 libraries.append(Library(id=drive_id, name=str(entry.get("name") or "")))
             token = _skiptoken(payload.get("@odata.nextLink"))
             if token is None:
@@ -483,11 +479,7 @@ class SharePointClient:
             kind = "file"
         else:
             kind = "other"
-        item_id = str(entry.get("id") or "")
-        try:
-            _require_id(item_id, _DRIVE_OR_ITEM_ID)
-        except SharePointError as exc:
-            raise SharePointError(SharePointErrorKind.UNREACHABLE, "SharePoint returned an unexpected item id.") from exc
+        item_id = _graph_id(str(entry.get("id") or ""), _DRIVE_OR_ITEM_ID, "item")
         size = entry.get("size")
         modified = entry.get("lastModifiedDateTime")
         return Item(
