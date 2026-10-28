@@ -50,6 +50,7 @@ _SLOW_MARGIN_SECONDS = 1.0
 _CHILD_FIELDS = "id,name,size,file,folder,lastModifiedDateTime"
 _PICK_FIELDS = "id,name,size,file,folder"
 _STALE_CURSOR = "This folder listing is out of date. Open the folder again."
+_FOLDER_CHANGED = "The folder changed while it was read. Try the import again."
 _WINDOWS_UNSAFE_CHARS = frozenset('<>:"|?*')
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"} | {f"COM{n}" for n in range(1, 10)} | {f"LPT{n}" for n in range(1, 10)}
@@ -115,7 +116,7 @@ class SharePointError(Exception):
 class AppKey:
     tenant_id: str
     client_id: str
-    client_secret: str
+    client_secret: str = field(repr=False)
 
     def cache_key(self) -> tuple[str, str, str]:
         """Identify this key in the token cache without holding the secret itself."""
@@ -690,7 +691,13 @@ class SharePointClient:
             cursor: str | None = None
             while True:
                 budget.read_page()
-                page = self._children_page(site, drive_id, folder_id, cursor, deadline)
+                try:
+                    page = self._children_page(site, drive_id, folder_id, cursor, deadline)
+                except SharePointError as exc:
+                    # Graph refused its own next-page cursor; reopening a folder doesn't apply here.
+                    if cursor and exc.kind is SharePointErrorKind.INVALID:
+                        raise SharePointError(SharePointErrorKind.INVALID, _FOLDER_CHANGED) from exc
+                    raise
                 for child in page.items:
                     path = (*prefix, child.name)
                     if child.id in picked_ids:

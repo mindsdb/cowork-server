@@ -6,13 +6,13 @@ before anything is stored. Create and edit are separate routes: a create
 refuses a name already in use, so it never replaces another key's
 connection. Creates take one lock while they check the name again and save,
 so a name or env prefix taken during the key check is refused, not
-overwritten. Browse reads only the sites the
+overwritten; the save itself refuses a name another writer took meanwhile,
+never saving under a suffix. Browse reads only the sites the
 connection names. Refused in org mode: the hosted app keeps connections in
 auth, not in this vault.
 """
 from __future__ import annotations
 
-import logging
 import re
 import threading
 from typing import Annotated, Any
@@ -32,7 +32,7 @@ from cowork.schemas.sharepoint import (
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, LayeredDataVault
-from cowork.services.connectors.persist import persist_connection, vault_for_scope
+from cowork.services.connectors.persist import ConnectionExistsError, persist_connection, vault_for_scope
 from cowork.services.connectors.sharepoint import (
     ENGINE,
     AppKey,
@@ -44,7 +44,6 @@ from cowork.services.connectors.sharepoint import (
     validate_tenant_id,
 )
 
-logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
@@ -171,14 +170,20 @@ def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str
     with _CREATE_LOCK:
         if _name_taken(vault, name):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN)
-        slug = persist_connection(
-            ENGINE, None, name, credentials, user_label=fields.get("user_label") or None, vault=vault, scope=scope,
-        )
-    if slug != name:
-        # Only a writer outside these routes gets here. The checked key was
-        # saved under another name, so the reply names it; nothing is deleted.
-        logger.warning("A SharePoint create for %r was saved as %r by another writer's race", name, slug)
-    return _saved(vault, slug)
+        try:
+            persist_connection(
+                ENGINE,
+                None,
+                name,
+                credentials,
+                user_label=fields.get("user_label") or None,
+                create_only=True,
+                vault=vault,
+                scope=scope,
+            )
+        except ConnectionExistsError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_NAME_TAKEN) from exc
+    return _saved(vault, name)
 
 
 @router.put("/connections/{name}")
