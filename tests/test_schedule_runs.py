@@ -633,9 +633,10 @@ def test_turn_terminal_reason_none_without_handle(monkeypatch):
     assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
 
 
-def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
+def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
     """Run execute_schedule with a no-op turn and a forced terminal reason;
-    return the resulting run/schedule state as plain values."""
+    return the resulting run/schedule state as plain values. ``turn``, when
+    given, is awaited inside the turn's stream in place of the no-op."""
     import asyncio
 
     import cowork.handlers.responses as responses_mod
@@ -651,6 +652,8 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
 
         async def handle(self, request):
             async def _gen():
+                if turn is not None:
+                    await turn()
                 if False:
                     yield
 
@@ -732,6 +735,93 @@ def test_execute_schedule_completed_is_success(monkeypatch):
     assert state["run_error"] is None
     assert state["last_error"] is None
     assert state["last_run_at"] is not None
+    assert state["next_advanced"] is True
+
+
+async def _turn_raises():
+    raise RuntimeError("turn blew up")
+
+
+def test_execute_schedule_that_raises_consumes_its_slot(monkeypatch):
+    state = _execute_with_terminal(monkeypatch, None, turn=_turn_raises)
+    assert state["run_status"] == RunStatus.failed
+    assert state["last_error"] == "turn blew up"
+    # Left due, the next poll would start the failing run again.
+    assert state["next_advanced"] is True
+
+
+def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "_MAX_RUN_DURATION_SECONDS", 0.01)
+
+    async def _hangs():
+        await asyncio.sleep(5)
+
+    state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
+    assert state["run_status"] == RunStatus.failed
+    assert "max duration" in state["last_error"]
+    assert state["next_advanced"] is True
+
+
+def test_manual_run_that_raises_leaves_the_cron_slot(monkeypatch):
+    state = _execute_with_terminal(monkeypatch, None, is_manual=True, turn=_turn_raises)
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is False
+
+
+def _permission_check_raises(monkeypatch, exc_type):
+    import cowork.services.product_permissions as permissions_mod
+
+    async def _check(*_args, **_kwargs):
+        raise exc_type()
+
+    monkeypatch.setattr(permissions_mod, "require_product_permission", _check)
+
+
+def test_auth_outage_before_the_turn_keeps_the_slot_due(monkeypatch):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    _permission_check_raises(monkeypatch, ProductPermissionUnavailable)
+    state = _execute_with_terminal(monkeypatch, None)
+    assert state["run_status"] == RunStatus.failed
+    # The outage clears on its own; the next poll runs the occurrence.
+    assert state["next_advanced"] is False
+
+
+def test_revoked_permission_consumes_the_slot(monkeypatch):
+    from cowork.services.product_permissions import ProductPermissionDenied
+
+    _permission_check_raises(monkeypatch, ProductPermissionDenied)
+    state = _execute_with_terminal(monkeypatch, None)
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is True
+
+
+def test_pool_timeout_before_the_turn_keeps_the_slot_due(monkeypatch):
+    import cowork.scheduler as scheduler_mod
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    def _read_schedule(*_args, **_kwargs):
+        raise PoolTimeoutError("pool full")
+
+    monkeypatch.setattr(scheduler_mod, "_read_schedule", _read_schedule)
+    state = _execute_with_terminal(monkeypatch, None)
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is False
+
+
+def test_pool_timeout_inside_the_turn_consumes_the_slot(monkeypatch):
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    async def _turn_pool_timeout():
+        raise PoolTimeoutError("pool full")
+
+    # The agent may already have acted, so running it again is not safe.
+    state = _execute_with_terminal(monkeypatch, None, turn=_turn_pool_timeout)
+    assert state["run_status"] == RunStatus.failed
     assert state["next_advanced"] is True
 
 

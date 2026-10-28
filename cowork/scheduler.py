@@ -335,10 +335,13 @@ def _record_turn_outcome(
     return outcome
 
 
-def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str) -> None:
+def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool) -> None:
     schedule = ScheduleService(session).get_schedule(schedule_id)
     schedule.last_error = error
     session.add(schedule)
+    # A run that disabled its schedule has already stopped the re-fire.
+    if consume_slot and schedule.enabled:
+        _advance_next_run_at(schedule, session)
 
 
 def _finish_run(
@@ -387,7 +390,7 @@ async def execute_schedule(
     """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
-    from cowork.services.product_permissions import require_product_permission
+    from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
 
     try:
         run_id = await run_db(
@@ -405,6 +408,7 @@ async def execute_schedule(
     error: str | None = None
     final_status: RunStatus | None = None
     created_conversation = conversation_id is None
+    turn_started = False
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -443,6 +447,7 @@ async def execute_schedule(
             async for _ in stream:
                 pass
 
+        turn_started = True
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
@@ -507,12 +512,26 @@ async def execute_schedule(
             "Schedule run failed: %s", error,
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
+        # A run that raised consumes its cron slot like one that failed inside
+        # its turn. Left due, the next poll starts it again, and a failure that
+        # repeats (a timeout, a revoked permission) re-fires every poll. A busy
+        # pool or an auth outage before the turn starts is the exception: it
+        # clears on its own, the agent has done nothing yet, and skipping the
+        # slot would drop a daily or weekly occurrence over a short blip.
+        transient = not turn_started and isinstance(exc, (PoolTimeoutError, ProductPermissionUnavailable))
         try:
-            await run_db(
-                partial(_record_schedule_error, schedule_id=schedule_id, error=error), scope=SYSTEM_SCOPE,
+            await _until_it_lands(
+                partial(
+                    _record_schedule_error, schedule_id=schedule_id, error=error,
+                    consume_slot=not is_manual and not transient,
+                ),
+                schedule_id=schedule_id,
             )
         except Exception:
-            pass
+            logger.exception(
+                "Failed to record the scheduled run's error",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
     finally:
         try:
             # This write must always land or the run strands at `running` and
