@@ -245,7 +245,7 @@ def test_a_name_taken_during_the_save_never_overwrites_a_same_account_suffixed_c
     assert _record("corp-2") == before
 
 
-def test_a_name_taken_during_the_save_never_creates_an_env_prefix_twin(monkeypatch, microsoft):
+def test_a_name_taken_during_the_save_never_falls_back_to_a_suffix_that_twins_an_existing_prefix(monkeypatch, microsoft):
     sharepoint_ep.create_connection({**BODY, "name": "corp_2"}, LOCAL_SCOPE)
     _create_during_the_save(monkeypatch, "corp", {"client_id": OTHER_CLIENT})
 
