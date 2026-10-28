@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cache, partial
@@ -235,9 +235,11 @@ async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bo
     """Whether a remote ``turn_failed`` is the user's own Stop, not a failure.
 
     ``REMOTE_CANCEL_LITERAL`` is proof on its own. ``REMOTE_CANCEL_VIA_FAIL_JOB``
-    is not: a controller replica taking SIGTERM mid-turn unwinds through the
-    same handler that a keepalive-driven cancel does, so the string cannot tell
-    a Stop from a rolling deploy killing the turn.
+    is not: a controller replica without a shutdown drain sends it too when its
+    whole process is cancelled mid-turn, as SIGINT in a local run does, through
+    the same handler that a keepalive-driven cancel uses. So the string cannot
+    tell a Stop from the process ending the turn. A hosted SIGTERM never takes
+    that path: such a controller runs as PID 1 and ignores it.
 
     The cancel flag separates them. ``/cancel`` writes it, the producer clears
     a stale one before each turn, and the keepalive-driven path never clears
@@ -416,6 +418,25 @@ class _SavedAnswer:
     def assistant_message_id(self) -> str | None:
         """The row's id as the terminal frames carry it, or None."""
         return str(self.message_id) if self.message_id is not None else None
+
+
+# Saves that outlived the wait in _saved_by. Held here because the event loop
+# keeps only a weak reference to a task.
+_saves_past_their_deadline: set[asyncio.Task] = set()
+
+
+async def _saved_by(save: Awaitable[_SavedAnswer], *, deadline: float) -> _SavedAnswer:
+    """Run ``save`` in its own task and wait for it until the loop time
+    ``deadline``. One still running then goes on in the background and this
+    returns an empty _SavedAnswer, which names no row and no failure."""
+    task = asyncio.ensure_future(save)
+    loop = asyncio.get_running_loop()
+    await asyncio.wait([task], timeout=max(0.0, deadline - loop.time()))
+    if task.done():
+        return task.result()
+    _saves_past_their_deadline.add(task)
+    task.add_done_callback(_saves_past_their_deadline.discard)
+    return _SavedAnswer()
 
 
 @dataclass(frozen=True)
@@ -2129,6 +2150,10 @@ class ResponsesHandler:
                 await buffer.append("sse", {"sse": self._inject_completion_id(completed_frame, saved.message_id)})
             await buffer.close("completed")
 
+        async def save_as_it_stands() -> _SavedAnswer:
+            await record_artifacts(completed_cleanly=False)
+            return await persist(clean=False)
+
         async def end_turn(
             reason: TerminalReason, failed_frame: Callable[[str | None], str] | None = None,
         ) -> None:
@@ -2137,9 +2162,17 @@ class ResponsesHandler:
             and the terminal record. The cancel and error branches below run it
             under run_to_completion, so a second Stop or a shutdown that lands
             during a save waits for it, and the stream still ends the way this
-            turn did."""
-            await record_artifacts(completed_cleanly=False)
-            saved = await persist(clean=False)
+            turn did.
+
+            A turn a shutdown ended waits for its save only until
+            ``lifecycle.shutdown_frame_deadline``, so its frame reaches the
+            open stream before Uvicorn's request drain cuts it. A save still
+            running then goes on in the background, and the frame carries no
+            row id, as a failed save's does."""
+            if lifecycle.shutdown_frame_deadline is None:
+                saved = await save_as_it_stands()
+            else:
+                saved = await _saved_by(save_as_it_stands(), deadline=lifecycle.shutdown_frame_deadline)
             if lifecycle.discarded:
                 # Deleted while it saved: see finish().
                 return
