@@ -20,6 +20,7 @@ REASONS = [
     "handback_verifier_failure",
     "handback_stuck",
     "retry_exhausted",
+    "question_unanswered",
 ]
 
 
