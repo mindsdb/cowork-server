@@ -38,8 +38,12 @@ T = TypeVar("T")
 _POLL_INTERVAL_SECONDS = 30
 # Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
 # must not keep its ScheduleRun in `running` forever — that would block the
-# schedule from ever firing again. On timeout the run is recorded as failed.
+# schedule from ever firing again. On timeout the turn is stopped and the run
+# is recorded as failed.
 _MAX_RUN_DURATION_SECONDS = 600
+# The width of Conversation.topic. A schedule's title has no limit, and a run's
+# conversation is named after it.
+_TOPIC_MAX_LENGTH = 255
 # How long a run's last writes, its outcome and its finish, keep asking for a
 # database connection while the pool is full. They must land: a run left at
 # `running` stops its schedule firing until a restart, and an outcome never
@@ -58,6 +62,12 @@ _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 # so only boot uses it, not every poll.
 _ORPHANED_RUN_AGE_SECONDS = _MAX_RUN_DURATION_SECONDS + 2 * _BOOKKEEPING_DEADLINE_SECONDS + 10 * 60
 _scheduler_task: asyncio.Task | None = None
+
+
+def schedule_conversation_topic(title: str) -> str:
+    """The topic of a run's conversation: the schedule's title, cut to fit."""
+    return title[:_TOPIC_MAX_LENGTH]
+
 # A run's error when its turn was refused because the server was shutting
 # down. The run never started, so the schedule's own last_error is left alone.
 _SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
@@ -269,7 +279,7 @@ def _link_conversation(
             unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
         )
         conversation_id = ConversationService(conv_session).create_conversation(
-            topic=scheduled.title,
+            topic=schedule_conversation_topic(scheduled.title),
             project_id=scheduled.project_id,
         ).id
     ScheduleRunService(session).set_run_conversation(run_id, conversation_id)
@@ -451,6 +461,9 @@ async def execute_schedule(
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
+            # The timeout cancels only this drain. The turn runs detached in
+            # the registry and would go on writing and publishing, so stop it.
+            await registry.cancel(str(conversation_id))
             raise RuntimeError(
                 f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
             ) from exc
