@@ -170,7 +170,8 @@ def _persist_direct_connection(
 ) -> dict[str, object]:
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
-    if is_genie_method(body.connector_id, body.method):
+    # persist_connection keeps a `_method` from the values when the request names none.
+    if is_genie_method(body.connector_id, body.method or values.get("_method")):
         # Only save_genie_connection checks it and stores the secret where the agent can't read it.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=DIRECT_SAVE_REFUSAL)
     if body.name.strip():

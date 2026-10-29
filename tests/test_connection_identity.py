@@ -19,6 +19,7 @@ from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL,
     connection_display_name,
     derive_connection_name,
+    is_same_account,
     oauth_default_label,
     resolve_keep_sentinels,
     secure_keys_for,
@@ -377,6 +378,15 @@ class TestPersistConnectionSecretCarryForward:
         assert second_slug != first_slug
         assert "password" not in vault.read_record("redis", second_slug)["fields"]
 
+
+class TestStatusIsNotIdentity:
+    """The desktop token refresh marks a record needs_reconnect; the reconnect never sends it back."""
+
+    def test_a_record_marked_needs_reconnect_is_the_same_account(self):
+        record = {"fields": {"host": "db.example.net", "user": "ops", "status": "needs_reconnect"}}
+
+        assert is_same_account(record, {"host": "db.example.net", "user": "ops"}, [])
+        assert not is_same_account(record, {"host": "other.example.net", "user": "ops"}, [])
 
 class TestDisplayName:
     """The card/detail display name: derived identity only (email/host) —

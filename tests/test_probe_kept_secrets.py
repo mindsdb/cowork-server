@@ -265,11 +265,13 @@ def test_a_desktop_reconnect_of_a_connection_marked_needs_reconnect_keeps_its_st
     assert "status" not in fields
 
 
-def test_a_direct_save_of_a_genie_connection_is_refused_and_writes_nothing(stores):
+@pytest.mark.parametrize(("method", "hidden"), [("genie-mcp", {}), (None, {"_method": "genie-mcp"}),
+                                                ("", {"_method": "genie-mcp"})])
+def test_a_direct_save_of_a_genie_connection_is_refused_and_writes_nothing(stores, method, hidden):
     body = DirectSaveRequest(
-        connector_id="databricks", method="genie-mcp", name="",
+        connector_id="databricks", method=method, name="",
         values={"workspace_url": "adb-1234567890123456.7.azuredatabricks.net", "client_id": "principal",
-                "client_secret": "submitted-secret"},
+                "client_secret": "submitted-secret", **hidden},
     )
 
     with pytest.raises(HTTPException) as refused:
@@ -278,6 +280,7 @@ def test_a_direct_save_of_a_genie_connection_is_refused_and_writes_nothing(store
     assert refused.value.status_code == 400
     assert refused.value.detail == databricks_genie.DIRECT_SAVE_REFUSAL
     assert _records() == []
+
 
 GENIE_HOST = "adb-1234567890123456.7.azuredatabricks.net"
 GENIE_SAVED = {"workspace_url": GENIE_HOST, "client_id": "principal", "_client_secret": "stored-secret"}
