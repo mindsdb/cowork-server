@@ -2,6 +2,10 @@
 
 Every other test fakes half the split. This is the arrangement that runs in
 production: the reader shares nothing with the writer except Redis.
+
+`.github/workflows/tests-services.yml` runs these against a Redis service
+container on every pull request. `make test/integration` leaves them out,
+since the deployed environments it targets give the runner no Redis of its own.
 """
 
 from __future__ import annotations
@@ -14,8 +18,9 @@ import redis.asyncio as aioredis
 
 from cowork.streaming import turn_index
 from cowork.streaming.buffer import RedisStreamBuffer
+from tests.integration.prereq import missing_prerequisite
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.redis_service]
 
 
 @pytest.fixture
@@ -25,7 +30,8 @@ async def redis_url(monkeypatch):
     try:
         await client.ping()
     except Exception:
-        pytest.skip("no Redis reachable for integration test")
+        missing_prerequisite(
+            f"no Redis reachable at {url}", required_by="COWORK_REQUIRE_SERVICES")
     await client.flushdb()
     monkeypatch.setenv("COWORK_TURN_REDIS_URL", url)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")

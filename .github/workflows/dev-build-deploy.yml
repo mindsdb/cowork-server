@@ -76,6 +76,13 @@ jobs:
     # fork contributor gets the CI that matters to them.
     uses: ./.github/workflows/tests-unit.yml
 
+  run-service-tests:
+    # Ungated for the same reason as the unit tests: GitHub-hosted, secret-free,
+    # with Redis and PostgreSQL as service containers.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests-services.yml
+
   wheels-available:
     # Ungated for the same reason as the unit tests: GitHub-hosted, secret-free,
     # and this is the check a fork contributor most needs, since it fails on a
