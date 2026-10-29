@@ -169,6 +169,7 @@ class CredentialProbe:
         skipped: list[str] | None = None,
         timeout_seconds: float = 90.0,
         usage_notes: str | None = None,
+        notes_define_pass: bool = False,
         web_tool_kwargs: WebToolKwargs | None = None,
         saved_fields: list[str] | None = None,
         cell_sandbox: CellSandbox | None = None,
@@ -183,6 +184,9 @@ class CredentialProbe:
         # The prober makes the first real API call, so it needs the same API
         # traps the chat agent is told about.
         self.usage_notes = (usage_notes or "").strip()
+        # Only notes from the reviewed spec files may say what counts as a
+        # pass; a custom connector's notes are model-written.
+        self.notes_define_pass = notes_define_pass
         # The caller captures this alongside llm_client. Never re-read settings
         # here: the provider may have changed since the client was constructed.
         self.web_tool_kwargs: WebToolKwargs = {**(web_tool_kwargs or {})}
@@ -380,7 +384,7 @@ class CredentialProbe:
         quirks_rule = (
             "• Where the KNOWN API QUIRKS say how to check this API or what "
             "counts as a pass, follow them over steps 5–6.\n"
-            if self.usage_notes else ""
+            if self.usage_notes and self.notes_define_pass else ""
         )
         saved = (
             f"——— ALREADY SAVED ON THIS CONNECTION ———\n"
