@@ -28,7 +28,7 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
     use_turn_settings,
 )
-from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
+from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_efs, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
 from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
@@ -2041,15 +2041,22 @@ class ResponsesHandler:
             turn_artifacts.recorded = True
             directory = turn_artifacts.directory
             try:
-                changes = turn_artifact_changes(
-                    conversation_id=conv_id,
-                    artifacts_base=directory.base,
-                    before=turn_artifacts.before_slugs,
-                    before_mtimes=turn_artifacts.before_mtimes,
-                    # ENG-2961: the project base is shared, so only folders
-                    # whose provenance names this conversation are its own.
-                    attribute_by_provenance=True,
-                    completed_cleanly=completed_cleanly,
+                # Waits for a file store slot rather than failing: in org mode
+                # nothing reconciles a turn whose diff was refused.
+                changes = await run_efs(
+                    partial(
+                        turn_artifact_changes,
+                        conversation_id=conv_id,
+                        artifacts_base=directory.base,
+                        before=turn_artifacts.before_slugs,
+                        before_mtimes=turn_artifacts.before_mtimes,
+                        # ENG-2961: the project base is shared, so only folders
+                        # whose provenance names this conversation are its own.
+                        attribute_by_provenance=True,
+                        completed_cleanly=completed_cleanly,
+                    ),
+                    scope=scope,
+                    deadline=False,
                 )
             except Exception:
                 logger.warning(
@@ -2238,7 +2245,9 @@ class ResponsesHandler:
                 # in the caller is what makes it a genuine "before":
                 # stream_remote_replies below only enqueues the job once this
                 # generator is first iterated.
-                before_slugs, before_mtimes = snapshot_artifact_state(seed.artifacts.base)
+                before_slugs, before_mtimes = await run_efs(
+                    partial(snapshot_artifact_state, seed.artifacts.base), scope=scope, deadline=False
+                )
                 turn_artifacts = _RemoteTurnArtifacts(
                     directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
                 )

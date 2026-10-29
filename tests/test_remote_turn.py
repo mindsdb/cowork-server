@@ -20,6 +20,8 @@ from tests._logging_assertions import assert_log_fields
 
 class _FakeScope:
     org_id = "org-123"
+    # An organization's scope, which cowork.db.units.run_efs reads for the share.
+    partitioned = True
     user_id = None
 
 

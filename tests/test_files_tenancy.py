@@ -319,8 +319,9 @@ def _upload(name: str, data: bytes = b"x") -> UploadFile:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["../../../../etc/pwned", "/etc/cron.d/pwned", ".."])
-async def test_upload_filename_cannot_escape_root(engine, tmp_path, name):
-    svc = _svc(engine, _scope(ORG_A))
+async def test_upload_filename_cannot_escape_root(units_read_engine, tmp_path, name):
+    # The upload's row is written in a database unit, on the app's engine.
+    svc = _svc(units_read_engine, _scope(ORG_A))
     res = await svc.create_file(_upload(name), purpose="assistants")
     stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
     # org-first layout: bytes contained under <shared>/<org>/files

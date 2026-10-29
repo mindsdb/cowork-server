@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import stat
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -26,6 +27,7 @@ from cowork.common.paths import (
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, scoped_storage_root
+from cowork.db.units import run_db, run_efs
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 
@@ -281,6 +283,27 @@ def _prune_staged_attachments(attach: PinnedDir, keep: set[str]) -> None:
             )
 
 
+def _write_upload(file_dir: Path, name: str, contents: bytes) -> Path:
+    """Write an upload into its own new folder, or leave no folder behind."""
+    try:
+        file_dir.mkdir(parents=True)
+        dest = file_dir / name
+        dest.write_bytes(contents)
+    except Exception:
+        shutil.rmtree(file_dir, ignore_errors=True)
+        raise
+    return dest
+
+
+def _insert_file(session, *, file: File) -> File:
+    """Insert an upload's row, as a unit. Stamps its organization and author
+    (ScopedSession.add) and returns it loaded."""
+    session.add(file)
+    session.commit()
+    session.refresh(file)
+    return file
+
+
 class FileService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
@@ -367,22 +390,22 @@ class FileService:
             purpose=purpose,
             path="",
         )
-        # Stage the row first: the scope check (and stamping) happens in
-        # add(), so a missing principal fails BEFORE any bytes hit disk.
-        self.session.add(file)
+        # The storage root refuses a scope with no organization where files
+        # are partitioned (scoped_storage_root), so a missing principal fails
+        # BEFORE any bytes hit disk.
+        scope = self.session.scope
         file_dir = self._root_dir() / str(file.id)
-        try:
-            file_dir.mkdir(parents=True)
-            dest = file_dir / safe_name
-            dest.write_bytes(contents)
-        except Exception:
-            self.session.rollback()
-            shutil.rmtree(file_dir, ignore_errors=True)
-            raise
+        # The bytes go to the file store, then the row to the database, each
+        # in a worker thread of its own: no pooled connection waits on the
+        # file server, and the event loop waits for neither.
+        dest = await run_efs(partial(_write_upload, file_dir, safe_name, contents), scope=scope)
         file.path = str(dest)
-        self.session.commit()
-        self.session.refresh(file)
-        return self._to_response(file)
+        try:
+            saved = await run_db(partial(_insert_file, file=file), scope=scope)
+        except BaseException:
+            await run_efs(partial(shutil.rmtree, file_dir, ignore_errors=True), scope=scope)
+            raise
+        return self._to_response(saved)
 
     def create_file_from_bytes(
         self, *, filename: str, content_type: str, data: bytes, purpose: str

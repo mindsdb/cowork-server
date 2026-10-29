@@ -16,6 +16,7 @@ from cowork.services.artifact_revisions import (
     create_agent_repair,
     current_source,
 )
+from _async_stub import awaitable
 
 
 def test_lines_are_numbered_and_carry_the_position():
@@ -244,7 +245,7 @@ def owner_workspace(artifact, monkeypatch):
     def fake_owner_workspace(_session, _project_ref, _artifact_id):
         return None, folder, metadata, None
 
-    monkeypatch.setattr(workspace_ep, "_owner_workspace", fake_owner_workspace)
+    monkeypatch.setattr(workspace_ep, "_owner_workspace", awaitable(fake_owner_workspace))
     return folder, metadata, artifact_id
 
 

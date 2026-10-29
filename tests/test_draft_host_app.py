@@ -42,6 +42,7 @@ from draft_host_support import (
     make_artifact,
     sign_claims,
 )
+from _async_stub import awaitable
 
 
 @pytest.fixture
@@ -49,7 +50,7 @@ def seen(tmp_path, monkeypatch):
     calls: dict = {}
     source, folder, metadata = make_artifact(tmp_path)
     monkeypatch.setattr(
-        draft_app_module, "review_artifact_for_request", fake_review(source, folder, metadata, calls)
+        draft_app_module, "review_artifact_for_request", awaitable(fake_review(source, folder, metadata, calls))
     )
     return calls
 
@@ -363,7 +364,7 @@ def test_a_failure_is_logged_by_its_event_and_without_the_token(client, monkeypa
     def broken(*_args):
         raise RuntimeError(f"broken while reading /_t/{token}/index.html")
 
-    monkeypatch.setattr(draft_app_module, "review_artifact_for_request", broken)
+    monkeypatch.setattr(draft_app_module, "review_artifact_for_request", awaitable(broken))
     with caplog.at_level("WARNING"):
         response = client.get(f"/_t/{token}/index.html", headers=FETCH)
 
@@ -399,7 +400,7 @@ def test_a_fullstack_draft_serves_only_its_public_subtree(client, tmp_path, monk
         files={"static/index.html": DOC, "backend.py": "SECRET = 1"},
     )
     monkeypatch.setattr(
-        draft_app_module, "review_artifact_for_request", fake_review(source, folder, metadata, calls)
+        draft_app_module, "review_artifact_for_request", awaitable(fake_review(source, folder, metadata, calls))
     )
     token = draft_token()
 

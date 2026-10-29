@@ -14,6 +14,8 @@ from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.services import artifact_files
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.comments_layer import ACTIVATION_PARAM
+from _async_stub import awaitable
+from cowork.db.scoped import LOCAL_SCOPE
 
 
 def _artifact(tmp_path, *, metadata: dict | None = None):
@@ -38,7 +40,7 @@ async def _serve(
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, metadata, is_own),
+        awaitable(lambda *_args: (source, folder, metadata, is_own)),
     )
     request = SimpleNamespace(
         query_params={ACTIVATION_PARAM: "1"} if comments else {}
@@ -48,7 +50,7 @@ async def _serve(
         "0123456789abcdef0123456789abcdef",
         rel_path,
         request,
-        SimpleNamespace(),
+        SimpleNamespace(scope=LOCAL_SCOPE),
         download=download,
     )
 
@@ -410,12 +412,12 @@ async def test_download_does_not_bypass_authorization(tmp_path, monkeypatch):
     def deny(*_args):
         raise HTTPException(status_code=404, detail="Artifact not found")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", deny)
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(deny))
 
     with pytest.raises(HTTPException) as excinfo:
         await workspace_ep.serve_private_draft(
             "local", "0123456789abcdef0123456789abcdef", "report.xlsx",
-            SimpleNamespace(query_params={}), SimpleNamespace(), download=True,
+            SimpleNamespace(query_params={}), SimpleNamespace(scope=LOCAL_SCOPE), download=True,
         )
     assert excinfo.value.status_code == 404
 

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
+from cowork.db.units import run_efs
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -359,13 +360,13 @@ async def _publish_one(
         # The upload service holds this report_id for another account, so a
         # retry cannot succeed and a fresh report_id would publish a copy. A
         # skip like `not_owner`, not a failure; no thread is left running.
-        release(artifacts_base, slug)
+        await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
         _record("skipped", slug=slug, reason="owned_by_other_user")
         return False
     except PublishTooLarge:
         # Every retry of the same bundle is refused again, and the 413 is
         # already logged by the classifier: a skip, not a failure.
-        release(artifacts_base, slug)
+        await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
         _record("skipped", slug=slug, reason="too_large")
         return False
     except Exception as exc:
@@ -373,14 +374,14 @@ async def _publish_one(
         # resolver, PublisherUnavailable) leaves NO running thread, so holding the
         # lock for its whole TTL would block self-heal for minutes and break the
         # "next turn retries" promise.
-        release(artifacts_base, slug)
+        await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
         _record("failed", slug=slug, error=type(exc).__name__)
         # publish_artifact has already logged a PublishRejected's traceback.
         logger.warning(
             "artifact autopublish failed for %s", slug, exc_info=not isinstance(exc, PublishRejected),
         )
         return False
-    release(artifacts_base, slug)
+    await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
     _record("published", slug=slug)
     return True
 
@@ -433,7 +434,8 @@ async def autopublish_project_artifacts(
         return set()
 
     base = Path(artifacts_base)
-    all_slugs = _candidate_slugs(base)
+    # Turn bookkeeping: each file store step waits for a slot rather than fail.
+    all_slugs = await run_efs(partial(_candidate_slugs, base), scope=scope, deadline=False)
     owners = await _owned_slugs(
         artifacts_base=base, scope=scope, project_id=project_id, slugs=all_slugs,
     )
@@ -465,7 +467,8 @@ async def autopublish_project_artifacts(
             if (started + budget_s) - time.monotonic() < _MIN_START_BUDGET_S:
                 _record("deferred", reason="budget", slugs=len(phase_slugs))
                 continue
-            for slug, decision in _plan(base, phase_slugs):
+            plans = await run_efs(partial(_plan, base, phase_slugs), scope=scope, deadline=False)
+            for slug, decision in plans:
                 if len(published) >= limit:
                     _record("deferred", slug=slug, reason="limit")
                     continue
@@ -473,17 +476,19 @@ async def autopublish_project_artifacts(
                 if remaining < _MIN_START_BUDGET_S:
                     _record("deferred", slug=slug, reason="budget")
                     continue
-                if not acquire(base, slug, ttl_s=lock_ttl):
+                if not await run_efs(
+                    partial(acquire, base, slug, ttl_s=lock_ttl), scope=scope, deadline=False
+                ):
                     _record("lock_busy", slug=slug)
                     continue
                 try:
                     api_key = await key.get()
                 except (ProductPermissionDenied, ProductPermissionUnavailable):
-                    release(base, slug)
+                    await run_efs(partial(release, base, slug), scope=scope, deadline=False)
                     _record("no_key", slug=slug)
                     return published
                 if not api_key:
-                    release(base, slug)
+                    await run_efs(partial(release, base, slug), scope=scope, deadline=False)
                     _record("no_key", slug=slug)
                     return published
                 if await _publish_one(

@@ -118,8 +118,8 @@ def make_artifact(tmp_path, *, metadata=None, files=None):
 def fake_review(source, folder, metadata, seen: dict):
     """Stand-in for review_artifact_for_request that records who asked."""
 
-    def review(session, project_ref, artifact_id):
-        seen.update(scope=session.scope, project_ref=project_ref, artifact_id=artifact_id)
+    def review(scope, project_ref, artifact_id):
+        seen.update(scope=scope, project_ref=project_ref, artifact_id=artifact_id)
         return source, folder, metadata, True
 
     return review

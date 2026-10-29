@@ -23,6 +23,7 @@ from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
     artifacts_sources_for_scope,
     conversation_artifacts_base,
+    plan_scope_roots,
     project_artifacts_base,
 )
 
@@ -399,10 +400,12 @@ def test_sources_for_scope_scans_when_projects_are_shared(session, monkeypatch):
     # Earlier tests leave project rows behind in the shared database; the
     # adopted-folder half of the desktop path is not what this pins.
     monkeypatch.setattr(
-        "cowork.services.artifact_roots._sources_outside_the_projects_root",
-        lambda _session: called.append("adopted") or [],
+        "cowork.services.artifact_roots._adopted_root",
+        lambda _project: called.append("adopted") or None,
     )
 
     scope = _personal(partition=PARTITION_A, user=USER_A, resources=frozenset())
+    plan = plan_scope_roots(ScopedSession(session, scope))
+    assert plan.scan and plan.scan_scope == scope and plan.projects == ()
     assert artifacts_sources_for_scope(ScopedSession(session, scope)) == []
-    assert called == ["scan", "adopted"]
+    assert called[0] == "scan"

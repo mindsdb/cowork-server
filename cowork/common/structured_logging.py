@@ -49,10 +49,21 @@ EVENT_FIELDS = frozenset(
         "model_alias",
         "managed_connection_file",
         "retryable",
+        # cowork.common.loop_watchdog and the lifespan's step timings.
+        "stack",
+        "in_flight",
+        "limiter",
+        "steps",
     ]
 )
 HEALTH_PATHS = frozenset(
-    ["/health", "/api/v1/health", "/api/v1/health/", "/api/v1/health/live"]
+    [
+        "/health",
+        "/api/v1/health",
+        "/api/v1/health/",
+        "/api/v1/health/live",
+        "/api/v1/health/ready",
+    ]
 )
 
 

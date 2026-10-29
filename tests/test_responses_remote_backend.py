@@ -29,6 +29,8 @@ from _fakes import inline_run_db, opens
 
 class _FakeScope:
     org_id = "org-123"
+    # An organization's scope, which cowork.db.units.run_efs reads for the share.
+    partitioned = True
     user_id = "user-456"
 
 
@@ -3467,3 +3469,107 @@ async def test_a_pod_model_call_timeout_saves_its_own_code_and_request_id(monkey
     assert failed["code"] == "model_timeout"
     assert failed["error"] == "The model sent no output for 10 minutes, so the call was stopped."
     assert failed["request_id"] == "corr-deadline"
+
+
+@pytest.mark.asyncio
+async def test_a_remote_turns_artifact_bookkeeping_leaves_the_event_loop_free(monkeypatch, tmp_path):
+    """The snapshot at turn start, and the diff and cards at turn end, read
+    the shared file store. Each is made slow here, the diff behind a
+    revision-lock wait too, and the loop keeps ticking through all of it."""
+    import threading
+    import time
+
+    from cowork.services import task_objects
+    from cowork.services.artifact_lock import artifact_lock
+
+    slow = 1.0
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts", fake_autopublish,
+    )
+    steps = []
+    real_snapshot = task_objects.snapshot_artifact_state
+    real_changes = task_objects.turn_artifact_changes
+    real_cards = task_objects.cards_for_slugs
+
+    def slow_snapshot(base):
+        steps.append("snapshot")
+        time.sleep(slow)
+        return real_snapshot(base)
+
+    def slow_changes(**kwargs):
+        steps.append("diff")
+        folder = artifacts_base / "sales-report"
+        held = threading.Event()
+
+        def another_writer():
+            with artifact_lock(folder):
+                held.set()
+                time.sleep(0.5)
+
+        writer = threading.Thread(target=another_writer)
+        writer.start()
+        held.wait(5)
+        with artifact_lock(folder):  # spins until the other writer lets go
+            time.sleep(slow)
+        writer.join()
+        return real_changes(**kwargs)
+
+    def slow_cards(*args, **kwargs):
+        steps.append("cards")
+        time.sleep(slow)
+        return real_cards(*args, **kwargs)
+
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", slow_snapshot)
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", slow_changes)
+    monkeypatch.setattr(task_objects, "cards_for_slugs", slow_cards)
+    conv_id = uuid4()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "sales-report", conversation_id=conv_id)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    loop = asyncio.get_running_loop()
+    beat = asyncio.create_task(heartbeat())
+    started = loop.time()
+    try:
+        await handler._produce_remote(
+            conv_id=conv_id, input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        )
+    finally:
+        beat.cancel()
+    elapsed = loop.time() - started
+
+    assert steps == ["snapshot", "diff", "cards"]
+    assert elapsed >= 3 * slow
+    # A free loop ticks about 100 times a second here; a blocked one stops.
+    assert ticks >= 50 * elapsed * 0.5, f"{ticks} ticks in {elapsed:.1f}s"
+    cards = [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+    assert [card["artifact"]["slug"] for card in cards] == ["sales-report"]

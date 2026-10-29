@@ -218,9 +218,15 @@ deployment:
   # Liveness restarts the pod if it fails. Kept tolerant (failureThreshold * periodSeconds = 60s)
   # so a transient stall doesn't take the pod down. Points at the zero-I/O /live
   # route so a database outage can't be misread as "this process is dead".
+  # The delay covers the boot: the lifespan does file store and database work
+  # before uvicorn binds, and on 28 Oct staging pods booting under load served
+  # their first request about 120s after start, the moment the old 60s delay
+  # plus 60s of failures killed them. With 180s a boot of up to 240s survives;
+  # startup_finished logs each boot's length. The deployment subchart renders no
+  # startupProbe, so the delay is the one setting that holds a slow boot.
   livenessProbe:
     enabled: true
-    initialDelaySeconds: 60
+    initialDelaySeconds: 180
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 6
@@ -228,13 +234,16 @@ deployment:
 
   # Readiness gates traffic. Polls quickly so the pod returns to service fast after a hiccup.
   # failureThreshold * periodSeconds = 15s before the pod is pulled from endpoints.
+  # Points at /ready, which reads no database, file store or settings: a full
+  # pool or a slow file store would otherwise fail readiness on every replica
+  # at once and leave nginx with no upstream.
   readinessProbe:
     enabled: true
     initialDelaySeconds: 15
     periodSeconds: 5
     timeoutSeconds: 4
     failureThreshold: 3
-    path: /api/v1/health/
+    path: /api/v1/health/ready
 
   # deployment container resource requests/limits
   # Limits are HARD limits; Requests are "soft" and drive HPA aggressiveness when enabled.

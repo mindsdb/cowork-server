@@ -113,7 +113,8 @@ def test_remote_producer_records_artifacts_on_every_other_exit():
 @pytest.mark.parametrize("producer", PRODUCERS)
 def test_pre_turn_snapshot_captures_content_mtimes(producer):
     src = _norm(producer)
-    assert "snapshot_artifact_state(" in src
+    # On a file store thread (run_efs), so it's named in a partial, not called.
+    assert "partial(snapshot_artifact_state," in src
     assert "before_mtimes" in src
 
 
@@ -131,7 +132,7 @@ def test_remote_producer_breaks_rather_than_returns_on_completion():
 
 def test_cards_exclude_self_heal_publishes():
     src = _norm(t.publish_and_card_turn_artifacts)
-    assert "cards_for_slugs(" in src
+    assert "partial( cards_for_slugs," in src
     # An edited (not new) artifact must get a card so its URL reaches the UI
     # without waiting for the next list fetch — hence the union with
     # `republished`. But INTERSECTED with the touched set: `republished` also holds
