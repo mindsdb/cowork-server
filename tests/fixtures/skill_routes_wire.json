@@ -876,6 +876,45 @@
             }
           },
           {
+            "id": "scheduled-artifact-refresh",
+            "label": "scheduled-artifact-refresh",
+            "name": "scheduled-artifact-refresh",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
             "id": "skill-creator",
             "label": "skill-creator",
             "name": "skill-creator",
@@ -1634,6 +1673,45 @@
             "id": "presentations",
             "label": "presentations",
             "name": "presentations",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "scheduled-artifact-refresh",
+            "label": "scheduled-artifact-refresh",
+            "name": "scheduled-artifact-refresh",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
