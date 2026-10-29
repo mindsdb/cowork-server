@@ -495,6 +495,7 @@ class ScheduleRunService:
         error: str | None,
         outcome: AttemptOutcome,
         conversation_id: UUID | None = None,
+        unavailable_model: str | None = None,
     ) -> bool:
         """Stage the end of a run that is still ``running``. False, writing
         nothing, when it has already ended: a reaper ended it while its
@@ -509,6 +510,7 @@ class ScheduleRunService:
             status=status,
             error=error,
             outcome=outcome,
+            unavailable_model=unavailable_model,
         )
         if conversation_id is not None:
             values["conversation_id"] = self.still_exists(conversation_id)

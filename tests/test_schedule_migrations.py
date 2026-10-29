@@ -114,7 +114,8 @@ def test_occurrences_upgrade_keeps_existing_runs_and_matches_the_models(database
     assert _columns(engine, "schedule_occurrences") == set(ScheduleOccurrence.__table__.columns.keys()) - {
         "version_id",
     }
-    assert set(ScheduleRun.__table__.columns.keys()) <= _columns(engine, "schedule_runs")
+    # unavailable_model arrives with its own revision.
+    assert set(ScheduleRun.__table__.columns.keys()) - {"unavailable_model"} <= _columns(engine, "schedule_runs")
     row = _run_row(engine, run_id)
     assert row["status"] == "success"
     assert (row["occurrence_id"], row["attempt"], row["outcome"], row["execution_started_at"]) == (
@@ -239,3 +240,22 @@ def test_run_conversation_index_upgrade_and_downgrade(database):
     _migrate(engine, uri, AUDIT_TRAIL, down=True)
     indexes = {ix["name"] for ix in sa.inspect(engine).get_indexes("schedule_runs")}
     assert "ix_schedule_runs_conversation_id" not in indexes
+
+
+UNAVAILABLE_MODEL = "c1d7e2a94f60"
+
+
+def test_unavailable_model_upgrade_keeps_existing_runs_and_downgrades(database):
+    engine, uri = database
+    _migrate(engine, uri, CONVERSATION_INDEX)
+    _, run_id = _seed_schedule_and_run(engine)
+
+    _migrate(engine, uri, UNAVAILABLE_MODEL)
+
+    assert set(ScheduleRun.__table__.columns.keys()) <= _columns(engine, "schedule_runs")
+    row = _run_row(engine, run_id)
+    assert (row["status"], row["unavailable_model"]) == ("success", None)
+
+    _migrate(engine, uri, CONVERSATION_INDEX, down=True)
+    assert "unavailable_model" not in _columns(engine, "schedule_runs")
+    assert _run_row(engine, run_id)["status"] == "success"

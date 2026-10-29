@@ -291,6 +291,10 @@ class ScheduleRun(BaseSQLModel, table=True):
         default=None,
         description="How the attempt ended, by what is known of its execution (AttemptOutcome)",
     )
+    unavailable_model: str | None = Field(
+        default=None,
+        description="The task's pinned model, when it could not be served and the run used the account default",
+    )
 
 
 class ScheduleEvent(BaseSQLModel, table=True):

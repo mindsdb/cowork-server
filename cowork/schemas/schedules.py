@@ -10,9 +10,8 @@ from cowork.schemas.base import CamelRequest, CamelResponse
 
 
 # The `model` value a schedule stores when it should run on the account's
-# configured default models rather than a pinned id. The scheduler UI removed
-# the per-task model picker (see ScheduleTaskModal), so the frontend always
-# sends `model: null` and every schedule carries this sentinel.
+# configured default models rather than a pinned id. The task form sends it
+# for "Account default", and a create without a model stores it too.
 #
 # It is NOT a servable model id. Passing it into a turn makes the harness
 # override every model role with the literal string "default"
@@ -27,11 +26,11 @@ def resolve_schedule_model(stored: str | None) -> str | None:
     """The model to run a schedule with, or None to follow the account defaults.
 
     A schedule stores ``DEFAULT_MODEL_SENTINEL`` when it should track the
-    account's configured default model — the only mode the UI offers. That
-    sentinel is not a real model id, so it must become None (a no-op override)
-    before the turn is built, or the gateway rejects it (ENG-2353). A schedule
-    that pinned a concrete id (legacy rows, or a future picker) is passed
-    through unchanged.
+    account's configured default model. That sentinel is not a real model id,
+    so it must become None (a no-op override) before the turn is built, or the
+    gateway rejects it (ENG-2353). A schedule that pinned a concrete id is
+    passed through unchanged; a run whose pin can't be served falls back to
+    the default (see cowork.scheduler).
     """
     if not stored or stored == DEFAULT_MODEL_SENTINEL:
         return None
@@ -211,6 +210,7 @@ class ScheduleRunResponse(CamelResponse):
     outcome: AttemptOutcome | None = None
     execution_started_at: datetime | None = None
     stop_requested_at: datetime | None = None
+    unavailable_model: str | None = None
     created_at: datetime | None
 
 
