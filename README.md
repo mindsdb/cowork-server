@@ -482,7 +482,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/conversations` | Conversation threads and message history |
 | `/responses` | Streaming agent responses (SSE) |
 | `/files` | OpenAI-compatible file uploads |
-| `/schedules` | Recurring task scheduling |
+| `/schedules` | Recurring task scheduling; scripting it with an API key: [docs/SCHEDULED_TASKS_API.md](docs/SCHEDULED_TASKS_API.md) |
 | `/skills` | Agent skill definitions |
 | `/memory` | Persistent agent memory |
 | `/artifacts` | Agent-produced file previews |
