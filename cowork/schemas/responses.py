@@ -91,9 +91,10 @@ class IncompleteDetails(BaseModel):
             "`handback_budget` (automatic continuations ran out), "
             "`handback_verifier_failure` (the completion check returned no verdict), "
             "`handback_stuck` (the completion check judged the task stuck), "
-            "`retry_exhausted` (repeated errors) or `question_unanswered` (an "
-            "`ask_user` question timed out or was skipped). Treat any other value as a stop "
-            "for an unlisted reason."
+            "`retry_exhausted` (repeated errors), `content_filter` (the model "
+            "provider's content filter blocked a reply) or `question_unanswered` "
+            "(an `ask_user` question timed out or was skipped). Treat any other "
+            "value as a stop for an unlisted reason."
         ),
     )
 
