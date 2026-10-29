@@ -22,8 +22,10 @@ class SkillCreateRequest(CamelRequest):
 class SkillSharingRequest(CamelRequest):
     """Who one skill is shared with.
 
-    Hosted org mode (ENG-3787) reads ``org``, ``team_ids`` and ``emails``; a
-    field left out keeps what the skill has. Elsewhere, where a person shares
+    Hosted org mode (ENG-3787) reads ``org``, ``team_ids``, ``emails`` and
+    ``always_on`` (``alwaysOn``: put an org-wide or team skill in every
+    turn's prompt instead of recalling it on demand); a field left out keeps
+    what the skill has. Elsewhere, where a person shares
     their own skills one at a time, ``shared`` shares one with everyone,
     read-only, or stops sharing it.
     """
@@ -32,15 +34,20 @@ class SkillSharingRequest(CamelRequest):
     org: bool | None = None
     team_ids: list[str] | None = None
     emails: list[str] | None = None
+    always_on: bool | None = None
 
 
 class SkillSharingView(CamelResponse):
     """Who a skill is shared with in hosted org mode. All empty elsewhere.
-    ``emails`` is listed only to whoever may change it (owner or admin)."""
+    ``emails`` is listed only to whoever may change it (owner or admin).
+    ``always_on``: an org-wide or team skill in every turn's prompt; false
+    for one recalled on demand, a built-in, a managed skill, and outside
+    hosted org mode."""
 
     org: bool = False
     team_ids: list[str] = Field(default_factory=list)
     emails: list[str] = Field(default_factory=list)
+    always_on: bool = False
 
 
 class SkillOwner(CamelResponse):

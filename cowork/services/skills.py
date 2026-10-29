@@ -46,6 +46,7 @@ from cowork.managed import (
     readonly_skill_dirs,
 )
 from cowork.models.skill import (
+    META_ALWAYS_ON,
     META_CREATED_AT,
     META_CREATED_BY,
     META_CREATED_BY_EMAIL,
@@ -305,12 +306,14 @@ def select_turn_skills(
 
 
 def _always_on_rank(service: SkillService, slug: str, path: Path) -> int | None:
-    """0 for an org-wide skill, 1 for one shared with one of the viewer's
-    teams, None for a skill that is only on demand."""
+    """0 for an always-on org-wide skill, 1 for an always-on one shared with
+    one of the viewer's teams, None for a skill that is only on demand."""
     skill = _skill_from_dir(path)
     if skill is None or is_builtin_skill(slug):
         return None
     sharing = SkillSharing.of(skill)
+    if not sharing.always_on:
+        return None
     if sharing.org:
         return 0
     viewer = service.viewer
@@ -325,9 +328,10 @@ def always_on_turn_skills(
     """The skills a turn applies on every task, in hosted org mode: the ones
     the turn uses (select_turn_skills, which keeps the viewer's visible,
     enabled skills of this project) that are org-wide or shared with one of
-    the viewer's teams. Org-wide first, then team, each by slug. Packaged
-    built-ins are never always-on: they read as org-wide only because they
-    predate sharing. Empty outside hosted org mode."""
+    the viewer's teams and marked always on (META_ALWAYS_ON); every other
+    org-wide or team skill is on demand. Org-wide first, then team, each by
+    slug. Packaged built-ins are never always-on: they read as org-wide only
+    because they predate sharing. Empty outside hosted org mode."""
     if not service.org_sharing:
         return []
     ranked: list[tuple[int, str, TurnSkill]] = []
@@ -921,10 +925,11 @@ class SkillService:
         In hosted org mode, the scope's person and the viewer's email, and
         explicit only-me sharing, so a new skill is never org-wide by default
         (an org store reads a skill with no sharing as org-wide). Any creator
-        or sharing an uploaded SKILL.md carries is dropped first."""
+        or sharing (always_on included) an uploaded SKILL.md carries is
+        dropped first."""
         if self.org_sharing:
             for key in (META_CREATED_BY, META_CREATED_BY_EMAIL, META_SHARE_ORG,
-                        META_SHARE_TEAMS, META_SHARE_EMAILS):
+                        META_SHARE_TEAMS, META_SHARE_EMAILS, META_ALWAYS_ON):
                 metadata.pop(key, None)
             if self._scope.user_id:
                 metadata[META_CREATED_BY] = self._scope.user_id

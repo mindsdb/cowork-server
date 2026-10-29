@@ -25,6 +25,10 @@ META_CREATED_BY = "created_by"
 META_SHARE_ORG = "share_org"
 META_SHARE_TEAMS = "share_teams"
 META_SHARE_EMAILS = "share_emails"
+# "true" puts an org-wide or team skill in every turn's prompt of the people it
+# reaches; absent or anything else keeps it on demand, like any other skill.
+# Only kept on a skill shared org-wide or with a team (SkillSharing.apply).
+META_ALWAYS_ON = "always_on"
 # The creator's email as the gateway gave it at creation, so the people a
 # skill is shared with can see whose it is. Hosted org mode only.
 META_CREATED_BY_EMAIL = "created_by_email"

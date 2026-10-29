@@ -1,5 +1,6 @@
 import logging
 from contextlib import ExitStack, nullcontext
+from dataclasses import replace
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
@@ -256,6 +257,7 @@ def _org_sharing_fields(
             team_ids=list(sharing.team_ids),
             # The recipients' addresses only to whoever may change them.
             emails=list(sharing.emails) if viewer.can_manage_sharing(owner_id=owner_id) else [],
+            always_on=sharing.always_on and sharing.broad,
         ),
         "section": viewer.section(skill, owner_id=owner_id),
         "owner": SkillOwner(id=owner_id, email=owner_email),
@@ -780,6 +782,12 @@ SHARING_ORG_REFUSAL = (
     "Sharing a skill with everyone in the organization, or taking it back, requires the "
     "skills.share_org permission or an organization admin."
 )
+ALWAYS_ON_UNSHARED_REFUSAL = "Only skills shared with the organization or a team can be always on."
+ALWAYS_ON_ORG_REFUSAL = "Only admins can make an organization-wide skill always on."
+ALWAYS_ON_TEAM_REFUSAL = (
+    "Only the skill's owner, a member of a team it's shared with, or an organization "
+    "admin can make it always on."
+)
 
 
 def _set_org_skill_sharing(
@@ -797,6 +805,12 @@ def _set_org_skill_sharing(
     to (admins exempt), checked against their listing from auth: 503 while
     auth can't be asked, 400 for a team they aren't in. Emails are
     lowercased and deduplicated; one that isn't an address is a 400.
+
+    ``always_on`` can be set only on a skill that, after this change, is
+    shared org-wide or with a team (else 400). Changing it on an org-wide
+    skill takes ``skills.share_org``; on a team skill, edit rights (owner, a
+    member of one of its teams, or admin); else 403. A change that leaves
+    the skill neither org-wide nor team-shared clears it.
 
     404 for a skill the caller doesn't see or that doesn't exist, 403 for a
     built-in, a managed skill, or a change the caller may not make. Nothing
@@ -824,7 +838,23 @@ def _set_org_skill_sharing(
                 org=current.org if body.org is None else body.org,
                 team_ids=current.team_ids if team_ids is None else team_ids,
                 emails=current.emails if emails is None else emails,
+                always_on=current.always_on if body.always_on is None else body.always_on,
             )
+            if wanted.always_on and not wanted.broad:
+                if body.always_on:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=ALWAYS_ON_UNSHARED_REFUSAL,
+                    )
+                # Unshared from the org and every team: no longer always on.
+                wanted = replace(wanted, always_on=False)
+            if wanted.always_on != (current.always_on and current.broad) and wanted.broad:
+                if wanted.org and not viewer.can_share_org:
+                    raise PermissionError(ALWAYS_ON_ORG_REFUSAL)
+                if not wanted.org and not (
+                    viewer.is_admin or viewer.owns(owner_id) or viewer.in_team_of(wanted)
+                ):
+                    raise PermissionError(ALWAYS_ON_TEAM_REFUSAL)
             if (
                 wanted.team_ids != current.team_ids or wanted.emails != current.emails
             ) and not viewer.can_manage_sharing(owner_id=owner_id):

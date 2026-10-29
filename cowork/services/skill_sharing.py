@@ -9,6 +9,10 @@ org-wide, a list of team ids, and a list of emails. Nothing set is "only me".
 - Team: every member of a team it's shared with sees it and changes it.
 - Org-wide: everyone sees and uses it; changing it takes ``skills.write_org``.
 
+An org-wide or team skill is recalled on demand like any other unless it is
+marked always on (META_ALWAYS_ON), which puts it in every turn's prompt of the
+people it reaches. Only such a skill keeps the mark.
+
 An org admin (cowork.principal.can_manage_org) sees, changes and shares
 every skill on the skills page, but their turns use only what they'd see
 without the role (SkillViewer.for_turns). A skill with no
@@ -31,6 +35,7 @@ from typing import Literal
 
 from cowork.db.scoped import TenantScope
 from cowork.models.skill import (
+    META_ALWAYS_ON,
     META_SHARE_EMAILS,
     META_SHARE_ORG,
     META_SHARE_TEAMS,
@@ -63,11 +68,18 @@ def _split(raw: str | None) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class SkillSharing:
-    """Who one skill is shared with. The default is only its owner."""
+    """Who one skill is shared with. The default is only its owner.
+    ``always_on`` puts an org-wide or team skill in every turn's prompt."""
 
     org: bool = False
     team_ids: tuple[str, ...] = ()
     emails: tuple[str, ...] = ()
+    always_on: bool = False
+
+    @property
+    def broad(self) -> bool:
+        """Shared org-wide or with a team: the skills that can be always on."""
+        return self.org or bool(self.team_ids)
 
     @classmethod
     def of(cls, skill: Skill) -> SkillSharing:
@@ -78,17 +90,24 @@ class SkillSharing:
             org=True if raw_org is None else raw_org.strip().lower() == "true",
             team_ids=_split(metadata.get(META_SHARE_TEAMS)),
             emails=_split(metadata.get(META_SHARE_EMAILS)),
+            always_on=(metadata.get(META_ALWAYS_ON) or "").strip().lower() == "true",
         )
 
     def apply(self, metadata: dict[str, str]) -> None:
         """Write this sharing into ``metadata``. ``share_org`` is always
-        written, so the skill never reads as legacy org-wide again."""
+        written, so the skill never reads as legacy org-wide again.
+        ``always_on`` is kept only on a skill shared org-wide or with a team;
+        anything else drops it."""
         metadata[META_SHARE_ORG] = "true" if self.org else "false"
         for key, values in ((META_SHARE_TEAMS, self.team_ids), (META_SHARE_EMAILS, self.emails)):
             if values:
                 metadata[key] = ",".join(values)
             else:
                 metadata.pop(key, None)
+        if self.always_on and self.broad:
+            metadata[META_ALWAYS_ON] = "true"
+        else:
+            metadata.pop(META_ALWAYS_ON, None)
 
 
 ONLY_ME = SkillSharing()

@@ -4,7 +4,8 @@ In hosted org tenancy every member reads one skill store, and each skill
 records who it is shared with in its SKILL.md metadata: only its owner (the
 default for a new skill), people by email, teams, or the whole organization.
 A skill with no sharing metadata predates sharing and reads as org-wide.
-Org-wide and team skills are always on in a turn of the people they reach.
+Org-wide and team skills are recalled on demand like any other unless marked
+always on, which puts them in every turn's prompt of the people they reach.
 
 Handlers are called directly with an explicit SkillViewer, the suite's
 convention for org routes (cowork.server wires the identity middleware only
@@ -18,7 +19,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from anton.core.tools.skill_format import dump_skill
+from anton.core.tools.skill_format import dump_skill, parse_skill_text
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
@@ -28,6 +29,7 @@ from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.skill import (
+    META_ALWAYS_ON,
     META_CREATED_BY,
     META_CREATED_BY_EMAIL,
     META_SHARE_EMAILS,
@@ -161,7 +163,7 @@ def test_a_new_skill_is_only_its_creators(org):
     created = _create(org, ALICE, "alice-notes", teams=(TEAM_ENG,))
 
     assert created["section"] == "mine"
-    assert created["sharing"] == {"org": False, "teamIds": [], "emails": []}
+    assert created["sharing"] == {"org": False, "teamIds": [], "emails": [], "alwaysOn": False}
     assert created["canEdit"] is True
     assert created["owner"] == {"id": ALICE, "email": "alice@x.com"}
     metadata = SkillService(org.as_(ALICE).scope).get_skill("alice-notes").metadata
@@ -175,13 +177,18 @@ def test_a_new_skill_is_only_its_creators(org):
 def test_an_upload_drops_the_sharing_and_creator_its_file_claims(org):
     skill = Skill(
         name="uploaded", description="u", instructions="x",
-        metadata={META_SHARE_ORG: "true", META_CREATED_BY: DAVE, META_SHARE_TEAMS: TEAM_OPS},
+        metadata={
+            META_SHARE_ORG: "true", META_CREATED_BY: DAVE, META_SHARE_TEAMS: TEAM_OPS, META_ALWAYS_ON: "true",
+        },
     )
     uploaded = skills_ep._upload_skill_bytes(
         dump_skill(skill).encode(), "SKILL.md", org.as_(ALICE), _principal(ALICE), viewer=_viewer(ALICE),
     )
     assert (uploaded["section"], uploaded["sharing"]["org"], uploaded["sharing"]["teamIds"]) == ("mine", False, [])
-    assert SkillService(org.as_(ALICE).scope).get_skill("uploaded").created_by == ALICE
+    assert uploaded["sharing"]["alwaysOn"] is False
+    stored = SkillService(org.as_(ALICE).scope).get_skill("uploaded")
+    assert stored.created_by == ALICE
+    assert META_ALWAYS_ON not in stored.metadata
 
 
 def test_a_skill_with_no_sharing_metadata_is_org_wide(org):
@@ -265,7 +272,9 @@ def test_sharing_normalizes_emails_and_keeps_teams(org):
     _create(org, ALICE, "shared")
     out = _share(org, ALICE, "shared", team_ids=[TEAM_ENG, TEAM_ENG], emails=[" Carol@X.com", "carol@x.com", "BOB@x.com"])
 
-    assert out["sharing"] == {"org": False, "teamIds": [TEAM_ENG], "emails": ["carol@x.com", "bob@x.com"]}
+    assert out["sharing"] == {
+        "org": False, "teamIds": [TEAM_ENG], "emails": ["carol@x.com", "bob@x.com"], "alwaysOn": False,
+    }
     metadata = SkillService(org.as_(ALICE).scope).get_skill("shared").metadata
     assert (metadata[META_SHARE_TEAMS], metadata[META_SHARE_EMAILS]) == (TEAM_ENG, "carol@x.com,bob@x.com")
     _refused(lambda: _share(org, ALICE, "shared", emails=["not-an-email"]), 400, "not a valid email")
@@ -308,7 +317,7 @@ def test_an_org_mode_shared_only_body_changes_nothing(org):
     an audience with nothing set, which keeps what the skill has."""
     _create(org, ALICE, "shared")
     out = _share(org, ALICE, "shared", shared=True)
-    assert out["sharing"] == {"org": False, "teamIds": [], "emails": []}
+    assert out["sharing"] == {"org": False, "teamIds": [], "emails": [], "alwaysOn": False}
 
 
 def test_a_skill_the_caller_cannot_see_or_a_builtin_is_refused(org):
@@ -372,6 +381,118 @@ def test_an_org_wide_skill_takes_write_org_to_change(org):
     assert edit(ADMIN, _viewer(ADMIN, admin=True))["declarative"] == f"{ADMIN} edit"
 
 
+# ── always on ────────────────────────────────────────────────────────────────
+
+
+ALWAYS_ON_UNSHARED = "Only skills shared with the organization or a team can be always on."
+ALWAYS_ON_ORG = "Only admins can make an organization-wide skill always on."
+
+
+def _stored_always_on(org, slug: str) -> str | None:
+    return SkillService(org.as_(ALICE).scope).get_skill(slug).metadata.get(META_ALWAYS_ON)
+
+
+def test_org_and_team_skills_are_on_demand_by_default(org):
+    _legacy_skill(org.as_(ALICE).scope, "house-style", created_by=ALICE)
+    _create(org, ALICE, "team-skill")
+    out = _share(org, ALICE, "team-skill", team_ids=[TEAM_ENG])
+
+    assert out["sharing"]["alwaysOn"] is False
+    listed = _listed(org, BOB, _viewer(BOB, teams=(TEAM_ENG,)))
+    assert listed["house-style"]["sharing"]["alwaysOn"] is False
+    assert listed["team-skill"]["sharing"]["alwaysOn"] is False
+
+
+def test_always_on_needs_an_org_or_team_share(org):
+    _create(org, ALICE, "private")
+    _refused(lambda: _share(org, ALICE, "private", always_on=True), 400, ALWAYS_ON_UNSHARED)
+    _refused(
+        lambda: _share(org, ALICE, "private", emails=["bob@x.com"], always_on=True), 400, ALWAYS_ON_UNSHARED,
+    )
+    # Shared with a team in the same request is enough.
+    out = _share(org, ALICE, "private", team_ids=[TEAM_ENG], always_on=True)
+    assert (out["sharing"]["alwaysOn"], _stored_always_on(org, "private")) == (True, "true")
+
+
+def test_an_org_wide_skill_takes_share_org_to_be_always_on(org):
+    _create(org, ALICE, "rules")
+    _share(org, ALICE, "rules", _viewer(ALICE, share_org=True), org=True)
+
+    _refused(
+        lambda: _share(org, ALICE, "rules", _viewer(ALICE, write_org=True), always_on=True), 403, ALWAYS_ON_ORG,
+    )
+    out = _share(org, BOB, "rules", _viewer(BOB, share_org=True), always_on=True)
+    assert out["sharing"]["alwaysOn"] is True
+    assert _listed(org, CAROL, _viewer(CAROL))["rules"]["sharing"]["alwaysOn"] is True
+    # Turning it off takes the same.
+    _refused(lambda: _share(org, ALICE, "rules", always_on=False), 403, ALWAYS_ON_ORG)
+    out = _share(org, ADMIN, "rules", _viewer(ADMIN, admin=True), admin=True, always_on=False)
+    assert out["sharing"]["alwaysOn"] is False
+    assert _stored_always_on(org, "rules") is None
+    # A legacy skill reads as org-wide, so it can be made always on too.
+    _legacy_skill(org.as_(ALICE).scope, "house-style", created_by=ALICE)
+    out = _share(org, BOB, "house-style", _viewer(BOB, share_org=True), always_on=True)
+    assert (out["sharing"]["org"], out["sharing"]["alwaysOn"]) == (True, True)
+
+
+def test_a_team_skill_takes_edit_rights_to_be_always_on(org):
+    _create(org, ALICE, "team-skill")
+    _share(org, ALICE, "team-skill", team_ids=[TEAM_ENG], emails=["carol@x.com"])
+
+    # Carol only reads it (shared by email).
+    _refused(lambda: _share(org, CAROL, "team-skill", _viewer(CAROL), always_on=True), 403)
+    # A member of the team edits it, so may make it always on.
+    out = _share(org, BOB, "team-skill", _viewer(BOB, teams=(TEAM_ENG,)), always_on=True)
+    assert out["sharing"]["alwaysOn"] is True
+    _refused(lambda: _share(org, CAROL, "team-skill", _viewer(CAROL), always_on=False), 403)
+    out = _share(org, ADMIN, "team-skill", _viewer(ADMIN, admin=True), admin=True, always_on=False)
+    assert out["sharing"]["alwaysOn"] is False
+    out = _share(org, ALICE, "team-skill", _viewer(ALICE), always_on=True)
+    assert out["sharing"]["alwaysOn"] is True
+
+
+def test_unsharing_from_the_org_and_every_team_clears_always_on(org):
+    _create(org, ALICE, "team-skill")
+    _share(org, ALICE, "team-skill", team_ids=[TEAM_ENG], always_on=True)
+
+    out = _share(org, ALICE, "team-skill", team_ids=[], emails=["bob@x.com"])
+    assert out["sharing"]["alwaysOn"] is False
+    assert _stored_always_on(org, "team-skill") is None
+    # Sharing it with a team again doesn't bring it back.
+    out = _share(org, ALICE, "team-skill", team_ids=[TEAM_ENG])
+    assert out["sharing"]["alwaysOn"] is False
+
+
+def test_the_sharing_body_accepts_the_camel_case_spelling(org):
+    _create(org, ALICE, "team-skill")
+    body = SkillSharingRequest.model_validate({"teamIds": [TEAM_ENG], "alwaysOn": True})
+    assert body.always_on is True
+    out = skills_ep.set_skill_sharing(
+        "team-skill", body, org.as_(ALICE), _principal(ALICE), _viewer(ALICE, teams=(TEAM_ENG,)),
+    )
+    assert out["sharing"]["alwaysOn"] is True
+
+
+def test_always_on_survives_edits_renames_and_toggles(org):
+    _create(org, ALICE, "team-skill")
+    _share(org, ALICE, "team-skill", team_ids=[TEAM_ENG], always_on=True)
+    alice = _viewer(ALICE, teams=(TEAM_ENG,))
+
+    skills_ep.update_skill(
+        "team-skill", SkillUpdateRequest(label="renamed", instructions="New body."),
+        org.as_(ALICE), _principal(ALICE), alice,
+    )
+    skills_ep.update_skill("renamed", SkillUpdateRequest(enabled=False), org.as_(ALICE), _principal(ALICE), alice)
+    out = skills_ep.update_skill(
+        "renamed", SkillUpdateRequest(enabled=True), org.as_(ALICE), _principal(ALICE), alice,
+    )
+    assert out["sharing"]["alwaysOn"] is True
+    assert _stored_always_on(org, "renamed") == "true"
+    # A sharing change that leaves it on a team keeps it.
+    out = _share(org, ALICE, "renamed", emails=["carol@x.com"])
+    assert out["sharing"]["alwaysOn"] is True
+
+
 # ── turns ────────────────────────────────────────────────────────────────────
 
 
@@ -379,10 +500,15 @@ def _turn_fixture(org):
     """Skills of every kind, as Bob (team eng, bob@x.com) meets them."""
     alice = org.as_(ALICE).scope
     _legacy_skill(alice, "zeta-legacy", "Zeta body.")
+    _legacy_skill(alice, "omega-legacy-on", "Omega body.", always_on="true")
     _create(org, ALICE, "alpha-org")
-    _share(org, ALICE, "alpha-org", _viewer(ALICE, share_org=True), org=True)
+    _share(org, ALICE, "alpha-org", _viewer(ALICE, share_org=True), org=True, always_on=True)
     _create(org, ALICE, "beta-team")
-    _share(org, ALICE, "beta-team", team_ids=[TEAM_ENG])
+    _share(org, ALICE, "beta-team", team_ids=[TEAM_ENG], always_on=True)
+    _create(org, ALICE, "delta-org")
+    _share(org, ALICE, "delta-org", _viewer(ALICE, share_org=True), org=True)
+    _create(org, ALICE, "eta-team")
+    _share(org, ALICE, "eta-team", team_ids=[TEAM_ENG])
     _create(org, ALICE, "gamma-email")
     _share(org, ALICE, "gamma-email", emails=["bob@x.com"])
     _create(org, BOB, "bob-own")
@@ -404,9 +530,12 @@ def test_the_pod_gets_only_visible_skills_with_always_on_first(org):
     block = build_turn_skills(org.as_(BOB).scope, project_name="general", viewer=_viewer(BOB, teams=(TEAM_ENG,)))
 
     always_on = [slug for slug, entry in block.items() if entry.get("always_on")]
-    assert always_on == ["alpha-org", "zeta-legacy", "beta-team"]
+    assert always_on == ["alpha-org", "omega-legacy-on", "beta-team"]
     assert list(block)[:3] == always_on
-    assert {"gamma-email", "bob-own"} <= set(block)
+    # Org-wide and team skills not marked always on, legacy ones included,
+    # go as on demand.
+    assert {"gamma-email", "bob-own", "zeta-legacy", "delta-org", "eta-team"} <= set(block)
+    assert not any(block[slug].get("always_on") for slug in ("zeta-legacy", "delta-org", "eta-team"))
     assert not {"dave-private", "off-org", "elsewhere-team"} & set(block)
     assert not any(block[slug].get("always_on") for slug in BUILTIN_SKILL_SLUGS if slug in block)
     assert block["alpha-org"]["files"]["SKILL.md"].startswith("---\n")
@@ -421,19 +550,19 @@ def test_the_in_process_suffix_renders_the_same_always_on_skills(org):
     )
     assert skills == [
         {"name": "alpha-org", "body": "Body of alpha-org."},
-        {"name": "zeta-legacy", "body": "Zeta body."},
+        {"name": "omega-legacy-on", "body": "Omega body."},
         {"name": "beta-team", "body": "Body of beta-team."},
     ]
     assert render_always_on_skills(skills) == (
         HEADER
         + "\n\n### alpha-org\nBody of alpha-org."
-        + "\n\n### zeta-legacy\nZeta body."
+        + "\n\n### omega-legacy-on\nOmega body."
         + "\n\n### beta-team\nBody of beta-team."
     )
     # Without a viewer (no caller credential) only org-wide skills apply.
     assert [s["name"] for s in always_on_prompt_skills(
         scope=org.as_(BOB).scope, project_name="general", viewer=None,
-    )] == ["alpha-org", "zeta-legacy"]
+    )] == ["alpha-org", "omega-legacy-on"]
 
 
 def test_the_render_respects_both_budgets():
@@ -601,6 +730,16 @@ def test_sharing_metadata_reads_and_writes_strings():
     metadata: dict[str, str] = {META_SHARE_TEAMS: "old"}
     SkillSharing(org=False, team_ids=("a", "b"), emails=()).apply(metadata)
     assert metadata == {META_SHARE_ORG: "false", META_SHARE_TEAMS: "a,b"}
+    SkillSharing(org=False, team_ids=("a",), always_on=True).apply(metadata)
+    assert metadata == {META_SHARE_ORG: "false", META_SHARE_TEAMS: "a", META_ALWAYS_ON: "true"}
+    on = Skill(name="s", instructions="x", metadata=dict(metadata))
+    assert SkillSharing.of(on).always_on is True
+    # The frontmatter round trip keeps it.
+    assert parse_skill_text(dump_skill(on), "s").metadata[META_ALWAYS_ON] == "true"
+    # Only an org-wide or team skill keeps it.
+    SkillSharing(org=False, emails=("a@b.co",), always_on=True).apply(metadata)
+    assert META_ALWAYS_ON not in metadata
+    assert SkillSharing.of(Skill(name="s", instructions="x", metadata={META_ALWAYS_ON: "false"})).always_on is False
     assert normalize_emails(["A@B.co", "a@b.co", " "]) == ("a@b.co",)
 
 

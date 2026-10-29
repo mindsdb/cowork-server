@@ -1839,10 +1839,11 @@ class AntonHarness:
                 *artifact_skill_dirs(scope=turn_scope, project_name=conversation.project.name),
             ]
             read_only_dirs += anton_settings.skills_extra_roots
-            # Org-wide and team skills, applied on every task: hosted org mode
-            # only, so "" on the desktop and every local deployment. This path
-            # has no caller credential to read teams with, so it gets the
-            # fail-closed set (org-wide only), as a pod turn without one does.
+            # Org-wide and team skills marked always on, applied on every task:
+            # hosted org mode only, so "" on the desktop and every local
+            # deployment. This path has no caller credential to read teams
+            # with, so it gets the fail-closed set (org-wide only), as a pod
+            # turn without one does.
             always_on_context = render_always_on_skills(
                 always_on_prompt_skills(
                     scope=turn_scope, project_name=conversation.project.name, viewer=None
