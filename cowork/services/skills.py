@@ -117,7 +117,7 @@ _TURN_SKILL_FILE_MAX = 200_000
 # Desktop seeding (unkeyed store, DB sentinel) lives in migrations.py and shares
 # this version; org seeding (per-org store, file marker) is a SkillService method.
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills_builtin"
-BUILTIN_SKILLS_VERSION = 1
+BUILTIN_SKILLS_VERSION = 2
 # Versioned identity manifest. Authorization must not depend on the packaged
 # directory being readable: an incomplete image must not make an existing
 # shared-volume copy mutable.
@@ -130,6 +130,7 @@ BUILTIN_SKILL_SLUGS = frozenset(
         "google-slides",
         "pdf",
         "presentations",
+        "scheduled-artifact-refresh",
         "skill-creator",
     }
 )
