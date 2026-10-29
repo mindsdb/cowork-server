@@ -53,7 +53,6 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
-from cowork.services.connectors.specs._registry import registry
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.live_apps import (
     TurnLiveApps,
@@ -1389,6 +1388,7 @@ class AntonHarness:
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             build_cowork_create_skill_draft_tool,
+            scope_usage_notes,
         )
         CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
@@ -1687,7 +1687,7 @@ class AntonHarness:
                 )
                 # Agent-facing API notes for this turn's connected engines.
                 # `data_vault` is already filtered by `disabled_connections`.
-                connector_usage_notes = registry.usage_notes_for(
+                connector_usage_notes = await scope_usage_notes(
                     c["engine"] for c in vault_connections
                 )
 

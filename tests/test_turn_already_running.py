@@ -66,7 +66,7 @@ class _PausedBeforeItsFirstRecord(PausedHarness):
         self.turn_started = asyncio.Event()
         self.write = asyncio.Event()
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         self.turn_started.set()
         await self.write.wait()
         async for frame in super().formatter(stream, model, event_sink):

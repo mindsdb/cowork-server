@@ -1,9 +1,12 @@
 import sqlite3
+import uuid
+from types import SimpleNamespace
 
 import pytest
 from alembic import command
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel
 
 # Import models so SQLModel.metadata can create a pre-Alembic legacy schema.
@@ -17,10 +20,15 @@ import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
 import cowork.models.shared_resource  # noqa: F401
 import cowork.models.skill  # noqa: F401
+from cowork.common.settings import app_settings
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db import migrations
 from cowork.db.migrations import (
+    INITIAL_REVISION,
+    MIGRATION_LOCK_KEY,
     DatabaseSchemaAheadError,
     _alembic_config,
+    lock_migrations,
     run_schema_migrations,
 )
 
@@ -92,6 +100,56 @@ def test_migration_graph_has_single_head():
         "Add a merge revision joining them: alembic merge -m '<why>' "
         + " ".join(sorted(heads))
     )
+
+
+@pytest.mark.parametrize("path", ["startup", "alembic-command"])
+def test_migrations_take_the_migration_lock_in_their_transaction_before_alembic_starts(
+    tmp_path, monkeypatch, path,
+):
+    """Every new pod's db-migrate init container runs `alembic upgrade head`
+    (env.py's own engine), and startup migrates on a connection it supplies.
+    Both take the lock once, before Alembic has written the revision table.
+    On PostgreSQL that is inside the transaction Alembic's begin_transaction
+    opens, which SQLite, with no transactional DDL, does not open here."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    uri = _sqlite_uri(tmp_path / "locked.db")
+    revision_table_at_lock: list[bool] = []
+
+    def record(connection):
+        revision_table_at_lock.append(inspect(connection).has_table("alembic_version"))
+
+    monkeypatch.setattr(migrations, "lock_migrations", record)
+    if path == "startup":
+        run_schema_migrations(create_engine(uri), uri)
+    else:
+        settings = get_app_settings().model_copy(deep=True)
+        settings.database.uri = uri
+        monkeypatch.setattr(app_settings, "get_app_settings", lambda: settings)
+        command.upgrade(_alembic_config(uri), INITIAL_REVISION)
+
+    assert revision_table_at_lock == [False]
+
+
+class _RecordingConnection:
+    def __init__(self, dialect: str) -> None:
+        self.dialect = SimpleNamespace(name=dialect)
+        self.executed: list[tuple[str, dict]] = []
+
+    def execute(self, statement, parameters):
+        self.executed.append((str(statement), parameters))
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "sqlite"])
+def test_only_postgresql_migrations_wait_for_the_migration_lock(dialect):
+    """Pods a rollout starts together migrate one at a time on PostgreSQL. The
+    desktop's SQLite has one process and no advisory locks."""
+    connection = _RecordingConnection(dialect)
+
+    lock_migrations(connection)
+
+    expected = [("SELECT pg_advisory_xact_lock(:key)", {"key": MIGRATION_LOCK_KEY})]
+    assert connection.executed == (expected if dialect == "postgresql" else [])
 
 
 def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
@@ -677,6 +735,55 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     assert "reports" in names and "untitled-project" in names
 
 
+def _insert_custom_connector(connection, *, connector_id, org_id=None):
+    connection.execute(
+        text(
+            "insert into custom_connectors "
+            "(id, connector_id, label, description, spec, featured, org_id) "
+            "values (:id, :connector_id, :label, '', '{}', 1, :org_id)"
+        ),
+        {"id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id, "org_id": org_id},
+    )
+
+
+def test_custom_connectors_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "custom_connectors.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "custom_connectors")
+
+    _downgrade_to(engine, uri, "f3733a102501")
+    assert not _has_table(db_path, "custom_connectors")
+
+    _upgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert _has_table(db_path, "custom_connectors")
+
+
+def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "custom_connectors_unique.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="httpbin")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b")
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="httpbin")
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+
+
 def test_published_page_ownership_upgrade_is_unique_and_survives_rollback(tmp_path):
     from uuid import uuid4
     from sqlalchemy.exc import IntegrityError
@@ -757,6 +864,7 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
     uri = _sqlite_uri(db_path)
     engine = create_engine(uri)
     previous = "e3618a102301"
+    previews = "f3733a102501"
     _upgrade_to(engine, uri, previous)
     assert not _has_table(db_path, "live_app_previews")
     assert not _has_table(db_path, "live_app_preview_owners")
@@ -777,8 +885,8 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         shares_before = connection.execute("SELECT * FROM live_app_shares").fetchall()
     schema_before = persistent_schema()
 
-    _upgrade_to(engine, uri, "head")
-    assert _alembic_version(db_path) == expected_head()
+    _upgrade_to(engine, uri, previews)
+    assert _alembic_version(db_path) == previews
     expected_columns = {
         "id", "created_at", "modified_at", "owner_partition_id", "owner_user_id",
         "owner_email", "viewer_cookie", "position", "launch_id", "origin",
@@ -832,8 +940,8 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
         assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
 
-    _upgrade_to(engine, uri, "head")
-    assert _alembic_version(db_path) == expected_head()
+    _upgrade_to(engine, uri, previews)
+    assert _alembic_version(db_path) == previews
     assert _table_columns(db_path, "live_app_previews") == expected_columns
     assert _table_columns(db_path, "live_app_preview_owners") == {"id", "created_at", "modified_at", "marker", "revision"}
     assert persistent_schema() == schema_before
