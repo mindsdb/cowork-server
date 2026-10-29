@@ -282,6 +282,25 @@ def test_a_direct_save_of_a_genie_connection_is_refused_and_writes_nothing(store
     assert _records() == []
 
 
+@pytest.mark.parametrize(("method", "replace_existing"), [(None, True), ("", True), (PAT, True), (None, False)])
+def test_a_direct_save_over_a_genie_connection_is_refused_and_changes_nothing(stores, method, replace_existing):
+    saved = {"workspace_url": "adb-1234567890123456.7.azuredatabricks.net", "client_id": "principal",
+             "_client_secret": "stored-secret"}
+    slug = persist_connection("databricks", "genie-mcp", "", saved)
+    [before] = _records()
+    body = DirectSaveRequest(
+        connector_id="databricks", method=method, name=slug, replace_existing=replace_existing,
+        values={"workspace_url": saved["workspace_url"], "client_id": "principal"},
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        connections_ep.save_connection_direct(body, LOCAL_SCOPE)
+
+    assert refused.value.status_code == 400
+    assert refused.value.detail == databricks_genie.DIRECT_SAVE_REFUSAL
+    assert _records() == [before]
+
+
 GENIE_HOST = "adb-1234567890123456.7.azuredatabricks.net"
 GENIE_SAVED = {"workspace_url": GENIE_HOST, "client_id": "principal", "_client_secret": "stored-secret"}
 

@@ -170,15 +170,20 @@ def _persist_direct_connection(
 ) -> dict[str, object]:
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
-    # persist_connection keeps a `_method` from the values when the request names none.
-    if is_genie_method(body.connector_id, body.method or values.get("_method")):
+    vault = vault_for_scope(scope)
+    name = body.name.strip()
+    named = vault.read_record(body.connector_id, name) if name else None
+    # persist_connection keeps a `_method` from the values when the request names none,
+    # and a save onto a named Genie record would rewrite it without its check.
+    if is_genie_method(body.connector_id, body.method or values.get("_method")) or is_genie_method(
+        body.connector_id, ((named or {}).get("fields") or {}).get("_method")
+    ):
         # Only save_genie_connection checks it and stores the secret where the agent can't read it.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=DIRECT_SAVE_REFUSAL)
-    if body.name.strip():
-        _refuse_unchangeable(scope, body.connector_id, body.name.strip())
+    if name:
+        _refuse_unchangeable(scope, body.connector_id, name)
     if body.method in {"browser_oauth_builtin", "oauth"} or values.get("refresh_token"):
         values["auth_type"] = "oauth"
-    vault = vault_for_scope(scope)
     try:
         # default_label gives a brand-new OAuth connection's tile a
         # meaningful title (the account/org/workspace name the provider
