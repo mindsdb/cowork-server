@@ -219,7 +219,9 @@ _KNOWN_NONSECRET_FIELDS = frozenset({"token_url", "auth_type", "token_type"})
 # reordered scope string back) — defeating the dedup entirely and leaving a
 # fresh `-2`, `-3`, ... suffixed connection behind each time (the
 # duplicate-Google-Drive-connections bug).
-_VOLATILE_IDENTITY_FIELDS = frozenset({"expires_at", "scope"})
+# - `status` is set to `needs_reconnect` by the desktop token refresh, and the
+#   reconnect that clears it never sends it.
+_VOLATILE_IDENTITY_FIELDS = frozenset({"expires_at", "scope", "status"})
 
 
 def secure_keys_for(connector_id: str, method: str | None, fields: dict) -> list[str]:

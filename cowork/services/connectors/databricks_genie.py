@@ -52,6 +52,7 @@ NO_GENIE_SUPPORT = "This build cannot connect Databricks Genie. Update the app a
 SECRET_NEEDED = "Enter the service principal's secret."
 SAVE_FAILED = "The connection worked but could not be saved. Try again."
 ORG_MODE_REFUSAL = "Databricks Genie is not available on this deployment."
+DIRECT_SAVE_REFUSAL = "Connect Databricks Genie from its connection form."
 
 
 @dataclass(frozen=True)

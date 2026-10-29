@@ -19,6 +19,7 @@ from cowork.schemas.connectors import (
     PatchPickedFilesBody,
 )
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.databricks_genie import DIRECT_SAVE_REFUSAL, is_genie_method
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
     DeveloperProviderUnavailable,
@@ -169,6 +170,9 @@ def _persist_direct_connection(
 ) -> dict[str, object]:
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
+    if is_genie_method(body.connector_id, body.method):
+        # Only save_genie_connection checks it and stores the secret where the agent can't read it.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=DIRECT_SAVE_REFUSAL)
     if body.name.strip():
         _refuse_unchangeable(scope, body.connector_id, body.name.strip())
     if body.method in {"browser_oauth_builtin", "oauth"} or values.get("refresh_token"):

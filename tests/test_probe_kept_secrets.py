@@ -239,6 +239,46 @@ def test_a_desktop_reconnect_that_leaves_out_the_token_on_the_same_host_keeps_it
     assert record["fields"]["access_token"] == TOKEN
     assert record["fields"]["http_path"] == NEW_PATH
 
+
+def test_a_desktop_reconnect_of_a_connection_marked_needs_reconnect_keeps_its_stored_secret(stores):
+    signed_in = {
+        "access_token": "ads-oauth-token-old", "developer_token": "ads-developer-token-9d1e",
+        "account_email": "ops@example.net", "token_url": "https://oauth2.googleapis.com/token",
+        "auth_type": "oauth",
+    }
+    slug = persist_connection("google_ads", "browser_oauth_builtin", "", signed_in)
+    connections_ep.patch_connection_token(
+        "google_ads", slug, connections_ep.PatchTokenBody(status="needs_reconnect"), LOCAL_SCOPE,
+    )
+    reconnect = {k: v for k, v in signed_in.items() if k != "developer_token"}
+    body = DirectSaveRequest(
+        connector_id="google_ads", method="browser_oauth_builtin", name=slug, replace_existing=True,
+        values={**reconnect, "access_token": "ads-oauth-token-new"},
+    )
+
+    saved = connections_ep.save_connection_direct(body, LOCAL_SCOPE)
+
+    assert saved["name"] == slug
+    fields = own_vault_for_scope(LOCAL_SCOPE).read_record("google_ads", slug)["fields"]
+    assert fields["access_token"] == "ads-oauth-token-new"
+    assert fields["developer_token"] == "ads-developer-token-9d1e"
+    assert "status" not in fields
+
+
+def test_a_direct_save_of_a_genie_connection_is_refused_and_writes_nothing(stores):
+    body = DirectSaveRequest(
+        connector_id="databricks", method="genie-mcp", name="",
+        values={"workspace_url": "adb-1234567890123456.7.azuredatabricks.net", "client_id": "principal",
+                "client_secret": "submitted-secret"},
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        connections_ep.save_connection_direct(body, LOCAL_SCOPE)
+
+    assert refused.value.status_code == 400
+    assert refused.value.detail == databricks_genie.DIRECT_SAVE_REFUSAL
+    assert _records() == []
+
 GENIE_HOST = "adb-1234567890123456.7.azuredatabricks.net"
 GENIE_SAVED = {"workspace_url": GENIE_HOST, "client_id": "principal", "_client_secret": "stored-secret"}
 
