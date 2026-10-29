@@ -33,6 +33,15 @@ def test_roam_research_spec_carries_the_redirect_rule():
     assert "case-sensitive" in notes
 
 
+def test_roam_research_spec_supports_append_only_tokens():
+    notes = registry.usage_notes_for(["roam_research"])["roam_research"]
+
+    assert "append-api.roamresearch.com/api/graph/{graph_name}/append-blocks" in notes
+    # The connection check tells an append-only token apart without writing.
+    assert '"append-data": []' in notes
+    assert "400 means an append-only token" in notes
+
+
 def test_picker_guidance_lists_files_but_no_longer_the_drive_api_rules():
     text = harness._picked_files_guidance({
         "work": [{"id": "f1", "name": "Roadmap.gdoc", "resourceKey": "rk1"}],
