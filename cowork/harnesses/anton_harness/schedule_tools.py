@@ -56,7 +56,8 @@ _TITLE_FROM_PROMPT_CHARS = 80
 _ACTIONS = ("create", "update", "pause", "resume", "delete")
 
 _CADENCE_DESCRIPTION = (
-    "'once' runs a single time at next_run_at. 'hourly', 'daily', 'weekdays' (Mon-Fri) and "
+    "'once' runs a single time at next_run_at. 'every_15_minutes' and 'every_30_minutes' "
+    "repeat that often from next_run_at. 'hourly', 'daily', 'weekdays' (Mon-Fri) and "
     "'weekly' repeat from next_run_at: at that minute past each hour, at that time of day, "
     "or on that weekday at that time."
 )
@@ -289,6 +290,8 @@ def describe_cadence(cadence: str, at: datetime, tz_name: str) -> str:
     local = _local(at, tz_name)
     text = {
         Cadence.once.value: "Once",
+        Cadence.every_15_minutes.value: "Every 15 minutes",
+        Cadence.every_30_minutes.value: "Every 30 minutes",
         Cadence.hourly.value: f"Every hour at :{local.strftime('%M')}",
         Cadence.daily.value: f"Every day at {_clock(local)}",
         Cadence.weekdays.value: f"Every weekday (Mon–Fri) at {_clock(local)}",

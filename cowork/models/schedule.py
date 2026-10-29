@@ -19,7 +19,7 @@ class Schedule(BaseSQLModel, table=True):
 
     title: str = Field(description="Display name for the schedule")
     prompt: str = Field(description="The prompt to run on each execution")
-    cadence: str = Field(description="Execution cadence: once | hourly | daily | weekly")
+    cadence: str = Field(description="Execution cadence: once | every_15_minutes | every_30_minutes | hourly | daily | weekdays | weekly")
     timezone: str = Field(default="UTC", description="IANA timezone name")
     next_run_at: datetime = Field(
         sa_type=sa.DateTime(timezone=True),  # type: ignore

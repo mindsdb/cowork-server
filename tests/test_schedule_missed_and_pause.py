@@ -129,6 +129,9 @@ def _claim(engine, schedule_id: UUID, key: str, *, manual: bool = False) -> UUID
 @pytest.mark.parametrize(
     ("cadence", "away", "step"),
     [
+        ("every_15_minutes", timedelta(hours=2, minutes=5), timedelta(minutes=15)),
+        ("every_15_minutes", timedelta(days=40), timedelta(minutes=15)),
+        ("every_30_minutes", timedelta(hours=3, minutes=10), timedelta(minutes=30)),
         ("hourly", timedelta(hours=5, minutes=10), timedelta(hours=1)),
         ("hourly", timedelta(days=40), timedelta(hours=1)),
         ("daily", timedelta(days=3, hours=2), timedelta(days=1)),
@@ -624,6 +627,22 @@ def test_a_cron_success_does_not_suppress_the_next_slot(engine):
     with Session(engine) as session:
         runs = ScheduleRunService(_scoped(session))
         runs.finish_run(runs.create_run(schedule_id, is_manual=False).id)
+
+    with Session(engine) as session:
+        assert [s.id for s in scheduler._due_schedules(_scoped(session), now)] == [schedule_id]
+
+
+@pytest.mark.parametrize("cadence", ["every_15_minutes", "every_30_minutes"])
+def test_a_short_cadence_runs_the_slot_right_after_a_manual_run(engine, cadence):
+    """At every 15 or 30 minutes the next slot is wanted even just after Run
+    now; the freshness guard would otherwise swallow every other slot."""
+    import cowork.scheduler as scheduler
+
+    now = datetime.now(timezone.utc)
+    schedule_id = _schedule(engine, cadence=cadence, next_run_at=now - timedelta(seconds=30))
+    with Session(engine) as session:
+        runs = ScheduleRunService(_scoped(session))
+        runs.finish_run(runs.create_run(schedule_id, is_manual=True).id)
 
     with Session(engine) as session:
         assert [s.id for s in scheduler._due_schedules(_scoped(session), now)] == [schedule_id]
