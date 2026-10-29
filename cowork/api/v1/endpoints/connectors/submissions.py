@@ -24,6 +24,7 @@ from cowork.services.connectors.custom_connectors import (
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 
@@ -87,6 +88,10 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if connector_id == SHAREPOINT:
+        # Only the SharePoint routes may save it: they check the key first.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=generic_setup_refusal(scope.org_mode))
 
     method = req.resolve_method()
 

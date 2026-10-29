@@ -31,6 +31,7 @@ from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, 
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
 router = APIRouter()
@@ -153,6 +154,7 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     using ``/save``.  This route is for the personal-token fallback shown when
     a desktop build has no hosted OAuth client configured.
     """
+    _refuse_sharepoint(body.connector_id, scope)
     try:
         identity = validate_developer_connection(body.connector_id, body.method, body.values)
     except DeveloperCredentialError as exc:
@@ -164,11 +166,18 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     return _persist_direct_connection(body, scope, values)
 
 
+def _refuse_sharepoint(connector_id: str, scope: TenantScope) -> None:
+    """Refuse SharePoint here: only its own routes save it, after checking the key with Microsoft."""
+    if connector_id == SHAREPOINT:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=generic_setup_refusal(scope.org_mode))
+
+
 def _persist_direct_connection(
     body: DirectSaveRequest,
     scope: TenantScope,
     values: dict,
 ) -> dict[str, object]:
+    _refuse_sharepoint(body.connector_id, scope)
     with unit_session(scope=scope) as session:
         known = ConnectorCatalog(session).get_connector(body.connector_id)
     if known is None:

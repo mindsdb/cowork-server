@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, quote, urlparse
 import httpx
 
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
+ENGINE = "sharepoint"
 LOGIN_URL = "https://login.microsoftonline.com"
 MAX_SITES = 20
 CHECK_SECONDS = 60.0
@@ -269,6 +270,17 @@ def _skip_reason(item: Item) -> str | None:
 
 _TOKENS: dict[tuple[str, str, str], tuple[str, float]] = {}
 _TOKENS_LOCK = threading.Lock()
+
+
+def generic_setup_refusal(org_mode: bool) -> str:
+    """What a generic connector path says instead of collecting a SharePoint key.
+
+    SharePoint is saved only by its own routes, which check the key with
+    Microsoft first; those routes are desktop and self-hosted only.
+    """
+    if org_mode:
+        return "SharePoint is available in the desktop app."
+    return "Update Cowork, then set up SharePoint in Customize, under Connections, where its key is checked."
 
 
 def validate_tenant_id(value: str) -> str:
