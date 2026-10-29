@@ -24,6 +24,7 @@ from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from cowork.api.v1.endpoints import hub_people as hub_people_ep
 from cowork.api.v1.endpoints import hub_teams as hub_teams_ep
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
@@ -39,7 +40,7 @@ from cowork.models.skill import (
 )
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.schemas.skills import SkillCreateRequest, SkillSharingRequest, SkillUpdateRequest
-from cowork.services import hub_teams
+from cowork.services import hub_people, hub_teams
 from cowork.services.always_on_skills import (
     ALWAYS_ON_SKILL_MAX_CHARS,
     ALWAYS_ON_TOTAL_MAX_CHARS,
@@ -128,10 +129,32 @@ def _create(org, user: str, label: str, **viewer_kwargs) -> dict:
     )
 
 
-def _share(ctx, user: str, slug: str, viewer: SkillViewer | None = None, *, admin=False, **body) -> dict:
+def _members(*emails: str, calls: list | None = None):
+    """An org member lookup that knows ``emails`` (every test user by default)."""
+    known = frozenset(emails or EMAILS.values())
+
+    async def lookup(asked):
+        asked = list(asked)
+        if calls is not None:
+            calls.append(asked)
+        return frozenset(e for e in asked if e in known)
+
+    return lookup
+
+
+def _share(
+    ctx, user: str, slug: str, viewer: SkillViewer | None = None, *, admin=False, members=None, **body
+) -> dict:
+    """PUT /skills/{slug}/sharing as ``user``, running the org membership
+    check (verify_people_in_org) first, as the route's dependency does."""
+    request = SkillSharingRequest(**body)
+    scoped = ctx.as_(user)
+    viewer = viewer or _viewer(user, teams=(TEAM_ENG,), admin=admin)
+    verified = asyncio.run(
+        skills_ep.verify_people_in_org(slug, request, scoped, viewer, members or _members())
+    )
     return skills_ep.set_skill_sharing(
-        slug, SkillSharingRequest(**body), ctx.as_(user), _principal(user, admin=admin),
-        viewer or _viewer(user, teams=(TEAM_ENG,), admin=admin),
+        slug, request, scoped, _principal(user, admin=admin), viewer, verified
     )
 
 
@@ -681,6 +704,161 @@ def test_sharing_capabilities_report_the_viewer():
         "enabled": True, "canShareOrg": True, "canWriteOrg": False, "orgName": None,
     }
     assert skills_ep.skill_sharing_capabilities(_viewer(ADMIN, admin=True))["canWriteOrg"] is True
+
+
+# ── people must be in the org ────────────────────────────────────────────────
+
+
+def test_sharing_with_people_all_in_the_org_asks_auth_once(org):
+    _create(org, ALICE, "shared")
+    calls: list = []
+    out = _share(org, ALICE, "shared", members=_members(calls=calls), emails=["bob@x.com", "Carol@x.com"])
+    assert out["sharing"]["emails"] == ["bob@x.com", "carol@x.com"]
+    assert calls == [["bob@x.com", "carol@x.com"]]
+
+
+def test_sharing_with_someone_outside_the_org_is_refused_naming_them(org):
+    _create(org, ALICE, "shared")
+    _refused(
+        lambda: _share(org, ALICE, "shared", emails=["bob@x.com", "eve@else.com", "mal@else.com"]),
+        400,
+        "Skills can only be shared with people in your organization: eve@else.com, mal@else.com",
+    )
+    stored = SkillService(org.as_(ALICE).scope).get_skill("shared").metadata
+    assert META_SHARE_EMAILS not in stored
+
+
+def test_sharing_with_people_while_auth_is_unreachable_is_a_503(org):
+    _create(org, ALICE, "shared")
+
+    async def unreachable(asked):
+        return None
+
+    _refused(lambda: _share(org, ALICE, "shared", members=unreachable, emails=["bob@x.com"]), 503)
+
+
+def test_people_already_shared_with_are_not_asked_about_again(org):
+    _create(org, ALICE, "shared")
+    _share(org, ALICE, "shared", emails=["bob@x.com"])
+
+    calls: list = []
+
+    async def unreachable(asked):
+        calls.append(list(asked))
+        return None
+
+    # Keeping bob, adding a team, and the sharer's own address: nothing to ask.
+    out = _share(
+        org, ALICE, "shared", members=unreachable, team_ids=[TEAM_ENG], emails=["BOB@x.com", "alice@x.com"]
+    )
+    assert out["sharing"]["teamIds"] == [TEAM_ENG]
+    assert calls == []
+    # Adding carol beside bob asks about carol alone.
+    asked: list = []
+    _share(org, ALICE, "shared", members=_members(calls=asked), emails=["bob@x.com", "carol@x.com"])
+    assert asked == [["carol@x.com"]]
+
+
+def test_an_address_added_without_the_check_is_a_conflict(org):
+    """The route re-checks under the skill's lock: an address the dependency
+    didn't confirm (the skill changed in between) isn't written."""
+    _create(org, ALICE, "shared")
+    _refused(
+        lambda: skills_ep.set_skill_sharing(
+            "shared", SkillSharingRequest(emails=["bob@x.com"]), org.as_(ALICE), _principal(ALICE),
+            _viewer(ALICE), frozenset(),
+        ),
+        409,
+    )
+
+
+def test_the_org_membership_lookup_batches_and_fails_closed(monkeypatch):
+    calls: list[str] = []
+
+    async def get_auth_json(path, bearer):
+        calls.append(path)
+        return {"results": [{"id": "u1", "name": "Bob", "email": "Bob@x.com"}]}
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    found = asyncio.run(hub_people.org_members_among(bearer_token="t", emails=["bob@x.com", "eve@else.com"]))
+    assert found == frozenset({"bob@x.com"})
+    assert calls == ["/me/org-members/?emails=bob%40x.com%2Ceve%40else.com"]
+
+    many = [f"p{i}@x.com" for i in range(60)]
+    calls.clear()
+    asyncio.run(hub_people.org_members_among(bearer_token="t", emails=many))
+    assert len(calls) == 2
+
+    async def down(path, bearer):
+        return None
+
+    monkeypatch.setattr(hub_people, "get_auth_json", down)
+    assert asyncio.run(hub_people.org_members_among(bearer_token="t", emails=["bob@x.com"])) is None
+    assert asyncio.run(hub_people.org_members_among(bearer_token="", emails=["bob@x.com"])) is None
+    assert asyncio.run(hub_people.org_members_among(bearer_token="t", emails=[])) == frozenset()
+
+
+# ── hub people ───────────────────────────────────────────────────────────────
+
+
+def test_hub_people_searches_the_org_and_caches_per_query(monkeypatch):
+    hub_people.reset_caches_for_tests()
+    calls: list[str] = []
+
+    async def get_auth_json(path, bearer):
+        calls.append(path)
+        return {"results": [{"id": "u1", "name": "Bob B", "email": "bob@x.com"}, {"name": "no id"}]}
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bo", limit=50))
+    assert view.model_dump(by_alias=True) == {
+        "reachable": True, "people": [{"id": "u1", "name": "Bob B", "email": "bob@x.com"}],
+    }
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q=" BO ", limit=50))
+    assert calls == ["/me/org-members/?q=bo&limit=20"]
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", limit=5))
+    assert calls[-1] == "/me/org-members/?q=bob&limit=5"
+    # Another caller doesn't get alice's cached answer.
+    other = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
+    asyncio.run(hub_people_ep.get_hub_people(_Request("other"), other, q="bo", limit=50))
+    assert len(calls) == 3
+    hub_people.reset_caches_for_tests()
+
+
+def test_hub_people_short_query_answers_empty_without_asking(monkeypatch):
+    hub_people.reset_caches_for_tests()
+
+    async def get_auth_json(path, bearer):
+        raise AssertionError("auth asked for a one-character query")
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    for q in ("", "b", " b "):
+        view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q=q, limit=10))
+        assert view.model_dump(by_alias=True) == {"reachable": True, "people": []}
+
+
+def test_hub_people_unreachable_is_reported_not_raised(monkeypatch):
+    hub_people.reset_caches_for_tests()
+
+    async def get_auth_json(path, bearer):
+        return None
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", limit=10))
+    assert view.model_dump(by_alias=True) == {"reachable": False, "people": []}
+    hub_people.reset_caches_for_tests()
+
+
+def test_hub_people_outside_org_mode_is_empty_and_reachable(monkeypatch):
+    async def get_auth_json(path, bearer):
+        raise AssertionError("auth asked outside org mode")
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), LOCAL_SCOPE, q="bob", limit=10))
+    assert view.model_dump(by_alias=True) == {"reachable": True, "people": []}
 
 
 # ── hub teams ────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from typing import Annotated
@@ -30,6 +31,7 @@ from cowork.schemas.skills import (
     SkillUpdateRequest,
 )
 from cowork.schemas.shared_resources import SkillCapabilities
+from cowork.services.hub_people import org_members_among
 from cowork.services.projects import ProjectService
 from cowork.services.shared_resources import (
     SKILL,
@@ -77,6 +79,23 @@ async def get_skill_viewer(
 
 
 SkillViewerDep = Annotated[SkillViewer | None, Depends(get_skill_viewer)]
+
+# Which of some addresses are members of the caller's active org, or None when
+# auth couldn't be asked (cowork.services.hub_people.org_members_among).
+OrgMemberLookup = Callable[[Iterable[str]], Awaitable[frozenset[str] | None]]
+
+
+def get_org_member_lookup(request: Request) -> OrgMemberLookup:
+    """The org membership check, asked with the caller's own bearer."""
+    bearer_token = hub_credential(request)
+
+    async def lookup(emails: Iterable[str]) -> frozenset[str] | None:
+        return await org_members_among(bearer_token=bearer_token, emails=emails)
+
+    return lookup
+
+
+OrgMemberLookupDep = Annotated[OrgMemberLookup | None, Depends(get_org_member_lookup)]
 
 # Every change to a skill the caller may not change in hosted org mode.
 ORG_WIDE_EDIT_REFUSAL = (
@@ -753,6 +772,68 @@ def update_skill(
     return _skill_response(service.as_own(skill), access=access, service=service)
 
 
+PEOPLE_OUTSIDE_ORG_REFUSAL = "Skills can only be shared with people in your organization"
+PEOPLE_UNREACHABLE_REFUSAL = (
+    "Couldn't reach MindsHub to confirm who is in your organization. Try again in a moment."
+)
+SHARING_RACED_REFUSAL = "This skill's sharing changed while saving. Reload it and try again."
+
+
+async def verify_people_in_org(
+    skill_id: str,
+    body: SkillSharingRequest,
+    scoped: ScopedSessionDep,
+    viewer: SkillViewerDep = None,
+    members: OrgMemberLookupDep = None,
+) -> frozenset[str]:
+    """The addresses ``body`` adds to the skill's people, confirmed members of
+    the caller's org in one batched lookup.
+
+    Only new addresses are asked about: one already stored is kept as is, so
+    an auth outage doesn't block an edit that adds nobody. The caller's own
+    address needs no check. 400 naming every address outside the org; 503
+    while auth can't be asked. A malformed address or a skill that can't be
+    read is left to _set_org_skill_sharing to refuse; it re-checks the added
+    addresses against this answer under the skill's lock.
+
+    A dependency of PUT /{skill_id}/sharing rather than a step in it, so the
+    route stays sync. Nothing to check outside hosted org mode.
+    """
+    if viewer is None or body.emails is None:
+        return frozenset()
+    try:
+        emails = normalize_emails(body.emails)
+    except ValueError:
+        return frozenset()
+
+    def current_emails() -> tuple[str, ...]:
+        try:
+            skill = SkillService(scoped.scope, viewer=viewer).get_seen_skill(skill_id)
+        except Exception:
+            return ()
+        return SkillSharing.of(skill).emails
+
+    stored = await run_in_threadpool(current_emails)
+    added = [e for e in emails if e not in stored and e != viewer.email]
+    if not added:
+        return frozenset()
+    found = await members(added) if members is not None else None
+    if found is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=PEOPLE_UNREACHABLE_REFUSAL
+        )
+    outside = [e for e in added if e not in found]
+    if outside:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{PEOPLE_OUTSIDE_ORG_REFUSAL}: {', '.join(outside)}",
+        )
+    return frozenset(added)
+
+
+VerifiedPeopleDep = Annotated[frozenset[str], Depends(verify_people_in_org)]
+
+
 @router.put("/{skill_id}/sharing", response_model=SkillResponse)
 def set_skill_sharing(
     skill_id: str,
@@ -763,16 +844,18 @@ def set_skill_sharing(
     # the desktop) has nothing to share and gets a 401 in either mode.
     principal: Principal = Depends(require(Authenticated)),
     viewer: SkillViewerDep = None,
+    verified_people: VerifiedPeopleDep = frozenset(),
 ):
     """Change who one skill is shared with: in hosted org mode
     _set_org_skill_sharing, elsewhere _set_personal_skill_sharing."""
     if viewer is not None:
-        return _set_org_skill_sharing(skill_id, body, scoped, principal, viewer)
+        return _set_org_skill_sharing(skill_id, body, scoped, principal, viewer, verified_people)
     if body.shared is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="shared is required."
         )
     return _set_personal_skill_sharing(skill_id, body.shared, scoped, principal)
+
 
 
 SHARING_OWNER_REFUSAL = (
@@ -796,6 +879,7 @@ def _set_org_skill_sharing(
     scoped: ScopedSession,
     principal: Principal,
     viewer: SkillViewer,
+    verified_people: frozenset[str] = frozenset(),
 ) -> dict:
     """Hosted org mode: set a skill's org-wide flag, teams and people.
 
@@ -804,7 +888,10 @@ def _set_org_skill_sharing(
     takes ``skills.share_org``. A team added must be one the caller belongs
     to (admins exempt), checked against their listing from auth: 503 while
     auth can't be asked, 400 for a team they aren't in. Emails are
-    lowercased and deduplicated; one that isn't an address is a 400.
+    lowercased and deduplicated; one that isn't an address is a 400. An
+    address added must be a member of the org, which verify_people_in_org
+    confirmed before this runs (``verified_people``); one added since that
+    check read the skill is a 409.
 
     ``always_on`` can be set only on a skill that, after this change, is
     shared org-wide or with a team (else 400). Changing it on an org-wide
@@ -874,6 +961,15 @@ def _set_org_skill_sharing(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"You can only share with teams you belong to: {', '.join(foreign)}.",
                     )
+            unverified = [
+                e
+                for e in wanted.emails
+                if e not in current.emails and e != viewer.email and e not in verified_people
+            ]
+            if unverified:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail=SHARING_RACED_REFUSAL
+                )
             original = (service._skill_dir(skill.name) / "SKILL.md").read_bytes()
             updated = service.set_org_sharing(skill.name, wanted)
             if updated.metadata != skill.metadata:
