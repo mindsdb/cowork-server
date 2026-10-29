@@ -49,6 +49,10 @@ class ConnectionNotFoundError(LookupError):
     """An ``extends`` save named a connection that does not exist."""
 
 
+class HeldMethodError(ValueError):
+    """A save would replace a record saved with a method the caller holds it to."""
+
+
 class KeptSecretMovedError(ValueError):
     """A save keeps a stored secret for another host or account; ``message`` is the fixed text."""
 
@@ -216,6 +220,7 @@ def persist_connection(
     extends: bool = False,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
+    held_methods: frozenset[str] = frozenset(),
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -265,6 +270,10 @@ def persist_connection(
     the connector's SAFE_WITH_KEPT_SECRET differs from the record raises
     KeptSecretMovedError before anything is written (kept_secret_moved), so
     a save can't send the stored secret elsewhere.
+
+    ``held_methods`` raises HeldMethodError before anything is written when
+    the record this save replaces, wherever its slug resolved to, was saved
+    with one of these methods and this save is not.
 
     ``scope`` names the vault saved into and the record lock the save takes
     (own_vault_root); a caller passing ``vault`` passes the scope it built
@@ -331,6 +340,9 @@ def persist_connection(
         # from `existing`, the record this save replaces: the record at
         # `base_slug` can belong to a different account that shares the slug.
         existing_fields = (existing or {}).get("fields", {})
+        held = existing_fields.get("_method")
+        if held in held_methods and payload.get("_method") != held:
+            raise HeldMethodError()
         carried = [
             key for key in secure_keys_for(connector_id, method, existing_fields)
             if key not in payload and existing_fields.get(key)

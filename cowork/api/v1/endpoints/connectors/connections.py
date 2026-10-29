@@ -19,7 +19,7 @@ from cowork.schemas.connectors import (
     PatchPickedFilesBody,
 )
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.databricks_genie import DIRECT_SAVE_REFUSAL, is_genie_method
+from cowork.services.connectors.databricks_genie import DIRECT_SAVE_REFUSAL, GENIE_METHOD, is_genie_method
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
     DeveloperProviderUnavailable,
@@ -29,7 +29,12 @@ from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
-from cowork.services.connectors.persist import KeptSecretMovedError, persist_connection, vault_for_scope
+from cowork.services.connectors.persist import (
+    HeldMethodError,
+    KeptSecretMovedError,
+    persist_connection,
+    vault_for_scope,
+)
 from cowork.services.connectors.specs._registry import registry
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -170,20 +175,15 @@ def _persist_direct_connection(
 ) -> dict[str, object]:
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
-    vault = vault_for_scope(scope)
-    name = body.name.strip()
-    named = vault.read_record(body.connector_id, name) if name else None
-    # persist_connection keeps a `_method` from the values when the request names none,
-    # and a save onto a named Genie record would rewrite it without its check.
-    if is_genie_method(body.connector_id, body.method or values.get("_method")) or is_genie_method(
-        body.connector_id, ((named or {}).get("fields") or {}).get("_method")
-    ):
+    if body.name.strip():
+        _refuse_unchangeable(scope, body.connector_id, body.name.strip())
+    # persist_connection keeps a `_method` from the values when the request names none.
+    if is_genie_method(body.connector_id, body.method or values.get("_method")):
         # Only save_genie_connection checks it and stores the secret where the agent can't read it.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=DIRECT_SAVE_REFUSAL)
-    if name:
-        _refuse_unchangeable(scope, body.connector_id, name)
     if body.method in {"browser_oauth_builtin", "oauth"} or values.get("refresh_token"):
         values["auth_type"] = "oauth"
+    vault = vault_for_scope(scope)
     try:
         # default_label gives a brand-new OAuth connection's tile a
         # meaningful title (the account/org/workspace name the provider
@@ -208,6 +208,7 @@ def _persist_direct_connection(
             # re-authorizing) must not silently reset an "edit access"
             # upgrade to "write" back to "read".
             default_fields={"_access_mode": "read"} if body.method == "mcp" else None,
+            held_methods=frozenset({GENIE_METHOD}),
             vault=vault,
             scope=scope,
         )
@@ -217,6 +218,8 @@ def _persist_direct_connection(
         raise
     except KeptSecretMovedError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.message) from exc
+    except HeldMethodError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=DIRECT_SAVE_REFUSAL) from exc
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
