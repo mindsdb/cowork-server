@@ -1140,6 +1140,7 @@ class ProjectService:
         # it while the conversation still exists so the cleanup is safe.
         from cowork.models.conversation import Conversation
         from cowork.services.conversations import ConversationService
+        from cowork.services.task_objects import TaskObjectService
 
         conv_svc = ConversationService(self.session)
         conv_ids = [
@@ -1152,6 +1153,7 @@ class ProjectService:
         ]
         conversation_stages = []
         try:
+            TaskObjectService(self.session).delete_for_project(project_id)
             for cid in conv_ids:
                 # Owner-agnostic: a project is org-shared and may hold several
                 # members' conversations. Fetch org-scoped (session.get validates
