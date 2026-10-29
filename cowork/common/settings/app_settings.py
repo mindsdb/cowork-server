@@ -402,6 +402,27 @@ class DatabaseSettings(Settings):
             "with 503. Short, so a full pool answers within seconds."
         ),
     )  # POOL_TIMEOUT
+    # PostgreSQL session settings for the app's own connections, set when each
+    # connection opens. Migrations open their own engine and keep neither.
+    # SQLite engines ignore all three.
+    statement_timeout_ms: int = Field(
+        default=0,
+        ge=0,
+        description="PostgreSQL statement_timeout, in milliseconds. 0 leaves it off.",
+    )  # STATEMENT_TIMEOUT_MS
+    idle_in_transaction_timeout_ms: int = Field(
+        default=0,
+        ge=0,
+        description="PostgreSQL idle_in_transaction_session_timeout, in milliseconds. 0 leaves it off.",
+    )  # IDLE_IN_TRANSACTION_TIMEOUT_MS
+    slow_statement_log_ms: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Log a db_statement_slow line for each PostgreSQL statement that takes at "
+            "least this many milliseconds. 0 leaves it off."
+        ),
+    )  # SLOW_STATEMENT_LOG_MS
 
 
 class ProjectSettings(Settings):
