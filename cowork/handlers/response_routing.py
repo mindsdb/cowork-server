@@ -71,7 +71,9 @@ that analyzes data, connects to services, runs code, and builds things for the
 user. Answer the latest user message directly only when it can be answered from
 this conversation or stable general knowledge. Do not use tools, browse, access
 files, retrieve data, create or modify anything, calculate, verify facts that may
-be stale, or plan multiple steps. A line like "[ran tool: ...]" in the
+be stale, or plan multiple steps. Do not ask the user clarifying questions, such
+as where their data is or what format they want: when you would need to ask
+one, call the delegate tool instead. A line like "[ran tool: ...]" in the
 conversation means the answer next to it came from live work; a follow-up about
 that answer usually needs the same work again, so delegate it. Also delegate any
 question about the assistant itself — which model or provider is running, what
@@ -255,6 +257,32 @@ _GATE_TOOL_RE = re.compile(
 )
 
 
+# An answer that asks the user something: on a request to build or look up
+# something, the gate asks where the data is or what it should look like
+# instead of delegating, and the turn ends with no work done. The prompt forbids
+# it and the gate still did it on about one build request in eight, so this
+# delegates any answer with a question mark, in Latin, full-width, Spanish or
+# Arabic script. One short line is exempt: "Hi! How can I help?" is the gate's
+# commonest direct answer, and a clarifying answer is never that short. An ASCII
+# `?` followed by an ASCII letter, digit or `=` sits inside a URL's query string,
+# not at the end of a question. The other marks have no such use, and CJK text
+# runs on after `？` with no space, so they always count.
+_QUESTION_RE = re.compile(r"\?(?![A-Za-z0-9_=])|[？؟¿]")
+_SHORT_REPLY_CHARS = 120
+
+
+def asks_user_question(text: str) -> str | None:
+    """The question mark in ``text`` when it asks the user something, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    text = (text or "").strip()
+    if len(text) <= _SHORT_REPLY_CHARS and "\n" not in text:
+        return None
+    match = _QUESTION_RE.search(text)
+    return match.group(0) if match else None
+
+
 class _RejectedAnswer(Exception):
     """The gate produced an answer we will not ship; delegate instead.
 
@@ -373,7 +401,8 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     denying that our own product can be identified or exists (ENG-2423): also
     delegations, but raised rather than returned as None so the decision can
     carry its own reason instead of reporting that the model declined, which it
-    did not. An answer naming the gate's own tool raises it the same way.
+    did not. An answer naming the gate's own tool, or asking the user a
+    question, raises it the same way.
 
     Streaming is what makes the budget meetable: the delegate decision is the
     first event, so the ~100% delegate path pays only
@@ -475,6 +504,10 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
         # trace does not already carry.
         logger.info("[gate] discarding direct answer denying our own product; delegating")
         raise _RejectedAnswer("router_answer_denied_product", denial)
+    question = asks_user_question(answer)
+    if question is not None:
+        logger.info("[gate] discarding direct answer that asks the user a question; delegating")
+        raise _RejectedAnswer("router_answer_asked_question", question)
     return answer
 
 

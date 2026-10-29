@@ -2729,6 +2729,95 @@ async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delega
     assert decision.model == "gate-model"
 
 
+# --- a direct answer that asks the user something delegates ------------------
+
+# Shaped on gate answers to "build a page" requests: the gate asked for the data
+# instead of delegating, and the turn ended with no page.
+_QUESTION_ANSWERS = [
+    "I'd be happy to help you build a comparison page, but I need some information first:\n\n"
+    "1. **Data source**: Where should I get the data for the Base Plan and Demand Surge?\n"
+    "2. **Page preferences**: Would you like a table, cards, charts, or another layout?\n\n"
+    "Once you provide these details, I can build the comparison page for you.",
+    # One question inside a long answer still asks the user for the data.
+    "I don't have access to your data, projects, or shipment details.\n\nTo answer this, "
+    "I'd need you to:\n\n1. **Share the data** — the current timeline and costs\n"
+    "2. **Clarify the specifics** — which supplier, what's the current delay?\n\n"
+    "Once you share those details, I can help you compare the scenarios.",
+    "Pour construire cette synthèse, j'ai besoin de quelques précisions. Où se trouvent "
+    "les données du plan de base et de la hausse de demande ?",
+    "Para construir el panel necesito algunos datos. ¿Dónde están guardados los datos del "
+    "plan base y del escenario de demanda?",
+    # CJK text runs on after the full-width mark with no space.
+    "ダッシュボードを作成するには、いくつか確認させてください。\n"
+    "1. 基本計画と需要増加シナリオのデータはどこに保存されていますか？保存場所を教えてください。\n"
+    "2. 表とグラフのどちらがよいですか？",
+    "Hi! I can build that dashboard.\nWhere is the data stored?",
+]
+
+
+@pytest.mark.parametrize("answer", _QUESTION_ANSWERS)
+def test_question_matcher_catches_answers_that_ask_the_user(answer):
+    from cowork.handlers.response_routing import asks_user_question
+
+    assert asks_user_question(answer) is not None
+
+
+def test_question_matcher_lets_short_replies_and_plain_answers_through():
+    """A one-line greeting that offers help still ships, as does an answer
+    with no question or a question mark only inside a link."""
+    from cowork.handlers.response_routing import asks_user_question
+
+    for benign in (
+        "Hi there, how can I help?",
+        "Hello! How can I help you today?",
+        "¡Hola! ¿En qué puedo ayudarte?",
+        "Photosynthesis is how plants turn light, water and carbon dioxide into sugar and "
+        "oxygen. It happens in the chloroplasts, mainly in the leaves.",
+        "The capital of Australia is Canberra, not Sydney.\nIt was chosen as a compromise "
+        "between Sydney and Melbourne and became the capital in 1913.",
+        "The official guide is at https://docs.python.org/3/search.html?q=asyncio&area=default "
+        "and it covers the event loop, tasks and streams in detail.",
+        "",
+    ):
+        assert asks_user_question(benign) is None, benign
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _QUESTION_ANSWERS)
+async def test_streamed_gate_answer_asking_a_question_is_discarded_and_delegated(answer):
+    provider = _StreamProvider([_text(answer[:20]), _text(answer[20:]), _complete()])
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "build a comparison page for base plan vs surge"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=_binding(provider),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_asked_question"
+    assert decision.text == ""
+    assert decision.fallback is False
+    assert decision.model == "gate-model"
+
+
+@pytest.mark.asyncio
+async def test_short_greeting_with_a_question_still_routes_direct():
+    provider = _StreamProvider([_text("Hello! How can I "), _text("help you today?"), _complete()])
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "hi"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=_binding(provider),
+    )
+
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "Hello! How can I help you today?"
+
+
 # --- a follow-up to tool work delegates without a gate call (S2) -------------
 
 
