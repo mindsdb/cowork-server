@@ -11,6 +11,7 @@ from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_locks
 from cowork.services.artifact_revisions import current_source
 from cowork.services.artifacts import ProjectArtifacts
+from _async_stub import awaitable
 
 
 ARTIFACT_ID = "11111111111111111111111111111111"
@@ -67,7 +68,7 @@ async def test_manual_save_synchronizes_an_existing_live_artifact(artifact, monk
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def fake_sync(session, live_folder, **_kwargs):
@@ -99,7 +100,7 @@ async def test_noop_save_does_not_create_a_live_version(artifact, monkeypatch):
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def unexpected_sync(*_args):
@@ -137,7 +138,7 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def fake_sync(session, live_folder, **_kwargs):
@@ -307,7 +308,7 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def failed_sync(*_args, **_kwargs):
@@ -339,7 +340,7 @@ async def test_source_save_survives_live_publish_authority_failure(artifact, mon
     original = current_source(folder, metadata, ARTIFACT_ID)
     monkeypatch.setattr(
         workspace, "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def reject(**kwargs):

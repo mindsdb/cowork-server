@@ -23,6 +23,27 @@ _REFUSAL_REASONS = frozenset(
 )
 
 
+#: Requests this process is serving, by an id of their own: method, path and
+#: start time. Written on the event loop; cowork.common.loop_watchdog reads a
+#: copy from its own thread when the loop stalls.
+_in_flight: dict[int, tuple[str, str, float]] = {}
+_IN_FLIGHT_LISTED = 20
+_PATH_CHARS = 200
+
+
+def in_flight_summary() -> str:
+    """The requests in flight, oldest first, as ``METHOD /path (age s)``."""
+    now = monotonic()
+    requests = sorted(_in_flight.copy().values(), key=lambda request: request[2])
+    listed = [
+        f"{method} {path[:_PATH_CHARS]} ({now - started:.1f}s)"
+        for method, path, started in requests[:_IN_FLIGHT_LISTED]
+    ]
+    if len(requests) > _IN_FLIGHT_LISTED:
+        listed.append(f"and {len(requests) - _IN_FLIGHT_LISTED} more")
+    return "; ".join(listed)
+
+
 class RequestLoggingApp(FastAPI):
     def build_middleware_stack(self) -> ASGIApp:
         # Include ServerErrorMiddleware so generated 500 responses carry the
@@ -50,6 +71,12 @@ class RequestLoggingMiddleware:
         started = monotonic()
         status = 0
         escaped = False
+        in_flight_key = id(scope)
+        _in_flight[in_flight_key] = (
+            scope["method"] if scope["method"] in HTTPMethod else "OTHER",
+            scope.get("path", ""),
+            started,
+        )
 
         def fields():
             route = getattr(scope.get("route"), "path", None)
@@ -91,6 +118,7 @@ class RequestLoggingMiddleware:
             exc._cowork_diagnostic_logged = True
             raise
         finally:
+            _in_flight.pop(in_flight_key, None)
             if not escaped and status >= 400:
                 candidate = scope.get("state", {}).get("_request_log_reason")
                 reason = candidate if candidate in _REFUSAL_REASONS else None

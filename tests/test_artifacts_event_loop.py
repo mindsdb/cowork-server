@@ -26,7 +26,7 @@ def test_list_artifacts_does_not_block_the_event_loop():
     stub; a healthy one gives roughly 50 — the same discrimination without a
     timing threshold.
     """
-    def slow_all_artifact_cards(session):
+    def slow_folder_walk(sources):
         time.sleep(0.5)
         return []
 
@@ -44,7 +44,7 @@ def test_list_artifacts_does_not_block_the_event_loop():
         hb_task = asyncio.create_task(heartbeat())
         try:
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                with patch.object(artifacts_ep, "_all_artifact_cards", slow_all_artifact_cards):
+                with patch.object(artifacts_ep, "_list_artifacts", slow_folder_walk):
                     res = await client.get("/api/v1/artifacts/")
             assert res.status_code == 200, res.text
         finally:

@@ -667,7 +667,7 @@ class ProjectService:
         (LOCAL_SCOPE) sees its directory under that partition's own root, not
         a folder somebody chose; reading it as one would list that person's
         artifacts in the operator view's list
-        (`artifact_roots._sources_outside_the_projects_root`).
+        (`artifact_roots._adopted_root`).
         """
         if (
             get_app_settings().tenancy_mode == "org"

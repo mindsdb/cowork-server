@@ -437,6 +437,28 @@ This split is the result of an ongoing migration from a purely filesystem-based 
 
 Agents (via their harness) have read/write access to their project's working directory and the private `.anton/` subdirectory. They do **not** access the SQLite database directly — all DB interaction flows through the service layer.
 
+### Work on the shared file store
+
+On a hosted deployment `COWORK_HOME` is a shared NFS mount (EFS), mounted `hard`. A `stat` that the file server doesn't answer blocks its thread with no time limit. So file store work never runs on the event loop, where it would stop every request on the pod, liveness included, and never on anyio's default threads, which sync routes and every request's sync dependencies share.
+
+Async code runs it through `run_efs` in `cowork/db/units.py`, beside `run_db`:
+
+- `run_efs` has its own 16 threads per process (`EFS_SLOTS`). A started call keeps its thread until it returns, so a stuck mount holds 16 threads at most.
+- One person holds at most 4 of them at once (`EFS_SHARE`). A heavy client is then refused before anyone else waits.
+- A caller waits for a slot until `POOL_TIMEOUT`, then gets `FilesystemBusy`, which the app answers with `503` and `Retry-After`.
+- A turn's artifact bookkeeping (the snapshot at turn start, the diff, autopublish and the cards at turn end) passes `deadline=False` and waits as long as it takes. In org mode nothing records a turn's artifacts later, so a refusal there would lose them.
+- A caller cancelled after its work started waits for the work to return, as with `run_db`, so a lock the work holds is released before the caller unwinds.
+
+The artifact routes read in turn: the project row and the caller's conversations in a `run_db` unit, the artifact roots and the folder on the file store, then the owner in another unit. The request's own session never takes a connection while a file store call waits.
+
+A daemon thread, `cowork/common/loop_watchdog.py`, watches for what slips through:
+
+- `event_loop_stalled` (ERROR) means the event loop didn't answer for 2 s. The line carries the loop thread's stack and the requests in flight.
+- `event_loop_recovered` (WARNING) gives the stall's length once the loop answers again.
+- `limiter_saturated` (WARNING) means anyio's default threads, the `run_db` slots or the `run_efs` slots stayed full for 5 s.
+
+Each boot logs `startup_finished` (WARNING) with the boot's length and each lifespan step's. On a hosted deployment the liveness probe's delay has to cover that boot (`deployment/cowork-server/README.md`, "Probes").
+
 **Settings** use a hybrid approach: user preferences and API keys are stored in the `settings` DB table (with Fernet encryption for secrets), while desktop connector credentials live in the filesystem vault (`data-vault/`). Org-mode OAuth routes proxy the caller's private connection in auth's Data Vault instead.
 
 **The MindsHub credential is the exception, and it is stored nowhere.** On the
@@ -475,7 +497,9 @@ All endpoints live under `/api/v1/`. Key resource groups:
 
 | Path | Description |
 |------|-------------|
-| `/health` | Readiness probe |
+| `/health` | Server status: versions, capabilities and configuration state, which the desktop app and the web client poll |
+| `/health/live` | Liveness probe: answers whenever the event loop does, and reads no database, file store or settings |
+| `/health/ready` | Readiness probe: the same, for the kubelet's readiness check |
 | `/projects` | Project CRUD and working-folder management |
 | `/conversations` | Conversation threads and message history |
 | `/responses` | Streaming agent responses (SSE) |
@@ -620,8 +644,9 @@ controller pods in the `infrastructure` namespace on port 9010. It is off in PR
 environments, which take base values, so a PR environment does not enforce this
 boundary and a forged-header caller inside one is served.
 A request with no valid pair is answered 401 before any route runs, except on
-`/api/v1/health/`, which the kubelet probes with no headers, and the channel
-webhook paths, which third parties call.
+`/api/v1/health/`, `/api/v1/health/live` and `/api/v1/health/ready`, which
+clients and the kubelet probe with no headers, and the channel webhook paths,
+which third parties call.
 
 ### How the browser stays in one organization
 
@@ -1112,7 +1137,7 @@ Look for the events `router_startup_probe_passed`, at INFO, and `router_startup_
 |----------|---------|-------------|
 | `POOL_SIZE` | `20` | Connections the pool keeps open. |
 | `MAX_OVERFLOW` | `20` | Connections the pool may open beyond `POOL_SIZE` under load. Database units take one of `POOL_SIZE` plus `MAX_OVERFLOW` slots before they ask the pool. A negative value means no limit, for the pool and for units. |
-| `POOL_TIMEOUT` | `5` | Seconds a database unit may wait in all, for a slot and then for a connection, before it is refused: a request with `503` and a `Retry-After` of the same number of seconds, a streamed answer with `server_busy`. On Postgres it is also the pool's own wait, so every route that reads the database answers `503` with `Retry-After` once it passes, `/api/v1/health/` included. `/api/v1/health/live` reads no database and keeps answering. It must be at least `1`; a lower value stops the server at startup. |
+| `POOL_TIMEOUT` | `5` | Seconds a database unit may wait in all, for a slot and then for a connection, before it is refused: a request with `503` and a `Retry-After` of the same number of seconds, a streamed answer with `server_busy`. On Postgres it is also the pool's own wait, so every route that reads the database answers `503` with `Retry-After` once it passes, `/api/v1/health/` included. `/api/v1/health/live` and `/api/v1/health/ready` read no database and keep answering. It also bounds the wait for a shared file store slot (`run_efs`, see "Work on the shared file store"): a request that gets none in time answers `503` with the same `Retry-After`. It must be at least `1`; a lower value stops the server at startup. |
 
 **Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 

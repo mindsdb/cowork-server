@@ -652,3 +652,50 @@ async def test_a_rejected_publish_fails_without_a_second_traceback(base, enabled
     record = next(r for r in caplog.records if "artifact autopublish failed" in r.getMessage())
     assert not record.exc_info
     assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_reconciliation_reads_the_file_store_off_the_event_loop(
+    base, enabled, key, publish_url, published, monkeypatch,
+):
+    """The candidate walk, the plan and the publish lock each read the shared
+    file store. Made slow here, they leave the loop ticking."""
+    import asyncio
+    import time
+
+    real_candidates, real_plan = ap._candidate_slugs, ap._plan
+    steps = []
+
+    def slow_candidates(artifacts_base):
+        steps.append("candidates")
+        time.sleep(0.5)
+        return real_candidates(artifacts_base)
+
+    def slow_plan(artifacts_base, slugs):
+        steps.append("plan")
+        time.sleep(0.5)
+        return real_plan(artifacts_base, slugs)
+
+    async def everyone_owns(*, slugs, **_kwargs):
+        return ap.OwnedSlugs(owned=list(slugs), not_owner=0, owner_unknown=0)
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    monkeypatch.setattr(ap, "_candidate_slugs", slow_candidates)
+    monkeypatch.setattr(ap, "_plan", slow_plan)
+    monkeypatch.setattr(ap, "_owned_slugs", everyone_owns)
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    finally:
+        beat.cancel()
+
+    assert out == {"rep"}
+    assert steps == ["candidates", "plan"]
+    assert ticks >= 40, f"the loop ticked {ticks} times across 1s of file store work"

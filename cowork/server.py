@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import os
 import stat
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -31,7 +32,8 @@ from cowork.code_sandbox import check_startup as check_code_sandbox_startup
 from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
-from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.db.units import DatabaseBusy, FilesystemBusy, busy_retry_seconds, loop_limiters
+from cowork.common.loop_watchdog import LoopWatchdog
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
@@ -63,6 +65,38 @@ from cowork.services.pending_credential_clear import consume_pending_credential_
 
 # Set up logging
 logger = setup_logging()
+
+# Imported once, as the process starts serving, so startup_finished can say
+# how long the whole boot took and not only the lifespan.
+_IMPORTED_AT = time.monotonic()
+
+
+class _StartupClock:
+    """How long each lifespan step took, for one line at the end of startup.
+
+    Liveness starts counting before the lifespan ends, so a boot that grows
+    past its budget restarts the pod before it serves. One WARNING line, the
+    level hosted pods print, says which step grew.
+    """
+
+    def __init__(self) -> None:
+        self._mark = time.monotonic()
+        self._steps: list[str] = []
+
+    def step(self, name: str) -> None:
+        now = time.monotonic()
+        self._steps.append(f"{name}={round((now - self._mark) * 1000)}ms")
+        self._mark = now
+
+    def finished(self) -> None:
+        logger.warning(
+            "Startup finished",
+            extra={
+                "event": "startup_finished",
+                "duration_ms": round((time.monotonic() - _IMPORTED_AT) * 1000),
+                "steps": ", ".join(self._steps),
+            },
+        )
 
 
 async def _start_channels(app: FastAPI) -> None:
@@ -173,10 +207,13 @@ def _warm_agent_runtime() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    clock = _StartupClock()
     run_dev_setup()
+    clock.step("dev_setup")
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    clock.step("credential_clear")
     # Ownership recovery runs before the first request can mint a page. A pass
     # that cannot read publish history or verify the publisher does not stop
     # Cowork: published_page_ownership._require_backfill retries it on each
@@ -194,6 +231,7 @@ async def lifespan(app: FastAPI):
             "Published page ownership backfill did not finish; publishing answers 503 and retries it",
             extra={"event": "published_page_backfill_unavailable", "reason": str(exc)},
         )
+    clock.step("published_page_backfill")
     # After the clear, since resolving MEMORY_ENABLED where memory is shared
     # loads the stored settings.
     try:
@@ -204,6 +242,7 @@ async def lifespan(app: FastAPI):
         logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
+    clock.step("warm_agent_runtime")
     # History recovery also retries buffers sealed by an earlier failed sweep.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
@@ -218,6 +257,7 @@ async def lifespan(app: FastAPI):
             history_session.close()
     except Exception:
         logger.exception("turn-history boot recovery failed (non-fatal)")
+    clock.step("turn_history_recovery")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -228,6 +268,7 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
+    clock.step("turn_buffer_recovery")
     # Reclaim scratchpad namespace snapshots whose conversation is gone (ENG-1124).
     # `delete_conversation` prunes its own from now on; this catches everything
     # deleted before that shipped, plus any path that drops a conversation row
@@ -243,6 +284,7 @@ async def lifespan(app: FastAPI):
             sweep_session.close()
     except Exception:
         logger.exception("scratchpad-session boot sweep failed (non-fatal)")
+    clock.step("scratchpad_session_sweep")
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
     # run and never fires that schedule again.
@@ -260,14 +302,17 @@ async def lifespan(app: FastAPI):
             recovery_session.close()
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
+    clock.step("scheduled_run_recovery")
     # Warm the MindsHub availability map at boot (desktop, returning or
     # freshly-signed-in user) so the empty-map state — which keeps a stored
     # paid pin and 402s the first message on a free-tier wallet (ENG-748) —
     # is closed before the first turn. Bounded and fail-open; see the helper.
     if await _warm_model_map_on_boot():
         logger.info("warmed MindsHub model-availability map on boot")
+    clock.step("model_map_warm")
     start_scheduler()
     await _start_channels(app)
+    clock.step("scheduler_and_channels")
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
     if get_app_settings().tenancy_mode == "org":
@@ -291,9 +336,16 @@ async def lifespan(app: FastAPI):
         # Bootstrap and credential clearing finish first; provider checks must
         # not delay readiness while the configured endpoint is unavailable.
         app.state.router_startup_probe = asyncio.create_task(run_router_startup_probe())
+    clock.finished()
+    watchdog = None
     try:
+        # Last, once nothing left in startup blocks the loop on purpose.
+        watchdog = LoopWatchdog(loop_limiters())
+        watchdog.start()
         yield
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
@@ -505,6 +557,26 @@ def create_app() -> FastAPI:
         return JSONResponse(
             Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
             status_code=DatabaseBusy.status_code,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # No shared file store slot freed within POOL_TIMEOUT (cowork.db.units.
+    # run_efs). Answered as a busy database is, so the client waits the same
+    # Retry-After before it retries.
+    @app.exception_handler(FilesystemBusy)
+    async def _filesystem_busy(request, exc):
+        retry_after = busy_retry_seconds()
+        logger.warning(
+            "Request refused with 503: no shared file store slot freed in time",
+            extra={
+                "event": "filesystem_busy",
+                "method": request.method,
+                "route": getattr(request.scope.get("route"), "path", None),
+            },
+        )
+        return JSONResponse(
+            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+            status_code=FilesystemBusy.status_code,
             headers={"Retry-After": str(retry_after)},
         )
 

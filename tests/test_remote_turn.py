@@ -17,6 +17,8 @@ from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 class _FakeScope:
     org_id = "org-123"
+    # An organization's scope, which cowork.db.units.run_efs reads for the share.
+    partitioned = True
     user_id = None
 
 

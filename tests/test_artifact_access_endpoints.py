@@ -22,6 +22,7 @@ from fastapi import HTTPException
 from cowork.api.v1.endpoints import artifact_workspace as aw
 from cowork.db.scoped import TenantScope
 from cowork.services import artifact_locks
+from _async_stub import awaitable
 
 ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 ARTIFACT_ID = "11111111-1111-1111-1111-111111111111"
@@ -46,9 +47,9 @@ def as_owner(monkeypatch, folder):
     """Owner resolution succeeds and yields this folder."""
     monkeypatch.setattr(
         aw, "_owner_workspace",
-        lambda session, project_ref, artifact_id: (
+        awaitable(lambda scope, project_ref, artifact_id: (
             SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
-        ),
+        )),
     )
     return folder
 
@@ -232,7 +233,7 @@ async def test_a_non_owner_cannot_change_access(monkeypatch, publish_calls, publ
     def refuse(*_a, **_kw):
         raise HTTPException(status_code=403, detail="Not the owner")
 
-    monkeypatch.setattr(aw, "_owner_workspace", refuse)
+    monkeypatch.setattr(aw, "_owner_workspace", awaitable(refuse))
 
     with pytest.raises(HTTPException) as excinfo:
         await aw.set_artifact_access(

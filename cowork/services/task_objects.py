@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -706,10 +707,17 @@ async def publish_and_card_turn_artifacts(
         carded = set(new_slugs) | (republished & set(touched_slugs))
     else:
         carded = set(touched_slugs)
-    return cards_for_slugs(
-        artifacts_base, sorted(carded),
-        scope=scope,
-        project_id=project_id, project_name=project_name, project_label=project_label,
+    from cowork.db.units import run_efs
+
+    return await run_efs(
+        partial(
+            cards_for_slugs,
+            artifacts_base, sorted(carded),
+            scope=scope,
+            project_id=project_id, project_name=project_name, project_label=project_label,
+        ),
+        scope=scope or LOCAL_SCOPE,
+        deadline=False,
     )
 
 

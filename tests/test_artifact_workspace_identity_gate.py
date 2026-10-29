@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from cowork.api.v1 import artifact_scope
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
+from _async_stub import awaitable
 
 
 @pytest.fixture
@@ -105,11 +106,11 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
     monkeypatch.setattr(artifact_scope, "_refuse_a_persons_project_in_the_operator_view", lambda *_args: None)
     monkeypatch.setattr(
         artifact_scope,
-        "artifacts_sources_for_project",
-        lambda _session, project_id, **_kwargs: seen.append(project_id) or [],
+        "plan_project_roots",
+        lambda _session, project_id, **_kwargs: seen.append(project_id) or "plan",
     )
 
-    assert artifact_scope._sources_for_project_ref(object(), request_ref) == []
+    assert artifact_scope._plan_for_project_ref(object(), project_ref=request_ref) == "plan"
     assert seen == [server_id]
     assert seen[0] is server_id
 
@@ -162,7 +163,7 @@ def served_xlsx(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "file"}, True),
+        awaitable(lambda *_args: (source, folder, {"type": "file"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef/model.xlsx"
 
@@ -211,7 +212,7 @@ def cancel_route(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "document"}, True),
+        awaitable(lambda *_args: (source, folder, {"type": "document"}, True)),
     )
     monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
     seen: list[bool] = []
@@ -261,7 +262,7 @@ def release_route(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "document"}, True),
+        awaitable(lambda *_args: (source, folder, {"type": "document"}, True)),
     )
     monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
     seen: list[str] = []
@@ -300,7 +301,7 @@ def test_release_is_refused_without_owner_access(client, tmp_path, monkeypatch):
     def deny(*_args):
         raise _HTTPException(status_code=403, detail="Not the owner")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", deny)
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(deny))
     monkeypatch.setattr(
         workspace_ep, "release_repairs_for_comment",
         lambda *_a, **_k: pytest.fail("release ran without an owner check"),
@@ -349,7 +350,7 @@ def editable_artifact(tmp_path, monkeypatch):
     metadata = {"type": "file", "primary": "brief.md"}
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
+        awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -508,7 +509,7 @@ def reported_source_artifact(request, tmp_path, monkeypatch):
     metadata = dict(request.param)
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
+        awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -645,7 +646,7 @@ def mixed_case_artifact(tmp_path, monkeypatch):
     metadata = {"type": "file", "primary": "Brief.md"}
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
+        awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -781,7 +782,7 @@ def served_html_app(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "html-app"}, True),
+        awaitable(lambda *_args: (source, folder, {"type": "html-app"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef"
 

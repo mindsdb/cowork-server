@@ -19,10 +19,18 @@ the rollout together, and each fails quietly on its own:
   file: a duplicate renders fine and then either fails the upgrade or silently
   empties the variable. The controller's guard exists because that emptied its
   worker image in prod; this chart had no such guard.
+
+The probes keep a slow dependency from restarting or unrouting the pod:
+readiness reads ``/api/v1/health/ready`` and liveness ``/api/v1/health/live``,
+neither of which touches the database, the file store or settings, and the
+liveness delay leaves the boot room to finish. The ``deployment`` subchart
+that renders them is pinned to one version, so a new release of it can't
+change them unreviewed.
 """
 
 from __future__ import annotations
 
+import inspect
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,3 +149,67 @@ def test_no_env_name_is_declared_twice_per_environment(base, env_values):
     names = [entry.name for entry in base + _env(env_values)]
     duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
     assert not duplicates, f"{env_values.name} renders {duplicates} more than once with values.yaml"
+
+
+# Each file as an environment renders it; "values.yaml" alone is a PR environment.
+RENDERED = [BASE, *ENVIRONMENTS]
+
+
+def _merged(base: dict, overlay: dict) -> dict:
+    """Helm's merge of an overlay onto the base: maps merge key by key, any
+    other value replaces."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merged(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _rendered(path: Path) -> dict:
+    """The ``deployment:`` values an environment renders with."""
+    return _deployment(BASE) if path == BASE else _merged(_deployment(BASE), _deployment(path))
+
+
+
+
+
+
+# The liveness delay the boot has: kill comes at this plus failureThreshold *
+# periodSeconds, and staging boots under load took about 120s on 28 Oct.
+LIVENESS_DELAY_SECONDS = 180
+DEPLOYMENT_SUBCHART_VERSION = "1.0.47"
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_readiness_reads_the_route_that_does_no_io(values):
+    probe = _rendered(values)["readinessProbe"]
+    assert probe["enabled"] is True
+    assert probe["path"] == "/api/v1/health/ready"
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_liveness_reads_live_and_leaves_the_boot_its_delay(values):
+    probe = _rendered(values)["livenessProbe"]
+    assert probe["enabled"] is True
+    assert probe["path"] == "/api/v1/health/live"
+    assert probe["initialDelaySeconds"] == LIVENESS_DELAY_SECONDS
+    # The process may still be killed for a real hang: 60s of failures.
+    assert probe["failureThreshold"] * probe["periodSeconds"] == 60
+
+
+def test_both_probe_routes_are_async_so_they_never_wait_for_a_thread():
+    """A sync route runs on anyio's default threads, which sync dependencies
+    and file reads fill, so a probe there would fail with the pool and not
+    with the process."""
+    from cowork.api.v1.endpoints import health
+
+    assert inspect.iscoroutinefunction(health.live)
+    assert inspect.iscoroutinefunction(health.ready)
+
+
+def test_the_deployment_subchart_is_pinned_to_one_version():
+    requirements = yaml.safe_load((CHART / "requirements.yaml").read_text())
+    (subchart,) = [dep for dep in requirements["dependencies"] if dep["alias"] == "deployment"]
+    assert subchart["version"] == DEPLOYMENT_SUBCHART_VERSION

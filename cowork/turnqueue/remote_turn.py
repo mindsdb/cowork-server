@@ -2,9 +2,11 @@
 but built separately, since sharing it would move ~20 tests' patch targets."""
 from __future__ import annotations
 
+from functools import partial
 from uuid import UUID
 
 from cowork.db.scoped import ScopedSession
+from cowork.db.units import run_efs
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
@@ -62,7 +64,10 @@ async def remote_turn_events(
     )
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
-        snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
+        await run_efs(
+            partial(snapshot_artifact_state, artifacts[1]), scope=session.scope, deadline=False
+        )
+        if artifacts else (set(), {})
     )
     new_slugs: list[str] = []
     touched_slugs: set[str] = set()
@@ -126,11 +131,16 @@ async def remote_turn_events(
                 raise RemoteTurnFailed(code, message)
     finally:
         if artifacts is not None and artifact_writes_allowed:
-            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
-                artifacts[0], conv_id, artifacts[2], artifacts[1],
-                before_slugs, before_mtimes,
-                attribute_by_provenance=True,
-                completed_cleanly=completed_cleanly,
+            new_slugs, touched_slugs, turn_scope = await run_efs(
+                partial(
+                    index_turn_artifacts,
+                    artifacts[0], conv_id, artifacts[2], artifacts[1],
+                    before_slugs, before_mtimes,
+                    attribute_by_provenance=True,
+                    completed_cleanly=completed_cleanly,
+                ),
+                scope=session.scope,
+                deadline=False,
             )
 
     if artifacts is not None and artifact_writes_allowed:

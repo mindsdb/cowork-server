@@ -12,6 +12,28 @@ from cowork.db.scoped import LOCAL_SCOPE
 from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts
 from cowork.services import artifact_identity
+from _async_stub import awaitable
+from cowork.services.artifact_roots import ProjectRow, RootsPlan
+
+
+def _stub_project_roots(monkeypatch, discover):
+    """Answer the delete's async roots read from ``discover(session,
+    project_id)``, as a stub of the sync ``artifacts_sources_for_project``
+    would: the plan step sees the server's project id, and the roots step
+    returns what ``discover`` gave for it."""
+    found = {}
+
+    def plan(session, project_id, **_kwargs):
+        found["sources"] = discover(session, project_id)
+        return RootsPlan(
+            projects=(ProjectRow(id=project_id, name="project", path="/nowhere", external=False),)
+        )
+
+    async def sources(_plan, *, scope):
+        return found["sources"]
+
+    monkeypatch.setattr(artifacts, "plan_project_roots", plan)
+    monkeypatch.setattr(artifacts, "artifact_sources", sources)
 
 
 async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
@@ -34,7 +56,7 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
         events.append("basename")
         return real_basename(project_ref)
 
-    def discover(_session, project_ref):
+    def discover(_scope, project_ref):
         events.append("roots")
         seen["project_ref"] = project_ref
         return server_id, [trusted_source]
@@ -44,10 +66,10 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
         seen["card_sources"] = sources
         return []
 
-    session = SimpleNamespace(scope=SimpleNamespace(org_mode=False))
+    session = SimpleNamespace(scope=LOCAL_SCOPE)
     seen["session"] = session
     monkeypatch.setattr(artifacts.os.path, "basename", sanitize)
-    monkeypatch.setattr(artifacts, "_scoped_project_sources", discover)
+    monkeypatch.setattr(artifacts, "_scoped_project_roots", awaitable(discover))
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(
@@ -218,12 +240,12 @@ async def test_legacy_delete_scans_only_roots_selected_by_the_server_catalog(
         seen["folder_name"] = folder_name
         raise ScanReached
 
-    monkeypatch.setattr(artifacts, "artifacts_sources_for_project", discover)
+    _stub_project_roots(monkeypatch, discover)
     monkeypatch.setattr(artifacts, "_legacy_artifact_for_sources", scan)
 
     with pytest.raises(ScanReached):
         await artifacts.delete_artifact_for_request(
-            SimpleNamespace(scope=SimpleNamespace(org_mode=False)), "legacy-report", project_id=str(request_id)
+            SimpleNamespace(scope=LOCAL_SCOPE), "legacy-report", project_id=str(request_id)
         )
 
     assert seen == {"sources": [source], "folder_name": "legacy-report"}
@@ -242,9 +264,7 @@ async def test_identity_delete_passes_catalog_project_and_canonical_artifact_ids
         "scoped_project_id_for_request",
         lambda *_args: server_project_id,
     )
-    monkeypatch.setattr(
-        artifacts, "artifacts_sources_for_project", lambda *_args: []
-    )
+    _stub_project_roots(monkeypatch, lambda *_args: [])
 
     class ResolutionReached(Exception):
         pass
@@ -254,11 +274,11 @@ async def test_identity_delete_passes_catalog_project_and_canonical_artifact_ids
         seen["artifact_id"] = requested_artifact_id
         raise ResolutionReached
 
-    monkeypatch.setattr(artifact_scope, "review_artifact_for_request", resolve)
+    monkeypatch.setattr(artifact_scope, "review_artifact_for_request", awaitable(resolve))
 
     with pytest.raises(ResolutionReached):
         await artifacts.delete_artifact_for_request(
-            SimpleNamespace(scope=SimpleNamespace(org_mode=False)), str(artifact_id), project_id=str(request_project_id)
+            SimpleNamespace(scope=LOCAL_SCOPE), str(artifact_id), project_id=str(request_project_id)
         )
 
     assert seen == {
