@@ -63,6 +63,7 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
+    TurnQueueSettings,
     default_minds_api_host,
 )
 from cowork.common.settings.user_settings import (
@@ -654,6 +655,9 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # model "restricted by your admin". A model absent from this map keeps
     # today's locked, add-credits treatment.
     model_disabled_reasons: dict[str, str] = {}
+    # Decision models MindsHub refuses this caller, apart from the picker's
+    # maps: read only for `routing` below.
+    decision_disabled_reasons: dict[str, str] = {}
 
     # `modelLabels` maps a model id → MindsHub's human-readable display label.
     # Display-only: the picker uses this to render the option text, but the id
@@ -775,6 +779,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_disabled_reasons.update(listing.disabled_reasons)
+        decision_disabled_reasons.update(listing.decision_disabled_reasons)
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
@@ -873,10 +878,15 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # use), so Settings can show the decision-model section and say what it
     # does. `gate` above stays for UIs that predate this; they ship OTA apart
     # from this server.
-    from cowork.handlers.jev_route import gate_mode
+    from cowork.handlers.jev_route import gate_mode, zdr_restricted
 
     routing = {
-        "mode": gate_mode(gate_settings),
+        # "zdr" when MindsHub refuses Jev to the organization under zero data
+        # retention, which the turns' own check (`_jev_zdr_restricted`) reads
+        # from the same listing.
+        "mode": gate_mode(gate_settings, zdr=zdr_restricted(
+            decision_disabled_reasons, TurnQueueSettings().jev_route_model,
+        )),
         "routerProvider": gate["provider"],
     }
 

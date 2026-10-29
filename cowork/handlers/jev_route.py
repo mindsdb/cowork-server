@@ -97,7 +97,18 @@ class JevRoute:
     error: str = ""
 
 
-GateMode = Literal["own", "jev", "off", "llm"]
+GateMode = Literal["own", "jev", "off", "zdr", "llm"]
+
+# MindsHub's reason for refusing a model to an organization with zero data
+# retention on, whose agreements do not cover the model's provider (Jev's,
+# TypeSafe, today). Read from the model listing's `disabled_reason`.
+ZDR_RESTRICTED = "zdr_restricted"
+
+
+def zdr_restricted(decision_disabled_reasons, model: str) -> bool:
+    """Whether MindsHub refuses the decision model `model` to this
+    organization for zero data retention (`MindsModelListing.decision_disabled_reasons`)."""
+    return (decision_disabled_reasons or {}).get(model) == ZDR_RESTRICTED
 
 
 def own_decision_target(settings) -> "JevTarget | None":
@@ -108,7 +119,7 @@ def own_decision_target(settings) -> "JevTarget | None":
     return JevTarget(url=url, api_key=key) if key and url else None
 
 
-def gate_mode(settings) -> GateMode:
+def gate_mode(settings, *, zdr: bool = False) -> GateMode:
     """Which gate decides a turn, from settings alone. One source for the turn
     handler and for the settings response, so the UI shows what turns do.
 
@@ -117,6 +128,9 @@ def gate_mode(settings) -> GateMode:
     - "jev": Jev on MindsHub, for turns that answer on MindsHub.
     - "off": the organization turned Jev on MindsHub off and has no decision
       model of its own: MindsHub turns run the agent.
+    - "zdr": as "off", but because MindsHub refuses Jev to the organization
+      under zero data retention (`zdr`, from `zdr_restricted`), whatever the
+      switch says.
     - "llm": the LLM gate, for turns that answer on other providers.
     """
     from cowork.common.settings.user_settings import Provider
@@ -125,6 +139,8 @@ def gate_mode(settings) -> GateMode:
         return "own"
     if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
         return "llm"
+    if zdr:
+        return "zdr"
     return "jev" if settings.jev_decisions_enabled else "off"
 
 

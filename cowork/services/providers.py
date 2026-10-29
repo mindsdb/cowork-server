@@ -8,7 +8,8 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, TypedDict
 from urllib.parse import urlparse
 
@@ -325,6 +326,11 @@ class MindsModelListing(NamedTuple):
     # every MindsHub that predates the field and every plain OpenAI-compatible
     # endpoint. Required for the same reason as ``role_defaults``.
     disabled_reasons: dict[str, str]
+    # The same reasons for the decision models the listing leaves out of
+    # ``ids`` (Jev): "zdr_restricted" says the organization's zero data
+    # retention rules the model out. Read-only and empty by default, since only
+    # the MindsHub parse below fills it.
+    decision_disabled_reasons: Mapping[str, str] = MappingProxyType({})
 
 
 def _empty_listing() -> MindsModelListing:
@@ -577,6 +583,7 @@ async def fetch_minds_models(
     families: dict[str, str] = {}
     role_defaults: dict[str, str] = {}
     disabled_reasons: dict[str, str] = {}
+    decision_disabled_reasons: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -601,7 +608,12 @@ async def fetch_minds_models(
         # models — chosen for planning/coding roles they'd error every turn.
         # Filtered here, the single place every row is parsed, so neither the
         # picker nor default-resolution ever sees them.
-        if row.get("kind") == "decision" or _is_embedding_row(row, model_id):
+        if row.get("kind") == "decision":
+            # Kept apart for the route gate, which asks whether it may call Jev.
+            if row.get("enabled") is False and (reason := _text(row, "disabled_reason")):
+                decision_disabled_reasons[model_id] = reason
+            continue
+        if _is_embedding_row(row, model_id):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
@@ -657,7 +669,7 @@ async def fetch_minds_models(
     return _remember(
         MindsModelListing(
             (ids or None), efforts, enabled, labels, providers, families, role_defaults,
-            disabled_reasons,
+            disabled_reasons, decision_disabled_reasons,
         )
     )
 

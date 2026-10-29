@@ -1193,7 +1193,9 @@ class ResponsesHandler:
     def _jev_gate(self, turn_llm: dict | None):
         """How this turn is gated: a decision callable, "off" when the turn
         answers on MindsHub and the organization opted out of Jev there, or
-        None for the LLM gate.
+        None for the LLM gate. On MindsHub the callable first checks that
+        MindsHub does not refuse Jev to the organization under zero data
+        retention, and runs the agent without asking Jev when it does.
 
         The organization's own decision model, when configured, decides for
         every provider: configuring it is the opt-in, so the Jev opt-out does
@@ -1223,6 +1225,10 @@ class ResponsesHandler:
             model = queue_settings.jev_route_model
 
         async def ask(messages: list[dict]) -> jev_route.JevRoute:
+            if mode == "jev" and await self._jev_zdr_restricted(target, model, queue_settings):
+                # Refused to the organization under zero data retention: no
+                # call, and the turn runs the agent (reason "jev_zdr").
+                return jev_route.JevRoute(model=model, error="zdr")
             return await jev_route.decide(
                 target=target,
                 messages=messages,
@@ -1232,6 +1238,29 @@ class ResponsesHandler:
             )
 
         return ask
+
+    async def _jev_zdr_restricted(self, target: jev_route.JevTarget, model: str, queue_settings) -> bool:
+        """Whether MindsHub refuses Jev to this organization under zero data
+        retention, from the model listing it publishes for the same key
+        (cached per caller, see `fetch_minds_models`). A listing slower than
+        the gate's own timeout reads as no: the turn asks Jev, which MindsHub
+        refuses, and the turn runs the agent all the same. The fetch finishes
+        in the background so the next turn reads it from the cache."""
+        from cowork.services.providers import fetch_minds_models
+
+        base_url = target.url.removesuffix("/decisions")
+        fetch = asyncio.ensure_future(fetch_minds_models(
+            base_url, target.api_key,
+            # Hosted turns mint a key per turn, so their entry is the org
+            # member's; elsewhere it is the stored key's own.
+            tenant_key=self.scope.org_id if self.scope.org_mode else None,
+            user_id=self.scope.user_id if self.scope.org_mode else None,
+        ))
+        try:
+            listing = await asyncio.wait_for(asyncio.shield(fetch), queue_settings.jev_route_timeout_seconds)
+        except TimeoutError:
+            return False
+        return jev_route.zdr_restricted(listing.decision_disabled_reasons, model)
 
     def _answer_binding(self, *, model: str | None, turn_llm: dict | None) -> RouterBinding | None:
         """The model that writes a direct answer the gate routed: the

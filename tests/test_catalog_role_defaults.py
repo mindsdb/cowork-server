@@ -297,12 +297,15 @@ def test_an_embedding_row_cannot_claim_a_role(monkeypatch):
 _TOUCHED = ("minds_api_key", "minds_model_enabled", "minds_role_defaults")
 
 
-def _stub_listing(monkeypatch, *, ids, enabled=None, role_defaults=None):
+def _stub_listing(monkeypatch, *, ids, enabled=None, role_defaults=None, decision_reasons=None):
     from cowork.api.v1.endpoints import settings as endpoint
     from cowork.services.providers import MindsModelListing
 
     async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
-        return MindsModelListing(ids, {}, enabled or {}, {}, {}, {}, role_defaults or {}, {})
+        return MindsModelListing(
+            ids, {}, enabled or {}, {}, {}, {}, role_defaults or {}, {},
+            decision_disabled_reasons=decision_reasons or {},
+        )
 
     monkeypatch.setattr(endpoint, "fetch_minds_models", fake_fetch)
 
@@ -703,6 +706,25 @@ def test_settings_are_told_which_gate_decides_turns(monkeypatch):
     assert payload["routing"] == {"mode": "jev", "routerProvider": "minds-cloud"}
     # Kept for UIs that predate `routing`.
     assert "gate" in payload
+
+
+def test_settings_are_told_mindshub_refuses_jev_under_zdr(monkeypatch):
+    """An organization with zero data retention on is refused Jev by MindsHub,
+    so Settings says so rather than offering a switch that does nothing."""
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "sonnet", "haiku", "kimi"],
+        enabled={"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True},
+        role_defaults={"planning": "sonnet", "coding": "haiku", "router": "kimi"},
+        decision_reasons={"jev": "zdr_restricted"},
+    )
+
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["routing"]["mode"] == "zdr"
+    # Decision models stay out of the picker's maps.
+    assert "jev" not in payload["modelDisabledReasons"]
 
 
 def test_the_gate_model_is_availability_adjusted_like_resolution_is(monkeypatch):

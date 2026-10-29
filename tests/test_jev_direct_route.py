@@ -23,6 +23,7 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
+from cowork.services.providers import fetch_minds_models as _REAL_FETCH
 
 _TOOL_ROWS = [
     {"role": "user", "content": "Build me a dashboard of our 2025 sales."},
@@ -130,6 +131,27 @@ def _settings(*, planning=Provider.MINDS_CLOUD, enabled=True, model="opus-5-5", 
         decision_model_api_key=SecretStr(own["key"]) if own.get("key") else None,
         decision_model=own.get("model", "jev"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _listing(monkeypatch):
+    """The MindsHub model listing the gate checks for a zero data retention
+    refusal: none by default. Set `.reasons` to the decision models' reasons,
+    or `.delay` to make it slower than the gate's timeout."""
+    from cowork.services import providers
+
+    state = SimpleNamespace(reasons={}, delay=0.0, asked=[])
+
+    async def fake_fetch(minds_url, api_key, **kwargs):
+        state.asked.append((minds_url, api_key, kwargs))
+        if state.delay:
+            await asyncio.sleep(state.delay)
+        return providers.MindsModelListing(
+            ["opus-5-5"], {}, {}, {}, {}, {}, {}, {}, decision_disabled_reasons=state.reasons,
+        )
+
+    monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
+    return state
 
 
 def _gate(monkeypatch, settings, *, stored_key=None):
@@ -789,3 +811,112 @@ async def test_produce_answer_leaves_a_stop_after_delegation_to_the_agent(monkey
     assert buffer.status == "cancelled"
     assert buffer.frames == []
     assert await _rows(conversation_id) == []
+
+
+# ── zero data retention ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_jev_gate_runs_the_agent_without_asking_jev_under_zdr(monkeypatch, _listing):
+    _listing.reasons = {"jev": "zdr_restricted"}
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+
+    seen = await _asked(monkeypatch, handler)
+
+    assert seen == {}  # Jev was never asked
+    result = await handler._jev_gate(None)([{"role": "user", "content": "hi"}])
+    assert result.error == "zdr"
+    # Read with the key the turn would ask Jev with, on the same gateway.
+    assert _listing.asked[0][:2] == ("https://api.mindshub.ai/v1", "stored")
+
+
+@pytest.mark.asyncio
+async def test_jev_gate_asks_jev_when_refused_for_another_reason(monkeypatch, _listing):
+    _listing.reasons = {"jev": "wallet_empty", "other-decider": "zdr_restricted"}
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+
+    assert (await _asked(monkeypatch, handler))["model"] == "jev"
+
+
+@pytest.mark.asyncio
+async def test_jev_gate_asks_jev_when_the_listing_is_slow(monkeypatch, _listing):
+    """A slow listing never holds the turn past the gate's own timeout."""
+    _listing.reasons = {"jev": "zdr_restricted"}
+    _listing.delay = 5
+    monkeypatch.setenv("COWORK_TURN_JEV_ROUTE_TIMEOUT_SECONDS", "0.05")
+    handler = _gate(monkeypatch, _settings(), stored_key="stored")
+
+    assert (await _asked(monkeypatch, handler))["model"] == "jev"
+
+
+@pytest.mark.asyncio
+async def test_an_own_decision_model_is_not_checked_against_mindshub(monkeypatch, _listing):
+    _listing.reasons = {"jev": "zdr_restricted"}
+    own = {"url": "https://api.typesafe.ai/v1/systemone", "key": "own-key"}
+    handler = _gate(monkeypatch, _settings(own=own), stored_key="stored")
+
+    assert (await _asked(monkeypatch, handler))["target"].url == own["url"]
+    assert _listing.asked == []
+
+
+def test_gate_mode_reports_zdr_whatever_the_switch_says():
+    assert jev_route.gate_mode(_settings(enabled=True), zdr=True) == "zdr"
+    assert jev_route.gate_mode(_settings(enabled=False), zdr=True) == "zdr"
+    # Not for other providers, nor an organization's own decision model.
+    assert jev_route.gate_mode(_settings(planning=Provider.ANTHROPIC), zdr=True) == "llm"
+    own = {"url": "https://d.example/decide", "key": "k"}
+    assert jev_route.gate_mode(_settings(own=own), zdr=True) == "own"
+
+
+def test_the_listing_keeps_decision_models_refusal_apart():
+    import httpx
+
+    from cowork.services import providers
+
+    rows = {"data": [
+        {"id": "opus-5-5", "enabled": True},
+        {"id": "jev", "kind": "decision", "enabled": False, "disabled_reason": "zdr_restricted"},
+        {"id": "jev-1.13.0", "kind": "decision", "enabled": True},
+    ]}
+
+    async def fetch():
+        transport = httpx.MockTransport(lambda _request: httpx.Response(200, json=rows))
+        real = httpx.AsyncClient
+
+        class Client(real):
+            def __init__(self, *a, **k):
+                super().__init__(*a, transport=transport, **k)
+
+        httpx.AsyncClient = Client
+        try:
+            # The real fetch, past the module fixture's stub.
+            return await _REAL_FETCH("https://zdr.example", "key-zdr-parse")
+        finally:
+            httpx.AsyncClient = real
+
+    listing = asyncio.run(fetch())
+
+    assert listing.ids == ["opus-5-5"]
+    assert dict(listing.decision_disabled_reasons) == {"jev": "zdr_restricted"}
+    assert listing.disabled_reasons == {}
+
+
+@pytest.mark.parametrize(("reasons", "verifier_jev"), [({"jev": "zdr_restricted"}, "off"), ({}, "on")])
+def test_zdr_turns_off_antons_completion_check(monkeypatch, reasons, verifier_jev):
+    from anton.config.settings import AntonSettings
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+    from cowork.services import providers
+
+    def cached(minds_url, tenant_key=None, *, user_id=None, api_key=""):
+        assert api_key == "stored-key"
+        return providers.MindsModelListing(["opus-5-5"], {}, {}, {}, {}, {}, {}, {}, decision_disabled_reasons=reasons)
+
+    monkeypatch.setattr(providers, "cached_minds_models", cached)
+    anton = AntonSettings(_env_file=None)
+    _overlay_user_settings(anton, UserSettings.model_validate({
+        "planning_provider": "minds_cloud", "minds_api_key": "stored-key",
+    }))
+
+    assert anton.verifier_jev == verifier_jev
