@@ -28,6 +28,8 @@ def test_roam_research_spec_carries_the_redirect_rule():
     assert "308" in notes
     assert "Location" in notes
     assert "re-attached" in notes
+    # The token may only follow the redirect to Roam's own peer hosts.
+    assert "`.api.roamresearch.com`" in notes
     assert "case-sensitive" in notes
 
 

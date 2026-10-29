@@ -310,6 +310,23 @@ def test_usage_notes_fit_the_length_limit(path: Path):
     )
 
 
+# A method's `description` is the helper line under its button on the connect
+# form, so it is user copy. Instructions for the prober go in `usage_notes`.
+METHOD_DESCRIPTION_MAX_CHARS = 400
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_method_descriptions_stay_short(path: Path):
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    for method in (spec.get("form") or {}).get("methods") or []:
+        description = method.get("description") or ""
+        assert len(description) <= METHOD_DESCRIPTION_MAX_CHARS, (
+            f"{path.name}: method {method.get('id')!r} description is {len(description)} chars, "
+            f"over {METHOD_DESCRIPTION_MAX_CHARS}. Users see it on the connect form; "
+            "move prober instructions to usage_notes."
+        )
+
+
 # The two connectors enabled for cloud execution. Every other method
 # in the corpus carries no `cloud` block and is therefore desktop-only.
 CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
