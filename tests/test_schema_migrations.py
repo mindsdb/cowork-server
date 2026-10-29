@@ -1,10 +1,12 @@
 import sqlite3
+import uuid
 from types import SimpleNamespace
 
 import pytest
 from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel
 
 # Import models so SQLModel.metadata can create a pre-Alembic legacy schema.
@@ -733,6 +735,55 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     assert "reports" in names and "untitled-project" in names
 
 
+def _insert_custom_connector(connection, *, connector_id, org_id=None):
+    connection.execute(
+        text(
+            "insert into custom_connectors "
+            "(id, connector_id, label, description, spec, featured, org_id) "
+            "values (:id, :connector_id, :label, '', '{}', 1, :org_id)"
+        ),
+        {"id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id, "org_id": org_id},
+    )
+
+
+def test_custom_connectors_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "custom_connectors.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "custom_connectors")
+
+    _downgrade_to(engine, uri, "f3733a102501")
+    assert not _has_table(db_path, "custom_connectors")
+
+    _upgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert _has_table(db_path, "custom_connectors")
+
+
+def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "custom_connectors_unique.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="httpbin")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b")
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="httpbin")
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+
+
 def test_published_page_ownership_upgrade_is_unique_and_survives_rollback(tmp_path):
     from uuid import uuid4
     from sqlalchemy.exc import IntegrityError
@@ -813,7 +864,7 @@ def test_live_app_availability_migration_upgrades_and_preserves_a_pending_notice
 
     uri = _sqlite_uri(tmp_path / "availability.db")
     engine = create_engine(uri)
-    _upgrade_to(engine, uri, "f3733a102501")
+    _upgrade_to(engine, uri, "a6e3c9f2b4d8")
     assert not _has_table(tmp_path / "availability.db", "live_app_availability_waits")
     _upgrade_to(engine, uri, "head")
     generation = uuid4()
@@ -843,7 +894,7 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
     uri = _sqlite_uri(db_path)
     engine = create_engine(uri)
     previous = "e3618a102301"
-    revision = "f3733a102501"
+    previews = "f3733a102501"
     _upgrade_to(engine, uri, previous)
     assert not _has_table(db_path, "live_app_previews")
     assert not _has_table(db_path, "live_app_preview_owners")
@@ -864,8 +915,8 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         shares_before = connection.execute("SELECT * FROM live_app_shares").fetchall()
     schema_before = persistent_schema()
 
-    _upgrade_to(engine, uri, revision)
-    assert _alembic_version(db_path) == revision
+    _upgrade_to(engine, uri, previews)
+    assert _alembic_version(db_path) == previews
     expected_columns = {
         "id", "created_at", "modified_at", "owner_partition_id", "owner_user_id",
         "owner_email", "viewer_cookie", "position", "launch_id", "origin",
@@ -919,8 +970,8 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
         assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
 
-    _upgrade_to(engine, uri, revision)
-    assert _alembic_version(db_path) == revision
+    _upgrade_to(engine, uri, previews)
+    assert _alembic_version(db_path) == previews
     assert _table_columns(db_path, "live_app_previews") == expected_columns
     assert _table_columns(db_path, "live_app_preview_owners") == {"id", "created_at", "modified_at", "marker", "revision"}
     assert persistent_schema() == schema_before
