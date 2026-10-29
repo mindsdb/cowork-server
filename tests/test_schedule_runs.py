@@ -728,6 +728,30 @@ def test_turn_evidence_reads_the_terminal_record(tmp_path, monkeypatch):
     assert evidence.acted is False
 
 
+def test_the_memory_read_before_the_model_call_is_not_acting(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import cowork.scheduler as scheduler_mod
+    from cowork.streaming.buffer import FileStreamBuffer
+
+    buf = FileStreamBuffer(tmp_path / "turn.jsonl")
+
+    async def _fill():
+        await buf.append("sse", {"sse": "event: response.created"})
+        # The harness sends this once the prompt is built, before the model is called.
+        await buf.append("sse", {"sse": "event: response.memory_read"})
+        await buf.append("sse", {"sse": "event: response.failed"})
+        await buf.close("error")
+
+    asyncio.run(_fill())
+    monkeypatch.setattr(
+        scheduler_mod, "registry",
+        SimpleNamespace(get=lambda cid: SimpleNamespace(buffer=buf)),
+    )
+    assert asyncio.run(scheduler_mod._turn_evidence("c1")).acted is False
+
+
 def test_turn_evidence_with_real_registry_cancel(tmp_path):
     """End-to-end through the real registry: cancel a producer that swallows
     its CancelledError the way handlers/responses._produce does. The task
