@@ -137,6 +137,16 @@ deployment:
   datasourceTurnsEnabled: "false"
   datasourceCapabilities: ""
 
+  # The draft-preview host name and the one page allowed to frame a draft. The
+  # draft Ingress and the COWORK_DRAFT_* variables below are templated from
+  # these, so the host the links point at, the host the listener answers for
+  # and the host the Ingress routes cannot disagree. Empty in the base, so a PR
+  # environment, which renders this file alone, starts no draft listener and
+  # keeps previews on srcdoc. values-<env>.yaml sets both and switches
+  # ingress_secondary on.
+  draftHost: ""
+  webOrigin: ""
+
   image:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
     # slug, so this must track the GitHub repo name (cowork-server).
@@ -266,8 +276,54 @@ deployment:
         X-Organization-Id,X-User-Id,X-User-Email,X-User-Roles,X-Forwarded-User
       nginx.ingress.kubernetes.io/auth-request-headers: "Authorization,Cookie"
 
+  # Draft-preview host. A second Ingress with no auth-url: the signed link in
+  # the path is the credential, and the draft sub-app checks it. It sends /_t/
+  # to the draft port only, where the API app does not listen, and pins the
+  # upstream Host, which ingress-nginx would otherwise take from a client's
+  # X-Forwarded-Host (use-forwarded-headers). The draft sub-app reads no
+  # identity headers, so nothing strips them here; a configuration-snippet
+  # would make this release depend on the controller allowing snippets.
+  # An empty host would make this Ingress a catch-all for /_t/ on every host
+  # the controller serves, so switching it on without draftHost fails the render.
+  ingress_secondary:
+    enabled: false
+    # The default would repeat the primary Ingress's name.
+    name: cowork-server-draft
+    # The controller that serves the primary Ingress.
+    nginx_class: "infrastructure"
+    # Cookie affinity would add a "route" Set-Cookie; the draft host sets none.
+    nginx_affinity: false
+    annotations:
+      # Not `required` here: the subchart passes annotations through toYaml,
+      # which folds a long template onto two lines. The host below fails the
+      # render on its own.
+      nginx.ingress.kubernetes.io/upstream-vhost: '{{ $.Values.draftHost }}'
+      # The path carries the link token; keep it out of the access log.
+      nginx.ingress.kubernetes.io/enable-access-log: "false"
+    hosts:
+      - host: '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
+        enableMultiPath: true
+        paths:
+          - path: /_t/
+            serviceName: cowork-server
+            servicePort: 9011
+
+  # The draft listener (COWORK_DRAFT_PORT below): a second server in the same
+  # process that serves only the draft sub-app. Declared everywhere, but it
+  # listens only where draftHost is set. The Service exposes it under the same
+  # name; templates/network-policy.yaml admits it.
+  additionalPorts:
+    - name: draft
+      containerPort: 9011
+      protocol: TCP
+
   service:
     targetPort: 9010
+    additionalPorts:
+      - name: draft
+        port: 9011
+        targetPort: draft
+        protocol: TCP
 
   # Must match the access point's posixUser (uid/gid 1000), or every org tree
   # is unreadable. The image pins the same ids.
@@ -427,6 +483,34 @@ deployment:
     # correct for dev, staging, prod and per-PR alike.
     # A hardcoded value here pinned a per-PR host and 404'd every env at once
     # when that PR was reaped.
+
+    # ====================================
+    # DRAFT-PREVIEW LINKS
+    # ====================================
+
+    # The draft listener's port, the draft host it answers for, the origin links
+    # point at, the only page allowed to frame a draft (CSP frame-ancestors) and
+    # the signing key ring. All but the key come from draftHost and webOrigin
+    # above. Where draftHost is empty they render empty, and an empty
+    # COWORK_DRAFT_PORT starts no listener. The key is optional so a missing
+    # secret leaves draft links off (srcdoc previews) instead of blocking the
+    # pod; cowork-server logs a warning at boot. README.md has its format.
+    - name: COWORK_DRAFT_PORT
+      value: '{{ if $.Values.draftHost }}9011{{ end }}'
+    - name: COWORK_DRAFT_HOSTS
+      value: '{{ $.Values.draftHost }}'
+    - name: COWORK_DRAFT_ORIGIN
+      value: '{{ with $.Values.draftHost }}https://{{ . }}{{ end }}'
+    - name: COWORK_WEB_ORIGIN
+      value: '{{ $.Values.webOrigin }}'
+    - name: COWORK_DRAFT_LINK_KID
+      value: "v1"
+    - name: COWORK_DRAFT_LINK_KEYS
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: COWORK_DRAFT_LINK_KEYS
+          optional: true
 
     # ====================================
     # PROVIDER API KEYS

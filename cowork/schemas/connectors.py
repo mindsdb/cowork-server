@@ -194,6 +194,19 @@ class ConnectorMetadataResponse(BaseModel):
     # run yet, so the directory can list it under a desktop-only group instead
     # of hiding it. Always True on desktop, where the whole registry works.
     cloud_available: bool = True
+    # Built in Cowork and stored per org (or per local install), not shipped
+    # in the static registry.
+    custom: bool = False
+
+
+class CustomConnectorUpdate(BaseModel):
+    """Changes an admin makes to a custom connector; omitted fields stay as they are."""
+
+    label: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    category: str | None = Field(default=None, max_length=64)
+    featured: bool | None = None
+    spec: dict[str, Any] | None = None
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):
@@ -213,6 +226,12 @@ class ConnectorSpecResponse(ConnectorMetadataResponse):
     # Describe per-method differences by field name (`app_password`,
     # `access_token`), not by env var name.
     usage_notes: str | None = Field(default=None, exclude=True)
+
+
+class CustomConnectorAvailability(BaseModel):
+    """Whether the caller can build a custom connector that is kept for reuse."""
+
+    can_build: bool
 
 
 class MatchRequest(BaseModel):
@@ -298,6 +317,8 @@ class ConnectionSummaryResponse(BaseModel):
     # when healthy. Lets the catalogue card show a warning without requiring
     # the client to fetch each connection's full detail first.
     status: str | None = None
+    # The connection's connector is a custom one built in Cowork.
+    custom: bool = False
     # The caller can't change it: the operator's own, or one someone else
     # shares (ConnectionsService.can_change).
     managed: bool = False

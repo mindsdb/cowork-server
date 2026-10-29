@@ -86,6 +86,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "shared_resource_attributions": PersonalResource.PROJECTS,
     "shared_resource_mutations": PersonalResource.PROJECTS,
     "files": PersonalResource.FILES,
+    # Shared exactly when the vault is, so a shared connection's connector
+    # definition is visible to everyone who sees the connection.
+    "custom_connectors": PersonalResource.CONNECTIONS,
     "schedules": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
     # SettingService routes its own rows; ScopedSession leaves this table alone.

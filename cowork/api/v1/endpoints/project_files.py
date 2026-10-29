@@ -5,28 +5,36 @@ This is not necessarily final state — it was migrated to eliminate
 compat stubs and may be refactored later.
 """
 
+import errno
 import logging
 import mimetypes
 import ntpath
 import os
 import secrets
 import stat
+import threading
 import time
+import unicodedata
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from cowork.api.v1.content_disposition import attachment_disposition
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.endpoints.connectors.sharepoint import (
+    _KEY_NO_LONGER_WORKS,
+    _granted_site,
+    _stored_connection,
+)
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
 from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
 from cowork.common.paths import (
@@ -36,6 +44,7 @@ from cowork.common.paths import (
     dir_mkdir,
     dir_open,
     dir_replace,
+    dir_rmdir,
     dir_rmtree,
     dir_scandir,
     dir_unlink,
@@ -64,7 +73,18 @@ from cowork.schemas.project_files import (
     ProjectInstructionsResponse,
 )
 from cowork.schemas.shared_resources import MutableResourceCapabilities
+from cowork.schemas.sharepoint import (
+    SharePointImportedFile,
+    SharePointImportResponse,
+    SharePointSkippedItem,
+)
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+from cowork.services.connectors.sharepoint import (
+    DownloadBudget,
+    SharePointClient,
+    SharePointError,
+    SharePointErrorKind,
+)
 from cowork.services.projects import ProjectService
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
@@ -867,17 +887,23 @@ def _opened_existing_project_entry(
 
 @contextmanager
 def _opened_pinned_descendant(
-    root: PinnedDir, names: tuple[str, ...], *, create: bool
+    root: PinnedDir,
+    names: tuple[str, ...],
+    *,
+    create: bool,
+    created: list[tuple[str, ...]] | None = None,
 ) -> Iterator[PinnedDir]:
     """Descend from an already-pinned project root without rebuilding its Path.
 
     Every component is reduced to a basename again beside the descriptor-based
     operation. POSIX resolves it with ``dir_fd`` and ``O_NOFOLLOW``; the local
-    Windows fallback receives the same single-component guarantee.
+    Windows fallback receives the same single-component guarantee. With
+    ``create``, each folder this call made is appended to ``created`` as its
+    path below ``root``, so a caller can remove what it added.
     """
     with ExitStack() as descendants:
         current = root
-        for raw_name in names:
+        for depth, raw_name in enumerate(names, start=1):
             name = os.path.basename(raw_name)
             if not name or name != raw_name or name in {".", ".."}:
                 raise ValueError("invalid path component")
@@ -886,9 +912,33 @@ def _opened_pinned_descendant(
                     dir_mkdir(current, name)
                 except FileExistsError:
                     pass
+                else:
+                    if created is not None:
+                        created.append(names[:depth])
             current = open_pinned_child(current, name)
             descendants.callback(current.close)
         yield current
+
+
+def _create_project_temp(parent: PinnedDir, prefix: str, mode: int) -> tuple[str, int]:
+    """Create a new, empty temporary entry in ``parent`` and open it for writing.
+
+    Returns the entry's name and a descriptor the caller closes. ``O_EXCL``
+    and ``O_NOFOLLOW`` make it a fresh file, never an existing one or a link.
+    """
+    temporary = f"{prefix}{secrets.token_hex(12)}.tmp"
+    fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
+    return temporary, fd
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``; a write that makes no progress is an error."""
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written == 0:
+            raise OSError("project file write made no progress")
+        remaining = remaining[written:]
 
 
 def _write_bytes_at_project_root(
@@ -912,19 +962,13 @@ def _write_bytes_at_project_root(
                 raise HTTPException(status_code=400, detail="Path is a directory")
         # Replacing the entry detaches any pre-existing hardlink. Truncating
         # its inode could edit protected artifact bytes through an ordinary name.
-        temporary = f".cowork-file-{secrets.token_hex(12)}.tmp"
         mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
-        fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
+        temporary, fd = _create_project_temp(parent, ".cowork-file-", mode)
         try:
             try:
                 if existing is not None and hasattr(os, "fchmod"):
                     os.fchmod(fd, mode)
-                remaining = memoryview(data)
-                while remaining:
-                    written = os.write(fd, remaining)
-                    if written == 0:
-                        raise OSError("project file write made no progress")
-                    remaining = remaining[written:]
+                _write_all(fd, data)
                 result = os.fstat(fd)
             finally:
                 os.close(fd)
@@ -936,6 +980,344 @@ def _write_bytes_at_project_root(
             except FileNotFoundError:
                 pass
 
+
+
+_IMPORT_PREFIX = ".cowork-import-"
+_IMPORT_MAX_DEPTH = 32
+_IMPORT_STALE_SECONDS = 60 * 60
+_IMPORT_TEMP_NAME_LENGTH = len(_IMPORT_PREFIX) + 24 + len(".tmp")
+_WINDOWS_MAX_PATH = 259
+_WINDOWS_MAX_FOLDER = 247
+_MOVE_TRIES = 3
+_MOVE_RETRY_SECONDS = 0.35
+
+
+class _ImportWriteError(Exception):
+    """An import could not change the project; ``path`` is relative to the project root."""
+
+    def __init__(self, message: str, path: str) -> None:
+        """Keep a user-safe message and the project-relative path it is about."""
+        super().__init__(message)
+        self.path = path
+
+
+class _ImportConflict(_ImportWriteError):
+    """A target can't be written as asked; found before any byte is written."""
+
+
+class _ImportFileInUse(_ImportWriteError):
+    """Windows refused to replace a file another program holds open."""
+
+
+class _ImportDiskError(_ImportWriteError):
+    """The project folder refused a write, a move or a folder."""
+
+
+class _ImportRestoreFailed(_ImportWriteError):
+    """A failed import could not put a file back; ``kept`` is where its old copy still is."""
+
+    def __init__(self, message: str, path: str, kept: str | None) -> None:
+        """Name the file that could not be restored and the old copy kept beside it."""
+        super().__init__(message, path)
+        self.kept = kept
+
+
+@dataclass
+class _ImportTarget:
+    parts: tuple[str, ...]
+    old_mode: int | None = None
+    temporary: str | None = None
+    backup: str | None = None
+    state: str = "untouched"
+
+    @property
+    def path(self) -> str:
+        """The target as a project-relative path."""
+        return "/".join(self.parts)
+
+    @property
+    def folder(self) -> str:
+        """The target's folder as a project-relative path, ``""`` for the root."""
+        return "/".join(self.parts[:-1])
+
+
+def _folded(name: str) -> str:
+    """A name as a case-insensitive, Unicode-normalising filesystem compares it."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _utf16_length(path: str) -> int:
+    """A path's length as Windows counts it."""
+    return len(path.encode("utf-16-le")) // 2
+
+
+class _ProjectImport:
+    """Write a set of files into a project so that all of them land or none do.
+
+    ``check`` refuses every conflict before a byte is written. ``stage`` writes
+    one file's bytes to a temporary entry beside its target. ``commit`` moves
+    each old copy to a backup and each temporary onto its target, and only
+    after all of them moved removes the backups. Leaving the ``with`` block
+    with an exception undoes everything: files walked back in reverse, every
+    temporary removed, folders this import created removed if empty. A backup
+    is kept whenever its file could not be put back.
+
+    An old copy is only ever an entry with exactly the target's name: a name
+    the filesystem matches by folding case or Unicode form is a conflict, so
+    no file is touched that the import was not asked to replace.
+    """
+
+    def __init__(
+        self,
+        root: PinnedDir,
+        targets: list[tuple[str, ...]],
+        *,
+        windows: bool = os.name == "nt",
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Hold the pinned project root and each target's path below it."""
+        self._root = root
+        self._targets = [_ImportTarget(tuple(parts)) for parts in targets]
+        self._windows = windows
+        self._clock = clock
+        self._sleep = sleep
+        self._created: list[tuple[str, ...]] = []
+        self._swept: set[tuple[str, ...]] = set()
+
+    def __enter__(self) -> "_ProjectImport":
+        """Start an import; leaving with an exception rolls it back."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: BaseException | None, _tb: object) -> bool:
+        """On an exception, undo everything; a file that could not be put back replaces the error."""
+        if exc is None:
+            return False
+        failure = self._roll_back()
+        if failure is not None:
+            raise failure
+        return False
+
+    def check(self) -> None:
+        """Refuse any target that can't be written as asked, before anything is written."""
+        files: set[tuple[str, ...]] = set()
+        folders: dict[tuple[str, ...], tuple[str, ...]] = {}
+        for target in self._targets:
+            if not target.parts or len(target.parts) > _IMPORT_MAX_DEPTH:
+                raise _ImportConflict(f"{target.path} is more than {_IMPORT_MAX_DEPTH} folders deep.", target.path)
+            key = tuple(_folded(part) for part in target.parts)
+            if key in files:
+                raise _ImportConflict(f"Two picked files would both be saved as {target.path}.", target.path)
+            files.add(key)
+            for depth in range(1, len(key)):
+                spelled = folders.setdefault(key[:depth], target.parts[:depth])
+                if spelled != target.parts[:depth]:
+                    raise _ImportConflict(
+                        f"{'/'.join(target.parts[:depth])} and {'/'.join(spelled)} would be one folder "
+                        "on some computers. Rename one of them.",
+                        target.path,
+                    )
+        for target in self._targets:
+            if tuple(_folded(part) for part in target.parts) in folders:
+                raise _ImportConflict(f"{target.path} would be both a file and a folder.", target.path)
+        if self._windows:
+            self._check_windows_lengths()
+        for target in self._targets:
+            try:
+                self._check_on_disk(target)
+            except OSError as exc:
+                raise _ImportDiskError(f"Couldn't read {target.path} in the project folder.", target.path) from exc
+
+    def stage(self, index: int, feed: Callable[[Callable[[bytes], None]], object]) -> None:
+        """Write one target's bytes to a new temporary entry beside it.
+
+        ``feed`` is called with a sink and pushes the file's bytes into it.
+        An ``OSError`` or ``ValueError``, from the disk or from ``feed``,
+        becomes a disk error; any other error from ``feed`` propagates.
+        """
+        target = self._targets[index]
+        try:
+            with _opened_pinned_descendant(
+                self._root, target.parts[:-1], create=True, created=self._created
+            ) as parent:
+                self._sweep(parent, target.parts[:-1])
+                mode = target.old_mode if target.old_mode is not None else 0o644
+                temporary, fd = _create_project_temp(parent, _IMPORT_PREFIX, mode)
+                target.temporary = temporary
+                try:
+                    if target.old_mode is not None and hasattr(os, "fchmod"):
+                        os.fchmod(fd, mode)
+                    feed(lambda chunk: _write_all(fd, chunk))
+                finally:
+                    os.close(fd)
+        except (OSError, ValueError) as exc:
+            raise _ImportDiskError(f"Couldn't write {target.path} to the project folder.", target.path) from exc
+
+    def commit(self) -> None:
+        """Move every staged file into place, then drop the backups of the files it replaced."""
+        for target in self._targets:
+            try:
+                with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                    name = target.parts[-1]
+                    if target.old_mode is not None:
+                        backup = f"{_IMPORT_PREFIX}{secrets.token_hex(12)}.bak"
+                        # A held old copy means the user has it open, so it is not retried.
+                        dir_replace(parent, name, backup)
+                        target.backup = backup
+                        target.state = "backed_up"
+                    self._retrying(lambda: dir_replace(parent, target.temporary, name))
+                    target.temporary = None
+                    target.state = "replaced"
+            except (OSError, ValueError) as exc:
+                if self._windows and isinstance(exc, PermissionError):
+                    raise _ImportFileInUse(
+                        f"{target.path} is open in another program. Close it and import again.", target.path
+                    ) from exc
+                raise _ImportDiskError(f"Couldn't move {target.path} into place.", target.path) from exc
+        for target in self._targets:
+            if target.backup is not None:
+                self._discard(target, target.backup)
+                target.backup = None
+
+    def _check_windows_lengths(self) -> None:
+        """Refuse a target whose path, temporary entry or new folder would pass Windows' limits."""
+        base = str(self._root.path)
+        for target in self._targets:
+            folder = os.path.join(base, *target.parts[:-1])
+            if (
+                _utf16_length(os.path.join(base, *target.parts)) > _WINDOWS_MAX_PATH
+                or _utf16_length(folder) + 1 + _IMPORT_TEMP_NAME_LENGTH > _WINDOWS_MAX_PATH
+                or any(
+                    _utf16_length(os.path.join(base, *target.parts[:depth])) > _WINDOWS_MAX_FOLDER
+                    for depth in range(1, len(target.parts))
+                )
+            ):
+                raise _ImportConflict(f"{target.path} would be too long a path for Windows.", target.path)
+
+    def _check_on_disk(self, target: _ImportTarget) -> None:
+        """Refuse links, folders and case or Unicode variants in the way; note an old copy's mode."""
+        with ExitStack() as opened:
+            current = self._root
+            for depth, name in enumerate(target.parts, start=1):
+                shown = "/".join(target.parts[:depth])
+                if not name or os.path.basename(name) != name or name in {".", ".."}:
+                    raise _ImportConflict(f"{shown} isn't a valid name.", target.path)
+                try:
+                    found = dir_lstat(current, name)
+                except FileNotFoundError:
+                    return
+                if stat.S_ISLNK(found.st_mode):
+                    raise _ImportConflict(f"{shown} is a link, so the import won't write through it.", target.path)
+                try:
+                    _existing_entry_name(current, name)
+                except FileNotFoundError:
+                    raise _ImportConflict(
+                        f"{shown} matches an existing name that differs only in case or accents. Rename one of them.",
+                        target.path,
+                    ) from None
+                if depth < len(target.parts):
+                    if not stat.S_ISDIR(found.st_mode):
+                        raise _ImportConflict(f"{shown} is a file, but the import needs a folder there.", target.path)
+                    current = open_pinned_child(current, name)
+                    opened.callback(current.close)
+                elif stat.S_ISDIR(found.st_mode):
+                    raise _ImportConflict(f"{shown} is a folder, so the file can't be saved there.", target.path)
+                elif not stat.S_ISREG(found.st_mode):
+                    raise _ImportConflict(f"{shown} isn't a regular file.", target.path)
+                else:
+                    target.old_mode = stat.S_IMODE(found.st_mode)
+
+    def _sweep(self, parent: PinnedDir, folder: tuple[str, ...]) -> None:
+        """Remove import temporaries a killed import left in this folder over an hour ago."""
+        if folder in self._swept:
+            return
+        self._swept.add(folder)
+        cutoff = self._clock() - _IMPORT_STALE_SECONDS
+        with dir_scandir(parent) as entries:
+            names = [e.name for e in entries if e.name.startswith(_IMPORT_PREFIX) and e.name.endswith(".tmp")]
+        for name in names:
+            try:
+                found = dir_lstat(parent, name)
+                if stat.S_ISREG(found.st_mode) and found.st_mtime < cutoff:
+                    dir_unlink(parent, name)
+            except OSError as exc:
+                logger.warning("Could not remove a stale import temporary in %r: %s", "/".join(folder), exc)
+
+    def _retrying(self, action: Callable[[], None]) -> None:
+        """Run a move or removal, retrying briefly on Windows where a scanner may hold the file."""
+        tries = _MOVE_TRIES if self._windows else 1
+        for attempt in range(tries):
+            try:
+                action()
+                return
+            except PermissionError:
+                if attempt == tries - 1:
+                    raise
+                self._sleep(_MOVE_RETRY_SECONDS)
+
+    def _discard(self, target: _ImportTarget, name: str) -> None:
+        """Remove a temporary or backup beside ``target``; a failure is logged, not raised."""
+        try:
+            with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                self._retrying(lambda: dir_unlink(parent, name))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            logger.warning("Import could not remove %r beside %r: %s", name, target.path, exc)
+
+    def _roll_back(self) -> _ImportRestoreFailed | None:
+        """Undo every target in reverse, then remove the folders this import made; return the first restore failure."""
+        failure: _ImportRestoreFailed | None = None
+        for target in reversed(self._targets):
+            failed = self._undo(target)
+            if failure is None:
+                failure = failed
+        for parts in sorted(self._created, key=len, reverse=True):
+            try:
+                with _opened_pinned_descendant(self._root, parts[:-1], create=False) as parent:
+                    dir_rmdir(parent, parts[-1])
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                    logger.warning("Import could not remove the folder %r it created: %s", "/".join(parts), exc)
+        return failure
+
+    def _undo(self, target: _ImportTarget) -> _ImportRestoreFailed | None:
+        """Put one target back as it was and remove its temporary; report a file that stays changed."""
+        name = target.parts[-1]
+        try:
+            if target.state != "untouched":
+                with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                    if target.backup is not None:
+                        backup = target.backup
+                        self._retrying(lambda: dir_replace(parent, backup, name))
+                        target.backup = None
+                    else:
+                        self._retrying(lambda: dir_unlink(parent, name))
+                    target.state = "untouched"
+        except (OSError, ValueError) as exc:
+            if target.backup is not None:
+                kept = "/".join((*target.parts[:-1], target.backup))
+                failure = _ImportRestoreFailed(
+                    f"The import failed and {target.path} couldn't be put back. "
+                    f"Its old copy was kept as {kept}.",
+                    target.path,
+                    kept,
+                )
+            else:
+                failure = _ImportRestoreFailed(
+                    f"The import failed and couldn't remove {target.path}, which it had added.",
+                    target.path,
+                    None,
+                )
+            failure.__cause__ = exc
+            return failure
+        finally:
+            if target.temporary is not None:
+                self._discard(target, target.temporary)
+                target.temporary = None
+        return None
 
 
 def _write_project_bytes(
@@ -1494,6 +1876,178 @@ async def upload_project_files(
                     {"name": safe_name, "ok": False, "error": "File write failed"}
                 )
     return {"results": results}
+
+
+_SHAREPOINT_IMPORT_FIELDS = frozenset({"connection", "site", "drive_id", "folder", "item_ids"})
+_RESERVED_IMPORT_FOLDERS = frozenset({CONVERSATIONS_DIRNAME, "skills"})
+_IMPORTS_RUNNING: set[UUID] = set()
+_IMPORTS_LOCK = threading.Lock()
+_SHAREPOINT_IMPORT_STATUS = {
+    SharePointErrorKind.INVALID: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.TENANT_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.APP_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.KEY_REJECTED: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.SITE_NOT_GRANTED: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.ITEM_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.THROTTLED: status.HTTP_429_TOO_MANY_REQUESTS,
+    SharePointErrorKind.UNREACHABLE: status.HTTP_502_BAD_GATEWAY,
+    SharePointErrorKind.TOO_MANY_FILES: status.HTTP_413_CONTENT_TOO_LARGE,
+    SharePointErrorKind.TOO_LARGE: status.HTTP_413_CONTENT_TOO_LARGE,
+    SharePointErrorKind.BAD_NAME: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    SharePointErrorKind.PLAN_TOO_SLOW: status.HTTP_504_GATEWAY_TIMEOUT,
+    SharePointErrorKind.IMPORT_TOO_SLOW: status.HTTP_504_GATEWAY_TIMEOUT,
+}
+_IMPORT_WRITE_STATUS: dict[type[_ImportWriteError], int] = {
+    _ImportConflict: status.HTTP_409_CONFLICT,
+    _ImportFileInUse: status.HTTP_409_CONFLICT,
+    _ImportDiskError: status.HTTP_507_INSUFFICIENT_STORAGE,
+    _ImportRestoreFailed: status.HTTP_500_INTERNAL_SERVER_ERROR,
+}
+
+
+@dataclass(frozen=True)
+class _SharePointImportRequest:
+    connection: str
+    site: str
+    drive_id: str
+    folder: str
+    item_ids: list[str]
+
+
+def _sharepoint_import_request(body: Any) -> _SharePointImportRequest:
+    """Validate the import body: exactly its fields, strings, and 1 to 100 distinct item ids.
+
+    Every refusal is a fixed message, never an echo of the body.
+    """
+    invalid = HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail="Send connection, site, drive_id, folder and item_ids (a list of 1 to 100 ids).",
+    )
+    if not isinstance(body, dict) or set(body) != _SHAREPOINT_IMPORT_FIELDS:
+        raise invalid
+    text = {name: body[name] for name in ("connection", "site", "drive_id", "folder")}
+    item_ids = body["item_ids"]
+    if not all(isinstance(value, str) for value in text.values()):
+        raise invalid
+    if not isinstance(item_ids, list) or not all(isinstance(value, str) for value in item_ids):
+        raise invalid
+    distinct = list(dict.fromkeys(item_ids))
+    if not 1 <= len(distinct) <= 100:
+        raise invalid
+    return _SharePointImportRequest(item_ids=distinct, **text)
+
+
+def _reserved_import_folder(name: str) -> bool:
+    """Whether a top-level project folder is Cowork's own and closed to imports."""
+    return name.casefold() in _RESERVED_IMPORT_FOLDERS
+
+
+def _import_folder_parts(folder: str, scoped: ScopedSession) -> tuple[str, ...]:
+    """The destination folder as path parts; ``""`` is the project root."""
+    if folder == "":
+        return ()
+    path = _validated_project_path(folder)
+    if any(part.startswith(".") for part in path.parts):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid path")
+    if _reserved_import_folder(path.parts[0]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This folder is reserved for Cowork.")
+    _require_workspace_path(path, scoped)
+    return path.parts
+
+
+def _detached_root(directory: PinnedDir) -> PinnedDir:
+    """A second handle on a pinned project root that outlives the inventory that opened it."""
+    if directory.fd is None:
+        return PinnedDir(None, directory.path)
+    return PinnedDir(os.dup(directory.fd), directory.path)
+
+
+def _sharepoint_import_error(exc: SharePointError) -> HTTPException:
+    """The import response for a SharePoint failure; a stored key that stopped working is one message."""
+    detail = str(exc)
+    if exc.kind in {
+        SharePointErrorKind.TENANT_NOT_FOUND,
+        SharePointErrorKind.APP_NOT_FOUND,
+        SharePointErrorKind.KEY_REJECTED,
+    }:
+        detail = _KEY_NO_LONGER_WORKS
+    return HTTPException(status_code=_SHAREPOINT_IMPORT_STATUS[exc.kind], detail=detail)
+
+
+@contextmanager
+def _project_import_lock(project_id: UUID) -> Iterator[None]:
+    """Let one import at a time run into a project; a second one is refused, not queued."""
+    with _IMPORTS_LOCK:
+        if project_id in _IMPORTS_RUNNING:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Another import into this project is still running.",
+            )
+        _IMPORTS_RUNNING.add(project_id)
+    try:
+        yield
+    finally:
+        with _IMPORTS_LOCK:
+            _IMPORTS_RUNNING.discard(project_id)
+
+
+@router.post(
+    "/{project_name}/files/import/sharepoint",
+    dependencies=[Depends(require(DesktopOnly))],
+    response_model=SharePointImportResponse,
+)
+def import_sharepoint_files(
+    project_name: str,
+    body: Annotated[Any, Body()],
+    scoped: ScopedSessionDep,
+) -> SharePointImportResponse:
+    """Copy picked files and folders from a SharePoint site into a project.
+
+    Every check that needs the database runs first, then the session is
+    closed: the walk and the downloads can take minutes. Files land together
+    or not at all (``_ProjectImport``). Desktop only.
+    """
+    request = _sharepoint_import_request(body)
+    key, sites = _stored_connection(scoped.scope, request.connection)
+    site_url = _granted_site(request.site, sites)
+    folder = _import_folder_parts(request.folder, scoped)
+    project = _project_for_name(project_name, scoped)
+    with _project_import_lock(project.id), ExitStack() as held:
+        with _opened_selected_project_directory(project_name, scoped) as directory:
+            root = _detached_root(directory)
+        held.callback(root.close)
+        scoped.close()
+        try:
+            with SharePointClient(key) as client:
+                deadline = client.import_deadline()
+                plan = client.plan_import(site_url, request.drive_id, request.item_ids)
+                if not folder and any(_reserved_import_folder(f.parts[0]) for f in plan.files):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST, detail="This folder is reserved for Cowork."
+                    )
+                budget = DownloadBudget()
+                sizes: list[int] = []
+                with _ProjectImport(root, [(*folder, *f.parts) for f in plan.files]) as writer:
+                    writer.check()
+                    for index, planned in enumerate(plan.files):
+                        writer.stage(
+                            index,
+                            lambda sink, item_id=planned.item_id: sizes.append(
+                                client.download(plan.site, plan.drive_id, item_id, sink, budget, deadline)
+                            ),
+                        )
+                    writer.commit()
+        except SharePointError as exc:
+            raise _sharepoint_import_error(exc) from exc
+        except _ImportWriteError as exc:
+            raise HTTPException(status_code=_IMPORT_WRITE_STATUS[type(exc)], detail=str(exc)) from exc
+    return SharePointImportResponse(
+        imported=[
+            SharePointImportedFile(path="/".join((*folder, *planned.parts)), size=size)
+            for planned, size in zip(plan.files, sizes, strict=True)
+        ],
+        skipped=[SharePointSkippedItem(path=item.path, reason=item.reason) for item in plan.skipped],
+    )
 
 
 @router.delete(

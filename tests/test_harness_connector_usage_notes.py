@@ -116,6 +116,31 @@ async def test_usage_notes_reach_the_session_config(monkeypatch, tmp_path):
         assert "corpora" not in suffix   # ...without the moved Drive API rules
 
 
+async def test_a_custom_connectors_notes_reach_the_session_config(monkeypatch, tmp_path):
+    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.models.custom_connector import CustomConnector
+
+    with get_open_session() as db:
+        row = ScopedSession(db, LOCAL_SCOPE).add(CustomConnector(
+            connector_id="usage_notes_api", label="Usage notes API", spec={"form_id": "x", "fields": []},
+            usage_notes="Page with ?cursor=.",
+        ))
+        db.commit()
+        row_id = row.id
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("usage_notes_api", "main", {"token": "t"})
+
+    try:
+        async with _session_config(monkeypatch, vault) as config:
+            assert config.connector_usage_notes == {"usage_notes_api": "Page with ?cursor=."}
+    finally:
+        with get_open_session() as db:
+            db.delete(db.get(CustomConnector, row_id))
+            db.commit()
+
+
 async def test_drive_notes_reach_the_session_config_without_picked_files(monkeypatch, tmp_path):
     async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
         assert "corpora='allDrives'" in config.connector_usage_notes["google_drive"]
