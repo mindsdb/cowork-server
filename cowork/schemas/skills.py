@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 
@@ -19,10 +20,32 @@ class SkillCreateRequest(CamelRequest):
 
 
 class SkillSharingRequest(CamelRequest):
-    """Share one of the caller's own skills with everyone, read-only, or
-    stop sharing it."""
+    """Who one skill is shared with.
 
-    shared: bool
+    Hosted org mode (ENG-3787) reads ``org``, ``team_ids`` and ``emails``; a
+    field left out keeps what the skill has. Elsewhere, where a person shares
+    their own skills one at a time, ``shared`` shares one with everyone,
+    read-only, or stops sharing it.
+    """
+
+    shared: bool | None = None
+    org: bool | None = None
+    team_ids: list[str] | None = None
+    emails: list[str] | None = None
+
+
+class SkillSharingView(CamelResponse):
+    """Who a skill is shared with in hosted org mode. All empty elsewhere.
+    ``emails`` is listed only to whoever may change it (owner or admin)."""
+
+    org: bool = False
+    team_ids: list[str] = Field(default_factory=list)
+    emails: list[str] = Field(default_factory=list)
+
+
+class SkillOwner(CamelResponse):
+    id: str | None = None
+    email: str | None = None
 
 
 class SkillUpdateRequest(CamelRequest):
@@ -55,6 +78,15 @@ class SkillResponse(CamelResponse):
     # left shared, also one someone else created, read-only for the caller.
     shared: bool = False
     capabilities: SkillCapabilities
+    # Hosted org sharing (ENG-3787). Outside it: section "mine" (managed
+    # skills "org"), can_edit as capabilities.can_edit, sharing all empty.
+    sharing: SkillSharingView = Field(default_factory=SkillSharingView)
+    # The skills page's bucket for the caller: "mine" (they created it), else
+    # "org" (org-wide), else "team" (one of their teams), else
+    # "shared_with_me" (their email).
+    section: Literal["mine", "shared_with_me", "team", "org"] = "mine"
+    can_edit: bool = False
+    owner: SkillOwner = Field(default_factory=SkillOwner)
 
 
 class SkillListResponse(CamelResponse):
@@ -62,3 +94,13 @@ class SkillListResponse(CamelResponse):
     # Whether the caller may share their own skills here, one at a time:
     # what asks "who can use it" when a skill is created, before any exists.
     can_share: bool = False
+
+
+class SkillSharingCapabilities(CamelResponse):
+    """What the caller may do with skill sharing. ``enabled`` is hosted org
+    mode; an admin holds both capabilities."""
+
+    enabled: bool = False
+    can_share_org: bool = False
+    can_write_org: bool = False
+    org_name: str | None = None

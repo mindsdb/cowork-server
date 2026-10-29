@@ -886,12 +886,14 @@ async def test_a_cancel_during_a_memory_save_waits_for_it_then_saves_the_turn(mo
 
 
 def _no_workspace_or_memory_units(monkeypatch):
-    """Staging, the project memory read and the workspace lookups do nothing.
+    """Staging, the project memory read, the workspace lookups and the skills
+    block do nothing.
     The fake unit session cannot run them, and each would log an error."""
     monkeypatch.setattr(ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id, *, workspace: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_skills", lambda self, session, conv_id: None)
 
 
 @pytest.mark.asyncio

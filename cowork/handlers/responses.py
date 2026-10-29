@@ -536,6 +536,8 @@ class _RemoteTurnInputs:
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
     files: AgentFiles | None
+    # The skills the caller sees, for the pod's request (_remote_skills).
+    skills: dict | None = None
 
 
 @dataclass
@@ -640,9 +642,23 @@ def _start_first_take(
 
 
 class ResponsesHandler:
-    def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        principal: Principal | None = None,
+        interactive: bool = True,
+        hub_bearer: str = "",
+    ) -> None:
         self.principal = principal
         self.scope = scope_from_principal(principal)
+        # The caller's own MindsHub credential (cowork.principal.hub_credential),
+        # used only to read their teams for skill sharing. Empty for a turn
+        # with no caller present, such as a scheduled one: that turn gets the
+        # fail-closed set, without skills shared only with a team.
+        self.hub_bearer = hub_bearer
+        # Hosted org skill sharing's view of the caller, resolved once per
+        # remote turn before its inputs are read (_remote_skills).
+        self._skill_viewer = None
         # The harness this turn runs: the request's own pick or the stored
         # setting, resolved by handle() from the settings its first unit reads.
         # Anton itself is built lazily, only after Cowork delegates a turn:
@@ -1537,6 +1553,20 @@ class ResponsesHandler:
             first_take=first_take,
         )
 
+    async def _resolve_skill_viewer(self, scope) -> None:
+        """Hosted org skill sharing's view of the caller, for this turn's
+        skills. Never fails the turn: a failure leaves the fail-closed view
+        (build_turn_skills)."""
+        from cowork.services.skill_sharing import resolve_skill_viewer
+
+        try:
+            self._skill_viewer = await resolve_skill_viewer(
+                scope=scope, principal=self.principal, bearer_token=getattr(self, "hub_bearer", "")
+            )
+        except Exception:
+            logger.warning("[responses] could not resolve the caller's teams for skills", exc_info=True)
+            self._skill_viewer = None
+
     @staticmethod
     def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
         """Stage the project-level files the pod can't otherwise see — the
@@ -1786,7 +1816,34 @@ class ResponsesHandler:
             workspace=workspace,
             started_at=self._remote_started_at(session, conv_id),
             files=self._remote_agent_files(session, conv_id, workspace=workspace),
+            skills=self._remote_skills(session, conv_id),
         )
+
+    def _remote_skills(self, session: ScopedSession, conv_id: UUID) -> dict | None:
+        """The skills block for the pod's request, in hosted org mode: only
+        the skills the caller sees, the always-on ones flagged and first
+        (build_turn_skills). The pod renders the always-on ones into its
+        prompt from this block alone, and today still reads the rest off the
+        org skills mount, which holds every member's skills; see
+        build_turn_skills.
+
+        None outside org mode, and on a failure, which runs the turn without
+        a skills block rather than failing it.
+        """
+        if not getattr(getattr(session, "scope", None), "org_mode", False):
+            return None
+        from cowork.services.skills import build_turn_skills
+
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            return build_turn_skills(
+                session.scope,
+                project_name=conversation.project.name,
+                viewer=getattr(self, "_skill_viewer", None),
+            )
+        except Exception:
+            logger.exception("[responses] failed to build the turn's skills", extra=log_context(conversation_id=conv_id))
+            return None
 
     @staticmethod
     def _remote_seed_history(session, conv_id) -> tuple[list[dict], dict | None]:
@@ -2227,6 +2284,9 @@ class ResponsesHandler:
             # compaction against exactly the history seeded here, so
             # re-reading it when the reply arrives could map the count onto a
             # different list.
+            # The caller's teams and permissions, read from auth (cached per
+            # caller) before the seed, which selects the skills they see.
+            await self._resolve_skill_viewer(scope)
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
@@ -2263,6 +2323,7 @@ class ResponsesHandler:
                 # memory is outside the conversation workspace and therefore
                 # travels as a bounded, sheddable wire block.
                 memory=seed.memory,
+                skills=seed.skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,

@@ -574,6 +574,34 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
+def _team_audience(access: dict | None, previous: Any) -> list[str]:
+    """The teams a restricted publish shares with (ENG-3787): the request's
+    when it names them, else the previous publish's, so an access change from
+    a client that predates teams keeps them."""
+    if isinstance(access, dict) and "team_ids" in access:
+        return [str(t) for t in access.get("team_ids") or []]
+    prev = previous if isinstance(previous, dict) and previous.get("mode") == "restricted" else {}
+    return [str(t) for t in prev.get("team_ids") or []]
+
+
+def _with_team_audience(access: dict | None, team_ids: list[str]) -> dict | None:
+    """``access`` as anton's publisher reads it, which knows no teams.
+
+    ``org_wide`` is another name for ``org_allowed``, auth's "everyone in the
+    owner's organization": either one sets it, so the two never disagree. A
+    selection of teams alone is owner-only there, so the lambda writes a
+    restricted rule that sync_artifact_team_access then widens to the teams.
+    """
+    if not isinstance(access, dict) or access.get("mode") != "restricted":
+        return access
+    out = {k: v for k, v in access.items() if k not in ("team_ids", "org_wide")}
+    if access.get("org_wide"):
+        out["org_allowed"] = True
+    if team_ids and not out.get("emails") and not out.get("org_allowed"):
+        out["owner_only"] = True
+    return out
+
+
 def publish_artifact(
     artifact: Path,
     *,
@@ -654,7 +682,24 @@ def publish_artifact(
         # Resolve the effective access (mode + version) from the request and the
         # prior publish. Versions bump only when the password / restricted list
         # changed so previously issued viewer grants invalidate.
-        effective_access, pwd_version, access_version, owner_side = _resolve_access(password, access, previous)
+        # Teams and org-wide (ENG-3787) are org mode's alone; anton's
+        # publisher never sees them (_with_team_audience).
+        team_ids = _team_audience(access, previous) if scope is not None and scope.org_mode else []
+        prev_restricted = isinstance(previous, dict) and previous.get("mode") == "restricted"
+        prev_team_ids = list(previous.get("team_ids") or []) if prev_restricted else []
+        effective_access, pwd_version, access_version, owner_side = _resolve_access(
+            password, _with_team_audience(access, team_ids), previous
+        )
+        # Written to auth after the publish (_sync_team_audience) whenever a
+        # restricted rule has teams or just lost them.
+        team_audience = owner_side.get("mode") == "restricted" and bool(team_ids or prev_team_ids)
+        if team_audience:
+            if team_ids != prev_team_ids and prev_restricted:
+                # A changed audience invalidates the viewer grants already
+                # issued, as a changed email list does.
+                prev_version = previous.get("access_version", 0) or 0
+                access_version = max(access_version, prev_version + 1)
+            owner_side.update(team_ids=team_ids, access_version=access_version)
 
         # One identity spans private drafts, published versions, and comments. A
         # legacy loose file has no metadata and keeps the service-generated key.
@@ -792,6 +837,10 @@ def publish_artifact(
                 entry["password_hash"] = password_hash
             published_map[published_key] = entry
             _write_published_map(published_json, published_map)
+            if team_audience:
+                _sync_team_audience(
+                    artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
+                )
             state = _load_state(scope=scope)
             state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
             _save_state(state, scope=scope)
@@ -811,10 +860,33 @@ def publish_artifact(
             "accessEmails": owner_side.get("emails", []),
             "orgAllowed": bool(owner_side.get("org_allowed")),
             "ownerOnly": bool(owner_side.get("owner_only")),
+            "allowedTeamIds": list(owner_side.get("team_ids") or []),
+            # org_wide is org_allowed under its auth name (_with_team_audience).
+            "orgWide": bool(owner_side.get("org_allowed")),
             # The renderer addresses comment requests by this key.
             "artifactKey": response_key,
             "result": {k: v for k, v in result.items() if k != "file_payload"},
         }
+
+
+def _sync_team_audience(*, artifact_id: str, scope: TenantScope, owner_side: dict) -> None:
+    """Write the restricted rule's teams and org-wide flag to auth, after the
+    lambda wrote the rest of it (sync_artifact_team_access)."""
+    from cowork.services.artifact_access import ArtifactAccessUnavailable, sync_artifact_team_access
+    from cowork.services.artifact_autopublish import _active_workspace_id
+
+    if not artifact_id:
+        raise ArtifactAccessUnavailable("The artifact has no identity to share with teams")
+    sync_artifact_team_access(
+        artifact_id=artifact_id,
+        scope=scope,
+        owner_user_id=str(scope.user_id or ""),
+        workspace_id=_active_workspace_id(scope),
+        allowed_emails=list(owner_side.get("emails") or []),
+        org_allowed=bool(owner_side.get("org_allowed")),
+        team_ids=list(owner_side.get("team_ids") or []),
+        access_version=int(owner_side.get("access_version") or 1),
+    )
 
 
 def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
@@ -978,7 +1050,10 @@ def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
     entry = published_map.get(published_key)
     if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
         raise FileNotFoundError("No published version to update")
-    return access_from_owner_side(entry)
+    access = access_from_owner_side(entry)
+    if access.get("mode") == "restricted" and entry.get("team_ids"):
+        access["team_ids"] = list(entry["team_ids"])
+    return access
 
 
 def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:

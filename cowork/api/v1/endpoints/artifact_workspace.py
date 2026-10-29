@@ -802,10 +802,53 @@ class _AccessBody(BaseModel):
     schema (`{"mode": "public"}`, `{"mode": "password", "password": ...}`,
     `{"mode": "restricted", "emails": [...], "org_allowed": bool,
     "owner_only": bool}`) and validates it, so a second definition here could
-    only drift away from it.
+    only drift away from it. Restricted access in hosted org mode also takes
+    `team_ids` and `org_wide` (ENG-3787), which this server writes to auth
+    itself (cowork.services.publish._sync_team_audience).
     """
 
     access: dict
+
+
+async def _checked_team_audience(access: dict, *, request: Request, session) -> dict:
+    """``access`` with its ``team_ids`` normalized and each one checked to be a
+    team the caller belongs to (an org admin may name any). 503 while auth
+    can't list the caller's teams, 400 for one they aren't in. Outside hosted
+    org mode both team fields are dropped: there are no teams there."""
+    from cowork.principal import can_manage_org, get_principal, hub_credential
+    from cowork.services.hub_teams import fetch_hub_teams
+    from cowork.services.skill_sharing import normalize_team_ids
+
+    if not session.scope.org_mode:
+        return {k: v for k, v in access.items() if k not in ("team_ids", "org_wide")}
+    if "team_ids" not in access:
+        return access
+    raw = access.get("team_ids") or []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="team_ids must be a list.")
+    try:
+        team_ids = list(normalize_team_ids(raw))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    principal = get_principal(request)
+    if team_ids and not can_manage_org(principal):
+        listing = await fetch_hub_teams(
+            bearer_token=hub_credential(request),
+            org_id=session.scope.org_id or "",
+            user_id=session.scope.user_id or "",
+        )
+        if not listing.reachable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Couldn't reach MindsHub to confirm your teams. Try again in a moment.",
+            )
+        foreign = [t for t in team_ids if t not in listing.team_ids]
+        if foreign:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"You can only share with teams you belong to: {', '.join(foreign)}.",
+            )
+    return {**access, "team_ids": team_ids}
 
 
 def _owner_publish_context(session, folder: Path):
@@ -870,6 +913,7 @@ async def set_artifact_access(
     artifact_id: ArtifactIdDep,
     body: _AccessBody,
     session: ScopedSessionDep,
+    request: Request = None,
 ):
     """Re-publish this artifact with a new audience. Owner-only.
 
@@ -889,6 +933,7 @@ async def set_artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
+    access = await _checked_team_audience(dict(body.access or {}), request=request, session=session)
     if not await _acquire_live_publish_lock(folder):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -916,7 +961,7 @@ async def set_artifact_access(
                     artifacts_base=artifacts_base,
                     api_key=api_key,
                     publish_url=publish_url,
-                    access=dict(body.access or {}),
+                    access=access,
                     scope=session.scope,
                     project_id=source.project_id,
                 ),

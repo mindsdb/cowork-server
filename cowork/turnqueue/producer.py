@@ -127,6 +127,19 @@ def _fit_request(params: dict, conversation_id: str) -> dict:
             budget,
         )
         size = _request_wire_size(params)
+    skills = params.get("skills")
+    if size > budget and isinstance(skills, dict):
+        # Then the skills recalled on demand, which the pod can still read off
+        # its skills mount, and only then the always-on ones.
+        kept = {slug: entry for slug, entry in skills.items() if isinstance(entry, dict) and entry.get("always_on")}
+        params["skills"] = kept
+        if not kept or _request_wire_size(params) > budget:
+            params.pop("skills")
+        logger.warning(
+            "[producer] shed skills from turn %s: request line was %d bytes, over the %d-byte cap",
+            conversation_id, size, budget,
+        )
+        size = _request_wire_size(params)
     if size > budget:
         logger.warning(
             "[producer] turn %s request line is %d bytes, over the %d-byte cap; "
@@ -515,6 +528,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
                                 memory: dict | None = None,
+                                skills: dict | None = None,
                                 workspace: RemoteWorkspace | None = None,
                                 correlation_id: str | None = None,
                                 run_id: str | None = None,
@@ -536,7 +550,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
     `workspace` is the project the turn runs in; None runs it in the org's
-    default project with no project on the job."""
+    default project with no project on the job.
+    `skills` is the caller's visible skills, `{slug: {"files": {...}}}` with
+    `"always_on": true` on the ones the pod puts in its prompt every turn
+    (cowork.services.skills.build_turn_skills); absent when None or empty."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -641,6 +658,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
               **({"memory": memory_block} if memory_block else {}),
+              # Hosted org skill sharing (ENG-3787): only what the caller sees.
+              # A pod with the org skills mount still recalls from the mount,
+              # but reads which skills are always-on from here alone; an older
+              # pod ignores the flag.
+              **({"skills": skills} if skills else {}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),

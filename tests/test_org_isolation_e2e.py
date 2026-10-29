@@ -226,14 +226,17 @@ def test_shared_resource_authorization_and_contract_through_http(client):
     skill = skill_created.json()
     assert skill["attribution"]["createdBy"]["userId"] == USER_A
     assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable", "canShare"}
-    # Hosted org tenancy shares no skill one at a time.
-    assert skill["capabilities"]["canShare"] is False
+    # Hosted org sharing (ENG-3787): the owner chooses who a new skill reaches,
+    # and it starts as theirs alone.
+    assert skill["capabilities"]["canShare"] is True
+    assert (skill["section"], skill["sharing"]["org"]) == ("mine", False)
     denied = client.put(
         f"/api/v1/skills/{skill['id']}",
         json={"instructions": "Peer overwrite"},
         headers=A_PEER,
     )
-    assert denied.status_code == 403, denied.text
+    # A new skill is its creator's alone, so a peer doesn't find it at all.
+    assert denied.status_code == 404, denied.text
     skill_updated = client.put(
         f"/api/v1/skills/{skill['id']}",
         json={"enabled": False},

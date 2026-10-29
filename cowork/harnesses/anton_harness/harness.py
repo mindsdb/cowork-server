@@ -65,7 +65,13 @@ from cowork.services.live_apps import (
 )
 from cowork.services.projects import display_label
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
-from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
+from cowork.services.always_on_skills import render_always_on_skills
+from cowork.services.skills import (
+    always_on_prompt_skills,
+    artifact_skill_dirs,
+    link_turn_skills,
+    reads_shared_skills,
+)
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -1833,6 +1839,15 @@ class AntonHarness:
                 *artifact_skill_dirs(scope=turn_scope, project_name=conversation.project.name),
             ]
             read_only_dirs += anton_settings.skills_extra_roots
+            # Org-wide and team skills, applied on every task: hosted org mode
+            # only, so "" on the desktop and every local deployment. This path
+            # has no caller credential to read teams with, so it gets the
+            # fail-closed set (org-wide only), as a pod turn without one does.
+            always_on_context = render_always_on_skills(
+                always_on_prompt_skills(
+                    scope=turn_scope, project_name=conversation.project.name, viewer=None
+                )
+            )
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
             # None with the sandbox off, and then not passed at all. Built in a
             # worker thread: it lists every person's partition and opens the
@@ -1872,6 +1887,10 @@ class AntonHarness:
                     runtime_context=build_runtime_context(anton_settings),
                     suffix=(
                         _turn_style_context(channel_context)
+                        # Next to the project instructions, the suffix's most
+                        # stable part: org skills change rarely, so the
+                        # cached prompt prefix survives from turn to turn.
+                        + always_on_context
                         + f"{project_context}"
                         + f"{output_context}"
                         + f"{skill_output_context}"

@@ -703,3 +703,49 @@ def test_org_publish_reports_the_lambda_echo_when_it_differs(
         project_id=str(project.id),
     )
     assert result["artifactKey"] == echoed
+
+
+def test_a_team_audience_is_published_owner_only_and_widened_in_auth(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """ENG-3787: anton's publisher knows no teams, so a restricted publish to
+    teams alone reaches it owner-only, and cowork then upserts the same rule
+    with ``team_ids`` and ``org_wide`` (equal to ``org_allowed``). A republish
+    keeps the teams at the same version; changing them bumps it."""
+    from cowork.services.publish import published_artifact_access
+
+    _session, project, _conversation, folder = owned_artifact
+    uploads = []
+
+    def publish(_source, **kwargs):
+        uploads.append(kwargs)
+        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.test/1"}
+
+    monkeypatch.setattr("anton.publisher.publish", publish)
+    monkeypatch.setattr("cowork.services.artifact_autopublish._active_workspace_id", lambda scope: None)
+
+    def run(access):
+        return publish_artifact(
+            folder, artifacts_base=folder.parent, api_key="key", publish_url="https://view.test",
+            scope=scope, project_id=str(project.id), access=access,
+        )
+
+    result = run({"mode": "restricted", "emails": [], "org_allowed": False, "team_ids": ["team-eng"]})
+    assert uploads[-1]["access"] == {"mode": "restricted", "emails": [], "org_allowed": False}
+    path, body = issuer.calls[-1]
+    assert path == "/v1/internal/artifact-access/"
+    assert (body["team_ids"], body["org_allowed"], body["org_wide"]) == (["team-eng"], False, False)
+    assert body["artifact_id"] == result["artifactKey"]
+    first_version = body["access_version"]
+    assert (result["allowedTeamIds"], result["orgWide"]) == (["team-eng"], False)
+    entry = json.loads((folder / ".published.json").read_text())["index.html"]
+    assert entry["team_ids"] == ["team-eng"]
+
+    run(published_artifact_access(folder, artifacts_base=folder.parent))
+    assert issuer.calls[-1][1]["team_ids"] == ["team-eng"]
+    assert issuer.calls[-1][1]["access_version"] == first_version
+
+    run({"mode": "restricted", "emails": [], "org_allowed": True, "org_wide": True, "team_ids": ["team-ops"]})
+    body = issuer.calls[-1][1]
+    assert (body["team_ids"], body["org_allowed"], body["org_wide"]) == (["team-ops"], True, True)
+    assert body["access_version"] > first_version

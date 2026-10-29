@@ -679,6 +679,9 @@ def _published_access_for(
         "accessEmails": [],
         "orgAllowed": False,
         "ownerOnly": False,
+        # Hosted org team sharing (ENG-3787), restricted mode only.
+        "allowedTeamIds": [],
+        "orgWide": False,
         # Composite comments scope {user_dir}/{report_id} (Plan 5); "" when
         # unpublished or published before the key was persisted.
         "artifactKey": "",
@@ -704,6 +707,9 @@ def _published_access_for(
                 out["accessEmails"] = entry.get("emails", []) or []
                 out["orgAllowed"] = bool(entry.get("org_allowed"))
                 out["ownerOnly"] = bool(entry.get("owner_only"))
+                out["allowedTeamIds"] = list(entry.get("team_ids") or [])
+                # org_wide is org_allowed under auth's new name.
+                out["orgWide"] = out["orgAllowed"]
     except Exception:
         pass
     return out
