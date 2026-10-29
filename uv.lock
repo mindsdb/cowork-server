@@ -141,8 +141,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.10.26.2rc4.dev3+g61a97574a"
-source = { git = "https://github.com/mindsdb/anton.git?rev=61a97574a5a9d2c7e52ffea9fd3df6a8ef724362#61a97574a5a9d2c7e52ffea9fd3df6a8ef724362" }
+version = "2.26.10.29.1rc4"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
     { name = "anyio" },
@@ -162,6 +162,10 @@ dependencies = [
     { name = "structlog" },
     { name = "truststore" },
     { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/73/0d/69e818c8105a3bb1ed5721e2c3754efb64230971cfe506dd153365cdb10b/anton_agent-2.26.10.29.1rc4.tar.gz", hash = "sha256:d61ccd1e1f924707391e57f8b89fc7d65dfbead2cb091185e08e617b321428d0", size = 3883904, upload-time = "2026-10-29T17:06:43.313Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/65/d5455a0f7292617cdb0b3e3d5e09e6e23400b0bfbd28861fc7adb3f479bd/anton_agent-2.26.10.29.1rc4-py3-none-any.whl", hash = "sha256:6b3d00d62579bfa27fc0d1b0b8f9a50d5b547c5859b2d33e6712bd607b525901", size = 1341513, upload-time = "2026-10-29T17:06:40.885Z" },
 ]
 
 [[package]]
@@ -452,7 +456,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?rev=61a97574a5a9d2c7e52ffea9fd3df6a8ef724362" },
+    { name = "anton-agent", specifier = ">=2.26.10.29.1rc4,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },
