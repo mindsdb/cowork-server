@@ -21,6 +21,11 @@ member saw before. Built-in and managed skills stay visible to everyone and
 read-only. Outside hosted org mode none of this applies: no viewer is built
 (resolve_skill_viewer) and the store behaves as it always has.
 
+The org's default team (auth's ``is_default``) has the whole organization
+as its members, so it IS org-wide: a share naming it is stored as
+``share_org`` (and takes ``skills.share_org``), and a skill that already
+lists it in ``share_teams`` reads as org-wide (SkillViewer.sharing_of).
+
 Teams come from auth per caller (cowork.services.hub_teams). When auth can't
 be asked, the caller is in no team: they see their own, org-wide and
 email-shared skills, never one shared only with a team. That fails closed.
@@ -93,6 +98,17 @@ class SkillSharing:
             always_on=(metadata.get(META_ALWAYS_ON) or "").strip().lower() == "true",
         )
 
+    def with_default_team_as_org(self, default_team_id: str) -> SkillSharing:
+        """The org's default team named among ``team_ids`` means org-wide:
+        drop it from the teams and set ``org``."""
+        if not default_team_id or default_team_id not in self.team_ids:
+            return self
+        return replace(
+            self,
+            org=True,
+            team_ids=tuple(t for t in self.team_ids if t != default_team_id),
+        )
+
     def apply(self, metadata: dict[str, str]) -> None:
         """Write this sharing into ``metadata``. ``share_org`` is always
         written, so the skill never reads as legacy org-wide again.
@@ -159,6 +175,12 @@ class SkillViewer:
     # Both already true for an admin.
     can_share_org: bool = False
     can_write_org: bool = False
+    # The org's default team (whole-org membership), when auth named one.
+    default_team_id: str = ""
+
+    def sharing_of(self, skill: Skill) -> SkillSharing:
+        """``skill``'s sharing, with the org's default team read as org-wide."""
+        return SkillSharing.of(skill).with_default_team_as_org(self.default_team_id)
 
     def owns(self, owner_id: str | None) -> bool:
         return bool(owner_id and self.user_id and owner_id == self.user_id)
@@ -169,7 +191,7 @@ class SkillViewer:
     def sees(self, skill: Skill) -> bool:
         """Owner, org-wide, one of the caller's teams, or the caller's email;
         an admin sees every skill."""
-        sharing = SkillSharing.of(skill)
+        sharing = self.sharing_of(skill)
         return (
             self.is_admin
             or self.owns(skill.created_by)
@@ -190,7 +212,7 @@ class SkillViewer:
         skill shared with their team; people-shared recipients read only."""
         if self.is_admin:
             return True
-        sharing = SkillSharing.of(skill)
+        sharing = self.sharing_of(skill)
         if sharing.org:
             return self.can_write_org
         return self.owns(owner_id) or self.in_team_of(sharing)
@@ -204,7 +226,7 @@ class SkillViewer:
         """The bucket the skills page lists ``skill`` under for this caller."""
         if self.owns(owner_id):
             return "mine"
-        sharing = SkillSharing.of(skill)
+        sharing = self.sharing_of(skill)
         if sharing.org:
             return "org"
         if self.in_team_of(sharing):
@@ -247,4 +269,5 @@ async def resolve_skill_viewer(
         is_admin=is_admin,
         can_share_org=is_admin or SKILLS_SHARE_ORG in permissions.permissions,
         can_write_org=is_admin or SKILLS_WRITE_ORG in permissions.permissions,
+        default_team_id=teams.default_team_id,
     )

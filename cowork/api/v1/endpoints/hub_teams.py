@@ -33,5 +33,8 @@ async def get_hub_teams(request: Request, scope: ScopeDep) -> HubTeamsView:
     )
     return HubTeamsView(
         reachable=listing.reachable,
-        teams=[HubTeamRow(id=team.id, display_name=team.display_name) for team in listing.teams],
+        teams=[
+            HubTeamRow(id=team.id, display_name=team.display_name, is_default=team.is_default)
+            for team in listing.teams
+        ],
     )

@@ -58,6 +58,12 @@ class HubTeamListing(BaseModel):
     def team_ids(self) -> frozenset[str]:
         return frozenset(team.id for team in self.teams)
 
+    @property
+    def default_team_id(self) -> str:
+        """The org's default team, whose members are the whole organization:
+        sharing with it is sharing org-wide. Empty when auth named none."""
+        return next((team.id for team in self.teams if team.is_default), "")
+
 
 class HubPermissions(BaseModel):
     """The caller's resolved permissions in the active organization."""

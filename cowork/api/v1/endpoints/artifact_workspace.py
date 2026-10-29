@@ -813,7 +813,9 @@ class _AccessBody(BaseModel):
 async def _checked_team_audience(access: dict, *, request: Request, session) -> dict:
     """``access`` with its ``team_ids`` normalized and each one checked to be a
     team the caller belongs to (an org admin may name any). 503 while auth
-    can't list the caller's teams, 400 for one they aren't in. Outside hosted
+    can't list the caller's teams, 400 for one they aren't in. The org's
+    default team is dropped from ``team_ids`` and sets ``org_wide``: its
+    members are the whole organization. Outside hosted
     org mode both team fields are dropped: there are no teams there."""
     from cowork.principal import can_manage_org, get_principal, hub_credential
     from cowork.services.hub_teams import fetch_hub_teams
@@ -831,24 +833,34 @@ async def _checked_team_audience(access: dict, *, request: Request, session) -> 
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     principal = get_principal(request)
-    if team_ids and not can_manage_org(principal):
-        listing = await fetch_hub_teams(
-            bearer_token=hub_credential(request),
-            org_id=session.scope.org_id or "",
-            user_id=session.scope.user_id or "",
+    if not team_ids:
+        return {**access, "team_ids": team_ids}
+    is_admin = can_manage_org(principal)
+    listing = await fetch_hub_teams(
+        bearer_token=hub_credential(request),
+        org_id=session.scope.org_id or "",
+        user_id=session.scope.user_id or "",
+    )
+    if not listing.reachable and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Couldn't reach MindsHub to confirm your teams. Try again in a moment.",
         )
-        if not listing.reachable:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Couldn't reach MindsHub to confirm your teams. Try again in a moment.",
-            )
+    out = dict(access)
+    # The org's default team has everyone in the org as members: naming it
+    # is "Everyone at <org>", which auth already has as org_allowed.
+    default_team_id = listing.default_team_id
+    if default_team_id and default_team_id in team_ids:
+        team_ids = [t for t in team_ids if t != default_team_id]
+        out["org_wide"] = True
+    if not is_admin:
         foreign = [t for t in team_ids if t not in listing.team_ids]
         if foreign:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"You can only share with teams you belong to: {', '.join(foreign)}.",
             )
-    return {**access, "team_ids": team_ids}
+    return {**out, "team_ids": team_ids}
 
 
 def _owner_publish_context(session, folder: Path):

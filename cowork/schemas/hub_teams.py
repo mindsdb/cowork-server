@@ -8,6 +8,9 @@ from cowork.schemas.base import CamelResponse
 class HubTeamRow(CamelResponse):
     id: str
     display_name: str = ""
+    # The org's default team: its members are everyone in the organization,
+    # so sharing with it is "Everyone at <org>".
+    is_default: bool = False
 
 
 class HubTeamsView(CamelResponse):

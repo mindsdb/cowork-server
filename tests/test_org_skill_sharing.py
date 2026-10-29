@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -333,6 +334,64 @@ def test_org_wide_takes_the_share_org_capability(org):
     assert (out["sharing"]["org"], out["section"]) == (True, "mine")
     # Taking it back takes the capability too.
     _refused(lambda: _share(org, ALICE, "shared", _viewer(ALICE, write_org=True), org=False), 403)
+
+
+TEAM_ALL = "team-everyone"
+
+
+def _with_default(viewer: SkillViewer) -> SkillViewer:
+    """``viewer`` in an org whose default team (everyone) is TEAM_ALL."""
+    return replace(viewer, team_ids=viewer.team_ids | {TEAM_ALL}, default_team_id=TEAM_ALL)
+
+
+def test_sharing_with_the_default_team_is_sharing_org_wide(org):
+    _create(org, ALICE, "shared")
+
+    member = _with_default(_viewer(ALICE, teams=(TEAM_ENG,)))
+    _refused(lambda: _share(org, ALICE, "shared", member, team_ids=[TEAM_ALL]), 403, "skills.share_org")
+    _refused(lambda: _share(org, ALICE, "shared", member, team_ids=[TEAM_ENG, TEAM_ALL]), 403, "skills.share_org")
+    assert SkillService(org.as_(ALICE).scope).get_skill("shared").metadata[META_SHARE_ORG] == "false"
+
+    sharer = _with_default(_viewer(ALICE, teams=(TEAM_ENG,), share_org=True))
+    out = _share(org, ALICE, "shared", sharer, team_ids=[TEAM_ALL, TEAM_ENG])
+    assert (out["sharing"]["org"], out["sharing"]["teamIds"]) == (True, [TEAM_ENG])
+    metadata = SkillService(org.as_(ALICE).scope).get_skill("shared").metadata
+    assert (metadata[META_SHARE_ORG], metadata[META_SHARE_TEAMS]) == ("true", TEAM_ENG)
+
+
+def test_a_stored_default_team_share_reads_as_org_wide(org):
+    _legacy_skill(
+        org.as_(ALICE).scope, "everyone", created_by=ALICE,
+        **{META_SHARE_ORG: "false", META_SHARE_TEAMS: TEAM_ALL, META_ALWAYS_ON: "true"},
+    )
+    bob = _with_default(_viewer(BOB))
+    seen = _listed(org, BOB, bob)["everyone"]
+    assert (seen["section"], seen["sharing"]["org"], seen["sharing"]["teamIds"]) == ("org", True, [])
+    # Org-wide's edit rule: a member of the default team alone doesn't change it.
+    assert seen["canEdit"] is False
+    assert _listed(org, BOB, replace(bob, can_write_org=True))["everyone"]["canEdit"] is True
+    assert "everyone" in build_turn_skills(org.as_(BOB).scope, project_name="general", viewer=bob)
+    # Rewritten as org-wide the next time its sharing is saved.
+    _share(org, ALICE, "everyone", _with_default(_viewer(ALICE)), emails=["carol@x.com"])
+    metadata = SkillService(org.as_(ALICE).scope).get_skill("everyone").metadata
+    assert (metadata[META_SHARE_ORG], META_SHARE_TEAMS in metadata) == ("true", False)
+
+
+def test_the_viewer_learns_the_default_team_from_auth(monkeypatch):
+    hub_teams.reset_caches_for_tests()
+
+    async def get_auth_json(path, bearer):
+        if path == hub_teams.TEAMS_PATH:
+            return {"results": [{"id": TEAM_ENG}, {"id": TEAM_ALL, "is_default": True}]}
+        return {"permissions": []}
+
+    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
+    viewer = asyncio.run(resolve_skill_viewer(
+        scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE),
+        principal=_principal(ALICE), bearer_token="t",
+    ))
+    assert viewer.default_team_id == TEAM_ALL
+    hub_teams.reset_caches_for_tests()
 
 
 def test_an_org_mode_shared_only_body_changes_nothing(org):
@@ -880,7 +939,9 @@ def test_hub_teams_lists_the_callers_teams_and_caches_them(monkeypatch):
     monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
     view = asyncio.run(hub_teams_ep.get_hub_teams(_Request(), scope))
-    assert view.model_dump(by_alias=True) == {"reachable": True, "teams": [{"id": TEAM_ENG, "displayName": "Eng"}]}
+    assert view.model_dump(by_alias=True) == {
+        "reachable": True, "teams": [{"id": TEAM_ENG, "displayName": "Eng", "isDefault": True}],
+    }
     asyncio.run(hub_teams_ep.get_hub_teams(_Request(), scope))
     assert calls == [hub_teams.TEAMS_PATH]
     hub_teams.reset_caches_for_tests()
@@ -1005,6 +1066,20 @@ def test_setting_artifact_access_checks_the_callers_teams(monkeypatch):
     assert asyncio.run(aw._checked_team_audience(
         {"mode": "restricted", "team_ids": [TEAM_OPS]}, request=admin_request, session=session,
     ))["team_ids"] == [TEAM_OPS]
+    # The org's default team is everyone: dropped from the teams, org-wide.
+    hub_teams.reset_caches_for_tests()
+
+    async def with_default(path, bearer):
+        return {"results": [{"id": TEAM_ENG}, {"id": "team-all", "is_default": True}]}
+
+    monkeypatch.setattr(hub_teams, "get_auth_json", with_default)
+    for caller in (request, admin_request):
+        assert asyncio.run(aw._checked_team_audience(
+            {"mode": "restricted", "team_ids": ["team-all", TEAM_ENG]}, request=caller, session=session,
+        )) == {"mode": "restricted", "team_ids": [TEAM_ENG], "org_wide": True}
+    assert asyncio.run(aw._checked_team_audience(
+        {"mode": "restricted", "team_ids": ["team-all"], "org_wide": False}, request=request, session=session,
+    )) == {"mode": "restricted", "team_ids": [], "org_wide": True}
     local = SimpleNamespace(scope=LOCAL_SCOPE)
     assert asyncio.run(aw._checked_team_audience(
         {"mode": "restricted", "team_ids": [TEAM_OPS], "org_wide": True}, request=None, session=local,

@@ -133,7 +133,7 @@ def _require_skill_change(
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail=ORG_WIDE_EDIT_REFUSAL if SkillSharing.of(skill).org else SKILL_EDIT_REFUSAL,
+        detail=ORG_WIDE_EDIT_REFUSAL if viewer.sharing_of(skill).org else SKILL_EDIT_REFUSAL,
     )
 
 
@@ -266,7 +266,7 @@ def _org_sharing_fields(
         return {"sharing": SkillSharingView(org=True), "section": "org", "owner": SkillOwner()}
     if viewer is None:
         return {"sharing": SkillSharingView(), "section": "mine", "owner": SkillOwner()}
-    sharing = SkillSharing.of(skill)
+    sharing = viewer.sharing_of(skill)
     owner_email = skill.metadata.get(META_CREATED_BY_EMAIL) or (
         viewer.email if viewer.owns(owner_id) and viewer.email else None
     )
@@ -920,13 +920,16 @@ def _set_org_skill_sharing(
         with access.coordination_lock(SKILL, skill.name):
             skill = service.get_seen_skill(skill.name)
             owner_id = _skill_owner_id(access, skill)
-            current = SkillSharing.of(skill)
+            # The org's default team is "everyone in the org": named among
+            # the teams it means org-wide, with org-wide's rules
+            # (skills.share_org), and a stored one is rewritten as such.
+            current = viewer.sharing_of(skill)
             wanted = SkillSharing(
                 org=current.org if body.org is None else body.org,
                 team_ids=current.team_ids if team_ids is None else team_ids,
                 emails=current.emails if emails is None else emails,
                 always_on=current.always_on if body.always_on is None else body.always_on,
-            )
+            ).with_default_team_as_org(viewer.default_team_id)
             if wanted.always_on and not wanted.broad:
                 if body.always_on:
                     raise HTTPException(
