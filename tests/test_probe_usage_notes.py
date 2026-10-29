@@ -31,6 +31,15 @@ def test_no_notes_no_section():
     assert "KNOWN API QUIRKS" not in _prompt(usage_notes="   ")
 
 
+def test_notes_can_define_what_counts_as_a_pass():
+    # Roam's append-only tokens can never return data without a write, so the
+    # notes must be able to override step 6's "a real data endpoint returned data".
+    rule = "follow them over steps 5–6"
+
+    assert rule in _prompt(usage_notes="A 400 from append-blocks is a pass.")
+    assert rule not in _prompt()
+
+
 def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
     created: list[dict] = []
 

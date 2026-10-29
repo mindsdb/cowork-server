@@ -370,6 +370,14 @@ class CredentialProbe:
             f"——— KNOWN API QUIRKS ———\n{self.usage_notes}\n\n"
             if self.usage_notes else ""
         )
+        # Some credentials can never return data without a write (Roam's
+        # append-only tokens), so the notes, which know the API, must be able
+        # to say what a pass looks like over the generic step 6.
+        quirks_rule = (
+            "• Where the KNOWN API QUIRKS say how to check this API or what "
+            "counts as a pass, follow them over steps 5–6.\n"
+            if self.usage_notes else ""
+        )
         return (
             f"You are a connection prober for `{self.engine}`. Your only job is "
             f"to determine if the credentials we just collected actually "
@@ -416,6 +424,7 @@ class CredentialProbe:
             f"• NEVER print credential values. NEVER include them in tool inputs.\n"
             f"• You MUST call exactly one verdict tool before stopping.\n"
             f"• Don't ask follow-up questions in prose — use `request_extra_field`.\n"
+            f"{quirks_rule}"
         )
 
     @staticmethod

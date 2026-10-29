@@ -37,9 +37,11 @@ def test_roam_research_spec_supports_append_only_tokens():
     notes = registry.usage_notes_for(["roam_research"])["roam_research"]
 
     assert "append-api.roamresearch.com/api/graph/{graph_name}/append-blocks" in notes
-    # The connection check tells an append-only token apart without writing.
+    # The connection check tells an append-only token apart without writing,
+    # and must take the 400 as a pass instead of hunting for data.
     assert '"append-data": []' in notes
-    assert "400 means an append-only token" in notes
+    assert "`Invalid request`" in notes
+    assert "call `report_success` now" in notes
 
 
 def test_picker_guidance_lists_files_but_no_longer_the_drive_api_rules():
