@@ -1588,6 +1588,8 @@ class ResponsesHandler:
         answer is saved with the pending flag cleared in one commit
         (`_save_answer`), before the completed frame reports it. A Stop saves
         the answer as it stands; a failure saves it and reports the error.
+        A Stop before the answer starts saves the question with no answer,
+        as an agent turn stopped before its first output does.
         A turn the server ended (shutdown, duration bound) is saved and
         reported as interrupted, as the agent's are, and waits for its save
         only until ``lifecycle.shutdown_frame_deadline``.
@@ -1606,30 +1608,14 @@ class ResponsesHandler:
             tags=("cowork-direct",),
             metadata={**trace_metadata, "correlation_id": corr},
         ))
-        try:
-            answer = await direct_answer.start_answer(binding, history=history)
-        finally:
-            reset_trace_context(token)
-        if answer is None:
-            # Fields, not template values: the log formatter drops those. A
-            # delegation here is Jev's wrong direct route, or a failure before
-            # the answer started.
-            logger.warning(
-                "Direct answer handed the turn to the agent",
-                extra={
-                    "event": "direct_answer_delegated",
-                    "model": binding.model,
-                    **log_context(request_id=corr, conversation_id=conv_id),
-                },
-            )
-            await delegate()
-            return
 
         scope = scope_from_principal(self.principal)
         item_id = f"msg-{conv_id.hex[:12]}"
-        parts: list[str] = [answer.first_text]
+        answer: direct_answer.DirectAnswer | None = None
+        parts: list[str] = []
         question_id: UUID | None = None
         persisted = False
+        delegated = False
         sequence = 1
 
         def text_delta(text: str) -> dict:
@@ -1697,7 +1683,8 @@ class ResponsesHandler:
             the terminal record. A turn a shutdown ended waits for its save
             only until ``lifecycle.shutdown_frame_deadline``, so its frame
             reaches the open stream before Uvicorn's request drain cuts it."""
-            events = [text_delta("".join(parts)), _DIRECT_MEMORY_READ.payload()]
+            # A turn stopped before its answer started saves no answer row.
+            events = [text_delta("".join(parts)), _DIRECT_MEMORY_READ.payload()] if parts else []
             if lifecycle.shutdown_frame_deadline is None:
                 saved = await persist(events)
             else:
@@ -1712,6 +1699,28 @@ class ResponsesHandler:
             await buffer.close(reason)
 
         try:
+            try:
+                answer = await direct_answer.start_answer(binding, history=history)
+            finally:
+                reset_trace_context(token)
+            if answer is None:
+                # Fields, not template values: the log formatter drops those. A
+                # delegation here is Jev's wrong direct route, or a failure before
+                # the answer started.
+                logger.warning(
+                    "Direct answer handed the turn to the agent",
+                    extra={
+                        "event": "direct_answer_delegated",
+                        "model": binding.model,
+                        **log_context(request_id=corr, conversation_id=conv_id),
+                    },
+                )
+                # The agent's producer ends this turn, a Stop during it included.
+                delegated = True
+                await delegate()
+                return
+
+            parts.append(answer.first_text)
             if await run_to_completion(start()) is None:
                 return
             response = Response(status=ResponseStatus.created, model=binding.model)
@@ -1786,6 +1795,15 @@ class ResponsesHandler:
                 return
             if buffer.is_closed:
                 return
+            if delegated:
+                # The agent's producer ended the turn and saved the question.
+                return
+            if answer is None:
+                # Cancelled before the answer started: nothing is saved yet,
+                # so save the question; end_turn then saves no answer and
+                # clears its pending flag.
+                if await run_to_completion(start()) is None:
+                    return
             if lifecycle.shutting_down or lifecycle.timed_out:
                 # The server ended the turn, not the user: say so, as the
                 # agent's producers do, rather than reading as a Stop.
@@ -1796,6 +1814,8 @@ class ResponsesHandler:
                 return
             await run_to_completion(end_turn("cancelled"))
         except Exception as exc:
+            if delegated:
+                raise
             if isinstance(exc, PoolTimeoutError):
                 logger.warning(
                     "[direct] turn found no free database connection",
@@ -1808,8 +1828,11 @@ class ResponsesHandler:
             if not buffer.is_closed:
                 await run_to_completion(end_turn("error", exc))
         finally:
-            await answer.close()
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
+            if answer is not None:
+                await answer.close()
+            if not delegated:
+                # A delegated turn's producer seals the buffer itself.
+                await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
 
     def _select_producer(
         self,

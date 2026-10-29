@@ -129,8 +129,8 @@ class DirectAnswer:
 
 async def start_answer(binding: RouterBinding, *, history: list[dict]) -> DirectAnswer | None:
     """Start the direct answer: a `DirectAnswer` once it begins with text, or
-    None to delegate. Never raises (a database pool timeout aside, which
-    nothing here can raise)."""
+    None to delegate. Never raises, except the caller's cancel, which closes
+    the model call first."""
     from anton.core.llm.provider import StreamComplete, StreamTextDelta, StreamToolUseStart
 
     messages = _text_history(history, max_messages=MAX_HISTORY_MESSAGES, max_chars=_MAX_MESSAGE_CHARS)
@@ -168,6 +168,11 @@ async def start_answer(binding: RouterBinding, *, history: list[dict]) -> Direct
                 break
             if isinstance(event, StreamTextDelta) and event.text.strip():
                 return DirectAnswer(first_text=event.text, _events=events)
+    except asyncio.CancelledError:
+        # A Stop or shutdown while the answer starts: close the model call
+        # now, rather than when the generator is collected.
+        await _close(events)
+        raise
     except TimeoutError:
         logger.warning(
             "Direct answer did not start in time; delegating",

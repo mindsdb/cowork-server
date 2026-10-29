@@ -477,10 +477,14 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
     return direct_answer.DirectAnswer(first_text=first.text, _events=stream)
 
 
-async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None):
+async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None):
     from cowork.streaming.registry import TurnLifecycle
 
     async def fake_start(_binding, *, history):
+        if started is not None:
+            # An answer that has not started yet: wait to be stopped.
+            started.set()
+            await asyncio.Event().wait()
         return answer
 
     monkeypatch.setattr(direct_answer, "start_answer", fake_start)
@@ -700,3 +704,88 @@ async def test_produce_answer_ended_by_a_shutdown_reads_as_interrupted(monkeypat
     rows = await _rows(conversation_id)
     assert rows[1][1].startswith("Revenue was")
     assert failed.get("assistant_message_id")
+
+
+@pytest.mark.asyncio
+async def test_start_answer_closes_the_model_call_on_stop():
+    provider = _Provider([_text("late")], delay=10)
+
+    task = asyncio.create_task(direct_answer.start_answer(_binding(provider), history=_RECALL))
+    while not provider.calls:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert task.cancelled()
+    assert provider.closed
+
+
+async def _stopped_before_text(monkeypatch, lifecycle=None):
+    """Stop a direct turn while its answer has not started."""
+    conversation_id = await _conversation()
+    started = asyncio.Event()
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, None, lifecycle=lifecycle, started=started,
+    )
+    task = asyncio.create_task(coro)
+    await started.wait()
+    return conversation_id, buffer, task
+
+
+@pytest.mark.asyncio
+async def test_produce_answer_keeps_the_question_on_a_stop_before_text(monkeypatch):
+    conversation_id, buffer, task = await _stopped_before_text(monkeypatch)
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    # The stream ends, and the question stays in the conversation, with no
+    # answer, as an agent turn stopped before its first output does.
+    assert buffer.status == "cancelled"
+    assert await _rows(conversation_id) == [("user", "what were those headline numbers again?", False, None)]
+
+
+@pytest.mark.asyncio
+async def test_produce_answer_ended_by_a_shutdown_before_text_reads_as_interrupted(monkeypatch):
+    from cowork.streaming.registry import RunIdentity, TurnLifecycle
+
+    lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id="corr-direct"))
+    conversation_id, buffer, task = await _stopped_before_text(monkeypatch, lifecycle)
+
+    lifecycle.shutting_down = True
+    lifecycle.shutdown_frame_deadline = asyncio.get_running_loop().time() + 5
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert buffer.status == "interrupted"
+    assert _events(buffer) == ["response.failed"]
+    assert _payload(buffer.frames[-1])["request_id"] == "corr-direct"
+    assert await _rows(conversation_id) == [("user", "what were those headline numbers again?", False, None)]
+
+
+@pytest.mark.asyncio
+async def test_produce_answer_leaves_a_stop_after_delegation_to_the_agent(monkeypatch):
+    """Once delegated, the agent's producer owns the turn: a Stop there must
+    not save the question a second time."""
+    conversation_id = await _conversation()
+    running = asyncio.Event()
+    buffers = []
+
+    async def delegate():
+        running.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await buffers[0].close("cancelled")
+
+    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate)
+    buffers.append(buffer)
+    task = asyncio.create_task(coro)
+    await running.wait()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert buffer.status == "cancelled"
+    assert buffer.frames == []
+    assert await _rows(conversation_id) == []
