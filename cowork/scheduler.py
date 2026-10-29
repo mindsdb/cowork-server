@@ -4,7 +4,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
@@ -25,6 +25,7 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.db.units import run_db
+from cowork.handlers.turn_errors import MODEL_UNAVAILABLE_CODES
 from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleSkippedPeriod, ScheduleVersion
 from cowork.schedule_timing import missed_slots, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, OccurrenceStatus, RunStatus, resolve_schedule_model
@@ -307,6 +308,8 @@ class _TurnFailure:
 
     message: str | None = None
     code: str | None = None
+    # The failed turn's saved answer, which anchors deleting the turn.
+    assistant_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -318,6 +321,10 @@ class _AttemptEnd:
     # Whether the same failure could go differently next time. Only an
     # attempt that failed before execution is ever tried again.
     retryable: bool = False
+    # What the turn's failure frame said, when it ended on one.
+    failure: _TurnFailure | None = None
+    # The pinned model the run could not use; it ran on the account default.
+    unavailable_model: str | None = None
 
 
 # Frames a turn writes before its agent can do anything, and its failure. A
@@ -612,6 +619,7 @@ def _stage_attempt_end(
         error=end.error,
         outcome=end.outcome,
         conversation_id=conversation_id,
+        unavailable_model=end.unavailable_model,
     )
     return settlement
 
@@ -643,6 +651,7 @@ def _finish_run(session: ScopedSession, *, run_id: UUID, end: _AttemptEnd) -> No
     occurrence keeps its lease and is reaped once that lapses."""
     if ScheduleRunService(session).end_run(
         run_id, status=_run_status(end.outcome), error=end.error, outcome=end.outcome,
+        unavailable_model=end.unavailable_model,
     ):
         session.commit()
 
@@ -884,10 +893,10 @@ async def _execute_attempt(
         # trigger produced a turn from timestamps.
         trigger = "manual" if is_manual else "cron"
         request = ResponsesRequest(
-            # `schedule.model` is the "default" sentinel for every task the UI
-            # creates, not a servable id. Resolve it to None so the harness
-            # applies the account's configured default models instead of
-            # overriding every role with the literal string.
+            # A task on the account default stores the "default" sentinel, not
+            # a servable id. Resolve it to None so the harness applies the
+            # account's configured default models instead of overriding every
+            # role with the literal string.
             input=scheduled.prompt,
             model=resolve_schedule_model(scheduled.model),
             stream=True,
@@ -936,6 +945,65 @@ async def _execute_attempt(
             outcome=AttemptOutcome.failed_before_execution, error=error, retryable=_is_retryable(exc),
         ), conversation_id
 
+    pinned = request.model
+    end = await _drive_turn(
+        stream, conversation_id=conversation_id, run_id=attempt.run_id, schedule_id=schedule_id,
+        lease_lost=lease_lost,
+    )
+    if pinned is None or not _model_unavailable(end) or (lease_lost is not None and lease_lost.is_set()):
+        return end, conversation_id
+
+    # The pinned model can't be served, and the turn failed before it acted.
+    # Run the prompt again on the account default in place of the failed
+    # turn, so a stale pin costs the run its model rather than its work.
+    logger.warning(
+        "Scheduled run's model %s is unavailable; running it on the account default", pinned,
+        extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+    )
+    failed_answer = end.failure.assistant_message_id if end.failure else None
+    if failed_answer:
+        try:
+            await run_db(
+                partial(
+                    _drop_failed_turn, principal=scheduled.principal, conversation_id=conversation_id,
+                    message_id=UUID(failed_answer),
+                ),
+                scope=SYSTEM_SCOPE,
+            )
+        except Exception:
+            # The rerun matters more than a tidy transcript: it goes ahead
+            # after the failed turn instead of in its place.
+            logger.exception(
+                "Could not delete the scheduled run's failed turn",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
+    try:
+        stream = await ResponsesHandler(
+            principal=scheduled.principal, interactive=False, schedule_id=str(schedule_id),
+        ).handle(request.model_copy(update={"model": None}))
+    except Exception:
+        logger.exception(
+            "Could not run the scheduled run on the account default",
+            extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+        )
+        return end, conversation_id
+    fallback = await _drive_turn(
+        stream, conversation_id=conversation_id, run_id=attempt.run_id, schedule_id=schedule_id,
+        lease_lost=lease_lost,
+    )
+    return replace(fallback, unavailable_model=pinned), conversation_id
+
+
+async def _drive_turn(
+    stream,
+    *,
+    conversation_id: UUID,
+    run_id: UUID,
+    schedule_id: UUID,
+    lease_lost: asyncio.Event | None,
+) -> _AttemptEnd:
+    """Follow a handed-off turn to its end, within the run's duration bound,
+    and say how it ended."""
     async def _drain() -> None:
         async for _ in stream:
             pass
@@ -972,9 +1040,9 @@ async def _execute_attempt(
                         "Stopping a taken-back scheduled run's turn failed",
                         extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
                     )
-            return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_INTERRUPTED_ERROR), conversation_id
+            return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_INTERRUPTED_ERROR)
     if timed_out or lost_track:
-        await _stop_turn(str(conversation_id), run_id=attempt.run_id, schedule_id=schedule_id)
+        await _stop_turn(str(conversation_id), run_id=run_id, schedule_id=schedule_id)
 
     # A cancel or a producer failure closes the stream normally from the
     # consumer's side (the producer runs detached and even swallows its own
@@ -982,7 +1050,26 @@ async def _execute_attempt(
     # the only truthful account of how the turn ended — without it every run
     # is recorded as success.
     evidence = await _turn_evidence(str(conversation_id))
-    return _classify(evidence, timed_out=timed_out), conversation_id
+    return _classify(evidence, timed_out=timed_out)
+
+
+def _model_unavailable(end: _AttemptEnd) -> bool:
+    """Whether the turn failed, before it acted, because its model can't be served."""
+    return (
+        end.outcome == AttemptOutcome.failed_before_execution
+        and end.failure is not None
+        and end.failure.code in MODEL_UNAVAILABLE_CODES
+    )
+
+
+def _drop_failed_turn(
+    session: ScopedSession, *, principal: Principal | None, conversation_id: UUID, message_id: UUID,
+) -> None:
+    """Delete the failed turn, so the run's conversation holds its prompt once."""
+    from cowork.services.conversations import ConversationService
+
+    conv_session = ScopedSession(unsafe_unscoped_session(session), scope_from_principal(principal))
+    ConversationService(conv_session).delete_turn(conversation_id, message_id)
 
 
 async def _drain_unless(drain, lost: asyncio.Event | None) -> bool:
@@ -1117,9 +1204,11 @@ def _classify(evidence: _TurnEvidence, *, timed_out: bool) -> _AttemptEnd:
             outcome=AttemptOutcome.failed_before_execution,
             error=failure.message or _FAILED_BEFORE_ERROR,
             retryable=failure.code not in _PERMANENT_FAILURE_CODES,
+            failure=failure,
         )
     return _AttemptEnd(
         outcome=AttemptOutcome.failed_during_execution, error=failure.message or _FAILED_DURING_ERROR,
+        failure=failure,
     )
 
 
@@ -1138,9 +1227,11 @@ def _failure_from_record(data: dict) -> _TurnFailure | None:
         if isinstance(payload, dict) and payload.get("type") == "response.failed":
             message = payload.get("error")
             code = payload.get("code")
+            message_id = payload.get("assistant_message_id")
             return _TurnFailure(
                 message=message if isinstance(message, str) and message.strip() else None,
                 code=code if isinstance(code, str) else None,
+                assistant_message_id=message_id if isinstance(message_id, str) else None,
             )
     return None
 
