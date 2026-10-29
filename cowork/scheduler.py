@@ -296,9 +296,11 @@ class _AttemptEnd:
 
 
 # Frames a turn writes before its agent can do anything, and its failure. A
-# failed turn whose stream holds nothing else failed before it acted.
+# failed turn whose stream holds nothing else failed before it acted. The
+# memory read is sent once the prompt is built, before the model is called.
 _PRE_EXECUTION_EVENTS = frozenset({
-    "response.created", "response.in_progress", "response.queued", "response.failed",
+    "response.created", "response.in_progress", "response.queued", "response.memory_read",
+    "response.failed",
 })
 
 
