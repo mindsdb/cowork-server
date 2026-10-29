@@ -48,6 +48,7 @@ class _FakeBuffer:
 
 def _handler() -> ResponsesHandler:
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.scope = _FakeScope()
     handler.interactive = True
     return handler

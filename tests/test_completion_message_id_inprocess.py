@@ -26,11 +26,13 @@ def _handler_with_formatter(turn_formatter) -> ResponsesHandler:
     """Same construction as test_turn_errors.py's _handler_with_raising_formatter
     (built without __init__, no DB/harness setup needed)."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = None
 
     async def _stream_response(*, conversation, input, model=None, reasoning_effort=None,
                                 disabled_connections=None, trace_tags=None, trace_metadata=None,
-                                tool_messages=False, model_wait=None, interactive=True):
+                                tool_messages=False, model_wait=None, interactive=True,
+                                schedule_id=None):
         if False:
             yield
 
@@ -192,6 +194,8 @@ async def _run_direct(*, assistant_message_id, route_text="ok", user_message_id=
     from cowork.handlers.response_routing import RouteDecision
 
     handler = object.__new__(ResponsesHandler)
+
+    handler.schedule_id = None
     handler.principal = None
     buffer = _Buffer()
     route = RouteDecision(route="direct_context", text=route_text, model="anton", reason="test")

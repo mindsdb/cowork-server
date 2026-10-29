@@ -370,7 +370,7 @@ def test_a_failing_cron_run_schedules_a_retry_and_a_later_attempt_succeeds(monke
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
