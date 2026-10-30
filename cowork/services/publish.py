@@ -603,6 +603,9 @@ _NOTIFY_KEY = "notify"
 # auth's bounds on what the share email names and links.
 _MAX_NOTIFY_TITLE_CHARS = 200
 _MAX_NOTIFY_URL_CHARS = 2048
+# The viewer hosts auth's share email links to (dev and PR envs share dev's);
+# the publish lambda's view_url is on one of them.
+_NOTIFY_URL_HOSTS = frozenset({"view.dev.mindshub.ai", "view.staging.mindshub.ai", "view.mindshub.ai"})
 
 
 class ShareNotify(NamedTuple):
@@ -1033,8 +1036,8 @@ def publish_artifact(
 def _share_notice(published_dir: Path, published_key: str, view_url: str) -> dict[str, str]:
     """What auth's share email names and links: the artifact's title (its
     metadata name, else its folder or file name) and the published URL the
-    recipient opens, within auth's bounds. A URL that isn't https is left out
-    rather than sent to be refused."""
+    recipient opens, within auth's bounds. A URL that isn't an https link on
+    one of the viewer hosts auth links to is left out."""
     title = ""
     try:
         meta = json.loads((published_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -1043,7 +1046,13 @@ def _share_notice(published_dir: Path, published_key: str, view_url: str) -> dic
     except (OSError, ValueError):
         pass
     title = " ".join((title or published_dir.name or published_key or "").split())
-    url = view_url if isinstance(view_url, str) and view_url.startswith("https://") else ""
+    url = view_url if isinstance(view_url, str) else ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.scheme != "https" or parsed.hostname not in _NOTIFY_URL_HOSTS:
+        url = ""
     return {
         "artifact_title": title[:_MAX_NOTIFY_TITLE_CHARS],
         "artifact_url": url if len(url) <= _MAX_NOTIFY_URL_CHARS else "",

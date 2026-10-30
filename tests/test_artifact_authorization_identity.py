@@ -813,7 +813,7 @@ def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
 
     def publish(_source, **kwargs):
         uploads.append(kwargs)
-        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.test/1"}
+        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.dev.mindshub.ai/1"}
 
     monkeypatch.setattr("anton.publisher.publish", publish)
     monkeypatch.setattr("cowork.services.artifact_autopublish._active_workspace_id", lambda scope: None)
@@ -833,7 +833,7 @@ def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
         notify=ShareNotify(user_ids=(person, stranger), emails=("out@else.com", "nope@else.com")))
     body = access_writes()[-1]
     assert (body["notify_recipients"], body["artifact_title"], body["artifact_url"]) == (
-        True, "Q3 Revenue", "https://view.test/1",
+        True, "Q3 Revenue", "https://view.dev.mindshub.ai/1",
     )
     # Only the people the saved rule names: never someone it doesn't share with.
     assert (body["notify_user_ids"], body["notify_emails"]) == ([person], ["out@else.com"])
@@ -870,7 +870,7 @@ def test_a_notifying_save_of_outside_emails_alone_still_writes_to_auth(
     _session, project, _conversation, folder = owned_artifact
 
     def publish(_source, **kwargs):
-        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.test/1"}
+        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.dev.mindshub.ai/1"}
 
     monkeypatch.setattr("anton.publisher.publish", publish)
     monkeypatch.setattr("cowork.services.artifact_autopublish._active_workspace_id", lambda scope: None)
@@ -897,7 +897,18 @@ def test_a_notifying_save_of_outside_emails_alone_still_writes_to_auth(
     assert (body["notify_recipients"], body["notify_user_ids"], body["notify_emails"]) == (
         True, [], ["new@else.com"],
     )
-    assert (body["artifact_title"], body["artifact_url"]) == ("demo", "https://view.test/1")
+    assert (body["artifact_title"], body["artifact_url"]) == ("demo", "https://view.dev.mindshub.ai/1")
     # A public share names nobody to notify: no write.
     run({"mode": "public"}, notify=ShareNotify(emails=("new@else.com",)))
     assert len(access_writes()) == 1
+
+
+def test_the_share_email_links_only_a_viewer_url(tmp_path):
+    """auth links the share email only to the viewer hosts (dev and PR envs
+    share dev's), so any other view_url is left out rather than sent."""
+    from cowork.services.publish import _share_notice
+
+    for url in ("https://view.dev.mindshub.ai/r/1", "https://view.staging.mindshub.ai/r/1", "https://view.mindshub.ai/r/1"):
+        assert _share_notice(tmp_path, "index.html", url)["artifact_url"] == url
+    for url in ("http://view.mindshub.ai/r/1", "https://view.test/1", "https://evil.example/view.mindshub.ai", ""):
+        assert _share_notice(tmp_path, "index.html", url)["artifact_url"] == ""

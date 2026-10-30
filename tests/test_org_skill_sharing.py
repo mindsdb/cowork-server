@@ -1328,6 +1328,24 @@ def test_auth_refusing_a_non_member_is_a_400_naming_them():
     assert isinstance(caught.value, ValueError) and EVE in str(caught.value)
 
 
+def test_auth_refusing_a_foreign_team_is_a_400_naming_it():
+    """auth's unknown_team body names the teams in allowed_team_ids."""
+    from cowork.services.artifact_access import ArtifactAudienceRejected, sync_artifact_team_access
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"code": "unknown_team", "detail": "x", "allowed_team_ids": [TEAM_OPS]})
+
+    settings = SimpleNamespace(auth_internal_base_url="https://auth.test", auth_internal_secret="s")
+    with pytest.raises(ArtifactAudienceRejected) as caught:
+        sync_artifact_team_access(
+            artifact_id="a", scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE),
+            owner_user_id=ALICE, workspace_id=None, allowed_emails=[], org_allowed=False,
+            allowed_team_ids=[TEAM_OPS], access_version=1, settings=settings,
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    assert TEAM_OPS in str(caught.value)
+
+
 def test_the_access_write_carries_notify_only_when_asked():
     from cowork.services.artifact_access import sync_artifact_team_access
 

@@ -35,7 +35,7 @@ def _audience_rejection(response: httpx.Response) -> str:
         ids = ", ".join(str(i) for i in body.get("allowed_user_ids") or [])
         return f"Only people in your organization can be added by name; share with anyone else by email: {ids}"
     if body.get("code") == "unknown_team":
-        ids = ", ".join(str(i) for i in body.get("allowed_team_ids") or body.get("team_ids") or [])
+        ids = ", ".join(str(i) for i in body.get("allowed_team_ids") or [])
         return f"Each team must be a team of your organization: {ids}"
     return ""
 
