@@ -620,9 +620,9 @@ def _workspace_state(
 async def artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    scope: ScopeDep,
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
     path: str | None = Query(default=None, max_length=1000),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS.
@@ -797,9 +797,9 @@ async def artifact_revisions(
 async def artifact_review_entry(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    scope: ScopeDep,
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
 
@@ -1357,9 +1357,9 @@ def _draft_link_file_parts(folder: Path, metadata: dict) -> tuple[str, ...]:
 async def create_draft_link(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    scope: ScopeDep,
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
 ):
     """A 30-minute signed link to this draft on the draft host.
 
@@ -1409,9 +1409,9 @@ async def serve_private_draft(
     artifact_id: ArtifactIdDep,
     rel_path: str,
     request: Request,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    scope: ScopeDep,
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
     download: Annotated[bool, Query()] = False,
 ):
     """Authenticated draft preview with project/org containment and relative assets.
