@@ -24,6 +24,7 @@ from cowork.models.channel import ChannelBinding
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
+from cowork.models.task_object import TaskObject
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
 from cowork.services.schedules import ScheduleRunService
 
@@ -198,3 +199,32 @@ def test_delete_project_releases_a_channel_binding_without_deleting_it(
     session.refresh(survivor)
     assert survivor.anton_project_id is None
     assert survivor.external_group_id == "C123"
+
+
+def test_delete_project_drops_objects_a_moved_task_left_behind(tmp_path, monkeypatch):
+    """A task moved to another project without its objects keeps its
+    `task_objects` rows pointing at the old project. Those rows belong to a
+    conversation the project delete does not touch, and `task_objects.project_id`
+    has no `ondelete`, so the final `DELETE FROM projects` failed on Postgres."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="source")
+    destination = _project(session, tmp_path, name="destination")
+
+    moved = Conversation(project_id=destination.id, topic="moved task")
+    session.add(moved)
+    session.commit()
+    session.refresh(moved)
+    left_behind = TaskObject(
+        conversation_id=moved.id, project_id=project.id, kind="artifact", ref="report"
+    )
+    session.add(left_behind)
+    session.commit()
+    session.refresh(left_behind)
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert session.get(Project, project.id) is None
+    assert session.get(TaskObject, left_behind.id) is None
+    assert session.get(Conversation, moved.id) is not None, "the moved task stays"
