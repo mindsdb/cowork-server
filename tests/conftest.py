@@ -502,7 +502,7 @@ def _a_full_unit_run(session) -> bool:
     run not stopped early: only then is an allowlist entry no test reached
     stale rather than unreached."""
     option = session.config.option
-    if _GUARD_RUN["deselected"] or option.keyword or option.markexpr:
+    if option.collectonly or _GUARD_RUN["deselected"] or option.keyword or option.markexpr:
         return False
     if session.shouldstop or session.shouldfail:
         return False

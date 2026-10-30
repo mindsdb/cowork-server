@@ -68,6 +68,8 @@ uv run --locked pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
+Every unit test runs under a guard for blocking work where it stops other requests (`tests/_blocking_guard.py`). A test fails when cowork code checks out a pooled database connection on the event loop. It also fails when, in org tenancy, cowork code touches a file under `COWORK_HOME` on the event loop, or on a worker thread that `run_efs` didn't start. Move such work into `run_db` or `run_efs` (`cowork/db/units.py`). The sites the code has today are listed in the guard with their reasons. A listed site that no test reaches fails a full run, so remove its entry when you move the work.
+
 Post-deploy integration runs use the target cluster's self-hosted runner. Dev
 and staging obtain the fixed `cowork` test suite through auth's cluster-only
 service URL. Production must not mutate that shared `@emailsink.dev` identity
