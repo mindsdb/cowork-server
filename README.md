@@ -68,6 +68,18 @@ uv run --locked pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
+A few tests need a real Redis or PostgreSQL, because hosted Cowork runs on both: two replicas reading one Redis (`tests/integration/test_two_replicas.py`), and the migration and launch-lock contracts on PostgreSQL. They carry the `redis_service` or `postgres_service` marker and skip when their service is absent. `make test/services` runs only them. Point it at a disposable database, since the migration test downgrades it to an empty schema:
+
+```sh
+COWORK_TEST_REDIS_URL=redis://localhost:6379/1 \
+COWORK_TEST_POSTGRES_URI=postgresql://postgres@localhost:5432/cowork_test \
+make test/services
+```
+
+On every pull request and every push to `staging`, `.github/workflows/tests-services.yml` runs them against Redis 8.2.3 and PostgreSQL 16.13 service containers with `COWORK_REQUIRE_SERVICES=true`, so a missing service fails the job instead of skipping. The desktop wheel release doesn't wait on that job.
+
+A run that requires every prerequisite (`COWORK_REQUIRE_INTEGRATION=true` or `COWORK_REQUIRE_SERVICES=true`) fails when a test skips, or is left out with `--deselect`, unless `tests/skip_allowlist.yaml` names it with a reason (`tests/skip_guard.py`). Any run that sets either flag lists what it left out at the end of its report and in the GitHub job summary. The allowlist names two tests: the remote-worker disconnect check, an operator-run proof described under [Streaming & scheduling](#streaming--scheduling), and the post-deploy cancel check, which skips when the model ends its turn before the turn can be seen running, so there is nothing to cancel.
+
 Post-deploy integration runs use the target cluster's self-hosted runner. Dev
 and staging obtain the fixed `cowork` test suite through auth's cluster-only
 service URL. Production must not mutate that shared `@emailsink.dev` identity
