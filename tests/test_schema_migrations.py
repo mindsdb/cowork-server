@@ -389,7 +389,7 @@ def test_skill_access_upgrade_and_downgrade(tmp_path, monkeypatch):
             with connection.begin_nested():
                 connection.execute(insert, {"id": "b" * 32})
 
-    _downgrade_to(engine, uri, "a6e3c9f2b4d8")
+    _downgrade_to(engine, uri, "a3734c9e5210")
     assert not _has_table(db_path, "skill_access")
     _upgrade_to(engine, uri, "head")
     assert _has_table(db_path, "skill_access")
@@ -883,6 +883,36 @@ def test_migrated_schema_holds_the_live_app_uniqueness_rules(tmp_path, monkeypat
     _downgrade_to(engine, uri, "3e4b5f7586d3")
     for table in ("live_app_launches", "live_app_shares", "live_app_copies"):
         assert not _has_table(db_path, table)
+
+
+def test_live_app_availability_migration_upgrades_and_preserves_a_pending_notice(tmp_path):
+    from uuid import uuid4
+
+    from sqlmodel import Session, select
+    from cowork.models.live_app import LiveAppAvailabilityWait
+
+    uri = _sqlite_uri(tmp_path / "availability.db")
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert not _has_table(tmp_path / "availability.db", "live_app_availability_waits")
+    _upgrade_to(engine, uri, "head")
+    generation = uuid4()
+    with Session(engine) as session:
+        session.add(LiveAppAvailabilityWait(
+            partition_id="partition", user_id="person", generation=generation, notified=True
+        ))
+        session.commit()
+    _upgrade_to(engine, uri, "head")
+    with Session(engine) as session:
+        row = session.exec(select(LiveAppAvailabilityWait)).one()
+        assert row.generation == generation and row.notified
+    # The schema enforces one unresolved refusal per person across workers.
+    from sqlalchemy.exc import IntegrityError
+    with Session(engine) as session:
+        session.add(LiveAppAvailabilityWait(partition_id="partition", user_id="person"))
+        with pytest.raises(IntegrityError):
+            session.commit()
+    engine.dispose()
 
 
 def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monkeypatch):

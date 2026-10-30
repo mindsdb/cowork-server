@@ -6,7 +6,7 @@ skills' own. Only hosted org mode writes it; the desktop's SQLite gets the
 empty table and never reads it.
 
 Revision ID: b7d1e4a9c2f6
-Revises: a6e3c9f2b4d8
+Revises: a3734c9e5210
 Create Date: 2026-10-29 12:00:00.000000
 
 """
@@ -17,7 +17,7 @@ from alembic import op
 
 
 revision: str = "b7d1e4a9c2f6"
-down_revision: Union[str, Sequence[str], None] = "a6e3c9f2b4d8"
+down_revision: Union[str, Sequence[str], None] = "a3734c9e5210"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

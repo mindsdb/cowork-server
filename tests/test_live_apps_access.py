@@ -954,3 +954,82 @@ def test_the_access_client_reads_the_deployments_ca_variables(monkeypatch):
 
     with pytest.raises(FileNotFoundError):
         live_apps._http_client()
+
+
+async def test_antons_cancelled_first_launch_records_failure_before_releasing_admission(services, monkeypatch):
+    """Drive Anton's real record finalizer with the server's real host: Stop
+    reaches first-launch cleanup once and admission outlives cleanup/reset."""
+    import threading
+    import anton.core.artifacts.live_app_slots as slots
+
+    host = _host(ALICE)
+    client = slots.SlotClient(SLOT_ADDRESSES[0], token=LAUNCH_TOKEN)
+    written, finish_write = asyncio.Event(), asyncio.Event()
+    cleanup_started, finish_cleanup = asyncio.Event(), asyncio.Event()
+    reset_started, finish_reset = threading.Event(), threading.Event()
+    competitor_entered = asyncio.Event()
+    real_run_db = live_apps.run_db
+    resets = []
+
+    async def pause_after_write(unit, *, scope):
+        result = await real_run_db(unit, scope=scope)
+        if unit.func is live_apps._start_record:
+            written.set()
+            await finish_write.wait()
+        elif unit.func is live_apps._launch_failed:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+        return result
+
+    def reset():
+        reset_started.set()
+        assert finish_reset.wait(5)
+        resets.append(1)
+        services.slots[1].state = "empty"
+
+    monkeypatch.setattr(live_apps, "run_db", pause_after_write)
+    monkeypatch.setattr(client, "reset", reset)
+
+    async def record():
+        async with host.launch_lock():
+            await slots._record_launched(host, client, _launch_model(1, "dash", BOOT_1))
+
+    async def competitor():
+        async with _host(BOB).launch_lock():
+            competitor_entered.set()
+
+    task = asyncio.create_task(record())
+    rival = None
+    try:
+        await asyncio.wait_for(written.wait(), 5)
+        task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), 5)
+        # A first launch had no claim; its own host must stop the committed
+        # record when Anton delivers that first cancellation.
+        (row,) = _records(1)
+        assert (row.state, row.stop_reason) == ("stopped", "launch_failed")
+        rival = asyncio.create_task(competitor())
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done() and not competitor_entered.is_set()
+
+        finish_cleanup.set()
+        assert await asyncio.to_thread(reset_started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done() and not competitor_entered.is_set()
+        finish_reset.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(rival, 5)
+        (row,) = _records(1)
+        assert (row.state, row.stop_reason, row.stop_noticed) == ("stopped", "launch_failed", False)
+        assert resets == [1]
+    finally:
+        finish_write.set()
+        finish_cleanup.set()
+        finish_reset.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if rival is not None:
+            await asyncio.gather(rival, return_exceptions=True)
