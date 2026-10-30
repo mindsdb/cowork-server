@@ -64,14 +64,7 @@ from cowork.services.live_apps import (
 )
 from cowork.services.projects import display_label
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
-from cowork.services.always_on_skills import render_always_on_skills
-from cowork.services.skill_sharing import sharing_applies
-from cowork.services.skills import (
-    always_on_prompt_skills,
-    artifact_skill_dirs,
-    link_turn_skills,
-    reads_shared_skills,
-)
+from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -1797,8 +1790,8 @@ class AntonHarness:
             # (linked_turn_skills), and neither do the fan-outs into projects
             # (reconcile_skill_links, reconcile_project).
             # The skills the asker turned off for themselves, read once for
-            # the whole turn: none of them is linked, followed by an artifact
-            # build or applied always on, whichever root holds it.
+            # the whole turn: none of them is linked or followed by an
+            # artifact build, whichever root holds it.
             off_for_me = await _turn_skills_off_for_me(current_settings_scope())
             managed = managed_folder()
             managed_skill_dirs: dict[str, Path] = {}
@@ -1876,25 +1869,6 @@ class AntonHarness:
                 ),
             ]
             read_only_dirs += anton_settings.skills_extra_roots
-            # Org-wide and team skills marked always on, applied on every task:
-            # hosted org mode only, so "" on the desktop and every local
-            # deployment. This path has no caller credential to read teams
-            # with, so it gets the fail-closed set (org-wide only), as a pod
-            # turn without one does. Which skills are always on is the org's
-            # skill_access rows', read in one unit of work.
-            always_on_context = ""
-            if sharing_applies(turn_scope):
-                always_on_context = render_always_on_skills(
-                    await run_db(
-                        partial(
-                            always_on_prompt_skills,
-                            project_name=conversation.project.name,
-                            viewer=None,
-                            off_for_me=off_for_me,
-                        ),
-                        scope=turn_scope,
-                    )
-                )
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
             # None with the sandbox off, and then not passed at all. Built in a
             # worker thread: it lists every person's partition and opens the
@@ -1934,10 +1908,6 @@ class AntonHarness:
                     runtime_context=build_runtime_context(anton_settings),
                     suffix=(
                         _turn_style_context(channel_context)
-                        # Next to the project instructions, the suffix's most
-                        # stable part: org skills change rarely, so the
-                        # cached prompt prefix survives from turn to turn.
-                        + always_on_context
                         + f"{project_context}"
                         + f"{output_context}"
                         + f"{skill_output_context}"

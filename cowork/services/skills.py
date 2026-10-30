@@ -262,7 +262,16 @@ def _used_in(skill: Skill, *, project_name: str | None) -> bool:
 def select_turn_skills(
     *, service: SkillService, project_name: str | None
 ) -> list[TurnSkill]:
-    """The skills of ``service``'s store that a turn in ``project_name`` uses.
+    """The skills of ``service``'s store that a turn in ``project_name`` uses
+    (_selected_turn_skills)."""
+    return [turn_skill for turn_skill, _skill in _selected_turn_skills(service, project_name)]
+
+
+def _selected_turn_skills(
+    service: SkillService, project_name: str | None
+) -> list[tuple[TurnSkill, Skill]]:
+    """The skills of ``service``'s store that a turn in ``project_name`` uses,
+    each with its parsed SKILL.md.
 
     Selection mirrors skill_links: enabled skills whose ``metadata.projects`` is
     empty or names this project, less the ones the scope's person turned off
@@ -276,7 +285,7 @@ def select_turn_skills(
     if not root.exists():
         return []
     off_for_me = service.off_for_me()
-    selected: list[TurnSkill] = []
+    selected: list[tuple[TurnSkill, Skill]] = []
     for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         slug = skill_dir.name
         if not service.allows_skill(slug) or slug in off_for_me:
@@ -303,15 +312,16 @@ def select_turn_skills(
             continue
         if not service.visible_to_viewer(skill):
             continue
-        selected.append(TurnSkill(slug=slug, path=skill_dir))
+        selected.append((TurnSkill(slug=slug, path=skill_dir), skill))
     return selected
 
 
-def _always_on_rank(service: SkillService, slug: str, path: Path) -> int | None:
+def _always_on_rank(service: SkillService, slug: str, skill: Skill) -> int | None:
     """0 for an always-on org-wide skill, 1 for an always-on one shared with
-    one of the viewer's teams, None for a skill that is only on demand."""
-    skill = _skill_from_dir(path)
-    if skill is None or is_builtin_skill(slug):
+    one of the viewer's teams, None for a skill that is only on demand.
+    Packaged built-ins are never always-on: they read as org-wide only
+    because they predate sharing."""
+    if is_builtin_skill(slug):
         return None
     viewer = service.viewer
     rule = service.access_rule(skill)
@@ -326,56 +336,26 @@ def _always_on_rank(service: SkillService, slug: str, path: Path) -> int | None:
     return None
 
 
-def always_on_turn_skills(
-    *, service: SkillService, project_name: str | None
-) -> list[TurnSkill]:
-    """The skills a turn applies on every task, in hosted org mode: the ones
-    the turn uses (select_turn_skills, which keeps the viewer's visible,
-    enabled skills of this project) that are org-wide or shared with one of
-    the viewer's teams and marked ``always_on`` in its skill_access row; every other
-    org-wide or team skill is on demand. Org-wide first, then team, each by
-    slug. Packaged built-ins are never always-on: they read as org-wide only
-    because they predate sharing. Empty outside hosted org mode."""
+def _split_always_on(
+    service: SkillService, selected: list[tuple[TurnSkill, Skill]]
+) -> tuple[list[TurnSkill], list[TurnSkill]]:
+    """``(always_on, on_demand)`` of a turn's selected skills, in hosted org
+    mode: always on are the ones org-wide or shared with one of the viewer's
+    teams and marked ``always_on`` in their skill_access row, org-wide first,
+    then team, each by slug; the rest keep their order. Outside hosted org
+    mode nothing is always on."""
     if not service.org_sharing:
-        return []
+        return [], [turn_skill for turn_skill, _skill in selected]
     ranked: list[tuple[int, str, TurnSkill]] = []
-    for turn_skill in select_turn_skills(service=service, project_name=project_name):
-        rank = _always_on_rank(service, turn_skill.slug, turn_skill.path)
-        if rank is not None:
+    on_demand: list[TurnSkill] = []
+    for turn_skill, skill in selected:
+        rank = _always_on_rank(service, turn_skill.slug, skill)
+        if rank is None:
+            on_demand.append(turn_skill)
+        else:
             ranked.append((rank, turn_skill.slug, turn_skill))
-    return [turn_skill for _rank, _slug, turn_skill in sorted(ranked, key=lambda r: r[:2])]
-
-
-def always_on_prompt_skills(
-    session: ScopedSession | None,
-    *,
-    project_name: str | None,
-    viewer: SkillViewer | None,
-    off_for_me: frozenset[str] | None = None,
-) -> list[dict]:
-    """``[{"name", "body"}]`` for render_always_on_skills
-    (cowork.services.always_on_skills), as the cloud pod builds it from the
-    request: the name from the SKILL.md frontmatter, as anton's parser
-    normalizes it, and the body stripped. ``session`` is the unit's, whose
-    scope picks the store and whose org's skill_access rows say which skills
-    are always on, and whose person's own off settings drop theirs unless
-    ``off_for_me`` already names them. Empty outside hosted org mode."""
-    scope = session.scope if session is not None else None
-    if not sharing_applies(scope):
-        return []
-    service = SkillService(
-        scope,
-        viewer=(viewer or fail_closed_viewer(scope)).for_turns(),
-        session=session,
-        off_for_me=off_for_me,
-    )
-    out: list[dict] = []
-    for turn_skill in always_on_turn_skills(service=service, project_name=project_name):
-        parsed = _skill_from_dir(turn_skill.path, canonicalize_name=False)
-        body = parsed.instructions.strip() if parsed is not None else ""
-        if body:
-            out.append({"name": normalize_name(parsed.name) or turn_skill.slug, "body": body})
-    return out
+    always_on = [turn_skill for _rank, _slug, turn_skill in sorted(ranked, key=lambda r: r[:2])]
+    return always_on, on_demand
 
 
 def shared_turn_skills(
@@ -442,9 +422,15 @@ def build_turn_skills(
     Selection is select_turn_skills's, by ``project_name``, else this project's
     folder name. In hosted org mode only the skills ``viewer`` sees go in (a
     missing viewer is the fail-closed one), and the always-on ones
-    (always_on_turn_skills) come first, in their order, since the pod renders
+    (_split_always_on) come first, in their order, since the pod renders
     them in the order it reads them. Who each skill is shared with is read
     from ``session``'s skill_access rows (SkillService).
+
+    This is every skill the pod's agent can recall in the turn: the pod
+    treats the block as the whole recallable set (anton#722), so a skill the
+    caller doesn't see is never there to recall, whatever its skills volume
+    holds. Every cloud turn sends it, empty when the caller sees nothing
+    (cowork.handlers.responses.remote_turn_skills).
     """
     if sharing_applies(scope):
         viewer = (viewer or fail_closed_viewer(scope)).for_turns()
@@ -458,13 +444,9 @@ def build_turn_skills(
     if project_name is None:
         project_name = Path(project_path).name if project_path else None
 
-    always_on = always_on_turn_skills(service=svc, project_name=project_name)
+    # One selection, split by always-on: each SKILL.md is parsed once.
+    always_on, rest = _split_always_on(svc, _selected_turn_skills(svc, project_name))
     always_on_slugs = {skill.slug for skill in always_on}
-    rest = [
-        skill
-        for skill in select_turn_skills(service=svc, project_name=project_name)
-        if skill.slug not in always_on_slugs
-    ]
     out: dict[str, dict] = {}
     for skill in [*always_on, *rest]:
         files = _skill_wire_files(skill.path, svc.root)

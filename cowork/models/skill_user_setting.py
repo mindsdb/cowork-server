@@ -32,6 +32,17 @@ class SkillUserSetting(BaseSQLModel, table=True):
         sa.UniqueConstraint(
             "org_id", "user_id", "skill_slug", name="uq_skill_user_setting_org_user_skill"
         ),
+        # NULLs are distinct in the constraint above, so rows with no org
+        # (the desktop, and wherever skills are left shared) take their own
+        # partial unique index.
+        sa.Index(
+            "uq_skill_user_setting_user_skill_no_org",
+            "user_id",
+            "skill_slug",
+            unique=True,
+            postgresql_where=sa.text("org_id IS NULL"),
+            sqlite_where=sa.text("org_id IS NULL"),
+        ),
     )
 
     org_id: str | None = Field(

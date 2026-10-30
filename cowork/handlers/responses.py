@@ -536,8 +536,39 @@ class _RemoteTurnInputs:
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
     files: AgentFiles | None
-    # The skills the caller sees, for the pod's request (_remote_skills).
-    skills: dict | None = None
+    # The skills the caller sees, the pod's whole recallable set
+    # (remote_turn_skills); {} when they see none.
+    skills: dict
+
+
+def remote_turn_skills(session: ScopedSession, conv_id: UUID, *, viewer=None) -> dict:
+    """The skills block for a cloud turn's request: every skill the pod's
+    agent may recall in it, and the always-on ones flagged and first
+    (cowork.services.skills.build_turn_skills). In hosted org mode only the
+    skills ``viewer`` sees; without one (a scheduled or channel turn, or one
+    whose teams couldn't be read) the fail-closed viewer's.
+
+    Never None: the pod treats a request without the block as one that may
+    recall anything on its skills volume, which holds every member's skills,
+    so every turn path sends one. A failure sends ``{}``, a turn with no
+    skills, rather than failing the turn or falling back to the volume.
+    """
+    from cowork.services.skills import build_turn_skills
+
+    try:
+        conversation = ConversationService(session).get_conversation(conv_id)
+        return build_turn_skills(
+            session.scope,
+            project_name=conversation.project.name,
+            viewer=viewer,
+            session=session,
+        )
+    except Exception:
+        logger.exception(
+            "[responses] failed to build the turn's skills; sending none",
+            extra=log_context(conversation_id=conv_id),
+        )
+        return {}
 
 
 @dataclass
@@ -657,7 +688,7 @@ class ResponsesHandler:
         # fail-closed set, without skills shared only with a team.
         self.hub_bearer = hub_bearer
         # Hosted org skill sharing's view of the caller, resolved once per
-        # remote turn before its inputs are read (_remote_skills).
+        # remote turn before its inputs are read (remote_turn_skills).
         self._skill_viewer = None
         # The harness this turn runs: the request's own pick or the stored
         # setting, resolved by handle() from the settings its first unit reads.
@@ -1561,7 +1592,7 @@ class ResponsesHandler:
 
         try:
             self._skill_viewer = await resolve_skill_viewer(
-                scope=scope, principal=self.principal, bearer_token=getattr(self, "hub_bearer", "")
+                scope=scope, principal=self.principal, bearer_token=self.hub_bearer
             )
         except Exception:
             logger.warning("[responses] could not resolve the caller's teams for skills", exc_info=True)
@@ -1574,10 +1605,10 @@ class ResponsesHandler:
         into the conversation workspace on the shared mount, and seed this
         org's skill store with the packaged builtins if it hasn't been yet.
 
-        The seeding call belongs here, not just behind ``GET /skills``: the pod
-        reads skills straight off the shared mount (no payload), so this is the
-        only place that runs on every remote turn and can catch an org that
-        chats before it ever opens the skills menu. Never fails the turn: a
+        The seeding call belongs here, not just behind ``GET /skills``: this
+        runs before every remote turn, web or channel, and catches an org that
+        chats before it ever opens the skills menu, as the turn's skills block
+        (remote_turn_skills) seeds again. Never fails the turn: a
         staging error degrades to a turn without the missing piece."""
         try:
             from cowork.services.artifact_roots import project_artifacts_base
@@ -1816,35 +1847,8 @@ class ResponsesHandler:
             workspace=workspace,
             started_at=self._remote_started_at(session, conv_id),
             files=self._remote_agent_files(session, conv_id, workspace=workspace),
-            skills=self._remote_skills(session, conv_id),
+            skills=remote_turn_skills(session, conv_id, viewer=self._skill_viewer),
         )
-
-    def _remote_skills(self, session: ScopedSession, conv_id: UUID) -> dict | None:
-        """The skills block for the pod's request, in hosted org mode: only
-        the skills the caller sees, the always-on ones flagged and first
-        (build_turn_skills). The pod renders the always-on ones into its
-        prompt from this block alone, and today still reads the rest off the
-        org skills mount, which holds every member's skills; see
-        build_turn_skills.
-
-        None outside org mode, and on a failure, which runs the turn without
-        a skills block rather than failing it.
-        """
-        if not getattr(getattr(session, "scope", None), "org_mode", False):
-            return None
-        from cowork.services.skills import build_turn_skills
-
-        try:
-            conversation = ConversationService(session).get_conversation(conv_id)
-            return build_turn_skills(
-                session.scope,
-                project_name=conversation.project.name,
-                viewer=getattr(self, "_skill_viewer", None),
-                session=session,
-            )
-        except Exception:
-            logger.exception("[responses] failed to build the turn's skills", extra=log_context(conversation_id=conv_id))
-            return None
 
     @staticmethod
     def _remote_seed_history(session, conv_id) -> tuple[list[dict], dict | None]:
@@ -2320,9 +2324,10 @@ class ResponsesHandler:
                 model=model,
                 turn_id=turn_id,
                 history=seed.history,
-                # Global memory and skills use read-only mounts. Project
-                # memory is outside the conversation workspace and therefore
-                # travels as a bounded, sheddable wire block.
+                # Global memory uses a read-only mount. Project memory is
+                # outside the conversation workspace and therefore travels as
+                # a bounded, sheddable wire block. Skills travel as the
+                # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
                 skills=seed.skills,
                 workspace=seed.workspace,

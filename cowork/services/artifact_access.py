@@ -35,7 +35,7 @@ def _audience_rejection(response: httpx.Response) -> str:
         ids = ", ".join(str(i) for i in body.get("allowed_user_ids") or [])
         return f"Only people in your organization can be added by name; share with anyone else by email: {ids}"
     if body.get("code") == "unknown_team":
-        ids = ", ".join(str(i) for i in body.get("team_ids") or [])
+        ids = ", ".join(str(i) for i in body.get("allowed_team_ids") or body.get("team_ids") or [])
         return f"Each team must be a team of your organization: {ids}"
     return ""
 
@@ -155,7 +155,7 @@ def sync_artifact_team_access(
     workspace_id: str | None,
     allowed_emails: list[str],
     org_allowed: bool,
-    team_ids: list[str],
+    allowed_team_ids: list[str],
     access_version: int,
     allowed_user_ids: list[str] | None = None,
     notify_user_ids: list[str] | None = None,
@@ -170,19 +170,17 @@ def sync_artifact_team_access(
     The publish lambda upserts the same rule from the anton publisher's
     access block, which carries emails and the org flag but no teams or
     people by id, so this upserts the whole rule again, with the same
-    version, adding ``team_ids`` and ``allowed_user_ids`` (Keycloak ids of
-    people in the org; ``allowed_emails`` are people outside it). Auth checks
-    each team belongs to the org and each person is a member of it, and
-    refuses the whole rule otherwise: ArtifactAudienceRejected, naming them.
-    Called after a successful publish, so it lands second. ``org_wide`` is
-    sent equal to ``org_allowed``: one audience, "everyone in the owner's
-    organization", under auth's old and new names, so the two never disagree.
-    An auth that predates teams ignores both new fields and keeps the rule
-    the lambda wrote. Raises ArtifactAccessUnavailable when it can't write, so
-    a restricted publish never reports a team audience auth doesn't hold.
+    version, under auth's ArtifactAccess names: ``org_allowed``,
+    ``allowed_team_ids``, ``allowed_user_ids`` (Keycloak ids of people in the
+    org) and ``allowed_emails`` (people outside it). Auth checks each team
+    belongs to the org and each person is a member of it, and refuses the
+    whole rule otherwise: ArtifactAudienceRejected, naming them. Called after
+    a successful publish, so it lands second. Raises ArtifactAccessUnavailable
+    when it can't write, so a restricted publish never reports a team
+    audience auth doesn't hold.
 
     ``notify_user_ids`` and ``notify_emails`` are the people a person's own
-    save chose to tell: with either non-empty the write carries
+    save chose to tell: with either non-empty the write carries auth's
     ``notify_recipients: true`` and both lists, and auth emails them, naming
     the artifact by ``artifact_title`` and linking ``artifact_url``. The
     lambda's write, a re-sync and a retry never carry any of it.
@@ -204,9 +202,8 @@ def sync_artifact_team_access(
                 "workspace_id": workspace_id or None,
                 "allowed_emails": allowed_emails,
                 "org_allowed": org_allowed,
-                "team_ids": team_ids,
+                "allowed_team_ids": allowed_team_ids,
                 "allowed_user_ids": list(allowed_user_ids or []),
-                "org_wide": org_allowed,
                 "access_version": access_version,
                 **(
                     {

@@ -24,6 +24,8 @@ import httpx
 import pytest
 from anton.core.tools.skill_format import dump_skill
 from fastapi import HTTPException
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -43,11 +45,6 @@ from cowork.schemas.skills import (
     SkillUpdateRequest,
 )
 from cowork.services import hub_people, hub_teams
-from cowork.services.always_on_skills import (
-    ALWAYS_ON_SKILL_MAX_CHARS,
-    ALWAYS_ON_TOTAL_MAX_CHARS,
-    render_always_on_skills,
-)
 from cowork.services.skill_access import (
     access_row,
     access_rows,
@@ -67,7 +64,6 @@ from cowork.services.skill_sharing import (
 from cowork.services.skills import (
     BUILTIN_SKILL_SLUGS,
     SkillService,
-    always_on_prompt_skills,
     build_turn_skills,
     link_turn_skills,
 )
@@ -87,11 +83,6 @@ EMAILS = {ALICE: "alice@x.com", BOB: "bob@x.com", CAROL: "carol@x.com", DAVE: "d
 TEAM_ENG = "team-eng"
 TEAM_OPS = "team-ops"
 
-HEADER = (
-    "\n\n## Organization and team skills (always apply)\n"
-    "These are how this organization works. Follow them on every task where they apply; "
-    "they override general defaults but never the user's explicit instructions in this conversation."
-)
 NOTHING_SHARED = {"orgAllowed": False, "allowedTeamIds": [], "allowedUserIds": [], "alwaysOn": False}
 
 
@@ -475,6 +466,26 @@ def test_org_wide_takes_the_share_org_capability(org):
     _refused(lambda: _share(org, ALICE, "shared", _viewer(ALICE, write_org=True), org_allowed=False), 403)
 
 
+def test_org_wide_also_takes_owning_the_skill_or_admin(org):
+    """skills.share_org alone doesn't let someone a skill was shared with
+    make it org-wide, or take that back: the owner or an admin decides."""
+    _create(org, ALICE, "team-skill")
+    _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], allowed_user_ids=[BOB])
+    bob = _viewer(BOB, teams=(TEAM_ENG,), share_org=True)
+
+    _refused(
+        lambda: _share(org, BOB, "team-skill", bob, org_allowed=True), 403, skills_ep.SHARING_ORG_REFUSAL,
+    )
+    assert _row(org, "team-skill").org_allowed is False
+    out = _share(org, ADMIN, "team-skill", _viewer(ADMIN, admin=True, share_org=True), admin=True, org_allowed=True)
+    assert out["access"]["orgAllowed"] is True
+    _refused(
+        lambda: _share(org, BOB, "team-skill", bob, org_allowed=False), 403, skills_ep.SHARING_ORG_REFUSAL,
+    )
+    out = _share(org, ALICE, "team-skill", _viewer(ALICE, teams=(TEAM_ENG,), share_org=True), org_allowed=False)
+    assert out["access"]["orgAllowed"] is False
+
+
 def test_an_owners_skill_is_listed_by_its_audience(org):
     """The owner's section follows who the skill reaches: only them or
     people is "mine", a team is "team", org-wide is "org"."""
@@ -639,7 +650,7 @@ def test_an_org_wide_skill_takes_write_org_to_change(org):
 
 
 ALWAYS_ON_UNSHARED = "Only skills shared with the organization or a team can be always on."
-ALWAYS_ON_ORG = "Only admins can make an organization-wide skill always on."
+ALWAYS_ON_ORG = skills_ep.ALWAYS_ON_ORG_REFUSAL
 
 
 def _stored_always_on(org, slug: str) -> bool:
@@ -796,42 +807,16 @@ def test_the_pod_gets_only_visible_skills_with_always_on_first(org):
     assert "bob-own" in blind and not {"alpha-org", "beta-team", "gamma-person"} & set(blind)
 
 
-def test_the_in_process_suffix_renders_the_same_always_on_skills(org):
+def test_a_turn_without_a_viewer_gets_only_org_wide_skills_always_on(org):
+    """No caller credential (a scheduled or channel turn): the fail-closed
+    viewer's set, so only org-wide skills apply always on, and no team-only
+    skill is there to recall."""
     _turn_fixture(org)
 
-    skills = always_on_prompt_skills(org.as_(BOB), project_name="general", viewer=_viewer(BOB, teams=(TEAM_ENG,)))
-    assert skills == [
-        {"name": "alpha-org", "body": "Body of alpha-org."},
-        {"name": "beta-team", "body": "Body of beta-team."},
-    ]
-    assert render_always_on_skills(skills) == (
-        HEADER + "\n\n### alpha-org\nBody of alpha-org." + "\n\n### beta-team\nBody of beta-team."
-    )
-    # Without a viewer (no caller credential) only org-wide skills apply.
-    assert [s["name"] for s in always_on_prompt_skills(
-        org.as_(BOB), project_name="general", viewer=None,
-    )] == ["alpha-org"]
-
-
-def test_the_render_respects_both_budgets():
-    long_line = "x" * 50
-    body = "\n".join([long_line] * 200)  # 10199 chars
-    rendered = render_always_on_skills([{"name": "big", "body": body}])
-    cut = body[:ALWAYS_ON_SKILL_MAX_CHARS]
-    cut = cut[: cut.rfind("\n")]
-    assert rendered == HEADER + f"\n\n### big\n{cut}\n[…truncated; the full skill is available on demand]"
-    # One line longer than the cap is cut at the cap.
-    one_line = render_always_on_skills([{"name": "line", "body": "y" * 7000}])
-    assert one_line.endswith("y" * ALWAYS_ON_SKILL_MAX_CHARS + "\n[…truncated; the full skill is available on demand]")
-    # Past the total, the first skill that doesn't fit and every later one,
-    # however small, are named instead.
-    full = "z" * (ALWAYS_ON_SKILL_MAX_CHARS - 1)
-    skills = [{"name": f"s{i}", "body": full} for i in range(4)] + [{"name": "tiny", "body": "t"}]
-    rendered = render_always_on_skills([{"name": "first", "body": "a" * 100}, *skills])
-    assert 100 + 3 * len(full) <= ALWAYS_ON_TOTAL_MAX_CHARS < 100 + 4 * len(full)
-    assert "### s2" in rendered and "### s3" not in rendered and "### tiny" not in rendered
-    assert rendered.endswith("\n\n(Also available on demand: s3, tiny.)")
-    assert render_always_on_skills([]) == ""
+    block = build_turn_skills(org.as_(BOB).scope, project_name="general", viewer=None, session=org.as_(BOB))
+    assert [slug for slug, entry in block.items() if entry.get("always_on")] == ["alpha-org"]
+    assert not {"beta-team", "eta-team", "dave-private"} & set(block)
+    assert {"alpha-org", "delta-org", "gamma-person", "bob-own"} <= set(block)
 
 
 def test_the_request_sheds_on_demand_skills_before_always_on_ones(monkeypatch):
@@ -849,9 +834,15 @@ def test_the_request_sheds_on_demand_skills_before_always_on_ones(monkeypatch):
     fitted = _fit_request(params, "conv")
     assert list(fitted["skills"]) == ["rule"]
 
+    # Not even the always-on ones fit: the block stays, empty, so the pod
+    # recalls nothing rather than its whole skills volume.
+    params = {"input": "hi", "skills": {"rule": {"files": {"SKILL.md": "r" * 3000}, "always_on": True}}}
+    assert _fit_request(params, "conv")["skills"] == {}
+
 
 def test_the_producer_sends_the_skills_block(monkeypatch):
-    """stream_remote_replies puts ``skills`` on the job, absent when empty."""
+    """stream_remote_replies always puts ``skills`` on the job, ``{}`` when
+    the caller sees nothing or no block was built."""
     from cowork.turnqueue import producer
 
     captured: list[dict] = []
@@ -897,8 +888,10 @@ def test_the_producer_sends_the_skills_block(monkeypatch):
     block = {"rule": {"files": {"SKILL.md": "---\nname: rule\n---\nx"}, "always_on": True}}
     asyncio.run(run(block))
     asyncio.run(run({}))
+    asyncio.run(run(None))
     assert captured[0]["skills"] == block
-    assert "skills" not in captured[1]
+    assert captured[1]["skills"] == {}
+    assert captured[2]["skills"] == {}
 
 
 # ── desktop and local deployments ────────────────────────────────────────────
@@ -916,7 +909,6 @@ def test_local_deployments_are_unchanged(monkeypatch, tmp_path):
         assert build_turn_skills(LOCAL_SCOPE, project_name="general") == {
             "desk": {"files": {"SKILL.md": (service.root / "desk" / "SKILL.md").read_text()}}
         }
-        assert always_on_prompt_skills(None, project_name="general", viewer=None) == []
         assert skills_ep.skill_sharing_capabilities(None) == {
             "enabled": False, "canShareOrg": False, "canWriteOrg": False, "orgName": None,
         }
@@ -1221,21 +1213,17 @@ def test_teams_and_people_reach_anton_as_owner_only_and_survive_republish():
     from cowork.services.publish import _org_audience, _with_team_audience
 
     access = {
-        "mode": "restricted", "emails": [], "org_allowed": False, "team_ids": [TEAM_ENG],
-        "allowed_user_ids": [BOB], "org_wide": False,
+        "mode": "restricted", "emails": [], "org_allowed": False, "allowed_team_ids": [TEAM_ENG],
+        "allowed_user_ids": [BOB],
     }
     audience = _org_audience(access, None)
-    assert audience == {"team_ids": [TEAM_ENG], "allowed_user_ids": [BOB]}
+    assert audience == {"allowed_team_ids": [TEAM_ENG], "allowed_user_ids": [BOB]}
     assert _with_team_audience(access, audience) == {
         "mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True,
     }
-    # org_wide is org_allowed under auth's new name: either one sets it.
-    assert _with_team_audience(
-        {"mode": "restricted", "emails": [], "org_wide": True}, {"team_ids": [], "allowed_user_ids": []},
-    )["org_allowed"] is True
-    previous = {"mode": "restricted", "team_ids": [TEAM_OPS], "allowed_user_ids": [CAROL]}
+    previous = {"mode": "restricted", "allowed_team_ids": [TEAM_OPS], "allowed_user_ids": [CAROL]}
     assert _org_audience({"mode": "restricted", "emails": ["a@x.com"]}, previous) == {
-        "team_ids": [TEAM_OPS], "allowed_user_ids": [CAROL],
+        "allowed_team_ids": [TEAM_OPS], "allowed_user_ids": [CAROL],
     }
     assert _org_audience({"mode": "restricted", "allowed_user_ids": []}, previous)["allowed_user_ids"] == []
     assert _with_team_audience({"mode": "public"}, audience) == {"mode": "public"}
@@ -1246,12 +1234,12 @@ def test_a_people_only_restriction_stays_restricted_never_public_or_nobody():
     field empty and owner_only false. anton's publisher reads that as an
     empty selection and would publish it public; the plan keeps it restricted
     to the owner there and widens it to the people at auth."""
-    from cowork.services.publish import _plan_access
+    from cowork.services.publish import _plan_access, access_from_app
 
-    app_body = {
+    app_body = access_from_app({
         "mode": "restricted", "org_allowed": False, "allowed_team_ids": [], "allowed_user_ids": [BOB],
-        "allowed_emails": [], "owner_only": False, "emails": [], "team_ids": [],
-    }
+        "allowed_emails": [], "owner_only": False,
+    })
     effective, _pwd, version, owner_side, team_audience = _plan_access(None, app_body, None, org_mode=True)
     assert effective["mode"] == "restricted"
     assert (owner_side["mode"], owner_side["owner_only"], owner_side["allowed_user_ids"]) == (
@@ -1259,7 +1247,7 @@ def test_a_people_only_restriction_stays_restricted_never_public_or_nobody():
     )
     # Written to auth with the people: not public, and not the owner alone.
     assert team_audience is True
-    # Republished with a client that predates people: they stay.
+    # Republished with an access that leaves people out: they stay.
     again = _plan_access(None, {"mode": "restricted", "emails": []}, owner_side, org_mode=True)
     assert (again[0]["mode"], again[3]["allowed_user_ids"], again[4]) == ("restricted", [BOB], True)
     # Taking the people away (nothing else picked) is the owner alone, written
@@ -1272,19 +1260,28 @@ def test_a_people_only_restriction_stays_restricted_never_public_or_nobody():
     assert (local[0]["mode"], local[3]["owner_only"], local[4]) == ("restricted", True, False)
 
 
-def test_auth_names_are_aliases_of_the_older_access_fields():
-    from cowork.services.publish import _plan_access, canonical_access
+def test_the_app_sends_auths_four_audience_names_and_nothing_else():
+    """org_allowed, allowed_team_ids, allowed_user_ids and allowed_emails;
+    allowed_emails is anton's emails. A retired name is refused, naming the
+    one to send, rather than dropped."""
+    from cowork.services.publish import _plan_access, access_from_app
 
-    assert canonical_access(
-        {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "team_ids": [], "allowed_emails": ["e@else.com"]}
-    ) == {"mode": "restricted", "team_ids": [TEAM_ENG], "emails": ["e@else.com"]}
-    assert canonical_access({"mode": "restricted", "team_ids": [TEAM_OPS]}) == {
-        "mode": "restricted", "team_ids": [TEAM_OPS],
+    assert access_from_app({
+        "mode": "restricted", "org_allowed": True, "allowed_team_ids": [TEAM_ENG],
+        "allowed_user_ids": [BOB], "allowed_emails": ["e@else.com"],
+    }) == {
+        "mode": "restricted", "org_allowed": True, "allowed_team_ids": [TEAM_ENG],
+        "allowed_user_ids": [BOB], "emails": ["e@else.com"],
     }
+    for retired, name in (("emails", "allowed_emails"), ("team_ids", "allowed_team_ids"), ("org_wide", "org_allowed")):
+        with pytest.raises(ValueError, match=name):
+            access_from_app({"mode": "restricted", retired: []})
     _e, _p, _v, owner_side, _t = _plan_access(
         None, {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "org_allowed": True}, None, org_mode=True,
     )
-    assert (owner_side["team_ids"], owner_side["org_allowed"], owner_side["owner_only"]) == ([TEAM_ENG], True, False)
+    assert (owner_side["allowed_team_ids"], owner_side["org_allowed"], owner_side["owner_only"]) == (
+        [TEAM_ENG], True, False,
+    )
 
 
 def test_the_team_and_people_audience_is_written_to_auth():
@@ -1300,7 +1297,7 @@ def test_the_team_and_people_audience_is_written_to_auth():
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
     sync_artifact_team_access(
         artifact_id="artifact/1", scope=scope, owner_user_id=ALICE, workspace_id=None,
-        allowed_emails=["e@else.com"], org_allowed=False, team_ids=[TEAM_ENG], allowed_user_ids=[BOB],
+        allowed_emails=["e@else.com"], org_allowed=False, allowed_team_ids=[TEAM_ENG], allowed_user_ids=[BOB],
         access_version=3, settings=settings, client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     assert seen == [{
@@ -1308,7 +1305,7 @@ def test_the_team_and_people_audience_is_written_to_auth():
         "body": {
             "artifact_id": "artifact/1", "owner_keycloak_id": ALICE, "organization_id": ORG_ID,
             "workspace_id": None, "allowed_emails": ["e@else.com"], "org_allowed": False,
-            "team_ids": [TEAM_ENG], "allowed_user_ids": [BOB], "org_wide": False, "access_version": 3,
+            "allowed_team_ids": [TEAM_ENG], "allowed_user_ids": [BOB], "access_version": 3,
         },
     }]
 
@@ -1323,7 +1320,7 @@ def test_auth_refusing_a_non_member_is_a_400_naming_them():
     with pytest.raises(ArtifactAudienceRejected) as caught:
         sync_artifact_team_access(
             artifact_id="a", scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE),
-            owner_user_id=ALICE, workspace_id=None, allowed_emails=[], org_allowed=False, team_ids=[],
+            owner_user_id=ALICE, workspace_id=None, allowed_emails=[], org_allowed=False, allowed_team_ids=[],
             allowed_user_ids=[EVE], access_version=1, settings=settings,
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
@@ -1344,7 +1341,7 @@ def test_the_access_write_carries_notify_only_when_asked():
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
     common = dict(
         artifact_id="artifact/1", scope=scope, owner_user_id=ALICE, workspace_id=None,
-        allowed_emails=["e@else.com"], org_allowed=False, team_ids=[], allowed_user_ids=[BOB],
+        allowed_emails=["e@else.com"], org_allowed=False, allowed_team_ids=[], allowed_user_ids=[BOB],
         access_version=3, settings=settings,
     )
     sync_artifact_team_access(**common, client=httpx.Client(transport=httpx.MockTransport(handler)))
@@ -1375,13 +1372,15 @@ def test_the_post_publish_rewrite_sends_the_people(monkeypatch):
     monkeypatch.setattr(artifact_autopublish, "_active_workspace_id", lambda scope: None)
     _sync_team_audience(
         artifact_id="a", scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE),
-        owner_side={"mode": "restricted", "emails": [], "org_allowed": False, "team_ids": [TEAM_ENG],
+        owner_side={"mode": "restricted", "emails": [], "org_allowed": False, "allowed_team_ids": [TEAM_ENG],
                     "allowed_user_ids": [BOB], "access_version": 4},
     )
-    assert (sent[0]["team_ids"], sent[0]["allowed_user_ids"], sent[0]["access_version"]) == ([TEAM_ENG], [BOB], 4)
+    assert (sent[0]["allowed_team_ids"], sent[0]["allowed_user_ids"], sent[0]["access_version"]) == (
+        [TEAM_ENG], [BOB], 4,
+    )
 
 
-def test_the_access_read_returns_teams_people_and_org_wide(tmp_path):
+def test_the_access_read_returns_teams_people_and_org_allowed(tmp_path):
     from cowork.services.artifacts import _published_access_for
     from cowork.services.publish import published_artifact_access
 
@@ -1391,12 +1390,13 @@ def test_the_access_read_returns_teams_people_and_org_wide(tmp_path):
     (folder / "metadata.json").write_text(json.dumps({"slug": "rep", "type": "html-app"}))
     (folder / ".published.json").write_text(json.dumps({"index.html": {
         "report_id": "r1", "url": "u", "mode": "restricted", "emails": [], "org_allowed": True,
-        "owner_only": False, "team_ids": [TEAM_ENG], "allowed_user_ids": [BOB], "access_version": 2,
+        "owner_only": False, "allowed_team_ids": [TEAM_ENG], "allowed_user_ids": [BOB], "access_version": 2,
     }}))
     read = _published_access_for(folder, folder / "index.html")
-    assert (read["allowedTeamIds"], read["allowedUserIds"], read["orgWide"]) == ([TEAM_ENG], [BOB], True)
+    assert (read["allowedTeamIds"], read["allowedUserIds"], read["orgAllowed"]) == ([TEAM_ENG], [BOB], True)
+    assert "orgWide" not in read
     again = published_artifact_access(folder, artifacts_base=folder.parent)
-    assert (again["team_ids"], again["allowed_user_ids"], again["org_allowed"]) == ([TEAM_ENG], [BOB], True)
+    assert (again["allowed_team_ids"], again["allowed_user_ids"], again["org_allowed"]) == ([TEAM_ENG], [BOB], True)
     # People alone are stored owner-only for anton, and read as people.
     (folder / ".published.json").write_text(json.dumps({"index.html": {
         "report_id": "r1", "url": "u", "mode": "restricted", "emails": [], "org_allowed": False,
@@ -1404,6 +1404,12 @@ def test_the_access_read_returns_teams_people_and_org_wide(tmp_path):
     }}))
     read = _published_access_for(folder, folder / "index.html")
     assert (read["ownerOnly"], read["allowedUserIds"]) == (False, [BOB])
+
+
+def _request(principal=None):
+    return SimpleNamespace(
+        headers={"X-MindsHub-Authorization": "Bearer t"}, state=SimpleNamespace(principal=principal),
+    )
 
 
 def test_setting_artifact_access_passes_people_through(monkeypatch):
@@ -1414,9 +1420,9 @@ def test_setting_artifact_access_passes_people_through(monkeypatch):
 
     monkeypatch.setattr(hub_teams, "get_auth_json", no_auth)
     session = SimpleNamespace(scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE))
-    request = SimpleNamespace(headers={"X-MindsHub-Authorization": "Bearer t"}, state=SimpleNamespace(principal=_principal(ALICE)))
+    request = _request(_principal(ALICE))
     out = asyncio.run(aw._checked_team_audience(
-        {"mode": "restricted", "allowed_user_ids": [f" {BOB.upper()}", BOB], "allowed_emails": ["e@else.com"]},
+        {"mode": "restricted", "allowed_user_ids": [f" {BOB.upper()}", BOB], "emails": ["e@else.com"]},
         request=request, session=session,
     ))
     assert out == {"mode": "restricted", "allowed_user_ids": [BOB], "emails": ["e@else.com"]}
@@ -1425,11 +1431,11 @@ def test_setting_artifact_access_passes_people_through(monkeypatch):
             {"mode": "restricted", "allowed_user_ids": "nope"}, request=request, session=session,
         ))
     assert caught.value.status_code == 400
-    # Outside org mode, people picked alone still keep the rule private.
+    # Outside org mode the access is left as it is: the plan keeps people
+    # picked alone private (test_a_people_only_restriction_stays_restricted...).
     local = SimpleNamespace(scope=LOCAL_SCOPE)
-    assert asyncio.run(aw._checked_team_audience(
-        {"mode": "restricted", "allowed_user_ids": [BOB], "owner_only": False}, request=None, session=local,
-    )) == {"mode": "restricted", "owner_only": True}
+    access = {"mode": "restricted", "allowed_user_ids": [BOB], "owner_only": False}
+    assert asyncio.run(aw._checked_team_audience(access, request=_request(), session=local)) == access
 
 
 def test_setting_artifact_access_checks_the_callers_teams(monkeypatch):
@@ -1442,18 +1448,21 @@ def test_setting_artifact_access_checks_the_callers_teams(monkeypatch):
 
     monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
     session = SimpleNamespace(scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE))
-    request = SimpleNamespace(headers={"X-MindsHub-Authorization": "Bearer t"}, state=SimpleNamespace(principal=_principal(ALICE)))
+    request = _request(_principal(ALICE))
     ok = asyncio.run(aw._checked_team_audience(
-        {"mode": "restricted", "team_ids": [f" {TEAM_ENG} "], "org_wide": True}, request=request, session=session,
+        {"mode": "restricted", "allowed_team_ids": [f" {TEAM_ENG} "], "org_allowed": True},
+        request=request, session=session,
     ))
-    assert ok == {"mode": "restricted", "team_ids": [TEAM_ENG], "org_wide": True}
+    assert ok == {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "org_allowed": True}
     with pytest.raises(HTTPException) as caught:
-        asyncio.run(aw._checked_team_audience({"mode": "restricted", "team_ids": [TEAM_OPS]}, request=request, session=session))
+        asyncio.run(aw._checked_team_audience(
+            {"mode": "restricted", "allowed_team_ids": [TEAM_OPS]}, request=request, session=session,
+        ))
     assert caught.value.status_code == 400
-    admin_request = SimpleNamespace(headers=request.headers, state=SimpleNamespace(principal=_principal(ADMIN, admin=True)))
+    admin_request = _request(_principal(ADMIN, admin=True))
     assert asyncio.run(aw._checked_team_audience(
-        {"mode": "restricted", "team_ids": [TEAM_OPS]}, request=admin_request, session=session,
-    ))["team_ids"] == [TEAM_OPS]
+        {"mode": "restricted", "allowed_team_ids": [TEAM_OPS]}, request=admin_request, session=session,
+    ))["allowed_team_ids"] == [TEAM_OPS]
     # The org's default team is everyone: dropped from the teams, org-wide.
     hub_teams.reset_caches_for_tests()
 
@@ -1463,48 +1472,13 @@ def test_setting_artifact_access_checks_the_callers_teams(monkeypatch):
     monkeypatch.setattr(hub_teams, "get_auth_json", with_default)
     for caller in (request, admin_request):
         assert asyncio.run(aw._checked_team_audience(
-            {"mode": "restricted", "team_ids": ["team-all", TEAM_ENG]}, request=caller, session=session,
-        )) == {"mode": "restricted", "team_ids": [TEAM_ENG], "org_wide": True}
+            {"mode": "restricted", "allowed_team_ids": ["team-all", TEAM_ENG]}, request=caller, session=session,
+        )) == {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "org_allowed": True}
     assert asyncio.run(aw._checked_team_audience(
-        {"mode": "restricted", "team_ids": ["team-all"], "org_wide": False}, request=request, session=session,
-    )) == {"mode": "restricted", "team_ids": [], "org_wide": True}
-    local = SimpleNamespace(scope=LOCAL_SCOPE)
-    assert asyncio.run(aw._checked_team_audience(
-        {"mode": "restricted", "team_ids": [TEAM_OPS], "org_wide": True}, request=None, session=local,
-    )) == {"mode": "restricted", "owner_only": True}
+        {"mode": "restricted", "allowed_team_ids": ["team-all"], "org_allowed": False},
+        request=request, session=session,
+    )) == {"mode": "restricted", "allowed_team_ids": [], "org_allowed": True}
     hub_teams.reset_caches_for_tests()
-
-
-# ── the in-process harness ───────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_the_harness_puts_the_always_on_section_in_the_suffix(monkeypatch, tmp_path):
-    """The in-process turn appends render_always_on_skills's section to its
-    suffix, ahead of the project context, from a unit of work in hosted org
-    mode; a local turn has none and reads nothing."""
-    from cowork.harnesses.anton_harness import harness
-    from tests._turns import built_turn
-
-    seen: list[tuple] = []
-
-    def always_on(session, **kwargs):
-        seen.append((session, kwargs))
-        return [{"name": "house-style", "body": "Use the house style."}]
-
-    monkeypatch.setattr(harness, "always_on_prompt_skills", always_on)
-    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=LOCAL_SCOPE) as turn:
-        assert "Organization and team skills" not in turn.config.system_prompt_context.suffix
-    assert seen == []
-
-    monkeypatch.setattr(harness, "sharing_applies", lambda scope: True)
-    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=LOCAL_SCOPE) as turn:
-        suffix = turn.config.system_prompt_context.suffix
-    section = HEADER + "\n\n### house-style\nUse the house style."
-    assert section in suffix
-    session, kwargs = seen[0]
-    assert isinstance(session, ScopedSession)
-    assert kwargs == {"project_name": turn.project.name, "viewer": None, "off_for_me": frozenset()}
 
 
 # ── off for me (a person's own on/off) ───────────────────────────────────────
@@ -1577,12 +1551,8 @@ def test_an_always_on_skill_off_for_me_leaves_my_turns_only(org):
     block = _turn(org, BOB, bob)
     assert "alpha-org" not in block
     assert [slug for slug, entry in block.items() if entry.get("always_on")] == ["beta-team"]
-    assert [s["name"] for s in always_on_prompt_skills(org.as_(BOB), project_name="general", viewer=bob)] == [
-        "beta-team"
-    ]
     carol = _viewer(CAROL, teams=(TEAM_ENG,))
-    assert _turn(org, CAROL, carol)["alpha-org"]["always_on"] is True
-    assert [s["name"] for s in always_on_prompt_skills(org.as_(CAROL), project_name="general", viewer=carol)] == [
+    assert [slug for slug, entry in _turn(org, CAROL, carol).items() if entry.get("always_on")] == [
         "alpha-org", "beta-team",
     ]
 
@@ -1692,5 +1662,38 @@ def test_off_for_me_on_the_desktop(monkeypatch, tmp_path):
             # A delete takes the setting with it.
             skills_ep.delete_skill("desk", scoped, None, None)
             assert user_off_for_me(scoped) == frozenset()
+    finally:
+        get_app_settings.cache_clear()
+
+
+def test_off_for_me_on_the_desktop_keeps_one_row_and_on_clears_every_one(monkeypatch, tmp_path):
+    """The desktop's rows carry no org, where the org-keyed unique constraint
+    doesn't hold (NULLs are distinct): the no-org partial index refuses a
+    second row, and turning a skill back on deletes every matching row, so
+    a twin can never keep it off."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.delenv("COWORK_MANAGED_DIR", raising=False)
+    get_app_settings.cache_clear()
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    try:
+        with Session(engine) as raw:
+            scoped = ScopedSession(raw, LOCAL_SCOPE)
+            stage_enabled_for_me(scoped, "desk", False)
+            scoped.commit()
+            raw.add(SkillUserSetting(org_id=None, user_id="local", skill_slug="desk", enabled=False))
+            with pytest.raises(IntegrityError):
+                raw.flush()
+            raw.rollback()
+
+            # A twin from a database without the index.
+            raw.exec(text("DROP INDEX uq_skill_user_setting_user_skill_no_org"))
+            raw.add(SkillUserSetting(org_id=None, user_id="local", skill_slug="desk", enabled=False))
+            raw.commit()
+            assert stage_enabled_for_me(scoped, "desk", True) is True
+            scoped.commit()
+            assert user_off_for_me(scoped) == frozenset()
+            assert scoped.exec(scoped.select(SkillUserSetting)).all() == []
     finally:
         get_app_settings.cache_clear()

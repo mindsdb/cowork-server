@@ -51,20 +51,25 @@ def off_for_me(session: ScopedSession | None) -> frozenset[str]:
 def stage_enabled_for_me(session: ScopedSession, slug: str, enabled: bool) -> bool:
     """Stage the session's person's setting for ``slug``: a row for off, none
     for on (the default). False, staging nothing, when it already reads so.
-    PermissionError for a scope with no person."""
+    PermissionError for a scope with no person. Two requests turning the
+    same skill off at once both stage a row, and the unique indexes refuse
+    the second (IntegrityError) whether or not the scope has an org."""
     user_id = setting_user_id(session.scope)
     if user_id is None:
         raise PermissionError("A personal skill setting needs a signed-in person.")
-    row = session.exec(_mine(session, user_id).where(SkillUserSetting.skill_slug == slug)).first()
+    rows = list(session.exec(_mine(session, user_id).where(SkillUserSetting.skill_slug == slug)).all())
     if enabled:
-        if row is None:
+        # Every matching row, not just the first, so no twin can keep the
+        # skill off.
+        if not rows:
             return False
-        session.delete(row)
+        for row in rows:
+            session.delete(row)
         session.flush()
         return True
-    if row is not None and not row.enabled:
+    if any(not row.enabled for row in rows):
         return False
-    row = row or SkillUserSetting(user_id=user_id, skill_slug=slug)
+    row = rows[0] if rows else SkillUserSetting(user_id=user_id, skill_slug=slug)
     row.enabled = False
     session.add(row)
     session.flush()

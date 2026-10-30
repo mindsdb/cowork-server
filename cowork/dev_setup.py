@@ -37,8 +37,8 @@ def _distribute_skill_links() -> None:
     """Boot-time symlink fan-out of the skill store into project dirs.
 
     Desktop-only: in org mode this reads the unkeyed root and scans every
-    project dir. Cloud turns read skills straight off the shared mount instead
-    (no payload); the pod's org gets seeded lazily, see
+    project dir. Cloud turns get their skills in the request instead
+    (cowork.handlers.responses.remote_turn_skills); the pod's org gets seeded lazily, see
     `_stage_remote_workspace_files` and `SkillService.ensure_builtin_skills`.
     The base store is LOCAL_SCOPE's, named explicitly because a deployment that
     trusts identity headers refuses a store with no scope. Wherever skills are

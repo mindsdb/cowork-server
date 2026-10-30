@@ -6,7 +6,7 @@ import asyncio
 from uuid import UUID
 
 from cowork.db.scoped import ScopedSession
-from cowork.handlers.responses import ResponsesHandler
+from cowork.handlers.responses import ResponsesHandler, remote_turn_skills
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import read_earlier_answers
@@ -97,6 +97,9 @@ async def remote_turn_events(
             history=seeded_history,
             workspace=workspace,
             started_at=ResponsesHandler._remote_started_at(session, conv_id),
+            # A channel turn has no member behind it: the fail-closed set,
+            # the org-wide skills, and never the whole skills volume.
+            skills=remote_turn_skills(session, conv_id),
             correlation_id=correlation_id,
             llm=llm,
         ):

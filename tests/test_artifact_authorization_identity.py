@@ -710,7 +710,7 @@ def test_a_team_audience_is_published_owner_only_and_widened_in_auth(
 ):
     """ENG-3787: anton's publisher knows no teams, so a restricted publish to
     teams alone reaches it owner-only, and cowork then upserts the same rule
-    with ``team_ids`` and ``org_wide`` (equal to ``org_allowed``). A republish
+    with ``allowed_team_ids``, under auth's ArtifactAccess names. A republish
     keeps the teams at the same version; changing them bumps it."""
     from cowork.services.publish import published_artifact_access
 
@@ -730,25 +730,70 @@ def test_a_team_audience_is_published_owner_only_and_widened_in_auth(
             scope=scope, project_id=str(project.id), access=access,
         )
 
-    result = run({"mode": "restricted", "emails": [], "org_allowed": False, "team_ids": ["team-eng"]})
+    result = run({"mode": "restricted", "emails": [], "org_allowed": False, "allowed_team_ids": ["team-eng"]})
     assert uploads[-1]["access"] == {"mode": "restricted", "emails": [], "org_allowed": False}
     path, body = issuer.calls[-1]
     assert path == "/v1/internal/artifact-access/"
-    assert (body["team_ids"], body["org_allowed"], body["org_wide"]) == (["team-eng"], False, False)
+    assert (body["allowed_team_ids"], body["org_allowed"]) == (["team-eng"], False)
+    assert not {"team_ids", "org_wide"} & set(body)
     assert body["artifact_id"] == result["artifactKey"]
     first_version = body["access_version"]
-    assert (result["allowedTeamIds"], result["orgWide"]) == (["team-eng"], False)
+    assert (result["allowedTeamIds"], result["orgAllowed"]) == (["team-eng"], False)
     entry = json.loads((folder / ".published.json").read_text())["index.html"]
-    assert entry["team_ids"] == ["team-eng"]
+    assert entry["allowed_team_ids"] == ["team-eng"]
 
     run(published_artifact_access(folder, artifacts_base=folder.parent))
-    assert issuer.calls[-1][1]["team_ids"] == ["team-eng"]
+    assert issuer.calls[-1][1]["allowed_team_ids"] == ["team-eng"]
     assert issuer.calls[-1][1]["access_version"] == first_version
 
-    run({"mode": "restricted", "emails": [], "org_allowed": True, "org_wide": True, "team_ids": ["team-ops"]})
+    run({"mode": "restricted", "emails": [], "org_allowed": True, "allowed_team_ids": ["team-ops"]})
     body = issuer.calls[-1][1]
-    assert (body["team_ids"], body["org_allowed"], body["org_wide"]) == (["team-ops"], True, True)
+    assert (body["allowed_team_ids"], body["org_allowed"]) == (["team-ops"], True)
     assert body["access_version"] > first_version
+
+
+def test_an_audience_auth_refuses_is_never_stored(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """ENG-3787: the new teams and people are stored in .published.json only
+    once auth holds them. A failed write leaves the previous publish's, which
+    is what auth still has, so the share dialog never shows an audience
+    nobody was granted; a retry then bumps the version again."""
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
+
+    _session, project, _conversation, folder = owned_artifact
+
+    def publish(_source, **kwargs):
+        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.test/1"}
+
+    monkeypatch.setattr("anton.publisher.publish", publish)
+    monkeypatch.setattr("cowork.services.artifact_autopublish._active_workspace_id", lambda scope: None)
+
+    def run(access):
+        return publish_artifact(
+            folder, artifacts_base=folder.parent, api_key="key", publish_url="https://view.test",
+            scope=scope, project_id=str(project.id), access=access,
+        )
+
+    def stored():
+        return json.loads((folder / ".published.json").read_text())["index.html"]
+
+    run({"mode": "restricted", "emails": [], "allowed_team_ids": ["team-eng"]})
+    granted = stored()["access_version"]
+
+    issuer.failure = True
+    with pytest.raises(ArtifactAccessUnavailable):
+        run({"mode": "restricted", "emails": [], "allowed_team_ids": ["team-ops"], "allowed_user_ids": [str(uuid4())]})
+    issuer.failure = None
+    entry = stored()
+    assert (entry["allowed_team_ids"], entry["allowed_user_ids"]) == (["team-eng"], [])
+    refused = entry["access_version"]
+    assert refused > granted
+
+    run({"mode": "restricted", "emails": [], "allowed_team_ids": ["team-ops"]})
+    entry = stored()
+    assert entry["allowed_team_ids"] == ["team-ops"]
+    assert entry["access_version"] > refused
 
 
 def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
@@ -805,9 +850,9 @@ def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
     assert "notify_recipients" not in access_writes()[-1]
     # Nor when the flag rides inside the access object of a non-user publish.
     run({"mode": "restricted", "emails": [], "allowed_user_ids": [person],
-         "notify": {"user_ids": [person]}, "notify_recipients": True})
+         "notify": {"user_ids": [person]}})
     assert not {"notify_recipients", "notify_user_ids"} & set(access_writes()[-1])
-    assert not {"notify", "notify_recipients"} & set(uploads[-1]["access"] or {})
+    assert "notify" not in (uploads[-1]["access"] or {})
     # A list naming nobody the rule holds notifies no one.
     run({"mode": "restricted", "emails": [], "allowed_user_ids": [person]},
         notify=ShareNotify(user_ids=(stranger,)))
@@ -848,7 +893,7 @@ def test_a_notifying_save_of_outside_emails_alone_still_writes_to_auth(
     run({**access, "emails": ["out@else.com", "new@else.com"]}, notify=ShareNotify(emails=("new@else.com",)))
     [body] = access_writes()
     assert body["allowed_emails"] == ["out@else.com", "new@else.com"]
-    assert (body["team_ids"], body["allowed_user_ids"]) == ([], [])
+    assert (body["allowed_team_ids"], body["allowed_user_ids"]) == ([], [])
     assert (body["notify_recipients"], body["notify_user_ids"], body["notify_emails"]) == (
         True, [], ["new@else.com"],
     )

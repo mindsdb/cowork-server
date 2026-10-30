@@ -5,8 +5,7 @@ caller's own bearer (cowork.services.hub_people):
 
 - no params: the whole org directory (capped by auth, ``truncated`` passed
   through), the caller excluded, cached per caller for five minutes. What the
-  share dialog loads once and filters locally. An older client's ``?all=1``
-  is an unknown parameter and lands here too.
+  share dialog loads once and filters locally.
 - ``?ids=a,b``: the members among those Keycloak user ids, with names and
   addresses, so the app can name the ids a skill's access stores. Uncached.
 

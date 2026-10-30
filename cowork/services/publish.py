@@ -575,19 +575,30 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
 
 
 # A restricted rule's org audience beyond emails and the org flag (ENG-3787):
-# teams, and people in the org by Keycloak user id. Auth holds both; anton's
-# publisher knows neither, so this server writes them to auth itself.
-_ORG_AUDIENCE_KEYS = ("team_ids", "allowed_user_ids")
+# teams, and people in the org by Keycloak user id, under auth's ArtifactAccess
+# names, which the app sends and the stored entry keeps. Auth holds both;
+# anton's publisher knows neither, so this server writes them to auth itself.
+_ORG_AUDIENCE_KEYS = ("allowed_team_ids", "allowed_user_ids")
 
+# The app's names for a restricted rule's audience (ENG-3787), auth's
+# ArtifactAccess ones: org_allowed, allowed_team_ids, allowed_user_ids and
+# allowed_emails. anton's publisher reads emails by its own older name.
+_APP_EMAILS_KEY = "allowed_emails"
+# Names the app no longer sends: refused rather than silently dropped, so a
+# mismatched client can't shrink an audience without noticing.
+_RETIRED_ACCESS_KEYS = {
+    "emails": "allowed_emails",
+    "team_ids": "allowed_team_ids",
+    "org_wide": "org_allowed",
+}
 
 # The app's "Notify people" choice, sent inside the access object (ENG-3787):
 # ``notify: {user_ids: [...], emails: [...]}``, the individuals the person just
-# added and chose to tell. The older ``notify_recipients: true`` names nobody,
-# so it notifies no one. Never part of the access anton's publisher or the
+# added and chose to tell. Never part of the access anton's publisher or the
 # stored entry sees: the caller acting on a person's save lifts it out and
 # passes it to publish_artifact on its own, so a re-publish from the stored
 # access (live sync, autopublish, a retry) can never carry it.
-_NOTIFY_KEYS = ("notify", "notify_recipients")
+_NOTIFY_KEY = "notify"
 
 # auth's bounds on what the share email names and links.
 _MAX_NOTIFY_TITLE_CHARS = 200
@@ -614,12 +625,12 @@ def _notify_list(raw: Any, field: str) -> list[str]:
 
 
 def pop_notify(access: dict | None) -> tuple[dict | None, ShareNotify]:
-    """``(access without its notify fields, who to notify)``. Raises
+    """``(access without its notify field, who to notify)``. Raises
     ValueError for a ``notify`` that isn't ``{user_ids?: [], emails?: []}``."""
-    if not isinstance(access, dict) or not any(k in access for k in _NOTIFY_KEYS):
+    if not isinstance(access, dict) or _NOTIFY_KEY not in access:
         return access, ShareNotify()
-    out = {k: v for k, v in access.items() if k not in _NOTIFY_KEYS}
-    raw = access.get("notify")
+    out = {k: v for k, v in access.items() if k != _NOTIFY_KEY}
+    raw = access.get(_NOTIFY_KEY)
     if raw is None:
         return out, ShareNotify()
     if not isinstance(raw, dict):
@@ -627,6 +638,21 @@ def pop_notify(access: dict | None) -> tuple[dict | None, ShareNotify]:
     user_ids = dict.fromkeys(v.lower() for v in _notify_list(raw.get("user_ids"), "user_ids"))
     emails = _normalize_emails(_notify_list(raw.get("emails"), "emails"))
     return out, ShareNotify(user_ids=tuple(user_ids), emails=tuple(dict.fromkeys(emails)))
+
+
+def access_from_app(access: dict) -> dict:
+    """The app's access object (ENG-3787) as this module and anton's publisher
+    read it: ``allowed_emails`` (people outside the org, by address) becomes
+    anton's ``emails``; ``org_allowed``, ``allowed_team_ids`` and
+    ``allowed_user_ids`` pass through as they are. ValueError naming the
+    field to use for a retired name (``emails``, ``team_ids``, ``org_wide``)."""
+    for retired, name in _RETIRED_ACCESS_KEYS.items():
+        if retired in access:
+            raise ValueError(f"{retired} is not an access field; send {name}.")
+    out = dict(access)
+    if _APP_EMAILS_KEY in out:
+        out["emails"] = out.pop(_APP_EMAILS_KEY)
+    return out
 
 
 def _notify_within(notify: ShareNotify, owner_side: dict) -> ShareNotify:
@@ -640,36 +666,10 @@ def _notify_within(notify: ShareNotify, owner_side: dict) -> ShareNotify:
     )
 
 
-# auth's ArtifactAccess names (and the app's, ENG-3787) for the fields anton's
-# publisher and this module know by older ones. The new name wins when a
-# request sends both.
-_ACCESS_ALIASES = (
-    ("allowed_team_ids", "team_ids"),
-    ("allowed_emails", "emails"),
-)
-
-
-def canonical_access(access: dict | None) -> dict | None:
-    """``access`` with auth's ArtifactAccess names folded into the ones this
-    module reads: ``allowed_team_ids`` is ``team_ids`` and ``allowed_emails``
-    (people outside the org, by address) is ``emails``. ``org_allowed`` and
-    ``org_wide`` are one setting already (_with_team_audience). Anything that
-    isn't a dict is returned as it is."""
-    if not isinstance(access, dict):
-        return access
-    out = dict(access)
-    for alias, name in _ACCESS_ALIASES:
-        if alias in out:
-            value = out.pop(alias)
-            if value is not None or name not in out:
-                out[name] = value
-    return out
-
-
 def _org_audience(access: dict | None, previous: Any) -> dict[str, list[str]]:
     """The teams and people a restricted publish shares with: each the
     request's when it names it, else the previous publish's, so an access
-    change from a client that predates them keeps them."""
+    change that leaves them out keeps them."""
     prev = previous if isinstance(previous, dict) and previous.get("mode") == "restricted" else {}
     source = {}
     for key in _ORG_AUDIENCE_KEYS:
@@ -680,21 +680,15 @@ def _org_audience(access: dict | None, previous: Any) -> dict[str, list[str]]:
 
 def _with_team_audience(access: dict | None, audience: dict[str, list[str]]) -> dict | None:
     """``access`` as anton's publisher reads it, which knows no teams and no
-    people by id.
-
-    ``org_wide`` is another name for ``org_allowed``, auth's "everyone in the
-    owner's organization": either one sets it, so the two never disagree. A
-    selection of teams or people alone is owner-only there, so the lambda
-    writes a restricted rule that sync_artifact_team_access then widens.
+    people by id. A selection of teams or people alone is owner-only there,
+    so the lambda writes a restricted rule that sync_artifact_team_access
+    then widens; teams or people named where they can't apply (outside org
+    mode, ``audience`` is empty) stay owner-only too, never the public rule
+    anton falls back to for an empty selection.
     """
     if not isinstance(access, dict) or access.get("mode") != "restricted":
         return access
-    out = {k: v for k, v in access.items() if k not in (*_ORG_AUDIENCE_KEYS, "org_wide")}
-    if access.get("org_wide"):
-        out["org_allowed"] = True
-    # Teams or people alone, or ones named where they can't apply (outside
-    # org mode, ``audience`` is empty): restricted to the owner, never the
-    # public rule anton falls back to for an empty selection.
+    out = {k: v for k, v in access.items() if k not in _ORG_AUDIENCE_KEYS}
     named = any(access.get(key) for key in _ORG_AUDIENCE_KEYS)
     if (any(audience.values()) or named) and not out.get("emails") and not out.get("org_allowed"):
         out["owner_only"] = True
@@ -710,12 +704,10 @@ def _plan_access(
     teams and people must be written to auth after the publish
     (_sync_team_audience): it has some, or just lost them. Teams or people
     alone are restricted to them, never public (_with_team_audience)."""
-    try:
-        access, _notify = pop_notify(canonical_access(access))
-    except ValueError:
-        # Only the person's own save carries notify, and its caller checked
-        # it; anything else just loses the field.
-        access = {k: v for k, v in canonical_access(access).items() if k not in _NOTIFY_KEYS}
+    if isinstance(access, dict):
+        # Only the person's own save carries notify, and its caller lifted it
+        # out already; anything else just loses the field.
+        access = {k: v for k, v in access.items() if k != _NOTIFY_KEY}
     audience = (
         _org_audience(access, previous) if org_mode else {k: [] for k in _ORG_AUDIENCE_KEYS}
     )
@@ -964,6 +956,14 @@ def publish_artifact(
             }
             if password_hash:
                 entry["password_hash"] = password_hash
+            if team_audience:
+                # The new teams and people are stored only once auth holds
+                # them (_sync_team_audience below). Until then the entry keeps
+                # the previous publish's, which is what auth still has: the
+                # lambda's write leaves a rule's teams and people as they were.
+                # A failed write then leaves an entry that says so, and a retry
+                # sees a changed audience and bumps the version again.
+                entry.update(_org_audience(None, previous))
             published_map[published_key] = entry
             _write_published_map(published_json, published_map)
             recipients = (
@@ -984,6 +984,8 @@ def publish_artifact(
                     artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
                     notify=notice,
                 )
+                entry.update({key: owner_side[key] for key in _ORG_AUDIENCE_KEYS})
+                _write_published_map(published_json, published_map)
             elif notice is not None:
                 # No teams or people by id, so the lambda's write was the whole
                 # rule; this one only asks auth to email the people the save
@@ -1019,11 +1021,9 @@ def publish_artifact(
             # Nobody else picked: not teams or people alone, which anton's
             # publisher is told as owner-only (_with_team_audience).
             "ownerOnly": bool(owner_side.get("owner_only"))
-            and not (owner_side.get("team_ids") or owner_side.get("allowed_user_ids")),
-            "allowedTeamIds": list(owner_side.get("team_ids") or []),
+            and not (owner_side.get("allowed_team_ids") or owner_side.get("allowed_user_ids")),
+            "allowedTeamIds": list(owner_side.get("allowed_team_ids") or []),
             "allowedUserIds": list(owner_side.get("allowed_user_ids") or []),
-            # org_wide is org_allowed under its auth name (_with_team_audience).
-            "orgWide": bool(owner_side.get("org_allowed")),
             # The renderer addresses comment requests by this key.
             "artifactKey": response_key,
             "result": {k: v for k, v in result.items() if k != "file_payload"},
@@ -1070,7 +1070,7 @@ def _sync_team_audience(
         workspace_id=_active_workspace_id(scope),
         allowed_emails=list(owner_side.get("emails") or []),
         org_allowed=bool(owner_side.get("org_allowed")),
-        team_ids=list(owner_side.get("team_ids") or []),
+        allowed_team_ids=list(owner_side.get("allowed_team_ids") or []),
         allowed_user_ids=list(owner_side.get("allowed_user_ids") or []),
         access_version=int(owner_side.get("access_version") or 1),
         notify_user_ids=list(notify["recipients"].user_ids) if notify else [],

@@ -111,7 +111,7 @@ def get_org_member_lookup(request: Request) -> OrgMemberLookup:
     return lookup
 
 
-OrgMemberLookupDep = Annotated[OrgMemberLookup | None, Depends(get_org_member_lookup)]
+OrgMemberLookupDep = Annotated[OrgMemberLookup, Depends(get_org_member_lookup)]
 
 # Every change to a skill the caller may not change in hosted org mode.
 ORG_WIDE_EDIT_REFUSAL = (
@@ -928,8 +928,8 @@ async def verify_people_in_org(
     skill_id: str,
     body: SkillSharingRequest,
     scoped: ScopedSessionDep,
-    viewer: SkillViewerDep = None,
-    members: OrgMemberLookupDep = None,
+    viewer: SkillViewerDep,
+    members: OrgMemberLookupDep,
 ) -> frozenset[str]:
     """The user ids ``body`` adds to the skill's people, confirmed members of
     the caller's org in one batched lookup (auth's ``?ids=``).
@@ -963,7 +963,7 @@ async def verify_people_in_org(
     added = [u for u in user_ids if u not in stored and u != me]
     if not added:
         return frozenset()
-    found = await members(added) if members is not None else None
+    found = await members(added)
     if found is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=PEOPLE_UNREACHABLE_REFUSAL
@@ -1008,11 +1008,14 @@ SHARING_OWNER_REFUSAL = (
     "Only the skill's owner or an organization admin can change who it is shared with."
 )
 SHARING_ORG_REFUSAL = (
-    "Sharing a skill with everyone in the organization, or taking it back, requires the "
-    "skills.share_org permission or an organization admin."
+    "Sharing a skill with everyone in the organization, or taking that back, requires the "
+    "skills.share_org permission and being the skill's owner, or an organization admin."
 )
 ALWAYS_ON_UNSHARED_REFUSAL = "Only skills shared with the organization or a team can be always on."
-ALWAYS_ON_ORG_REFUSAL = "Only admins can make an organization-wide skill always on."
+ALWAYS_ON_ORG_REFUSAL = (
+    "Making an organization-wide skill always on, or taking that back, requires the "
+    "skills.share_org permission or an organization admin."
+)
 ALWAYS_ON_TEAM_REFUSAL = (
     "Only the skill's owner, a member of a team it's shared with, or an organization "
     "admin can make it always on."
@@ -1033,7 +1036,7 @@ def _set_org_skill_sharing(
 
     A field the body leaves out keeps what the skill has. Teams and people
     are the owner's or an admin's to change; setting or clearing org-wide
-    takes ``skills.share_org``. A team added must be one the caller belongs
+    takes ``skills.share_org`` as well as being the owner or an admin. A team added must be one the caller belongs
     to (admins exempt), checked against their listing from auth: 503 while
     auth can't be asked, 400 for a team they aren't in. User ids are
     stripped, lowercased and deduplicated; a malformed one is a 400. An id
@@ -1108,7 +1111,9 @@ def _set_org_skill_sharing(
                 or wanted.allowed_user_ids != current.allowed_user_ids
             ) and not viewer.can_manage_sharing(stored):
                 raise PermissionError(SHARING_OWNER_REFUSAL)
-            if wanted.org_allowed != current.org_allowed and not viewer.can_share_org:
+            if wanted.org_allowed != current.org_allowed and not (
+                viewer.can_share_org and viewer.can_manage_sharing(stored)
+            ):
                 raise PermissionError(SHARING_ORG_REFUSAL)
             added = [t for t in wanted.allowed_team_ids if t not in current.allowed_team_ids]
             if added and not viewer.is_admin:

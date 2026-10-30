@@ -104,9 +104,10 @@ def _request_wire_size(params: dict) -> int:
 
 
 def _fit_request(params: dict, conversation_id: str) -> dict:
-    """Drop project memory first, then warn if the request still will not fit.
+    """Drop project memory first, then on-demand skills, then always-on
+    ones, then warn if the request still will not fit.
 
-    Skills and personal/global memory live on read-only mounts. Project memory
+    Personal/global memory lives on read-only mounts. Project memory
     does not: the worker mounts only this conversation's workspace, so its two
     shared slots ride the request again. They are the one optional block we can
     deterministically shed as a unit without changing the user's input or
@@ -128,13 +129,15 @@ def _fit_request(params: dict, conversation_id: str) -> dict:
         )
         size = _request_wire_size(params)
     skills = params.get("skills")
-    if size > budget and isinstance(skills, dict):
-        # Then the skills recalled on demand, which the pod can still read off
-        # its skills mount, and only then the always-on ones.
+    if size > budget and isinstance(skills, dict) and skills:
+        # Then the skills recalled on demand, and only then the always-on
+        # ones. The block itself stays, empty at worst: it is the pod's whole
+        # recallable set, so a turn that sheds skills has fewer, never the
+        # whole skills volume.
         kept = {slug: entry for slug, entry in skills.items() if isinstance(entry, dict) and entry.get("always_on")}
         params["skills"] = kept
-        if not kept or _request_wire_size(params) > budget:
-            params.pop("skills")
+        if kept and _request_wire_size(params) > budget:
+            params["skills"] = {}
         logger.warning(
             "[producer] shed skills from turn %s: request line was %d bytes, over the %d-byte cap",
             conversation_id, size, budget,
@@ -553,7 +556,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     default project with no project on the job.
     `skills` is the caller's visible skills, `{slug: {"files": {...}}}` with
     `"always_on": true` on the ones the pod puts in its prompt every turn
-    (cowork.services.skills.build_turn_skills); absent when None or empty."""
+    (cowork.services.skills.build_turn_skills). Always sent, None as `{}`:
+    the pod recalls only what the block names, and a request without one
+    would fall back to its whole skills volume
+    (cowork.handlers.responses.remote_turn_skills)."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -637,7 +643,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # <root>, so the two sit at different depths and an absolute path from
     # here is wrong inside the pod. Each side joins its own root.
     #
-    # Skills and personal/global memory are mounted read-only. Project memory is
+    # Personal/global memory is mounted read-only. Project memory is
     # outside the conversation-scoped workspace mount, so send only that tier on
     # the wire. Filtering here as well as in ResponsesHandler keeps a future
     # caller from accidentally serializing private global memory into the job.
@@ -658,11 +664,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
               **({"memory": memory_block} if memory_block else {}),
-              # Hosted org skill sharing (ENG-3787): only what the caller sees.
-              # A pod with the org skills mount still recalls from the mount,
-              # but reads which skills are always-on from here alone; an older
-              # pod ignores the flag.
-              **({"skills": skills} if skills else {}),
+              # Skill sharing (ENG-3787): only what the caller sees, and the
+              # pod's whole recallable set, so always present, even empty.
+              "skills": skills or {},
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),
