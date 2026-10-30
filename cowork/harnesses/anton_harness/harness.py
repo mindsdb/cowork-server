@@ -229,7 +229,35 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
             db_val = db_val.value.replace("_", "-")
         setattr(anton_settings, attr, db_val)
         applied.append(attr)
+    # The Jev opt-out covers anton's completion check too, so an organization
+    # that turns Jev off sends it nothing, nor does one MindsHub refuses Jev
+    # under zero data retention. Only ever turns it off: on leaves anton's own
+    # setting alone.
+    jev_off = getattr(user, "jev_decisions_enabled", True) is False or _jev_zdr_restricted(user)
+    if jev_off and hasattr(anton_settings, "verifier_jev"):
+        anton_settings.verifier_jev = "off"
+        applied.append("verifier_jev")
     return applied
+
+
+def _jev_zdr_restricted(user) -> bool:
+    """Whether MindsHub refuses Jev to this install's organization under zero
+    data retention, from the model listing already cached for the stored
+    MindsHub key (the route gate fetches it before each turn). False when
+    nothing is cached: anton then stops asking Jev after its first refusal."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.common.settings.user_settings import Provider, provider_api_key_str
+    from cowork.handlers.jev_route import zdr_restricted
+    from cowork.services.providers import cached_minds_models
+
+    try:
+        key = provider_api_key_str(user, Provider.MINDS_CLOUD)
+        listing = cached_minds_models(user.minds_url, api_key=key) if key else None
+    except Exception:
+        return False
+    if listing is None:
+        return False
+    return zdr_restricted(listing.decision_disabled_reasons, TurnQueueSettings().jev_route_model)
 
 
 def _apply_client_models(anton_settings, llm_client) -> list[str]:
