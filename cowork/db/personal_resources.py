@@ -89,6 +89,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # Shared exactly when the vault is, so a shared connection's connector
     # definition is visible to everyone who sees the connection.
     "custom_connectors": PersonalResource.CONNECTIONS,
+    # Who a skill is shared with: hosted org mode only, where every resource
+    # is partitioned, so this entry decides nothing in a personal scope.
+    "skill_access": PersonalResource.SKILLS,
     "schedules": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
     # SettingService routes its own rows; ScopedSession leaves this table alone.

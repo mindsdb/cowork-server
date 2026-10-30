@@ -366,6 +366,35 @@ def test_shared_resource_audit_upgrade_and_downgrade(tmp_path, monkeypatch):
     assert _has_table(db_path, "shared_resource_mutations")
 
 
+def test_skill_access_upgrade_and_downgrade(tmp_path, monkeypatch):
+    """ENG-3787: the skill_access table, one row per skill per org, on the
+    desktop's SQLite as on the hosted Postgres."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "skill-access.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "skill_access")
+    with engine.begin() as connection:
+        insert = text(
+            "INSERT INTO skill_access (id, org_id, skill_slug, org_allowed, always_on) "
+            "VALUES (:id, 'org', 'notes', 0, 0)"
+        )
+        connection.execute(insert, {"id": "a" * 32})
+        row = connection.execute(text("SELECT allowed_team_ids, allowed_user_ids FROM skill_access")).one()
+        assert tuple(row) == ("[]", "[]")
+        with pytest.raises(IntegrityError):
+            with connection.begin_nested():
+                connection.execute(insert, {"id": "b" * 32})
+
+    _downgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert not _has_table(db_path, "skill_access")
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "skill_access")
+
+
 # ── ENG-338: attachment purpose re-keying (f7d2b9e4a1c6) ─────────────────
 
 ATTACH_REKEY_REV = "f7d2b9e4a1c6"

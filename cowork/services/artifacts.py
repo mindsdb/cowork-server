@@ -681,6 +681,9 @@ def _published_access_for(
         "ownerOnly": False,
         # Hosted org team sharing (ENG-3787), restricted mode only.
         "allowedTeamIds": [],
+        # People in the org by Keycloak user id; outside people stay in
+        # accessEmails.
+        "allowedUserIds": [],
         "orgWide": False,
         # Composite comments scope {user_dir}/{report_id} (Plan 5); "" when
         # unpublished or published before the key was persisted.
@@ -706,8 +709,14 @@ def _published_access_for(
             elif mode == "restricted":
                 out["accessEmails"] = entry.get("emails", []) or []
                 out["orgAllowed"] = bool(entry.get("org_allowed"))
-                out["ownerOnly"] = bool(entry.get("owner_only"))
                 out["allowedTeamIds"] = list(entry.get("team_ids") or [])
+                out["allowedUserIds"] = list(entry.get("allowed_user_ids") or [])
+                # Stored for anton's publisher when teams or people alone are
+                # picked (publish._with_team_audience); to the app it means
+                # nobody else picked.
+                out["ownerOnly"] = bool(entry.get("owner_only")) and not (
+                    out["allowedTeamIds"] or out["allowedUserIds"]
+                )
                 # org_wide is org_allowed under auth's new name.
                 out["orgWide"] = out["orgAllowed"]
     except Exception:

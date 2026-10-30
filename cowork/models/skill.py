@@ -18,20 +18,9 @@ META_PROJECTS = "projects"
 # identity headers (cowork.creators). Built-ins, the operator's managed skills
 # and the operator view's own carry none.
 META_CREATED_BY = "created_by"
-# Hosted org sharing (ENG-3787, cowork.services.skill_sharing). String values
-# like the keys above: ``share_org`` "true"/"false", the other two
-# comma-joined. A skill in an org store with no ``share_org`` predates sharing
-# and reads as org-wide, which is what every member saw before.
-META_SHARE_ORG = "share_org"
-META_SHARE_TEAMS = "share_teams"
-META_SHARE_EMAILS = "share_emails"
-# "true" puts an org-wide or team skill in every turn's prompt of the people it
-# reaches; absent or anything else keeps it on demand, like any other skill.
-# Only kept on a skill shared org-wide or with a team (SkillSharing.apply).
-META_ALWAYS_ON = "always_on"
-# The creator's email as the gateway gave it at creation, so the people a
-# skill is shared with can see whose it is. Hosted org mode only.
-META_CREATED_BY_EMAIL = "created_by_email"
+# In hosted org mode it is also the scope's person, and tells a skill made
+# since sharing from one that predates it when the skill has no skill_access
+# row. Who a skill is shared with is that row's (cowork.models.skill_access).
 
 
 class Skill(AgentSkill):

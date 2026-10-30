@@ -803,8 +803,13 @@ class _AccessBody(BaseModel):
     `{"mode": "restricted", "emails": [...], "org_allowed": bool,
     "owner_only": bool}`) and validates it, so a second definition here could
     only drift away from it. Restricted access in hosted org mode also takes
-    `team_ids` and `org_wide` (ENG-3787), which this server writes to auth
-    itself (cowork.services.publish._sync_team_audience).
+    `team_ids`, `allowed_user_ids` (Keycloak ids of people in the org;
+    `emails` are people outside it) and `org_wide` (ENG-3787), which this
+    server writes to auth itself (cowork.services.publish._sync_team_audience).
+    auth's names are accepted for the older ones: `allowed_team_ids` for
+    `team_ids`, `allowed_emails` for `emails`, `org_allowed` for `org_wide`
+    (cowork.services.publish.canonical_access). Teams or people alone keep the
+    rule restricted to them, never public.
     """
 
     access: dict
@@ -815,14 +820,44 @@ async def _checked_team_audience(access: dict, *, request: Request, session) -> 
     team the caller belongs to (an org admin may name any). 503 while auth
     can't list the caller's teams, 400 for one they aren't in. The org's
     default team is dropped from ``team_ids`` and sets ``org_wide``: its
-    members are the whole organization. Outside hosted
-    org mode both team fields are dropped: there are no teams there."""
+    members are the whole organization. ``allowed_user_ids`` is normalized
+    and passed through: that each is a member of the org is auth's check, on
+    the write (cowork.services.artifact_access.sync_artifact_team_access).
+    Outside hosted org mode the team and people fields are dropped: there are
+    no teams or org members there."""
     from cowork.principal import can_manage_org, get_principal, hub_credential
     from cowork.services.hub_teams import fetch_hub_teams
-    from cowork.services.skill_sharing import normalize_team_ids
+    from cowork.services.publish import canonical_access
+    from cowork.services.skill_sharing import normalize_team_ids, normalize_user_ids
 
+    # auth's names (allowed_team_ids, allowed_emails) as the older ones.
+    access = canonical_access(access)
     if not session.scope.org_mode:
-        return {k: v for k, v in access.items() if k not in ("team_ids", "org_wide")}
+        out = {
+            k: v
+            for k, v in access.items()
+            if k not in ("team_ids", "allowed_user_ids", "org_wide")
+        }
+        # Teams or people picked where there are none still restrict: the
+        # rule stays the owner's rather than an empty, public one.
+        if (
+            out.get("mode") == "restricted"
+            and (access.get("team_ids") or access.get("allowed_user_ids"))
+            and not out.get("emails")
+            and not out.get("org_allowed")
+        ):
+            out["owner_only"] = True
+        return out
+    if "allowed_user_ids" in access:
+        raw_people = access.get("allowed_user_ids") or []
+        if not isinstance(raw_people, list):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="allowed_user_ids must be a list."
+            )
+        try:
+            access = {**access, "allowed_user_ids": list(normalize_user_ids(raw_people))}
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if "team_ids" not in access:
         return access
     raw = access.get("team_ids") or []

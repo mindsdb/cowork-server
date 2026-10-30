@@ -17,21 +17,21 @@ from cowork.db.scoped import (
     get_tenant_scope,
 )
 from cowork.db.session import get_open_session
-from cowork.models.skill import META_CREATED_BY_EMAIL, Skill
+from cowork.models.skill import Skill
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal, hub_credential
 from cowork.schemas.skills import (
+    SkillAccessView,
     SkillCreateRequest,
     SkillListResponse,
     SkillOwner,
     SkillResponse,
     SkillSharingCapabilities,
     SkillSharingRequest,
-    SkillSharingView,
     SkillUpdateRequest,
 )
 from cowork.schemas.shared_resources import SkillCapabilities
-from cowork.services.hub_people import org_members_among
+from cowork.services.hub_people import org_members_by_ids
 from cowork.services.projects import ProjectService
 from cowork.services.shared_resources import (
     SKILL,
@@ -48,11 +48,16 @@ from cowork.services.skills import (
     builtin_skill_refusal,
     is_builtin_skill,
 )
+from cowork.services.skill_access import (
+    stage_delete as stage_access_delete,
+    stage_only_owner,
+    stage_rename as stage_access_rename,
+)
 from cowork.services.skill_sharing import (
-    SkillSharing,
+    SkillAccessRule,
     SkillViewer,
-    normalize_emails,
     normalize_team_ids,
+    normalize_user_ids,
     resolve_skill_viewer,
 )
 
@@ -80,8 +85,9 @@ async def get_skill_viewer(
 
 SkillViewerDep = Annotated[SkillViewer | None, Depends(get_skill_viewer)]
 
-# Which of some addresses are members of the caller's active org, or None when
-# auth couldn't be asked (cowork.services.hub_people.org_members_among).
+# Which of some Keycloak user ids (lowercased) are members of the caller's
+# active org, or None when auth couldn't be asked
+# (cowork.services.hub_people.org_members_by_ids).
 OrgMemberLookup = Callable[[Iterable[str]], Awaitable[frozenset[str] | None]]
 
 
@@ -89,8 +95,11 @@ def get_org_member_lookup(request: Request) -> OrgMemberLookup:
     """The org membership check, asked with the caller's own bearer."""
     bearer_token = hub_credential(request)
 
-    async def lookup(emails: Iterable[str]) -> frozenset[str] | None:
-        return await org_members_among(bearer_token=bearer_token, emails=emails)
+    async def lookup(ids: Iterable[str]) -> frozenset[str] | None:
+        members = await org_members_by_ids(bearer_token=bearer_token, ids=ids)
+        if members is None:
+            return None
+        return frozenset(m.id.strip().lower() for m in members)
 
     return lookup
 
@@ -108,10 +117,25 @@ SKILL_EDIT_REFUSAL = (
 )
 
 
-def _skill_owner_id(access: SharedResourceAccess, skill: Skill) -> str | None:
-    """Who created ``skill``: the attribution row in org mode, else the
-    creator its metadata records."""
-    return access.creator_id(SKILL, skill.name, fallback=skill.created_by) or skill.created_by
+def _access_rule(
+    access: SharedResourceAccess,
+    service: SkillService,
+    skill: Skill,
+    creator_id: str | None = None,
+) -> SkillAccessRule:
+    """Who ``skill`` is shared with, hosted org mode (SkillService.access_rule),
+    and who owns it: its skill_access row's owner, else, for a skill with no
+    row, ``creator_id``, the attribution row's creator, or the creator its
+    metadata records."""
+    rule = service.access_rule(skill)
+    if rule.owner_user_id or is_builtin_skill(skill.name):
+        return rule
+    owner_id = (
+        creator_id
+        or access.creator_id(SKILL, skill.name, fallback=skill.created_by)
+        or skill.created_by
+    )
+    return replace(rule, owner_user_id=owner_id)
 
 
 def _require_skill_change(
@@ -128,12 +152,12 @@ def _require_skill_change(
     if not service.org_sharing or viewer is None:
         access.require_change(creator_id, detail=detail)
         return
-    owner_id = creator_id or skill.created_by
-    if access.has_trusted_actor and viewer.can_edit(skill, owner_id=owner_id):
+    rule = _access_rule(access, service, skill, creator_id)
+    if access.has_trusted_actor and viewer.can_edit(rule):
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail=ORG_WIDE_EDIT_REFUSAL if viewer.sharing_of(skill).org else SKILL_EDIT_REFUSAL,
+        detail=ORG_WIDE_EDIT_REFUSAL if viewer.effective(rule).org_allowed else SKILL_EDIT_REFUSAL,
     )
 
 
@@ -169,7 +193,7 @@ def _skill_response(
     skill = visible.skill
     shared = visible.shared
     viewer = service.viewer if service.org_sharing else None
-    owner_id: str | None = None
+    rule: SkillAccessRule | None = None
     if visible.origin is SkillOrigin.MANAGED:
         # The operator's managed skill: built-in and read-only for every
         # caller, and authored by nobody here.
@@ -193,11 +217,12 @@ def _skill_response(
                     )
         pending = access.claim_is_pending(SKILL, skill.name)
         creator_id = access.creator_id(SKILL, skill.name)
-        owner_id = creator_id or skill.created_by
+        if viewer is not None:
+            rule = _access_rule(access, service, skill, creator_id)
         builtin = is_builtin_skill(skill.name)
         theirs = not service.may_change(skill)
         may_change = (
-            access.has_trusted_actor and viewer.can_edit(skill, owner_id=owner_id)
+            access.has_trusted_actor and viewer.can_edit(rule)
             if viewer is not None
             else access.can_change(creator_id)
         )
@@ -240,46 +265,50 @@ def _skill_response(
                 visible.origin is SkillOrigin.OWN
                 and not is_builtin_skill(skill.name)
                 and (
-                    viewer.can_manage_sharing(owner_id=owner_id)
+                    viewer.can_manage_sharing(rule)
                     if viewer is not None
                     else service.sharing_available
                 )
             ),
         ),
         can_edit=can_change,
-        **_org_sharing_fields(visible, viewer=viewer, owner_id=owner_id),
+        **_org_access_fields(visible, viewer=viewer, rule=rule),
     ).model_dump(by_alias=True)
 
 
-def _org_sharing_fields(
-    visible: VisibleSkill, *, viewer: SkillViewer | None, owner_id: str | None
+def _org_access_fields(
+    visible: VisibleSkill, *, viewer: SkillViewer | None, rule: SkillAccessRule | None
 ) -> dict:
-    """``sharing``, ``section`` and ``owner`` for one skill's response.
+    """``access``, ``section`` and ``owner`` for one skill's response.
 
     Managed skills, and packaged built-ins in an org store, read as org-wide
     and owned by nobody. Outside hosted org mode every other skill is the
-    caller's own bucket with no sharing."""
+    caller's own bucket with no access set."""
     skill = visible.skill
     if visible.origin is SkillOrigin.MANAGED or (
         viewer is not None and is_builtin_skill(skill.name)
     ):
-        return {"sharing": SkillSharingView(org=True), "section": "org", "owner": SkillOwner()}
-    if viewer is None:
-        return {"sharing": SkillSharingView(), "section": "mine", "owner": SkillOwner()}
-    sharing = viewer.sharing_of(skill)
-    owner_email = skill.metadata.get(META_CREATED_BY_EMAIL) or (
-        viewer.email if viewer.owns(owner_id) and viewer.email else None
-    )
+        return {"access": SkillAccessView(org_allowed=True), "section": "org", "owner": SkillOwner()}
+    if viewer is None or rule is None:
+        return {"access": SkillAccessView(), "section": "mine", "owner": SkillOwner()}
+    effective = viewer.effective(rule)
+    owner_id = rule.owner_user_id
     return {
-        "sharing": SkillSharingView(
-            org=sharing.org,
-            team_ids=list(sharing.team_ids),
-            # The recipients' addresses only to whoever may change them.
-            emails=list(sharing.emails) if viewer.can_manage_sharing(owner_id=owner_id) else [],
-            always_on=sharing.always_on and sharing.broad,
+        "access": SkillAccessView(
+            org_allowed=effective.org_allowed,
+            allowed_team_ids=list(effective.allowed_team_ids),
+            # The people only to whoever may change them.
+            allowed_user_ids=(
+                list(effective.allowed_user_ids) if viewer.can_manage_sharing(rule) else []
+            ),
+            always_on=effective.always_on and effective.broad,
         ),
-        "section": viewer.section(skill, owner_id=owner_id),
-        "owner": SkillOwner(id=owner_id, email=owner_email),
+        "section": viewer.section(rule),
+        # Only the caller's own address is known here; the app names anyone
+        # else's id through GET /hub/people/?ids=.
+        "owner": SkillOwner(
+            id=owner_id, email=viewer.email if viewer.owns(owner_id) and viewer.email else None
+        ),
     }
 
 
@@ -322,6 +351,22 @@ def _record_new_skill(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A skill named '{skill.name}' already exists.",
         )
+    if service.org_sharing:
+        # Hosted org mode: the new skill is shared with nobody but its
+        # creator, whatever an uploaded SKILL.md says, and never reads as a
+        # skill from before sharing (org-wide).
+        try:
+            stage_only_owner(access.session, skill.name, access.session.scope.user_id)
+            access.session.commit()
+        except Exception:
+            access.session.rollback()
+            try:
+                service.delete_skill(skill.name)
+                access.record_delete(SKILL, skill.name)
+            except Exception:
+                logger.exception("Could not remove a skill after its access failed to save")
+            raise
+        service.forget_access()
 
 
 def _release_new_skill_claim(
@@ -381,7 +426,7 @@ def list_skills(
     # Seeded here for an org that opens this menu before it has ever chatted.
     # The turn payload seeds too, so whichever comes first wins; see
     # `build_turn_skills`. In hosted org mode, only what the caller sees.
-    skill_service = SkillService(scoped.scope, viewer=viewer)
+    skill_service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     skill_service.ensure_builtin_skills()
     access = SharedResourceAccess(scoped, principal)
     # The typed response carries can_share's "canShare" alias from the model.
@@ -428,9 +473,10 @@ def create_skill(
 ):
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
-    # In hosted org mode a new skill records its creator and only-me sharing
-    # (SkillService._stamp_creator), so it is never org-wide by default.
-    service = SkillService(scoped.scope, viewer=viewer)
+    # In hosted org mode a new skill records its creator
+    # (SkillService._stamp_creator) and gets a skill_access row shared with
+    # nobody else (_record_new_skill), so it is never org-wide by default.
+    service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     claim = None
     claim_token = None
     with _project_reference_lock(access):
@@ -492,7 +538,7 @@ def _upload_skill_bytes(
 ) -> dict:
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
-    service = SkillService(scoped.scope, viewer=viewer)
+    service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     claim = None
     claim_token = None
 
@@ -598,7 +644,7 @@ def get_skill(
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
 ):
-    service = SkillService(scoped.scope, viewer=viewer)
+    service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     try:
         visible = service.get_visible_skill(skill_id)
     except ValueError as e:
@@ -616,7 +662,7 @@ def update_skill(
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
 ):
-    service = SkillService(scoped.scope, viewer=viewer)
+    service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     access = SharedResourceAccess(scoped, principal)
     with _project_reference_lock(access):
         resource_coordination = ExitStack()
@@ -729,6 +775,10 @@ def update_skill(
                             status_code=status.HTTP_409_CONFLICT,
                             detail=f"A skill named '{skill.name}' already exists.",
                         )
+                    if renamed and service.org_sharing:
+                        # Who the skill is shared with follows it to its new
+                        # name, in the commit that moves its attribution.
+                        stage_access_rename(access.session, current.name, skill.name)
                     access.record_updates(
                         SKILL,
                         current.name,
@@ -769,6 +819,8 @@ def update_skill(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
         finally:
             resource_coordination.close()
+    # A rename moved the skill's access row; read it again under the new name.
+    service.forget_access()
     return _skill_response(service.as_own(skill), access=access, service=service)
 
 
@@ -786,35 +838,36 @@ async def verify_people_in_org(
     viewer: SkillViewerDep = None,
     members: OrgMemberLookupDep = None,
 ) -> frozenset[str]:
-    """The addresses ``body`` adds to the skill's people, confirmed members of
-    the caller's org in one batched lookup.
+    """The user ids ``body`` adds to the skill's people, confirmed members of
+    the caller's org in one batched lookup (auth's ``?ids=``).
 
-    Only new addresses are asked about: one already stored is kept as is, so
-    an auth outage doesn't block an edit that adds nobody. The caller's own
-    address needs no check. 400 naming every address outside the org; 503
-    while auth can't be asked. A malformed address or a skill that can't be
-    read is left to _set_org_skill_sharing to refuse; it re-checks the added
-    addresses against this answer under the skill's lock.
+    Only new ids are asked about: one already stored is kept as is, so an
+    auth outage doesn't block an edit that adds nobody. The caller's own id
+    needs no check. 400 naming every id outside the org; 503 while auth can't
+    be asked. A malformed id or a skill that can't be read is left to
+    _set_org_skill_sharing to refuse; it re-checks the added ids against this
+    answer under the skill's lock.
 
     A dependency of PUT /{skill_id}/sharing rather than a step in it, so the
     route stays sync. Nothing to check outside hosted org mode.
     """
-    if viewer is None or body.emails is None:
+    if viewer is None or body.allowed_user_ids is None:
         return frozenset()
     try:
-        emails = normalize_emails(body.emails)
+        user_ids = normalize_user_ids(body.allowed_user_ids)
     except ValueError:
         return frozenset()
 
-    def current_emails() -> tuple[str, ...]:
+    def current_user_ids() -> tuple[str, ...]:
         try:
-            skill = SkillService(scoped.scope, viewer=viewer).get_seen_skill(skill_id)
+            service = SkillService(scoped.scope, viewer=viewer, session=scoped)
+            return service.access_rule(service.get_seen_skill(skill_id)).allowed_user_ids
         except Exception:
             return ()
-        return SkillSharing.of(skill).emails
 
-    stored = await run_in_threadpool(current_emails)
-    added = [e for e in emails if e not in stored and e != viewer.email]
+    stored = await run_in_threadpool(current_user_ids)
+    me = (viewer.user_id or "").lower()
+    added = [u for u in user_ids if u not in stored and u != me]
     if not added:
         return frozenset()
     found = await members(added) if members is not None else None
@@ -822,7 +875,7 @@ async def verify_people_in_org(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=PEOPLE_UNREACHABLE_REFUSAL
         )
-    outside = [e for e in added if e not in found]
+    outside = [u for u in added if u not in found]
     if outside:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -881,17 +934,19 @@ def _set_org_skill_sharing(
     viewer: SkillViewer,
     verified_people: frozenset[str] = frozenset(),
 ) -> dict:
-    """Hosted org mode: set a skill's org-wide flag, teams and people.
+    """Hosted org mode: set a skill's access (its skill_access row):
+    ``org_allowed``, ``allowed_team_ids``, ``allowed_user_ids`` and
+    ``always_on``.
 
     A field the body leaves out keeps what the skill has. Teams and people
     are the owner's or an admin's to change; setting or clearing org-wide
     takes ``skills.share_org``. A team added must be one the caller belongs
     to (admins exempt), checked against their listing from auth: 503 while
-    auth can't be asked, 400 for a team they aren't in. Emails are
-    lowercased and deduplicated; one that isn't an address is a 400. An
-    address added must be a member of the org, which verify_people_in_org
-    confirmed before this runs (``verified_people``); one added since that
-    check read the skill is a 409.
+    auth can't be asked, 400 for a team they aren't in. User ids are
+    stripped, lowercased and deduplicated; a malformed one is a 400. An id
+    added must be a member of the org, which verify_people_in_org confirmed
+    before this runs (``verified_people``); one added since that check read
+    the skill is a 409.
 
     ``always_on`` can be set only on a skill that, after this change, is
     shared org-wide or with a team (else 400). Changing it on an org-wide
@@ -901,9 +956,10 @@ def _set_org_skill_sharing(
 
     404 for a skill the caller doesn't see or that doesn't exist, 403 for a
     built-in, a managed skill, or a change the caller may not make. Nothing
-    is written when the sharing already reads this way.
+    is written when the access already reads this way. A skill from before
+    sharing gets its row here, owned by its creator.
     """
-    service = SkillService(scoped.scope, viewer=viewer)
+    service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     access = SharedResourceAccess(scoped, principal)
     try:
         service.refuse_unchangeable(skill_id)
@@ -912,22 +968,31 @@ def _set_org_skill_sharing(
             raise PermissionError(builtin_skill_refusal(skill.name))
         try:
             team_ids = (
-                normalize_team_ids(body.team_ids) if body.team_ids is not None else None
+                normalize_team_ids(body.allowed_team_ids)
+                if body.allowed_team_ids is not None
+                else None
             )
-            emails = normalize_emails(body.emails) if body.emails is not None else None
+            user_ids = (
+                normalize_user_ids(body.allowed_user_ids)
+                if body.allowed_user_ids is not None
+                else None
+            )
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         with access.coordination_lock(SKILL, skill.name):
+            service.forget_access()
             skill = service.get_seen_skill(skill.name)
-            owner_id = _skill_owner_id(access, skill)
+            stored = _access_rule(access, service, skill)
+            owner_id = stored.owner_user_id
             # The org's default team is "everyone in the org": named among
             # the teams it means org-wide, with org-wide's rules
             # (skills.share_org), and a stored one is rewritten as such.
-            current = viewer.sharing_of(skill)
-            wanted = SkillSharing(
-                org=current.org if body.org is None else body.org,
-                team_ids=current.team_ids if team_ids is None else team_ids,
-                emails=current.emails if emails is None else emails,
+            current = viewer.effective(stored)
+            wanted = replace(
+                current,
+                org_allowed=current.org_allowed if body.org_allowed is None else body.org_allowed,
+                allowed_team_ids=current.allowed_team_ids if team_ids is None else team_ids,
+                allowed_user_ids=current.allowed_user_ids if user_ids is None else user_ids,
                 always_on=current.always_on if body.always_on is None else body.always_on,
             ).with_default_team_as_org(viewer.default_team_id)
             if wanted.always_on and not wanted.broad:
@@ -939,19 +1004,20 @@ def _set_org_skill_sharing(
                 # Unshared from the org and every team: no longer always on.
                 wanted = replace(wanted, always_on=False)
             if wanted.always_on != (current.always_on and current.broad) and wanted.broad:
-                if wanted.org and not viewer.can_share_org:
+                if wanted.org_allowed and not viewer.can_share_org:
                     raise PermissionError(ALWAYS_ON_ORG_REFUSAL)
-                if not wanted.org and not (
+                if not wanted.org_allowed and not (
                     viewer.is_admin or viewer.owns(owner_id) or viewer.in_team_of(wanted)
                 ):
                     raise PermissionError(ALWAYS_ON_TEAM_REFUSAL)
             if (
-                wanted.team_ids != current.team_ids or wanted.emails != current.emails
-            ) and not viewer.can_manage_sharing(owner_id=owner_id):
+                wanted.allowed_team_ids != current.allowed_team_ids
+                or wanted.allowed_user_ids != current.allowed_user_ids
+            ) and not viewer.can_manage_sharing(stored):
                 raise PermissionError(SHARING_OWNER_REFUSAL)
-            if wanted.org != current.org and not viewer.can_share_org:
+            if wanted.org_allowed != current.org_allowed and not viewer.can_share_org:
                 raise PermissionError(SHARING_ORG_REFUSAL)
-            added = [t for t in wanted.team_ids if t not in current.team_ids]
+            added = [t for t in wanted.allowed_team_ids if t not in current.allowed_team_ids]
             if added and not viewer.is_admin:
                 if not viewer.teams_known:
                     raise HTTPException(
@@ -964,28 +1030,26 @@ def _set_org_skill_sharing(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"You can only share with teams you belong to: {', '.join(foreign)}.",
                     )
+            me = (viewer.user_id or "").lower()
             unverified = [
-                e
-                for e in wanted.emails
-                if e not in current.emails and e != viewer.email and e not in verified_people
+                u
+                for u in wanted.allowed_user_ids
+                if u not in current.allowed_user_ids and u != me and u not in verified_people
             ]
             if unverified:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT, detail=SHARING_RACED_REFUSAL
                 )
-            original = (service._skill_dir(skill.name) / "SKILL.md").read_bytes()
-            updated = service.set_org_sharing(skill.name, wanted)
-            if updated.metadata != skill.metadata:
+            if service.stage_org_access(skill.name, wanted):
                 try:
                     access.record_update(
                         SKILL, skill.name, action="share", fallback_creator_id=owner_id
                     )
+                    # record_update commits only in org mode, which this is;
+                    # committed here too so the row never waits on it.
+                    access.session.commit()
                 except Exception:
                     access.session.rollback()
-                    try:
-                        service._restore_skill_file(skill.name, original)
-                    except Exception:
-                        logger.exception("Could not restore a skill after an audit failure")
                     raise
     except SkillSharingError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
@@ -993,7 +1057,10 @@ def _set_org_skill_sharing(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return _skill_response(service.as_own(updated), access=access, service=service)
+    service.forget_access()
+    return _skill_response(
+        service.as_own(service.get_skill(skill.name)), access=access, service=service
+    )
 
 
 def _set_personal_skill_sharing(
@@ -1039,7 +1106,7 @@ def delete_skill(
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
 ):
-    service = SkillService(scoped.scope, viewer=viewer)
+    service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     access = SharedResourceAccess(scoped, principal)
     reference_coordination = _project_reference_lock(access)
     reference_coordination.__enter__()
@@ -1080,6 +1147,9 @@ def delete_skill(
                 found = staged is not None
                 if found:
                     try:
+                        if service.org_sharing:
+                            # Gone with the skill, in the same commit.
+                            stage_access_delete(access.session, skill.name)
                         access.record_delete(SKILL, skill.name)
                     except Exception:
                         access.session.rollback()

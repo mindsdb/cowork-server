@@ -1840,6 +1840,7 @@ class ResponsesHandler:
                 session.scope,
                 project_name=conversation.project.name,
                 viewer=getattr(self, "_skill_viewer", None),
+                session=session,
             )
         except Exception:
             logger.exception("[responses] failed to build the turn's skills", extra=log_context(conversation_id=conv_id))

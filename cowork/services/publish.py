@@ -574,32 +574,102 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
-def _team_audience(access: dict | None, previous: Any) -> list[str]:
-    """The teams a restricted publish shares with (ENG-3787): the request's
-    when it names them, else the previous publish's, so an access change from
-    a client that predates teams keeps them."""
-    if isinstance(access, dict) and "team_ids" in access:
-        return [str(t) for t in access.get("team_ids") or []]
+# A restricted rule's org audience beyond emails and the org flag (ENG-3787):
+# teams, and people in the org by Keycloak user id. Auth holds both; anton's
+# publisher knows neither, so this server writes them to auth itself.
+_ORG_AUDIENCE_KEYS = ("team_ids", "allowed_user_ids")
+
+
+# auth's ArtifactAccess names (and the app's, ENG-3787) for the fields anton's
+# publisher and this module know by older ones. The new name wins when a
+# request sends both.
+_ACCESS_ALIASES = (
+    ("allowed_team_ids", "team_ids"),
+    ("allowed_emails", "emails"),
+)
+
+
+def canonical_access(access: dict | None) -> dict | None:
+    """``access`` with auth's ArtifactAccess names folded into the ones this
+    module reads: ``allowed_team_ids`` is ``team_ids`` and ``allowed_emails``
+    (people outside the org, by address) is ``emails``. ``org_allowed`` and
+    ``org_wide`` are one setting already (_with_team_audience). Anything that
+    isn't a dict is returned as it is."""
+    if not isinstance(access, dict):
+        return access
+    out = dict(access)
+    for alias, name in _ACCESS_ALIASES:
+        if alias in out:
+            value = out.pop(alias)
+            if value is not None or name not in out:
+                out[name] = value
+    return out
+
+
+def _org_audience(access: dict | None, previous: Any) -> dict[str, list[str]]:
+    """The teams and people a restricted publish shares with: each the
+    request's when it names it, else the previous publish's, so an access
+    change from a client that predates them keeps them."""
     prev = previous if isinstance(previous, dict) and previous.get("mode") == "restricted" else {}
-    return [str(t) for t in prev.get("team_ids") or []]
+    source = {}
+    for key in _ORG_AUDIENCE_KEYS:
+        values = access.get(key) if isinstance(access, dict) and key in access else prev.get(key)
+        source[key] = [str(v) for v in values or []]
+    return source
 
 
-def _with_team_audience(access: dict | None, team_ids: list[str]) -> dict | None:
-    """``access`` as anton's publisher reads it, which knows no teams.
+def _with_team_audience(access: dict | None, audience: dict[str, list[str]]) -> dict | None:
+    """``access`` as anton's publisher reads it, which knows no teams and no
+    people by id.
 
     ``org_wide`` is another name for ``org_allowed``, auth's "everyone in the
     owner's organization": either one sets it, so the two never disagree. A
-    selection of teams alone is owner-only there, so the lambda writes a
-    restricted rule that sync_artifact_team_access then widens to the teams.
+    selection of teams or people alone is owner-only there, so the lambda
+    writes a restricted rule that sync_artifact_team_access then widens.
     """
     if not isinstance(access, dict) or access.get("mode") != "restricted":
         return access
-    out = {k: v for k, v in access.items() if k not in ("team_ids", "org_wide")}
+    out = {k: v for k, v in access.items() if k not in (*_ORG_AUDIENCE_KEYS, "org_wide")}
     if access.get("org_wide"):
         out["org_allowed"] = True
-    if team_ids and not out.get("emails") and not out.get("org_allowed"):
+    # Teams or people alone, or ones named where they can't apply (outside
+    # org mode, ``audience`` is empty): restricted to the owner, never the
+    # public rule anton falls back to for an empty selection.
+    named = any(access.get(key) for key in _ORG_AUDIENCE_KEYS)
+    if (any(audience.values()) or named) and not out.get("emails") and not out.get("org_allowed"):
         out["owner_only"] = True
     return out
+
+
+def _plan_access(
+    password: str | None, access: dict | None, previous: Any, *, org_mode: bool
+) -> tuple[dict, int, int, dict, bool]:
+    """anton's resolve_access, with the org audience (ENG-3787) around it:
+    ``(effective_access, pwd_version, access_version, owner_side,
+    team_audience)``. ``team_audience`` is whether the restricted rule's
+    teams and people must be written to auth after the publish
+    (_sync_team_audience): it has some, or just lost them. Teams or people
+    alone are restricted to them, never public (_with_team_audience)."""
+    access = canonical_access(access)
+    audience = (
+        _org_audience(access, previous) if org_mode else {k: [] for k in _ORG_AUDIENCE_KEYS}
+    )
+    prev_restricted = isinstance(previous, dict) and previous.get("mode") == "restricted"
+    prev_audience = _org_audience(None, previous)
+    effective_access, pwd_version, access_version, owner_side = _resolve_access(
+        password, _with_team_audience(access, audience), previous
+    )
+    team_audience = owner_side.get("mode") == "restricted" and (
+        any(audience.values()) or any(prev_audience.values())
+    )
+    if team_audience:
+        if audience != prev_audience and prev_restricted:
+            # A changed audience invalidates the viewer grants already
+            # issued, as a changed email list does.
+            prev_version = previous.get("access_version", 0) or 0
+            access_version = max(access_version, prev_version + 1)
+        owner_side.update(**audience, access_version=access_version)
+    return effective_access, pwd_version, access_version, owner_side, team_audience
 
 
 def publish_artifact(
@@ -682,24 +752,9 @@ def publish_artifact(
         # Resolve the effective access (mode + version) from the request and the
         # prior publish. Versions bump only when the password / restricted list
         # changed so previously issued viewer grants invalidate.
-        # Teams and org-wide (ENG-3787) are org mode's alone; anton's
-        # publisher never sees them (_with_team_audience).
-        team_ids = _team_audience(access, previous) if scope is not None and scope.org_mode else []
-        prev_restricted = isinstance(previous, dict) and previous.get("mode") == "restricted"
-        prev_team_ids = list(previous.get("team_ids") or []) if prev_restricted else []
-        effective_access, pwd_version, access_version, owner_side = _resolve_access(
-            password, _with_team_audience(access, team_ids), previous
+        effective_access, pwd_version, access_version, owner_side, team_audience = _plan_access(
+            password, access, previous, org_mode=scope is not None and scope.org_mode
         )
-        # Written to auth after the publish (_sync_team_audience) whenever a
-        # restricted rule has teams or just lost them.
-        team_audience = owner_side.get("mode") == "restricted" and bool(team_ids or prev_team_ids)
-        if team_audience:
-            if team_ids != prev_team_ids and prev_restricted:
-                # A changed audience invalidates the viewer grants already
-                # issued, as a changed email list does.
-                prev_version = previous.get("access_version", 0) or 0
-                access_version = max(access_version, prev_version + 1)
-            owner_side.update(team_ids=team_ids, access_version=access_version)
 
         # One identity spans private drafts, published versions, and comments. A
         # legacy loose file has no metadata and keeps the service-generated key.
@@ -859,8 +914,12 @@ def publish_artifact(
             "accessProtected": bool(owner_side.get("requires_password")),
             "accessEmails": owner_side.get("emails", []),
             "orgAllowed": bool(owner_side.get("org_allowed")),
-            "ownerOnly": bool(owner_side.get("owner_only")),
+            # Nobody else picked: not teams or people alone, which anton's
+            # publisher is told as owner-only (_with_team_audience).
+            "ownerOnly": bool(owner_side.get("owner_only"))
+            and not (owner_side.get("team_ids") or owner_side.get("allowed_user_ids")),
             "allowedTeamIds": list(owner_side.get("team_ids") or []),
+            "allowedUserIds": list(owner_side.get("allowed_user_ids") or []),
             # org_wide is org_allowed under its auth name (_with_team_audience).
             "orgWide": bool(owner_side.get("org_allowed")),
             # The renderer addresses comment requests by this key.
@@ -870,8 +929,8 @@ def publish_artifact(
 
 
 def _sync_team_audience(*, artifact_id: str, scope: TenantScope, owner_side: dict) -> None:
-    """Write the restricted rule's teams and org-wide flag to auth, after the
-    lambda wrote the rest of it (sync_artifact_team_access)."""
+    """Write the restricted rule's teams, people by id and org-wide flag to
+    auth, after the lambda wrote the rest of it (sync_artifact_team_access)."""
     from cowork.services.artifact_access import ArtifactAccessUnavailable, sync_artifact_team_access
     from cowork.services.artifact_autopublish import _active_workspace_id
 
@@ -885,6 +944,7 @@ def _sync_team_audience(*, artifact_id: str, scope: TenantScope, owner_side: dic
         allowed_emails=list(owner_side.get("emails") or []),
         org_allowed=bool(owner_side.get("org_allowed")),
         team_ids=list(owner_side.get("team_ids") or []),
+        allowed_user_ids=list(owner_side.get("allowed_user_ids") or []),
         access_version=int(owner_side.get("access_version") or 1),
     )
 
@@ -1051,8 +1111,10 @@ def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
     if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
         raise FileNotFoundError("No published version to update")
     access = access_from_owner_side(entry)
-    if access.get("mode") == "restricted" and entry.get("team_ids"):
-        access["team_ids"] = list(entry["team_ids"])
+    if access.get("mode") == "restricted":
+        for key in _ORG_AUDIENCE_KEYS:
+            if entry.get(key):
+                access[key] = list(entry[key])
     return access
 
 

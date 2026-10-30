@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from anton.core.tools.skill_format import (
@@ -46,16 +46,11 @@ from cowork.managed import (
     readonly_skill_dirs,
 )
 from cowork.models.skill import (
-    META_ALWAYS_ON,
     META_CREATED_AT,
     META_CREATED_BY,
-    META_CREATED_BY_EMAIL,
     META_DISPLAY_NAME,
     META_ENABLED,
     META_PROJECTS,
-    META_SHARE_EMAILS,
-    META_SHARE_ORG,
-    META_SHARE_TEAMS,
     META_UPDATED_AT,
     Skill,
 )
@@ -69,12 +64,17 @@ from cowork.services.skill_links import (
 # operator command.
 from cowork.shared_skills import SKILL_SHARING_BUSY, SharedSkillsBusyError  # noqa: F401
 from cowork.services.skill_sharing import (
-    ONLY_ME,
-    SkillSharing,
+    LEGACY_ORG_WIDE,
+    SkillAccessRule,
     SkillViewer,
+    access_rule_for,
     fail_closed_viewer,
     sharing_applies,
 )
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import ScopedSession
+    from cowork.models.skill_access import SkillAccess
 
 logger = logging.getLogger(__name__)
 
@@ -311,13 +311,15 @@ def _always_on_rank(service: SkillService, slug: str, path: Path) -> int | None:
     skill = _skill_from_dir(path)
     if skill is None or is_builtin_skill(slug):
         return None
-    sharing = SkillSharing.of(skill)
-    if not sharing.always_on:
-        return None
-    if sharing.org:
-        return 0
     viewer = service.viewer
-    if viewer is not None and viewer.in_team_of(sharing):
+    rule = service.access_rule(skill)
+    if viewer is not None:
+        rule = viewer.effective(rule)
+    if not rule.always_on:
+        return None
+    if rule.org_allowed:
+        return 0
+    if viewer is not None and viewer.in_team_of(rule):
         return 1
     return None
 
@@ -328,7 +330,7 @@ def always_on_turn_skills(
     """The skills a turn applies on every task, in hosted org mode: the ones
     the turn uses (select_turn_skills, which keeps the viewer's visible,
     enabled skills of this project) that are org-wide or shared with one of
-    the viewer's teams and marked always on (META_ALWAYS_ON); every other
+    the viewer's teams and marked ``always_on`` in its skill_access row; every other
     org-wide or team skill is on demand. Org-wide first, then team, each by
     slug. Packaged built-ins are never always-on: they read as org-wide only
     because they predate sharing. Empty outside hosted org mode."""
@@ -343,15 +345,23 @@ def always_on_turn_skills(
 
 
 def always_on_prompt_skills(
-    *, scope: TenantScope | None, project_name: str | None, viewer: SkillViewer | None
+    session: ScopedSession | None,
+    *,
+    project_name: str | None,
+    viewer: SkillViewer | None,
 ) -> list[dict]:
     """``[{"name", "body"}]`` for render_always_on_skills
     (cowork.services.always_on_skills), as the cloud pod builds it from the
     request: the name from the SKILL.md frontmatter, as anton's parser
-    normalizes it, and the body stripped. Empty outside hosted org mode."""
+    normalizes it, and the body stripped. ``session`` is the unit's, whose
+    scope picks the store and whose org's skill_access rows say which skills
+    are always on. Empty outside hosted org mode."""
+    scope = session.scope if session is not None else None
     if not sharing_applies(scope):
         return []
-    service = SkillService(scope, viewer=(viewer or fail_closed_viewer(scope)).for_turns())
+    service = SkillService(
+        scope, viewer=(viewer or fail_closed_viewer(scope)).for_turns(), session=session
+    )
     out: list[dict] = []
     for turn_skill in always_on_turn_skills(service=service, project_name=project_name):
         parsed = _skill_from_dir(turn_skill.path, canonicalize_name=False)
@@ -412,6 +422,7 @@ def build_turn_skills(
     *,
     project_name: str | None = None,
     viewer: SkillViewer | None = None,
+    session: ScopedSession | None = None,
 ) -> dict[str, dict]:
     """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``, and
     ``"always_on": true`` on each skill the turn applies on every task.
@@ -421,11 +432,12 @@ def build_turn_skills(
     folder name. In hosted org mode only the skills ``viewer`` sees go in (a
     missing viewer is the fail-closed one), and the always-on ones
     (always_on_turn_skills) come first, in their order, since the pod renders
-    them in the order it reads them.
+    them in the order it reads them. Who each skill is shared with is read
+    from ``session``'s skill_access rows (SkillService).
     """
     if sharing_applies(scope):
         viewer = (viewer or fail_closed_viewer(scope)).for_turns()
-    svc = SkillService(scope, viewer=viewer)
+    svc = SkillService(scope, viewer=viewer, session=session)
     # A fresh org's store starts empty and there is no org-creation hook, so the
     # builtins are seeded on first read: here, behind ``GET /skills``, and in
     # `_stage_remote_workspace_files`. No-op after the first run, and in local
@@ -659,7 +671,11 @@ class SkillService:
     immutable_builtins_in_local_mode = False
 
     def __init__(
-        self, scope: TenantScope | None = None, *, viewer: SkillViewer | None = None
+        self,
+        scope: TenantScope | None = None,
+        *,
+        viewer: SkillViewer | None = None,
+        session: ScopedSession | None = None,
     ) -> None:
         settings = get_app_settings()
         self._scope = scope
@@ -667,6 +683,13 @@ class SkillService:
         # store, so the listing, reads and turns keep to what they see. None
         # reads the whole store, as the project-rename cascade and seeding do.
         self.viewer = viewer
+        # Hosted org mode only: the session whose org's skill_access rows say
+        # who each skill is shared with (cowork.services.skill_access), read
+        # once per instance. Without one no row is known, and every skill
+        # reads as access_rule_for has a skill with none: its recorded
+        # creator's alone, or org-wide when it predates sharing.
+        self._session = session
+        self._rows: dict[str, SkillAccess] | None = None
         base = Path(settings.skill.root_dir)
         if self.store_name != "skills":
             base = base.parent / self.store_name
@@ -701,7 +724,29 @@ class SkillService:
         packaged built-in."""
         if not self.org_sharing or self.viewer is None or is_builtin_skill(skill.name):
             return True
-        return self.viewer.sees(skill)
+        return self.viewer.sees(self.access_rule(skill))
+
+    def _access_rows(self) -> dict[str, SkillAccess]:
+        if self._session is None or not self.org_sharing:
+            return {}
+        if self._rows is None:
+            from cowork.services.skill_access import access_rows
+
+            self._rows = access_rows(self._session)
+        return self._rows
+
+    def access_rule(self, skill: Skill) -> SkillAccessRule:
+        """Who ``skill``, one of the store's own, is shared with in hosted org
+        mode: its skill_access row's rule (access_rule_for). A packaged
+        built-in is org-wide and never always on. The org's default team is
+        left as stored; SkillViewer.effective reads it as org-wide."""
+        if is_builtin_skill(skill.name):
+            return LEGACY_ORG_WIDE
+        return access_rule_for(self._access_rows().get(skill.name), skill)
+
+    def forget_access(self) -> None:
+        """Drop the rows read so far, after a change to them."""
+        self._rows = None
 
     @property
     def builtin_skills_dir(self) -> Path:
@@ -922,20 +967,16 @@ class SkillService:
         recorded: the changer's (cowork.creators.Changer.creator), never a
         value the caller passed.
 
-        In hosted org mode, the scope's person and the viewer's email, and
-        explicit only-me sharing, so a new skill is never org-wide by default
-        (an org store reads a skill with no sharing as org-wide). Any creator
-        or sharing (always_on included) an uploaded SKILL.md carries is
-        dropped first."""
+        In hosted org mode, the scope's person, in place of any creator an
+        uploaded SKILL.md claims. Who the skill is shared with is its
+        skill_access row's (the route writes it beside the skill, shared with
+        nobody); the creator recorded here is what tells a skill made since
+        sharing from one that predates it when no row is read
+        (cowork.services.skill_sharing.access_rule_for)."""
         if self.org_sharing:
-            for key in (META_CREATED_BY, META_CREATED_BY_EMAIL, META_SHARE_ORG,
-                        META_SHARE_TEAMS, META_SHARE_EMAILS, META_ALWAYS_ON):
-                metadata.pop(key, None)
+            metadata.pop(META_CREATED_BY, None)
             if self._scope.user_id:
                 metadata[META_CREATED_BY] = self._scope.user_id
-            if self.viewer is not None and self.viewer.email:
-                metadata[META_CREATED_BY_EMAIL] = self.viewer.email
-            ONLY_ME.apply(metadata)
             return
         if self._changer is None:
             return
@@ -1804,24 +1845,26 @@ class SkillService:
             raise ValueError("Invalid staged skill deletion path")
         return absolute.name
 
-    def set_org_sharing(self, slug: str, sharing: SkillSharing) -> Skill:
-        """Record who ``slug``, one of the store's own, is shared with, in
-        hosted org mode. Who may is the caller's to check
-        (cowork.services.skill_sharing.SkillViewer). Nothing is written when
-        the sharing already reads this way."""
-        if not self.org_sharing:
+    def stage_org_access(self, slug: str, rule: SkillAccessRule) -> bool:
+        """Stage ``rule`` as who ``slug``, one of the store's own, is shared
+        with, in hosted org mode, in this instance's session; the caller
+        commits it. Who may is the caller's to check
+        (cowork.services.skill_sharing.SkillViewer). False, staging nothing,
+        when the skill already has a row that reads this way."""
+        from cowork.services.skill_access import access_row, stage_access
+
+        if not self.org_sharing or self._session is None:
             raise SkillSharingUnavailableError(SKILL_SHARING_UNAVAILABLE)
         self._refuse_if_reserved(slug)
         skill = self.get_seen_skill(slug)
         if is_builtin_skill(skill.name):
             raise SkillImmutableError(builtin_skill_refusal(skill.name))
-        metadata = dict(skill.metadata)
-        sharing.apply(metadata)
-        if metadata == skill.metadata:
-            return skill
-        skill.metadata = metadata
-        self._write(skill)
-        return self.get_skill(skill.name)
+        row = access_row(self._session, skill.name)
+        if row is not None and SkillAccessRule.from_row(row) == rule.normalized():
+            return False
+        stage_access(self._session, skill.name, rule)
+        self.forget_access()
+        return True
 
     def project_reference_slugs(self, project_name: str) -> list[str]:
         """Canonical skill identities whose metadata names ``project_name``."""

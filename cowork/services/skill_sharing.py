@@ -1,51 +1,47 @@
 """Who sees, uses and changes a skill in hosted org mode (ENG-3787).
 
-In an org store every member reads one folder, so sharing is recorded on each
-skill, in its SKILL.md ``metadata`` (cowork.models.skill META_SHARE_*):
-org-wide, a list of team ids, and a list of emails. Nothing set is "only me".
+In an org store every member reads one folder, so who each skill is shared
+with is recorded beside it, in the ``skill_access`` table
+(cowork.models.skill_access.SkillAccess, read and written through
+cowork.services.skill_access). Its names mirror auth's ArtifactAccess:
+``org_allowed``, ``allowed_team_ids`` and ``allowed_user_ids`` (Keycloak ids
+of people in the org). Nothing set is "only me".
 
 - Only me: the owner sees and changes it.
-- People: each email's owner sees and uses it; only the owner changes it.
+- People: each one sees and uses it; only the owner changes it.
 - Team: every member of a team it's shared with sees it and changes it.
 - Org-wide: everyone sees and uses it; changing it takes ``skills.write_org``.
 
 An org-wide or team skill is recalled on demand like any other unless it is
-marked always on (META_ALWAYS_ON), which puts it in every turn's prompt of the
-people it reaches. Only such a skill keeps the mark.
+marked ``always_on``, which puts it in every turn's prompt of the people it
+reaches. Only such a skill keeps the mark (SkillAccessRule.normalized).
 
 An org admin (cowork.principal.can_manage_org) sees, changes and shares
 every skill on the skills page, but their turns use only what they'd see
-without the role (SkillViewer.for_turns). A skill with no
-``share_org`` key predates sharing and reads as org-wide, which is what every
-member saw before. Built-in and managed skills stay visible to everyone and
-read-only. Outside hosted org mode none of this applies: no viewer is built
-(resolve_skill_viewer) and the store behaves as it always has.
+without the role (SkillViewer.for_turns). A skill with no row and no creator
+in its SKILL.md predates sharing and reads as org-wide, which is what every
+member saw before; one with no row but a recorded creator is that creator's
+alone (access_rule_for). Built-in and managed skills stay visible to everyone
+and read-only. Outside hosted org mode none of this applies: no viewer is
+built (resolve_skill_viewer) and the store behaves as it always has.
 
 The org's default team (auth's ``is_default``) has the whole organization
 as its members, so it IS org-wide: a share naming it is stored as
-``share_org`` (and takes ``skills.share_org``), and a skill that already
-lists it in ``share_teams`` reads as org-wide (SkillViewer.sharing_of).
+``org_allowed`` (and takes ``skills.share_org``), and a row that already
+lists it among its teams reads as org-wide (SkillViewer.effective).
 
 Teams come from auth per caller (cowork.services.hub_teams). When auth can't
 be asked, the caller is in no team: they see their own, org-wide and
-email-shared skills, never one shared only with a team. That fails closed.
+people-shared skills, never one shared only with a team. That fails closed.
 """
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from cowork.db.scoped import TenantScope
-from cowork.models.skill import (
-    META_ALWAYS_ON,
-    META_SHARE_EMAILS,
-    META_SHARE_ORG,
-    META_SHARE_TEAMS,
-    Skill,
-)
 from cowork.principal import Principal, can_manage_org
 from cowork.services.hub_teams import (
     SKILLS_SHARE_ORG,
@@ -53,13 +49,16 @@ from cowork.services.hub_teams import (
     fetch_teams_and_permissions,
 )
 
+if TYPE_CHECKING:
+    from cowork.models.skill import Skill
+    from cowork.models.skill_access import SkillAccess
+
 SkillSection = Literal["mine", "shared_with_me", "team", "org"]
 
-# Deliberately loose: one @, no spaces, a dot in the domain. Auth is the
-# source of truth for who an address names.
-_EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
-_MAX_EMAILS = 200
+_MAX_PEOPLE = 200
 _MAX_TEAMS = 100
+# A Keycloak id or a team id is a UUID; this only bounds what is stored.
+_MAX_ID_CHARS = 64
 
 
 def sharing_applies(scope: TenantScope | None) -> bool:
@@ -67,98 +66,91 @@ def sharing_applies(scope: TenantScope | None) -> bool:
     return scope is not None and scope.org_mode
 
 
-def _split(raw: str | None) -> tuple[str, ...]:
-    return tuple(part for part in (s.strip() for s in (raw or "").split(",")) if part)
-
-
 @dataclass(frozen=True)
-class SkillSharing:
-    """Who one skill is shared with. The default is only its owner.
-    ``always_on`` puts an org-wide or team skill in every turn's prompt."""
+class SkillAccessRule:
+    """Who one skill is shared with, as its ``skill_access`` row records it.
+    The default is only its owner."""
 
-    org: bool = False
-    team_ids: tuple[str, ...] = ()
-    emails: tuple[str, ...] = ()
+    org_allowed: bool = False
+    allowed_team_ids: tuple[str, ...] = ()
+    allowed_user_ids: tuple[str, ...] = ()
     always_on: bool = False
+    owner_user_id: str | None = None
 
     @property
     def broad(self) -> bool:
         """Shared org-wide or with a team: the skills that can be always on."""
-        return self.org or bool(self.team_ids)
+        return self.org_allowed or bool(self.allowed_team_ids)
 
     @classmethod
-    def of(cls, skill: Skill) -> SkillSharing:
-        """The sharing ``skill`` records; org-wide when it records none."""
-        metadata = skill.metadata or {}
-        raw_org = metadata.get(META_SHARE_ORG)
+    def from_row(cls, row: SkillAccess) -> SkillAccessRule:
         return cls(
-            org=True if raw_org is None else raw_org.strip().lower() == "true",
-            team_ids=_split(metadata.get(META_SHARE_TEAMS)),
-            emails=_split(metadata.get(META_SHARE_EMAILS)),
-            always_on=(metadata.get(META_ALWAYS_ON) or "").strip().lower() == "true",
-        )
+            org_allowed=bool(row.org_allowed),
+            allowed_team_ids=tuple(row.allowed_team_ids or ()),
+            allowed_user_ids=tuple(row.allowed_user_ids or ()),
+            always_on=bool(row.always_on),
+            owner_user_id=row.owner_user_id,
+        ).normalized()
 
-    def with_default_team_as_org(self, default_team_id: str) -> SkillSharing:
-        """The org's default team named among ``team_ids`` means org-wide:
-        drop it from the teams and set ``org``."""
-        if not default_team_id or default_team_id not in self.team_ids:
+    def normalized(self) -> SkillAccessRule:
+        """``always_on`` kept only on a skill shared org-wide or with a team."""
+        return self if not self.always_on or self.broad else replace(self, always_on=False)
+
+    def with_default_team_as_org(self, default_team_id: str) -> SkillAccessRule:
+        """The org's default team named among the teams means org-wide: drop
+        it from the teams and set ``org_allowed``."""
+        if not default_team_id or default_team_id not in self.allowed_team_ids:
             return self
         return replace(
             self,
-            org=True,
-            team_ids=tuple(t for t in self.team_ids if t != default_team_id),
+            org_allowed=True,
+            allowed_team_ids=tuple(t for t in self.allowed_team_ids if t != default_team_id),
         )
 
-    def apply(self, metadata: dict[str, str]) -> None:
-        """Write this sharing into ``metadata``. ``share_org`` is always
-        written, so the skill never reads as legacy org-wide again.
-        ``always_on`` is kept only on a skill shared org-wide or with a team;
-        anything else drops it."""
-        metadata[META_SHARE_ORG] = "true" if self.org else "false"
-        for key, values in ((META_SHARE_TEAMS, self.team_ids), (META_SHARE_EMAILS, self.emails)):
-            if values:
-                metadata[key] = ",".join(values)
-            else:
-                metadata.pop(key, None)
-        if self.always_on and self.broad:
-            metadata[META_ALWAYS_ON] = "true"
-        else:
-            metadata.pop(META_ALWAYS_ON, None)
+
+# Everyone, on demand: a skill that predates sharing, and a packaged built-in.
+LEGACY_ORG_WIDE = SkillAccessRule(org_allowed=True)
 
 
-ONLY_ME = SkillSharing()
+def access_rule_for(row: SkillAccess | None, skill: Skill) -> SkillAccessRule:
+    """``skill``'s access: its row's, else org-wide when its SKILL.md records
+    no creator (a skill from before sharing: what every member saw then),
+    else its creator's alone."""
+    if row is not None:
+        return SkillAccessRule.from_row(row)
+    if skill.created_by:
+        return SkillAccessRule(owner_user_id=skill.created_by)
+    return LEGACY_ORG_WIDE
 
 
-def normalize_emails(values: Iterable[str]) -> tuple[str, ...]:
-    """Lowercased, stripped and deduplicated in first-seen order. Raises
-    ValueError naming the first address that doesn't look like one."""
+def _normalize_ids(values: Iterable[str], *, what: str, most: int) -> tuple[str, ...]:
     seen: dict[str, None] = {}
     for raw in values:
-        email = str(raw).strip().lower()
-        if not email:
+        value = str(raw).strip()
+        if not value:
             continue
-        if not _EMAIL_RE.match(email):
-            raise ValueError(f"{raw!r} is not a valid email address.")
-        seen.setdefault(email, None)
-    if len(seen) > _MAX_EMAILS:
-        raise ValueError(f"A skill can be shared with at most {_MAX_EMAILS} people.")
+        if len(value) > _MAX_ID_CHARS or "," in value or any(c.isspace() for c in value):
+            raise ValueError(f"{raw!r} is not a valid {what} id.")
+        seen.setdefault(value, None)
+    if len(seen) > most:
+        raise ValueError(f"A skill can be shared with at most {most} {what}s.")
     return tuple(seen)
 
 
 def normalize_team_ids(values: Iterable[str]) -> tuple[str, ...]:
-    """Stripped and deduplicated in first-seen order. A comma would corrupt
-    the stored list, so it is refused."""
-    seen: dict[str, None] = {}
-    for raw in values:
-        team_id = str(raw).strip()
-        if not team_id:
-            continue
-        if "," in team_id:
-            raise ValueError(f"{raw!r} is not a valid team id.")
-        seen.setdefault(team_id, None)
-    if len(seen) > _MAX_TEAMS:
-        raise ValueError(f"A skill can be shared with at most {_MAX_TEAMS} teams.")
-    return tuple(seen)
+    """Stripped and deduplicated in first-seen order; a malformed id is a
+    ValueError naming it."""
+    return _normalize_ids(values, what="team", most=_MAX_TEAMS)
+
+
+def normalize_user_ids(values: Iterable[str]) -> tuple[str, ...]:
+    """Keycloak user ids, stripped, lowercased (a UUID's canonical form, as
+    the gateway forwards ``sub``) and deduplicated in first-seen order."""
+    return tuple(
+        dict.fromkeys(
+            v.lower() for v in _normalize_ids(values, what="person", most=_MAX_PEOPLE)
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -178,26 +170,29 @@ class SkillViewer:
     # The org's default team (whole-org membership), when auth named one.
     default_team_id: str = ""
 
-    def sharing_of(self, skill: Skill) -> SkillSharing:
-        """``skill``'s sharing, with the org's default team read as org-wide."""
-        return SkillSharing.of(skill).with_default_team_as_org(self.default_team_id)
+    def effective(self, rule: SkillAccessRule) -> SkillAccessRule:
+        """``rule`` with the org's default team read as org-wide."""
+        return rule.with_default_team_as_org(self.default_team_id)
 
     def owns(self, owner_id: str | None) -> bool:
         return bool(owner_id and self.user_id and owner_id == self.user_id)
 
-    def in_team_of(self, sharing: SkillSharing) -> bool:
-        return not self.team_ids.isdisjoint(sharing.team_ids)
+    def in_team_of(self, rule: SkillAccessRule) -> bool:
+        return not self.team_ids.isdisjoint(rule.allowed_team_ids)
 
-    def sees(self, skill: Skill) -> bool:
-        """Owner, org-wide, one of the caller's teams, or the caller's email;
-        an admin sees every skill."""
-        sharing = self.sharing_of(skill)
+    def named_in(self, rule: SkillAccessRule) -> bool:
+        return bool(self.user_id) and self.user_id.lower() in rule.allowed_user_ids
+
+    def sees(self, rule: SkillAccessRule) -> bool:
+        """Owner, org-wide, one of the caller's teams, or the caller's own
+        id among the people; an admin sees every skill."""
+        rule = self.effective(rule)
         return (
             self.is_admin
-            or self.owns(skill.created_by)
-            or sharing.org
-            or self.in_team_of(sharing)
-            or bool(self.email and self.email.lower() in sharing.emails)
+            or self.owns(rule.owner_user_id)
+            or rule.org_allowed
+            or self.in_team_of(rule)
+            or self.named_in(rule)
         )
 
     def for_turns(self) -> SkillViewer:
@@ -206,37 +201,37 @@ class SkillViewer:
         skills in their agent."""
         return replace(self, is_admin=False) if self.is_admin else self
 
-    def can_edit(self, skill: Skill, *, owner_id: str | None) -> bool:
+    def can_edit(self, rule: SkillAccessRule) -> bool:
         """Change the content, enable or disable, rename or delete. Org-wide
         takes skills.write_org, even for its owner; a team member changes a
         skill shared with their team; people-shared recipients read only."""
         if self.is_admin:
             return True
-        sharing = self.sharing_of(skill)
-        if sharing.org:
+        rule = self.effective(rule)
+        if rule.org_allowed:
             return self.can_write_org
-        return self.owns(owner_id) or self.in_team_of(sharing)
+        return self.owns(rule.owner_user_id) or self.in_team_of(rule)
 
-    def can_manage_sharing(self, *, owner_id: str | None) -> bool:
+    def can_manage_sharing(self, rule: SkillAccessRule) -> bool:
         """Change who a skill is shared with: its owner or an admin. Whether
         they may also set or clear org-wide is can_share_org's question."""
-        return self.is_admin or self.owns(owner_id)
+        return self.is_admin or self.owns(rule.owner_user_id)
 
-    def section(self, skill: Skill, *, owner_id: str | None) -> SkillSection:
-        """The bucket the skills page lists ``skill`` under for this caller."""
-        if self.owns(owner_id):
+    def section(self, rule: SkillAccessRule) -> SkillSection:
+        """The bucket the skills page lists a skill under for this caller."""
+        if self.owns(rule.owner_user_id):
             return "mine"
-        sharing = self.sharing_of(skill)
-        if sharing.org:
+        rule = self.effective(rule)
+        if rule.org_allowed:
             return "org"
-        if self.in_team_of(sharing):
+        if self.in_team_of(rule):
             return "team"
         return "shared_with_me"
 
 
 def fail_closed_viewer(scope: TenantScope | None) -> SkillViewer:
     """A viewer for a caller whose teams and permissions are unknown: their
-    own skills, org-wide ones, and nothing team-only."""
+    own skills, org-wide ones, ones naming them, and nothing team-only."""
     return SkillViewer(user_id=scope.user_id if scope is not None else None)
 
 

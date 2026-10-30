@@ -6,12 +6,14 @@ bearer against the operator's host (same rules as ``hub_workspaces``):
 - ``?q=<text>&limit=<n>``: the skill sharing picker's people search. Members
   of the caller's active org, the caller excluded. Cached briefly per caller
   per query, so typing back over a prefix doesn't ask again.
-- ``?emails=a@x,b@y``: which of those addresses are members of the active
-  org. What sharing a skill with people checks a newly added address against.
-  Never cached: a refusal has to reflect who is in the org now.
+- ``?ids=a,b``: which of those Keycloak user ids are members of the active
+  org, with their names and addresses. What sharing a skill with people checks
+  a newly added id against, and what the app names stored ids with
+  (``GET /hub/people/?ids=``). Never cached: a refusal has to reflect who is
+  in the org now.
 
 Every failure is "unreachable", never an exception. The search renders
-nothing on it; the email check turns it into a 503 at the caller.
+nothing on it; the id check turns it into a 503 at the caller.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ ORG_MEMBERS_PATH = "/me/org-members/"
 MIN_QUERY_CHARS = 2
 MAX_LIMIT = 20
 DEFAULT_LIMIT = 10
-MAX_EMAILS_PER_LOOKUP = 50
+MAX_IDS_PER_LOOKUP = 50
 
 # Short on purpose: the search is keystroke-driven, and a member who just
 # joined should show up within a breath.
@@ -123,26 +125,30 @@ async def search_org_members(
     return result
 
 
-async def org_members_among(
-    *, bearer_token: str, emails: Iterable[str]
-) -> frozenset[str] | None:
-    """Which of ``emails`` (lowercase) belong to the caller's active org, or
-    None when auth couldn't be asked. One call per MAX_EMAILS_PER_LOOKUP
-    addresses; any chunk failing makes the whole answer None."""
-    wanted = list(dict.fromkeys(e.strip().lower() for e in emails if e and e.strip()))
+async def org_members_by_ids(
+    *, bearer_token: str, ids: Iterable[str]
+) -> list[OrgMember] | None:
+    """The members of the caller's active org among ``ids`` (Keycloak user
+    ids, compared lowercased), or None when auth couldn't be asked. One call
+    per MAX_IDS_PER_LOOKUP ids; any chunk failing makes the whole answer
+    None. An id auth doesn't return is not a member."""
+    wanted = list(dict.fromkeys(i.strip().lower() for i in ids if i and i.strip()))
     if not wanted:
-        return frozenset()
+        return []
     if not bearer_token:
         return None
-    found: set[str] = set()
-    for start in range(0, len(wanted), MAX_EMAILS_PER_LOOKUP):
-        chunk = wanted[start : start + MAX_EMAILS_PER_LOOKUP]
-        path = f"{ORG_MEMBERS_PATH}?{urlencode({'emails': ','.join(chunk)})}"
+    found: dict[str, OrgMember] = {}
+    for start in range(0, len(wanted), MAX_IDS_PER_LOOKUP):
+        chunk = wanted[start : start + MAX_IDS_PER_LOOKUP]
+        path = f"{ORG_MEMBERS_PATH}?{urlencode({'ids': ','.join(chunk)})}"
         members = _rows(await get_auth_json(path, bearer_token))
         if members is None:
             return None
-        found.update(m.email.strip().lower() for m in members if m.email)
-    return frozenset(found)
+        for member in members:
+            key = member.id.strip().lower()
+            if key in wanted:
+                found.setdefault(key, member)
+    return [found[i] for i in wanted if i in found]
 
 
 def reset_caches_for_tests() -> None:

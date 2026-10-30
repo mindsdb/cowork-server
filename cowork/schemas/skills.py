@@ -22,35 +22,40 @@ class SkillCreateRequest(CamelRequest):
 class SkillSharingRequest(CamelRequest):
     """Who one skill is shared with.
 
-    Hosted org mode (ENG-3787) reads ``org``, ``team_ids``, ``emails`` and
-    ``always_on`` (``alwaysOn``: put an org-wide or team skill in every
-    turn's prompt instead of recalling it on demand); a field left out keeps
-    what the skill has. Elsewhere, where a person shares
-    their own skills one at a time, ``shared`` shares one with everyone,
-    read-only, or stops sharing it.
+    Hosted org mode (ENG-3787) reads the skill's access, named as auth's
+    ArtifactAccess names it: ``org_allowed`` (everyone in the org),
+    ``allowed_team_ids``, ``allowed_user_ids`` (Keycloak ids of people in the
+    org) and ``always_on`` (put an org-wide or team skill in every turn's
+    prompt instead of recalling it on demand). Each is accepted in camelCase
+    too; a field left out keeps what the skill has. Elsewhere, where a person
+    shares their own skills one at a time, ``shared`` shares one with
+    everyone, read-only, or stops sharing it.
     """
 
     shared: bool | None = None
-    org: bool | None = None
-    team_ids: list[str] | None = None
-    emails: list[str] | None = None
+    org_allowed: bool | None = None
+    allowed_team_ids: list[str] | None = None
+    allowed_user_ids: list[str] | None = None
     always_on: bool | None = None
 
 
-class SkillSharingView(CamelResponse):
-    """Who a skill is shared with in hosted org mode. All empty elsewhere.
-    ``emails`` is listed only to whoever may change it (owner or admin).
-    ``always_on``: an org-wide or team skill in every turn's prompt; false
-    for one recalled on demand, a built-in, a managed skill, and outside
-    hosted org mode."""
+class SkillAccessView(CamelResponse):
+    """Who a skill is shared with in hosted org mode (its skill_access row).
+    All empty elsewhere. ``allowed_user_ids`` is listed only to whoever may
+    change it (owner or admin). ``always_on``: an org-wide or team skill in
+    every turn's prompt; false for one recalled on demand, a built-in, a
+    managed skill, and outside hosted org mode."""
 
-    org: bool = False
-    team_ids: list[str] = Field(default_factory=list)
-    emails: list[str] = Field(default_factory=list)
+    org_allowed: bool = False
+    allowed_team_ids: list[str] = Field(default_factory=list)
+    allowed_user_ids: list[str] = Field(default_factory=list)
     always_on: bool = False
 
 
 class SkillOwner(CamelResponse):
+    """The skill's owner, by Keycloak id. ``email`` only when the owner is
+    the caller; anyone else is named through GET /hub/people/?ids=."""
+
     id: str | None = None
     email: str | None = None
 
@@ -86,11 +91,11 @@ class SkillResponse(CamelResponse):
     shared: bool = False
     capabilities: SkillCapabilities
     # Hosted org sharing (ENG-3787). Outside it: section "mine" (managed
-    # skills "org"), can_edit as capabilities.can_edit, sharing all empty.
-    sharing: SkillSharingView = Field(default_factory=SkillSharingView)
-    # The skills page's bucket for the caller: "mine" (they created it), else
+    # skills "org"), can_edit as capabilities.can_edit, access all empty.
+    access: SkillAccessView = Field(default_factory=SkillAccessView)
+    # The skills page's bucket for the caller: "mine" (they own it), else
     # "org" (org-wide), else "team" (one of their teams), else
-    # "shared_with_me" (their email).
+    # "shared_with_me" (their user id).
     section: Literal["mine", "shared_with_me", "team", "org"] = "mine"
     can_edit: bool = False
     owner: SkillOwner = Field(default_factory=SkillOwner)

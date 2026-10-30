@@ -229,7 +229,7 @@ def test_shared_resource_authorization_and_contract_through_http(client):
     # Hosted org sharing (ENG-3787): the owner chooses who a new skill reaches,
     # and it starts as theirs alone.
     assert skill["capabilities"]["canShare"] is True
-    assert (skill["section"], skill["sharing"]["org"]) == ("mine", False)
+    assert (skill["section"], skill["access"]["orgAllowed"]) == ("mine", False)
     denied = client.put(
         f"/api/v1/skills/{skill['id']}",
         json={"instructions": "Peer overwrite"},

@@ -66,6 +66,7 @@ from cowork.services.live_apps import (
 from cowork.services.projects import display_label
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.always_on_skills import render_always_on_skills
+from cowork.services.skill_sharing import sharing_applies
 from cowork.services.skills import (
     always_on_prompt_skills,
     artifact_skill_dirs,
@@ -1843,12 +1844,20 @@ class AntonHarness:
             # hosted org mode only, so "" on the desktop and every local
             # deployment. This path has no caller credential to read teams
             # with, so it gets the fail-closed set (org-wide only), as a pod
-            # turn without one does.
-            always_on_context = render_always_on_skills(
-                always_on_prompt_skills(
-                    scope=turn_scope, project_name=conversation.project.name, viewer=None
+            # turn without one does. Which skills are always on is the org's
+            # skill_access rows', read in one unit of work.
+            always_on_context = ""
+            if sharing_applies(turn_scope):
+                always_on_context = render_always_on_skills(
+                    await run_db(
+                        partial(
+                            always_on_prompt_skills,
+                            project_name=conversation.project.name,
+                            viewer=None,
+                        ),
+                        scope=turn_scope,
+                    )
                 )
-            )
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
             # None with the sandbox off, and then not passed at all. Built in a
             # worker thread: it lists every person's partition and opens the

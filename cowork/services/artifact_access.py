@@ -14,6 +14,32 @@ class ArtifactAccessUnavailable(RuntimeError):
     pass
 
 
+class ArtifactAudienceRejected(ValueError):
+    """Auth refused a restricted rule's teams or people: a team outside the
+    artifact's organization, or a person who isn't a member of it. A
+    ValueError, so the access route answers 400 with the reason."""
+
+
+def _audience_rejection(response: httpx.Response) -> str:
+    """Auth's 400 for an unknown team or a non-member, as one sentence naming
+    them; "" for any other answer."""
+    if response.status_code != 400:
+        return ""
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    if body.get("code") == "not_a_member":
+        ids = ", ".join(str(i) for i in body.get("allowed_user_ids") or [])
+        return f"Only people in your organization can be added by name; share with anyone else by email: {ids}"
+    if body.get("code") == "unknown_team":
+        ids = ", ".join(str(i) for i in body.get("team_ids") or [])
+        return f"Each team must be a team of your organization: {ids}"
+    return ""
+
+
 def draft_review_access_key(artifact_id: str) -> str:
     """Internal auth rule for draft collaborators, separate from sharing.
 
@@ -131,14 +157,19 @@ def sync_artifact_team_access(
     org_allowed: bool,
     team_ids: list[str],
     access_version: int,
+    allowed_user_ids: list[str] | None = None,
     settings: TurnQueueSettings | None = None,
     client: httpx.Client | None = None,
 ) -> None:
-    """Write a restricted artifact's teams to auth (ENG-3787).
+    """Write a restricted artifact's teams and people to auth (ENG-3787).
 
     The publish lambda upserts the same rule from the anton publisher's
-    access block, which carries emails and the org flag but no teams, so this
-    upserts the whole rule again, with the same version, adding ``team_ids``.
+    access block, which carries emails and the org flag but no teams or
+    people by id, so this upserts the whole rule again, with the same
+    version, adding ``team_ids`` and ``allowed_user_ids`` (Keycloak ids of
+    people in the org; ``allowed_emails`` are people outside it). Auth checks
+    each team belongs to the org and each person is a member of it, and
+    refuses the whole rule otherwise: ArtifactAudienceRejected, naming them.
     Called after a successful publish, so it lands second. ``org_wide`` is
     sent equal to ``org_allowed``: one audience, "everyone in the owner's
     organization", under auth's old and new names, so the two never disagree.
@@ -164,14 +195,20 @@ def sync_artifact_team_access(
                 "allowed_emails": allowed_emails,
                 "org_allowed": org_allowed,
                 "team_ids": team_ids,
+                "allowed_user_ids": list(allowed_user_ids or []),
                 "org_wide": org_allowed,
                 "access_version": access_version,
             },
             headers={"X-Internal-Auth": settings.auth_internal_secret},
         )
+        rejected = _audience_rejection(response)
+        if rejected:
+            raise ArtifactAudienceRejected(rejected)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise ArtifactAccessUnavailable("Could not share the artifact with the selected teams") from exc
+        raise ArtifactAccessUnavailable(
+            "Could not share the artifact with the selected teams and people"
+        ) from exc
     finally:
         if owns_client:
             client.close()
