@@ -532,6 +532,7 @@ def turn_artifact_changes(
     tracked_edits: set[str] | None = None,
     attribute_by_provenance: bool = False,
     completed_cleanly: bool = True,
+    repair_slugs: set[str] | None = None,
 ) -> ArtifactChanges:
     """What the turn created and touched, from the directory as it stands now
     against ``before``, with an agent revision captured for every touched
@@ -576,7 +577,16 @@ def turn_artifact_changes(
     )
 
     base = Path(artifacts_base)
-    after = snapshot_artifact_slugs(base)
+    # With both tracked sets and the folders holding a repair queued to this
+    # conversation (`repair_slugs`, from queued_agent_repairs), nothing else
+    # can be in the answer, so only those folders are statted, not every
+    # folder in the project's artifacts.
+    if tracked_new is not None and tracked_edits is not None and repair_slugs is not None:
+        from cowork.services.artifact_identity import artifact_folders_named
+
+        after = artifact_folders_named(base, set(tracked_new) | set(tracked_edits) | set(repair_slugs))
+    else:
+        after = snapshot_artifact_slugs(base)
     if tracked_new is None and attribute_by_provenance:
         from cowork.services.artifact_ownership import turn_created_slugs
 

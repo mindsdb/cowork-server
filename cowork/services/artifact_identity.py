@@ -612,6 +612,26 @@ def identities_below(source: "ProjectArtifacts") -> dict[str, tuple[str, ...]]:
         return {}
 
 
+def artifact_folders_named(base: Path, slugs) -> set[str]:
+    """The names among ``slugs`` that are artifact folders directly below
+    ``base``: plain folders holding a plain ``metadata.json``. A name that
+    isn't one path component, a link, or a missing entry is left out. Stats
+    only the named folders, never the whole root."""
+    found: set[str] = set()
+    try:
+        with pinned_dir(Path(base), nofollow_base=True) as root:
+            for slug in slugs:
+                try:
+                    with _opened_child_directory(root, slug) as folder:
+                        if stat.S_ISREG(dir_stat(folder, "metadata.json", follow_symlinks=False).st_mode):
+                            found.add(_component(slug))
+                except (OSError, ValueError):
+                    continue
+    except OSError:
+        return set()
+    return found
+
+
 def artifact_ids_below(base: Path, slugs) -> dict[str, str]:
     """The id each of ``slugs``' folders directly below ``base`` holds, read
     without writing. A folder that is gone, is a link or holds no readable id

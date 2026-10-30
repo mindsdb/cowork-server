@@ -94,6 +94,7 @@ async def remote_turn_events(
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import remote_turn_history
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
+    from cowork.services.queued_repairs import queued_repair_folders
     from cowork.services.task_objects import (
         publish_and_card_turn_artifacts,
         remote_skill_draft_result,
@@ -122,6 +123,9 @@ async def remote_turn_events(
         )
         if artifacts else (set(), {})
     )
+    # Read before the pod runs, beside the snapshot: a repair is queued
+    # before its turn starts.
+    repair_slugs = await queued_repair_folders(conv_id, scope=scope) if artifacts else None
     new_slugs: list[str] = []
     touched_slugs: set[str] = set()
     artifact_writes_allowed = False
@@ -212,6 +216,7 @@ async def remote_turn_events(
                 before_mtimes=before_mtimes,
                 completed_cleanly=completed_cleanly,
                 touched=pod_touched,
+                repair_slugs=repair_slugs,
             )
 
     if artifacts is not None and artifact_writes_allowed:
@@ -235,6 +240,7 @@ async def _record_turn_artifacts(
     before_mtimes: dict[str, int],
     completed_cleanly: bool,
     touched: set[str] | None = None,
+    repair_slugs: set[str] | None = None,
 ) -> tuple[list[str], set[str]]:
     """The folders the turn created and touched. Those it created are indexed
     as this conversation's (and, in org mode, its creator's), in a unit.
@@ -243,8 +249,12 @@ async def _record_turn_artifacts(
     would replace the turn's real outcome. A failed diff records nothing, and
     outside org mode the next turn in the project reconciles it; in org mode
     nothing does."""
+    from cowork.services.queued_repairs import forget_checked_repairs
     from cowork.services.task_objects import record_new_artifacts, turn_artifact_changes
 
+    # With the pod's list, the folders holding a repair queued to this
+    # conversation are all the diff needs besides the touched ones.
+    repair_slugs = repair_slugs if touched is not None else None
     try:
         # Waits for a file store slot rather than failing: in org mode
         # nothing reconciles a turn whose diff was refused.
@@ -262,6 +272,7 @@ async def _record_turn_artifacts(
                 tracked_new=touched,
                 tracked_edits=touched,
                 completed_cleanly=completed_cleanly,
+                repair_slugs=repair_slugs,
             ),
             scope=scope,
             deadline=False,
@@ -294,4 +305,6 @@ async def _record_turn_artifacts(
                     artifact_slugs=changes.created,
                 ),
             )
+    # Last: the rows only spare the next turn end a folder check.
+    await forget_checked_repairs(conv_id, repair_slugs, scope=scope)
     return changes.created, changes.touched

@@ -1171,6 +1171,13 @@ async def request_agent_repair(
     _source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    # Before the repair is queued, so the end of the conversation's turn
+    # checks this folder; a failed write queues nothing.
+    from cowork.services.queued_repairs import record_queued_repair
+
+    await run_db(
+        partial(record_queued_repair, conversation_id=body.conversationId, slug=folder.name), scope=scope
+    )
     try:
         return await run_efs(
             partial(

@@ -549,6 +549,10 @@ class _RemoteTurnArtifacts:
     directory: _RemoteArtifactsDir
     before_slugs: set[str]
     before_mtimes: dict[str, int]
+    # The folders holding an agent repair queued to the conversation
+    # (queued_agent_repairs), read before the pod runs: the repair is queued
+    # before its turn starts. None when they couldn't be read.
+    repair_slugs: set[str] | None = None
     writes_allowed: bool = False
     recorded: bool = False
 
@@ -2059,12 +2063,16 @@ class ResponsesHandler:
             the artifacts its tools touched: with it, the diff claims and
             checks only those; without it, provenance decides what the turn
             created, and every folder is checked for edits."""
+            from cowork.services.queued_repairs import forget_checked_repairs
             from cowork.services.task_objects import record_new_artifacts, turn_artifact_changes
 
             if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
                 return None
             turn_artifacts.recorded = True
             directory = turn_artifacts.directory
+            # With the pod's list, the folders holding a repair queued to this
+            # conversation are all the diff needs besides the touched ones.
+            repair_slugs = turn_artifacts.repair_slugs if touched is not None else None
             try:
                 # Waits for a file store slot rather than failing: in org mode
                 # nothing reconciles a turn whose diff was refused.
@@ -2081,6 +2089,7 @@ class ResponsesHandler:
                         tracked_new=touched,
                         tracked_edits=touched,
                         completed_cleanly=completed_cleanly,
+                        repair_slugs=repair_slugs,
                     ),
                     scope=scope,
                     deadline=False,
@@ -2131,6 +2140,8 @@ class ResponsesHandler:
                 # its error log, so a refusal still names the slugs it left
                 # unrecorded.
                 await run_to_completion(record())
+            # Last: the rows only spare the next turn end a folder check.
+            await forget_checked_repairs(conv_id, repair_slugs, scope=scope)
             return changes
 
         async def persist(*, clean: bool) -> _SavedAnswer:
@@ -2276,8 +2287,11 @@ class ResponsesHandler:
                 before_slugs, before_mtimes = await run_efs(
                     partial(snapshot_artifact_state, seed.artifacts.base), scope=scope, deadline=False
                 )
+                from cowork.services.queued_repairs import queued_repair_folders
+
                 turn_artifacts = _RemoteTurnArtifacts(
                     directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
+                    repair_slugs=await queued_repair_folders(conv_id, scope=scope),
                 )
             # Set only on turn_completed: any other exit (Stop, cancel, failure)
             # may have cut anton off between writing an artifact's metadata and
