@@ -148,7 +148,7 @@ def _delete_channel_events(*dedupe_keys: str) -> None:
 async def test_intake_events_stamps_the_resolved_org(monkeypatch, org_deployment):
     captured = []
     try:
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-a"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured), org_id=ORG_A,
         )
@@ -173,14 +173,14 @@ async def test_intake_events_isolates_dedupe_across_orgs(org_deployment):
     captured_a: list = []
     captured_b: list = []
     try:
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_a), org_id=ORG_A,
         )
         for coro in captured_a:
             await coro
 
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_b), org_id=ORG_B,
         )

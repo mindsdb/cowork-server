@@ -60,18 +60,17 @@ def artifact_capabilities(
         if resolution.unknown:
             capabilities["ownerUnknown"] = True
     if export_source is not None:
-        capabilities = with_export_formats(session, capabilities, export_source)
+        capabilities = with_export_formats(scope, capabilities, export_source)
     return capabilities
 
 
-def with_export_formats(session, capabilities: dict, export_source: ExportSource) -> dict:
+def with_export_formats(scope, capabilities: dict, export_source: ExportSource) -> dict:
     """*capabilities* with ``exportFormats`` added, as ``artifact_capabilities`` adds it.
 
     The workspace response already holds its owner's capabilities, so it adds
     the field through this instead of resolving the owner again. Both answers
     then decide the list in this one place.
     """
-    scope = getattr(session, "scope", None)
     return {
         **capabilities,
         "exportFormats": offered_export_formats(

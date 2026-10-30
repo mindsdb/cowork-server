@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -15,6 +16,7 @@ from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import RemoteWorkspace
 from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
+from tests._fakes import inline_run_db
 from tests._logging_assertions import assert_log_fields
 
 
@@ -27,6 +29,11 @@ class _FakeScope:
 
 class _FakeSession:
     scope = _FakeScope()
+
+
+def _no_memory(session, conv_id, entries, principal):
+    """ResponsesHandler._persist_turn_memory's own signature, so a call that
+    leaves an argument out fails as the real one does."""
 
 
 def _fake_handler(
@@ -42,6 +49,8 @@ def _fake_handler(
         return ()
 
     monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
+    # Each unit runs inline, on a session that reaches no database.
+    monkeypatch.setattr(remote_turn_mod, "run_db", inline_run_db(_FakeSession()))
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
@@ -50,7 +59,7 @@ def _fake_handler(
             "_remote_workspace": staticmethod(remote_workspace or (lambda s, c: None)),
             "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c, *, workspace: None)),
             "_remote_started_at": staticmethod(lambda s, c: None),
-            "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
+            "_persist_turn_memory": staticmethod(persist_turn_memory or _no_memory),
         },
     ))
 
@@ -92,7 +101,7 @@ async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events = [event async for event in remote_turn_events(
-        session=session, conv_id=conv_id, org_id="org-123", user_id=None,
+        scope=session.scope, conv_id=conv_id, org_id="org-123", user_id=None,
         input_text="How many at S1?", model="anton", turn_rows=[],
     )]
 
@@ -127,7 +136,7 @@ async def test_the_turn_looks_up_its_workspace_once(monkeypatch):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -149,7 +158,7 @@ async def test_turn_delta_becomes_a_stream_text_delta(monkeypatch):
 
     turn_rows = []
     events, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=turn_rows,
     ))
 
@@ -169,7 +178,7 @@ async def test_turn_failed_raises_with_the_workers_code_and_message(monkeypatch)
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -191,7 +200,7 @@ async def test_turn_failed_falls_back_to_the_generic_message_and_code(monkeypatc
     from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
     _, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -219,7 +228,7 @@ async def test_turn_history_mutates_the_callers_turn_rows_list(monkeypatch):
 
     turn_rows = []
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=turn_rows,
     ))
 
@@ -247,7 +256,7 @@ async def test_turn_history_reaches_the_formatter_as_the_pod_sent_it(monkeypatch
 
     turn_rows = []
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
     ))
 
@@ -289,7 +298,7 @@ async def test_a_compacted_turns_history_reaches_the_formatter_and_none_is_kept(
 
     turn_rows = []
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
     ))
 
@@ -315,7 +324,7 @@ async def test_a_compacted_turns_history_frame_without_a_list_of_rows_reaches_th
 
     turn_rows = []
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
     ))
 
@@ -337,7 +346,7 @@ async def test_the_turns_context_carries_the_history_the_pod_is_seeded_with(monk
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events = [event async for event in remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="And at S2?", model="anton", turn_rows=[],
     )]
 
@@ -347,8 +356,14 @@ async def test_the_turns_context_carries_the_history_the_pod_is_seeded_with(monk
 
 @pytest.mark.asyncio
 async def test_turn_memory_calls_persist_turn_memory(monkeypatch):
+    """A channel turn writes memory for the org, with no principal. The fake
+    keeps the real signature, so a call that drops the principal fails."""
     calls = []
-    _fake_handler(monkeypatch, persist_turn_memory=lambda s, c, e: calls.append(e))
+
+    def persist(session, conv_id, entries, principal):
+        calls.append((entries, principal))
+
+    _fake_handler(monkeypatch, persist_turn_memory=persist)
 
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
@@ -358,11 +373,11 @@ async def test_turn_memory_calls_persist_turn_memory(monkeypatch):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
-    assert calls == [[{"key": "likes", "value": "pizza"}]]
+    assert calls == [([{"key": "likes", "value": "pizza"}], None)]
 
 
 @pytest.mark.asyncio
@@ -376,7 +391,7 @@ async def test_no_artifacts_context_skips_indexing_without_error(monkeypatch):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -407,7 +422,7 @@ async def test_vault_secrets_are_registered_before_the_seed_history_is_built(mon
 
     session = _FakeSession()
     _, failure = await _drain(remote_turn_events(
-        session=session, conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=session.scope, conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -424,9 +439,9 @@ async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatc
     context = (object(), object(), "project", "Project")
     _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
-    index = Mock(return_value=([], set(), None))
+    index = Mock(return_value=SimpleNamespace(created=[], touched=set()))
     publish = AsyncMock(return_value=[])
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", index)
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", index)
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", publish)
 
     async def replies(**kwargs):
@@ -437,7 +452,7 @@ async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatc
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
         input_text="run", model="m", turn_rows=[],
     ))
     assert events[0].text == "model still runs"
@@ -449,7 +464,7 @@ async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatc
 async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch, failed):
     """ENG-2961 R1: a turn cut short between anton's metadata write and its
     provenance append leaves a folder with no provenance; only a non-clean exit
-    may claim it. The producer tells `index_turn_artifacts` how the turn ended
+    may claim it. The producer tells `turn_artifact_changes` how the turn ended
     and leaves the provenance filter to it."""
     from unittest.mock import AsyncMock, Mock
     from cowork.services import task_objects
@@ -457,8 +472,8 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
     context = (object(), object(), "project", "Project")
     _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
-    index = Mock(return_value=([], set(), None))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", index)
+    index = Mock(return_value=SimpleNamespace(created=[], touched=set()))
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", index)
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
 
     async def replies(**kwargs):
@@ -467,7 +482,7 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
         input_text="run", model="m", turn_rows=[],
     ))
     assert index.call_args.kwargs["attribute_by_provenance"] is True
@@ -511,7 +526,7 @@ async def test_a_cancelled_channel_turn_stops_its_controller_turn(monkeypatch, c
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     turn = asyncio.create_task(_drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[], correlation_id=correlation_id,
     )))
     await asyncio.wait_for(started.wait(), timeout=2)
@@ -533,7 +548,7 @@ async def test_a_channel_turn_its_reader_abandons_stops_its_controller_turn(monk
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     events = remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     )
     async for event in events:
@@ -558,7 +573,7 @@ async def test_a_channel_turn_that_reached_its_terminal_writes_no_cancel_flag(
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -588,7 +603,7 @@ async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     turn = asyncio.create_task(_drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     )))
     await asyncio.wait_for(started.wait(), timeout=2)

@@ -23,7 +23,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.file import File
 from cowork.models.project import Project
 from cowork.principal import Principal
-from cowork.services.files import FileService, attachment_purpose
+from cowork.services.files import FileService, attachment_purpose, save_upload
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -322,8 +322,8 @@ def _upload(name: str, data: bytes = b"x") -> UploadFile:
 async def test_upload_filename_cannot_escape_root(units_read_engine, tmp_path, name):
     # The upload's row is written in a database unit, on the app's engine.
     svc = _svc(units_read_engine, _scope(ORG_A))
-    res = await svc.create_file(_upload(name), purpose="assistants")
-    stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
+    res = await save_upload(_upload(name), purpose="assistants", scope=_scope(ORG_A))
+    stored = Path(svc._get_file_model(res.id).path).resolve()
     # org-first layout: bytes contained under <shared>/<org>/files
     assert (tmp_path / ORG_A / "files").resolve() in stored.parents
     assert stored.name in ("pwned", "upload")                # basename or fallback

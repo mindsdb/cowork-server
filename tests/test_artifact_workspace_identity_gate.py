@@ -387,13 +387,13 @@ def test_the_service_receives_the_resolved_path_on_both_routes(
 
     requested = "docs/notes.md"
     asyncio.run(workspace_ep.artifact_source(
-        "local", "0123456789abcdef0123456789abcdef", session=SimpleNamespace(scope=LOCAL_SCOPE), path=requested,
+        "local", "0123456789abcdef0123456789abcdef", scope=LOCAL_SCOPE, path=requested,
     ))
     body = workspace_ep._SourceUpdateBody(
         content="x", expectedRevisionId="r1", path=requested,
     )
     asyncio.run(workspace_ep.update_artifact_source(
-        "local", "0123456789abcdef0123456789abcdef", body=body, session=SimpleNamespace(scope=LOCAL_SCOPE),
+        "local", "0123456789abcdef0123456789abcdef", body=body, scope=LOCAL_SCOPE,
     ))
 
     assert received == ["docs/notes.md", "docs/notes.md"]

@@ -11,6 +11,7 @@ import cowork.channels.runtime as runtime_mod
 from cowork.channels.runtime import AntonChannelRuntime
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_open_session
+from _fakes import inline_run_db
 
 
 class _FakeHarnessLocal:
@@ -82,23 +83,23 @@ def test_turn_stream_uses_the_remote_worker_when_backend_is_remote(monkeypatch):
     conv_id = uuid4()
     turn_rows = []
 
+    # Staging is a unit; it runs inline here, on a session nothing reads.
+    monkeypatch.setattr(runtime_mod, "run_db", inline_run_db(None))
+    scope = TenantScope(org_mode=True, org_id="org-a")
+
     async def scenario():
-        session = get_open_session()
-        try:
-            scoped = ScopedSession(session, TenantScope(org_mode=True, org_id="org-a"))
-            conversation = type("C", (), {"id": conv_id})()
-            stream = await runtime._turn_stream(
-                harness, "anton", scoped, conversation, [{"type": "text", "text": "hi"}],
-                "hi", None, turn_rows,
-            )
-            with pytest.raises(StopAsyncIteration):
-                await stream.__anext__()
-        finally:
-            session.close()
+        conversation = type("C", (), {"id": conv_id})()
+        stream = await runtime._turn_stream(
+            harness, "anton", scope, conversation, [{"type": "text", "text": "hi"}],
+            "hi", None, turn_rows,
+        )
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
 
     asyncio.run(scenario())
 
     assert staged == [conv_id]
+    assert captured["scope"] == scope
     assert captured["conv_id"] == conv_id
     assert captured["org_id"] == "org-a"
     assert captured["input_text"] == "hi"

@@ -138,7 +138,7 @@ class IngressManager:
                 async for events in bridge.stream_events():
                     if events:
                         log.info("channel %s: stream delivered %d event(s)", channel_type, len(events))
-                        intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
+                        await intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -158,7 +158,7 @@ class IngressManager:
                 continue
             if events:
                 log.info("channel %s: poll fetched %d event(s)", channel_type, len(events))
-                intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
+                await intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
 
 
 async def sync_channel_ingress(
@@ -193,6 +193,20 @@ async def sync_channel_ingress(
 _RECONCILE_INTERVAL_S = 30.0
 
 
+def _org_installations(session) -> set[tuple[str, str]]:
+    """(channel_type, org_id) of every org's installation, as a unit. It reads
+    across orgs, so it runs in SYSTEM_SCOPE on the raw session."""
+    from sqlmodel import select
+
+    from cowork.db.scoped import unsafe_unscoped_session
+    from cowork.models.channel import ChannelInstallation
+
+    rows = unsafe_unscoped_session(session).exec(
+        select(ChannelInstallation).where(ChannelInstallation.org_id.is_not(None))
+    ).all()
+    return {(r.channel_type, r.org_id) for r in rows}
+
+
 async def reconcile_once(manager: IngressManager, adapters: Any) -> None:
     """One reconciliation pass across every org-scoped channel installation.
 
@@ -202,19 +216,10 @@ async def reconcile_once(manager: IngressManager, adapters: Any) -> None:
     any locally running (channel_type, org_id) whose installation is gone —
     covering both "a new org just configured Discord" and "a config got
     deleted on a different replica than the one holding the connection"."""
-    from sqlmodel import select
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_db
 
-    from cowork.db.session import get_open_session
-    from cowork.models.channel import ChannelInstallation
-
-    session = get_open_session()
-    try:
-        rows = session.exec(
-            select(ChannelInstallation).where(ChannelInstallation.org_id.is_not(None))
-        ).all()
-        desired = {(r.channel_type, r.org_id) for r in rows}
-    finally:
-        session.close()
+    desired = await run_db(_org_installations, scope=SYSTEM_SCOPE)
 
     for channel_type, org_id in desired:
         await adapters.get_or_refresh(channel_type, org_id)

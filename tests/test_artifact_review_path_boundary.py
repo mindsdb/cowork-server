@@ -12,7 +12,7 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, get_scoped_session
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope, get_tenant_scope
 from _async_stub import awaitable
 
 
@@ -31,21 +31,21 @@ def client(monkeypatch):
 
 
 @pytest.mark.parametrize("route", ["draft", "delete"])
-def test_session_comes_from_dependency_and_cannot_be_supplied_in_query(
+def test_scope_comes_from_dependency_and_cannot_be_supplied_in_query(
     client, monkeypatch, route,
 ):
-    scoped_session = SimpleNamespace(scope=LOCAL_SCOPE)
-    client.app.dependency_overrides[get_scoped_session] = lambda: scoped_session
+    scope = TenantScope(org_mode=False, org_id=None, user_id="from-the-dependency")
+    client.app.dependency_overrides[get_tenant_scope] = lambda: scope
     seen = []
 
-    def capture(session, *_args, **_kwargs):
-        seen.append(session)
+    def capture(scope, *_args, **_kwargs):
+        seen.append(scope)
         raise HTTPException(status_code=404, detail="No artifact in test catalog")
 
-    async def capture_delete(session, *args, **kwargs):
-        return capture(session, *args, **kwargs)
+    async def capture_delete(scope, *args, **kwargs):
+        return capture(scope, *args, **kwargs)
 
-    params = {"session": "../../untrusted"}
+    params = {"session": "../../untrusted", "scope": "../../untrusted"}
     if route == "draft":
         monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(capture))
         method = "get"
@@ -62,11 +62,10 @@ def test_session_comes_from_dependency_and_cannot_be_supplied_in_query(
 
     assert response.status_code == 404, response.text
     assert len(seen) == 1
-    # The draft route hands the resolver the session's scope; the delete
-    # helper still receives the session itself.
-    assert seen[0] is (scoped_session.scope if route == "draft" else scoped_session)
+    # Both routes hand on the dependency's scope.
+    assert seen[0] is scope
     operation = client.app.openapi()["paths"][schema_path][method]
-    assert all(parameter["name"] != "session" for parameter in operation["parameters"])
+    assert all(parameter["name"] not in ("session", "scope") for parameter in operation["parameters"])
 
 
 @pytest.mark.parametrize(

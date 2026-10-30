@@ -17,7 +17,7 @@ from cowork.common.settings.user_settings import (
     setting_is_org_scoped,
 )
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import ScopedSession, TenantScope, unsafe_unscoped_session
 from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
 
@@ -474,3 +474,13 @@ class SettingService:
         if deleted:
             invalidate_user_settings_cache()
         return deleted
+
+
+def unit_setting_service(session: ScopedSession) -> SettingService:
+    """A ``run_db`` unit's SettingService, for the unit's scope.
+
+    ``settings`` stays in ``_TENANCY_DEFERRED_TABLES`` (cowork/db/scoped.py),
+    so the service queries the raw session and routes by scope itself, as
+    SettingService's docstring says.
+    """
+    return SettingService(unsafe_unscoped_session(session), session.scope)

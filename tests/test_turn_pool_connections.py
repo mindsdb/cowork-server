@@ -61,7 +61,7 @@ from cowork.streaming import discard_conversation, registry
 from cowork.streaming.buffer import FileStreamBuffer, read_records
 from cowork.streaming.recovery import seal_orphan_turns_in_history
 
-from _fakes import PausedModel
+from _fakes import PausedModel, inline_run_db
 
 # Seconds; the one_connection_pool fixture's POOL_TIMEOUT.
 WAIT = 2
@@ -768,6 +768,8 @@ async def test_a_channel_turns_saves_wait_for_the_conversations_write_lock(monke
     monkeypatch.setattr(runtime, "build_input_blocks", text_only, raising=False)
     monkeypatch.setattr(channel_runtime, "get_harness", lambda harness_id: _Answers())
     monkeypatch.setattr(channel_runtime, "ConversationService", _RecordingService)
+    # Each unit runs inline here; the recording service ignores its session.
+    monkeypatch.setattr(channel_runtime, "run_db", inline_run_db(None))
 
     lock_held, release = asyncio.Event(), asyncio.Event()
 
@@ -831,6 +833,7 @@ async def test_a_channel_turn_does_not_load_the_conversations_history(monkeypatc
     monkeypatch.setattr(runtime, "build_input_blocks", text_only, raising=False)
     monkeypatch.setattr(channel_runtime, "get_harness", lambda harness_id: _Answers())
     monkeypatch.setattr(channel_runtime, "ConversationService", _Service)
+    monkeypatch.setattr(channel_runtime, "run_db", inline_run_db(None))
 
     reply, _ = await asyncio.wait_for(runtime._run_anton(None, _Conversation(), event), timeout=5)
 

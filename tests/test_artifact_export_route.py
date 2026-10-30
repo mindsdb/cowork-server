@@ -765,7 +765,7 @@ def test_a_unc_primary_is_passed_over_before_any_file_call(client, local_artifac
 
 
 def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_tenant_scope
     from cowork.services import product_permissions
 
     async def denied(_scope, _permission):
@@ -777,7 +777,7 @@ def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
     app = FastAPI()
     app.include_router(workspace_ep.router)
     org = TenantScope(org_mode=True, org_id="org", user_id="user")
-    app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=org)
+    app.dependency_overrides[get_tenant_scope] = lambda: org
 
     with TestClient(app) as test_client:
         response = test_client.post(
@@ -924,7 +924,7 @@ async def _export(world, user_id: str, slug: str, export_format: str = "docx", *
             str(world.project.id),
             world.artifacts[slug].id,
             ExportRequest(format=export_format),
-            session,
+            session.scope,
         )
 
 

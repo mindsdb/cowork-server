@@ -126,7 +126,7 @@ async def test_setting_access_republishes_with_the_chosen_audience(
     access = {"mode": "restricted", "emails": ["a@example.com"], "org_allowed": False}
 
     out = await aw.set_artifact_access(
-        "proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(),
+        "proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE,
     )
 
     assert out["url"] == "https://view.example/r/1"
@@ -146,7 +146,7 @@ async def test_sharing_publicly_is_passed_through_verbatim(
 ):
     """The publisher owns the access schema; this route must not reinterpret it."""
     await aw.set_artifact_access(
-        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
     )
 
     assert publish_calls[0]["access"] == {"mode": "public"}
@@ -158,7 +158,7 @@ async def test_audience_change_waits_for_an_inflight_live_sync(
     assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
     task = asyncio.create_task(
         aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "restricted"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "restricted"}), ORG_SCOPE,
         )
     )
 
@@ -193,7 +193,7 @@ async def test_share_preserves_mint_failure_after_waiting_for_publish_lock(
     monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", reject_mint)
     assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60)
     task = asyncio.create_task(aw.set_artifact_access(
-        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
     ))
     try:
         await admitted.wait()
@@ -218,7 +218,7 @@ async def test_share_preserves_authority_failure_from_the_artifact_consumer(
     _upload_service_answers(monkeypatch, status, "Rejected", json.dumps(body).encode())
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert error.value.status_code == status
     assert error.value.detail["code"] == ("permission_denied" if status == 403 else "permission_unavailable")
@@ -237,7 +237,7 @@ async def test_a_non_owner_cannot_change_access(monkeypatch, publish_calls, publ
 
     with pytest.raises(HTTPException) as excinfo:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
 
     assert excinfo.value.status_code == 403
@@ -267,7 +267,7 @@ async def test_access_is_not_changed_when_no_publish_credential_is_available(
 
     with pytest.raises(HTTPException) as excinfo:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
 
     assert excinfo.value.status_code == 503
@@ -284,7 +284,7 @@ async def test_owner_reads_back_the_email_list_a_card_would_withhold(as_owner):
         },
     }))
 
-    out = await aw.artifact_access("proj", ARTIFACT_ID, _Session())
+    out = await aw.artifact_access("proj", ARTIFACT_ID, ORG_SCOPE)
 
     assert out["accessMode"] == "restricted"
     assert out["accessEmails"] == ["a@example.com"]
@@ -301,7 +301,7 @@ async def test_identity_service_failure_does_not_report_a_successful_share(
     monkeypatch.setattr("cowork.services.publish.publish_artifact", unavailable)
     with pytest.raises(HTTPException) as excinfo:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert excinfo.value.status_code == 503
     assert not (as_owner / ".published.json").exists()
@@ -317,7 +317,7 @@ async def test_owner_reads_back_an_owner_only_artifact(as_owner):
         },
     }))
 
-    out = await aw.artifact_access("proj", ARTIFACT_ID, _Session())
+    out = await aw.artifact_access("proj", ARTIFACT_ID, ORG_SCOPE)
 
     assert out["ownerOnly"] is True
     assert out["accessEmails"] == []
@@ -341,7 +341,7 @@ async def test_share_of_a_report_owned_by_another_account_is_409(as_owner, publi
     )
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert error.value.status_code == 409
     assert error.value.detail == {
@@ -360,7 +360,7 @@ async def test_share_reports_an_unmarked_upload_503_as_the_service_being_unavail
     _upload_service_answers(monkeypatch, 503, "Service Unavailable", b'{"error": "Service Unavailable"}')
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert error.value.status_code == 503
     assert error.value.detail == {
@@ -375,7 +375,7 @@ async def test_a_too_large_artifact_is_413_with_its_code(as_owner, publish_conte
     _upload_service_answers(monkeypatch, 413, "Payload Too Large", b'{"message": "Request Too Long"}')
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert error.value.status_code == 413
     assert error.value.detail == {
@@ -395,7 +395,7 @@ async def test_a_rejected_publish_shows_the_upload_service_text(as_owner, publis
     monkeypatch.setattr("cowork.services.publish.publish_artifact", reject)
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert error.value.status_code == 502
     assert error.value.detail == "Publishing failed: This organization is archived or still being provisioned."
@@ -418,7 +418,7 @@ async def test_a_local_publish_failure_hides_its_text_but_logs_it(
     with caplog.at_level(logging.WARNING, logger=aw.logger.name):
         with pytest.raises(HTTPException) as error:
             await aw.set_artifact_access(
-                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
             )
     assert error.value.status_code == 502
     assert error.value.detail == "Publishing failed. Try again in a moment."
@@ -436,7 +436,7 @@ async def test_a_missing_publisher_is_503(as_owner, publish_context, monkeypatch
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fail)
     with pytest.raises(HTTPException) as error:
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert error.value.status_code == 503
     assert error.value.detail == "Anton publisher is unavailable"
@@ -444,7 +444,7 @@ async def test_a_missing_publisher_is_503(as_owner, publish_context, monkeypatch
 
 async def test_the_turn_key_is_revoked_after_a_share(as_owner, publish_calls, publish_context):
     await aw.set_artifact_access(
-        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
     )
     assert publish_context == [True]
 
@@ -458,7 +458,7 @@ async def test_the_turn_key_is_revoked_after_a_failed_share(as_owner, publish_co
     monkeypatch.setattr("cowork.services.publish.publish_artifact", reject)
     with pytest.raises(HTTPException):
         await aw.set_artifact_access(
-            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
         )
     assert publish_context == [True]
 
@@ -479,7 +479,7 @@ async def test_the_turn_key_is_kept_while_a_timed_out_publish_still_runs(
     try:
         with pytest.raises(HTTPException) as error:
             await aw.set_artifact_access(
-                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+                "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), ORG_SCOPE,
             )
     finally:
         finish.set()

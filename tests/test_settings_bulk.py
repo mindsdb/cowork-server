@@ -106,7 +106,6 @@ async def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
                 SettingsBulkUpsertRequest(
                     values={"tone": "casual", "planning_provider": "nope"}
                 ),
-                session,
                 LOCAL_SCOPE,
                 None,
             )
@@ -135,7 +134,6 @@ async def test_test_providers_does_not_persist(monkeypatch):
         SettingService(session).upsert_setting("anthropic_api_key", "sk-test")
 
         result = await ep.test_providers(
-            session,
             LOCAL_SCOPE,
             ep._TestProvidersBody(providers=[{"type": "anthropic", "apiKey": "***"}]),
         )
@@ -157,7 +155,6 @@ async def test_bulk_upsert_skips_none_values():
         _cleanup(session, "greeting", "tone")
         result = await bulk_upsert_settings(
             SettingsBulkUpsertRequest(values={"greeting": None, "tone": "formal"}),
-            session,
             LOCAL_SCOPE,
             None,
         )
@@ -174,7 +171,6 @@ async def test_bulk_endpoint_saves_show_figure_sources():
         _cleanup(session, "show_figure_sources")
         result = await bulk_upsert_settings(
             SettingsBulkUpsertRequest(values={"show_figure_sources": "false"}),
-            session,
             LOCAL_SCOPE,
             None,
         )

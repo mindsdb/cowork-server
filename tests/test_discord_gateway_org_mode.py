@@ -118,7 +118,10 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
     async def fake_post(self, url, json=None, **kw):
         if not str(url).startswith("https://discord.com/api"):
             return await real_post(self, url, json=json, **kw)
-        posted.append(json or {})
+        # The typing indicator posts too while the turn runs; only the reply
+        # is a message.
+        if str(url).endswith("/messages"):
+            posted.append(json or {})
 
         class R:
             status_code = 200

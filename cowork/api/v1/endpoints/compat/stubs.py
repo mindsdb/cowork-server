@@ -11,7 +11,7 @@ import mimetypes
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import log_context
-from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep
+from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
 logger = logging.getLogger(__name__)
@@ -101,10 +101,10 @@ def list_attachments(
 async def upload_attachment(
     project_name: str,
     session_id: str,
-    scoped: ScopedSessionDep,
+    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     files: list[UploadFile] = File(...),
 ):
-    from cowork.services.files import FileService
+    from cowork.services.files import save_upload
     if ":" in session_id:
         # Real clients mint UUIDs (or the legacy timestamp format) — neither
         # contains a colon. Rejecting colon-bearing ids keeps every
@@ -114,13 +114,12 @@ async def upload_attachment(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="session_id must not contain ':'",
         )
-    svc = FileService(scoped)
     purpose = _attachment_purpose(project_name, session_id)
     results = []
     for f in files:
         try:
-            created = await svc.create_file(upload=f, purpose=purpose)
-            results.append(_to_attachment(svc.get_file_row(UUID(created.id))))
+            saved = await save_upload(f, purpose=purpose, scope=scope)
+            results.append(_to_attachment(saved))
         except MissingTenantScopeError:
             raise  # auth problem — the app-level handler answers 401
         except Exception as exc:
