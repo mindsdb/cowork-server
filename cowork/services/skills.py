@@ -265,7 +265,8 @@ def select_turn_skills(
     """The skills of ``service``'s store that a turn in ``project_name`` uses.
 
     Selection mirrors skill_links: enabled skills whose ``metadata.projects`` is
-    empty or names this project.
+    empty or names this project, less the ones the scope's person turned off
+    for themselves (SkillService.off_for_me), packaged built-ins included.
 
     Slug and files both come from the DIRECTORY, not frontmatter ``name`` — the
     two can drift on a hand-edited store, and resolving by frontmatter could
@@ -274,10 +275,11 @@ def select_turn_skills(
     root = service.root
     if not root.exists():
         return []
+    off_for_me = service.off_for_me()
     selected: list[TurnSkill] = []
     for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         slug = skill_dir.name
-        if not service.allows_skill(slug):
+        if not service.allows_skill(slug) or slug in off_for_me:
             continue
         if skill_dir.is_symlink():
             # is_dir() follows the link, so a symlinked dir could point into
@@ -349,18 +351,23 @@ def always_on_prompt_skills(
     *,
     project_name: str | None,
     viewer: SkillViewer | None,
+    off_for_me: frozenset[str] | None = None,
 ) -> list[dict]:
     """``[{"name", "body"}]`` for render_always_on_skills
     (cowork.services.always_on_skills), as the cloud pod builds it from the
     request: the name from the SKILL.md frontmatter, as anton's parser
     normalizes it, and the body stripped. ``session`` is the unit's, whose
     scope picks the store and whose org's skill_access rows say which skills
-    are always on. Empty outside hosted org mode."""
+    are always on, and whose person's own off settings drop theirs unless
+    ``off_for_me`` already names them. Empty outside hosted org mode."""
     scope = session.scope if session is not None else None
     if not sharing_applies(scope):
         return []
     service = SkillService(
-        scope, viewer=(viewer or fail_closed_viewer(scope)).for_turns(), session=session
+        scope,
+        viewer=(viewer or fail_closed_viewer(scope)).for_turns(),
+        session=session,
+        off_for_me=off_for_me,
     )
     out: list[dict] = []
     for turn_skill in always_on_turn_skills(service=service, project_name=project_name):
@@ -379,11 +386,15 @@ def shared_turn_skills(
 
     SkillService.shared_with_owner's skills, with the selection rule the
     owner's own get (select_turn_skills), applied to each skill's own
-    metadata: its creator's disable or project scope reaches everyone. Each
-    path is the skill's folder in its creator's own store, read live.
+    metadata: its creator's disable or project scope reaches everyone, and
+    the owner's own off (SkillService.off_for_me) them alone. Each path is
+    the skill's folder in its creator's own store, read live.
     """
     selected: list[TurnSkill] = []
+    off_for_me = service.off_for_me()
     for slug, skill_dir in sorted(service.shared_with_owner().items()):
+        if slug in off_for_me:
+            continue
         skill = _skill_from_dir(skill_dir)
         if skill is not None and _used_in(skill, project_name=project_name):
             selected.append(TurnSkill(slug=slug, path=skill_dir))
@@ -475,6 +486,7 @@ def link_turn_skills(
     project_name: str,
     skills_dir: Path,
     shared_skills_dir: Path | None = None,
+    off_for_me: frozenset[str] = frozenset(),
 ) -> tuple[Path, ...]:
     """Link the skills one in-process turn uses into ``skills_dir``, from the
     asker's own store, and the ones others share with the asker into
@@ -497,8 +509,12 @@ def link_turn_skills(
     store, and it takes a name from the first read-only root that has one
     (SkillStore._readonly_roots), so a shared skill never hides a host or
     managed skill of the same name.
+
+    ``off_for_me`` is the slugs the asker turned off for themselves
+    (cowork.services.skill_user_settings.off_for_me), read by the caller in
+    its own unit of work: none of them is linked.
     """
-    service = SkillService(scope)
+    service = SkillService(scope, off_for_me=off_for_me)
     service.ensure_builtin_skills()
     own = {
         skill.slug: skill.path
@@ -516,7 +532,10 @@ def link_turn_skills(
 
 
 def artifact_skill_dirs(
-    *, scope: TenantScope | None, project_name: str
+    *,
+    scope: TenantScope | None,
+    project_name: str,
+    off_for_me: frozenset[str] = frozenset(),
 ) -> tuple[Path, ...]:
     """The folders of the asker's own skills that an artifact build follows
     without a recall: part of anton's ``skills_artifact_roots``, beside the
@@ -533,7 +552,7 @@ def artifact_skill_dirs(
     (SkillStore.list_for_artifacts), so another person's text never steers
     the asker's build unasked.
     """
-    service = SkillService(scope)
+    service = SkillService(scope, off_for_me=off_for_me)
     changer = turn_changer_for(scope, resource=PersonalResource.SKILLS)
     own: list[Path] = []
     for turn_skill in linked_turn_skills(service=service, project_name=project_name):
@@ -676,6 +695,7 @@ class SkillService:
         *,
         viewer: SkillViewer | None = None,
         session: ScopedSession | None = None,
+        off_for_me: frozenset[str] | None = None,
     ) -> None:
         settings = get_app_settings()
         self._scope = scope
@@ -690,6 +710,11 @@ class SkillService:
         # creator's alone, or org-wide when it predates sharing.
         self._session = session
         self._rows: dict[str, SkillAccess] | None = None
+        # The slugs the scope's person turned off for themselves
+        # (cowork.services.skill_user_settings): given, as an in-process
+        # turn reads them in its own unit of work, else read once from
+        # ``session``. Without either, none.
+        self._off_for_me = off_for_me
         base = Path(settings.skill.root_dir)
         if self.store_name != "skills":
             base = base.parent / self.store_name
@@ -747,6 +772,20 @@ class SkillService:
     def forget_access(self) -> None:
         """Drop the rows read so far, after a change to them."""
         self._rows = None
+
+    def off_for_me(self) -> frozenset[str]:
+        """The slugs this scope's person turned off for themselves, read in
+        one query per instance (cowork.services.skill_user_settings.off_for_me).
+        A turn leaves them out whatever else selects them."""
+        if self._off_for_me is None:
+            from cowork.services.skill_user_settings import off_for_me
+
+            self._off_for_me = off_for_me(self._session)
+        return self._off_for_me
+
+    def forget_off_for_me(self) -> None:
+        """Drop the settings read so far, after a change to them."""
+        self._off_for_me = None
 
     @property
     def builtin_skills_dir(self) -> Path:

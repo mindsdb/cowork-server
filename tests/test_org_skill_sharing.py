@@ -35,7 +35,13 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.skill import META_CREATED_BY, Skill
 from cowork.models.skill_access import SkillAccess
 from cowork.principal import ORG_MANAGE_ROLE, Principal
-from cowork.schemas.skills import SkillCreateRequest, SkillSharingRequest, SkillUpdateRequest
+from cowork.models.skill_user_setting import SkillUserSetting
+from cowork.schemas.skills import (
+    SkillCreateRequest,
+    SkillEnabledForMeRequest,
+    SkillSharingRequest,
+    SkillUpdateRequest,
+)
 from cowork.services import hub_people, hub_teams
 from cowork.services.always_on_skills import (
     ALWAYS_ON_SKILL_MAX_CHARS,
@@ -63,7 +69,10 @@ from cowork.services.skills import (
     SkillService,
     always_on_prompt_skills,
     build_turn_skills,
+    link_turn_skills,
 )
+from cowork.services.skill_user_settings import off_for_me as user_off_for_me
+from cowork.services.skill_user_settings import stage_enabled_for_me
 from cowork.turnqueue.producer import _fit_request
 
 ORG_ID = "33333333-3333-4333-8333-333333333333"
@@ -1514,4 +1523,193 @@ async def test_the_harness_puts_the_always_on_section_in_the_suffix(monkeypatch,
     assert section in suffix
     session, kwargs = seen[0]
     assert isinstance(session, ScopedSession)
-    assert kwargs == {"project_name": turn.project.name, "viewer": None}
+    assert kwargs == {"project_name": turn.project.name, "viewer": None, "off_for_me": frozenset()}
+
+
+# ── off for me (a person's own on/off) ───────────────────────────────────────
+
+
+def _me(org, user: str, slug: str, enabled: bool, viewer: SkillViewer | None = None) -> dict:
+    """PUT /skills/{slug}/me as ``user``."""
+    return skills_ep.set_skill_enabled_for_me(
+        slug, SkillEnabledForMeRequest(enabled=enabled), org.as_(user), _principal(user),
+        viewer or _viewer(user, teams=(TEAM_ENG,)),
+    )
+
+
+def _off_rows(org, user: str) -> set[str]:
+    return set(user_off_for_me(org.as_(user)))
+
+
+def _turn(org, user: str, viewer: SkillViewer | None = None) -> dict:
+    viewer = viewer or _viewer(user, teams=(TEAM_ENG,))
+    return build_turn_skills(org.as_(user).scope, project_name="general", viewer=viewer, session=org.as_(user))
+
+
+def test_off_for_me_is_one_persons_alone(org):
+    _create(org, ALICE, "policy")
+    _share(org, ALICE, "policy", _viewer(ALICE, share_org=True), org_allowed=True)
+
+    out = _me(org, BOB, "policy", False)
+    assert (out["enabled"], out["enabledForMe"]) == (True, False)
+    assert _off_rows(org, BOB) == {"policy"}
+    assert _off_rows(org, CAROL) == set()
+    assert _listed(org, BOB, _viewer(BOB))["policy"]["enabledForMe"] is False
+    carol = _listed(org, CAROL, _viewer(CAROL))["policy"]
+    assert (carol["enabled"], carol["enabledForMe"]) == (True, True)
+    assert "policy" not in _turn(org, BOB)
+    assert "policy" in _turn(org, CAROL, _viewer(CAROL))
+
+    # On again is the default: no row is kept.
+    assert _me(org, BOB, "policy", True)["enabledForMe"] is True
+    assert _off_rows(org, BOB) == set()
+    assert "policy" in _turn(org, BOB)
+    session = org.as_(BOB)
+    assert session.exec(session.select(SkillUserSetting)).all() == []
+
+
+def test_a_builtin_turns_off_for_one_person(org):
+    SkillService(org.as_(ALICE).scope).ensure_builtin_skills()
+    builtin = sorted(BUILTIN_SKILL_SLUGS)[0]
+    assert builtin in _turn(org, BOB)
+
+    out = _me(org, BOB, builtin, False)
+    assert (out["isBuiltin"], out["enabled"], out["enabledForMe"]) == (True, True, False)
+    assert (out["canDisableForEveryone"], out["visibleToOthers"]) == (False, True)
+    assert builtin not in _turn(org, BOB)
+    assert builtin in _turn(org, CAROL, _viewer(CAROL))
+    # It is off for Bob in an in-process turn too.
+    assert builtin not in {
+        p.name for p in link_turn_skills(
+            scope=org.as_(BOB).scope, project_name="general",
+            skills_dir=SkillService(org.as_(BOB).scope).root.parent / "bob-turn",
+            off_for_me=frozenset({builtin}),
+        )
+    }
+
+
+def test_an_always_on_skill_off_for_me_leaves_my_turns_only(org):
+    _turn_fixture(org)
+    bob = _viewer(BOB, teams=(TEAM_ENG,))
+    _me(org, BOB, "alpha-org", False, bob)
+
+    block = _turn(org, BOB, bob)
+    assert "alpha-org" not in block
+    assert [slug for slug, entry in block.items() if entry.get("always_on")] == ["beta-team"]
+    assert [s["name"] for s in always_on_prompt_skills(org.as_(BOB), project_name="general", viewer=bob)] == [
+        "beta-team"
+    ]
+    carol = _viewer(CAROL, teams=(TEAM_ENG,))
+    assert _turn(org, CAROL, carol)["alpha-org"]["always_on"] is True
+    assert [s["name"] for s in always_on_prompt_skills(org.as_(CAROL), project_name="general", viewer=carol)] == [
+        "alpha-org", "beta-team",
+    ]
+
+
+def test_disabling_for_everyone_still_takes_edit_rights(org):
+    _create(org, ALICE, "team-skill")
+    _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], allowed_user_ids=[CAROL])
+    _create(org, ALICE, "policy")
+    _share(org, ALICE, "policy", _viewer(ALICE, share_org=True), org_allowed=True)
+
+    # Carol only reads the team skill and Bob the org-wide one: each turns it
+    # off for themselves, never for everyone.
+    carol = _listed(org, CAROL, _viewer(CAROL))["team-skill"]
+    assert (carol["canDisableForEveryone"], carol["visibleToOthers"]) == (False, True)
+    _refused(
+        lambda: skills_ep.update_skill(
+            "team-skill", SkillUpdateRequest(enabled=False), org.as_(CAROL), _principal(CAROL), _viewer(CAROL),
+        ),
+        403,
+        skills_ep.SKILL_EDIT_REFUSAL,
+    )
+    assert _me(org, CAROL, "team-skill", False, _viewer(CAROL))["enabledForMe"] is False
+    assert _listed(org, BOB, _viewer(BOB))["policy"]["canDisableForEveryone"] is False
+    _refused(
+        lambda: skills_ep.update_skill(
+            "policy", SkillUpdateRequest(enabled=False), org.as_(BOB), _principal(BOB), _viewer(BOB),
+        ),
+        403,
+        "skills.write_org",
+    )
+
+    # A team member edits the team skill, so may turn it off for everyone.
+    bob = _viewer(BOB, teams=(TEAM_ENG,))
+    assert _listed(org, BOB, bob)["team-skill"]["canDisableForEveryone"] is True
+    out = skills_ep.update_skill("team-skill", SkillUpdateRequest(enabled=False), org.as_(BOB), _principal(BOB), bob)
+    assert (out["enabled"], out["enabledForMe"]) == (False, True)
+    assert "team-skill" not in _turn(org, ALICE, _viewer(ALICE, teams=(TEAM_ENG,)))
+    # Turning it on for everyone turns it on for its editor too.
+    _me(org, BOB, "team-skill", False, bob)
+    out = skills_ep.update_skill("team-skill", SkillUpdateRequest(enabled=True), org.as_(BOB), _principal(BOB), bob)
+    assert (out["enabled"], out["enabledForMe"]) == (True, True)
+    # Carol's own off is hers and stays.
+    assert _off_rows(org, CAROL) == {"team-skill"}
+
+
+def test_a_private_skill_is_visible_to_nobody_else(org):
+    _create(org, ALICE, "mine")
+    listed = _listed(org, ALICE, _viewer(ALICE))["mine"]
+    assert (listed["visibleToOthers"], listed["canDisableForEveryone"]) == (False, True)
+    _share(org, ALICE, "mine", allowed_user_ids=[CAROL])
+    assert _listed(org, ALICE, _viewer(ALICE))["mine"]["visibleToOthers"] is True
+
+
+def test_off_for_me_follows_a_rename_and_goes_with_a_delete(org):
+    _create(org, ALICE, "team-skill")
+    _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], allowed_user_ids=[CAROL])
+    bob = _viewer(BOB, teams=(TEAM_ENG,))
+    _me(org, CAROL, "team-skill", False, _viewer(CAROL))
+    _me(org, BOB, "team-skill", False, bob)
+    # A stale row the new name still had is dropped, not merged.
+    stale = org.as_(DAVE)
+    stage_enabled_for_me(stale, "eng-skill", False)
+    stale.commit()
+
+    skills_ep.update_skill("team-skill", SkillUpdateRequest(label="eng-skill"), org.as_(BOB), _principal(BOB), bob)
+    assert (_off_rows(org, CAROL), _off_rows(org, BOB), _off_rows(org, DAVE)) == ({"eng-skill"}, {"eng-skill"}, set())
+    assert _listed(org, CAROL, _viewer(CAROL))["eng-skill"]["enabledForMe"] is False
+
+    skills_ep.delete_skill("eng-skill", org.as_(BOB), _principal(BOB), bob)
+    assert (_off_rows(org, CAROL), _off_rows(org, BOB)) == (set(), set())
+    # A new skill of the old name starts on for everyone.
+    _create(org, CAROL, "eng-skill")
+    assert _listed(org, CAROL, _viewer(CAROL))["eng-skill"]["enabledForMe"] is True
+
+
+def test_off_for_me_needs_a_skill_the_caller_sees(org):
+    _create(org, DAVE, "dave-private")
+    _refused(lambda: _me(org, ALICE, "dave-private", False), 404)
+    _refused(lambda: _me(org, ALICE, "no-such-skill", False), 404)
+    assert _off_rows(org, ALICE) == set()
+
+
+def test_settings_are_per_org(org):
+    _legacy_skill(org.as_(ALICE).scope, "house-style")
+    _me(org, ALICE, "house-style", False)
+    assert set(user_off_for_me(org.as_(ALICE, org_id="other-org"))) == set()
+
+
+def test_off_for_me_on_the_desktop(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.delenv("COWORK_MANAGED_DIR", raising=False)
+    get_app_settings.cache_clear()
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    try:
+        SkillService(LOCAL_SCOPE).create_skill("desk", "Desk body.")
+        with Session(engine) as raw:
+            scoped = ScopedSession(raw, LOCAL_SCOPE)
+            listed = {s["id"]: s for s in skills_ep.list_skills(scoped, None, None)["skills"]}
+            assert (listed["desk"]["visibleToOthers"], listed["desk"]["enabledForMe"]) == (False, True)
+            out = skills_ep.set_skill_enabled_for_me("desk", SkillEnabledForMeRequest(enabled=False), scoped, None, None)
+            assert out["enabledForMe"] is False
+            assert user_off_for_me(scoped) == frozenset({"desk"})
+            assert "desk" not in build_turn_skills(LOCAL_SCOPE, project_name="general", session=scoped)
+            assert "desk" in build_turn_skills(LOCAL_SCOPE, project_name="general")
+            # A delete takes the setting with it.
+            skills_ep.delete_skill("desk", scoped, None, None)
+            assert user_off_for_me(scoped) == frozenset()
+    finally:
+        get_app_settings.cache_clear()

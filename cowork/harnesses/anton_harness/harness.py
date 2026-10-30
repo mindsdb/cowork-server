@@ -49,7 +49,6 @@ from cowork.harnesses.anton_harness.stream_formatter import (
 )
 from cowork.managed import managed_folder
 from cowork.models.conversation import Conversation
-from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
@@ -739,6 +738,30 @@ def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list
     from cowork.services.conversations import ConversationService
 
     return ConversationService(session).archived_messages(conversation_id)
+
+
+async def _turn_skills_off_for_me(scope: TenantScope | None) -> frozenset[str]:
+    """The skills the turn's person turned off for themselves
+    (cowork.services.skill_user_settings.off_for_me), in one database unit.
+
+    No scope on a partitioned deployment names no person, so nothing; the
+    desktop's no scope is LOCAL_SCOPE's one person. A failed read logs and
+    turns nothing off, rather than failing the turn over a preference. A wait
+    for a connection that runs out is the turn's failure, so it propagates.
+    """
+    from cowork.services.skill_user_settings import off_for_me
+
+    if scope is None:
+        if tenant_scope_required():
+            return frozenset()
+        scope = LOCAL_SCOPE
+    try:
+        return await run_db(off_for_me, scope=scope)
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.exception("turn skills: couldn't read the person's skill settings")
+        return frozenset()
 
 
 async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[_AttachedFile] | None:
@@ -1773,13 +1796,21 @@ class AntonHarness:
             # read-only root, never links a slug the managed folder reserves
             # (linked_turn_skills), and neither do the fan-outs into projects
             # (reconcile_skill_links, reconcile_project).
+            # The skills the asker turned off for themselves, read once for
+            # the whole turn: none of them is linked, followed by an artifact
+            # build or applied always on, whichever root holds it.
+            off_for_me = await _turn_skills_off_for_me(current_settings_scope())
             managed = managed_folder()
             managed_skill_dirs: dict[str, Path] = {}
             if managed is not None:
                 if turn_scratch_dir is None:
                     turn_scratch_dir = _new_turn_scratch_dir()
                 managed_skills_dir = turn_scratch_dir / "managed-skills"
-                managed_skill_dirs = managed.skill_dirs()
+                managed_skill_dirs = {
+                    slug: path
+                    for slug, path in managed.skill_dirs().items()
+                    if slug not in off_for_me
+                }
                 sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed_skill_dirs)
                 anton_settings.skills_extra_roots = [
                     *anton_settings.skills_extra_roots,
@@ -1826,6 +1857,7 @@ class AntonHarness:
                     project_name=conversation.project.name,
                     skills_dir=turn_skills_dir,
                     shared_skills_dir=shared_skills_dir,
+                    off_for_me=off_for_me,
                 )
                 if turn_skills_dir != project_skills_dir:
                     read_only_dirs.append(turn_skills_dir)
@@ -1837,7 +1869,11 @@ class AntonHarness:
             anton_settings.skills_artifact_roots = [
                 HOST_SKILLS_DIR,
                 *managed_skill_dirs.values(),
-                *artifact_skill_dirs(scope=turn_scope, project_name=conversation.project.name),
+                *artifact_skill_dirs(
+                    scope=turn_scope,
+                    project_name=conversation.project.name,
+                    off_for_me=off_for_me,
+                ),
             ]
             read_only_dirs += anton_settings.skills_extra_roots
             # Org-wide and team skills marked always on, applied on every task:
@@ -1854,6 +1890,7 @@ class AntonHarness:
                             always_on_prompt_skills,
                             project_name=conversation.project.name,
                             viewer=None,
+                            off_for_me=off_for_me,
                         ),
                         scope=turn_scope,
                     )

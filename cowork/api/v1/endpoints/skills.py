@@ -23,6 +23,7 @@ from cowork.principal import Principal, get_principal, hub_credential
 from cowork.schemas.skills import (
     SkillAccessView,
     SkillCreateRequest,
+    SkillEnabledForMeRequest,
     SkillListResponse,
     SkillOwner,
     SkillResponse,
@@ -52,6 +53,12 @@ from cowork.services.skill_access import (
     stage_delete as stage_access_delete,
     stage_only_owner,
     stage_rename as stage_access_rename,
+)
+from cowork.services.skill_user_settings import (
+    set_enabled_for_me,
+    stage_delete as stage_settings_delete,
+    stage_enabled_for_me,
+    stage_rename as stage_settings_rename,
 )
 from cowork.services.skill_sharing import (
     SkillAccessRule,
@@ -245,6 +252,9 @@ def _skill_response(
         created_at=skill.created_at,
         updated_at=skill.updated_at,
         enabled=skill.enabled,
+        enabled_for_me=skill.name not in service.off_for_me(),
+        can_disable_for_everyone=can_change and not builtin,
+        visible_to_others=_visible_to_others(visible, service=service, viewer=viewer, rule=rule),
         projects=skill.projects,
         attribution=access.attribution(
             SKILL,
@@ -274,6 +284,30 @@ def _skill_response(
         can_edit=can_change,
         **_org_access_fields(visible, viewer=viewer, rule=rule),
     ).model_dump(by_alias=True)
+
+
+def _visible_to_others(
+    visible: VisibleSkill,
+    *,
+    service: SkillService,
+    viewer: SkillViewer | None,
+    rule: SkillAccessRule | None,
+) -> bool:
+    """Whether anyone besides the caller reads ``visible``: a managed or
+    packaged built-in skill, someone else's, one shared with people, a team
+    or the org, or one of a store every person reads (skills left shared on
+    a deployment that trusts identity headers). False for the caller's own
+    private skill, whose switch is its global ``enabled``."""
+    skill = visible.skill
+    if visible.origin is not SkillOrigin.OWN or is_builtin_skill(skill.name) or visible.shared:
+        return True
+    if viewer is not None and rule is not None:
+        if not viewer.owns(rule.owner_user_id):
+            return True
+        effective = viewer.effective(rule)
+        return effective.broad or bool(effective.allowed_user_ids)
+    changer = service._changer
+    return changer is not None and changer.deployment_wide
 
 
 def _org_access_fields(
@@ -779,6 +813,9 @@ def update_skill(
                         # Who the skill is shared with follows it to its new
                         # name, in the commit that moves its attribution.
                         stage_access_rename(access.session, current.name, skill.name)
+                    if renamed:
+                        # So does every person's own on/off for it.
+                        stage_settings_rename(access.session, current.name, skill.name)
                     access.record_updates(
                         SKILL,
                         current.name,
@@ -786,6 +823,9 @@ def update_skill(
                         fallback_creator_id=creator_id,
                         new_key=skill.name if renamed else None,
                     )
+                    if renamed and not access.org_mode:
+                        # record_updates commits only in org mode.
+                        access.session.commit()
                 except Exception as audit_failure:
                     access.session.rollback()
                     try:
@@ -819,9 +859,62 @@ def update_skill(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
         finally:
             resource_coordination.close()
-    # A rename moved the skill's access row; read it again under the new name.
+    if body.enabled:
+        # Turning a skill on for everyone turns it on for its editor too:
+        # their own off would otherwise keep it out of their turns.
+        _set_enabled_for_me_or_log(scoped, skill.name, True)
+    # A rename moved the skill's access row and settings; read them again
+    # under the new name.
     service.forget_access()
+    service.forget_off_for_me()
     return _skill_response(service.as_own(skill), access=access, service=service)
+
+
+def _set_enabled_for_me_or_log(scoped: ScopedSession, slug: str, enabled: bool) -> None:
+    """set_enabled_for_me after a change that already succeeded: a failure
+    here is logged rather than reported as the change's."""
+    try:
+        set_enabled_for_me(scoped, slug, enabled)
+    except Exception:
+        logger.exception("Could not update the caller's own setting for skill %r", slug)
+
+
+@router.put("/{skill_id}/me", response_model=SkillResponse)
+def set_skill_enabled_for_me(
+    skill_id: str,
+    body: SkillEnabledForMeRequest,
+    scoped: ScopedSessionDep,
+    principal: Principal | None = Depends(get_principal),
+    viewer: SkillViewerDep = None,
+):
+    """The caller's own on/off for one skill they see (ENG-3787): off leaves
+    it out of their turns only, whoever else reads it. Any skill the caller
+    sees, built-ins and managed skills included; it needs no edit rights.
+    404 for one they don't see. On (the default) keeps no row.
+
+    Turning a skill off for everyone is the global ``enabled`` (PUT
+    /skills/{slug}), which takes edit rights."""
+    service = SkillService(scoped.scope, viewer=viewer, session=scoped)
+    service.ensure_builtin_skills()
+    try:
+        visible = service.get_visible_skill(skill_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    try:
+        if stage_enabled_for_me(scoped, visible.skill.name, body.enabled):
+            scoped.commit()
+    except PermissionError as e:
+        scoped.rollback()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except IntegrityError:
+        # A concurrent request turned it off first: the row it wrote reads
+        # as this one would have.
+        scoped.rollback()
+    except Exception:
+        scoped.rollback()
+        raise
+    service.forget_off_for_me()
+    return _skill_response(visible, access=SharedResourceAccess(scoped, principal), service=service)
 
 
 PEOPLE_OUTSIDE_ORG_REFUSAL = "Skills can only be shared with people in your organization"
@@ -1150,6 +1243,7 @@ def delete_skill(
                         if service.org_sharing:
                             # Gone with the skill, in the same commit.
                             stage_access_delete(access.session, skill.name)
+                        stage_settings_delete(access.session, skill.name)
                         access.record_delete(SKILL, skill.name)
                     except Exception:
                         access.session.rollback()
@@ -1158,6 +1252,16 @@ def delete_skill(
                     service.finalize_staged_delete(staged)
         else:
             found = service.delete_skill(skill.name)
+            if found:
+                # Every person's own on/off for it goes with it. The folder
+                # is gone already, so a failure here leaves rows that name no
+                # skill, which nothing reads, and is logged.
+                try:
+                    stage_settings_delete(access.session, skill.name)
+                    access.session.commit()
+                except Exception:
+                    access.session.rollback()
+                    logger.exception("Could not remove the settings of deleted skill %r", skill.name)
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:

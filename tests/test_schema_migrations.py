@@ -395,6 +395,41 @@ def test_skill_access_upgrade_and_downgrade(tmp_path, monkeypatch):
     assert _has_table(db_path, "skill_access")
 
 
+def test_skill_user_setting_upgrade_and_downgrade(tmp_path, monkeypatch):
+    """ENG-3787: skill_user_setting, one person's own off per skill, one row
+    per (org, person, skill); the desktop's rows carry no org."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "skill-user-setting.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "skill_user_setting")
+    with engine.begin() as connection:
+        insert = text(
+            "INSERT INTO skill_user_setting (id, org_id, user_id, skill_slug, enabled) "
+            "VALUES (:id, 'org', 'alice', 'notes', 0)"
+        )
+        connection.execute(insert, {"id": "a" * 32})
+        connection.execute(
+            text(
+                "INSERT INTO skill_user_setting (id, org_id, user_id, skill_slug, enabled) "
+                "VALUES (:id, NULL, 'local', 'pdf', 0)"
+            ),
+            {"id": "c" * 32},
+        )
+        with pytest.raises(IntegrityError):
+            with connection.begin_nested():
+                connection.execute(insert, {"id": "b" * 32})
+
+    _downgrade_to(engine, uri, "b7d1e4a9c2f6")
+    assert not _has_table(db_path, "skill_user_setting")
+    assert _has_table(db_path, "skill_access")
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "skill_user_setting")
+
+
 # ── ENG-338: attachment purpose re-keying (f7d2b9e4a1c6) ─────────────────
 
 ATTACH_REKEY_REV = "f7d2b9e4a1c6"

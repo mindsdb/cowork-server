@@ -69,6 +69,13 @@ class SkillUpdateRequest(CamelRequest):
     projects: list[str] | None = None
 
 
+class SkillEnabledForMeRequest(CamelRequest):
+    """PUT /skills/{slug}/me: the caller's own on/off for one skill they
+    see. Off leaves it out of their turns only; on is the default."""
+
+    enabled: bool
+
+
 class SkillResponse(CamelResponse):
     id: str  # the slug
     label: str
@@ -81,7 +88,20 @@ class SkillResponse(CamelResponse):
     )
     created_at: datetime | None
     updated_at: datetime | None
+    # Global: false turns the skill off for everyone who reads it (SKILL.md
+    # metadata). Changed only with edit rights (PUT /skills/{slug}).
     enabled: bool
+    # The caller's own setting (PUT /skills/{slug}/me): false leaves the skill
+    # out of their turns only. A turn uses a skill that is both.
+    enabled_for_me: bool = True
+    # Whether the caller may turn the skill off for everyone: they may edit
+    # it. Never for a built-in.
+    can_disable_for_everyone: bool = False
+    # Whether anyone besides the caller reads the skill: shared with people,
+    # a team or the org, someone else's, a built-in or a managed one, or one
+    # of a store every person reads. False for the caller's own private
+    # skill, where the switch is the global ``enabled``.
+    visible_to_others: bool = False
     projects: list[str]
     attribution: ResourceAttribution
     is_builtin: bool
