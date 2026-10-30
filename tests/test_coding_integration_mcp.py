@@ -62,5 +62,6 @@ def test_agent_neutral_mcp_exposes_project_context_as_read_only_tools(tmp_path: 
     payload = json.loads(result["content"][0]["text"])
     assert payload["project"] == "Product"
     assert payload["folders"][0]["taskBranch"] == "cowork/product/task-1"
-    assert payload["connectedTools"] == [{"provider": "github", "label": "Work GitHub"}]
+    # No saved credential in this test, so GitHub's own tools report unavailable.
+    assert payload["connectedTools"] == [{"provider": "github", "label": "Work GitHub", "tools": "Unavailable"}]
     server.close()
