@@ -98,6 +98,7 @@ async def remote_turn_events(
         publish_and_card_turn_artifacts,
         remote_skill_draft_result,
         snapshot_artifact_state,
+        tracked_artifacts_from_reply,
     )
 
     # Minted here rather than inside stream_remote_replies, so a cancel below
@@ -126,6 +127,9 @@ async def remote_turn_events(
     artifact_writes_allowed = False
     # Set only on turn_completed; see `turn_created_slugs(accept_unattributed=)`.
     completed_cleanly = False
+    # The artifacts the pod's tools touched, from turn_completed; None for a
+    # pod that sends no list, and for every other exit.
+    pod_touched: set[str] | None = None
     # Whether the pod compacted or hard-truncated the turn's context: its
     # compacted step comes for both, its compaction reply for a summary. Both
     # arrive before the history frame.
@@ -187,6 +191,7 @@ async def remote_turn_events(
                         yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
             elif kind == "turn_completed":
                 completed_cleanly = True
+                pod_touched = tracked_artifacts_from_reply(data)
                 break
             elif kind == "turn_failed":
                 message = data.get("message") or GENERIC_TURN_ERROR_MESSAGE
@@ -206,6 +211,7 @@ async def remote_turn_events(
                 before_slugs=before_slugs,
                 before_mtimes=before_mtimes,
                 completed_cleanly=completed_cleanly,
+                touched=pod_touched,
             )
 
     if artifacts is not None and artifact_writes_allowed:
@@ -228,6 +234,7 @@ async def _record_turn_artifacts(
     before_slugs: set[str],
     before_mtimes: dict[str, int],
     completed_cleanly: bool,
+    touched: set[str] | None = None,
 ) -> tuple[list[str], set[str]]:
     """The folders the turn created and touched. Those it created are indexed
     as this conversation's (and, in org mode, its creator's), in a unit.
@@ -249,8 +256,11 @@ async def _record_turn_artifacts(
                 before=before_slugs,
                 before_mtimes=before_mtimes,
                 # The project base is shared, so only folders whose
-                # provenance names this conversation are its own.
+                # provenance names this conversation are its own, unless the
+                # pod named the folders its tools touched.
                 attribute_by_provenance=True,
+                tracked_new=touched,
+                tracked_edits=touched,
                 completed_cleanly=completed_cleanly,
             ),
             scope=scope,

@@ -130,7 +130,7 @@ from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
-from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
+from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result, tracked_artifacts_from_reply
 
 
 import logging
@@ -2044,7 +2044,9 @@ class ResponsesHandler:
                     extra=log_context(request_id=corr, conversation_id=conv_id),
                 )
 
-        async def record_artifacts(*, completed_cleanly: bool) -> ArtifactChanges | None:
+        async def record_artifacts(
+            *, completed_cleanly: bool, touched: set[str] | None = None,
+        ) -> ArtifactChanges | None:
             """Record what the pod did to the project's artifacts, once per
             turn, whichever way the turn ends, as the in-process harness's
             `finally` does: the folders it created are indexed as this
@@ -2053,7 +2055,10 @@ class ResponsesHandler:
             turn may not keep what the pod wrote (its workspace was not
             persistent), when it recorded them already, or when the diff
             failed. Outside org mode the next turn in the project reconciles
-            them; in org mode nothing does."""
+            them; in org mode nothing does. `touched` is the pod's own list of
+            the artifacts its tools touched: with it, the diff claims and
+            checks only those; without it, provenance decides what the turn
+            created, and every folder is checked for edits."""
             from cowork.services.task_objects import record_new_artifacts, turn_artifact_changes
 
             if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
@@ -2073,6 +2078,8 @@ class ResponsesHandler:
                         # ENG-2961: the project base is shared, so only folders
                         # whose provenance names this conversation are its own.
                         attribute_by_provenance=True,
+                        tracked_new=touched,
+                        tracked_edits=touched,
                         completed_cleanly=completed_cleanly,
                     ),
                     scope=scope,
@@ -2276,6 +2283,9 @@ class ResponsesHandler:
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
             completed_cleanly = False
+            # The artifacts the pod's tools touched, from turn_completed; None
+            # for a pod that sends no list, and for every other exit.
+            pod_touched: set[str] | None = None
             # Whether the pod compacted or hard-truncated the turn's context:
             # its compacted step comes for both, its compaction reply for a
             # summary. Both arrive before the history frame.
@@ -2355,6 +2365,7 @@ class ResponsesHandler:
                     # `break`, not `return`: the record/publish/card block
                     # below must still run on a clean finish.
                     completed_cleanly = True
+                    pod_touched = tracked_artifacts_from_reply(data)
                     break
                 elif kind == "turn_failed":
                     if await _remote_cancel_confirmed(data.get("error"), corr):
@@ -2378,7 +2389,7 @@ class ResponsesHandler:
             # the artifacts in end_turn, with no publish and no cards, matching
             # the in-process path, where Stop/error produce no cards. Outside
             # org mode the next turn in the project reconciles the publish.
-            changes = await record_artifacts(completed_cleanly=completed_cleanly)
+            changes = await record_artifacts(completed_cleanly=completed_cleanly, touched=pod_touched)
             if changes is not None:
                 for card in await publish_and_card_turn_artifacts(
                     turn_artifacts.directory.base,

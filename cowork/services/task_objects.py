@@ -502,6 +502,26 @@ class ArtifactChanges:
     created_ids: dict[str, str] = field(default_factory=dict)
 
 
+# More names than this is not one turn's own work: the diff then covers the
+# whole folder, as for a pod that sends no list.
+_MAX_TRACKED_ARTIFACTS = 1000
+
+
+def tracked_artifacts_from_reply(data: Mapping) -> set[str] | None:
+    """The folder names a remote turn's artifact tools touched, from its
+    ``turn_completed`` reply, or None when the pod sent no usable list (an
+    older pod). Untrusted: the diff only ever intersects these names with the
+    folders it finds itself."""
+    touched = data.get("artifacts_touched")
+    if (
+        not isinstance(touched, list)
+        or len(touched) > _MAX_TRACKED_ARTIFACTS
+        or not all(isinstance(slug, str) for slug in touched)
+    ):
+        return None
+    return set(touched)
+
+
 def turn_artifact_changes(
     *,
     conversation_id,
