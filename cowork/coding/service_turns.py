@@ -85,8 +85,8 @@ class CodingTurnOperations:
             self._validated_command_intent(self.get_session(begun.session_id), request.prompt, request.attachments)
             require_attachments_exist(request.attachments)
             in_place_roots = (
-                {self.workspaces.in_place_root(request.path or "")}
-                if begun.workspace_mode == WorkspaceMode.in_place and begun.project is None
+                self.session_factory.in_place_roots(begun.project, request.resource_ids, request.path)
+                if begun.workspace_mode == WorkspaceMode.in_place
                 else set()
             )
             thread = threading.Thread(
@@ -299,12 +299,16 @@ class CodingTurnOperations:
         return frozenset(roots)
 
     def _in_place_roots(self, session: CodingSession) -> set[Path]:
-        """The repository an in-place task works in."""
+        """The repositories an in-place task works in."""
+        if session.workspaces:
+            return {Path(item.workspace_path).resolve() for item in session.workspaces}
         if session.workspace_path:
             return {Path(session.workspace_path).resolve()}
-        # Still preparing: its folder resolves to the repository its
-        # workspace will be.
-        return {self.workspaces.in_place_root(session.source_path).resolve()}
+        # Still preparing: its folders resolve to the repositories its
+        # workspaces will be.
+        project = self.projects.get(session.project_id) if session.project_id else None
+        resource_ids = None if session.scope_all_project_resources else session.resource_ids
+        return {root.resolve() for root in self.session_factory.in_place_roots(project, resource_ids, session.source_path)}
 
     def _is_remote(self, session: CodingSession) -> bool:
         return self.remote.is_remote(session)
