@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_workspace
+from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status, wait_for_workspace
 
-from cowork.coding.contracts import CodingSession, SessionCreateRequest, WorkspaceKind, WorkspaceMode
+from cowork.coding.contracts import CodingSession, SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
+from cowork.coding.workspace import WorkspaceError
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder, ProjectUpdateRequest
 from cowork.coding.workspace_mode import resolve_workspace_mode, supported_workspace_modes
 
@@ -116,3 +118,58 @@ def test_a_task_saved_before_modes_existed_still_loads(tmp_path: Path) -> None:
 
     assert legacy.workspace_mode is None
     assert legacy.workspace_kind == WorkspaceKind.git_worktree
+
+
+def test_the_composer_learns_which_modes_a_new_task_can_use(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Modes",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset({sys.platform}))
+    folder = service.workspace_mode_options(None, None)
+    assert folder.supported == [WorkspaceMode.worktree, WorkspaceMode.in_place]
+    assert folder.default == WorkspaceMode.worktree
+    assert service.workspace_mode_options(project.id, None).supported == [WorkspaceMode.worktree]
+    assert service.workspace_mode_options(None, "another-computer").supported == [WorkspaceMode.worktree]
+
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
+    unavailable = service.workspace_mode_options(None, None)
+    assert unavailable.supported == [WorkspaceMode.worktree]
+    assert "not available on this platform" in (unavailable.in_place_unavailable_reason or "")
+
+
+@pytest.mark.parametrize("kind", ["repository", "plain", "repositories", "empty repository"])
+def test_the_modes_offered_for_a_folder_are_the_modes_creation_accepts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset({sys.platform}))
+    if kind == "repository":
+        folder = repository(tmp_path)
+    else:
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        (folder / "notes.md").write_text("notes\n", encoding="utf-8")
+        if kind == "repositories":
+            (folder / "app").mkdir()
+            repository(folder / "app")
+        if kind == "empty repository":
+            git(folder, "init")
+    service = service_with(tmp_path, FakeEngine())
+
+    options = service.workspace_mode_options(None, None, str(folder))
+
+    for mode in (WorkspaceMode.worktree, WorkspaceMode.in_place):
+        request = SessionCreateRequest(path=str(folder), prompt="Go", workspace_mode=mode, allow_folder_copy=True)
+        if mode in options.supported:
+            created = service.create_session(request, CREDS, "fake", "fake-model")
+            wait_for_status(service, created.id, SessionStatus.completed)
+        else:
+            assert options.in_place_unavailable_reason
+            with pytest.raises((RuntimeError, ValueError, WorkspaceError)):
+                service.create_session(request, CREDS, "fake", "fake-model")
+    assert (WorkspaceMode.in_place in options.supported) == (kind == "repository")
