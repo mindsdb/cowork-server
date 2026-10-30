@@ -338,7 +338,8 @@ def test_each_member_sees_a_skill_in_their_own_section(org):
     _create(org, ALICE, "team-skill")
     _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], allowed_user_ids=[CAROL])
 
-    assert _listed(org, ALICE, _viewer(ALICE, teams=(TEAM_ENG,)))["team-skill"]["section"] == "mine"
+    # Its owner lists it by its audience too: shared with a team.
+    assert _listed(org, ALICE, _viewer(ALICE, teams=(TEAM_ENG,)))["team-skill"]["section"] == "team"
     bob = _listed(org, BOB, _viewer(BOB, teams=(TEAM_ENG,)))["team-skill"]
     assert (bob["section"], bob["canEdit"], bob["owner"]["id"]) == ("team", True, ALICE)
     # Recipients see who owns it, by id (named through /hub/people/?ids=),
@@ -457,10 +458,30 @@ def test_org_wide_takes_the_share_org_capability(org):
 
     _refused(lambda: _share(org, ALICE, "shared", org_allowed=True), 403, "skills.share_org")
     out = _share(org, ALICE, "shared", _viewer(ALICE, share_org=True), org_allowed=True)
-    assert (out["access"]["orgAllowed"], out["section"]) == (True, "mine")
+    # Its owner's own skill moves to the org section once org-wide.
+    assert (out["access"]["orgAllowed"], out["section"]) == (True, "org")
+    assert _listed(org, ALICE, _viewer(ALICE, share_org=True))["shared"]["section"] == "org"
     assert _row(org, "shared").org_allowed is True
     # Taking it back takes the capability too.
     _refused(lambda: _share(org, ALICE, "shared", _viewer(ALICE, write_org=True), org_allowed=False), 403)
+
+
+def test_an_owners_skill_is_listed_by_its_audience(org):
+    """The owner's section follows who the skill reaches: only them or
+    people is "mine", a team is "team", org-wide is "org"."""
+    _create(org, ALICE, "mine")
+    alice = _viewer(ALICE, teams=(TEAM_ENG,), share_org=True)
+    assert _listed(org, ALICE, alice)["mine"]["section"] == "mine"
+    out = _share(org, ALICE, "mine", alice, allowed_user_ids=[BOB])
+    assert out["section"] == "mine"
+    out = _share(org, ALICE, "mine", alice, allowed_team_ids=[TEAM_ENG], allowed_user_ids=[BOB])
+    assert out["section"] == "team"
+    assert _listed(org, ALICE, alice)["mine"]["section"] == "team"
+    out = _share(org, ALICE, "mine", alice, org_allowed=True, allowed_team_ids=[TEAM_ENG])
+    assert out["section"] == "org"
+    assert _listed(org, ALICE, alice)["mine"]["section"] == "org"
+    out = _share(org, ALICE, "mine", alice, org_allowed=False, allowed_team_ids=[])
+    assert out["section"] == "mine"
 
 
 TEAM_ALL = "team-everyone"

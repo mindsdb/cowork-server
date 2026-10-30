@@ -93,9 +93,9 @@ class SkillResponse(CamelResponse):
     # Hosted org sharing (ENG-3787). Outside it: section "mine" (managed
     # skills "org"), can_edit as capabilities.can_edit, access all empty.
     access: SkillAccessView = Field(default_factory=SkillAccessView)
-    # The skills page's bucket for the caller: "mine" (they own it), else
-    # "org" (org-wide), else "team" (one of their teams), else
-    # "shared_with_me" (their user id).
+    # The skills page's bucket for the caller, by audience (the owner's
+    # too): "org" (org-wide), else "team" (shared with a team), else "mine"
+    # (their own, shared with nobody or only people), else "shared_with_me".
     section: Literal["mine", "shared_with_me", "team", "org"] = "mine"
     can_edit: bool = False
     owner: SkillOwner = Field(default_factory=SkillOwner)

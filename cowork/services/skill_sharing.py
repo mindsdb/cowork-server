@@ -218,14 +218,19 @@ class SkillViewer:
         return self.is_admin or self.owns(rule.owner_user_id)
 
     def section(self, rule: SkillAccessRule) -> SkillSection:
-        """The bucket the skills page lists a skill under for this caller."""
-        if self.owns(rule.owner_user_id):
-            return "mine"
+        """The bucket the skills page lists a skill under for this caller,
+        by its audience, the owner's included: org-wide (or the default
+        team) is "org"; else shared with a team is "team" (for its owner, or
+        a member of one of the teams); else the caller's own is "mine" (its
+        owner's, even shared with people); else "shared_with_me"."""
+        owner = self.owns(rule.owner_user_id)
         rule = self.effective(rule)
         if rule.org_allowed:
             return "org"
-        if self.in_team_of(rule):
+        if rule.allowed_team_ids and (owner or self.in_team_of(rule)):
             return "team"
+        if owner:
+            return "mine"
         return "shared_with_me"
 
 
