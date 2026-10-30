@@ -20,6 +20,7 @@ from cowork.api.v1 import artifact_scope
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from _async_stub import awaitable
+from draft_host_support import reviewed_and_read
 
 
 @pytest.fixture
@@ -162,8 +163,8 @@ def served_xlsx(tmp_path, monkeypatch):
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        workspace_ep, "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, {"type": "file"}, True)),
+        workspace_ep, "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "file"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef/model.xlsx"
 
@@ -781,8 +782,8 @@ def served_html_app(tmp_path, monkeypatch):
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        workspace_ep, "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, {"type": "html-app"}, True)),
+        workspace_ep, "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef"
 

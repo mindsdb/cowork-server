@@ -765,3 +765,73 @@ async def test_a_save_still_running_at_the_frame_deadline_does_not_hold_up_the_f
     await asyncio.wait_for(save_landed.wait(), timeout=2)
     assert saved["assistant"] == "partial"
     assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
+
+
+def test_a_web_turns_answer_is_saved_when_the_event_loops_close_cuts_its_artifact_record(
+    monkeypatch, tmp_path, controller_flags,
+):
+    """A shutdown ends a web turn mid-stream while every file store slot is
+    taken, as calls stuck on a stalled mount take them. The turn's artifact
+    record waits for a slot, so its interrupted frame goes out at the frame
+    deadline without a row id. The teardown then ends, and the event loop's
+    close cancels the record still waiting. The answer is saved all the same,
+    as interrupted, before the loop closes."""
+    from cowork.services import task_objects
+    from test_responses_remote_backend import (
+        _FileStoreSlots, _artifact, _artifacts_context_at, _no_workspace_or_memory_units,
+        _remote_handler_with_message_id, _units_on_the_test_database,
+    )
+
+    monkeypatch.setattr(sys.modules["cowork.streaming.registry"], "SHUTDOWN_FRAME_SECONDS_PAST_GRACE", 0.05)
+    saved: dict = {}
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=uuid4())
+    _units_on_the_test_database(monkeypatch)
+    _no_workspace_or_memory_units(monkeypatch)
+    artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    _artifacts_context_at(monkeypatch, artifacts_base)
+    recorded: list[list[str]] = []
+    monkeypatch.setattr(
+        task_objects, "record_new_artifacts", lambda session, **kwargs: recorded.append(kwargs["slugs"]),
+    )
+    conv_id = uuid4()
+    lifecycle = TurnLifecycle(identity=RunIdentity(remote=True))
+    buffer = _FakeBuffer()
+
+    async def shutdown_during_a_stall() -> None:
+        slots = _FileStoreSlots()
+        streaming = asyncio.Event()
+
+        async def replies(**kwargs):
+            yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+            _artifact(artifacts_base, "mine", conversation_id=conv_id)
+            yield "turn_delta", {"text": "partial"}
+            await slots.take()
+            streaming.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+        handle = await registry.start(
+            conversation_id=CID, turn_id=0, open_buffer=opens(buffer), lifecycle=lifecycle,
+            produce=lambda buffer: handler._produce_remote(
+                conv_id=conv_id, input_text="hi", original_content="hi", model="anton",
+                harness_id="anton", buffer=buffer, lifecycle=lifecycle,
+            ),
+        )
+        await asyncio.wait_for(streaming.wait(), timeout=5)
+
+        assert await registry.shutdown(timeout_seconds=0.1) == 1
+        ended, _ = await asyncio.wait([handle.task], timeout=2)
+        assert ended, "the turn waited for its artifact record to write its frame"
+        assert buffer.closed == "interrupted"
+        assert "assistant_message_id" not in _failed_payload(buffer.records[-1])
+        assert slots.limiter.statistics().tasks_waiting == 1, "the artifact record is not waiting for a slot"
+        assert "assistant" not in saved
+
+    asyncio.run(shutdown_during_a_stall())
+
+    assert recorded == []
+    assert saved["assistant"] == "partial"
+    assert (saved["events"][-1]["error"], saved["events"][-1]["code"]) == (
+        INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE,
+    )

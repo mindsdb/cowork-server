@@ -22,6 +22,8 @@ from cowork.services.artifact_lock import artifact_lock
 
 ALICE = TenantScope(org_mode=True, org_id="org-1", user_id="alice")
 BOB = TenantScope(org_mode=True, org_id="org-1", user_id="bob")
+# A channel turn's scope (scope_for_org): the organization's, no person's.
+ORG_1_CHANNELS = TenantScope(org_mode=True, org_id="org-1")
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +56,34 @@ async def test_one_person_holding_their_share_leaves_slots_for_everyone_else():
         with pytest.raises(FilesystemBusy):
             await run_efs(lambda: "alice again", scope=ALICE)
         assert await asyncio.wait_for(run_efs(lambda: "bob", scope=BOB), timeout=0.5) == "bob"
+
+
+async def test_an_organizations_work_with_no_person_holds_one_share_and_leaves_slots_for_everyone():
+    """Channel bookkeeping waits for a slot rather than fail, but one
+    organization's turns still hold no more slots than one person."""
+    release = threading.Event()
+    started = threading.Semaphore(0)
+    running = []
+
+    def blocked():
+        running.append(threading.get_ident())
+        started.release()
+        release.wait(timeout=30)
+
+    turns = [
+        asyncio.create_task(run_efs(blocked, scope=ORG_1_CHANNELS, deadline=False))
+        for _ in range(units.EFS_SLOTS)
+    ]
+    try:
+        for _ in range(units.EFS_SHARE):
+            await asyncio.to_thread(started.acquire)
+        await asyncio.sleep(0.2)
+        assert len(running) == units.EFS_SHARE
+        assert await asyncio.wait_for(run_efs(lambda: "bob", scope=BOB), timeout=0.5) == "bob"
+    finally:
+        release.set()
+        await asyncio.gather(*turns)
+    assert len(running) == units.EFS_SLOTS
 
 
 async def test_a_full_file_store_refuses_a_call_after_pool_timeout():

@@ -30,7 +30,6 @@ one, so both modes address artifacts the same way.
 from __future__ import annotations
 
 import stat
-from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -159,7 +158,8 @@ class RootsPlan:
     legacy conversation roots. `scan` asks for the desktop scan of
     `scan_scope`'s projects root, and `adopted` are desktop projects in a
     folder the user chose, outside that root. `owner_filter` keeps only the
-    legacy conversation roots of conversations the caller owns.
+    legacy conversation roots of `owned`, the conversations the caller owns,
+    which the same database unit reads.
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -167,6 +167,7 @@ class RootsPlan:
     scan_scope: TenantScope | None = None
     adopted: tuple[ProjectRow, ...] = ()
     owner_filter: bool = False
+    owned: frozenset[UUID] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -181,18 +182,13 @@ class _FoundRoot:
 @dataclass(frozen=True)
 class DiscoveredRoots:
     """The roots `discover_roots` found, in discovery order, before the owner
-    filter."""
+    filter, with the plan's owner filter and owned conversations."""
 
     roots: tuple[_FoundRoot, ...]
     owner_filter: bool
+    owned: frozenset[UUID] = frozenset()
 
-    def conversation_ids(self) -> list[UUID]:
-        """The conversations whose ownership `sources` needs, for one query."""
-        if not self.owner_filter:
-            return []
-        return [root.conversation_id for root in self.roots if root.conversation_id is not None]
-
-    def sources(self, owned: Collection[UUID] = ()) -> list[ProjectArtifacts]:
+    def sources(self) -> list[ProjectArtifacts]:
         """The roots the caller may read. With the owner filter, a legacy root
         stays only when its conversation is in `owned`, which covers a
         directory name that is not a conversation id at all."""
@@ -200,7 +196,7 @@ class DiscoveredRoots:
             root.source
             for root in self.roots
             if not (self.owner_filter and root.legacy)
-            or (root.conversation_id is not None and root.conversation_id in owned)
+            or (root.conversation_id is not None and root.conversation_id in self.owned)
         ]
 
     def unfiltered(self) -> list[ProjectArtifacts]:
@@ -252,9 +248,11 @@ def plan_project_roots(
     from cowork.services.projects import ProjectService
 
     service = ProjectService(session)
+    owner_filter = not include_other_members and session.scope.org_mode
     return RootsPlan(
         projects=(_project_row(service, service.get_project(project_id)),),
-        owner_filter=not include_other_members and session.scope.org_mode,
+        owner_filter=owner_filter,
+        owned=owned_conversation_ids(session) if owner_filter else frozenset(),
     )
 
 
@@ -289,6 +287,7 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     return RootsPlan(
         projects=tuple(_project_row(service, project) for project in service.list_projects()),
         owner_filter=session.scope.org_mode,
+        owned=owned_conversation_ids(session) if session.scope.org_mode else frozenset(),
     )
 
 
@@ -382,29 +381,28 @@ def discover_roots(plan: RootsPlan) -> DiscoveredRoots:
         roots += [found for project in plan.adopted if (found := _adopted_root(project)) is not None]
     for project in plan.projects:
         roots += _project_roots(project)
-    return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter)
+    return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter, owned=plan.owned)
 
 
-def owned_conversation_ids(session: ScopedSession, conversation_ids: list[UUID]) -> set[UUID]:
-    """The subset of `conversation_ids` the caller owns, in one query."""
+def readable_sources(plan: RootsPlan) -> list[ProjectArtifacts]:
+    """The roots `plan` names that the caller may read. File store work only:
+    the plan already holds the owner filter's answer, so async code runs this
+    inside a file store call (cowork.db.units.run_efs), with the work on the
+    roots it finds."""
+    return discover_roots(plan).sources()
+
+
+def owned_conversation_ids(session: ScopedSession) -> frozenset[UUID]:
+    """Every conversation the caller owns, in one query, for a plan's owner
+    filter."""
     from cowork.services.conversations import ConversationService
 
-    return ConversationService(session).owned_ids(conversation_ids)
-
-
-def _sources(session: ScopedSession, plan: RootsPlan) -> list[ProjectArtifacts]:
-    """`plan`'s roots, with the database and the file store read in turn on the
-    calling thread. For code already running in a worker thread with a
-    session; async code reads the three steps through run_db and run_efs
-    (cowork.api.v1.artifact_scope.artifact_sources)."""
-    found = discover_roots(plan)
-    ids = found.conversation_ids()
-    return found.sources(owned_conversation_ids(session, ids) if ids else ())
+    return frozenset(ConversationService(session).owned_ids())
 
 
 def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts]:
     """Every artifacts root the caller can read; see `plan_scope_roots`."""
-    return _sources(session, plan_scope_roots(session))
+    return readable_sources(plan_scope_roots(session))
 
 
 def artifacts_sources_for_project(
@@ -417,12 +415,9 @@ def artifacts_sources_for_project(
     a caller that addresses by slug has to look in each. Desktop always yields
     exactly one.
     """
-    plan = plan_project_roots(session, project_id, include_other_members=include_other_members)
-    found = discover_roots(plan)
-    if include_other_members:
-        return found.unfiltered()
-    ids = found.conversation_ids()
-    return found.sources(owned_conversation_ids(session, ids) if ids else ())
+    return readable_sources(
+        plan_project_roots(session, project_id, include_other_members=include_other_members)
+    )
 
 
 def artifacts_sources_for_scan(*, scope: TenantScope | None) -> list[ProjectArtifacts]:
