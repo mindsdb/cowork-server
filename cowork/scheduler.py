@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from typing import TYPE_CHECKING, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
@@ -223,7 +223,8 @@ class _ScheduledTurn:
     project_id: UUID | None
 
 
-class DueSlot(NamedTuple):
+@dataclass(frozen=True)
+class DueSlot:
     """A schedule due to run, and the cron slot its run claims."""
 
     schedule_id: UUID
@@ -257,17 +258,26 @@ def _renew_run_lease(session: ScopedSession, *, run_id: UUID) -> bool:
 
 async def _renew_lease(run_id: UUID, *, schedule_id: UUID) -> None:
     """Renew the run's lease until cancelled, so no replica reaps it while it
-    lives. A renewal the pool refuses is tried again at the next interval."""
+    lives. A renewal the pool refuses is tried again at the next interval. A
+    run that is no longer `running` was reaped by another replica, so renewing
+    stops there."""
     while True:
         await asyncio.sleep(_LEASE_RENEW_SECONDS)
         try:
-            await run_db(partial(_renew_run_lease, run_id=run_id), scope=SYSTEM_SCOPE)
+            renewed = await run_db(partial(_renew_run_lease, run_id=run_id), scope=SYSTEM_SCOPE)
         except Exception:
             logger.warning(
                 "Could not renew a scheduled run's lease; trying again",
                 exc_info=True,
                 extra=log_context(schedule_id=schedule_id),
             )
+            continue
+        if not renewed:
+            logger.warning(
+                "A scheduled run lost its lease to another replica",
+                extra=log_context(schedule_id=schedule_id),
+            )
+            return
 
 
 def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTurn:
@@ -299,9 +309,16 @@ def _link_conversation(
 ) -> UUID:
     """The run's conversation, created first when the caller made none, and
     recorded on the run before the turn starts. Refuses with RunClaimLost when
-    another replica has reaped the run, since that replica may run its slot."""
+    another replica has reaped the run, since that replica may run its slot.
+
+    The check before the conversation exists saves making one for a run
+    already reaped. The link itself is the claim check that counts: it
+    records the conversation only on a run still `running`
+    (ScheduleRunService.set_run_conversation), so a reap that lands in
+    between still stops the turn."""
     if not ScheduleRunService(session).still_running(run_id):
         raise RunClaimLost(f"run {run_id} was reaped before its turn started")
+    created = conversation_id is None
     if conversation_id is None:
         from cowork.services.conversations import ConversationService
 
@@ -317,7 +334,10 @@ def _link_conversation(
             topic=scheduled.title,
             project_id=scheduled.project_id,
         ).id
-    ScheduleRunService(session).set_run_conversation(run_id, conversation_id)
+    if not ScheduleRunService(session).set_run_conversation(run_id, conversation_id):
+        if created:
+            _delete_unstarted_conversation(session, scheduled=scheduled, conversation_id=conversation_id)
+        raise RunClaimLost(f"run {run_id} was reaped before its turn started")
     return conversation_id
 
 
@@ -380,13 +400,19 @@ def _record_turn_outcome(
     return outcome
 
 
-def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool) -> None:
+def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool) -> bool:
+    """Record a run's error on its schedule. Returns whether it consumed the
+    cron slot."""
     schedule = ScheduleService(session).get_schedule(schedule_id)
     schedule.last_error = error
     session.add(schedule)
-    # A run that disabled its schedule has already stopped the re-fire.
-    if consume_slot and schedule.enabled:
+    # A run that disabled its schedule has already stopped the re-fire. So has
+    # a pause during the run; the run then gives its slot back
+    # (execute_schedule), so a resumed schedule can claim the slot it left due.
+    consumed = consume_slot and schedule.enabled
+    if consumed:
         _advance_next_run_at(schedule, session)
+    return consumed
 
 
 def _finish_run(
@@ -593,14 +619,13 @@ async def execute_schedule(
         # slot would drop a daily or weekly occurrence over a short blip.
         transient = not turn_started and isinstance(exc, (PoolTimeoutError, ProductPermissionUnavailable))
         try:
-            await _until_it_lands(
+            slot_consumed = await _until_it_lands(
                 partial(
                     _record_schedule_error, schedule_id=schedule_id, error=error,
                     consume_slot=not is_manual and not transient,
                 ),
                 schedule_id=schedule_id,
             )
-            slot_consumed = not is_manual and not transient
         except Exception:
             logger.exception(
                 "Failed to record the scheduled run's error",
@@ -715,7 +740,9 @@ def _reap_lapsed_runs(session: ScopedSession, now: datetime) -> None:
 
     A run that never started its turn gave its slot back, so the slot fires
     again (ScheduleRunService.reap_lapsed_runs). A run whose turn may have
-    started consumes its slot here instead, so the work isn't done twice.
+    started consumes its slot here instead, so the work isn't done twice. A
+    paused schedule moves on too, so it resumes at its next occurrence rather
+    than on a slot this run still holds.
     """
     for run in ScheduleRunService(session).reap_lapsed_runs(now=now, error=_LAPSED_RUN_ERROR):
         logger.warning(
@@ -725,7 +752,6 @@ def _reap_lapsed_runs(session: ScopedSession, now: datetime) -> None:
         schedule = session.get(Schedule, run.schedule_id)
         if (
             schedule is not None
-            and schedule.enabled
             and not run.is_manual
             and ensure_utc(schedule.next_run_at) == ensure_utc(run.slot_at)
         ):

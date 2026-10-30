@@ -312,12 +312,23 @@ class ScheduleRunService:
         ).first()
         return conversation_id if row is not None else None
 
-    def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> None:
+    def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> bool:
         """Attach the run's conversation as soon as it is known — before the
-        turn executes — so the UI can open a run that is still in flight."""
-        run = self.session.get(ScheduleRun, run_id)
-        if run is None:
-            return
+        turn executes — so the UI can open a run that is still in flight.
+
+        False when the run is gone or no longer `running`: another replica
+        reaped it and may run its slot, so its turn must not start. The row is
+        read FOR UPDATE, fresh from the database, and reap_lapsed_runs skips a
+        row locked that way, so on PostgreSQL a reap and this link never both
+        act on what the other has not yet committed."""
+        run = self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if run is None or run.status != RunStatus.running:
+            return False
         run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
         try:
@@ -327,6 +338,7 @@ class ScheduleRunService:
             # and its release already nulled the column in the database. The
             # run simply has no conversation to point at.
             self.session.rollback()
+        return True
 
     def finish_run(
         self,
@@ -415,12 +427,17 @@ class ScheduleRunService:
         have done its work, so it keeps the slot, and the caller consumes it
         rather than run that work twice. Returns those runs. Staged only: the
         caller commits.
+
+        Rows are locked as they are read, skipping any row already locked: a
+        run linking its conversation (set_run_conversation) or another
+        replica's reap holds it, and the next poll reads it as committed.
         """
         runs = self.session.exec(
             self.session.select(ScheduleRun)
             .where(ScheduleRun.status == RunStatus.running)
             .where(ScheduleRun.lease_expires_at.is_not(None))  # type: ignore[union-attr]
             .where(ScheduleRun.lease_expires_at < now)  # type: ignore[operator]
+            .with_for_update(skip_locked=True)
         ).all()
         kept: list[ScheduleRun] = []
         for run in runs:
