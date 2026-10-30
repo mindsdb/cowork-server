@@ -1163,7 +1163,7 @@ def test_a_poll_skips_a_schedule_deleted_after_the_poll_read_it(tmp_path, monkey
         due = _poll(ScopedSession(poll_session, SYSTEM_SCOPE))
 
     assert len(deleted) == 1
-    assert due == list(schedule_ids - set(deleted))
+    assert [slot.schedule_id for slot in due] == list(schedule_ids - set(deleted))
 
 
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
