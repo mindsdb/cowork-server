@@ -75,8 +75,9 @@ class LoopWatchdog:
         self._thread.start()
 
     def stop(self) -> None:
+        """Tell the thread to end, without waiting for it. Called on the loop,
+        where a join would hold the loop while a ping waits for it."""
         self._stop.set()
-        self._thread.join(timeout=PING_EVERY_S * 2)
 
     def _run(self) -> None:
         # When the loop last answered a ping. A stall is timed from here, not
@@ -90,6 +91,10 @@ class LoopWatchdog:
             except RuntimeError:
                 return  # the loop closed
             if not answered.wait(STALL_AFTER_S):
+                # Stopped while the ping waited: the loop is shutting down,
+                # and whatever held it then is no stall to report.
+                if self._stop.is_set():
+                    return
                 self._stalled(last_seen)
                 while not answered.wait(LIMITER_CHECK_EVERY_S):
                     if self._stop.is_set():

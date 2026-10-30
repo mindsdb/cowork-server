@@ -53,6 +53,7 @@ EVENT_FIELDS = frozenset(
         "stack",
         "in_flight",
         "limiter",
+        "step",
         "steps",
     ]
 )

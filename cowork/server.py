@@ -9,10 +9,12 @@ import asyncio
 import contextlib
 import os
 import stat
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import psutil
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -66,9 +68,26 @@ from cowork.services.pending_credential_clear import consume_pending_credential_
 # Set up logging
 logger = setup_logging()
 
-# Imported once, as the process starts serving, so startup_finished can say
-# how long the whole boot took and not only the lifespan.
-_IMPORTED_AT = time.monotonic()
+# When the operating system started this process, in epoch seconds, so
+# startup_finished counts the whole boot liveness counts: interpreter start
+# and imports too, not only the lifespan.
+_PROCESS_STARTED_AT = psutil.Process().create_time()
+# A lifespan step still running this long logs startup_step_running, and logs
+# startup_step_slow as it ends.
+_SLOW_STEP_S = 10.0
+
+
+def _log_running_step(name: str, started: float) -> None:
+    """What a step's timer logs once the step has run for _SLOW_STEP_S. Runs
+    on the timer's thread, and does nothing there but log."""
+    logger.warning(
+        "Startup step running",
+        extra={
+            "event": "startup_step_running",
+            "step": name,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        },
+    )
 
 
 class _StartupClock:
@@ -76,24 +95,54 @@ class _StartupClock:
 
     Liveness starts counting before the lifespan ends, so a boot that grows
     past its budget restarts the pod before it serves. One WARNING line, the
-    level hosted pods print, says which step grew.
+    level hosted pods print, says which step grew. A step still running after
+    _SLOW_STEP_S logs its own WARNING then, from a timer thread, and another
+    as it ends, so a boot liveness kills before that line still names its
+    slow steps and the step it was killed in.
     """
 
     def __init__(self) -> None:
-        self._mark = time.monotonic()
         self._steps: list[str] = []
+        self._name: str | None = None
+        self._mark = time.monotonic()
+        self._timer: threading.Timer | None = None
 
-    def step(self, name: str) -> None:
-        now = time.monotonic()
-        self._steps.append(f"{name}={round((now - self._mark) * 1000)}ms")
-        self._mark = now
+    def begin(self, name: str) -> None:
+        """End the running step, if any, and start ``name``."""
+        self._end()
+        self._name = name
+        self._mark = time.monotonic()
+        self._timer = threading.Timer(_SLOW_STEP_S, _log_running_step, args=(name, self._mark))
+        self._timer.daemon = True
+        self._timer.start()
+
+    def stop_timer(self) -> None:
+        """Cancel the running step's timer, if any."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _end(self) -> None:
+        self.stop_timer()
+        if self._name is None:
+            return
+        took = time.monotonic() - self._mark
+        self._steps.append(f"{self._name}={round(took * 1000)}ms")
+        if took >= _SLOW_STEP_S:
+            logger.warning(
+                "Startup step slow",
+                extra={"event": "startup_step_slow", "step": self._name, "duration_ms": round(took * 1000)},
+            )
+        self._name = None
 
     def finished(self) -> None:
+        """End the running step and log the boot's length and every step's."""
+        self._end()
         logger.warning(
             "Startup finished",
             extra={
                 "event": "startup_finished",
-                "duration_ms": round((time.monotonic() - _IMPORTED_AT) * 1000),
+                "duration_ms": round((time.time() - _PROCESS_STARTED_AT) * 1000),
                 "steps": ", ".join(self._steps),
             },
         )
@@ -208,12 +257,17 @@ def _warm_agent_runtime() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     clock = _StartupClock()
+    # A step that raises never reaches the next begin(), so its timer would
+    # still log it as running once _SLOW_STEP_S passed. The end of the task
+    # that runs the lifespan stops that timer.
+    asyncio.current_task().add_done_callback(lambda _task: clock.stop_timer())
+    clock.begin("dev_setup")
     run_dev_setup()
-    clock.step("dev_setup")
+    clock.begin("credential_clear")
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
-    clock.step("credential_clear")
+    clock.begin("published_page_backfill")
     # Ownership recovery runs before the first request can mint a page. A pass
     # that cannot read publish history or verify the publisher does not stop
     # Cowork: published_page_ownership._require_backfill retries it on each
@@ -231,7 +285,7 @@ async def lifespan(app: FastAPI):
             "Published page ownership backfill did not finish; publishing answers 503 and retries it",
             extra={"event": "published_page_backfill_unavailable", "reason": str(exc)},
         )
-    clock.step("published_page_backfill")
+    clock.begin("warm_agent_runtime")
     # After the clear, since resolving MEMORY_ENABLED where memory is shared
     # loads the stored settings.
     try:
@@ -242,7 +296,7 @@ async def lifespan(app: FastAPI):
         logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
-    clock.step("warm_agent_runtime")
+    clock.begin("turn_history_recovery")
     # History recovery also retries buffers sealed by an earlier failed sweep.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
@@ -257,7 +311,7 @@ async def lifespan(app: FastAPI):
             history_session.close()
     except Exception:
         logger.exception("turn-history boot recovery failed (non-fatal)")
-    clock.step("turn_history_recovery")
+    clock.begin("turn_buffer_recovery")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -268,7 +322,7 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
-    clock.step("turn_buffer_recovery")
+    clock.begin("scratchpad_session_sweep")
     # Reclaim scratchpad namespace snapshots whose conversation is gone (ENG-1124).
     # `delete_conversation` prunes its own from now on; this catches everything
     # deleted before that shipped, plus any path that drops a conversation row
@@ -284,7 +338,7 @@ async def lifespan(app: FastAPI):
             sweep_session.close()
     except Exception:
         logger.exception("scratchpad-session boot sweep failed (non-fatal)")
-    clock.step("scratchpad_session_sweep")
+    clock.begin("scheduled_run_recovery")
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
     # run and never fires that schedule again.
@@ -302,17 +356,16 @@ async def lifespan(app: FastAPI):
             recovery_session.close()
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
-    clock.step("scheduled_run_recovery")
+    clock.begin("model_map_warm")
     # Warm the MindsHub availability map at boot (desktop, returning or
     # freshly-signed-in user) so the empty-map state — which keeps a stored
     # paid pin and 402s the first message on a free-tier wallet (ENG-748) —
     # is closed before the first turn. Bounded and fail-open; see the helper.
     if await _warm_model_map_on_boot():
         logger.info("warmed MindsHub model-availability map on boot")
-    clock.step("model_map_warm")
+    clock.begin("scheduler_and_channels")
     start_scheduler()
     await _start_channels(app)
-    clock.step("scheduler_and_channels")
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
     if get_app_settings().tenancy_mode == "org":

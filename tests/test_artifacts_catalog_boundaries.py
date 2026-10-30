@@ -17,10 +17,10 @@ from cowork.services.artifact_roots import ProjectRow, RootsPlan
 
 
 def _stub_project_roots(monkeypatch, discover):
-    """Answer the delete's async roots read from ``discover(session,
-    project_id)``, as a stub of the sync ``artifacts_sources_for_project``
-    would: the plan step sees the server's project id, and the roots step
-    returns what ``discover`` gave for it."""
+    """Answer the delete's roots read from ``discover(session, project_id)``,
+    as a stub of the sync ``artifacts_sources_for_project`` would: the plan
+    step sees the server's project id, and the roots step returns what
+    ``discover`` gave for it."""
     found = {}
 
     def plan(session, project_id, **_kwargs):
@@ -29,11 +29,11 @@ def _stub_project_roots(monkeypatch, discover):
             projects=(ProjectRow(id=project_id, name="project", path="/nowhere", external=False),)
         )
 
-    async def sources(_plan, *, scope):
+    def sources(_plan):
         return found["sources"]
 
     monkeypatch.setattr(artifacts, "plan_project_roots", plan)
-    monkeypatch.setattr(artifacts, "artifact_sources", sources)
+    monkeypatch.setattr(artifacts, "readable_sources", sources)
 
 
 async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
@@ -56,10 +56,16 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
         events.append("basename")
         return real_basename(project_ref)
 
-    def discover(_scope, project_ref):
+    plan = RootsPlan(projects=(ProjectRow(id=server_id, name="project", path="/nowhere", external=False),))
+
+    def plan_for(_scope, project_ref):
         events.append("roots")
         seen["project_ref"] = project_ref
-        return server_id, [trusted_source]
+        return plan
+
+    def sources_of(found_plan):
+        assert found_plan is plan
+        return [trusted_source]
 
     def list_from_roots(sources):
         events.append("sink")
@@ -69,7 +75,8 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
     session = SimpleNamespace(scope=LOCAL_SCOPE)
     seen["session"] = session
     monkeypatch.setattr(artifacts.os.path, "basename", sanitize)
-    monkeypatch.setattr(artifacts, "_scoped_project_roots", awaitable(discover))
+    monkeypatch.setattr(artifacts, "_scoped_project_plan", awaitable(plan_for))
+    monkeypatch.setattr(artifacts, "readable_sources", sources_of)
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(

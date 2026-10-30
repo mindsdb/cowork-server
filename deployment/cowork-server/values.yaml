@@ -170,9 +170,11 @@ deployment:
   # The delay covers the boot: the lifespan does file store and database work
   # before uvicorn binds, and on 28 Oct staging pods booting under load served
   # their first request about 120s after start, the moment the old 60s delay
-  # plus 60s of failures killed them. With 180s a boot of up to 240s survives;
-  # startup_finished logs each boot's length. The deployment subchart renders no
-  # startupProbe, so the delay is the one setting that holds a slow boot.
+  # plus 60s of failures killed them. With 180s a boot of up to about 230s
+  # survives: the first probe lands in [180, 190)s and the sixth failure 50s
+  # later. startup_finished logs each boot's length from process start. The
+  # deployment subchart renders no startupProbe, so the delay is the one
+  # setting that holds a slow boot.
   livenessProbe:
     enabled: true
     initialDelaySeconds: 180

@@ -62,21 +62,21 @@ def test_snapshot_of_missing_dir_is_empty(tmp_path):
     assert mtimes == {}
 
 
-def test_index_reports_new_slug_as_new_and_touched(conv, tmp_path):
+def test_changes_report_new_slug_as_created_and_touched(conv, tmp_path):
     base = tmp_path / "artifacts"
     base.mkdir()
     before, before_mtimes = t.snapshot_artifact_state(base)
 
     _make_artifact(base, "fresh", files={"r.md": "hi"}, meta={"slug": "fresh", "type": "document"})
 
-    new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
     )
-    assert new == ["fresh"]
-    assert touched == {"fresh"}
+    assert changes.created == ["fresh"]
+    assert changes.touched == {"fresh"}
 
 
-def test_index_reports_edited_existing_slug_as_touched_not_new(conv, tmp_path):
+def test_changes_report_edited_existing_slug_as_touched_not_created(conv, tmp_path):
     base = tmp_path / "artifacts"
     _make_artifact(base, "old", files={"a.md": "v1"}, meta={"slug": "old", "type": "document"})
     before, before_mtimes = t.snapshot_artifact_state(base)
@@ -84,11 +84,11 @@ def test_index_reports_edited_existing_slug_as_touched_not_new(conv, tmp_path):
     (base / "old" / "a.md").write_text("v2")
     _bump_mtime(base / "old" / "a.md", 120)
 
-    new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
     )
-    assert new == []
-    assert touched == {"old"}
+    assert changes.created == []
+    assert changes.touched == {"old"}
 
     from cowork.services.artifact_revisions import list_revisions
 
@@ -97,7 +97,7 @@ def test_index_reports_edited_existing_slug_as_touched_not_new(conv, tmp_path):
     assert latest["conversationId"] == str(conv.id)
 
 
-def test_index_detects_same_second_same_size_agent_edit(conv, tmp_path):
+def test_changes_detect_same_second_same_size_agent_edit(conv, tmp_path):
     base = tmp_path / "artifacts"
     _make_artifact(base, "old", files={"a.md": "v1"}, meta={"slug": "old", "type": "document"})
     before, before_mtimes = t.snapshot_artifact_state(base)
@@ -106,27 +106,27 @@ def test_index_detects_same_second_same_size_agent_edit(conv, tmp_path):
     (base / "old" / "a.md").write_text("v2")
     os.utime(base / "old" / "a.md", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1))
 
-    new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
     )
 
-    assert new == []
-    assert touched == {"old"}
+    assert changes.created == []
+    assert changes.touched == {"old"}
 
 
-def test_index_leaves_untouched_slug_out_of_touched(conv, tmp_path):
+def test_changes_leave_untouched_slug_out_of_touched(conv, tmp_path):
     base = tmp_path / "artifacts"
     _make_artifact(base, "old", files={"a.md": "v1"}, meta={"slug": "old", "type": "document"})
     before, before_mtimes = t.snapshot_artifact_state(base)
 
-    new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
     )
-    assert new == []
-    assert touched == set()
+    assert changes.created == []
+    assert changes.touched == set()
 
 
-def test_index_finishes_no_change_repair_without_marking_artifact_touched(conv, tmp_path):
+def test_changes_finish_no_change_repair_without_marking_artifact_touched(conv, tmp_path):
     from cowork.services.artifact_identity import ensure_full_id
     from cowork.services.artifact_revisions import (
         agent_repair_detail,
@@ -156,11 +156,11 @@ def test_index_finishes_no_change_repair_without_marking_artifact_touched(conv, 
     )
     before, before_mtimes = t.snapshot_artifact_state(base)
 
-    _new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
     )
 
-    assert touched == set()
+    assert changes.touched == set()
     detail = agent_repair_detail(folder, repair["repair"]["id"])
     assert detail["repair"]["status"] == "no_change"
 
@@ -178,13 +178,13 @@ def test_concurrent_sibling_artifact_is_not_claimed_by_this_turn(conv, tmp_path)
     # A concurrent turn in another conversation, writing the same directory.
     _make_artifact(base, "theirs", files={"b.md": "y"}, meta={"slug": "theirs", "type": "document"})
 
-    new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
         tracked_new={"mine"}, tracked_edits={"mine"},
     )
 
-    assert new == ["mine"]
-    assert "theirs" not in touched
+    assert changes.created == ["mine"]
+    assert "theirs" not in changes.touched
 
 
 def test_without_tracking_both_are_claimed(conv, tmp_path):
@@ -199,11 +199,11 @@ def test_without_tracking_both_are_claimed(conv, tmp_path):
     _make_artifact(base, "mine", files={"a.md": "x"}, meta={"slug": "mine", "type": "document"})
     _make_artifact(base, "theirs", files={"b.md": "y"}, meta={"slug": "theirs", "type": "document"})
 
-    new, _touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
     )
 
-    assert new == ["mine", "theirs"]
+    assert changes.created == ["mine", "theirs"]
 
 
 def test_tracked_edit_of_a_sibling_artifact_is_not_claimed(conv, tmp_path):
@@ -218,12 +218,12 @@ def test_tracked_edit_of_a_sibling_artifact_is_not_claimed(conv, tmp_path):
         (base / slug / name).write_text("v2")
         _bump_mtime(base / slug / name, 120)
 
-    _new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
         tracked_new={"mine"}, tracked_edits={"mine"},
     )
 
-    assert touched == {"mine"}
+    assert changes.touched == {"mine"}
 
 
 def test_tracked_slug_that_never_appeared_is_ignored(conv, tmp_path):
@@ -233,23 +233,13 @@ def test_tracked_slug_that_never_appeared_is_ignored(conv, tmp_path):
     base.mkdir()
     before, before_mtimes = t.snapshot_artifact_state(base)
 
-    new, touched, _scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
         tracked_new={"vanished"}, tracked_edits={"vanished"},
     )
 
-    assert new == []
-    assert touched == set()
-
-
-def test_index_never_raises_and_degrades_to_empty(conv):
-    # A non-path artifacts_base makes the very first operation blow up; the
-    # caller runs this right after a turn's finally and must not get an
-    # exception that masks the turn's real outcome.
-    new, touched, scope = t.index_turn_artifacts(
-        conv, conv.id, conv.project_id, object(), set(), {},
-    )
-    assert (new, touched, scope) == ([], set(), None)
+    assert changes.created == []
+    assert changes.touched == set()
 
 
 def test_cards_for_slugs_builds_one_card_per_slug(tmp_path):
@@ -329,7 +319,7 @@ async def test_org_mode_still_requires_a_successful_republish_to_card_an_edit(
     assert cards == []
 
 
-def test_scope_falls_back_to_the_ambient_turn_scope(conv, tmp_path, monkeypatch):
+def test_scope_falls_back_to_the_ambient_turn_scope(conv, monkeypatch):
     # A detached or expired session yields no scope. The turn boundary binds an
     # ambient one (use_settings_scope in handlers.responses), and it survives
     # that — otherwise a whole class of "artifact never published" would depend
@@ -342,21 +332,13 @@ def test_scope_falls_back_to_the_ambient_turn_scope(conv, tmp_path, monkeypatch)
         "cowork.common.settings.user_settings.current_settings_scope", lambda: ambient
     )
 
-    base = tmp_path / "artifacts"
-    base.mkdir()
-    _, _, scope = t.index_turn_artifacts(conv, conv.id, conv.project_id, base, set(), {})
-
-    assert scope is ambient
+    assert t._recover_turn_scope(conv) is ambient
 
 
-def test_scope_is_none_when_neither_source_has_one(conv, tmp_path, monkeypatch):
+def test_scope_is_none_when_neither_source_has_one(conv, monkeypatch):
     monkeypatch.setattr(t, "scope_of_session", lambda _s: None)
     monkeypatch.setattr(
         "cowork.common.settings.user_settings.current_settings_scope", lambda: None
     )
 
-    base = tmp_path / "artifacts"
-    base.mkdir()
-    _, _, scope = t.index_turn_artifacts(conv, conv.id, conv.project_id, base, set(), {})
-
-    assert scope is None
+    assert t._recover_turn_scope(conv) is None

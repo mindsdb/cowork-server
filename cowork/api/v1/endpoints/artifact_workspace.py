@@ -8,7 +8,7 @@ import os
 import stat
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 from urllib.parse import quote
 from uuid import UUID
 
@@ -25,7 +25,11 @@ from cowork.common.paths import (
     open_pinned_child,
     read_bounded,
 )
-from cowork.api.v1.artifact_scope import review_artifact_for_request
+from cowork.api.v1.artifact_scope import (
+    ResolvedArtifact,
+    review_artifact_and_read,
+    review_artifact_for_request,
+)
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_scoped_session
 from cowork.db.units import FilesystemBusy, run_db, run_efs
@@ -295,6 +299,92 @@ class _PinnedDraftResponse(StreamingResponse):
             self._resources.close()
 
 
+def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
+    """Validate a draft file path against the artifact it is read from.
+
+    400 for a path that is not a plain relative one, 404 for the private
+    entries and, in a full-stack artifact, anything outside its public subtree.
+    """
+    try:
+        parts = artifact_files.relative_file_parts(rel_path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact path",
+        ) from exc
+    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
+    if str(metadata.get("type") or "").startswith("fullstack-"):
+        try:
+            primary_parts = artifact_files.relative_file_parts(
+                str(metadata.get("primary") or "static/index.html")
+            )
+        except ValueError:
+            primary_parts = ()
+        public_parts = primary_parts[:-1]
+        if not public_parts:
+            # A full-stack artifact needs a distinct public subtree. Serving its
+            # root would let a reviewer guess backend.py or credential-bearing
+            # runtime files. The dedicated runtime can handle legacy root-level
+            # apps; the private source preview must stay fail-closed.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Artifact file not found",
+            )
+        if parts[:len(public_parts)] != public_parts:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Artifact file not found",
+            )
+    return parts
+
+
+def _draft_file_response(
+    artifact: ResolvedArtifact,
+    rel_path: str,
+    *,
+    comments: bool,
+    download: bool = False,
+):
+    """Check ``rel_path`` against the artifact the lookup found
+    (``_draft_file_parts``), then open the draft file there and answer with it.
+
+    The authenticated ``/drafts`` route runs it as its lookup's own read
+    (``review_artifact_and_read``): the checks and the open share the lookup's
+    file store call, and run only once the lookup authorized the caller. HTML
+    goes out as the preview document unless ``download`` asks for the bytes;
+    every other file, and HTML that is not UTF-8, streams from the pinned
+    descriptor.
+    """
+    parts = _draft_file_parts(rel_path, artifact.metadata)
+    media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
+    try:
+        resources, fd, file_stat = artifact_files.open_pinned_draft_file(
+            artifact.source, artifact.folder, parts
+        )
+    except artifact_files.ArtifactFileRefused as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact file not found",
+        ) from exc
+    try:
+        if not download and media_type == "text/html":
+            response = _preview_html_from_fd(fd, comments=comments)
+            if response is not None:
+                resources.close()
+                return response
+        extra = (
+            {"Content-Disposition": _attachment_disposition(parts[-1])}
+            if download else None
+        )
+        return _draft_stream(
+            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+        )
+    except BaseException:
+        resources.close()
+        raise
+
+
 def _artifact_id_from_path(artifact_id: UUID) -> str:
     """The identity gate for every route in this file.
 
@@ -530,12 +620,29 @@ def _selected_source(source, folder: Path, metadata: dict, requested: str | None
     return selected
 
 
+class _WorkspaceState(NamedTuple):
+    """What the workspace GET reads from the folder."""
+
+    # The source and its revision.
+    result: dict
+    # The agent repair in progress on that source, if any.
+    repair: dict | None
+    export_source: ExportSource
+
+
 def _workspace_state(
-    folder: Path, metadata: dict, artifact_id: str, selected: str | None, *, with_export: bool
-) -> tuple[dict, dict | None, ExportSource]:
+    source,
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    requested: str | None,
+    *,
+    with_export: bool,
+) -> _WorkspaceState:
     """What the workspace GET returns from the folder, in one file store hop:
-    the source and its revision, the repair in progress, and the export
-    source."""
+    the source the request addresses and its revision, the repair in
+    progress, and the export source."""
+    selected = _selected_source(source, folder, metadata, requested)
     result = current_workspace(folder, metadata, artifact_id, selected)
     repair = active_agent_repair(folder, result.get("path"))
     export_source = (
@@ -543,7 +650,34 @@ def _workspace_state(
         if with_export
         else ExportSource(source_name="", is_backend=False)
     )
-    return result, repair, export_source
+    return _WorkspaceState(result, repair, export_source)
+
+
+def _save_selected_source(
+    source,
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    requested: str | None,
+    *,
+    content: str,
+    expected_revision_id: str,
+    actor_id: str | None,
+    summary: str,
+) -> dict:
+    """A manual edit's file store work, in one hop: the source the request
+    addresses, then the save."""
+    return save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content=content,
+        expected_revision_id=expected_revision_id,
+        rel_path=_selected_source(source, folder, metadata, requested),
+        actor_kind="manual",
+        actor_id=actor_id,
+        summary=summary,
+    )
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}")
@@ -564,15 +698,14 @@ async def artifact_source(
     source, folder, metadata, owner_capabilities = await _owner_workspace(
         session.scope, project_ref, artifact_id
     )
-    selected = await run_efs(
-        partial(_selected_source, source, folder, metadata, path), scope=session.scope
-    )
     # No format is offered whatever the folder holds while org export is off,
     # so the walk that finds the primary is skipped, and the source names none.
     with_export = not org_export_refused(org_mode=bool(session.scope.org_mode))
     try:
         result, repair, export_source = await run_efs(
-            partial(_workspace_state, folder, metadata, artifact_id, selected, with_export=with_export),
+            partial(
+                _workspace_state, source, folder, metadata, artifact_id, path, with_export=with_export
+            ),
             scope=session.scope,
         )
         capabilities = await _current_capabilities(
@@ -599,20 +732,17 @@ async def update_artifact_source(
     )
     scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
-    selected = await run_efs(
-        partial(_selected_source, source, folder, metadata, body.path), scope=session.scope
-    )
     try:
         saved = await run_efs(
             partial(
-                save_source,
+                _save_selected_source,
+                source,
                 folder,
                 metadata,
                 artifact_id,
+                body.path,
                 content=body.content,
                 expected_revision_id=body.expectedRevisionId,
-                rel_path=selected,
-                actor_kind="manual",
                 actor_id=actor_id,
                 summary=body.summary,
             ),
@@ -724,6 +854,16 @@ async def artifact_revisions(
     return {"revisions": await run_efs(partial(list_revisions, folder, rel_path=path), scope=session.scope)}
 
 
+def _current_revision(folder: Path, metadata: dict, artifact_id: str) -> dict | None:
+    """The revision comments anchor to, or None for an artifact with no
+    editable source."""
+    try:
+        return current_source(folder, metadata, artifact_id).get("revision")
+    except (FileNotFoundError, OSError, ValueError, TimeoutError):
+        # Binary/oversized artifacts still support general review comments.
+        return None
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}/review")
 async def artifact_review_entry(
     project_ref: str,
@@ -742,22 +882,21 @@ async def artifact_review_entry(
     """
     from cowork.services.artifact_identity import artifact_key
 
-    source, folder, metadata, _is_own = await review_artifact_for_request(
-        session.scope, project_ref, artifact_id
+    # The revision is what a reviewer may see, so it is read in the lookup's
+    # own file store call.
+    artifact, current_revision = await review_artifact_and_read(
+        session.scope,
+        project_ref,
+        artifact_id,
+        read=lambda found: _current_revision(found.folder, found.metadata, artifact_id),
     )
     capabilities = await _current_capabilities(
         session,
         await run_db(
-            lambda unit: artifact_capabilities(unit, source, folder.name), scope=session.scope
+            lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
+            scope=session.scope,
         ),
     )
-    current_revision = None
-    try:
-        draft = await run_efs(partial(current_source, folder, metadata, artifact_id), scope=session.scope)
-        current_revision = draft.get("revision")
-    except (FileNotFoundError, OSError, ValueError, TimeoutError):
-        # Binary/oversized artifacts still support general review comments.
-        pass
     return {
         "artifactKey": artifact_key(artifact_id),
         "capabilities": capabilities,
@@ -808,6 +947,20 @@ def _artifact_primary(folder: Path, metadata: dict | None):
     return _pick_primary(folder, _user_files(folder), primary_hint=(metadata or {}).get("primary"))
 
 
+def _access_state(folder: Path, metadata: dict) -> dict:
+    """The access state of the folder's primary file, in one file store hop;
+    404 when the folder has no publishable file."""
+    from cowork.services.artifacts import _published_access_for
+
+    primary = _artifact_primary(folder, metadata)
+    if primary is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no publishable file.",
+        )
+    return _published_access_for(folder, primary)
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}/access")
 async def artifact_access(
     project_ref: str,
@@ -822,18 +975,10 @@ async def artifact_access(
     can: `_owner_workspace` refuses anyone else, so the owner gets back what they
     need to pre-fill the dialog without widening what a card exposes.
     """
-    from cowork.services.artifacts import _published_access_for
-
     _source, folder, metadata, _capabilities = await _owner_workspace(
         session.scope, project_ref, artifact_id
     )
-    primary = await run_efs(partial(_artifact_primary, folder, metadata), scope=session.scope)
-    if primary is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="This artifact has no publishable file.",
-        )
-    return await run_efs(partial(_published_access_for, folder, primary), scope=session.scope)
+    return await run_efs(partial(_access_state, folder, metadata), scope=session.scope)
 
 
 @router.put("/workspace/{project_ref}/{artifact_id}/access")
@@ -945,6 +1090,25 @@ class CommentsAccessResponse(CamelResponse):
     current_revision: dict[str, Any] | None
 
 
+def _open_comments(
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    *,
+    review_scope: TenantScope | None,
+) -> dict | None:
+    """The comments-access file store work, in one hop: when ``review_scope``
+    is set, the marker that opens the draft to that scope's organization for
+    review, granted by its user; then the revision comments anchor to."""
+    from cowork.services.artifact_draft_review import enable_draft_review
+
+    if review_scope is not None:
+        enable_draft_review(
+            folder, org_id=str(review_scope.org_id), enabled_by=str(review_scope.user_id)
+        )
+    return _current_revision(folder, metadata, artifact_id)
+
+
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
 async def enable_artifact_comments(
     project_ref: str,
@@ -968,7 +1132,6 @@ async def enable_artifact_comments(
         ArtifactAccessUnavailable,
         provision_draft_review_access,
     )
-    from cowork.services.artifact_draft_review import enable_draft_review
     from cowork.services.artifact_authorization_identity import ensure_authorization_key
     from cowork.services.artifact_identity import artifact_key
 
@@ -976,6 +1139,7 @@ async def enable_artifact_comments(
         session.scope, project_ref, artifact_id
     )
     capabilities = await _current_capabilities(session, capabilities)
+    review_scope = None
     if session.scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is
         # the caller; resolving it again would only repeat that query.
@@ -997,28 +1161,18 @@ async def enable_artifact_comments(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=str(exc),
             ) from exc
-        # After the auth rule, never before: the marker is what reopens the folder
-        # to co-members on this server, and a rule-less grant would show a draft the
-        # comments service then refuses to talk about.
-        await run_efs(
-            partial(
-                enable_draft_review,
-                folder,
-                org_id=str(session.scope.org_id),
-                enabled_by=str(session.scope.user_id),
-            ),
-            scope=session.scope,
-        )
+        # The review marker is written below, after the auth rule, never before:
+        # the marker is what reopens the folder to co-members on this server, and
+        # a rule-less grant would show a draft the comments service then refuses
+        # to talk about.
+        review_scope = session.scope
         comments_scope = "organization"
     else:
         comments_scope = "owner"
-    current_revision = None
-    try:
-        draft = await run_efs(partial(current_source, folder, metadata, artifact_id), scope=session.scope)
-        current_revision = draft.get("revision")
-    except (FileNotFoundError, OSError, ValueError, TimeoutError):
-        # Binary/oversized artifacts still support general review comments.
-        pass
+    current_revision = await run_efs(
+        partial(_open_comments, folder, metadata, artifact_id, review_scope=review_scope),
+        scope=session.scope,
+    )
     return CommentsAccessResponse(
         # Workspace routes/cards keep the local id. The authenticated comments
         # proxy translates it through the same durable alias used to publish.
@@ -1047,6 +1201,31 @@ async def artifact_revision(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _restore_revision(
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    revision_id: str,
+    *,
+    expected_revision_id: str,
+    actor_id: str | None,
+) -> dict:
+    """A restore's file store work, in one hop: the old revision's content,
+    then its save as the new head."""
+    restored = revision_with_content(folder, revision_id)
+    return save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content=restored["content"],
+        expected_revision_id=expected_revision_id,
+        rel_path=restored["path"],
+        actor_kind="manual",
+        actor_id=actor_id,
+        summary=f"Restored revision {restored['number']}",
+    )
+
+
 @router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
 async def restore_artifact_revision(
     project_ref: str,
@@ -1060,21 +1239,17 @@ async def restore_artifact_revision(
         session.scope, project_ref, artifact_id
     )
     try:
-        restored = await run_efs(partial(revision_with_content, folder, revision_id), scope=session.scope)
         scope = getattr(session, "scope", None)
         actor_id = str(scope.user_id) if scope and scope.user_id else None
         saved = await run_efs(
             partial(
-                save_source,
+                _restore_revision,
                 folder,
                 metadata,
                 artifact_id,
-                content=restored["content"],
+                revision_id,
                 expected_revision_id=body.expectedRevisionId,
-                rel_path=restored["path"],
-                actor_kind="manual",
                 actor_id=actor_id,
-                summary=f"Restored revision {restored['number']}",
             ),
             scope=session.scope,
         )
@@ -1268,9 +1443,9 @@ async def serve_private_draft(
 ):
     """Authenticated draft preview with project/org containment and relative assets.
 
-    Open to a reviewer as well as the owner, but only through
-    `review_artifact_for_request`: a co-member's draft is reachable here solely
-    because its owner granted same-org review on that one artifact.
+    Open to a reviewer as well as the owner, but only through the review
+    lookup (`review_artifact_and_read`): a co-member's draft is reachable here
+    solely because its owner granted same-org review on that one artifact.
 
     ``?download=1`` returns the same bytes as an attachment (ENG-2044). On an
     org deployment this is the ONLY way to obtain a non-HTML artifact: the
@@ -1306,69 +1481,17 @@ async def serve_private_draft(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid artifact identity",
         ) from exc
-    source, folder, metadata, _is_own = await review_artifact_for_request(
-        session.scope, project_selector, artifact_selector
+    # A reviewer may read every file of the draft, so the path checks and the
+    # open run in the lookup's own file store call.
+    _artifact, response = await review_artifact_and_read(
+        session.scope,
+        project_selector,
+        artifact_selector,
+        read=partial(
+            _draft_file_response,
+            rel_path=rel_path,
+            comments=wants_comment_layer(request),
+            download=download or wants_download(request),
+        ),
     )
-    try:
-        parts = artifact_files.relative_file_parts(rel_path)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid artifact path",
-        ) from exc
-    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
-    if str(metadata.get("type") or "").startswith("fullstack-"):
-        try:
-            primary_parts = artifact_files.relative_file_parts(
-                str(metadata.get("primary") or "static/index.html")
-            )
-        except ValueError:
-            primary_parts = ()
-        public_parts = primary_parts[:-1]
-        if not public_parts:
-            # A full-stack artifact needs a distinct public subtree. Serving its
-            # root would let a reviewer guess backend.py or credential-bearing
-            # runtime files. The dedicated runtime can handle legacy root-level
-            # apps; the private source preview must stay fail-closed.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Artifact file not found",
-            )
-        if parts[:len(public_parts)] != public_parts:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Artifact file not found",
-            )
-
-    download = download or wants_download(request)
-    media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
-    try:
-        resources, fd, file_stat = await run_efs(
-            partial(artifact_files.open_pinned_draft_file, source, folder, parts),
-            scope=session.scope,
-        )
-    except artifact_files.ArtifactFileRefused as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artifact file not found",
-        ) from exc
-    try:
-        if not download and media_type == "text/html":
-            resp = await run_efs(
-                partial(_preview_html_from_fd, fd, comments=wants_comment_layer(request)),
-                scope=session.scope,
-            )
-            if resp is not None:
-                resources.close()
-                return resp
-        extra = (
-            {"Content-Disposition": _attachment_disposition(parts[-1])}
-            if download else None
-        )
-        return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
-        )
-    except BaseException:
-        resources.close()
-        raise
+    return response
