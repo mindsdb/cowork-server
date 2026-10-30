@@ -32,7 +32,7 @@ from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.db.units import FilesystemBusy, run_db, run_efs
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
@@ -501,7 +501,7 @@ async def _sync_live_artifact(
             return False
 
         if scope.org_mode:
-            artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
+            artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
             api_key = await key.get()
             if not api_key:
                 logger.warning("Could not synchronize live artifact %s: no publish key", folder)
@@ -942,7 +942,7 @@ async def set_artifact_access(
     publish_abandoned = False
     publish_started = False
     try:
-        artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
+        artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
         api_key = await key.get()
         if not api_key:
             raise HTTPException(

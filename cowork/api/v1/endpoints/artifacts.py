@@ -46,7 +46,7 @@ from cowork.api.v1.artifact_scope import (
     artifact_sources_for_request,
     scoped_project_id_for_request,
 )
-from cowork.db.units import FilesystemBusy, run_db, run_efs
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
@@ -862,7 +862,7 @@ async def delete_artifact_for_request(
 
     admin_delete = await run_db(owner_decision, scope=scope)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
-    publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
+    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
     if _org_mode():
         if not scope or not scope.org_id or not scope.user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
@@ -872,7 +872,8 @@ async def delete_artifact_for_request(
         from cowork.services.artifact_autopublish import _active_workspace_id
 
         api_key = await PublishKey(
-            scope.user_id, scope.org_id, min_ttl_s=120.0, workspace_id=_active_workspace_id(scope)
+            scope.user_id, scope.org_id, min_ttl_s=120.0,
+            workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
         ).get()
         if not api_key:
             raise HTTPException(

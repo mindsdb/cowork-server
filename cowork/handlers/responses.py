@@ -29,7 +29,7 @@ from cowork.common.settings.user_settings import (
     use_turn_settings,
 )
 from cowork.db.units import (
-    busy_retry_seconds, conversation_writes, run_db, run_efs, run_efs_unit, run_to_completion,
+    busy_retry_seconds, conversation_writes, run_db, run_efs, run_efs_unit, run_on_unit_threads, run_to_completion,
 )
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
@@ -2538,7 +2538,9 @@ class ResponsesHandler:
             if isinstance(exc, PoolTimeoutError):
                 # No database connection freed in time. The frame says so with
                 # the wait, as a refused request's 503 does.
-                code, message = friendly_turn_error(exc)
+                # Off the loop: the classification reads settings, and the
+                # pool is full right now.
+                code, message = await run_on_unit_threads(partial(friendly_turn_error, exc))
                 retry_after = busy_retry_seconds()
                 extra: dict = {"retry_after": retry_after, "retry_at": retry_at_instant(retry_after)}
                 logger.warning(
@@ -2833,7 +2835,8 @@ class ResponsesHandler:
             # Resolve the model-403 info once and hand it to friendly_turn_error
             # so it isn't computed twice on this path (reused by the extras below).
             model_info = model_unavailable_info(exc)
-            friendly = friendly_turn_error(exc, model_info=model_info)
+            # Off the loop: the classification reads settings.
+            friendly = await run_on_unit_threads(partial(friendly_turn_error, exc, model_info=model_info))
             if friendly is not None:
                 code, message = friendly
                 logger.info(
@@ -2862,7 +2865,7 @@ class ResponsesHandler:
                 # (no reconnectable flag), so the stream still closes cleanly.
                 try:
                     provider = _auth_failure_provider(
-                        get_user_settings(), getattr(exc, "role", None)
+                        await run_on_unit_threads(get_user_settings), getattr(exc, "role", None)
                     )
                     # An unattributable failure keeps the generic auth copy with
                     # no provider fields, rather than naming a provider that may
@@ -2937,7 +2940,7 @@ class ResponsesHandler:
                 failed_model = overloaded_info[1] if overloaded_info else ""
                 extra = {"model": failed_model}
                 try:
-                    s = get_user_settings()
+                    s = await run_on_unit_threads(get_user_settings)
                     # The nudge keys on WHICH provider overloaded. anton passes the
                     # actual failing model (planning OR coding); map it back to its
                     # provider so a coding-model incident on a DIFFERENT provider
@@ -3143,7 +3146,8 @@ class ResponsesHandler:
             # Minted here rather than up front like the streaming twin: this
             # path has no seal to feed, so a successful turn needs no id.
             corr = str(uuid4())
-            friendly = friendly_turn_error(exc)
+            # Off the loop: the classification reads settings.
+            friendly = await run_on_unit_threads(partial(friendly_turn_error, exc))
             if friendly is not None:
                 code, message = friendly
                 logger.info(

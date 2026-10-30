@@ -79,15 +79,6 @@ class Site(NamedTuple):
 
 #: (path under the repo, function, kind, reason). One entry per site.
 ALLOWLIST: tuple[tuple[str, str, str, str], ...] = (
-    ('cowork/api/v1/endpoints/artifact_workspace.py', 'set_artifact_access', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/api/v1/endpoints/artifact_workspace.py', '_sync_live_artifact', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/api/v1/endpoints/artifacts.py', 'delete_artifact_for_request', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/handlers/responses.py', 'ResponsesHandler._run_turn', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/handlers/responses.py', 'ResponsesHandler._collect', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/harnesses/anton_harness/harness.py', 'AntonHarness._build_turn_session', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/services/artifact_autopublish.py', 'autopublish_project_artifacts', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/services/providers.py', 'ping_provider.<locals>._chat_probe', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
-    ('cowork/turnqueue/producer.py', 'stream_remote_replies', LOOP_POOL_CHECKOUT, "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
     ('cowork/server.py', 'lifespan', LOOP_POOL_CHECKOUT, 'startup work before uvicorn binds the port, when no request waits on the loop'),
     ('cowork/api/v1/endpoints/coding.py', 'inference_proxy', LOOP_POOL_CHECKOUT, 'desktop only (LoopbackDesktopOnly on the router)'),
     ('cowork/api/v1/endpoints/publish.py', 'activate_version_endpoint', LOOP_POOL_CHECKOUT, 'desktop only (DesktopOnly on the publish router)'),
