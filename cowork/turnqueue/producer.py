@@ -14,6 +14,7 @@ import logging
 import time
 import uuid
 from datetime import datetime
+from functools import partial
 
 from pydantic import BaseModel, ConfigDict
 
@@ -558,7 +559,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # a valid minds alias, independent of any harness's built-in default.
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
-        model = get_user_settings(scope).resolved_planning_model
+        from cowork.db.units import run_on_unit_threads
+
+        model = (await run_on_unit_threads(partial(get_user_settings, scope))).resolved_planning_model
 
     # Independent network round trips (llm's turn-key mint, oauth's active-
     # connections list) — run concurrently rather than paying both latencies
@@ -576,7 +579,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             oauth_connections = await oauth_connections_coro
         else:
             from cowork.common.settings.user_settings import get_user_settings
-            workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
+            from cowork.db.units import run_on_unit_threads
+
+            user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+            workspace_id = getattr(user_settings, "hub_workspace_id", "") or None
             if settings.datasource_enabled:
                 (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
                     _mint_llm_block_with_turn_key_id(

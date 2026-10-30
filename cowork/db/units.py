@@ -127,8 +127,10 @@ def _threads() -> anyio.CapacityLimiter:
 
 async def run_on_unit_threads(fn: Callable[[], T]) -> T:
     """Run ``fn`` on the threads units run on, off anyio's default limiter,
-    and finish it even when the caller is cancelled. For a session's own
-    rollback or close, which talk to the database but are no unit."""
+    and finish it even when the caller is cancelled. For database work that
+    is no unit: a session's own rollback or close, or a sync helper that
+    reads settings through a session of its own (get_user_settings), which a
+    coroutine must not run on the event loop."""
     with anyio.CancelScope(shield=True):
         return await anyio.to_thread.run_sync(fn, limiter=_threads())
 
