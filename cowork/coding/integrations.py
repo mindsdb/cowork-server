@@ -115,6 +115,17 @@ class DeveloperIntegrationService:
             return self._read_linear(request, connection, fields)
         return self._read_slack(request, connection, fields)
 
+    def hosted_mcp_token(self, project: CodeProject, connection: ProjectConnection) -> str | None:
+        """The credential for the provider's own hosted MCP server, or None when it cannot reach one."""
+        _, fields = self._connection(project, connection.provider, connection.name)
+        if connection.provider == "linear":
+            return self._secret(fields, "access_token", "api_key", "token")
+        if connection.provider == "github":
+            _, token, host = self._github_credentials(fields)
+            # GitHub hosts its server for github.com only, not Enterprise Server.
+            return token if host == "github.com" else None
+        return None
+
     def search(self, project: CodeProject | None, request: WorkItemSearchRequest) -> WorkItemPage:
         # Discovery is account-scoped: opening the picker must not silently
         # mutate a project. The chosen account is added to the project only
