@@ -153,3 +153,39 @@ def test_the_app_engine_on_postgres_times_out_and_logs_slow_statements(monkeypat
         assert line.duration_ms >= 200
     finally:
         engine.dispose()
+
+
+@pytest.mark.postgres_service
+def test_the_startup_migration_on_the_app_engine_runs_with_both_timeouts_off(monkeypatch):
+    """The server migrates at startup on the app's own engine
+    (cowork.dev_setup.run_dev_setup). That migration waits on the migration
+    lock while another process migrates and holds one transaction throughout,
+    so neither timeout may reach it."""
+    from cowork.db import migrations
+
+    uri = os.environ.get("COWORK_TEST_POSTGRES_URI")
+    if not uri:
+        missing_prerequisite(
+            "set COWORK_TEST_POSTGRES_URI to a disposable database", required_by="COWORK_REQUIRE_SERVICES",
+        )
+    database = session_mod.settings.database
+    monkeypatch.setattr(database, "statement_timeout_ms", 500)
+    monkeypatch.setattr(database, "idle_in_transaction_timeout_ms", 700)
+    seen: list[tuple[str, str]] = []
+
+    def upgrade(config, revision):
+        connection = config.attributes["connection"]
+        seen.append((
+            connection.exec_driver_sql("SHOW statement_timeout").scalar(),
+            connection.exec_driver_sql("SHOW idle_in_transaction_session_timeout").scalar(),
+        ))
+
+    monkeypatch.setattr(migrations.command, "upgrade", upgrade)
+    monkeypatch.setattr(migrations, "_rekey_stray_legacy_attachment_rows", lambda connection: 0)
+    engine = session_mod._create_engine(uri)
+    try:
+        migrations.run_schema_migrations(engine, uri)
+    finally:
+        engine.dispose()
+
+    assert seen == [("0", "0")]

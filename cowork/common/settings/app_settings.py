@@ -403,7 +403,9 @@ class DatabaseSettings(Settings):
         ),
     )  # POOL_TIMEOUT
     # PostgreSQL session settings for the app's own connections, set when each
-    # connection opens. Migrations open their own engine and keep neither.
+    # connection opens. Migrations run with both off: the db-migrate init
+    # container opens its own engine, and the server's startup migration turns
+    # them off for its transaction (cowork.db.migrations.run_schema_migrations).
     # SQLite engines ignore all three.
     statement_timeout_ms: int = Field(
         default=0,
