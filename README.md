@@ -78,7 +78,7 @@ make test/services
 
 On every pull request and every push to `staging`, `.github/workflows/tests-services.yml` runs them against Redis 8.2.3 and PostgreSQL 16.13 service containers with `COWORK_REQUIRE_SERVICES=true`, so a missing service fails the job instead of skipping. The desktop wheel release doesn't wait on that job.
 
-A run that requires every prerequisite (`COWORK_REQUIRE_INTEGRATION=true` or `COWORK_REQUIRE_SERVICES=true`) fails when a test skips, or is left out with `--deselect`, unless `tests/skip_allowlist.yaml` names it with a reason (`tests/skip_guard.py`). Any run that sets either flag lists what it left out at the end of its report and in the GitHub job summary. The allowlist names one test: the remote-worker disconnect check, an operator-run proof described under [Streaming & scheduling](#streaming--scheduling).
+A run that requires every prerequisite (`COWORK_REQUIRE_INTEGRATION=true` or `COWORK_REQUIRE_SERVICES=true`) fails when a test skips, or is left out with `--deselect`, unless `tests/skip_allowlist.yaml` names it with a reason (`tests/skip_guard.py`). Any run that sets either flag lists what it left out at the end of its report and in the GitHub job summary. The allowlist names two tests: the remote-worker disconnect check, an operator-run proof described under [Streaming & scheduling](#streaming--scheduling), and the post-deploy cancel check, which skips when the model ends its turn before the turn can be seen running, so there is nothing to cancel.
 
 Post-deploy integration runs use the target cluster's self-hosted runner. Dev
 and staging obtain the fixed `cowork` test suite through auth's cluster-only
