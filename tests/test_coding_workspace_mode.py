@@ -17,7 +17,7 @@ from cowork.coding.workspace_mode import resolve_workspace_mode, supported_works
     ("runs_locally", "org_mode"),
     [(True, False), (False, False), (True, True), (False, True)],
 )
-def test_every_computer_defaults_to_a_worktree_until_in_place_tasks_exist(runs_locally: bool, org_mode: bool) -> None:
+def test_every_computer_defaults_to_a_worktree(runs_locally: bool, org_mode: bool) -> None:
     assert resolve_workspace_mode(None, None, runs_locally=runs_locally, org_mode=org_mode) == WorkspaceMode.worktree
 
 
@@ -26,11 +26,6 @@ def test_an_explicit_worktree_is_honoured_everywhere() -> None:
         assert resolve_workspace_mode(
             WorkspaceMode.worktree, WorkspaceMode.in_place, runs_locally=runs_locally, org_mode=org_mode,
         ) == WorkspaceMode.worktree
-
-
-def test_an_in_place_request_is_refused_on_this_computer_until_it_is_supported() -> None:
-    with pytest.raises(ValueError, match="original folder is not available yet"):
-        resolve_workspace_mode(WorkspaceMode.in_place, None, runs_locally=True, org_mode=False)
 
 
 @pytest.mark.parametrize(("runs_locally", "org_mode"), [(False, False), (True, True)])
@@ -68,11 +63,14 @@ def test_a_new_folder_task_records_its_resolved_mode(tmp_path: Path) -> None:
     assert prepared.workspace_kind == WorkspaceKind.git_worktree
 
 
-def test_an_in_place_task_is_refused_before_anything_is_prepared(tmp_path: Path) -> None:
+def test_an_unsupported_in_place_task_is_refused_before_anything_is_prepared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
 
-    with pytest.raises(ValueError, match="not available yet"):
+    with pytest.raises(ValueError, match="not available on this platform"):
         service.create_session(
             SessionCreateRequest(path=str(repo), prompt="Build it", workspace_mode=WorkspaceMode.in_place),
             CREDS,
