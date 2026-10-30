@@ -633,7 +633,9 @@ def test_turn_terminal_reason_none_without_handle(monkeypatch):
     assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
 
 
-def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
+def _execute_with_terminal(
+    monkeypatch, reason, *, is_manual=False, turn=None, title="terminal mapping test"
+):
     """Run execute_schedule with a no-op turn and a forced terminal reason;
     return the resulting run/schedule state as plain values. ``turn``, when
     given, is awaited inside the turn's stream in place of the no-op."""
@@ -668,7 +670,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
 
     session = get_open_session()
     schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
-        title="terminal mapping test",
+        title=title,
         prompt="do the thing",
         cadence="daily",
         next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
@@ -760,10 +762,36 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
     async def _hangs():
         await asyncio.sleep(5)
 
+    cancelled = []
+
+    async def _cancel(conversation_id):
+        cancelled.append(conversation_id)
+        return True
+
+    monkeypatch.setattr(scheduler_mod.registry, "cancel", _cancel)
+
     state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
     assert state["run_status"] == RunStatus.failed
     assert "max duration" in state["last_error"]
     assert state["next_advanced"] is True
+    # The turn runs detached from the drain the timeout cancels, so it is
+    # stopped explicitly or it goes on writing after the run is failed.
+    assert cancelled == [str(state["run_conversation_id"])]
+
+
+def test_execute_schedule_with_a_title_longer_than_a_topic_runs(monkeypatch):
+    from cowork.db.session import get_open_session
+    from cowork.services.conversations import ConversationService
+
+    state = _execute_with_terminal(monkeypatch, "completed", title="t" * 300)
+    assert state["run_status"] == RunStatus.success
+    assert state["last_error"] is None
+    session = get_open_session()
+    conversation = ConversationService(ScopedSession(session, SYSTEM_SCOPE)).get_conversation(
+        state["run_conversation_id"]
+    )
+    session.close()
+    assert conversation.topic == "t" * 255
 
 
 def test_manual_run_that_raises_leaves_the_cron_slot(monkeypatch):

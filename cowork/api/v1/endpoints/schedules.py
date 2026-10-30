@@ -107,11 +107,11 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    from cowork.scheduler import execute_schedule
+    from cowork.scheduler import execute_schedule, schedule_conversation_topic
     from cowork.services.conversations import ConversationService
 
     conversation = ConversationService(scoped).create_conversation(
-        topic=schedule.title,
+        topic=schedule_conversation_topic(schedule.title),
         project_id=schedule.project_id,
     )
     # FastAPI closes this session only after the background run ends, which
