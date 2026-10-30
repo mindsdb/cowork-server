@@ -98,6 +98,8 @@ from cowork.handlers.turn_errors import (
     SERVER_BUSY_CODE,
     STALLED_CODE,
     STALLED_TURN_MESSAGE,
+    TURN_LOST_CODE,
+    TURN_LOST_MESSAGE,
     auth_error_detail,
     friendly_turn_error,
     gate_reset_at,
@@ -2480,7 +2482,8 @@ class ResponsesHandler:
             if interrupted or lifecycle.stalled:
                 # Same split as _run_turn's branch; see there.
                 message, code = (
-                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    (TURN_LOST_MESSAGE, TURN_LOST_CODE) if lifecycle.shutting_down
+                    else (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
                     else (STALLED_TURN_MESSAGE, STALLED_CODE)
                 )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
@@ -2770,7 +2773,8 @@ class ResponsesHandler:
             interrupted = lifecycle.shutting_down or lifecycle.timed_out
             if interrupted or lifecycle.stalled:
                 message, code = (
-                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    (TURN_LOST_MESSAGE, TURN_LOST_CODE) if lifecycle.shutting_down
+                    else (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
                     else (STALLED_TURN_MESSAGE, STALLED_CODE)
                 )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
