@@ -372,7 +372,10 @@ def _directory_version(base: PinnedDir) -> DirectoryClock:
     return (value.st_dev, value.st_ino, value.st_mtime_ns, value.st_ctime_ns)
 
 
-_IDENTITY_INDEX_LIMIT = 256
+# One entry per artifacts root. A hosted replica serves every project of every
+# organization on it, and each legacy conversation root is a root of its own,
+# so a cap near the number of projects evicted entries before their next use.
+_IDENTITY_INDEX_LIMIT = 4096
 _identity_indexes: OrderedDict[
     tuple[str, DirectoryClock], dict[str, tuple[str, ...]]
 ] = OrderedDict()

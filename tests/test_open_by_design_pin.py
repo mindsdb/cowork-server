@@ -41,8 +41,8 @@ from cowork.server import create_app
 #: that middleware were removed, it does not belong here.
 OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/health/", ("GET",)): (
-        "the pre-auth readiness probe every client and the kubelet polls before "
-        "anything can authenticate"
+        "the pre-auth status probe every client polls before anything can "
+        "authenticate"
     ),
     ("/api/v1/health/live", ("GET",)): (
         "the kubelet's liveness probe, which has no identity headers to send "
@@ -54,6 +54,10 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
     ),
     ("/api/v1/connectors/specs/match", ("POST",)): (
         "a stateless token match against the same static registry"
+    ),
+    ("/api/v1/health/ready", ("GET",)): (
+        "the kubelet's readiness probe, which has no identity headers to send "
+        "either; refusing it pulls every pod out of the service"
     ),
     ("/api/v1/connectors/oauth/{service}/callback", ("GET",)): (
         "the OAuth provider's own redirect target; the browser arrives with "
@@ -181,9 +185,11 @@ def test_the_open_set_is_small_enough_to_read(open_routes):
 
     mindshub_services pins its own route count for the same reason. The bound
     is deliberately loose — it is a tripwire for a bulk reclassification, not
-    a budget to spend down.
+    a budget to spend down. 23 since the kubelet's readiness probe got its
+    own route, /api/v1/health/ready, which reads nothing a slow dependency
+    could make it fail on.
     """
-    assert len(open_routes) <= 22, (
+    assert len(open_routes) <= 23, (
         f"{len(open_routes)} routes now answer with no credential. If that is "
         "right, raise the bound in the same commit that explains why."
     )

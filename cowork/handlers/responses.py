@@ -28,7 +28,7 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
     use_turn_settings,
 )
-from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
+from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_efs, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
 from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
@@ -1587,8 +1587,8 @@ class ResponsesHandler:
         mount, so cowork-server reads the same directory the worker just wrote —
         this is the whole reason the in-process flow transplants onto the remote
         path unchanged. `conversation` comes back attached to `session` because
-        a channel turn's `index_turn_artifacts` recovers the tenant scope from
-        the session the row is bound to; the ids, the project name and (on the
+        a channel turn recovers the tenant scope from the session the row is
+        bound to (`_recover_turn_scope`); the ids, the project name and (on the
         remote producer, _read_remote_turn_inputs) the creator are read here,
         while it is unambiguously attached, rather than after the turn.
 
@@ -1971,63 +1971,71 @@ class ResponsesHandler:
                 return None
             turn_artifacts.recorded = True
             directory = turn_artifacts.directory
-            try:
-                changes = turn_artifact_changes(
-                    conversation_id=conv_id,
-                    artifacts_base=directory.base,
-                    before=turn_artifacts.before_slugs,
-                    before_mtimes=turn_artifacts.before_mtimes,
-                    # ENG-2961: the project base is shared, so only folders
-                    # whose provenance names this conversation are its own.
-                    attribute_by_provenance=True,
-                    completed_cleanly=completed_cleanly,
-                )
-            except Exception:
-                logger.warning(
-                    "[responses] could not diff the artifacts of remote turn %s", conv_id,
-                    exc_info=True, extra={"request_id": corr},
-                )
-                return None
-            if changes.created:
 
-                async def record() -> None:
-                    try:
-                        await run_db(
-                            partial(
-                                record_new_artifacts,
-                                conversation_id=conv_id,
-                                project_id=UUID(directory.project_id) if directory.project_id else None,
-                                slugs=changes.created,
-                                creator=directory.creator,
-                            ),
-                            scope=scope,
-                        )
-                    except Exception:
-                        # record_new_artifacts logs each slug whose index or
-                        # owner write fails itself; this covers the unit's own
-                        # refusal (a busy pool) or a failed commit. In org mode
-                        # nothing records these folders later:
-                        # reconcile_conversation skips org roots and the owner
-                        # backfill runs once, at startup, so they keep no
-                        # index row and their owner stays unknown.
-                        logger.error(
-                            "[responses] could not record the artifacts a remote turn created",
-                            exc_info=True,
-                            extra=log_context(
-                                request_id=corr,
-                                project_id=directory.project_id,
-                                conversation_id=conv_id,
-                                artifact_slugs=changes.created,
-                            ),
-                        )
+            async def record() -> ArtifactChanges | None:
+                try:
+                    # Waits for a file store slot rather than failing: in org
+                    # mode nothing reconciles a turn whose diff was refused.
+                    changes = await run_efs(
+                        partial(
+                            turn_artifact_changes,
+                            conversation_id=conv_id,
+                            artifacts_base=directory.base,
+                            before=turn_artifacts.before_slugs,
+                            before_mtimes=turn_artifacts.before_mtimes,
+                            # ENG-2961: the project base is shared, so only folders
+                            # whose provenance names this conversation are its own.
+                            attribute_by_provenance=True,
+                            completed_cleanly=completed_cleanly,
+                        ),
+                        scope=scope,
+                        deadline=False,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[responses] could not diff the artifacts of remote turn %s", conv_id,
+                        exc_info=True, extra={"request_id": corr},
+                    )
+                    return None
+                if not changes.created:
+                    return changes
+                try:
+                    await run_db(
+                        partial(
+                            record_new_artifacts,
+                            conversation_id=conv_id,
+                            project_id=UUID(directory.project_id) if directory.project_id else None,
+                            slugs=changes.created,
+                            creator=directory.creator,
+                        ),
+                        scope=scope,
+                    )
+                except Exception:
+                    # record_new_artifacts logs each slug whose index or
+                    # owner write fails itself; this covers the unit's own
+                    # refusal (a busy pool) or a failed commit. In org mode
+                    # nothing records these folders later:
+                    # reconcile_conversation skips org roots and the owner
+                    # backfill runs once, at startup, so they keep no
+                    # index row and their owner stays unknown.
+                    logger.error(
+                        "[responses] could not record the artifacts a remote turn created",
+                        exc_info=True,
+                        extra=log_context(
+                            request_id=corr,
+                            project_id=directory.project_id,
+                            conversation_id=conv_id,
+                            artifact_slugs=changes.created,
+                        ),
+                    )
+                return changes
 
-                # The turn is marked recorded before this unit, so its cancel
-                # branches never record again. A Stop that lands while the
-                # unit waits for a slot or a connection waits for the unit and
-                # its error log, so a refusal still names the slugs it left
-                # unrecorded.
-                await run_to_completion(record())
-            return changes
+            # The turn is marked recorded before the diff, so its cancel
+            # branches never record again. A Stop that lands while the diff
+            # or the record waits for a slot, or while either runs, waits for
+            # both and the record's error log, so the rows are written once
+            # and a refusal still names the slugs it left unrecorded.
+            return await run_to_completion(record())
 
         async def persist(*, clean: bool) -> _SavedAnswer:
             """Save the answer as it stands, once per turn, in one unit.
@@ -2098,9 +2106,15 @@ class ResponsesHandler:
             and the terminal record. The cancel and error branches below run it
             under run_to_completion, so a second Stop or a shutdown that lands
             during a save waits for it, and the stream still ends the way this
-            turn did."""
-            await record_artifacts(completed_cleanly=False)
-            saved = await persist(clean=False)
+            turn did.
+
+            The answer is saved even when the record is cut: the event loop's
+            close at the end of a shutdown cancels a record still waiting for
+            a file store slot, and the answer does not depend on it."""
+            try:
+                await record_artifacts(completed_cleanly=False)
+            finally:
+                saved = await persist(clean=False)
             if lifecycle.discarded:
                 # Deleted while it saved: see finish().
                 return
@@ -2157,7 +2171,9 @@ class ResponsesHandler:
                 # in the caller is what makes it a genuine "before":
                 # stream_remote_replies below only enqueues the job once this
                 # generator is first iterated.
-                before_slugs, before_mtimes = snapshot_artifact_state(seed.artifacts.base)
+                before_slugs, before_mtimes = await run_efs(
+                    partial(snapshot_artifact_state, seed.artifacts.base), scope=scope, deadline=False
+                )
                 turn_artifacts = _RemoteTurnArtifacts(
                     directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
                 )

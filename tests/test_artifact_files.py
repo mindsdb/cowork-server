@@ -27,6 +27,8 @@ from cowork.services.artifact_files import (
     read_artifact_file_entry,
 )
 from cowork.services.artifacts import ProjectArtifacts
+from _async_stub import reviewed_and_read
+from cowork.db.scoped import LOCAL_SCOPE
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_files"
 
@@ -709,15 +711,15 @@ def _draft_artifact(*, tmp_path) -> tuple[ProjectArtifacts, Path]:
 async def _serve_draft(*, monkeypatch, source, folder, rel_path):
     monkeypatch.setattr(
         workspace_ep,
-        "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "html-app"}, True),
+        "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
     )
     return await workspace_ep.serve_private_draft(
         "local",
         "0123456789abcdef0123456789abcdef",
         rel_path,
         SimpleNamespace(query_params={}),
-        SimpleNamespace(),
+        SimpleNamespace(scope=LOCAL_SCOPE),
         download=False,
     )
 

@@ -96,6 +96,21 @@ Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
 for the two selector checks to run alongside it, since getting either one wrong
 drops every real request without failing the release.
 
+## Probes
+
+The kubelet probes two routes, and neither reads the database, the file store or settings. A probe that can fail for an outside reason turns that outage into a pod restart, or into every replica leaving the service at once.
+
+| Probe | Path | Timing | Effect of failing |
+| -- | -- | -- | -- |
+| Readiness | `/api/v1/health/ready` | every 5 s, 3 failures | The pod leaves the Service's endpoints until it answers again |
+| Liveness | `/api/v1/health/live` | starts after 180 s, every 10 s, 6 failures | The kubelet restarts the container |
+
+Both answer as soon as the event loop does. A request that needs a busy database or a stuck file store is refused on its own, with `503` and `Retry-After`, so the probes stay green while it waits.
+
+The liveness delay covers the boot. The lifespan runs file store and database work before uvicorn binds the port, and the subchart renders no `startupProbe`. On 28 Oct 2026 staging pods booting under load served their first request about 120 s after start, the moment the old 60 s delay plus 60 s of failures killed them. With 180 s, a boot of up to about 230 s survives: the kubelet's first probe lands between 180 and 190 s after start, and the sixth failure 50 s after that, between 230 and 240 s. A process that hangs after it has started is still restarted after 60 s. Each boot logs `startup_finished` with its length, counted from the start of the container's server process, and each lifespan step's. That length is the number to compare when the delay is changed. A step still running 10 s after it starts logs `startup_step_running` then, once, and a step that took 10 s or more logs `startup_step_slow` as it ends. So a boot killed before `startup_finished` still names each step that ran for 10 s, including the step it was killed in if that step had run that long.
+
+The `deployment` subchart is pinned to one version in `requirements.yaml`, because these probes are its templates. `tests/test_chart_values.py` pins both paths, the delay and the subchart version.
+
 ## Browser organization boundary
 
 Every environment refuses a browser request whose tab names a different
