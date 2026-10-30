@@ -17,7 +17,11 @@ from typing import Literal
 TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
 # Force isolation (assignment, not setdefault, never touch a real DB).
 os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
-os.environ["MASTER_KEY_PATH"] = str(TMP / "master.key")
+# Outside COWORK_HOME: the blocking guard (tests/_blocking_guard.py) counts
+# file work under COWORK_HOME, and the key's first read would be blamed on
+# whichever test decrypts first after get_fernet's cache clears. Hosted pods
+# take the key from COWORK_MASTER_KEY and read no file.
+os.environ["MASTER_KEY_PATH"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-key-")) / "master.key")
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 # Org mode roots every filesystem store at cowork_home() (see
@@ -459,3 +463,66 @@ def owned_logger(monkeypatch, caplog, tmp_path):
         logger.setLevel(level)
     for handler in handlers:
         handler.close()
+
+
+# ── Blocking work where it stops other requests (tests/_blocking_guard.py) ──
+
+_GUARD_REACHED: set = set()
+_GUARD_RUN = {"deselected": False, "files": frozenset()}
+
+
+@pytest.fixture(autouse=True)
+def blocking_work_guard():
+    """Fail a test that reaches a blocking site the guard's allowlist lacks."""
+    import _blocking_guard
+
+    with _blocking_guard.watching() as found:
+        yield
+    _GUARD_REACHED.update(found)
+    unlisted = sorted(found - _blocking_guard.allowed_sites())
+    if unlisted:
+        lines = "\n".join(f"  ({site.path!r}, {site.function!r}, {site.kind!r})" for site in unlisted)
+        pytest.fail(
+            "blocking work where it stops other requests, not on "
+            f"tests/_blocking_guard.py's ALLOWLIST:\n{lines}",
+            pytrace=False,
+        )
+
+
+def pytest_deselected(items):
+    _GUARD_RUN["deselected"] = True
+
+
+def pytest_collection_finish(session):
+    _GUARD_RUN["files"] = frozenset(Path(item.path) for item in session.items)
+
+
+def _a_full_unit_run(session) -> bool:
+    """Every unit test file collected, nothing deselected or filtered, and the
+    run not stopped early: only then is an allowlist entry no test reached
+    stale rather than unreached."""
+    option = session.config.option
+    if _GUARD_RUN["deselected"] or option.keyword or option.markexpr:
+        return False
+    if session.shouldstop or session.shouldfail:
+        return False
+    tests_dir = Path(__file__).parent
+    every_file = {
+        path for path in tests_dir.rglob("test_*.py") if "integration" not in path.relative_to(tests_dir).parts
+    }
+    return every_file <= _GUARD_RUN["files"]
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if exitstatus not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED) or not _a_full_unit_run(session):
+        return
+    import _blocking_guard
+
+    stale = sorted(_blocking_guard.allowed_sites() - _GUARD_REACHED)
+    if not stale:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    reporter.write_line("tests/_blocking_guard.py's ALLOWLIST names sites no test reached:", red=True)
+    for site in stale:
+        reporter.write_line(f"  ({site.path!r}, {site.function!r}, {site.kind!r})", red=True)
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
