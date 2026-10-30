@@ -7,6 +7,7 @@ job summary are the ones CI sees.
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
@@ -162,6 +163,38 @@ def test_every_allowlist_entry_names_a_test_that_exists():
         source = (ROOT / path).read_text(encoding="utf-8")
         assert f"def {name.split('[')[0]}(" in source, entry.test
         assert entry.reason.strip(), entry.test
+
+
+def _integration_tests_that_skip_themselves() -> list[str]:
+    """Test ids under tests/integration whose own body calls ``pytest.skip``.
+
+    Every post-deploy run requires every prerequisite, so each of these fails
+    it unless the allowlist names it. A missing prerequisite goes through
+    ``missing_prerequisite`` instead, which fails a required run on purpose.
+    """
+    found = []
+    for path in sorted((ROOT / "tests" / "integration").glob("test_*.py")):
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.name.startswith("test_"):
+                continue
+            if any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "skip"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "pytest"
+                for call in ast.walk(node)
+            ):
+                found.append(f"{path.relative_to(ROOT).as_posix()}::{node.name}")
+    return found
+
+
+def test_every_integration_test_that_skips_itself_is_on_the_allowlist():
+    allowlist = load_allowlist(ALLOWLIST)
+    skipping = _integration_tests_that_skip_themselves()
+
+    assert "tests/integration/test_post_deploy.py::test_cancel_ends_the_turn" in skipping
+    assert [test for test in skipping if not is_allowed(test, allowlist)] == []
 
 
 def test_two_replicas_fails_without_redis_where_the_services_job_promised_one(tmp_path):

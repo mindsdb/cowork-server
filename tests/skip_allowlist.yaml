@@ -8,3 +8,9 @@
     Operator-run proof. It execs into live worker pods in the scratchpad
     namespace every environment shares, and the CI runner has no pods/exec by
     design. README.md's "Streaming & scheduling" section gives the command.
+
+- test: tests/integration/test_post_deploy.py::test_cancel_ends_the_turn
+  reason: >-
+    Premise check. When the model ends the turn before it can be seen running,
+    there is nothing to cancel, so the run proves nothing for this test. That
+    is a fact about the deployment's speed, not a defect.

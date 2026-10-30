@@ -358,10 +358,23 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
-# Message for a turn cut off by boot recovery or shutdown, not by the model,
-# provider, or user Stop. Paired with GENERIC_TURN_ERROR_CODE, not a code of
-# its own — same as TurnInterrupted below.
+# Message for a turn the watchdog ended after it made no progress
+# (TurnLifecycle.timed_out), not the model, provider, or user Stop. Paired
+# with GENERIC_TURN_ERROR_CODE, not a code of its own — same as
+# TurnInterrupted below.
 INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
+
+# The server stopped while the turn ran: a shutdown, or a crash that boot
+# recovery finds afterwards. A code of its own because the next step differs
+# from anton_error: nothing about the request or the agent failed, the answer
+# streamed so far is kept, and sending the question again works once the
+# server is back. A proxy that outlives the server can send the same frame to
+# a client whose stream the crash cut.
+TURN_LOST_CODE = "turn_lost"
+TURN_LOST_MESSAGE = (
+    "The server stopped before this answer finished. The answer ends where it "
+    "was cut off. Please send your question again."
+)
 
 # anton ended a model call that sent no output within its deadline. Its own
 # message names the deadline, so it passes through; this is the fallback for
