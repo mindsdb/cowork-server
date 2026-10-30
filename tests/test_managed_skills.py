@@ -90,7 +90,7 @@ def scoped(stores):
 
 
 def _listed(scoped, scope) -> dict[str, dict]:
-    return {skill["id"]: skill for skill in skills_ep.list_skills(scoped(scope), None)["skills"]}
+    return {skill["id"]: skill for skill in skills_ep._list_skills(scoped(scope), None)["skills"]}
 
 
 def _refusal(call) -> HTTPException:
@@ -126,7 +126,7 @@ def test_a_managed_skill_wins_over_a_same_named_own_skill(managed_skill, scoped,
     assert listed[MANAGED]["declarative"].strip() == MANAGED_BODY
     assert listed[MANAGED]["isBuiltin"] is True
 
-    read = skills_ep.get_skill(MANAGED, scoped(ALICE), None)
+    read = skills_ep._get_skill(MANAGED, scoped(ALICE), None)
     assert read["declarative"].strip() == MANAGED_BODY
     assert read["capabilities"]["canEdit"] is False
 
@@ -150,17 +150,17 @@ def test_every_change_to_a_managed_slug_is_refused(managed_skill, scoped, own_co
         _write_skill(service.root, MANAGED, "My own version.")
     scope = scoped(ALICE)
 
-    _refusal(lambda: skills_ep.create_skill(SkillCreateRequest(label=MANAGED, instructions="x"), scope, None))
+    _refusal(lambda: skills_ep._create_skill(SkillCreateRequest(label=MANAGED, instructions="x"), scope, None))
     upload = f"---\nname: {MANAGED}\ndescription: mine\n---\nMine.\n".encode()
     _refusal(lambda: skills_ep._upload_skill_bytes(upload, "SKILL.md", scope, None))
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as packed:
         packed.writestr(f"{MANAGED}/SKILL.md", upload.decode())
     _refusal(lambda: skills_ep._upload_skill_bytes(archive.getvalue(), "skill.zip", scope, None))
-    _refusal(lambda: skills_ep.update_skill("my-notes", SkillUpdateRequest(label=MANAGED), scope, None))
-    _refusal(lambda: skills_ep.update_skill(MANAGED, SkillUpdateRequest(instructions="x"), scope, None))
-    _refusal(lambda: skills_ep.update_skill(MANAGED, SkillUpdateRequest(enabled=False), scope, None))
-    _refusal(lambda: skills_ep.delete_skill(MANAGED, scope, None))
+    _refusal(lambda: skills_ep._update_skill("my-notes", SkillUpdateRequest(label=MANAGED), scope, None))
+    _refusal(lambda: skills_ep._update_skill(MANAGED, SkillUpdateRequest(instructions="x"), scope, None))
+    _refusal(lambda: skills_ep._update_skill(MANAGED, SkillUpdateRequest(enabled=False), scope, None))
+    _refusal(lambda: skills_ep._delete_skill(MANAGED, scope, None))
 
     # Nothing changed: the managed skill, the person's own skills.
     assert (managed_skill.skills_dir / MANAGED / "SKILL.md").read_text().strip().endswith(MANAGED_BODY)
@@ -197,7 +197,7 @@ def test_an_unreadable_managed_skill_is_unlisted_but_keeps_its_name(managed_skil
 
     assert MANAGED in listed
     assert LOCKED not in listed
-    _refusal(lambda: skills_ep.create_skill(SkillCreateRequest(label=LOCKED, instructions="x"), scoped(ALICE), None))
+    _refusal(lambda: skills_ep._create_skill(SkillCreateRequest(label=LOCKED, instructions="x"), scoped(ALICE), None))
     assert not (SkillService(ALICE).root / LOCKED).exists()
 
 
@@ -235,9 +235,9 @@ def test_the_service_refuses_too_in_every_scope(managed_dir, stores):
 
 def test_the_persons_own_skills_stay_editable(managed_skill, scoped):
     SkillService(ALICE).create_skill("my-notes", "Mine.")
-    edited = skills_ep.update_skill("my-notes", SkillUpdateRequest(instructions="Changed."), scoped(ALICE), None)
+    edited = skills_ep._update_skill("my-notes", SkillUpdateRequest(instructions="Changed."), scoped(ALICE), None)
     assert edited["declarative"] == "Changed."
-    skills_ep.delete_skill("my-notes", scoped(ALICE), None)
+    skills_ep._delete_skill("my-notes", scoped(ALICE), None)
     assert "my-notes" not in _listed(scoped, ALICE)
 
 

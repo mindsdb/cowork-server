@@ -125,6 +125,14 @@ def _threads() -> anyio.CapacityLimiter:
     return limiter
 
 
+async def run_on_unit_threads(fn: Callable[[], T]) -> T:
+    """Run ``fn`` on the threads units run on, off anyio's default limiter,
+    and finish it even when the caller is cancelled. For a session's own
+    rollback or close, which talk to the database but are no unit."""
+    with anyio.CancelScope(shield=True):
+        return await anyio.to_thread.run_sync(fn, limiter=_threads())
+
+
 @contextmanager
 def unit_session(*, scope: TenantScope) -> Iterator[ScopedSession]:
     """A tenant-scoped session that holds one pooled connection throughout.
@@ -408,6 +416,26 @@ async def run_efs(fn: Callable[[], T], *, scope: TenantScope, deadline: bool = T
             work.cancel()
         await _drain(work)
         raise
+
+
+async def run_efs_unit(
+    fn: Callable[[ScopedSession], T], *, scope: TenantScope, deadline: bool = True
+) -> T:
+    """Run ``fn``, a database unit that also works on the shared file store,
+    on the file store's threads (``run_efs``), with a ``unit_session``.
+
+    For work whose database and file store steps are not split yet, such as a
+    route that creates a project's row and its folder together. It holds its
+    connection while the file store answers, as a sync route did, but it takes
+    none of anyio's default threads and never runs on the event loop. A full
+    pool refuses it with ``DatabaseBusy``, as ``unit_session`` does.
+    """
+
+    def unit() -> T:
+        with unit_session(scope=scope) as session:
+            return fn(session)
+
+    return await run_efs(unit, scope=scope, deadline=deadline)
 
 
 def loop_limiters() -> dict[str, anyio.CapacityLimiter]:

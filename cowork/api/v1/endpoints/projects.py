@@ -1,12 +1,14 @@
 import ipaddress
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
+from cowork.db.units import run_db, run_efs_unit
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import PROJECT_SLOTS, ProjectMemoryStore
 from cowork.models.project import Project
@@ -41,12 +43,14 @@ from cowork.services.skills import SkillService
 from cowork.services.shared_projects import SharedProjectFiles
 
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# AuthenticatedInOrgMode, declared explicitly: a ScopedSession already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
 # whenever org mode has no org in scope. Declaring it too makes the
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 def _project_memory_slot_has_content(
@@ -242,9 +246,19 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
 
 
 @router.get("/", response_model=list[ProjectResponse])
-def list_projects(
-    session: ScopedSessionDep,
+async def list_projects(
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    # A database unit, not a file store one: the listing is rows plus one
+    # check of the general project's folder, and file store slots held by
+    # stuck artifact lookups must not refuse it.
+    return await run_db(lambda session: _list_projects(session, principal), scope=scope)
+
+
+def _list_projects(
+    session: ScopedSession,
+    principal: Principal | None,
 ):
     service = ProjectService(session)
     # Bootstrap site: adopt the seeded GENERAL project into this org before
@@ -306,10 +320,18 @@ def require_local_for_chosen_folder(
     response_model=ProjectResponse,
     dependencies=[Depends(require_local_for_chosen_folder)],
 )
-def create_project(
+async def create_project(
     body: ProjectCreateRequest,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _create_project(body, session, principal), scope=scope)
+
+
+def _create_project(
+    body: ProjectCreateRequest,
+    session: ScopedSession,
+    principal: Principal | None,
 ):
     access = SharedResourceAccess(session, principal)
     access.require_actor()
@@ -376,11 +398,20 @@ def create_project(
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
-def update_project(
+async def update_project(
     project_id: UUID,
     body: ProjectUpdateRequest,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _update_project(project_id, body, session, principal), scope=scope)
+
+
+def _update_project(
+    project_id: UUID,
+    body: ProjectUpdateRequest,
+    session: ScopedSession,
+    principal: Principal | None,
 ):
     service = ProjectService(session)
     access = SharedResourceAccess(session, principal)
@@ -619,10 +650,18 @@ def update_project(
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_project(
+async def delete_project(
     project_id: UUID,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _delete_project(project_id, session, principal), scope=scope)
+
+
+def _delete_project(
+    project_id: UUID,
+    session: ScopedSession,
+    principal: Principal | None,
 ):
     service = ProjectService(session)
     access = SharedResourceAccess(session, principal)

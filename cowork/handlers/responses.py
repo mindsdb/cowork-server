@@ -28,7 +28,9 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
     use_turn_settings,
 )
-from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_efs, run_to_completion
+from cowork.db.units import (
+    busy_retry_seconds, conversation_writes, run_db, run_efs, run_efs_unit, run_to_completion,
+)
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
 from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
@@ -639,6 +641,21 @@ def _start_first_take(
         reset_trace_context(token)
 
 
+def _carries_attachments(request: ResponsesRequest) -> bool:
+    """Whether the turn names an uploaded file, which its start reads from the
+    file store."""
+    if request.attachment_ids:
+        return True
+    if not isinstance(request.input, list):
+        return False
+    return any(
+        isinstance(item, Content) and item.type == ContentType.file and item.file_id
+        for message in request.input
+        if isinstance(message.content, list)
+        for item in message.content
+    )
+
+
 class ResponsesHandler:
     def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
         self.principal = principal
@@ -697,8 +714,11 @@ class ResponsesHandler:
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
-        # call, and a wait for one never stalls the event loop.
-        start = await run_db(
+        # call, and a wait for one never stalls the event loop. Attachments are
+        # read from the file store, so a turn that carries them waits for a
+        # file store slot.
+        read_unit = run_efs_unit if _carries_attachments(request) else run_db
+        start = await read_unit(
             partial(self._read_turn_start, request=request, has_disabled_connections=bool(disabled)),
             scope=self.scope,
         )

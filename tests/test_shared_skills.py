@@ -192,11 +192,11 @@ def _stored(scope: TenantScope, slug: str) -> dict[str, str]:
 
 
 def _listed(scoped, scope: TenantScope) -> dict[str, dict]:
-    return {skill["id"]: skill for skill in skills_ep.list_skills(scoped(scope), None)["skills"]}
+    return {skill["id"]: skill for skill in skills_ep._list_skills(scoped(scope), None)["skills"]}
 
 
 def _set_sharing(scoped, scope: TenantScope, principal: Principal, slug: str, *, shared: bool) -> dict:
-    return skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), scoped(scope), principal)
+    return skills_ep._set_skill_sharing(slug, SkillSharingRequest(shared=shared), scoped(scope), principal)
 
 
 def _answers(call, status: int, detail: str) -> None:
@@ -237,14 +237,14 @@ def _every_change_is_refused(scoped, scope: TenantScope, slug: str) -> None:
     session = scoped(scope)
     service = SkillService(scope)
     service.create_skill("own-notes", "Mine.")
-    _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(instructions="x"), session, None))
-    _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(enabled=False), session, None))
-    _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(label="taken-over"), session, None))
-    _create_refused(lambda: skills_ep.update_skill("own-notes", SkillUpdateRequest(label=slug), session, None), slug)
-    _create_refused(lambda: skills_ep.create_skill(SkillCreateRequest(label=slug, instructions="x"), session, None), slug)
+    _refused(lambda: skills_ep._update_skill(slug, SkillUpdateRequest(instructions="x"), session, None))
+    _refused(lambda: skills_ep._update_skill(slug, SkillUpdateRequest(enabled=False), session, None))
+    _refused(lambda: skills_ep._update_skill(slug, SkillUpdateRequest(label="taken-over"), session, None))
+    _create_refused(lambda: skills_ep._update_skill("own-notes", SkillUpdateRequest(label=slug), session, None), slug)
+    _create_refused(lambda: skills_ep._create_skill(SkillCreateRequest(label=slug, instructions="x"), session, None), slug)
     _create_refused(lambda: skills_ep._upload_skill_bytes(_skill_md(slug, "x").encode(), "SKILL.md", session, None), slug)
     _create_refused(lambda: skills_ep._upload_skill_bytes(_zip(slug, "x"), "skill.zip", session, None), slug)
-    _refused(lambda: skills_ep.delete_skill(slug, session, None))
+    _refused(lambda: skills_ep._delete_skill(slug, session, None))
     with pytest.raises(SkillImmutableError, match="shared with you"):
         service.update_skill(slug, instructions="x")
     with pytest.raises(SkillImmutableError, match="shared with you"):
@@ -258,7 +258,7 @@ def _every_change_is_refused(scoped, scope: TenantScope, slug: str) -> None:
 
 
 def test_a_create_stamps_the_person(trusted, scoped):
-    created = skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), scoped(ALICE), None)
+    created = skills_ep._create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), scoped(ALICE), None)
 
     assert created["id"] == "my-notes"
     assert _stored(ALICE, "my-notes")[META_CREATED_BY] == SUB_A
@@ -279,13 +279,13 @@ def test_an_upload_stamps_the_person_and_never_the_files_value(trusted, scoped, 
 
 def test_every_change_keeps_the_stored_creator(trusted, scoped):
     session = scoped(ALICE)
-    skills_ep.create_skill(
+    skills_ep._create_skill(
         SkillCreateRequest(label="my-notes", instructions="Mine.", projects=["general"]), session, None
     )
 
-    skills_ep.update_skill("my-notes", SkillUpdateRequest(instructions="Changed."), session, None)
-    skills_ep.update_skill("my-notes", SkillUpdateRequest(enabled=False), session, None)
-    skills_ep.update_skill("my-notes", SkillUpdateRequest(label="renamed-notes"), session, None)
+    skills_ep._update_skill("my-notes", SkillUpdateRequest(instructions="Changed."), session, None)
+    skills_ep._update_skill("my-notes", SkillUpdateRequest(enabled=False), session, None)
+    skills_ep._update_skill("my-notes", SkillUpdateRequest(label="renamed-notes"), session, None)
     SkillService(ALICE).replace_project_reference("general", "q4")
 
     metadata = _stored(ALICE, "renamed-notes")
@@ -293,7 +293,7 @@ def test_every_change_keeps_the_stored_creator(trusted, scoped):
 
 
 def test_the_operator_view_never_stamps_a_creator(trusted, scoped):
-    skills_ep.create_skill(SkillCreateRequest(label="ops-notes", instructions="Ours."), scoped(LOCAL_SCOPE), None)
+    skills_ep._create_skill(SkillCreateRequest(label="ops-notes", instructions="Ours."), scoped(LOCAL_SCOPE), None)
     skills_ep._upload_skill_bytes(
         _skill_md("ops-upload", "Ours.", created_by=SUB_A).encode(), "SKILL.md", scoped(LOCAL_SCOPE), None
     )
@@ -316,12 +316,12 @@ def test_bob_lists_and_reads_alices_shared_skill_read_only(sharing, scoped):
     assert (bobs["isBuiltin"], bobs["shared"], bobs["capabilities"]) == (False, True, NO_CAPABILITY)
     assert bobs["declarative"].strip() == SHARED_BODY
     assert bobs["attribution"]["createdBy"] is None
-    read = skills_ep.get_skill(SHARED, scoped(BOB), None)
+    read = skills_ep._get_skill(SHARED, scoped(BOB), None)
     assert (read["shared"], read["capabilities"], read["declarative"].strip()) == (True, NO_CAPABILITY, SHARED_BODY)
 
     alices = _listed(scoped, ALICE)[SHARED]
     assert (alices["isBuiltin"], alices["shared"], alices["capabilities"]) == (False, True, EVERY_CAPABILITY)
-    assert skills_ep.get_skill(SHARED, scoped(ALICE), None)["shared"] is True
+    assert skills_ep._get_skill(SHARED, scoped(ALICE), None)["shared"] is True
     # Nothing was copied into Bob's own store.
     assert not (SkillService(BOB).root / SHARED).exists()
 
@@ -413,7 +413,7 @@ def test_a_stale_entry_cant_resurrect_while_the_list_is_unreadable(trusted, scop
     """A delete that strands an entry, then a recreate while the list can't be
     read, must answer busy and write nothing: the stale entry can never
     silently re-share the new skill."""
-    skills_ep.create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
+    skills_ep._create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
     assert [e["skill"] for e in _list_entries()] == ["x"]
 
     # The delete's unshare write fails, so the delete succeeds best-effort and
@@ -428,7 +428,7 @@ def test_a_stale_entry_cant_resurrect_while_the_list_is_unreadable(trusted, scop
 
     monkeypatch.setattr(shared_skills, "change_shared_skills", maybe_fail)
     owned_logger("cowork.services.skills", level=logging.WARNING)
-    skills_ep.delete_skill("x", scoped(ALICE), None)
+    skills_ep._delete_skill("x", scoped(ALICE), None)
     failing["on"] = False
     assert not (SkillService(ALICE).root / "x").exists()
     assert [e["skill"] for e in _list_entries()] == ["x"]
@@ -437,7 +437,7 @@ def test_a_stale_entry_cant_resurrect_while_the_list_is_unreadable(trusted, scop
     with monkeypatch.context() as patch:
         _refuse_the_list(patch)
         with pytest.raises(HTTPException) as busy:
-            skills_ep.create_skill(SkillCreateRequest(label="x", instructions="second"), scoped(ALICE), None)
+            skills_ep._create_skill(SkillCreateRequest(label="x", instructions="second"), scoped(ALICE), None)
     assert busy.value.status_code == 503
     assert not (SkillService(ALICE).root / "x").exists()
 
@@ -453,12 +453,12 @@ def test_a_delete_while_the_list_is_unreadable_logs_the_entry_it_may_leave(
     """Deleting a shared skill while the list can't be read still deletes it,
     and attempts the unshare whatever the forgiving cached read said: the
     failure is logged naming the file, never skipped silently."""
-    skills_ep.create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
+    skills_ep._create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
     owned_logger("cowork.services.skills", level=logging.WARNING)
 
     with monkeypatch.context() as patch:
         _refuse_the_list(patch)
-        skills_ep.delete_skill("x", scoped(ALICE), None)
+        skills_ep._delete_skill("x", scoped(ALICE), None)
 
     assert not (SkillService(ALICE).root / "x").exists()
     list_file = str(shared_skills.shared_skills_file())
@@ -486,12 +486,12 @@ def test_stop_sharing_sees_another_writers_change_to_the_list(trusted):
 
 
 def test_renaming_a_shared_skill_while_the_list_is_unreadable_answers_busy(trusted, scoped, monkeypatch, owned_logger):
-    skills_ep.create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
+    skills_ep._create_skill(SkillCreateRequest(label="x", instructions="first", shared=True), scoped(ALICE), None)
     _refuse_the_list(monkeypatch)
     owned_logger("cowork.shared_skills", level=logging.WARNING)
 
     with pytest.raises(HTTPException) as busy:
-        skills_ep.update_skill("x", SkillUpdateRequest(label="x-v2"), scoped(ALICE), None)
+        skills_ep._update_skill("x", SkillUpdateRequest(label="x-v2"), scoped(ALICE), None)
 
     assert busy.value.status_code == 503
     # Nothing is half-renamed: the old name stays, the new one is never written.
@@ -503,25 +503,25 @@ def test_alice_changes_her_shared_skill_and_bob_sees_each_change(sharing, scoped
     alice = scoped(ALICE)
     shared_dir = stores / "bob-turn" / "shared-skills"
 
-    edited = skills_ep.update_skill(SHARED, SkillUpdateRequest(instructions="The new way."), alice, None)
+    edited = skills_ep._update_skill(SHARED, SkillUpdateRequest(instructions="The new way."), alice, None)
     assert (edited["shared"], edited["capabilities"]) == (True, EVERY_CAPABILITY)
     assert _listed(scoped, BOB)[SHARED]["declarative"] == "The new way."
     link_turn_skills(scope=BOB, project_name="general", skills_dir=stores / "bob-turn" / "skills", shared_skills_dir=shared_dir)
     assert (shared_dir / SHARED / "SKILL.md").read_text().endswith("The new way.")
 
     # Disabling lives in the skill's own SKILL.md, so it reaches everyone.
-    skills_ep.update_skill(SHARED, SkillUpdateRequest(enabled=False), alice, None)
+    skills_ep._update_skill(SHARED, SkillUpdateRequest(enabled=False), alice, None)
     assert _listed(scoped, BOB)[SHARED]["enabled"] is False
     link_turn_skills(scope=BOB, project_name="general", skills_dir=stores / "bob-turn" / "skills", shared_skills_dir=shared_dir)
     assert SHARED not in _links(shared_dir)
 
-    skills_ep.delete_skill(SHARED, alice, None)
+    skills_ep._delete_skill(SHARED, alice, None)
     assert SHARED not in _listed(scoped, BOB)
     with pytest.raises(HTTPException) as gone:
-        skills_ep.get_skill(SHARED, scoped(BOB), None)
+        skills_ep._get_skill(SHARED, scoped(BOB), None)
     assert gone.value.status_code == 404
     # The name is free for Bob again: nothing shares it any more.
-    created = skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions="Bob's."), scoped(BOB), None)
+    created = skills_ep._create_skill(SkillCreateRequest(label=SHARED, instructions="Bob's."), scoped(BOB), None)
     assert (created["shared"], created["capabilities"]) == (False, EVERY_CAPABILITY)
 
 
@@ -539,18 +539,18 @@ def test_alice_renames_her_shared_skill_only_after_unsharing_it(sharing, scoped)
     alice = scoped(ALICE)
 
     _refused(
-        lambda: skills_ep.update_skill(SHARED, SkillUpdateRequest(label="team-report-v2"), alice, None),
+        lambda: skills_ep._update_skill(SHARED, SkillUpdateRequest(label="team-report-v2"), alice, None),
         SHARED_SKILL_RENAME_REFUSAL,
     )
     with pytest.raises(SkillImmutableError, match="Stop sharing"):
         SkillService(ALICE).update_skill(SHARED, label="team-report-v2")
     assert SHARED in _listed(scoped, BOB)
     # A label that keeps the slug is no rename.
-    kept = skills_ep.update_skill(SHARED, SkillUpdateRequest(label=SHARED, name="Team Report"), alice, None)
+    kept = skills_ep._update_skill(SHARED, SkillUpdateRequest(label=SHARED, name="Team Report"), alice, None)
     assert (kept["id"], kept["name"]) == (SHARED, "Team Report")
 
     _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=False)
-    renamed = skills_ep.update_skill(SHARED, SkillUpdateRequest(label="team-report-v2"), alice, None)
+    renamed = skills_ep._update_skill(SHARED, SkillUpdateRequest(label="team-report-v2"), alice, None)
     assert renamed["id"] == "team-report-v2"
 
 
@@ -563,10 +563,10 @@ def test_a_new_skill_under_a_gone_shared_name_clears_the_leftover_entry(sharing,
     SkillService(ALICE).create_skill("private-notes", "Alice's private notes, never shared.")
     alice = scoped(ALICE)
     make = {
-        "create": lambda: skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions="x"), alice, None),
+        "create": lambda: skills_ep._create_skill(SkillCreateRequest(label=SHARED, instructions="x"), alice, None),
         "upload": lambda: skills_ep._upload_skill_bytes(_skill_md(SHARED, "x").encode(), "SKILL.md", alice, None),
         "upload-zip": lambda: skills_ep._upload_skill_bytes(_zip(SHARED, "x"), "skill.zip", alice, None),
-        "rename": lambda: skills_ep.update_skill("private-notes", SkillUpdateRequest(label=SHARED), alice, None),
+        "rename": lambda: skills_ep._update_skill("private-notes", SkillUpdateRequest(label=SHARED), alice, None),
     }[way]
 
     made = make()
@@ -669,7 +669,7 @@ def test_a_skill_the_agent_already_has_is_never_shared(sharing, scoped, stores, 
         scope=BOB, project_name="general", skills_dir=stores / "bob-turn" / "skills", shared_skills_dir=shared_dir
     )
     assert slug not in _links(shared_dir)
-    created = skills_ep.create_skill(SkillCreateRequest(label=slug, instructions="Bob's."), scoped(BOB), None)
+    created = skills_ep._create_skill(SkillCreateRequest(label=slug, instructions="Bob's."), scoped(BOB), None)
     assert (created["id"], created["shared"]) == (slug, False)
 
 
@@ -685,7 +685,7 @@ def test_only_list_entries_of_existing_skills_are_read(sharing, scoped):
     assert set(SkillService(BOB).shared_with_owner()) == {SHARED}
     listed = _listed(scoped, BOB)
     assert "never-made" not in listed and "alices-private" not in listed
-    created = skills_ep.create_skill(SkillCreateRequest(label="never-made", instructions="Bob's."), scoped(BOB), None)
+    created = skills_ep._create_skill(SkillCreateRequest(label="never-made", instructions="Bob's."), scoped(BOB), None)
     assert created["id"] == "never-made"
 
 
@@ -702,7 +702,7 @@ def test_one_rename_reads_the_list_once(sharing, scoped, monkeypatch):
 
     monkeypatch.setattr(shared_skills, "read_shared_skills", counted)
 
-    renamed = skills_ep.update_skill("notes", SkillUpdateRequest(label="notes-v2"), scoped(ALICE), None)
+    renamed = skills_ep._update_skill("notes", SkillUpdateRequest(label="notes-v2"), scoped(ALICE), None)
 
     assert renamed["id"] == "notes-v2"
     assert reads == [shared_skills.shared_skills_file()]
@@ -745,7 +745,7 @@ def _upload(scoped, scope: TenantScope, slug: str, body: str, *, zipped: bool, s
 def test_alice_shares_her_skill_and_hides_it_again(trusted, scoped):
     """No managed folder: the list sits in the shared root."""
     SkillService(ALICE).create_skill(SHARED, SHARED_BODY)
-    listing = skills_ep.list_skills(scoped(ALICE), None)
+    listing = skills_ep._list_skills(scoped(ALICE), None)
     listed = {skill["id"]: skill for skill in listing["skills"]}
     assert listing["canShare"] is True
     assert listed[SHARED]["capabilities"] == EVERY_CAPABILITY
@@ -872,7 +872,7 @@ def test_a_busy_list_answers_503_and_writes_nothing(trusted, scoped, monkeypatch
         for shared in (True, False):
             _answers(lambda: _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=shared), 503, SKILL_SHARING_BUSY)
         _answers(
-            lambda: skills_ep.create_skill(SkillCreateRequest(label="busy-notes", instructions="x", shared=True), alice, None),
+            lambda: skills_ep._create_skill(SkillCreateRequest(label="busy-notes", instructions="x", shared=True), alice, None),
             503,
             SKILL_SHARING_BUSY,
         )
@@ -880,7 +880,7 @@ def test_a_busy_list_answers_503_and_writes_nothing(trusted, scoped, monkeypatch
         # A rename into a name her list still has for a gone skill must
         # clear that entry first.
         _answers(
-            lambda: skills_ep.update_skill("private-notes", SkillUpdateRequest(label="gone-name"), alice, None),
+            lambda: skills_ep._update_skill("private-notes", SkillUpdateRequest(label="gone-name"), alice, None),
             503,
             SKILL_SHARING_BUSY,
         )
@@ -892,10 +892,10 @@ def test_a_busy_list_answers_503_and_writes_nothing(trusted, scoped, monkeypatch
 
 
 def test_deleting_a_shared_skill_stops_sharing_it(sharing, scoped):
-    skills_ep.delete_skill(SHARED, scoped(ALICE), None)
+    skills_ep._delete_skill(SHARED, scoped(ALICE), None)
 
     assert _list_entries() == []
-    created = skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions="New."), scoped(ALICE), None)
+    created = skills_ep._create_skill(SkillCreateRequest(label=SHARED, instructions="New."), scoped(ALICE), None)
     assert created["shared"] is False
     assert SHARED not in _listed(scoped, BOB)
 
@@ -907,7 +907,7 @@ def test_a_delete_still_succeeds_when_its_entry_cant_be_removed(sharing, scoped,
     monkeypatch.setattr(shared_skills, "change_shared_skills", broken)
     owned_logger("cowork.services.skills", level=logging.WARNING)
 
-    skills_ep.delete_skill(SHARED, scoped(ALICE), None)
+    skills_ep._delete_skill(SHARED, scoped(ALICE), None)
 
     assert not (SkillService(ALICE).root / SHARED).exists()
     warnings = [record.getMessage() for record in caplog.records if record.name == "cowork.services.skills"]
@@ -932,7 +932,7 @@ async def test_a_turn_reads_shared_skills_without_a_managed_folder(trusted, monk
 @pytest.mark.parametrize("way", ["create", "upload", "upload-zip"])
 def test_a_skill_created_shared_reaches_bob_read_only(trusted, scoped, way):
     if way == "create":
-        created = skills_ep.create_skill(
+        created = skills_ep._create_skill(
             SkillCreateRequest(label=SHARED, instructions=SHARED_BODY, shared=True), scoped(ALICE), None
         )
     else:
@@ -947,7 +947,7 @@ def test_a_skill_created_shared_reaches_bob_read_only(trusted, scoped, way):
 
 
 def test_a_skill_created_with_only_me_is_shared_with_nobody(trusted, scoped):
-    created = skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions=SHARED_BODY), scoped(ALICE), None)
+    created = skills_ep._create_skill(SkillCreateRequest(label=SHARED, instructions=SHARED_BODY), scoped(ALICE), None)
 
     assert (created["shared"], created["capabilities"]) == (False, EVERY_CAPABILITY)
     assert not shared_skills.shared_skills_file().exists()
@@ -966,7 +966,7 @@ def test_a_skill_created_shared_under_an_agent_skill_name_answers_409(trusted, s
 
     def make() -> dict:
         if way == "create":
-            return skills_ep.create_skill(
+            return skills_ep._create_skill(
                 SkillCreateRequest(label=slug, instructions="x", shared=True), scoped(ALICE), None
             )
         return _upload(scoped, ALICE, slug, "x", zipped=way == "upload-zip", shared=True)
@@ -986,7 +986,7 @@ def test_a_skill_created_shared_is_removed_when_its_entry_cant_be_written(truste
 
     with pytest.raises(OSError, match="the list can't be written"):
         if way == "create":
-            skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), scoped(ALICE), None)
+            skills_ep._create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), scoped(ALICE), None)
         else:
             _upload(scoped, ALICE, "new-shared", "x", zipped=way == "upload-zip", shared=True)
 
@@ -995,8 +995,8 @@ def test_a_skill_created_shared_is_removed_when_its_entry_cant_be_written(truste
 
 def test_where_skills_are_shared_nobody_shares_one_at_a_time(all_shared, scoped):
     alice = scoped(ALICE_SHARED)
-    skills_ep.create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), alice, None)
-    listing = skills_ep.list_skills(alice, None)
+    skills_ep._create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), alice, None)
+    listing = skills_ep._list_skills(alice, None)
     assert listing["canShare"] is False
     assert not any(skill["capabilities"]["canShare"] for skill in listing["skills"])
 
@@ -1006,12 +1006,12 @@ def test_where_skills_are_shared_nobody_shares_one_at_a_time(all_shared, scoped)
     for slug in ("team-notes", "never-made"):
         for shared in (True, False):
             _answers(
-                lambda: skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), alice, ALICE_PRINCIPAL),
+                lambda: skills_ep._set_skill_sharing(slug, SkillSharingRequest(shared=shared), alice, ALICE_PRINCIPAL),
                 409,
                 SKILL_SHARING_UNAVAILABLE,
             )
     _answers(
-        lambda: skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), alice, None),
+        lambda: skills_ep._create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), alice, None),
         409,
         SKILL_SHARING_UNAVAILABLE,
     )
@@ -1029,11 +1029,11 @@ def test_the_operator_view_shares_nothing(trusted, scoped):
     operator = scoped(LOCAL_SCOPE)
     SkillService(LOCAL_SCOPE).create_skill("ops-notes", "Ours.")
 
-    listing = skills_ep.list_skills(operator, None)
+    listing = skills_ep._list_skills(operator, None)
     assert listing["canShare"] is False
     assert not any(skill["capabilities"]["canShare"] for skill in listing["skills"])
     _answers(
-        lambda: skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), operator, None),
+        lambda: skills_ep._create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), operator, None),
         409,
         SKILL_SHARING_UNAVAILABLE,
     )
@@ -1138,14 +1138,14 @@ BOB_SHARED = _person(partition=PARTITION_B, sub=SUB_B, resources=SHARED_RESOURCE
 
 def _every_change_but_create_is_refused(scoped, scope: TenantScope, slug: str) -> None:
     session = scoped(scope)
-    _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(instructions="x"), session, None))
-    _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(enabled=False), session, None))
-    _refused(lambda: skills_ep.update_skill(slug, SkillUpdateRequest(label=f"{slug}-moved"), session, None))
-    _refused(lambda: skills_ep.delete_skill(slug, session, None))
+    _refused(lambda: skills_ep._update_skill(slug, SkillUpdateRequest(instructions="x"), session, None))
+    _refused(lambda: skills_ep._update_skill(slug, SkillUpdateRequest(enabled=False), session, None))
+    _refused(lambda: skills_ep._update_skill(slug, SkillUpdateRequest(label=f"{slug}-moved"), session, None))
+    _refused(lambda: skills_ep._delete_skill(slug, session, None))
 
 
 def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scoped):
-    skills_ep.create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), scoped(ALICE_SHARED), None)
+    skills_ep._create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), scoped(ALICE_SHARED), None)
     skills_ep._upload_skill_bytes(
         _skill_md("bob-upload", "Bob's.", created_by=SUB_A).encode(), "SKILL.md", scoped(BOB_SHARED), None
     )
@@ -1164,15 +1164,15 @@ def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scope
     ):
         listed = _listed(scoped, scope)["team-notes"]
         assert (listed["capabilities"], listed["shared"]) == (capabilities, shared)
-        read = skills_ep.get_skill("team-notes", scoped(scope), None)
+        read = skills_ep._get_skill("team-notes", scoped(scope), None)
         assert (read["capabilities"], read["shared"]) == (capabilities, shared)
 
     alice = scoped(ALICE_SHARED)
-    skills_ep.update_skill("team-notes", SkillUpdateRequest(instructions="Changed."), alice, None)
-    renamed = skills_ep.update_skill("team-notes", SkillUpdateRequest(label="team-notes-v2"), alice, None)
+    skills_ep._update_skill("team-notes", SkillUpdateRequest(instructions="Changed."), alice, None)
+    renamed = skills_ep._update_skill("team-notes", SkillUpdateRequest(label="team-notes-v2"), alice, None)
     assert renamed["capabilities"] == CHANGE_CAPABILITY
     assert _stored(LOCAL_SCOPE, "team-notes-v2")[META_CREATED_BY] == SUB_A
-    skills_ep.delete_skill("team-notes-v2", alice, None)
+    skills_ep._delete_skill("team-notes-v2", alice, None)
     assert "team-notes-v2" not in _listed(scoped, BOB_SHARED)
 
 
@@ -1180,16 +1180,16 @@ def test_where_all_are_shared_the_operator_view_changes_anyones_skill(all_shared
     """A creator who left can't hold their skill out of the operator's reach:
     the operator view edits, disables, renames and deletes it, and the stamp
     stays the creator's."""
-    skills_ep.create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), scoped(ALICE_SHARED), None)
+    skills_ep._create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), scoped(ALICE_SHARED), None)
     operator = scoped(LOCAL_SCOPE)
 
-    skills_ep.update_skill("team-notes", SkillUpdateRequest(instructions="The operator's."), operator, None)
-    skills_ep.update_skill("team-notes", SkillUpdateRequest(enabled=False), operator, None)
-    renamed = skills_ep.update_skill("team-notes", SkillUpdateRequest(label="team-notes-v2"), operator, None)
+    skills_ep._update_skill("team-notes", SkillUpdateRequest(instructions="The operator's."), operator, None)
+    skills_ep._update_skill("team-notes", SkillUpdateRequest(enabled=False), operator, None)
+    renamed = skills_ep._update_skill("team-notes", SkillUpdateRequest(label="team-notes-v2"), operator, None)
     assert (renamed["declarative"], renamed["enabled"]) == ("The operator's.", False)
     assert _stored(LOCAL_SCOPE, "team-notes-v2")[META_CREATED_BY] == SUB_A
 
-    skills_ep.delete_skill("team-notes-v2", operator, None)
+    skills_ep._delete_skill("team-notes-v2", operator, None)
     assert "team-notes-v2" not in _listed(scoped, ALICE_SHARED)
 
 
@@ -1201,10 +1201,10 @@ def test_where_all_are_shared_a_skill_with_no_creator_is_the_operators(all_share
     _every_change_but_create_is_refused(scoped, BOB_SHARED, "legacy")
 
     operator = scoped(LOCAL_SCOPE)
-    edited = skills_ep.update_skill("legacy", SkillUpdateRequest(instructions="The operator's."), operator, None)
+    edited = skills_ep._update_skill("legacy", SkillUpdateRequest(instructions="The operator's."), operator, None)
     assert edited["capabilities"] == CHANGE_CAPABILITY
     assert META_CREATED_BY not in _stored(LOCAL_SCOPE, "legacy")
-    skills_ep.delete_skill("legacy", operator, None)
+    skills_ep._delete_skill("legacy", operator, None)
     assert "legacy" not in _listed(scoped, LOCAL_SCOPE)
 
 
@@ -1215,7 +1215,7 @@ def _every_route_works(session, principal, *, upload_creator: str | None) -> Non
     """Create, upload, list, read, edit, disable, rename and delete one skill
     each, as the caller who made them. None is ``shared``, and nothing stamps
     a creator: an upload keeps what its file says (``upload_creator``)."""
-    created = skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), session, principal)
+    created = skills_ep._create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), session, principal)
     assert (created["shared"], created["capabilities"]) == (False, CHANGE_CAPABILITY)
     uploaded = skills_ep._upload_skill_bytes(
         _skill_md("uploaded", "Mine.", created_by=SUB_B).encode(), "SKILL.md", session, principal
@@ -1225,22 +1225,22 @@ def _every_route_works(session, principal, *, upload_creator: str | None) -> Non
     assert service.get_skill("my-notes").created_by is None
     assert service.get_skill("uploaded").created_by == upload_creator
 
-    listing = skills_ep.list_skills(session, principal)
+    listing = skills_ep._list_skills(session, principal)
     assert listing["canShare"] is False
     listed = {s["id"]: s for s in listing["skills"]}
     assert {"my-notes", "uploaded"} <= set(listed)
     assert not any(skill["shared"] or skill["capabilities"]["canShare"] for skill in listed.values())
-    assert skills_ep.get_skill("my-notes", session, principal)["shared"] is False
+    assert skills_ep._get_skill("my-notes", session, principal)["shared"] is False
 
-    edited = skills_ep.update_skill("my-notes", SkillUpdateRequest(instructions="Changed."), session, principal)
+    edited = skills_ep._update_skill("my-notes", SkillUpdateRequest(instructions="Changed."), session, principal)
     assert edited["declarative"] == "Changed."
-    disabled = skills_ep.update_skill("my-notes", SkillUpdateRequest(enabled=False), session, principal)
+    disabled = skills_ep._update_skill("my-notes", SkillUpdateRequest(enabled=False), session, principal)
     assert disabled["enabled"] is False
-    renamed = skills_ep.update_skill("my-notes", SkillUpdateRequest(label="my-renamed"), session, principal)
+    renamed = skills_ep._update_skill("my-notes", SkillUpdateRequest(label="my-renamed"), session, principal)
     assert (renamed["id"], renamed["shared"]) == ("my-renamed", False)
-    skills_ep.delete_skill("my-renamed", session, principal)
-    skills_ep.delete_skill("uploaded", session, principal)
-    remaining = {s["id"] for s in skills_ep.list_skills(session, principal)["skills"]}
+    skills_ep._delete_skill("my-renamed", session, principal)
+    skills_ep._delete_skill("uploaded", session, principal)
+    remaining = {s["id"] for s in skills_ep._list_skills(session, principal)["skills"]}
     assert not {"my-notes", "my-renamed", "uploaded"} & remaining
 
 
@@ -1284,15 +1284,15 @@ def test_hosted_org_tenancy_keeps_every_skills_route(hosted):
 
 def test_hosted_org_tenancy_shares_no_skill(hosted):
     principal = Principal(user_id=ORG_USER, org_id=ORG_ID, email="member@example.com")
-    skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), hosted, principal)
+    skills_ep._create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), hosted, principal)
 
     _answers(
-        lambda: skills_ep.set_skill_sharing("my-notes", SkillSharingRequest(shared=True), hosted, principal),
+        lambda: skills_ep._set_skill_sharing("my-notes", SkillSharingRequest(shared=True), hosted, principal),
         409,
         SKILL_SHARING_UNAVAILABLE,
     )
     _answers(
-        lambda: skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), hosted, principal),
+        lambda: skills_ep._create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), hosted, principal),
         409,
         SKILL_SHARING_UNAVAILABLE,
     )

@@ -502,7 +502,7 @@ def _mount_page(*, tmp_path, scope) -> str:
 
 
 def _preview(*, token: str, scope):
-    from cowork.api.v1.endpoints.project_files import preview_asset
+    from cowork.api.v1.endpoints.project_files import _preview_asset as preview_asset
 
     return preview_asset(token, "page.html", scope=scope)
 
@@ -559,7 +559,7 @@ def _mount_token(target, base, scope):
 
 
 def _asset_for(token, rel_path, scope):
-    from cowork.api.v1.endpoints.project_files import preview_asset
+    from cowork.api.v1.endpoints.project_files import _preview_asset as preview_asset
 
     return preview_asset(token, rel_path, scope)
 

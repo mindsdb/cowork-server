@@ -1,5 +1,7 @@
 """Database connection and session management using SQLAlchemy"""
 
+from collections.abc import Callable
+
 from sqlalchemy import create_engine
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
@@ -90,12 +92,18 @@ def get_session_factory(engine):
     return _session_factories[engine_id]
 
 
-def get_session():
+async def get_session():
     """
     FastAPI dependency that provides a database session with automatic cleanup.
 
     This is a generator-based dependency that ensures sessions are always closed
     after the request completes, preventing database connection leaks.
+
+    An async generator, so FastAPI runs it on the event loop rather than on one
+    of anyio's default threads, which sync routes and their file store work
+    share. Opening the session does no I/O. Rolling it back and closing it
+    return its connection to the pool, so they run on the threads database
+    units run on (run_on_unit_threads), unless the session never took one.
 
     It takes no parameters: FastAPI reads a dependency's parameters from the
     request, so the database URI comes from settings only.
@@ -151,11 +159,22 @@ def get_session():
             # answers it. That includes an error that carries a status_code
             # without being an HTTPException, such as a provider SDK's.
             logger.error("Session error: error_type=%s", type(e).__name__)
-        db.rollback()
+        await _off_the_loop(db, db.rollback)
         raise
     finally:
         logger.debug("🔒 Closing database session")
-        db.close()
+        await _off_the_loop(db, db.close)
+
+
+async def _off_the_loop(db: SQLModelSession, release: Callable[[], None]) -> None:
+    """``release`` (the session's rollback or close) on the units' threads
+    when the session holds a connection; inline when it never took one."""
+    if not db.in_transaction():
+        release()
+        return
+    from cowork.db.units import run_on_unit_threads
+
+    await run_on_unit_threads(release)
 
 
 def get_open_session(db_uri: str = settings.database.uri):

@@ -366,7 +366,7 @@ def _draft_file_response(
         raise
 
 
-def _artifact_id_from_path(artifact_id: UUID) -> str:
+async def _artifact_id_from_path(artifact_id: UUID) -> str:
     """The identity gate for every route in this file.
 
     Declaring the path parameter as a `UUID` makes FastAPI answer 422 before any

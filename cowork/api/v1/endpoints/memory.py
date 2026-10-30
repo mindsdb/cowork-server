@@ -1,5 +1,3 @@
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Annotated
 from uuid import UUID
 
@@ -7,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
-from cowork.db.session import get_open_session
+from cowork.db.units import run_efs_unit
 from cowork.principal import Principal, get_principal
 from cowork.schemas.memory import (
     MemoryCapabilities,
@@ -34,26 +32,25 @@ from cowork.services.memory import (
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
-@contextmanager
-def _memory_service(
-    scope: TenantScope,
-    principal: Principal | None,
-) -> Iterator[MemoryService]:
-    raw_session = get_open_session()
-    try:
-        yield MemoryService(ScopedSession(raw_session, scope), principal)
-    finally:
-        raw_session.close()
+async def _with_memory_service(scope: TenantScope, principal: Principal | None, use):
+    """``use(service)`` in a unit on the file store's threads: memory reads
+    and writes the project row and the memory files together."""
+
+    def unit(session: ScopedSession):
+        return use(MemoryService(session, principal))
+
+    return await run_efs_unit(unit, scope=scope)
 
 
 @router.get("/", response_model=list[MemoryResponse])
-def list_memory(
+async def list_memory(
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     project_id: UUID | None = Query(default=None),
     principal: Principal | None = Depends(get_principal),
 ):
-    with _memory_service(scope, principal) as service:
-        return service.list_memory_sync(project_id=project_id)
+    return await _with_memory_service(
+        scope, principal, lambda service: service.list_memory_sync(project_id=project_id)
+    )
 
 
 @router.get("/capabilities", response_model=MemoryCapabilities)
@@ -66,7 +63,7 @@ def memory_capabilities(
 
 
 @router.put("/", response_model=MemoryResponse)
-def update_memory(
+async def update_memory(
     body: MemoryUpdateRequest,
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     principal: Principal | None = Depends(get_principal),
@@ -76,13 +73,16 @@ def update_memory(
     if is_person(scope):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PERSON_EDIT_REFUSED)
     try:
-        with _memory_service(scope, principal) as service:
-            return service.update_memory_sync(
+        return await _with_memory_service(
+            scope,
+            principal,
+            lambda service: service.update_memory_sync(
                 scope=body.scope,
                 category=body.category,
                 content=body.content,
                 project_id=body.project_id,
-            )
+            ),
+        )
     except UnicodeError as e:
         # A slot whose stored bytes do not decode is a broken shared resource,
         # not a bad request. UnicodeDecodeError is a ValueError, so without this
@@ -97,7 +97,7 @@ def update_memory(
 
 
 @router.delete("/")
-def delete_memory(
+async def delete_memory(
     body: MemoryDeleteRequest,
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     principal: Principal | None = Depends(get_principal),
@@ -107,23 +107,26 @@ def delete_memory(
     if is_person(scope) and not person_owns_memory(scope):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_DELETE_REFUSED)
     try:
-        with _memory_service(scope, principal) as service:
-            service.delete_memory_sync(
+        await _with_memory_service(
+            scope,
+            principal,
+            lambda service: service.delete_memory_sync(
                 scope=body.scope,
                 category=body.category,
                 project_id=body.project_id,
-            )
+            ),
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"ok": True}
 
 
 @router.delete("/all", response_model=MemoryReset)
-def reset_memory(
+async def reset_memory(
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     principal: Principal | None = Depends(get_principal),
 ) -> MemoryReset:
     """Remove all of the caller's learned memory: their global tier and each
     project tier of theirs (MemoryService.reset_own_memory_sync)."""
-    with _memory_service(scope, principal) as service:
-        return MemoryReset(removed=service.reset_own_memory_sync().removed)
+    reset = await _with_memory_service(scope, principal, lambda service: service.reset_own_memory_sync())
+    return MemoryReset(removed=reset.removed)

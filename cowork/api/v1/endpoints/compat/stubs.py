@@ -15,7 +15,6 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import log_context
@@ -154,18 +153,28 @@ def delete_attachment_scoped(project_name: str, session_id: str, attachment_id: 
 
 
 @attachments_router.get("/{project_name}/{session_id}/{attachment_id}/raw")
-def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep):
+async def attachment_raw(
+    project_name: str,
+    session_id: str,
+    attachment_id: UUID,
+    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+):
+    from cowork.api.v1.efs_file_response import EfsFileResponse
+    from cowork.db.units import run_efs_unit
     from cowork.services.files import FileService
     try:
-        content_type, filename, path = FileService(scoped).get_file_content(attachment_id)
+        content_type, filename, path = await run_efs_unit(
+            lambda session: FileService(session).get_file_content(attachment_id), scope=scope
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     # Inline, not attachment: the rail's row click opens this URL in a
     # browser tab expecting the file to RENDER (image/pdf/text). The
     # default attachment disposition silently downloads instead, which
     # reads as "open does nothing" (ENG-264).
-    return FileResponse(
+    return EfsFileResponse(
         path,
+        scope=scope,
         media_type=content_type,
         filename=filename,
         content_disposition_type="inline",

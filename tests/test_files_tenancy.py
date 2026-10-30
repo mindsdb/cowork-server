@@ -16,6 +16,7 @@ from fastapi import UploadFile
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from _fakes import units_on_engine
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.harnesses.anton_harness.harness import _conversation_attachment_context
@@ -802,7 +803,7 @@ def test_undecodable_memory_slot_does_not_404_a_project_delete(org_engine):
     )
     project_id = project.id
 
-    projects_endpoint.delete_project(
+    projects_endpoint._delete_project(
         project_id,
         scoped,
         _org_principal(ORG_MEMBER),
@@ -830,7 +831,7 @@ def test_symlinked_memory_dir_does_not_500_a_project_delete(org_engine):
     scoped, project = _project_with_unreadable_rules(org_engine, plant_link)
     project_id = project.id
 
-    projects_endpoint.delete_project(
+    projects_endpoint._delete_project(
         project_id,
         scoped,
         _org_principal(ORG_MEMBER),
@@ -849,7 +850,7 @@ def _instructions_project(engine) -> tuple[ScopedSession, Project]:
 
     scoped = _org_scoped(engine, ORG_MEMBER)
     project = ProjectService(scoped).create_project("gated-instructions")
-    project_files.write_project_file(
+    project_files._write_project_file(
         project.name,
         project_files._validated_project_path(".anton/anton.md"),
         project_files._FileWriteRequest(content="the creator's rules"),
@@ -878,7 +879,7 @@ def test_peer_member_cannot_write_instructions_through_the_file_route(org_engine
     path = project_files._validated_project_path(alias)
 
     with pytest.raises(HTTPException) as denied:
-        project_files.write_project_file(
+        project_files._write_project_file(
             project.name,
             path,
             project_files._FileWriteRequest(content="peer takeover"),
@@ -888,7 +889,7 @@ def test_peer_member_cannot_write_instructions_through_the_file_route(org_engine
     assert denied.value.status_code == 403
 
     with pytest.raises(HTTPException) as delete_denied:
-        project_files.delete_project_file(
+        project_files._delete_project_file(
             project.name,
             path,
             peer,
@@ -901,7 +902,7 @@ def test_peer_member_cannot_write_instructions_through_the_file_route(org_engine
 
 
 @pytest.mark.asyncio
-async def test_upload_route_cannot_reach_the_instructions_file(org_engine):
+async def test_upload_route_cannot_reach_the_instructions_file(org_engine, monkeypatch):
     """The upload route writes project-root children only.
 
     A separator in the filename is stripped rather than honoured, so an upload
@@ -911,10 +912,11 @@ async def test_upload_route_cannot_reach_the_instructions_file(org_engine):
 
     _creator, project = _instructions_project(org_engine)
     peer = _org_scoped(org_engine, ORG_PEER)
+    units_on_engine(monkeypatch, org_engine)
 
     result = await project_files.upload_project_files(
         project.name,
-        peer,
+        peer.scope,
         files=[_upload(".anton/anton.md", b"peer takeover")],
     )
 

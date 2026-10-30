@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
@@ -61,6 +62,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
+from cowork.db.units import run_efs, run_efs_unit
 from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
@@ -105,6 +107,8 @@ logger = logging.getLogger(__name__)
 # instead of taking ScopedSessionDep, but the token is scoped per-mount, not
 # a bypass, so it needs nothing of its own here.)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
@@ -326,8 +330,14 @@ def _validated_project_path(path: str) -> _ValidatedProjectPath:
     return _ValidatedProjectPath(tuple(parts))
 
 
+async def _project_mutation_path(path: str) -> _ValidatedProjectPath:
+    """The validation as a coroutine, so a request needs no default thread
+    for it."""
+    return _validated_project_path(path)
+
+
 ProjectMutationPathDep = Annotated[
-    _ValidatedProjectPath, Depends(_validated_project_path)
+    _ValidatedProjectPath, Depends(_project_mutation_path)
 ]
 
 
@@ -555,7 +565,7 @@ def _instructions_file_exists(scoped: ScopedSession, project_id: UUID) -> bool:
 def _instructions_fields(
     project: Project,
     scoped: ScopedSession,
-    principal: Principal | None,
+    principal: Principal | None = None,
     *,
     modified: float | None,
 ) -> dict[str, Any]:
@@ -584,7 +594,7 @@ def _instructions_fields(
 def _require_instructions_change(
     project_name: str,
     scoped: ScopedSession,
-    principal: Principal | None,
+    principal: Principal | None = None,
 ) -> tuple[Project, SharedResourceAccess, ExitStack]:
     selected_name = _project_name_selector(project_name)
     project = _project_for_name(selected_name, scoped)
@@ -760,7 +770,7 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
 
 
 async def _authorize_artifact_file_mutation(
-    path: ProjectMutationPathDep, scoped: ScopedSessionDep,
+    path: ProjectMutationPathDep, scope: ScopeDep,
 ) -> None:
     """Protect artifact bytes reached through the generic file adapter.
 
@@ -771,19 +781,19 @@ async def _authorize_artifact_file_mutation(
     parts = tuple(part.casefold() for part in path.parts)
     if parts[0] == CONVERSATIONS_DIRNAME:
         if len(parts) == 1:
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         if len(parts) == 2:
             try:
                 UUID(parts[1])
             except ValueError:
                 return
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         parts = parts[2:]
     artifact_root = (".anton", "artifacts")
     if parts[:2] == artifact_root or parts == artifact_root[:1]:
-        await require_product_permission(scoped.scope, "artifact.manage")
+        await require_product_permission(scope, "artifact.manage")
 
 
 def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
@@ -1424,7 +1434,7 @@ def _close_instruction_context(
 
 
 def _pinned_stream(
-    target: Path, base: Path, *, media_type: str, headers: dict
+    target: Path, base: Path, *, media_type: str, headers: dict, scope: TenantScope
 ) -> StreamingResponse:
     """Serve `target` from a pinned descriptor.
 
@@ -1440,12 +1450,16 @@ def _pinned_stream(
     cm, fd, st = _pinned_regular_file(target, base)
     resources = ExitStack()
     resources.push(cm)
+    reader = read_bounded(fd, st.st_size)
 
-    def _chunks():
+    # Each read runs on the file store's threads, not on anyio's default
+    # threads, which Starlette would iterate a sync generator on.
+    async def _chunks():
         try:
-            yield from read_bounded(fd, st.st_size)
+            while (chunk := await run_efs(partial(next, reader, None), scope=scope)) is not None:
+                yield chunk
         finally:
-            resources.close()
+            await run_efs(resources.close, scope=scope, deadline=False)
 
     try:
         return PinnedStreamingResponse(
@@ -1462,10 +1476,18 @@ def _pinned_stream(
     response_model=ProjectInstructionsResponse,
     response_model_exclude_unset=True,
 )
-def get_project_instructions(
+async def get_project_instructions(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _get_project_instructions(project_name, session, principal), scope=scope)
+
+
+def _get_project_instructions(
+    project_name: str,
+    scoped: ScopedSession,
+    principal: Principal | None = None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1516,10 +1538,18 @@ def get_project_instructions(
     response_model=ProjectFileListResponse,
     response_model_exclude_unset=True,
 )
-def list_project_files(
+async def list_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _list_project_files(project_name, session, principal), scope=scope)
+
+
+def _list_project_files(
+    project_name: str,
+    scoped: ScopedSession,
+    principal: Principal | None = None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1587,11 +1617,20 @@ def list_project_files(
     response_model=ProjectFileReadResponse,
     response_model_exclude_unset=True,
 )
-def read_project_file(
+async def read_project_file(
     project_name: str,
     path: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _read_project_file(project_name, path, session, principal), scope=scope)
+
+
+def _read_project_file(
+    project_name: str,
+    path: str,
+    scoped: ScopedSession,
+    principal: Principal | None = None,
 ):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
@@ -1659,12 +1698,22 @@ def read_project_file(
     dependencies=[Depends(_authorize_artifact_file_mutation)],
     response_model_exclude_unset=True,
 )
-def write_project_file(
+async def write_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
     req: _FileWriteRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _write_project_file(project_name, path, req, session, principal), scope=scope)
+
+
+def _write_project_file(
+    project_name: str,
+    path: ProjectMutationPathDep,
+    req: _FileWriteRequest,
+    scoped: ScopedSession,
+    principal: Principal | None = None,
 ):
     _require_workspace_path(path, scoped)
     classification_base = (
@@ -1826,12 +1875,34 @@ def write_project_file(
     return response
 
 
+@dataclass(frozen=True)
+class _Upload:
+    """One uploaded file as the request read it: its bytes, or why they could
+    not be read."""
+
+    filename: str | None
+    data: bytes | None
+    read_error: Exception | None = None
+
+
 @router.post("/{project_name}/files/upload")
 async def upload_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     files: list[UploadFile] = File(...),
 ):
+    # The request body is read here, from the upload's own spool; the project
+    # lookup and the writes run together on the file store's threads.
+    uploads: list[_Upload] = []
+    for f in files:
+        try:
+            uploads.append(_Upload(filename=f.filename, data=await f.read()))
+        except Exception as exc:
+            uploads.append(_Upload(filename=f.filename, data=None, read_error=exc))
+    return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=uploads), scope=scope)
+
+
+def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[_Upload]) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     with _opened_project_directory_inventory(scoped) as inventory:
         selected_project_name = os.path.basename(project_name)
@@ -1854,22 +1925,23 @@ async def upload_project_files(
         if directory is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        for f in files:
-            if not f.filename:
+        for upload in uploads:
+            if not upload.filename:
                 results.append({"name": "", "ok": False, "error": "filename missing"})
                 continue
-            safe_name = os.path.basename(f.filename).strip()
+            safe_name = os.path.basename(upload.filename).strip()
             if not safe_name or safe_name.startswith("."):
                 results.append(
-                    {"name": f.filename, "ok": False, "error": "invalid filename"}
+                    {"name": upload.filename, "ok": False, "error": "invalid filename"}
                 )
                 continue
             try:
-                data = await f.read()
+                if upload.read_error is not None:
+                    raise upload.read_error
                 _write_bytes_at_project_root(
-                    directory, _ValidatedProjectPath((safe_name,)), data
+                    directory, _ValidatedProjectPath((safe_name,)), upload.data
                 )
-                results.append({"name": safe_name, "ok": True, "size": len(data)})
+                results.append({"name": safe_name, "ok": True, "size": len(upload.data)})
             except Exception as exc:
                 logger.error("Failed to write file %s: %s", safe_name, exc)
                 results.append(
@@ -2055,11 +2127,20 @@ def import_sharepoint_files(
     response_model=ProjectFileDeleteResponse,
     dependencies=[Depends(_authorize_artifact_file_mutation)],
 )
-def delete_project_file(
+async def delete_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(lambda session: _delete_project_file(project_name, path, session, principal), scope=scope)
+
+
+def _delete_project_file(
+    project_name: str,
+    path: ProjectMutationPathDep,
+    scoped: ScopedSession,
+    principal: Principal | None = None,
 ):
     _require_workspace_path(path, scoped)
     classification_base = (
@@ -2173,7 +2254,19 @@ def delete_project_file(
 @router.delete(
     "/{project_name}/skill_drafts/{slug}", status_code=status.HTTP_204_NO_CONTENT
 )
-def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
+async def delete_skill_draft(
+    project_name: str,
+    slug: str,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(lambda session: _delete_skill_draft(project_name, slug, session), scope=scope)
+
+
+def _delete_skill_draft(
+    project_name: str,
+    slug: str,
+    scoped: ScopedSession,
+):
     """Remove a staged skill draft once it is Saved (or dismissed).
 
     Idempotent: a missing draft is a no-op — Save may race the sweep, and a
@@ -2209,7 +2302,17 @@ def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
 
 
 @router.post("/preview-mount-file")
-def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
+async def preview_mount_file(
+    req: _PreviewMountRequest,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(lambda session: _preview_mount_file(req, session), scope=scope)
+
+
+def _preview_mount_file(
+    req: _PreviewMountRequest,
+    scoped: ScopedSession,
+):
     base = _project_dir(req.name, scoped)
     target = _safe_relpath(req.path, base)
     _require_workspace_access(target, base, scoped)
@@ -2228,9 +2331,13 @@ def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}")
-def preview_asset(
+async def preview_asset(
     token: str, rel_path: str, scope: TenantScope = Depends(get_tenant_scope)
 ):
+    return await run_efs(partial(_preview_asset, token, rel_path, scope), scope=scope)
+
+
+def _preview_asset(token: str, rel_path: str, scope: TenantScope):
     # An unknown token, an expired one and another member's one all answer the
     # same 404: which of the three it was is itself information about somebody
     # else's files.
@@ -2262,11 +2369,24 @@ def preview_asset(
         mount.project_base,
         media_type=media_type,
         headers={"Cache-Control": "private, max-age=300"},
+        scope=scope,
     )
 
 
 @router.get("/{project_name}/files-raw/{path:path}")
-def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+async def download_project_file(
+    project_name: str,
+    path: str,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(lambda session: _download_project_file(project_name, path, session), scope=scope)
+
+
+def _download_project_file(
+    project_name: str,
+    path: str,
+    scoped: ScopedSession,
+):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     _require_workspace_access(target, base, scoped)
@@ -2278,4 +2398,5 @@ def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep
         base,
         media_type=media_type,
         headers={"Content-Disposition": attachment_disposition(target.name)},
+        scope=scoped.scope,
     )

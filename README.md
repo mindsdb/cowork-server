@@ -457,6 +457,8 @@ Async code runs it through `run_efs` in `cowork/db/units.py`, beside `run_db`:
 
 The artifact routes read in turn: the project row and the caller's conversations in a `run_db` unit, the artifact roots and the folder on the file store, then the owner in another unit. The request's own session never takes a connection while a file store call waits.
 
+Routes that read or write project files, skills, memory or uploads run their work as one unit on the file store's threads (`run_efs_unit`). The unit opens its own session and closes it when the work returns. The files they serve go out through `EfsFileResponse` (`cowork/api/v1/efs_file_response.py`), which stats and reads on the same threads. Starlette's `FileResponse` reads on anyio's default threads, so only desktop-only routes use it. The request's identity dependencies (`get_principal`, `get_tenant_scope`, `get_scoped_session` and `get_session`) are coroutines, so authenticating a request takes no thread.
+
 A daemon thread, `cowork/common/loop_watchdog.py`, watches for what slips through:
 
 - `event_loop_stalled` (ERROR) means the event loop didn't answer for 2 s. The line carries the loop thread's stack and the requests in flight.

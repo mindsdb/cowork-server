@@ -43,12 +43,6 @@ ALLOWLIST = (
         "desktop only (DesktopOnly on the router)",
     ),
     (
-        "project_files",
-        "upload_project_files",
-        "lists the projects inside the pinned-directory inventory it writes the uploads "
-        "through, on the loop; moving that inventory to the file store's threads moves both",
-    ),
-    (
         "settings",
         "write_raw_settings",
         "desktop only (LoopbackDesktopOnly): writes the deployment's dotenv",

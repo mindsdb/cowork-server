@@ -304,7 +304,7 @@ def test_org_same_slug_rename_moves_the_label_and_stays_gated(org_engine):
     from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
 
     alice = _org_scoped(org_engine, ALICE)
-    created = project_endpoints.create_project(
+    created = project_endpoints._create_project(
         ProjectCreateRequest(name="Мій тестовий проєкт"),
         alice,
         _org_principal(ALICE),
@@ -315,7 +315,7 @@ def test_org_same_slug_rename_moves_the_label_and_stays_gated(org_engine):
     # Bob did not create it, and a label rename is still a rename.
     bob = _org_scoped(org_engine, BOB)
     with pytest.raises(HTTPException) as denied:
-        project_endpoints.update_project(
+        project_endpoints._update_project(
             created["id"],
             ProjectUpdateRequest(name="Інший проєкт"),
             bob,
@@ -323,7 +323,7 @@ def test_org_same_slug_rename_moves_the_label_and_stays_gated(org_engine):
         )
     assert denied.value.status_code == 403
 
-    renamed = project_endpoints.update_project(
+    renamed = project_endpoints._update_project(
         created["id"],
         ProjectUpdateRequest(name="Інший проєкт"),
         alice,
@@ -354,13 +354,13 @@ def test_org_slug_changing_rename_also_moves_the_label(org_engine):
     from cowork.schemas.projects import ProjectCreateRequest, ProjectUpdateRequest
 
     alice = _org_scoped(org_engine, ALICE)
-    created = project_endpoints.create_project(
+    created = project_endpoints._create_project(
         ProjectCreateRequest(name="Report"), alice, _org_principal(ALICE),
     )
     assert created["name"] == "Report"
     assert created["display_name"] == "Report"
 
-    renamed = project_endpoints.update_project(
+    renamed = project_endpoints._update_project(
         created["id"],
         ProjectUpdateRequest(name="Quarterly Report"),
         alice,
@@ -371,7 +371,7 @@ def test_org_slug_changing_rename_also_moves_the_label(org_engine):
 
     # And the case the ticket exists for: the slug carries nothing, so if the
     # label does not follow, the rename is invisible to the user.
-    cyrillic = project_endpoints.update_project(
+    cyrillic = project_endpoints._update_project(
         created["id"],
         ProjectUpdateRequest(name="Мій проєкт"),
         alice,

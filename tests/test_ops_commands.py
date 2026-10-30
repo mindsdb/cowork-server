@@ -377,7 +377,7 @@ def _listed_skills(person: Person) -> dict[str, dict]:
     raw = get_open_session()
     try:
         scoped = ScopedSession(raw, personal_scope(person))
-        return {s["id"]: s for s in skills_ep.list_skills(scoped, None)["skills"]}
+        return {s["id"]: s for s in skills_ep._list_skills(scoped, None)["skills"]}
     finally:
         raw.close()
 

@@ -318,7 +318,7 @@ def test_rename_into_a_destination_claimed_after_the_check_conflicts(
     the caller would never learn which name was refused.
     """
     alice = _scoped(org_engine, ALICE)
-    skills_api.create_skill(
+    skills_api._create_skill(
         SkillCreateRequest(label="alpha skill", instructions="original"),
         alice,
         _principal(ALICE),
@@ -340,7 +340,7 @@ def test_rename_into_a_destination_claimed_after_the_check_conflicts(
     )
 
     with pytest.raises(HTTPException) as conflict:
-        skills_api.update_skill(
+        skills_api._update_skill(
             "alpha-skill",
             SkillUpdateRequest(label="beta skill"),
             alice,
@@ -359,7 +359,7 @@ def test_rename_reports_a_lost_attribution_key_race_as_a_conflict(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    skills_api.create_skill(
+    skills_api._create_skill(
         SkillCreateRequest(label="racing skill", instructions="original"),
         alice,
         _principal(ALICE),
@@ -377,7 +377,7 @@ def test_rename_reports_a_lost_attribution_key_race_as_a_conflict(
     monkeypatch.setattr(SharedResourceAccess, "record_updates", lose_the_unique_key)
 
     with pytest.raises(HTTPException) as conflict:
-        skills_api.update_skill(
+        skills_api._update_skill(
             "racing-skill",
             SkillUpdateRequest(label="won by somebody else"),
             alice,
@@ -399,7 +399,7 @@ def test_update_through_an_alias_audits_the_canonical_slug(org_engine):
     the edit wrote.
     """
     alice = _scoped(org_engine, ALICE)
-    skills_api.create_skill(
+    skills_api._create_skill(
         SkillCreateRequest(label="canonical skill", instructions="original"),
         alice,
         _principal(ALICE),
@@ -410,7 +410,7 @@ def test_update_through_an_alias_audits_the_canonical_slug(org_engine):
         target_is_directory=True,
     )
 
-    edited = skills_api.update_skill(
+    edited = skills_api._update_skill(
         "alias-skill",
         SkillUpdateRequest(instructions="edited through the alias"),
         alice,
@@ -426,7 +426,7 @@ def test_update_through_an_alias_audits_the_canonical_slug(org_engine):
 
 def test_delete_through_an_alias_audits_the_canonical_slug(org_engine):
     alice = _scoped(org_engine, ALICE)
-    skills_api.create_skill(
+    skills_api._create_skill(
         SkillCreateRequest(label="deletable skill", instructions="original"),
         alice,
         _principal(ALICE),
@@ -437,7 +437,7 @@ def test_delete_through_an_alias_audits_the_canonical_slug(org_engine):
         target_is_directory=True,
     )
 
-    skills_api.delete_skill("alias-skill", alice, _principal(ALICE))
+    skills_api._delete_skill("alias-skill", alice, _principal(ALICE))
 
     assert alice.exec(alice.select(SharedResourceAttribution)).all() == []
     events = alice.exec(alice.select(SharedResourceMutation)).all()
@@ -466,7 +466,7 @@ def test_create_reserves_no_claim_for_an_occupied_slug(org_engine, monkeypatch):
     monkeypatch.setattr(SharedResourceAccess, "reserve_claim", record_reservation)
 
     with pytest.raises(HTTPException) as conflict:
-        skills_api.create_skill(
+        skills_api._create_skill(
             SkillCreateRequest(label="occupied skill", instructions="second writer"),
             alice,
             _principal(ALICE),

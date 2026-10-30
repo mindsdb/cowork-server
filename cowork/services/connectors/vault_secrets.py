@@ -6,12 +6,14 @@ the remote seed) needs that registration done at request entry.
 """
 from __future__ import annotations
 
-import asyncio
+from functools import partial
 from typing import TYPE_CHECKING
 
 from anton.utils.datasources import begin_ds_turn_scope, restore_namespaced_env
 
 from cowork.common.logger import get_logger
+from cowork.db.scoped import LOCAL_SCOPE
+from cowork.db.units import run_efs
 from cowork.services.connectors.persist import vault_for_scope
 
 if TYPE_CHECKING:
@@ -38,12 +40,12 @@ async def register_vault_secrets(scope: TenantScope | None) -> None:
     must not fail the turn: scrubbing falls back to the shape-based regex.
     """
     # The scope opens here, in the request's context, and the vault reads and
-    # rebuild run in a worker thread, off the event loop. The thread gets a
-    # copy of the context, which holds the same containers, and anton fills
-    # them in place, so the rebuild lands in this request's scope.
+    # rebuild run on the file store's threads, off the event loop. The thread
+    # gets a copy of the context, which holds the same containers, and anton
+    # fills them in place, so the rebuild lands in this request's scope.
     begin_ds_turn_scope()
     try:
-        await asyncio.to_thread(_restore_from_vault, scope)
+        await run_efs(partial(_restore_from_vault, scope), scope=scope or LOCAL_SCOPE)
     except Exception:
         logger.warning(
             "Could not register vault secrets; this turn's history is scrubbed "

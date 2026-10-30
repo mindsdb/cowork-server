@@ -2,10 +2,11 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse as FileContentResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.efs_file_response import EfsFileResponse
 from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.units import run_efs_unit
 from cowork.schemas.files import FileListResponse, FileResponse
 from cowork.services.files import FileService, file_response, save_upload
 
@@ -60,9 +61,11 @@ def delete_file(file_id: UUID, scoped: ScopedSessionDep):
 
 
 @router.get("/{file_id}/content")
-def retrieve_file_content(file_id: UUID, scoped: ScopedSessionDep):
+async def retrieve_file_content(file_id: UUID, scope: Annotated[TenantScope, Depends(get_tenant_scope)]):
     try:
-        content_type, filename, path = FileService(scoped).get_file_content(file_id)
+        content_type, filename, path = await run_efs_unit(
+            lambda session: FileService(session).get_file_content(file_id), scope=scope
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return FileContentResponse(path=str(path), media_type=content_type, filename=filename)
+    return EfsFileResponse(path, scope=scope, media_type=content_type, filename=filename)
