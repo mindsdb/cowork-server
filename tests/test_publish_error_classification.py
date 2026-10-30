@@ -23,6 +23,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from anton.publisher import PublishJobFailed, PublishJobTimeout
+
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import publish
 from cowork.services.publish import PublisherUnavailable, PublishOwnedByOtherUser
@@ -291,3 +293,35 @@ def test_a_missing_gateway_route_keeps_the_wrong_endpoint_advice(tmp_path, monke
         run()
     assert "Missing Authentication Token" not in str(error.value)
     assert "wrong server/endpoint" in str(error.value)
+
+
+
+def test_job_failed_503_is_the_upload_service_not_an_auth_outage():
+    exc = PublishJobFailed(503, "publish worker did not start", job_id="a" * 32, report_id="r")
+    with pytest.raises(publish.UploadServiceUnavailable):
+        publish.classify_upload_error(exc)
+
+
+def test_other_job_failures_come_back_as_upload_errors():
+    exc = PublishJobFailed(400, "pip install failed: x", job_id="a" * 32, report_id="r")
+    assert publish.classify_upload_error(exc) == publish.UploadError(400, None, "pip install failed: x")
+    assert publish.classify_upload_error(PublishJobTimeout(job_id="a" * 32, report_id="r", waited_s=180)) is None
+
+
+def test_job_failed_400_shows_the_server_text(tmp_path, monkeypatch):
+    exc = PublishJobFailed(400, "pip install failed: no wheel", job_id="a" * 32, report_id="r")
+    run = _publish_failing_with(tmp_path, monkeypatch, exc)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: pip install failed: no wheel"
+
+
+@pytest.mark.parametrize("exc", [
+    PublishJobFailed(504, "publish worker timed out", job_id="b" * 32, report_id="r"),
+    PublishJobTimeout(job_id="b" * 32, report_id="r", waited_s=180),
+])
+def test_job_5xx_and_timeout_show_the_job_id(tmp_path, monkeypatch, exc):
+    run = _publish_failing_with(tmp_path, monkeypatch, exc)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "b" * 32 in str(error.value)
