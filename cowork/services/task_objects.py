@@ -436,7 +436,7 @@ def record_new_artifacts(
     if org_mode and project_id and artifact_ids:
         from cowork.services.artifact_locations import Location, record_found_location
 
-        # The turn's folders are in the project's shared root (ENG-2056).
+        # A turn creates its folders in the project's shared root.
         for slug in slugs:
             if slug not in artifact_ids:
                 continue
