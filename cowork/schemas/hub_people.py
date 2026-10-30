@@ -1,4 +1,4 @@
-"""Wire shapes for the people search in the caller's MindsHub organization."""
+"""Wire shapes for the people in the caller's MindsHub organization."""
 
 from pydantic import Field
 
@@ -12,10 +12,10 @@ class HubPersonRow(CamelResponse):
 
 
 class HubPeopleView(CamelResponse):
-    """Members matching a search. ``reachable`` false means auth could not be
-    asked, which a client must not read as "nobody matches"."""
+    """The org directory, or the members among some ids. ``reachable`` false
+    means auth could not be asked, which a client must not read as "nobody"."""
 
     reachable: bool = False
     people: list[HubPersonRow] = Field(default_factory=list)
-    # ``?all=1`` only: the org has more members than the directory returns.
+    # The directory only: the org has more members than it returns.
     truncated: bool = False

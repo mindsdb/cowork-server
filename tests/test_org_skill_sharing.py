@@ -1050,8 +1050,8 @@ def test_hub_people_names_stored_ids(monkeypatch):
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": False,
     }
-    # Uncached, and it wins over a search.
-    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", ids=BOB))
+    # Uncached.
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, ids=BOB))
     assert calls == [f"/me/org-members/?ids={BOB}%2C{EVE}", f"/me/org-members/?ids={BOB}"]
 
     async def down(path, bearer):
@@ -1064,67 +1064,22 @@ def test_hub_people_names_stored_ids(monkeypatch):
     assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
 
 
-def test_hub_people_searches_the_org_and_caches_per_query(monkeypatch):
+def test_hub_people_asks_auth_for_the_directory_without_params(monkeypatch):
     hub_people.reset_caches_for_tests()
     calls: list[str] = []
 
     async def get_auth_json(path, bearer):
         calls.append(path)
-        return {"results": [{"id": "u1", "name": "Bob B", "email": "bob@x.com"}, {"name": "no id"}]}
+        return {"results": [], "truncated": False}
 
     monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bo", limit=50))
-    assert view.model_dump(by_alias=True) == {
-        "reachable": True, "people": [{"id": "u1", "name": "Bob B", "email": "bob@x.com"}], "truncated": False,
-    }
-    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q=" BO ", limit=50))
-    assert calls == ["/me/org-members/?q=bo&limit=20"]
-    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", limit=5))
-    assert calls[-1] == "/me/org-members/?q=bob&limit=5"
-    # Another caller doesn't get alice's cached answer.
-    other = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
-    asyncio.run(hub_people_ep.get_hub_people(_Request("other"), other, q="bo", limit=50))
-    assert len(calls) == 3
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
+    assert calls == ["/me/org-members/"]
     hub_people.reset_caches_for_tests()
 
 
-def test_hub_people_short_query_answers_empty_without_asking(monkeypatch):
-    hub_people.reset_caches_for_tests()
-
-    async def get_auth_json(path, bearer):
-        raise AssertionError("auth asked for a one-character query")
-
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
-    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    for q in ("", "b", " b "):
-        view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q=q, limit=10))
-        assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
-
-
-def test_hub_people_unreachable_is_reported_not_raised(monkeypatch):
-    hub_people.reset_caches_for_tests()
-
-    async def get_auth_json(path, bearer):
-        return None
-
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
-    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", limit=10))
-    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
-    hub_people.reset_caches_for_tests()
-
-
-def test_hub_people_outside_org_mode_is_empty_and_reachable(monkeypatch):
-    async def get_auth_json(path, bearer):
-        raise AssertionError("auth asked outside org mode")
-
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
-    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), LOCAL_SCOPE, q="bob", limit=10))
-    assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
-
-
-def test_hub_people_all_lists_the_org_directory_and_caches_it_per_caller(monkeypatch):
+def test_hub_people_lists_the_org_directory_and_caches_it_per_caller(monkeypatch):
     hub_people.reset_caches_for_tests()
     calls: list[tuple[str, str]] = []
 
@@ -1137,29 +1092,29 @@ def test_hub_people_all_lists_the_org_directory_and_caches_it_per_caller(monkeyp
 
     monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": True,
     }
-    assert calls == [("/me/org-members/?all=1", "tok")]
-    # Cached for the caller, whatever the query alongside it; ids still win.
-    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", everyone=True))
+    assert calls == [("/me/org-members/", "tok")]
+    # Cached for the caller; ids still go to auth.
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
     assert len(calls) == 1
-    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, ids=BOB, everyone=True))
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, ids=BOB))
     assert calls[-1][0] == f"/me/org-members/?ids={BOB}"
     # Another caller asks for their own.
     other = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
-    asyncio.run(hub_people_ep.get_hub_people(_Request("other"), other, everyone=True))
-    assert calls[-1] == ("/me/org-members/?all=1", "other")
+    asyncio.run(hub_people_ep.get_hub_people(_Request("other"), other))
+    assert calls[-1] == ("/me/org-members/", "other")
     # Five minutes, then asked again.
     clock = [hub_people.time.monotonic() + 301]
     monkeypatch.setattr(hub_people.time, "monotonic", lambda: clock[0])
-    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
-    assert calls[-1] == ("/me/org-members/?all=1", "tok") and len(calls) == 4
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
+    assert calls[-1] == ("/me/org-members/", "tok") and len(calls) == 4
     hub_people.reset_caches_for_tests()
 
 
-def test_hub_people_all_failure_is_unreachable_and_retried_after_15s(monkeypatch):
+def test_hub_people_failure_is_unreachable_and_retried_after_15s(monkeypatch):
     hub_people.reset_caches_for_tests()
     calls: list[str] = []
     answers = [None, {"results": [{"id": BOB}]}]
@@ -1170,13 +1125,13 @@ def test_hub_people_all_failure_is_unreachable_and_retried_after_15s(monkeypatch
 
     monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
     assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
-    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
     assert len(calls) == 1
     now = hub_people.time.monotonic()
     monkeypatch.setattr(hub_people.time, "monotonic", lambda: now + 16)
-    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
     # A plain list or no flag from auth: not truncated.
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "people": [{"id": BOB, "name": "", "email": ""}], "truncated": False,
@@ -1184,12 +1139,38 @@ def test_hub_people_all_failure_is_unreachable_and_retried_after_15s(monkeypatch
     hub_people.reset_caches_for_tests()
 
 
-def test_hub_people_all_outside_org_mode_is_empty_and_reachable(monkeypatch):
+def test_hub_people_auth_refusing_the_caller_is_unreachable(monkeypatch):
+    """Auth answers 403 to someone who is not a current member of the active
+    org: no directory and no lookup, reported rather than raised."""
+    hub_people.reset_caches_for_tests()
+    from cowork.services import hub_workspaces
+
+    seen: list[str] = []
+    real_client = httpx.AsyncClient
+
+    def client(**kwargs):
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.path)
+            return httpx.Response(403, json={"detail": "Not a member of this organization."})
+
+        return real_client(transport=httpx.MockTransport(handle), **kwargs)
+
+    monkeypatch.setattr(hub_workspaces.httpx, "AsyncClient", client)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope))
+    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, ids=BOB))
+    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
+    assert [path.endswith("/me/org-members/") for path in seen] == [True, True]
+    hub_people.reset_caches_for_tests()
+
+
+def test_hub_people_outside_org_mode_is_empty_and_reachable(monkeypatch):
     async def get_auth_json(path, bearer):
         raise AssertionError("auth asked outside org mode")
 
     monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
-    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), LOCAL_SCOPE, everyone=True))
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), LOCAL_SCOPE))
     assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
 
 
