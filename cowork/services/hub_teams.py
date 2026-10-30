@@ -1,8 +1,8 @@
 """The caller's MindsHub teams and skill-sharing permissions, read as them.
 
-Two auth reads for skill sharing in hosted org mode (ENG-3787):
-``GET /v1/me/teams/`` for the teams the caller belongs to, and
-``GET /v1/entitlements/me/`` for ``permissions[]``, where auth reports
+Two reads of the auth service for skill sharing in hosted org mode
+(ENG-3787): ``GET /v1/me/teams/`` for the teams the caller belongs to, and
+``GET /v1/entitlements/me/`` for ``permissions[]``, where it reports
 ``skills.share_org`` and ``skills.write_org``.
 
 Same rules as ``hub_workspaces``: the bearer is the caller's own, the host is
@@ -28,19 +28,19 @@ logger = logging.getLogger(__name__)
 TEAMS_PATH = "/me/teams/"
 ENTITLEMENTS_PATH = "/entitlements/me/"
 
-# Capabilities auth reports in ``permissions[]``.
+# Capabilities the auth service reports in ``permissions[]``.
 SKILLS_SHARE_ORG = "skills.share_org"
 SKILLS_WRITE_ORG = "skills.write_org"
 
 # The hub workspace listing's split TTL: one round trip per minute per caller
-# when auth answers, and a quick retry when it did not.
+# when the auth service answers, and a quick retry when it did not.
 _TTL_OK = 60.0
 _TTL_FAIL = 15.0
 _MAX_TTL_S = max(_TTL_OK, _TTL_FAIL)
 
 
 class HubTeam(BaseModel):
-    """One team, as auth puts it on the wire."""
+    """One team, as the auth service puts it on the wire."""
 
     id: str
     display_name: str = ""
@@ -48,8 +48,8 @@ class HubTeam(BaseModel):
 
 
 class HubTeamListing(BaseModel):
-    """The caller's teams. ``reachable`` false means auth could not be asked,
-    which is not the same as belonging to no team."""
+    """The caller's teams. ``reachable`` false means the auth service could
+    not be asked, which is not the same as belonging to no team."""
 
     teams: list[HubTeam] = Field(default_factory=list)
     reachable: bool = False
@@ -61,7 +61,8 @@ class HubTeamListing(BaseModel):
     @property
     def default_team_id(self) -> str:
         """The org's default team, whose members are the whole organization:
-        sharing with it is sharing org-wide. Empty when auth named none."""
+        sharing with it is sharing org-wide. Empty when the auth service
+        named none."""
         return next((team.id for team in self.teams if team.is_default), "")
 
 

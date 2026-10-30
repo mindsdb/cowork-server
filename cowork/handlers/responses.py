@@ -682,10 +682,11 @@ class ResponsesHandler:
     ) -> None:
         self.principal = principal
         self.scope = scope_from_principal(principal)
-        # The caller's own MindsHub credential (cowork.principal.hub_credential),
-        # used only to read their teams for skill sharing. Empty for a turn
-        # with no caller present, such as a scheduled one: that turn gets the
-        # fail-closed set, without skills shared only with a team.
+        # The Authorization the gateway validated (cowork.principal.caller_bearer),
+        # used only to read the caller's teams and permissions for skill
+        # sharing. Empty for a turn with no caller present, such as a
+        # scheduled one: that turn gets the fail-closed set, without skills
+        # shared only with a team.
         self.hub_bearer = hub_bearer
         # Hosted org skill sharing's view of the caller, resolved once per
         # remote turn before its inputs are read (remote_turn_skills).
@@ -2289,8 +2290,9 @@ class ResponsesHandler:
             # compaction against exactly the history seeded here, so
             # re-reading it when the reply arrives could map the count onto a
             # different list.
-            # The caller's teams and permissions, read from auth (cached per
-            # caller) before the seed, which selects the skills they see.
+            # The caller's teams and permissions, read from the auth service
+            # (cached per caller) before the seed, which selects the skills
+            # they see.
             await self._resolve_skill_viewer(scope)
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
             # A unit of its own, so a failed read can't abort the seed's.

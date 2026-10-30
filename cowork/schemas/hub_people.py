@@ -13,7 +13,8 @@ class HubPersonRow(CamelResponse):
 
 class HubPeopleView(CamelResponse):
     """The org directory, or the members among some ids. ``reachable`` false
-    means auth could not be asked, which a client must not read as "nobody"."""
+    means the auth service could not be asked, which a client must not read
+    as "nobody"."""
 
     reachable: bool = False
     people: list[HubPersonRow] = Field(default_factory=list)

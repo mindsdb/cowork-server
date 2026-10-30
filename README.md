@@ -562,7 +562,21 @@ the caller's JWT there; on a desktop install that header holds this server's own
 bearer, and forwarding it to auth would leak the one credential the main process
 scopes to the loopback origin. `hub_credential` reads both, and it is
 deliberately a different function from `caller_bearer` so a client cannot steer
-the credential on the org model-catalog fetch by setting a header.
+the credential on the org model-catalog fetch by setting a header. For the same
+reason skill and artifact sharing never use it: a caller can put a credential
+from another organization of theirs in that header, and the auth service would
+answer with that organization's permissions, teams and members. Sharing reads
+all three with `caller_bearer`. Three routes still take `hub_credential`: the
+workspace selector's `GET /hub/workspaces/` and `PUT /hub/workspaces/active`,
+and `GET /hub/usage/`. `PUT /active` (`set_active_hub_workspace` in
+`cowork/api/v1/endpoints/hub_workspaces.py`) answers 403 for a workspace missing
+from the listing that credential returns, so the listing decides what it
+stores. The pick it stores grants nothing: the menu shows it only while the
+listing has it (`resolve_active` in `cowork/services/hub_workspaces.py`), and
+every key mint sends it for the gateway's user and organization, where the auth
+service refuses a workspace they hold no grant on and the mint falls back to the
+default workspace and clears the pick (`_request_turn_key` in
+`cowork/turnqueue/auth_keys.py`).
 
 **The listing cache is keyed on the credential, not just the caller.** Auth
 answers the listing per caller: an owner or admin sees every workspace in the
@@ -1035,6 +1049,19 @@ Deleting a shared skill stops sharing it. Renaming one answers 403 "Stop sharing
 Everyone else lists a shared skill after the packaged built-ins, the managed skills and their own, live from its creator's store, with `isBuiltin` false, `shared` true and no capability. A same-named skill earlier in that order hides it, and so does one the agent already has, and a listed skill that no longer exists is skipped; for a name two people share, the first entry wins. Their turns link it from the creator's store into a read-only skill root after the managed skills, with the turn's selection rule (enabled, and scoped to no project or to this project's name) applied to the skill's own metadata. Everyone else's edit, disable, rename or delete of it answers 403 "This skill is shared with you and can't be changed here."; disabling is refused too, because `enabled` lives in the skill's own `SKILL.md`. Everyone else's create, upload or rename into its name answers 409 "Someone else shares a skill named '<slug>'. Choose another name." Its creator sees it `shared` with every capability and edits, disables and deletes it as before, and everyone else sees each change.
 
 The list is `<COWORK_SHARED_DIR>/shared/skills.json`, a JSON list of `{user_id, partition_id, skill}` in the order shared (`cowork.shared_skills`). Cowork writes it itself, under an `flock` on `skills.json.lock` beside it, replacing the file at once with mode 0644. A missing list shares nothing. A malformed one shares nothing too: every read logs a warning naming the file, the server still starts, and the next change that takes the list's lock replaces it, starting from empty: a share or hide, and a create, upload, rename or delete. A list larger than 1 MiB counts as malformed. A list the filesystem refuses to read (EIO, EMFILE, EACCES), or one that isn't a regular file (a FIFO, device, directory or symlink left in its place), is not malformed, so no change replaces it: while it lasts, readers share nothing, the server still starts, and every change logs an error naming the file, answers busy and writes nothing until an operator removes it. `python -m cowork.ops.skills share` and `unshare` change it on a person's behalf ([Operator commands](#operator-commands)).
+
+### Who an artifact is shared with in org mode
+
+In hosted org mode the auth service's rule for an artifact is the one record of who it is shared with: everyone in the organization (`org_allowed`), teams, people in the organization by Keycloak id, and anyone else by address. The artifact's `.published.json` sits in a folder the pod can write, so it keeps the access mode, the password and the versions, never the audience.
+
+- `GET /api/v1/artifacts/workspace/{project}/{artifact_id}/access` reads the rule from the auth service's `POST /v1/internal/artifact-access/read/` (`cowork.services.publish.stored_artifact_rule`).
+- `PUT .../access` checks a save against that rule: making the artifact org-wide takes `skills.share_org`, and a team it adds must be one of the caller's. The org's default team is never sent: naming it means everyone (`org_allowed`), so a save that adds a team while the caller's teams can't be read is a 503, an admin's included. When a save changes the people, everyone it names is asked about in one org-member lookup. A person it adds who isn't a member is a 400. A person on the rule who has left the organization is dropped, because the auth service keeps a departed person's id and refuses it on the next write that sends it. The caller's own address among the emails is a 400, and so is a `notify` naming more than 100 addresses or 100 people, the most the auth service emails from one save. All of this is answered before anything is published.
+- A save reads the rule once: the check's read is the rule the publish plans against. Every other restricted publish reads the rule too, so a live sync or an autopublish re-sends what the rule holds and writes no team or person.
+- The access mode a live sync or an autopublish keeps comes from `.published.json`, so it is checked against the rule. Only a restricted publish leaves a rule, and a public or password publish deletes it. The pod can write `metadata.json` too, which moves the artifact's identity, so the rule is read under that identity and under each key the entry recorded for its last publish (`artifact_key`, `lambda_artifact_key`). A re-publish whose entry isn't restricted while any of them holds a rule has a mode changed after the owner's last save. A re-publish of a page the entry names no key for can't be checked. Either is refused before anything is uploaded and logged as `artifact_access_mode_changed`, with `reason` `rule_held` or `no_rule_key`. The owner's next save of the artifact's sharing ends it.
+- What this check can't catch: a password changed in a password entry, an agent that points the metadata id and both entry keys at keys that hold no rule, such as another of the owner's public artifacts, and an agent that marks an unpublished entry published again, since unpublishing deletes the rule. Closing these takes a record of the owner's last saved mode that the pod can't write, such as a database row per artifact.
+- A read that fails fails the request or the publish (503) rather than guessing. A 409 or 403 from the auth service gets the same answer on every try, so it answers 409.
+
+The auth service has to serve that read before this server is deployed.
 
 ### Publishing with authenticated local users
 

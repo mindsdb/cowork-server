@@ -1,7 +1,7 @@
 """skill_access and skill_user_setting: org skill sharing (ENG-3787)
 
 skill_access: who a hosted org skill is shared with, one row per skill per
-org, keyed by the skill's slug. Names mirror auth's ArtifactAccess
+org, keyed by the skill's slug. Names mirror the auth service's ArtifactAccess
 (org_allowed, allowed_team_ids, allowed_user_ids); always_on is skills' own.
 Only hosted org mode writes it; the desktop's SQLite gets the empty table and
 never reads it.

@@ -671,6 +671,12 @@ def _published_access_for(
     the email list are owner-only — `.published.json` never enters the
     published bundle — so callers must only return this to the artifact's owner
     (the local/authenticated session).
+
+    In hosted org mode the entry doesn't say who a restricted artifact is
+    shared with: the auth service's rule is the one record of it, which GET
+    /access reads (cowork.services.publish.stored_artifact_rule). So the
+    audience fields stay empty here, even for an entry written before that,
+    and a card never shows a copy that could have gone stale or been planted.
     """
     out = {
         "accessMode": "public",
@@ -679,7 +685,8 @@ def _published_access_for(
         "accessEmails": [],
         "orgAllowed": False,
         "ownerOnly": False,
-        # Hosted org team sharing (ENG-3787), restricted mode only.
+        # Hosted org team sharing (ENG-3787), filled by GET /access from the
+        # auth service's rule.
         "allowedTeamIds": [],
         # People in the org by Keycloak user id; outside people stay in
         # accessEmails.
@@ -705,17 +712,10 @@ def _published_access_for(
             if mode == "password":
                 out["accessProtected"] = True
                 out["accessPassword"] = entry.get("access_password", "") or ""
-            elif mode == "restricted":
+            elif mode == "restricted" and not _org_mode():
                 out["accessEmails"] = entry.get("emails", []) or []
                 out["orgAllowed"] = bool(entry.get("org_allowed"))
-                out["allowedTeamIds"] = list(entry.get("allowed_team_ids") or [])
-                out["allowedUserIds"] = list(entry.get("allowed_user_ids") or [])
-                # Stored for anton's publisher when teams or people alone are
-                # picked (publish._with_team_audience); to the app it means
-                # nobody else picked.
-                out["ownerOnly"] = bool(entry.get("owner_only")) and not (
-                    out["allowedTeamIds"] or out["allowedUserIds"]
-                )
+                out["ownerOnly"] = bool(entry.get("owner_only"))
     except Exception:
         pass
     return out

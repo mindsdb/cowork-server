@@ -14,8 +14,8 @@ class HubTeamRow(CamelResponse):
 
 
 class HubTeamsView(CamelResponse):
-    """The caller's teams. ``reachable`` false means auth could not be asked,
-    which a client must not read as "in no team"."""
+    """The caller's teams. ``reachable`` false means the auth service could
+    not be asked, which a client must not read as "in no team"."""
 
     reachable: bool = False
     teams: list[HubTeamRow] = Field(default_factory=list)

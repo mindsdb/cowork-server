@@ -213,12 +213,10 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
     assert calls[0][1]["artifacts_base"] == folder.parent
     assert calls[0][1]["api_key"] == "turn-key"
     assert calls[0][1]["publish_url"] == "https://api.staging.example"
-    assert calls[0][1]["access"] == {
-        "mode": "restricted",
-        "emails": ["viewer@example.com"],
-        "org_allowed": False,
-        "owner_only": False,
-    }
+    # The restricted mode, naming nobody: the publish reads who the artifact
+    # is shared with from the auth service's rule, never from the entry an
+    # agent can write (cowork.services.publish._plan_access, ENG-3787).
+    assert calls[0][1]["access"] == {"mode": "restricted", "owner_only": True}
     assert calls[0][1]["scope"] is ORG_SCOPE
     assert revoked == [True]
     assert calls[0][1]["project_id"] == "project-1"

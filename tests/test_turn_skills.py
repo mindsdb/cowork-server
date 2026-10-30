@@ -7,12 +7,13 @@ mirroring skill_links), the org keying, and the size bounds.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
+
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import MissingTenantScopeError, TenantScope
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession, TenantScope
 from cowork.services.skills import SkillService, build_turn_skills
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -48,16 +49,38 @@ def skills_root(tmp_path, monkeypatch):
     get_app_settings.cache_clear()
 
 
+@pytest.fixture()
+def turn(skills_root):
+    """build_turn_skills as a cloud turn calls it, with the turn's database
+    session, whose skill_access rows say who sees each skill. The skills these
+    tests write straight to the store have no row, so the org's first read
+    gives each one shared org-wide, as for a skill from before sharing
+    (cowork.services.skill_access.backfill_legacy_access), and the selection
+    rules below see every one of them."""
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    sessions: list[ScopedSession] = []
+
+    def build(scope: TenantScope, project_path: str | None = None) -> dict:
+        session = ScopedSession(Session(engine), scope)
+        sessions.append(session)
+        return build_turn_skills(scope, project_path, session=session)
+
+    yield build
+    for session in sessions:
+        session.close()
+
+
 # ── selection ────────────────────────────────────────────────────────────────
 
-def test_turn_skills_payload_is_org_scoped(skills_root):
+def test_turn_skills_payload_is_org_scoped(skills_root, turn):
     SkillService(_org(ORG_A)).create_skill(label="Report", name="report", instructions="steps")
 
-    payload = build_turn_skills(_org(ORG_A))
+    payload = turn(_org(ORG_A))
     assert list(payload) == ["report"]
     assert "steps" in payload["report"]["files"]["SKILL.md"]
 
-    assert build_turn_skills(_org(ORG_B)) == {}   # invisible cross-org
+    assert turn(_org(ORG_B)) == {}   # invisible cross-org
 
 
 def test_turn_skills_fail_closed_without_org(skills_root):
@@ -65,14 +88,14 @@ def test_turn_skills_fail_closed_without_org(skills_root):
         build_turn_skills(_org(None))
 
 
-def test_disabled_skill_is_not_sent(skills_root):
+def test_disabled_skill_is_not_sent(skills_root, turn):
     svc = SkillService(_org(ORG_A))
     svc.create_skill(label="Off", name="off", instructions="i", enabled=False)
     svc.create_skill(label="On", name="on", instructions="i")
-    assert list(build_turn_skills(_org(ORG_A))) == ["on"]
+    assert list(turn(_org(ORG_A))) == ["on"]
 
 
-def test_project_scoping_mirrors_symlink_distribution(skills_root, tmp_path):
+def test_project_scoping_mirrors_symlink_distribution(skills_root, turn, tmp_path):
     """metadata.projects entries are project FOLDER names (skill_links parity):
     empty means every project, listed means only those."""
     svc = SkillService(_org(ORG_A))
@@ -81,15 +104,15 @@ def test_project_scoping_mirrors_symlink_distribution(skills_root, tmp_path):
 
     proj_a = str(tmp_path / "projects" / "proj-a")
     proj_b = str(tmp_path / "projects" / "proj-b")
-    assert set(build_turn_skills(_org(ORG_A), proj_a)) == {"everywhere", "scoped"}
-    assert set(build_turn_skills(_org(ORG_A), proj_b)) == {"everywhere"}
+    assert set(turn(_org(ORG_A), proj_a)) == {"everywhere", "scoped"}
+    assert set(turn(_org(ORG_A), proj_b)) == {"everywhere"}
     # No project context → a project-scoped skill has nowhere to apply.
-    assert set(build_turn_skills(_org(ORG_A))) == {"everywhere"}
+    assert set(turn(_org(ORG_A))) == {"everywhere"}
 
 
 # ── directory contents ───────────────────────────────────────────────────────
 
-def test_payload_carries_the_whole_directory_as_text(skills_root):
+def test_payload_carries_the_whole_directory_as_text(skills_root, turn):
     svc = SkillService(_org(ORG_A))
     svc.create_skill(label="Multi", name="multi", instructions="body")
     d = svc.root / "multi"
@@ -100,12 +123,12 @@ def test_payload_carries_the_whole_directory_as_text(skills_root):
     (d / ".hidden").write_text("x", encoding="utf-8")              # never authored content
     (d / "image.png").write_bytes(b"\x89PNG\x00\xff\xfe")          # binary → skipped
 
-    files = build_turn_skills(_org(ORG_A))["multi"]["files"]
+    files = turn(_org(ORG_A))["multi"]["files"]
     assert set(files) == {"SKILL.md", "references/recipe.md", "helper.py"}
     assert files["references/recipe.md"] == "- tip"
 
 
-def test_oversized_sibling_is_skipped_not_truncated(skills_root, monkeypatch):
+def test_oversized_sibling_is_skipped_not_truncated(skills_root, turn, monkeypatch):
     import cowork.services.skills as skills_mod
 
     svc = SkillService(_org(ORG_A))
@@ -113,12 +136,12 @@ def test_oversized_sibling_is_skipped_not_truncated(skills_root, monkeypatch):
     (svc.root / "big" / "huge.md").write_text("x" * 500, encoding="utf-8")
     monkeypatch.setattr(skills_mod, "_TURN_SKILL_FILE_MAX", 400)
 
-    files = build_turn_skills(_org(ORG_A))["big"]["files"]
+    files = turn(_org(ORG_A))["big"]["files"]
     # A truncated script/reference that half-applies is worse than an absent one.
     assert "huge.md" not in files and "SKILL.md" in files
 
 
-def test_oversized_skill_md_drops_the_whole_skill(skills_root, monkeypatch):
+def test_oversized_skill_md_drops_the_whole_skill(skills_root, turn, monkeypatch):
     import cowork.services.skills as skills_mod
 
     svc = SkillService(_org(ORG_A))
@@ -126,10 +149,10 @@ def test_oversized_skill_md_drops_the_whole_skill(skills_root, monkeypatch):
     svc.create_skill(label="Fine", name="fine", instructions="ok")
     monkeypatch.setattr(skills_mod, "_TURN_SKILL_FILE_MAX", 400)
 
-    assert list(build_turn_skills(_org(ORG_A))) == ["fine"]
+    assert list(turn(_org(ORG_A))) == ["fine"]
 
 
-def test_per_file_cap_counts_wire_bytes_not_chars(skills_root, monkeypatch):
+def test_per_file_cap_counts_wire_bytes_not_chars(skills_root, turn, monkeypatch):
     """The pod stdin cap is bytes and the controller uses ensure_ascii JSON
     (CJK → 6 bytes/char), so the per-file cap must count wire bytes: a file
     small in chars but large on the wire still has to drop."""
@@ -140,7 +163,7 @@ def test_per_file_cap_counts_wire_bytes_not_chars(skills_root, monkeypatch):
     monkeypatch.setattr(skills_mod, "_TURN_SKILL_FILE_MAX", 300)
     # char count would keep the SKILL.md; wire count drops it, and with no
     # SKILL.md the whole skill drops.
-    assert build_turn_skills(_org(ORG_A)) == {}
+    assert turn(_org(ORG_A)) == {}
 
 
 def test_local_mode_reads_the_shared_root(skills_root):
@@ -148,7 +171,7 @@ def test_local_mode_reads_the_shared_root(skills_root):
     assert list(build_turn_skills(None)) == ["local"]
 
 
-def test_slug_is_the_directory_name_not_the_frontmatter(skills_root):
+def test_slug_is_the_directory_name_not_the_frontmatter(skills_root, turn):
     """A hand-edited store can drift frontmatter `name` from the dir name. The
     payload must ship the listed directory's own files under its dir name —
     resolving by frontmatter would ship another dir's files, letting an
@@ -161,12 +184,12 @@ def test_slug_is_the_directory_name_not_the_frontmatter(skills_root):
     md.write_text(md.read_text(encoding="utf-8").replace("name: impostor", "name: mine"),
                   encoding="utf-8")
 
-    payload = build_turn_skills(_org(ORG_A))
+    payload = turn(_org(ORG_A))
     assert list(payload) == ["impostor"]
     assert "DISABLED CONTENT" not in payload["impostor"]["files"]["SKILL.md"]
 
 
-def test_symlinks_cannot_pull_in_another_orgs_files(skills_root):
+def test_symlinks_cannot_pull_in_another_orgs_files(skills_root, turn):
     """The tenancy wall: a symlinked file or directory planted inside org A's
     skill must never ship org B's content (or anything outside the skill dir)."""
     import os
@@ -180,13 +203,13 @@ def test_symlinks_cannot_pull_in_another_orgs_files(skills_root):
     os.symlink(victim.root / "secret" / "SKILL.md", d / "steal.md")   # file link
     os.symlink(victim.root / "secret", d / "linkdir")                 # dir link
 
-    payload = build_turn_skills(_org(ORG_A))
+    payload = turn(_org(ORG_A))
     dumped = str(payload)
     assert set(payload["evil"]["files"]) == {"SKILL.md"}
     assert "ORG B SECRET" not in dumped
 
 
-def test_symlinked_top_level_skill_dir_is_dropped(skills_root):
+def test_symlinked_top_level_skill_dir_is_dropped(skills_root, turn):
     """The dir itself being a symlink into another org's store: is_dir() follows
     it, so the whole entry must be rejected before its contents are walked."""
     import os
@@ -198,6 +221,6 @@ def test_symlinked_top_level_skill_dir_is_dropped(skills_root):
     svc.root.mkdir(parents=True, exist_ok=True)
     os.symlink(victim.root / "secret", svc.root / "evil")   # evil -> org B's dir
 
-    payload = build_turn_skills(_org(ORG_A))
+    payload = turn(_org(ORG_A))
     assert payload == {}
     assert "ORG B SECRET" not in str(payload)

@@ -64,7 +64,7 @@ from cowork.services.skill_links import (
 # operator command.
 from cowork.shared_skills import SKILL_SHARING_BUSY, SharedSkillsBusyError  # noqa: F401
 from cowork.services.skill_sharing import (
-    LEGACY_ORG_WIDE,
+    BUILTIN_ORG_WIDE,
     SkillAccessRule,
     SkillViewer,
     access_rule_for,
@@ -687,11 +687,13 @@ class SkillService:
         self.viewer = viewer
         # Hosted org mode only: the session whose org's skill_access rows say
         # who each skill is shared with (cowork.services.skill_access), read
-        # once per instance. Without one no row is known, and every skill
-        # reads as access_rule_for has a skill with none: its recorded
-        # creator's alone, or org-wide when it predates sharing.
+        # once per instance, after the org's skills from before sharing got
+        # theirs (backfill_legacy_access). Without one no row or creator is
+        # known, and every skill but a built-in reads as access_rule_for has
+        # a skill with neither: nobody's.
         self._session = session
         self._rows: dict[str, SkillAccess] | None = None
+        self._backfilled = False
         # The slugs the scope's person turned off for themselves
         # (cowork.services.skill_user_settings): given, as an in-process
         # turn reads them in its own unit of work, else read once from
@@ -737,22 +739,36 @@ class SkillService:
         if self._session is None or not self.org_sharing:
             return {}
         if self._rows is None:
-            from cowork.services.skill_access import access_rows
+            from cowork.services.skill_access import access_rows, backfill_legacy_access
 
+            if not self._backfilled:
+                backfill_legacy_access(
+                    self._session,
+                    lambda: [s.name for s in self.list_skills() if not is_builtin_skill(s.name)],
+                )
+                self._backfilled = True
             self._rows = access_rows(self._session)
         return self._rows
 
     def access_rule(self, skill: Skill) -> SkillAccessRule:
         """Who ``skill``, one of the store's own, is shared with in hosted org
-        mode: its skill_access row's rule (access_rule_for). A packaged
-        built-in is org-wide and never always on. The org's default team is
-        left as stored; SkillViewer.effective reads it as org-wide."""
+        mode, and who owns it: its skill_access row's rule, or with no row the
+        creator its SharedResourceAttribution records alone (access_rule_for).
+        A packaged built-in is org-wide and never always on. The org's default
+        team is left as stored; SkillViewer.effective reads it as org-wide."""
         if is_builtin_skill(skill.name):
-            return LEGACY_ORG_WIDE
-        return access_rule_for(self._access_rows().get(skill.name), skill)
+            return BUILTIN_ORG_WIDE
+        row = self._access_rows().get(skill.name)
+        if row is None and self._session is not None and self.org_sharing:
+            from cowork.services.shared_resources import SKILL, SharedResourceAccess
+
+            creator_id = SharedResourceAccess(self._session).creator_id(SKILL, skill.name)
+            return access_rule_for(None, creator_id)
+        return access_rule_for(row)
 
     def forget_access(self) -> None:
-        """Drop the rows read so far, after a change to them."""
+        """Drop the rows read so far: the next read asks the database again,
+        after a change to them or under a lock another change waited on."""
         self._rows = None
 
     def off_for_me(self) -> frozenset[str]:
@@ -988,16 +1004,13 @@ class SkillService:
         recorded: the changer's (cowork.creators.Changer.creator), never a
         value the caller passed.
 
-        In hosted org mode, the scope's person, in place of any creator an
-        uploaded SKILL.md claims. Who the skill is shared with is its
-        skill_access row's (the route writes it beside the skill, shared with
-        nobody); the creator recorded here is what tells a skill made since
-        sharing from one that predates it when no row is read
-        (cowork.services.skill_sharing.access_rule_for)."""
+        In hosted org mode, nothing, and any creator an uploaded SKILL.md
+        claims is dropped: the skill's owner is its skill_access row's
+        (the route writes it beside the skill) and its creator its
+        SharedResourceAttribution's, so a third copy in the file could only
+        disagree with them."""
         if self.org_sharing:
             metadata.pop(META_CREATED_BY, None)
-            if self._scope.user_id:
-                metadata[META_CREATED_BY] = self._scope.user_id
             return
         if self._changer is None:
             return

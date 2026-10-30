@@ -30,7 +30,7 @@ from cowork.db.scoped import (
     scope_from_principal,
 )
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
-from cowork.principal import Principal, get_principal, hub_credential
+from cowork.principal import Principal, caller_bearer, get_principal
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import RunHandle, TurnInProgress, registry
 from cowork.streaming.answers import SubmitResult, broker
@@ -238,7 +238,7 @@ async def responses(
     _refuse_while_answering(
         conversation=responses_request.conversation, scope=scope_from_principal(principal)
     )
-    handler = ResponsesHandler(principal=principal, hub_bearer=hub_credential(request))
+    handler = ResponsesHandler(principal=principal, hub_bearer=caller_bearer(request))
     if responses_request.cancel_on_disconnect:
         watch = DisconnectWatch(request.receive)
         try:

@@ -6,25 +6,49 @@ cowork.services.skill_sharing's). Every call takes the request's or the unit's
 ScopedSession, which keys the rows by the scope's org. Writes are staged and
 flushed, never committed: the caller commits them with the attribution and
 audit rows of the same change (cowork.services.shared_resources), or rolls
-them back with it.
+them back with it. The one exception is backfill_legacy_access, which commits
+in a session of its own.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session
+
 from cowork.db.scoped import ScopedSession
-from cowork.models.skill_access import SkillAccess
+from cowork.models.setting import Setting
+from cowork.models.shared_resource import SharedResourceAttribution
+from cowork.models.skill_access import OWNER_USER_ID_MAX_CHARS, SkillAccess
+from cowork.services.shared_resources import SKILL
 from cowork.services.skill_sharing import SkillAccessRule
+
+# The settings row that marks an org's skills from before sharing as given
+# their rows (backfill_legacy_access). In the database beside the rows it
+# vouches for, so the two share fate.
+BACKFILL_SETTING_KEY = "_skill_access_backfill_v1"
 
 
 def access_rows(session: ScopedSession) -> dict[str, SkillAccess]:
     """Every row of the scope's org, by skill slug: one query, for a listing
-    or a turn that reads many skills."""
-    return {row.skill_slug: row for row in session.exec(session.select(SkillAccess)).all()}
+    or a turn that reads many skills. Read from the database even when the
+    session already holds the rows, so a check made under a skill's lock sees
+    a change committed while it waited."""
+    return {
+        row.skill_slug: row
+        for row in session.exec(
+            session.select(SkillAccess).execution_options(populate_existing=True)
+        ).all()
+    }
 
 
 def access_row(session: ScopedSession, slug: str) -> SkillAccess | None:
+    """``slug``'s row, read from the database as access_rows reads them."""
     return session.exec(
-        session.select(SkillAccess).where(SkillAccess.skill_slug == slug)
+        session.select(SkillAccess)
+        .where(SkillAccess.skill_slug == slug)
+        .execution_options(populate_existing=True)
     ).first()
 
 
@@ -72,3 +96,88 @@ def stage_delete(session: ScopedSession, slug: str) -> None:
     if row is not None:
         session.delete(row)
         session.flush()
+
+
+def _backfilled(session: ScopedSession) -> bool:
+    return (
+        session.exec(
+            session.select(Setting).where(
+                Setting.key == BACKFILL_SETTING_KEY,
+                Setting.scope == "org",
+                Setting.org_id == session.scope.org_id,
+            )
+        ).first()
+        is not None
+    )
+
+
+def _insert_once(session: Session, row: Setting | SkillAccess) -> None:
+    """Insert ``row`` in its own transaction; a unique key that already holds
+    one (another replica's backfill, or a create that got there first) wins."""
+    try:
+        session.add(row)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+
+
+def backfill_legacy_access(session: ScopedSession, list_slugs: Callable[[], Iterable[str]]) -> None:
+    """Give every skill of the org's store that predates sharing its row,
+    once per org, before its rows are first read.
+
+    Each slug of ``list_slugs()`` with no row gets one shared org-wide (what
+    every member saw before sharing), owned by the creator its
+    SharedResourceAttribution names, or by nobody when it names none that
+    fits the column. A slug whose create is still in flight (a pending claim)
+    is left to that create, which commits its own row with the claim
+    (cowork.api.v1.endpoints.skills._record_new_skill), or to the recovery
+    that finalizes it after a crash (skills._recover_skill_claim), which
+    commits the same row. Then a settings row marks the org done. A folder
+    with no row after that, such as a skill a server from before sharing
+    created during the rollout, reads as its creator's alone, or as nobody's
+    with no creator (cowork.services.skill_sharing.access_rule_for).
+
+    Its writes commit in a session of its own, so the caller's unfinished
+    work is never committed with them, and each insert is its own
+    transaction, so two replicas backfilling one org at once write each row
+    once.
+    """
+    if _backfilled(session):
+        return
+    with Session(session.get_bind()) as raw:
+        own = ScopedSession(raw, session.scope)
+        if _backfilled(own):
+            return
+        stored = access_rows(own)
+        missing = [slug for slug in dict.fromkeys(list_slugs()) if slug not in stored]
+        claims: dict[str, SharedResourceAttribution] = {}
+        if missing:
+            claims = {
+                claim.resource_key: claim
+                for claim in own.exec(
+                    own.select(SharedResourceAttribution).where(
+                        SharedResourceAttribution.resource_kind == SKILL,
+                        SharedResourceAttribution.resource_key.in_(missing),
+                    )
+                ).all()
+            }
+        for slug in missing:
+            claim = claims.get(slug)
+            if claim is not None and claim.pending_claim_token:
+                continue
+            owner = claim.created_by_id if claim is not None else None
+            if owner and len(owner) > OWNER_USER_ID_MAX_CHARS:
+                owner = None
+            _insert_once(
+                raw,
+                SkillAccess(
+                    org_id=session.scope.org_id,
+                    skill_slug=slug,
+                    owner_user_id=owner,
+                    org_allowed=True,
+                ),
+            )
+        _insert_once(
+            raw,
+            Setting(key=BACKFILL_SETTING_KEY, value="1", scope="org", org_id=session.scope.org_id),
+        )

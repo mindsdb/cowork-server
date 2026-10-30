@@ -3,14 +3,15 @@
 In an org store every member reads one folder, so who each skill is shared
 with is recorded beside it, in the ``skill_access`` table
 (cowork.models.skill_access.SkillAccess, read and written through
-cowork.services.skill_access). Its names mirror auth's ArtifactAccess:
+cowork.services.skill_access). Its names mirror the auth service's ArtifactAccess:
 ``org_allowed``, ``allowed_team_ids`` and ``allowed_user_ids`` (Keycloak ids
 of people in the org). Nothing set is "only me".
 
 - Only me: the owner sees and changes it.
 - People: each one sees and uses it; only the owner changes it.
 - Team: every member of a team it's shared with sees it and changes it.
-- Org-wide: everyone sees and uses it; changing it takes ``skills.write_org``.
+- Org-wide: everyone sees and uses it; changing it takes being its owner or
+  ``skills.write_org``, and making a skill org-wide takes ``skills.share_org``.
 
 An org-wide or team skill is recalled on demand like any other unless it is
 marked ``always_on``, which puts it in every turn's prompt of the people it
@@ -18,31 +19,40 @@ reaches. Only such a skill keeps the mark (SkillAccessRule.normalized).
 
 An org admin (cowork.principal.can_manage_org) sees, changes and shares
 every skill on the skills page, but their turns use only what they'd see
-without the role (SkillViewer.for_turns). A skill with no row and no creator
-in its SKILL.md predates sharing and reads as org-wide, which is what every
-member saw before; one with no row but a recorded creator is that creator's
-alone (access_rule_for). Built-in and managed skills stay visible to everyone
-and read-only. Outside hosted org mode none of this applies: no viewer is
-built (resolve_skill_viewer) and the store behaves as it always has.
+without the role (SkillViewer.for_turns). Every skill of the store has a row:
+a new skill gets one with its folder, and a skill from before sharing gets
+one org-wide, owned by its recorded creator, the first time its org's rows
+are read (cowork.services.skill_access.backfill_legacy_access). A folder with
+no row after that is its recorded creator's alone, or nobody's when it has
+none, so only an admin sees it (access_rule_for).
+Built-in and managed skills stay visible to everyone and read-only. Outside
+hosted org mode none of this applies: no viewer is built
+(resolve_skill_viewer) and the store behaves as it always has.
 
-The org's default team (auth's ``is_default``) has the whole organization
-as its members, so it IS org-wide: a share naming it is stored as
-``org_allowed`` (and takes ``skills.share_org``), and a row that already
-lists it among its teams reads as org-wide (SkillViewer.effective).
+The org's default team (the auth service's ``is_default``) has the whole
+organization as its members, so it IS org-wide: a share naming it is stored
+as ``org_allowed`` (and takes ``skills.share_org``), and a row that already
+lists it among its teams reads as org-wide (SkillViewer.effective). Artifacts
+read it the same way (default_team_as_org).
 
-Teams come from auth per caller (cowork.services.hub_teams). When auth can't
-be asked, the caller is in no team: they see their own, org-wide and
-people-shared skills, never one shared only with a team. That fails closed.
+Teams come from the auth service per caller (cowork.services.hub_teams). When
+it can't be asked, the caller is in no team: they see their own, org-wide and
+people-shared skills, never one shared only with a team. That fails closed. A
+change whose answer rests on what it couldn't be asked is a 503
+``hub_unavailable`` (HubUnavailable), never a 403 that blames the caller.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
+
+from fastapi import HTTPException, Request, status
 
 from cowork.db.scoped import TenantScope
-from cowork.principal import Principal, can_manage_org
+from cowork.principal import Principal, can_manage_org, caller_bearer
+from cowork.services.hub_people import org_members_by_ids
 from cowork.services.hub_teams import (
     SKILLS_SHARE_ORG,
     SKILLS_WRITE_ORG,
@@ -50,15 +60,80 @@ from cowork.services.hub_teams import (
 )
 
 if TYPE_CHECKING:
-    from cowork.models.skill import Skill
     from cowork.models.skill_access import SkillAccess
 
 SkillSection = Literal["mine", "shared_with_me", "team", "org"]
 
-_MAX_PEOPLE = 200
-_MAX_TEAMS = 100
+# The most people and teams one skill or artifact is shared with by id: the
+# auth service's own bound on an artifact's rule, so a share it would refuse
+# is refused here first, before anything is published.
+MAX_SHARED_PEOPLE = 100
+MAX_SHARED_TEAMS = 100
+# The most addresses one save of an artifact's share may ask the auth service
+# to email: its own bound. The ids it emails are bound by MAX_SHARED_PEOPLE.
+MAX_NOTIFY_EMAILS = 100
 # A Keycloak id or a team id is a UUID; this only bounds what is stored.
 _MAX_ID_CHARS = 64
+
+HUB_UNAVAILABLE = "hub_unavailable"
+TEAMS_UNREACHABLE = "Couldn't reach MindsHub to confirm your teams. Try again in a moment."
+PERMISSIONS_UNREACHABLE = "Couldn't reach MindsHub to confirm your permissions. Try again in a moment."
+PEOPLE_UNREACHABLE_REFUSAL = (
+    "Couldn't reach MindsHub to confirm who is in your organization. Try again in a moment."
+)
+
+
+class HubUnavailable(HTTPException):
+    """503 ``hub_unavailable``: a sharing change needs an answer the auth
+    service couldn't give (the caller's teams, permissions or org members).
+    Retryable, and never the 403 that would tell the caller they lack a
+    permission they may hold."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": HUB_UNAVAILABLE, "message": message},
+        )
+
+
+# Which of some Keycloak user ids (lowercased) are members of the caller's
+# active org, or None when the auth service couldn't be asked
+# (cowork.services.hub_people.org_members_by_ids).
+OrgMemberLookup = Callable[[Iterable[str]], Awaitable[frozenset[str] | None]]
+
+
+def get_org_member_lookup(request: Request) -> OrgMemberLookup:
+    """The org membership check, asked with the Authorization the gateway
+    validated (cowork.principal.caller_bearer)."""
+    bearer_token = caller_bearer(request)
+
+    async def lookup(ids: Iterable[str]) -> frozenset[str] | None:
+        members = await org_members_by_ids(bearer_token=bearer_token, ids=ids)
+        if members is None:
+            return None
+        return frozenset(m.id.strip().lower() for m in members)
+
+    return lookup
+
+
+async def members_checked(
+    members: OrgMemberLookup, *, added: Iterable[str], kept: Iterable[str] = (), refusal: str
+) -> frozenset[str]:
+    """The org members among ``added`` and ``kept``, asked in one batched
+    lookup (the auth service's ``?ids=``), for a skill or an artifact a save
+    shares with people. 400 naming every added id outside the org, after
+    ``refusal``; 503 ``hub_unavailable`` while the lookup can't be asked. A
+    kept id the answer leaves out is the caller's to drop."""
+    added = list(added)
+    found = await members([*added, *kept])
+    if found is None:
+        raise HubUnavailable(PEOPLE_UNREACHABLE_REFUSAL)
+    outside = [u for u in added if u not in found]
+    if outside:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"{refusal}: {', '.join(outside)}"
+        )
+    return found
 
 
 def sharing_applies(scope: TenantScope | None) -> bool:
@@ -98,32 +173,55 @@ class SkillAccessRule:
 
     def with_default_team_as_org(self, default_team_id: str) -> SkillAccessRule:
         """The org's default team named among the teams means org-wide: drop
-        it from the teams and set ``org_allowed``."""
-        if not default_team_id or default_team_id not in self.allowed_team_ids:
+        it from the teams and set ``org_allowed`` (default_team_as_org)."""
+        teams = default_team_as_org(self.allowed_team_ids, default_team_id)
+        if not teams.named_default:
             return self
-        return replace(
-            self,
-            org_allowed=True,
-            allowed_team_ids=tuple(t for t in self.allowed_team_ids if t != default_team_id),
-        )
+        return replace(self, org_allowed=True, allowed_team_ids=teams.team_ids)
 
 
-# Everyone, on demand: a skill that predates sharing, and a packaged built-in.
-LEGACY_ORG_WIDE = SkillAccessRule(org_allowed=True)
+class TeamsWithoutDefault(NamedTuple):
+    """Teams a share names, the org's default team taken out
+    (default_team_as_org)."""
+
+    team_ids: tuple[str, ...]
+    # Whether the share named the default team: sharing org-wide.
+    named_default: bool
 
 
-def access_rule_for(row: SkillAccess | None, skill: Skill) -> SkillAccessRule:
-    """``skill``'s access: its row's, else org-wide when its SKILL.md records
-    no creator (a skill from before sharing: what every member saw then),
-    else its creator's alone."""
+def default_team_as_org(team_ids: Iterable[str], default_team_id: str) -> TeamsWithoutDefault:
+    """``team_ids`` without the org's default team, and whether they named
+    it. Its members are the whole organization, so naming it is sharing
+    org-wide (``org_allowed``), for a skill and an artifact alike. Nothing
+    is dropped while the default team is unknown (``default_team_id``
+    empty)."""
+    teams = tuple(team_ids)
+    if not default_team_id or default_team_id not in teams:
+        return TeamsWithoutDefault(team_ids=teams, named_default=False)
+    return TeamsWithoutDefault(team_ids=tuple(t for t in teams if t != default_team_id), named_default=True)
+
+
+# Everyone, on demand: a packaged built-in, which has no row.
+BUILTIN_ORG_WIDE = SkillAccessRule(org_allowed=True)
+
+
+def access_rule_for(row: SkillAccess | None, creator_id: str | None = None) -> SkillAccessRule:
+    """A skill's access: its row's. Every skill from before sharing got its
+    row from the backfill (cowork.services.skill_access.backfill_legacy_access)
+    and a new skill gets one when its create commits, so a folder with no row
+    is one a server from before sharing created during the rollout, a create
+    still in flight or cut short by a crash, or one written around the API.
+    With no row it is shared with nobody but ``creator_id``, the creator its
+    SharedResourceAttribution records: the row its create commits, or would
+    have. With neither it is nobody's, so only an admin sees it."""
     if row is not None:
         return SkillAccessRule.from_row(row)
-    if skill.created_by:
-        return SkillAccessRule(owner_user_id=skill.created_by)
-    return LEGACY_ORG_WIDE
+    return SkillAccessRule(owner_user_id=creator_id)
 
 
-def _normalize_ids(values: Iterable[str], *, what: str, most: int) -> tuple[str, ...]:
+def _normalize_ids(
+    values: Iterable[str], *, what: str, plural: str, most: int, subject: str
+) -> tuple[str, ...]:
     seen: dict[str, None] = {}
     for raw in values:
         value = str(raw).strip()
@@ -133,22 +231,29 @@ def _normalize_ids(values: Iterable[str], *, what: str, most: int) -> tuple[str,
             raise ValueError(f"{raw!r} is not a valid {what} id.")
         seen.setdefault(value, None)
     if len(seen) > most:
-        raise ValueError(f"A skill can be shared with at most {most} {what}s.")
+        raise ValueError(f"{subject[:1].upper()}{subject[1:]} can be shared with at most {most} {plural}.")
     return tuple(seen)
 
 
-def normalize_team_ids(values: Iterable[str]) -> tuple[str, ...]:
-    """Stripped and deduplicated in first-seen order; a malformed id is a
-    ValueError naming it."""
-    return _normalize_ids(values, what="team", most=_MAX_TEAMS)
+def normalize_team_ids(values: Iterable[str], *, subject: str = "a skill") -> tuple[str, ...]:
+    """Stripped and deduplicated in first-seen order; a malformed id, or more
+    than MAX_SHARED_TEAMS, is a ValueError saying so about ``subject`` ("a
+    skill", "an artifact")."""
+    return _normalize_ids(
+        values, what="team", plural="teams", most=MAX_SHARED_TEAMS, subject=subject
+    )
 
 
-def normalize_user_ids(values: Iterable[str]) -> tuple[str, ...]:
+def normalize_user_ids(values: Iterable[str], *, subject: str = "a skill") -> tuple[str, ...]:
     """Keycloak user ids, stripped, lowercased (a UUID's canonical form, as
-    the gateway forwards ``sub``) and deduplicated in first-seen order."""
+    the gateway forwards ``sub``) and deduplicated in first-seen order; more
+    than MAX_SHARED_PEOPLE is a ValueError saying so about ``subject``."""
     return tuple(
         dict.fromkeys(
-            v.lower() for v in _normalize_ids(values, what="person", most=_MAX_PEOPLE)
+            v.lower()
+            for v in _normalize_ids(
+                values, what="person", plural="people", most=MAX_SHARED_PEOPLE, subject=subject
+            )
         )
     )
 
@@ -160,14 +265,19 @@ class SkillViewer:
     user_id: str | None
     email: str = ""
     team_ids: frozenset[str] = frozenset()
-    # False when auth couldn't list the caller's teams: then team_ids is empty
-    # and no team-only skill is visible (fail closed).
+    # False when the auth service couldn't list the caller's teams: then
+    # team_ids is empty and no team-only skill is visible (fail closed).
     teams_known: bool = False
     is_admin: bool = False
     # Both already true for an admin.
     can_share_org: bool = False
     can_write_org: bool = False
-    # The org's default team (whole-org membership), when auth named one.
+    # False when the auth service couldn't list the caller's permissions:
+    # then both capabilities read false, and a refusal that rests on them is
+    # a 503 (HubUnavailable), not a 403.
+    permissions_known: bool = False
+    # The org's default team (whole-org membership), when the auth service
+    # named one.
     default_team_id: str = ""
 
     def effective(self, rule: SkillAccessRule) -> SkillAccessRule:
@@ -202,19 +312,30 @@ class SkillViewer:
         return replace(self, is_admin=False) if self.is_admin else self
 
     def can_edit(self, rule: SkillAccessRule) -> bool:
-        """Change the content, enable or disable, rename or delete. Org-wide
-        takes skills.write_org, even for its owner; a team member changes a
-        skill shared with their team; people-shared recipients read only."""
-        if self.is_admin:
+        """Change the content, enable or disable, rename or delete. Its owner
+        always may, org-wide or not; anyone else needs skills.write_org for
+        an org-wide skill, or to be a member of a team a team skill is shared
+        with; people-shared recipients read only."""
+        if self.is_admin or self.owns(rule.owner_user_id):
             return True
         rule = self.effective(rule)
         if rule.org_allowed:
             return self.can_write_org
-        return self.owns(rule.owner_user_id) or self.in_team_of(rule)
+        return self.in_team_of(rule)
+
+    def unsure_of(self, rule: SkillAccessRule) -> bool:
+        """Whether a can_edit refusal of ``rule`` rests on what the auth
+        service couldn't be asked: the caller's permissions for an org-wide
+        skill, or their teams for a team one."""
+        rule = self.effective(rule)
+        if rule.org_allowed:
+            return not self.permissions_known
+        return bool(rule.allowed_team_ids) and not self.teams_known
 
     def can_manage_sharing(self, rule: SkillAccessRule) -> bool:
-        """Change who a skill is shared with: its owner or an admin. Whether
-        they may also set or clear org-wide is can_share_org's question."""
+        """Change who a skill is shared with, taking it back from everyone
+        included: its owner or an admin. Whether they may also make it
+        org-wide is can_share_org's question."""
         return self.is_admin or self.owns(rule.owner_user_id)
 
     def section(self, rule: SkillAccessRule) -> SkillSection:
@@ -245,10 +366,13 @@ async def resolve_skill_viewer(
 ) -> SkillViewer | None:
     """The caller as skill sharing sees them, or None outside hosted org mode.
 
-    Teams and permissions are read from auth with the caller's own bearer
-    (cowork.principal.hub_credential), cached per caller. Admin standing is
-    the gateway's forwarded role, the same check every shared resource uses
-    (cowork.services.shared_resources.SharedResourceAccess.is_admin).
+    Teams and permissions are read from the auth service with
+    ``bearer_token``, cached per caller. Callers pass the Authorization the
+    gateway validated (cowork.principal.caller_bearer), never the client-set
+    X-MindsHub-Authorization: the auth service answers for whichever org that
+    credential belongs to, and its answer carries no org to check it against.
+    Admin standing is the gateway's forwarded role, the same check every
+    shared resource uses (cowork.services.shared_resources.SharedResourceAccess.is_admin).
     """
     if not sharing_applies(scope):
         return None
@@ -269,5 +393,6 @@ async def resolve_skill_viewer(
         is_admin=is_admin,
         can_share_org=is_admin or SKILLS_SHARE_ORG in permissions.permissions,
         can_write_org=is_admin or SKILLS_WRITE_ORG in permissions.permissions,
+        permissions_known=is_admin or permissions.reachable,
         default_team_id=teams.default_team_id,
     )

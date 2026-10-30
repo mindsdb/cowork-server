@@ -201,7 +201,12 @@ async def test_new_artifact_is_published_owner_only(base, enabled, key, publishe
 async def test_republish_keeps_the_access_the_owner_chose(base, enabled, key, published):
     """Re-applying the first-publish default here would silently revoke a share
     every time the agent touched the artifact — which would make the Share
-    control untrustworthy rather than merely incomplete (ENG-2316)."""
+    control untrustworthy rather than merely incomplete (ENG-2316).
+
+    The re-publish keeps the restricted mode and names nobody: who the
+    artifact is shared with is read from the auth service's rule by the
+    publish itself (cowork.services.publish._plan_access), never taken from
+    the entry, which an agent can write (ENG-3787)."""
     folder = _make(base, "rep", files={"index.html": "<html>v2</html>"},
                    meta={"slug": "rep", "type": "html-app"})
     (folder / ".published.json").write_text(json.dumps({
@@ -217,10 +222,7 @@ async def test_republish_keeps_the_access_the_owner_chose(base, enabled, key, pu
     out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == {"rep"}
-    assert published[0]["access"] == {
-        "mode": "restricted", "emails": ["someone@example.com"],
-        "org_allowed": False, "owner_only": False,
-    }
+    assert published[0]["access"] == {"mode": "restricted", "owner_only": True}
 
 
 async def test_republish_of_an_owner_only_artifact_stays_owner_only(base, enabled, key, published):

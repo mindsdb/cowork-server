@@ -22,8 +22,8 @@ class SkillCreateRequest(CamelRequest):
 class SkillSharingRequest(CamelRequest):
     """Who one skill is shared with.
 
-    Hosted org mode (ENG-3787) reads the skill's access, named as auth's
-    ArtifactAccess names it: ``org_allowed`` (everyone in the org),
+    Hosted org mode (ENG-3787) reads the skill's access, named as the auth
+    service's ArtifactAccess names it: ``org_allowed`` (everyone in the org),
     ``allowed_team_ids``, ``allowed_user_ids`` (Keycloak ids of people in the
     org) and ``always_on`` (put an org-wide or team skill in every turn's
     prompt instead of recalling it on demand). Each is accepted in camelCase

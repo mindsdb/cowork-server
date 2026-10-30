@@ -426,13 +426,16 @@ class SharedResourceAccess:
         key: str,
         *,
         resource_exists: Callable[[], bool],
+        on_finalize: Callable[[str], None] | None = None,
     ) -> bool:
         """Recover a crashed filesystem claim after its bounded lease expires.
 
         An empty resource releases the key for a new first writer. If bytes
         exist, finalize with the reserved actor snapshot and a recovery action.
         This preserves an actor for every surviving mutation even though the
-        originating process died before its audit commit.
+        originating process died before its audit commit. ``on_finalize``,
+        given that actor, stages what the create would have committed with
+        its claim, so it commits with the finalize.
         """
         if not self.org_mode:
             return False
@@ -480,6 +483,8 @@ class SharedResourceAccess:
                     "recover",
                     actor_id=current.created_by_id,
                 )
+                if on_finalize is not None:
+                    on_finalize(current.created_by_id)
             else:
                 self.session.delete(current)
             self.session.commit()

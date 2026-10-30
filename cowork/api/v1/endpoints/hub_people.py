@@ -1,17 +1,19 @@
-"""GET /hub/people/ — the people in the caller's MindsHub organization.
+"""GET /hub/people/: the people in the caller's MindsHub organization.
 
-Two reads (ENG-3787), both of auth's ``GET /v1/me/org-members/`` with the
-caller's own bearer (cowork.services.hub_people):
+Two reads (ENG-3787), both of the auth service's ``GET /v1/me/org-members/``
+with the Authorization the gateway validated (cowork.principal.caller_bearer),
+never the client-set X-MindsHub-Authorization, which could name another org's
+members (cowork.services.hub_people):
 
-- no params: the whole org directory (capped by auth, ``truncated`` passed
-  through), the caller excluded, cached per caller for five minutes. What the
-  share dialog loads once and filters locally.
+- no params: the whole org directory (capped by the auth service,
+  ``truncated`` passed through), the caller excluded, read uncached. What the share dialog loads
+  once, keeps and filters locally.
 - ``?ids=a,b``: the members among those Keycloak user ids, with names and
   addresses, so the app can name the ids a skill's access stores. Uncached.
 
 Outside org mode there is no organization to read, so the answer is empty
-and reachable. A caller auth refuses (not a current member of the active
-org) is answered ``reachable: false``.
+and reachable. A caller the auth service refuses (not a current member of
+the active org) is answered ``reachable: false``.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.principal import hub_credential
+from cowork.principal import caller_bearer
 from cowork.schemas.hub_people import HubPeopleView, HubPersonRow
 from cowork.services.hub_people import (
     MAX_IDS_PER_LOOKUP,
@@ -30,8 +32,8 @@ from cowork.services.hub_people import (
     org_members_by_ids,
 )
 
-# Gated as the hub teams router is: auth answers per caller, and refuses an
-# absent or invalid credential on its own.
+# Gated as the hub teams router is: the auth service answers per caller, and
+# refuses an absent or invalid credential on its own.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
@@ -48,18 +50,14 @@ async def get_hub_people(
         return HubPeopleView(reachable=True, truncated=False)
     wanted = [part for part in (p.strip() for p in ids.split(",")) if part]
     if wanted:
-        members = await org_members_by_ids(bearer_token=hub_credential(request), ids=wanted)
+        members = await org_members_by_ids(bearer_token=caller_bearer(request), ids=wanted)
         return HubPeopleView(
             reachable=members is not None,
             people=[
                 HubPersonRow(id=p.id, name=p.name, email=p.email) for p in members or ()
             ],
         )
-    directory = await list_org_directory(
-        bearer_token=hub_credential(request),
-        org_id=scope.org_id or "",
-        user_id=scope.user_id or "",
-    )
+    directory = await list_org_directory(bearer_token=caller_bearer(request))
     return HubPeopleView(
         reachable=directory.reachable,
         people=[

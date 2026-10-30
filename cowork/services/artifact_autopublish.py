@@ -18,12 +18,17 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from uuid import UUID
 
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
-from cowork.services.publish import PublishOwnedByOtherUser, PublishRejected, PublishTooLarge, publish_artifact
+from cowork.services.publish import (
+    PublishOwnedByOtherUser,
+    PublishRejected,
+    PublishTooLarge,
+    kept_access,
+    publish_artifact,
+)
 
 if TYPE_CHECKING:
     from cowork.services.artifact_ownership import OwnerResolution
@@ -79,15 +84,15 @@ def _access_for(decision: PublishDecision) -> dict:
     revoke a share every time the agent touched the artifact, which is the whole
     reason the Share control would otherwise be untrustworthy (ENG-2316).
 
-    `access_from_owner_side` is the canonical reconstruction, and it carries
-    `owner_only` for exactly this reason: without that key an owner-only entry
-    rebuilds as an empty selection and degrades to public.
+    `kept_access` is the canonical reconstruction, and it carries `owner_only`
+    for exactly this reason: without that key an owner-only entry rebuilds as
+    an empty selection and degrades to public. This path is hosted org mode
+    only, so a restricted artifact's audience comes from the auth service's
+    rule, which publish_artifact reads; a failed read fails this publish.
     """
-    from anton.publish_access import access_from_owner_side
-
     if not decision.published_entry:
         return dict(AUTOPUBLISH_ACCESS)
-    return access_from_owner_side(decision.published_entry)
+    return kept_access(decision.published_entry, org_mode=True)
 
 
 def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
@@ -375,7 +380,9 @@ async def _publish_one(
         # "next turn retries" promise.
         release(artifacts_base, slug)
         _record("failed", slug=slug, error=type(exc).__name__)
-        # publish_artifact has already logged a PublishRejected's traceback.
+        # publish_artifact already logged every PublishRejected: an upload
+        # failure with its traceback, and an AccessModeChanged refusal as a
+        # warning with its reason, which needs none.
         logger.warning(
             "artifact autopublish failed for %s", slug, exc_info=not isinstance(exc, PublishRejected),
         )

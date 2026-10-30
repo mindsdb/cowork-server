@@ -103,9 +103,40 @@ def _request_wire_size(params: dict) -> int:
     return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
 
 
+def _shed_skills(params: dict, size: int, budget: int, *, always_on: bool) -> int:
+    """Drop the skills block's on-demand skills (or, with ``always_on``, its
+    always-on ones) one at a time from the end of the block until the request
+    fits; the request's size after. The block holds the always-on skills
+    first, org-wide ones before team ones, then the on-demand ones by slug
+    (cowork.services.skills.build_turn_skills), so the on-demand skills go
+    in reverse slug order, and the always-on ones team skills first. The
+    block itself stays, empty at worst: it is the pod's whole recallable
+    set, so a turn that sheds skills has fewer, never the whole skills
+    volume."""
+    skills = params.get("skills")
+    if size <= budget or not isinstance(skills, dict):
+        return size
+    skills = params["skills"] = dict(skills)
+    ranked = [
+        slug for slug, entry in skills.items()
+        if bool(isinstance(entry, dict) and entry.get("always_on")) is always_on
+    ]
+    for slug in reversed(ranked):
+        if size <= budget:
+            break
+        # The entry's own bytes, ``"slug":{...}``, and the comma before or
+        # after it when another entry is left.
+        entry_bytes = _request_wire_size({slug: skills.pop(slug)}) - 2
+        size -= entry_bytes + (1 if skills else 0)
+    return size
+
+
 def _fit_request(params: dict, conversation_id: str) -> dict:
-    """Drop project memory first, then on-demand skills, then always-on
-    ones, then warn if the request still will not fit.
+    """Shed what is optional until the request fits, least needed first: the
+    skills recalled on demand, one at a time from the end of the block, which
+    orders them by slug; then project memory; then the always-on skills one
+    at a time, team ones before org-wide ones (_shed_skills). Then warn if
+    the request still will not fit.
 
     Personal/global memory lives on read-only mounts. Project memory
     does not: the worker mounts only this conversation's workspace, so its two
@@ -118,31 +149,24 @@ def _fit_request(params: dict, conversation_id: str) -> dict:
     windowing remains the upstream fix for that required-payload case.
     """
     budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
-    size = _request_wire_size(params)
+    size = original = _request_wire_size(params)
+    skill_count = len(params["skills"]) if isinstance(params.get("skills"), dict) else 0
+    size = _shed_skills(params, size, budget, always_on=False)
     if size > budget and params.pop("memory", None) is not None:
         logger.warning(
             "[producer] dropped project memory from turn %s: request line was "
             "%d bytes, over the %d-byte cap",
             conversation_id,
-            size,
+            original,
             budget,
         )
         size = _request_wire_size(params)
-    skills = params.get("skills")
-    if size > budget and isinstance(skills, dict) and skills:
-        # Then the skills recalled on demand, and only then the always-on
-        # ones. The block itself stays, empty at worst: it is the pod's whole
-        # recallable set, so a turn that sheds skills has fewer, never the
-        # whole skills volume.
-        kept = {slug: entry for slug, entry in skills.items() if isinstance(entry, dict) and entry.get("always_on")}
-        params["skills"] = kept
-        if kept and _request_wire_size(params) > budget:
-            params["skills"] = {}
+    size = _shed_skills(params, size, budget, always_on=True)
+    if isinstance(params.get("skills"), dict) and len(params["skills"]) < skill_count:
         logger.warning(
             "[producer] shed skills from turn %s: request line was %d bytes, over the %d-byte cap",
-            conversation_id, size, budget,
+            conversation_id, original, budget,
         )
-        size = _request_wire_size(params)
     if size > budget:
         logger.warning(
             "[producer] turn %s request line is %d bytes, over the %d-byte cap; "

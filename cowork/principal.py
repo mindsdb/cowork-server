@@ -299,6 +299,24 @@ def hub_credential(request: Request | None) -> str:
     accepting an identity from one would not be. A caller can present their own
     token or a useless one; neither buys them anything they did not already have.
 
+    **Never for skill or artifact sharing.** The caller can present a
+    credential from another organization of theirs, and the service answers
+    for that organization: its permissions, teams and members. Sharing's reads
+    (skill sharing's viewer, the people and teams a share may name) take
+    ``caller_bearer``, the Authorization the gateway validated and took the
+    request's scope from. Three routes still take this credential: the
+    workspace selector's ``GET /hub/workspaces/`` and ``PUT
+    /hub/workspaces/active`` (cowork.api.v1.endpoints.hub_workspaces), and
+    ``GET /hub/usage/``. ``PUT /active`` (set_active_hub_workspace) answers
+    403 for a workspace missing from the listing this credential returns,
+    so that listing decides what it stores. The pick it stores grants
+    nothing: the menu shows it only while the listing has it
+    (cowork.services.hub_workspaces.resolve_active), and every key mint
+    sends it for the gateway's user and organization, where the auth service
+    refuses a workspace they hold no grant on and the mint falls back to the
+    default workspace and clears the pick
+    (cowork.turnqueue.auth_keys._request_turn_key).
+
     Deliberately separate from ``caller_bearer``. Folding the header preference
     into that one would let any client steer the credential on the org model
     catalog fetch too, which reads ``Authorization`` because in org mode the

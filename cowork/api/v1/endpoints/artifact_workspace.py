@@ -7,9 +7,10 @@ import mimetypes
 import os
 import stat
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
 from urllib.parse import quote
 from uuid import UUID
 
@@ -70,6 +71,9 @@ from cowork.services.artifact_revisions import (
     revision_with_content,
     save_source,
 )
+
+if TYPE_CHECKING:
+    from cowork.services.artifact_access import ArtifactRule
 
 logger = logging.getLogger(__name__)
 
@@ -462,6 +466,7 @@ async def _sync_live_artifact(
     the artifact's modified state visible for a manual retry.
     """
     from cowork.services.publish import (
+        AccessModeChanged,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         desktop_publish_credential,
@@ -478,12 +483,18 @@ async def _sync_live_artifact(
     key = None
     publish_abandoned = False
     publish_started = False
+    scope = getattr(session, "scope", None)
+    org_mode = scope is not None and getattr(scope, "org_mode", False)
     try:
         try:
+            # In hosted org mode who a restricted artifact is shared with is
+            # read from the auth service's rule by the publish itself, and a
+            # failed read fails this sync rather than guessing.
             access = await run_in_threadpool(
                 published_artifact_access,
                 folder,
                 artifacts_base=artifacts_base,
+                org_mode=org_mode,
             )
         except FileNotFoundError:
             return None
@@ -491,8 +502,7 @@ async def _sync_live_artifact(
             logger.warning("Could not read live publish state for %s", folder, exc_info=True)
             return False
 
-        scope = getattr(session, "scope", None)
-        if scope is not None and getattr(scope, "org_mode", False):
+        if org_mode:
             artifacts_base, publish_url, key = _owner_publish_context(session, folder)
             api_key = await key.get()
             if not api_key:
@@ -533,6 +543,10 @@ async def _sync_live_artifact(
     except PublishTooLarge:
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
+        return False
+    except AccessModeChanged:
+        # publish_artifact logged the refusal. It repeats on every save until
+        # the owner saves the artifact's sharing again.
         return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
@@ -802,89 +816,165 @@ class _AccessBody(BaseModel):
     schema (`{"mode": "public"}`, `{"mode": "password", "password": ...}`,
     `{"mode": "restricted", "allowed_emails": [...], "org_allowed": bool,
     "owner_only": bool}`) and validates it, so a second definition here could
-    only drift away from it. A restricted audience uses auth's ArtifactAccess
-    names (ENG-3787): `org_allowed`, `allowed_emails` (people outside the
-    org, by address; anton's `emails`, cowork.services.publish.access_from_app),
-    and in hosted org mode `allowed_team_ids` and `allowed_user_ids`
-    (Keycloak ids of people in the org), which this server writes to auth
-    itself (cowork.services.publish._sync_team_audience). The retired names
-    `emails`, `team_ids` and `org_wide` are a 400. Teams or people alone keep
-    the rule restricted to them, never public. `notify: {user_ids, emails}`
-    names the people this save added and chose to tell; auth emails them. It
-    applies to this save only and is never stored.
+    only drift away from it. A restricted audience uses the auth service's
+    ArtifactAccess names (ENG-3787): `org_allowed`, `allowed_emails` (people
+    outside the org, by address; anton's `emails`,
+    cowork.services.publish.access_from_app), and in hosted org mode
+    `allowed_team_ids` and `allowed_user_ids` (Keycloak ids of people in the
+    org), which this server writes to the auth service itself
+    (cowork.services.publish._sync_team_audience). In hosted org mode a field
+    a restricted save leaves out keeps what the auth service's rule holds.
+    The retired names `emails`, `team_ids` and `org_wide` are a 400. Teams or
+    people alone keep the rule restricted to them, never public. `notify:
+    {user_ids, emails}` names the people this save added and chose to tell;
+    the auth service emails them. It applies to this save only and is never
+    stored.
     """
 
     access: dict
 
 
-async def _checked_team_audience(access: dict, *, request: Request, session) -> dict:
-    """``access`` with its ``allowed_team_ids`` normalized and each one checked
-    to be a team the caller belongs to (an org admin may name any). 503 while
-    auth can't list the caller's teams, 400 for one they aren't in. The org's
-    default team is dropped from ``allowed_team_ids`` and sets
-    ``org_allowed``: its members are the whole organization.
-    ``allowed_user_ids`` is normalized and passed through: that each is a
-    member of the org is auth's check, on the write
-    (cowork.services.artifact_access.sync_artifact_team_access).
+# Sharing an artifact with everyone takes what sharing a skill with everyone
+# takes (cowork.api.v1.endpoints.skills.SHARING_ORG_REFUSAL).
+ARTIFACT_ORG_REFUSAL = (
+    "Sharing an artifact with everyone in the organization requires the skills.share_org "
+    "permission or an organization admin."
+)
 
-    Outside hosted org mode ``access`` is returned as it is: there are no
-    teams or org members there, and publish._with_team_audience drops them,
-    keeping a rule that named them restricted to its owner."""
-    from cowork.principal import can_manage_org, get_principal, hub_credential
-    from cowork.services.hub_teams import fetch_hub_teams
-    from cowork.services.skill_sharing import normalize_team_ids, normalize_user_ids
 
-    if not session.scope.org_mode:
-        return access
-    if "allowed_user_ids" in access:
-        raw_people = access.get("allowed_user_ids") or []
-        if not isinstance(raw_people, list):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="allowed_user_ids must be a list."
-            )
-        try:
-            access = {**access, "allowed_user_ids": list(normalize_user_ids(raw_people))}
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    if "allowed_team_ids" not in access:
-        return access
-    raw = access.get("allowed_team_ids") or []
+OWN_EMAIL_REFUSAL = "Your own email address can't be added: you can always open your own artifact."
+
+
+def _id_list(access: dict, key: str) -> list:
+    raw = access.get(key) or []
     if not isinstance(raw, list):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="allowed_team_ids must be a list."
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{key} must be a list.")
+    return raw
+
+
+class CheckedAccess(NamedTuple):
+    """A save's access after _checked_team_audience, and the artifact's
+    rule it was checked against: None when the check didn't read it."""
+
+    access: dict
+    stored: ArtifactRule | None = None
+
+
+async def _checked_team_audience(
+    access: dict, *, request: Request, session, stored_rule: Callable[[], Awaitable[ArtifactRule]]
+) -> CheckedAccess:
+    """``access``, a restricted save of the share dialog, checked against the
+    caller and against the artifact's rule as the auth service stores it
+    (``stored_rule``, read only when the save names teams, people or the org
+    flag), the one record of who the artifact is shared with. What the
+    artifact's .published.json says decides nothing: an agent can write it.
+    The rule it read comes back with the access, so the publish plans
+    against the same rule (publish_artifact's ``stored``).
+
+    - The caller's own address among the emails is a 400.
+    - Teams and people are normalized, at most MAX_SHARED_TEAMS and
+      MAX_SHARED_PEOPLE each (400), before anything is published.
+    - The org's default team is never sent: naming it sets ``org_allowed``
+      (skill_sharing.default_team_as_org). While the caller's teams can't be
+      read the default team can't be told apart, so a save that adds a team
+      is a 503 ``hub_unavailable``, an admin's included.
+    - ``org_allowed`` the stored rule doesn't have takes ``skills.share_org``
+      (403), as making a skill org-wide does. An owner without it can still
+      save an artifact that is already org-wide.
+    - A team the stored rule doesn't have must be one the caller belongs to
+      (400; an org admin may name any). A team it has is kept unchecked: the
+      auth service drops a deleted team's id from every rule itself.
+    - When the save changes the people, each one it names is asked about in
+      one batched org-member lookup (503 while it can't be asked). One the
+      stored rule doesn't have must be a member (400 naming them). One it
+      has who has left the org is dropped: the auth service keeps a departed
+      person's id on the rule and refuses it on the next write.
+
+    The caller's teams and permissions, and the org's members, are read with
+    the Authorization the gateway validated (cowork.principal.caller_bearer).
+
+    Outside hosted org mode, and for a save that isn't restricted, ``access``
+    is returned as it is: there are no teams or org members there, and
+    publish._with_team_audience keeps a rule that names them restricted to
+    its owner."""
+    from cowork.principal import caller_bearer, get_principal
+    from cowork.services.artifact_access import NOT_A_MEMBER_REFUSAL
+    from cowork.services.skill_sharing import (
+        PERMISSIONS_UNREACHABLE,
+        TEAMS_UNREACHABLE,
+        HubUnavailable,
+        default_team_as_org,
+        get_org_member_lookup,
+        members_checked,
+        normalize_team_ids,
+        normalize_user_ids,
+        resolve_skill_viewer,
+    )
+
+    if not session.scope.org_mode or access.get("mode") != "restricted":
+        return CheckedAccess(access)
+    out = dict(access)
+    principal = get_principal(request)
+    own_email = (principal.email if principal is not None else "").strip().lower()
+    if own_email and own_email in {str(e).strip().lower() for e in out.get("emails") or []}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=OWN_EMAIL_REFUSAL)
     try:
-        team_ids = list(normalize_team_ids(raw))
+        team_ids = (
+            list(normalize_team_ids(_id_list(out, "allowed_team_ids"), subject="an artifact"))
+            if "allowed_team_ids" in out
+            else []
+        )
+        user_ids = (
+            list(normalize_user_ids(_id_list(out, "allowed_user_ids"), subject="an artifact"))
+            if "allowed_user_ids" in out
+            else []
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    if not team_ids:
-        return {**access, "allowed_team_ids": team_ids}
-    is_admin = can_manage_org(get_principal(request))
-    listing = await fetch_hub_teams(
-        bearer_token=hub_credential(request),
-        org_id=session.scope.org_id or "",
-        user_id=session.scope.user_id or "",
-    )
-    if not listing.reachable and not is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Couldn't reach MindsHub to confirm your teams. Try again in a moment.",
-        )
-    out = dict(access)
-    # The org's default team has everyone in the org as members: naming it
-    # is "Everyone at <org>", which auth already has as org_allowed.
-    default_team_id = listing.default_team_id
-    if default_team_id and default_team_id in team_ids:
-        team_ids = [t for t in team_ids if t != default_team_id]
-        out["org_allowed"] = True
-    if not is_admin:
-        foreign = [t for t in team_ids if t not in listing.team_ids]
-        if foreign:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"You can only share with teams you belong to: {', '.join(foreign)}.",
+    rule: ArtifactRule | None = None
+    if team_ids or user_ids or out.get("org_allowed"):
+        rule = await stored_rule()
+        if team_ids or (out.get("org_allowed") and not rule.org_allowed):
+            viewer = await resolve_skill_viewer(
+                scope=session.scope, principal=principal, bearer_token=caller_bearer(request)
             )
-    return {**out, "allowed_team_ids": team_ids}
+            # The org's default team has everyone in the org as members:
+            # naming it is "Everyone at <org>", which is org_allowed.
+            teams = default_team_as_org(team_ids, viewer.default_team_id)
+            team_ids = list(teams.team_ids)
+            if teams.named_default:
+                out["org_allowed"] = True
+            added = [t for t in team_ids if t not in rule.allowed_team_ids]
+            if added and not viewer.teams_known:
+                # Without the caller's teams the default team can't be told
+                # apart, and the auth service is never sent it.
+                raise HubUnavailable(TEAMS_UNREACHABLE)
+            if out.get("org_allowed") and not rule.org_allowed and not viewer.can_share_org:
+                if not viewer.permissions_known:
+                    raise HubUnavailable(PERMISSIONS_UNREACHABLE)
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ARTIFACT_ORG_REFUSAL)
+            outside = [t for t in added if t not in viewer.team_ids]
+            if outside and not viewer.is_admin:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"You can only share with teams you belong to: {', '.join(outside)}.",
+                )
+        stored_people = {u.lower() for u in rule.allowed_user_ids}
+        if user_ids and set(user_ids) != stored_people:
+            me = (session.scope.user_id or "").lower()
+            asked = [u for u in user_ids if u != me]
+            members = await members_checked(
+                get_org_member_lookup(request),
+                added=[u for u in asked if u not in stored_people],
+                kept=[u for u in asked if u in stored_people],
+                refusal=NOT_A_MEMBER_REFUSAL,
+            )
+            user_ids = [u for u in user_ids if u == me or u in members]
+    if "allowed_user_ids" in out:
+        out["allowed_user_ids"] = user_ids
+    if "allowed_team_ids" in out:
+        out["allowed_team_ids"] = team_ids
+    return CheckedAccess(out, rule)
 
 
 def _owner_publish_context(session, folder: Path):
@@ -930,17 +1020,51 @@ async def artifact_access(
     whole organization, so the card cannot tell owner from co-member. This route
     can: `_owner_workspace` refuses anyone else, so the owner gets back what they
     need to pre-fill the dialog without widening what a card exposes.
-    """
-    from cowork.services.artifacts import _published_access_for
 
-    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    In hosted org mode who a restricted artifact is shared with comes from
+    its rule as the auth service stores it, the one record of it
+    (cowork.services.publish.stored_artifact_rule): 503 while it can't be
+    read, 409 when the auth service refuses the read. The pod can write
+    .published.json, so an entry that isn't restricted is checked too: when
+    the auth service still holds a rule for the artifact
+    (cowork.services.publish.rule_held_over_entry, the check a re-publish
+    makes before it goes ahead), the artifact is restricted to that rule's
+    audience, which is what this answers.
+    """
+    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
+    from cowork.services.artifacts import _published_access_for
+    from cowork.services.publish import audience_fields, rule_held_over_entry, stored_artifact_rule
+
+    source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
     primary = await run_in_threadpool(_artifact_primary, folder, metadata)
     if primary is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    return await run_in_threadpool(_published_access_for, folder, primary)
+    state = await run_in_threadpool(_published_access_for, folder, primary)
+    if not session.scope.org_mode:
+        return state
+    read_rule: Callable[..., ArtifactRule | None] = (
+        stored_artifact_rule if state["accessMode"] == "restricted" else rule_held_over_entry
+    )
+    try:
+        rule = await run_in_threadpool(
+            read_rule,
+            folder,
+            artifacts_base=folder.parent,
+            scope=session.scope,
+            project_id=source.project_id,
+        )
+    except ArtifactAccessUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ArtifactAccessRefused as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if rule is not None:
+        state.update(
+            accessMode="restricted", accessProtected=False, accessPassword="", **audience_fields(rule),
+        )
+    return state
 
 
 @router.put("/workspace/{project_ref}/{artifact_id}/access")
@@ -961,7 +1085,7 @@ async def set_artifact_access(
     await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.publish import PublishRejected, PublisherUnavailable
     from cowork.services.publish import publish_artifact as _publish_bundle
-    from cowork.services.artifact_access import ArtifactAccessUnavailable
+    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
 
     source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
     if _artifact_primary(folder, metadata) is None:
@@ -969,7 +1093,7 @@ async def set_artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    from cowork.services.publish import access_from_app, pop_notify
+    from cowork.services.publish import access_from_app, pop_notify, stored_artifact_rule
 
     # "Notify people" belongs to this save alone: lifted out here and passed
     # on its own, so it is never stored with the access a later re-publish reads.
@@ -977,7 +1101,16 @@ async def set_artifact_access(
         access, notify = pop_notify(access_from_app(dict(body.access or {})))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    access = await _checked_team_audience(access, request=request, session=session)
+
+    async def stored_rule() -> ArtifactRule:
+        return await run_in_threadpool(
+            stored_artifact_rule,
+            folder,
+            artifacts_base=folder.parent,
+            scope=session.scope,
+            project_id=source.project_id,
+        )
+
     if not await _acquire_live_publish_lock(folder):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -989,6 +1122,12 @@ async def set_artifact_access(
     publish_abandoned = False
     publish_started = False
     try:
+        # Checked under the lock, so no other publish of this artifact writes
+        # its rule between the check's read and this publish, which plans
+        # against the rule the check read rather than reading it again.
+        checked = await _checked_team_audience(
+            access, request=request, session=session, stored_rule=stored_rule
+        )
         artifacts_base, publish_url, key = _owner_publish_context(session, folder)
         api_key = await key.get()
         if not api_key:
@@ -1005,10 +1144,12 @@ async def set_artifact_access(
                     artifacts_base=artifacts_base,
                     api_key=api_key,
                     publish_url=publish_url,
-                    access=access,
+                    access=checked.access,
                     scope=session.scope,
                     project_id=source.project_id,
                     notify=notify or None,
+                    stored=checked.stored,
+                    owner_save=True,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -1023,6 +1164,9 @@ async def set_artifact_access(
         raise
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ArtifactAccessRefused as exc:
+        # Asking again gets the same answer, so never the retryable 503.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
