@@ -3,7 +3,7 @@ name = "cowork-server"
 dynamic = ["version"]
 description = "FastAPI backend for the MindsHub Cowork desktop app"
 readme = "README.md"
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 requires-python = ">=3.12,<3.14"
 authors = [
     { name = "MindsDB Inc", email = "admin@mindsdb.com" },
