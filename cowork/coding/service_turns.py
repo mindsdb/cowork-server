@@ -249,6 +249,8 @@ class CodingTurnOperations:
         ``announced`` means the prompt is already in the timeline, as it is for
         a new task's first turn.
         """
+        # A released workspace is rebuilt before validation reads its files.
+        self.ensure_workspace(session_id, reserved=maintenance_reserved)
         intent = self._validated_command_intent(self.get_session(session_id), prompt, attachments)
         if intent.runs_immediately:
             if maintenance_reserved:
