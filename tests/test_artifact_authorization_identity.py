@@ -749,3 +749,95 @@ def test_a_team_audience_is_published_owner_only_and_widened_in_auth(
     body = issuer.calls[-1][1]
     assert (body["team_ids"], body["org_allowed"], body["org_wide"]) == (["team-ops"], True, True)
     assert body["access_version"] > first_version
+
+
+def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """ENG-3787: only a person's save with "Notify people" chosen sends
+    ``notify_recipients`` (with the artifact's title and published URL) on
+    cowork's write of the rule. The lambda's upsert never carries it, and
+    neither does a re-publish from the stored access (live sync, autopublish)."""
+    from cowork.services.publish import published_artifact_access
+
+    _session, project, _conversation, folder = owned_artifact
+    metadata = json.loads((folder / "metadata.json").read_text())
+    (folder / "metadata.json").write_text(json.dumps({**metadata, "name": "Q3  Revenue"}))
+    uploads = []
+
+    def publish(_source, **kwargs):
+        uploads.append(kwargs)
+        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.test/1"}
+
+    monkeypatch.setattr("anton.publisher.publish", publish)
+    monkeypatch.setattr("cowork.services.artifact_autopublish._active_workspace_id", lambda scope: None)
+
+    def run(access, **kwargs):
+        return publish_artifact(
+            folder, artifacts_base=folder.parent, api_key="key", publish_url="https://view.test",
+            scope=scope, project_id=str(project.id), access=access, **kwargs,
+        )
+
+    def access_writes():
+        return [body for path, body in issuer.calls if path == "/v1/internal/artifact-access/"]
+
+    person = str(uuid4())
+    run({"mode": "restricted", "emails": [], "org_allowed": False, "allowed_user_ids": [person]},
+        notify_recipients=True)
+    body = access_writes()[-1]
+    assert (body["notify_recipients"], body["artifact_title"], body["artifact_url"]) == (
+        True, "Q3 Revenue", "https://view.test/1",
+    )
+    assert body["allowed_user_ids"] == [person]
+    # Never handed to anton's publisher (the lambda's write), never stored.
+    assert all("notify_recipients" not in (u["access"] or {}) for u in uploads)
+    entry = json.loads((folder / ".published.json").read_text())["index.html"]
+    assert "notify_recipients" not in entry
+
+    # The automatic re-publish from what is stored: the same write, no notify.
+    count = len(access_writes())
+    run(published_artifact_access(folder, artifacts_base=folder.parent))
+    assert len(access_writes()) == count + 1
+    assert "notify_recipients" not in access_writes()[-1]
+    # Nor when the flag rides inside the access object of a non-user publish.
+    run({"mode": "restricted", "emails": [], "allowed_user_ids": [person], "notify_recipients": True})
+    assert "notify_recipients" not in access_writes()[-1]
+    assert "notify_recipients" not in (uploads[-1]["access"] or {})
+
+
+def test_a_notifying_save_of_outside_emails_alone_still_writes_to_auth(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """No teams or people by id means the lambda wrote the whole rule, but a
+    save that chose "Notify people" still makes cowork's write so auth emails
+    the addresses it added. Without notify, nothing extra is written."""
+    _session, project, _conversation, folder = owned_artifact
+
+    def publish(_source, **kwargs):
+        return {"artifact_key": kwargs["artifact_key"], "report_id": "report-1", "view_url": "https://view.test/1"}
+
+    monkeypatch.setattr("anton.publisher.publish", publish)
+    monkeypatch.setattr("cowork.services.artifact_autopublish._active_workspace_id", lambda scope: None)
+
+    def run(access, **kwargs):
+        return publish_artifact(
+            folder, artifacts_base=folder.parent, api_key="key", publish_url="https://view.test",
+            scope=scope, project_id=str(project.id), access=access, **kwargs,
+        )
+
+    def access_writes():
+        return [body for path, body in issuer.calls if path == "/v1/internal/artifact-access/"]
+
+    access = {"mode": "restricted", "emails": ["out@else.com"], "org_allowed": False}
+    run(access)
+    assert access_writes() == []
+    run({**access, "emails": ["out@else.com", "new@else.com"]}, notify_recipients=True)
+    [body] = access_writes()
+    assert body["allowed_emails"] == ["out@else.com", "new@else.com"]
+    assert (body["team_ids"], body["allowed_user_ids"]) == ([], [])
+    assert (body["notify_recipients"], body["artifact_title"], body["artifact_url"]) == (
+        True, "demo", "https://view.test/1",
+    )
+    # A public share names nobody to notify: no write.
+    run({"mode": "public"}, notify_recipients=True)
+    assert len(access_writes()) == 1

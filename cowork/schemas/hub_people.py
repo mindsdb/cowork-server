@@ -17,3 +17,5 @@ class HubPeopleView(CamelResponse):
 
     reachable: bool = False
     people: list[HubPersonRow] = Field(default_factory=list)
+    # ``?all=1`` only: the org has more members than the directory returns.
+    truncated: bool = False

@@ -580,6 +580,26 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
 _ORG_AUDIENCE_KEYS = ("team_ids", "allowed_user_ids")
 
 
+# The app's "Notify people" choice, sent inside the access object (ENG-3787).
+# Never part of the access anton's publisher or the stored entry sees: the
+# caller acting on a person's save lifts it out and passes it to
+# publish_artifact on its own, so a re-publish from the stored access (live
+# sync, autopublish, a retry) can never carry it.
+NOTIFY_RECIPIENTS_KEY = "notify_recipients"
+
+# auth's bounds on what the share email names and links.
+_MAX_NOTIFY_TITLE_CHARS = 200
+_MAX_NOTIFY_URL_CHARS = 2048
+
+
+def pop_notify_recipients(access: dict | None) -> tuple[dict | None, bool]:
+    """``(access without notify_recipients, whether it was exactly true)``."""
+    if not isinstance(access, dict) or NOTIFY_RECIPIENTS_KEY not in access:
+        return access, False
+    out = dict(access)
+    return out, out.pop(NOTIFY_RECIPIENTS_KEY) is True
+
+
 # auth's ArtifactAccess names (and the app's, ENG-3787) for the fields anton's
 # publisher and this module know by older ones. The new name wins when a
 # request sends both.
@@ -650,7 +670,7 @@ def _plan_access(
     teams and people must be written to auth after the publish
     (_sync_team_audience): it has some, or just lost them. Teams or people
     alone are restricted to them, never public (_with_team_audience)."""
-    access = canonical_access(access)
+    access, _notify = pop_notify_recipients(canonical_access(access))
     audience = (
         _org_audience(access, previous) if org_mode else {k: [] for k in _ORG_AUDIENCE_KEYS}
     )
@@ -682,6 +702,7 @@ def publish_artifact(
     access: dict | None = None,
     scope: TenantScope | None = None,
     project_id: str | None = None,
+    notify_recipients: bool = False,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -705,6 +726,13 @@ def publish_artifact(
 
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
+
+    `notify_recipients` (ENG-3787) is true only for a person's own save of the
+    Share dialog with "Notify people" chosen. Auth then emails the people that
+    save newly adds; the write that carries it is this server's post-publish
+    write of the rule, made for a restricted org-mode share even without teams
+    or people by id, so people added by address alone are emailed too. Every
+    other publish (live sync, autopublish, a retry) leaves it false.
     """
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
@@ -892,10 +920,31 @@ def publish_artifact(
                 entry["password_hash"] = password_hash
             published_map[published_key] = entry
             _write_published_map(published_json, published_map)
+            notify = bool(
+                notify_recipients
+                and scope is not None
+                and scope.org_mode
+                and owner_side.get("mode") == "restricted"
+            )
             if team_audience:
                 _sync_team_audience(
                     artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
+                    notify=_share_notice(published_dir, published_key, view_url) if notify else None,
                 )
+            elif notify:
+                # No teams or people by id, so the lambda's write was the whole
+                # rule; this one only asks auth to email the people the save
+                # added. Best effort: the share itself already stands.
+                try:
+                    _sync_team_audience(
+                        artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
+                        notify=_share_notice(published_dir, published_key, view_url),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not ask auth to notify the people an artifact was shared with",
+                        exc_info=True,
+                    )
             state = _load_state(scope=scope)
             state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
             _save_state(state, scope=scope)
@@ -928,9 +977,33 @@ def publish_artifact(
         }
 
 
-def _sync_team_audience(*, artifact_id: str, scope: TenantScope, owner_side: dict) -> None:
+def _share_notice(published_dir: Path, published_key: str, view_url: str) -> dict[str, str]:
+    """What auth's share email names and links: the artifact's title (its
+    metadata name, else its folder or file name) and the published URL the
+    recipient opens, within auth's bounds. A URL that isn't https is left out
+    rather than sent to be refused."""
+    title = ""
+    try:
+        meta = json.loads((published_dir / "metadata.json").read_text(encoding="utf-8"))
+        if isinstance(meta, dict):
+            title = str(meta.get("title") or meta.get("name") or "")
+    except (OSError, ValueError):
+        pass
+    title = " ".join((title or published_dir.name or published_key or "").split())
+    url = view_url if isinstance(view_url, str) and view_url.startswith("https://") else ""
+    return {
+        "artifact_title": title[:_MAX_NOTIFY_TITLE_CHARS],
+        "artifact_url": url if len(url) <= _MAX_NOTIFY_URL_CHARS else "",
+    }
+
+
+def _sync_team_audience(
+    *, artifact_id: str, scope: TenantScope, owner_side: dict, notify: dict[str, str] | None = None
+) -> None:
     """Write the restricted rule's teams, people by id and org-wide flag to
-    auth, after the lambda wrote the rest of it (sync_artifact_team_access)."""
+    auth, after the lambda wrote the rest of it (sync_artifact_team_access).
+    ``notify`` (a person's save with "Notify people" chosen) carries the
+    title and URL the share email uses; None never notifies."""
     from cowork.services.artifact_access import ArtifactAccessUnavailable, sync_artifact_team_access
     from cowork.services.artifact_autopublish import _active_workspace_id
 
@@ -946,6 +1019,9 @@ def _sync_team_audience(*, artifact_id: str, scope: TenantScope, owner_side: dic
         team_ids=list(owner_side.get("team_ids") or []),
         allowed_user_ids=list(owner_side.get("allowed_user_ids") or []),
         access_version=int(owner_side.get("access_version") or 1),
+        notify_recipients=notify is not None,
+        artifact_title=(notify or {}).get("artifact_title", ""),
+        artifact_url=(notify or {}).get("artifact_url", ""),
     )
 
 

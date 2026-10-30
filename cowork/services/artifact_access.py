@@ -158,6 +158,9 @@ def sync_artifact_team_access(
     team_ids: list[str],
     access_version: int,
     allowed_user_ids: list[str] | None = None,
+    notify_recipients: bool = False,
+    artifact_title: str = "",
+    artifact_url: str = "",
     settings: TurnQueueSettings | None = None,
     client: httpx.Client | None = None,
 ) -> None:
@@ -176,6 +179,11 @@ def sync_artifact_team_access(
     An auth that predates teams ignores both new fields and keeps the rule
     the lambda wrote. Raises ArtifactAccessUnavailable when it can't write, so
     a restricted publish never reports a team audience auth doesn't hold.
+
+    ``notify_recipients`` asks auth to email the people this write newly adds,
+    naming the artifact by ``artifact_title`` and linking ``artifact_url``.
+    Sent only when true, and true only for a person's own save: the lambda's
+    write, a re-sync and a retry never carry it.
     """
     if not scope.org_mode or not scope.org_id or not owner_user_id:
         raise ArtifactAccessUnavailable("Team sharing requires a signed-in organization")
@@ -198,6 +206,15 @@ def sync_artifact_team_access(
                 "allowed_user_ids": list(allowed_user_ids or []),
                 "org_wide": org_allowed,
                 "access_version": access_version,
+                **(
+                    {
+                        "notify_recipients": True,
+                        "artifact_title": artifact_title,
+                        "artifact_url": artifact_url,
+                    }
+                    if notify_recipients
+                    else {}
+                ),
             },
             headers={"X-Internal-Auth": settings.auth_internal_secret},
         )

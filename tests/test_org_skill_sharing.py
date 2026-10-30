@@ -1039,7 +1039,7 @@ def test_hub_people_names_stored_ids(monkeypatch):
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
     view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, ids=f"{BOB}, {EVE},"))
     assert view.model_dump(by_alias=True) == {
-        "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}],
+        "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": False,
     }
     # Uncached, and it wins over a search.
     asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", ids=BOB))
@@ -1050,9 +1050,9 @@ def test_hub_people_names_stored_ids(monkeypatch):
 
     monkeypatch.setattr(hub_people, "get_auth_json", down)
     view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, ids=BOB))
-    assert view.model_dump(by_alias=True) == {"reachable": False, "people": []}
+    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
     view = asyncio.run(hub_people_ep.get_hub_people(_Request(), LOCAL_SCOPE, ids=BOB))
-    assert view.model_dump(by_alias=True) == {"reachable": True, "people": []}
+    assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
 
 
 def test_hub_people_searches_the_org_and_caches_per_query(monkeypatch):
@@ -1067,7 +1067,7 @@ def test_hub_people_searches_the_org_and_caches_per_query(monkeypatch):
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
     view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bo", limit=50))
     assert view.model_dump(by_alias=True) == {
-        "reachable": True, "people": [{"id": "u1", "name": "Bob B", "email": "bob@x.com"}],
+        "reachable": True, "people": [{"id": "u1", "name": "Bob B", "email": "bob@x.com"}], "truncated": False,
     }
     asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q=" BO ", limit=50))
     assert calls == ["/me/org-members/?q=bo&limit=20"]
@@ -1090,7 +1090,7 @@ def test_hub_people_short_query_answers_empty_without_asking(monkeypatch):
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
     for q in ("", "b", " b "):
         view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q=q, limit=10))
-        assert view.model_dump(by_alias=True) == {"reachable": True, "people": []}
+        assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
 
 
 def test_hub_people_unreachable_is_reported_not_raised(monkeypatch):
@@ -1102,7 +1102,7 @@ def test_hub_people_unreachable_is_reported_not_raised(monkeypatch):
     monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
     view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", limit=10))
-    assert view.model_dump(by_alias=True) == {"reachable": False, "people": []}
+    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
     hub_people.reset_caches_for_tests()
 
 
@@ -1112,7 +1112,76 @@ def test_hub_people_outside_org_mode_is_empty_and_reachable(monkeypatch):
 
     monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
     view = asyncio.run(hub_people_ep.get_hub_people(_Request(), LOCAL_SCOPE, q="bob", limit=10))
-    assert view.model_dump(by_alias=True) == {"reachable": True, "people": []}
+    assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
+
+
+def test_hub_people_all_lists_the_org_directory_and_caches_it_per_caller(monkeypatch):
+    hub_people.reset_caches_for_tests()
+    calls: list[tuple[str, str]] = []
+
+    async def get_auth_json(path, bearer):
+        calls.append((path, bearer))
+        return {
+            "results": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}, {"name": "no id"}],
+            "truncated": True,
+        }
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    assert view.model_dump(by_alias=True) == {
+        "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": True,
+    }
+    assert calls == [("/me/org-members/?all=1", "tok")]
+    # Cached for the caller, whatever the query alongside it; ids still win.
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, q="bob", everyone=True))
+    assert len(calls) == 1
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, ids=BOB, everyone=True))
+    assert calls[-1][0] == f"/me/org-members/?ids={BOB}"
+    # Another caller asks for their own.
+    other = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
+    asyncio.run(hub_people_ep.get_hub_people(_Request("other"), other, everyone=True))
+    assert calls[-1] == ("/me/org-members/?all=1", "other")
+    # Five minutes, then asked again.
+    clock = [hub_people.time.monotonic() + 301]
+    monkeypatch.setattr(hub_people.time, "monotonic", lambda: clock[0])
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    assert calls[-1] == ("/me/org-members/?all=1", "tok") and len(calls) == 4
+    hub_people.reset_caches_for_tests()
+
+
+def test_hub_people_all_failure_is_unreachable_and_retried_after_15s(monkeypatch):
+    hub_people.reset_caches_for_tests()
+    calls: list[str] = []
+    answers = [None, {"results": [{"id": BOB}]}]
+
+    async def get_auth_json(path, bearer):
+        calls.append(path)
+        return answers[min(len(calls), len(answers)) - 1]
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
+    asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    assert len(calls) == 1
+    now = hub_people.time.monotonic()
+    monkeypatch.setattr(hub_people.time, "monotonic", lambda: now + 16)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), scope, everyone=True))
+    # A plain list or no flag from auth: not truncated.
+    assert view.model_dump(by_alias=True) == {
+        "reachable": True, "people": [{"id": BOB, "name": "", "email": ""}], "truncated": False,
+    }
+    hub_people.reset_caches_for_tests()
+
+
+def test_hub_people_all_outside_org_mode_is_empty_and_reachable(monkeypatch):
+    async def get_auth_json(path, bearer):
+        raise AssertionError("auth asked outside org mode")
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    view = asyncio.run(hub_people_ep.get_hub_people(_Request(), LOCAL_SCOPE, everyone=True))
+    assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
 
 
 # ── hub teams ────────────────────────────────────────────────────────────────
@@ -1270,6 +1339,33 @@ def test_auth_refusing_a_non_member_is_a_400_naming_them():
         )
     # A ValueError, which the access route answers as 400.
     assert isinstance(caught.value, ValueError) and EVE in str(caught.value)
+
+
+def test_the_access_write_carries_notify_only_when_asked():
+    from cowork.services.artifact_access import sync_artifact_team_access
+
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    settings = SimpleNamespace(auth_internal_base_url="https://auth.test", auth_internal_secret="s")
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    common = dict(
+        artifact_id="artifact/1", scope=scope, owner_user_id=ALICE, workspace_id=None,
+        allowed_emails=["e@else.com"], org_allowed=False, team_ids=[], allowed_user_ids=[BOB],
+        access_version=3, settings=settings,
+    )
+    sync_artifact_team_access(**common, client=httpx.Client(transport=httpx.MockTransport(handler)))
+    sync_artifact_team_access(
+        **common, notify_recipients=True, artifact_title="Q3", artifact_url="https://view.test/1",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert not {"notify_recipients", "artifact_title", "artifact_url"} & set(seen[0])
+    assert (seen[1]["notify_recipients"], seen[1]["artifact_title"], seen[1]["artifact_url"]) == (
+        True, "Q3", "https://view.test/1",
+    )
 
 
 def test_the_post_publish_rewrite_sends_the_people(monkeypatch):
