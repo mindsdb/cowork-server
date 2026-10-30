@@ -259,19 +259,19 @@ class WorkspaceManager:
             ),
         )
 
-    def check_source(self, raw_path: str, allow_direct_folder: bool) -> None:
+    def check_source(self, raw_path: str, allow_folder_copy: bool) -> None:
         """Reject a task folder ``prepare`` would refuse, without its slower Git status work."""
         path = self._resolve_existing(raw_path)
         if path is None or not path.is_dir():
             raise WorkspaceError("Choose an existing local folder")
-        if not allow_direct_folder and self._git_root(path) is None:
+        if not allow_folder_copy and self._git_root(path) is None:
             raise WorkspaceError("Local folder isolation was not enabled for this request")
 
     def prepare(
         self,
         session_id: str,
         raw_path: str,
-        allow_direct_folder: bool,
+        allow_folder_copy: bool,
         base_branch: str | None = None,
         *,
         include_local_changes: bool = False,
@@ -282,7 +282,7 @@ class WorkspaceManager:
                 raise WorkspaceError("Choose an existing local folder")
             source = Path(inspection.path)
             if not inspection.is_git:
-                if not allow_direct_folder:
+                if not allow_folder_copy:
                     raise WorkspaceError("Local folder isolation was not enabled for this request")
                 return self._prepare_local_copy(session_id, source)
 

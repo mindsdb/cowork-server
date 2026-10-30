@@ -15,6 +15,7 @@ from cowork.coding.contracts import (  # noqa: F401
     TerminalShellPreference,
     utc_now,
     ReasoningEffort,
+    WorkspaceMode,
 )
 from cowork.coding.git_transport import validate_git_source
 from cowork.coding.skill_models import ProjectSkillSource
@@ -260,6 +261,8 @@ class CodeProject(BaseModel):
     # None means "use the model's own default"; tasks may still override it.
     default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode = PermissionMode.supervised
+    # None lets the server choose for the computer running each task.
+    default_workspace_mode: WorkspaceMode | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -339,6 +342,8 @@ class ProjectCreateRequest(BaseModel):
     # None means "use the model's own default"; tasks may still override it.
     default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode = PermissionMode.supervised
+    # None lets the server choose for the computer running each task.
+    default_workspace_mode: WorkspaceMode | None = None
 
     @model_validator(mode="after")
     def require_resources(self) -> ProjectCreateRequest:
@@ -359,6 +364,7 @@ class ProjectUpdateRequest(BaseModel):
     default_model: str | None = None
     default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode | None = None
+    default_workspace_mode: WorkspaceMode | None = None
 
     @model_validator(mode="after")
     def reject_duplicate_resource_inputs(self) -> ProjectUpdateRequest:
