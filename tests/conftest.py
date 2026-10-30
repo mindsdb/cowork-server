@@ -127,7 +127,8 @@ def trust_test_client_host():
 @pytest.fixture
 def cleanup_tmp_projects(tmp_path):
     """Delete Project rows created under this test's `tmp_path`, plus their
-    dependent TaskObject, Conversation, and SharedResourceAttribution rows.
+    dependent TaskObject, ArtifactLocation, Conversation, and
+    SharedResourceAttribution rows.
 
     Several artifact-ownership test modules create real Project rows against
     the session-scoped test DB; a leaked row (especially one with a real
@@ -140,6 +141,7 @@ def cleanup_tmp_projects(tmp_path):
 
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.session import get_engine
+    from cowork.models.artifact_location import ArtifactLocation
     from cowork.models.conversation import Conversation
     from cowork.models.project import Project
     from cowork.models.shared_resource import SharedResourceAttribution
@@ -157,6 +159,7 @@ def cleanup_tmp_projects(tmp_path):
         if not leaked_ids:
             return
         session.exec(delete(TaskObject).where(TaskObject.project_id.in_(leaked_ids)))
+        session.exec(delete(ArtifactLocation).where(ArtifactLocation.project_id.in_(leaked_ids)))
         session.exec(delete(Conversation).where(Conversation.project_id.in_(leaked_ids)))
         # `artifact_resource_key` always starts with "<project_id>/".
         session.exec(

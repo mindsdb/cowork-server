@@ -2095,6 +2095,7 @@ class ResponsesHandler:
                                 project_id=UUID(directory.project_id) if directory.project_id else None,
                                 slugs=changes.created,
                                 creator=directory.creator,
+                                artifact_ids=changes.created_ids,
                             ),
                             scope=scope,
                         )

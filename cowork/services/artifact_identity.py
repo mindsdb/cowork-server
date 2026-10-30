@@ -382,8 +382,10 @@ _identity_indexes: OrderedDict[
 _identity_indexes_lock = RLock()
 
 
-def _build_identity_index(base: PinnedDir) -> dict[str, tuple[str, ...]]:
-    """Build an id-to-folder-name index below one pinned container."""
+def _build_identity_index(base: PinnedDir, *, widen: bool = True) -> dict[str, tuple[str, ...]]:
+    """Build an id-to-folder-name index below one pinned container. With
+    ``widen`` off, a legacy short id is widened in memory only, and nothing is
+    written."""
     matches: dict[str, list[str]] = {}
     try:
         with dir_scandir(base) as entries:
@@ -409,7 +411,10 @@ def _build_identity_index(base: PinnedDir) -> dict[str, tuple[str, ...]]:
                 )
                 if not stat.S_ISREG(metadata_stat.st_mode):
                     continue
-                found, _metadata = ensure_full_id(folder.path, _pinned=folder)
+                if widen:
+                    found, _metadata = ensure_full_id(folder.path, _pinned=folder)
+                else:
+                    found, _metadata = read_full_id(folder)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         matches.setdefault(found, []).append(folder_name)
@@ -595,6 +600,59 @@ def _resolved_from_source(
         if known is not None:
             return _indexed_artifacts(source, known)
     return ()
+
+
+def identities_below(source: "ProjectArtifacts") -> dict[str, tuple[str, ...]]:
+    """Every id found in ``source``'s root, with the folders holding it, read
+    without writing. Empty for a missing root or a link in its chain."""
+    try:
+        with opened_artifact_root(source) as base:
+            return _build_identity_index(base, widen=False)
+    except (OSError, ValueError):
+        return {}
+
+
+def artifact_ids_below(base: Path, slugs) -> dict[str, str]:
+    """The id each of ``slugs``' folders directly below ``base`` holds, read
+    without writing. A folder that is gone, is a link or holds no readable id
+    is left out."""
+    ids: dict[str, str] = {}
+    try:
+        with pinned_dir(Path(base), nofollow_base=True) as root:
+            for slug in slugs:
+                try:
+                    with _opened_child_directory(root, slug) as folder:
+                        ids[slug] = read_full_id(folder)[0]
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+    except OSError:
+        return {}
+    return ids
+
+
+def resolve_recorded_folder(
+    source: "ProjectArtifacts", slug: str, artifact_id: str
+) -> tuple[Path, dict] | None:
+    """The folder a location row names, when it still holds ``artifact_id``.
+
+    ``source`` is a root the caller may already read, and ``slug`` comes from
+    a row the server wrote from a folder name it found or made; it is opened
+    as one validated, no-follow component below the pinned root. The request's
+    id is only compared with the folder's own. None when the folder is gone,
+    is not a plain folder, or holds another id: the row is stale.
+    """
+    wanted = canonical_artifact_id(artifact_id)
+    try:
+        with opened_artifact_root(source) as base:
+            with _opened_child_directory(base, slug) as folder:
+                found, metadata = ensure_full_id(folder.path, _pinned=folder)
+            if not secrets.compare_digest(found, wanted):
+                return None
+            if not _root_still_current(source, base):
+                return None
+            return base.path / _component(slug), metadata
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def resolve_artifact_folder(

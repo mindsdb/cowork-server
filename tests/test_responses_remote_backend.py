@@ -2812,7 +2812,7 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator):
+    def spy_index_new(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)
@@ -2856,7 +2856,7 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator):
+    def spy_index_new(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)

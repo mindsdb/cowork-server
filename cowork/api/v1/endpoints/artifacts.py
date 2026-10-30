@@ -30,7 +30,6 @@ from cowork.db.scoped import (
     ScopedSession,
     ScopedSessionDep,
     TenantScope,
-    get_scoped_session,
     get_tenant_scope,
 )
 from cowork.db.session import get_session
@@ -58,12 +57,15 @@ from cowork.schemas.live_apps import (
     LiveAppShareResponse,
     SharedLiveAppResponse,
 )
+from cowork.services.artifact_identity import canonical_artifact_id
+from cowork.services.artifact_locations import forget_location
 from cowork.services.artifact_roots import (
     RootsPlan,
     artifacts_sources_for_project,
     artifacts_sources_for_scan,
     plan_project_roots,
     plan_scope_roots,
+    recorded_location,
 )
 from cowork.services.artifacts import (
     BackendPreviewRefused,
@@ -961,6 +963,23 @@ async def delete_artifact_for_request(
             exc_info=True,
             extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
         )
+
+    # The location row goes with the folder (org mode; a no-op elsewhere).
+    # Best-effort: a row left behind names a folder that no longer holds the
+    # id, and the next lookup drops it.
+    location = recorded_location(source, Path(source.base) / folder_name)
+    if expected_artifact_id is not None and location is not None:
+        try:
+            await run_db(
+                partial(forget_location, artifact_id=canonical_artifact_id(expected_artifact_id), location=location),
+                scope=scope,
+            )
+        except Exception:
+            logger.warning(
+                "Could not drop the location of a deleted artifact",
+                exc_info=True,
+                extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
+            )
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which

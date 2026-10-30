@@ -14,6 +14,7 @@ import stat
 import threading
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from types import FrameType
 
@@ -314,6 +315,23 @@ async def _run_artifact_owner_backfill() -> None:
         logger.exception("artifact owner backfill failed (non-fatal)")
 
 
+async def _run_artifact_location_backfill(stop: threading.Event) -> None:
+    """Background, one-time location backfill: one file store call with no
+    deadline, so it holds one file store slot for the walk. Never affects
+    startup. Shutdown sets ``stop`` before it cancels the task, since a
+    cancelled file store call waits for its work."""
+    try:
+        from cowork.db.scoped import SYSTEM_SCOPE
+        from cowork.db.units import run_efs
+        from cowork.services.artifact_location_backfill import run_artifact_location_backfill
+
+        await run_efs(partial(run_artifact_location_backfill, stop=stop), scope=SYSTEM_SCOPE, deadline=False)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("artifact location backfill failed (non-fatal)")
+
+
 # Imported lazily by the first agent turn otherwise, adding their import time to
 # that turn's time to first text.
 AGENT_RUNTIME_MODULES = (
@@ -453,6 +471,8 @@ async def lifespan(app: FastAPI):
     clock.step("scheduler_and_channels")
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
+    app.state.artifact_location_backfill = None
+    app.state.artifact_location_backfill_stop = threading.Event()
     if get_app_settings().tenancy_mode == "org":
         from cowork.channels.ingress import start_reconciler
 
@@ -462,6 +482,9 @@ async def lifespan(app: FastAPI):
         # Background so the port binds without waiting for an EFS walk.
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
+        )
+        app.state.artifact_location_backfill = asyncio.create_task(
+            _run_artifact_location_backfill(app.state.artifact_location_backfill_stop)
         )
     app.state.router_startup_probe = None
     if (
@@ -515,6 +538,10 @@ async def lifespan(app: FastAPI):
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
+        location_backfill_stop = getattr(app.state, "artifact_location_backfill_stop", None)
+        if location_backfill_stop is not None:
+            location_backfill_stop.set()
+        await _cancel_and_wait(getattr(app.state, "artifact_location_backfill", None))
         await _cancel_and_wait(getattr(app.state, "router_startup_probe", None))
 
         await app.state.channel_ingress.stop_all()

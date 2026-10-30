@@ -33,6 +33,7 @@ import stat
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from cowork.db.personal_resources import PersonalResource
@@ -42,6 +43,9 @@ from cowork.services.artifacts import (
     _org_mode,
     _scan_artifact_dirs,
 )
+
+if TYPE_CHECKING:
+    from cowork.services.artifact_locations import Location
 
 _ARTIFACTS_SUBPATH = (".anton", "artifacts")
 
@@ -292,6 +296,50 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     )
 
 
+def _project_source(project: ProjectRow, base: Path) -> ProjectArtifacts:
+    """A root of `project`, reopened from the project's directory one component
+    at a time."""
+    project_path = Path(project.path)
+    return ProjectArtifacts(
+        base=base,
+        project_id=str(project.id),
+        project_name=project.name,
+        trusted_anchor=project_path,
+        root_parts=base.relative_to(project_path).parts,
+        external=project.external,
+    )
+
+
+def recorded_source(project: ProjectRow, conversation_id: UUID | None) -> ProjectArtifacts:
+    """The one root a location row names (cowork.services.artifact_locations):
+    `project`'s shared root, or a conversation's legacy root. Built without
+    listing anything; `project` is a row the caller may read, and
+    `conversation_id` is a UUID, so it is one path component."""
+    if conversation_id is None:
+        return _project_source(project, _artifacts_base(project.path))
+    base = (Path(project.path) / CONVERSATIONS_DIRNAME / str(UUID(str(conversation_id)))).joinpath(*_ARTIFACTS_SUBPATH)
+    return _project_source(project, base)
+
+
+def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
+    """The location row for `folder`, found below `source`, or None for a root
+    no row describes (a desktop root, which has no project id)."""
+    from cowork.services.artifact_locations import Location
+
+    if source.project_id is None:
+        return None
+    parts = tuple(source.root_parts)
+    if parts == _ARTIFACTS_SUBPATH:
+        conversation_id = None
+    elif len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
+        conversation_id = _conversation_id(Path(parts[1]))
+        if conversation_id is None:
+            return None
+    else:
+        return None
+    return Location(UUID(source.project_id), conversation_id, folder.name)
+
+
 def _project_roots(project: ProjectRow) -> list[_FoundRoot]:
     """One project's roots. One on the desktop. In org mode (ENG-2056): the
     PROJECT-level base first, the primary location, where every new artifact
@@ -312,17 +360,7 @@ def _project_roots(project: ProjectRow) -> list[_FoundRoot]:
     project_path = Path(project.path)
 
     def root(base: Path, **found) -> _FoundRoot:
-        return _FoundRoot(
-            source=ProjectArtifacts(
-                base=base,
-                project_id=str(project.id),
-                project_name=project.name,
-                trusted_anchor=project_path,
-                root_parts=base.relative_to(project_path).parts,
-                external=project.external,
-            ),
-            **found,
-        )
+        return _FoundRoot(source=_project_source(project, base), **found)
 
     roots = [root(_artifacts_base(project.path))]
     if not _org_mode():
