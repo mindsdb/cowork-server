@@ -1,0 +1,36 @@
+{
+  "id": "sqlite",
+  "label": "SQLite",
+  "aliases": ["sqlite", "sqlite3", "sqlite database"],
+  "keywords": ["database", "sql", "sqlite", "file", "local", "tables", "queries"],
+  "description": "Query a SQLite database file on this machine.",
+  "category": "database",
+  "logo": "database",
+  "logo_color": "#003B57",
+  "usage_notes": "Open the file named by `database_path` read-only, through a URI: `sqlite3.connect(f\"file:{path}?mode=ro\", uri=True)`. Never open it for writing and never copy it to change it. List the tables with `SELECT name FROM sqlite_master WHERE type = 'table'`.",
+  "form": {
+    "form_id": "sqlite-connector",
+    "title": "Connect SQLite",
+    "subtitle": "Point Anton at a SQLite database file on this machine.",
+    "logo": "database",
+    "logo_color": "#003B57",
+    "methods": [
+      {
+        "id": "file",
+        "label": "Database file",
+        "description": "The path of a SQLite database file (.db, .sqlite) on this machine.",
+        "recommended": true,
+        "fields": [
+          {
+            "name": "database_path",
+            "label": "Database file path",
+            "type": "text",
+            "required": true,
+            "placeholder": "/path/to/database.db",
+            "description": "Absolute path to the SQLite file."
+          }
+        ]
+      }
+    ]
+  }
+}
