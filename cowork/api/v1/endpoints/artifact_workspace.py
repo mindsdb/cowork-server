@@ -809,9 +809,10 @@ class _AccessBody(BaseModel):
     auth's names are accepted for the older ones: `allowed_team_ids` for
     `team_ids`, `allowed_emails` for `emails`, `org_allowed` for `org_wide`
     (cowork.services.publish.canonical_access). Teams or people alone keep the
-    rule restricted to them, never public. `notify_recipients: true` (ENG-3787)
-    asks auth to email the people this save newly adds; it applies to this
-    save only and is never stored.
+    rule restricted to them, never public. `notify: {user_ids, emails}`
+    (ENG-3787) names the people this save added and chose to tell; auth
+    emails them. It applies to this save only and is never stored. The older
+    `notify_recipients: true` names nobody and notifies no one.
     """
 
     access: dict
@@ -982,11 +983,14 @@ async def set_artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    from cowork.services.publish import pop_notify_recipients
+    from cowork.services.publish import pop_notify
 
     # "Notify people" belongs to this save alone: lifted out here and passed
     # on its own, so it is never stored with the access a later re-publish reads.
-    access, notify_recipients = pop_notify_recipients(dict(body.access or {}))
+    try:
+        access, notify = pop_notify(dict(body.access or {}))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     access = await _checked_team_audience(access, request=request, session=session)
     if not await _acquire_live_publish_lock(folder):
         raise HTTPException(
@@ -1018,7 +1022,7 @@ async def set_artifact_access(
                     access=access,
                     scope=session.scope,
                     project_id=source.project_id,
-                    notify_recipients=notify_recipients,
+                    notify=notify or None,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )

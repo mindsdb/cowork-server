@@ -1359,13 +1359,21 @@ def test_the_access_write_carries_notify_only_when_asked():
     )
     sync_artifact_team_access(**common, client=httpx.Client(transport=httpx.MockTransport(handler)))
     sync_artifact_team_access(
-        **common, notify_recipients=True, artifact_title="Q3", artifact_url="https://view.test/1",
+        **common, notify_user_ids=[BOB], notify_emails=["e@else.com"], artifact_title="Q3",
+        artifact_url="https://view.test/1", client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    # Empty lists are nobody to notify.
+    sync_artifact_team_access(
+        **common, notify_user_ids=[], notify_emails=[], artifact_title="Q3",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    assert not {"notify_recipients", "artifact_title", "artifact_url"} & set(seen[0])
-    assert (seen[1]["notify_recipients"], seen[1]["artifact_title"], seen[1]["artifact_url"]) == (
-        True, "Q3", "https://view.test/1",
-    )
+    notify_keys = {"notify_recipients", "notify_user_ids", "notify_emails", "artifact_title", "artifact_url"}
+    assert not notify_keys & set(seen[0])
+    assert {k: seen[1][k] for k in notify_keys} == {
+        "notify_recipients": True, "notify_user_ids": [BOB], "notify_emails": ["e@else.com"],
+        "artifact_title": "Q3", "artifact_url": "https://view.test/1",
+    }
+    assert not notify_keys & set(seen[2])
 
 
 def test_the_post_publish_rewrite_sends_the_people(monkeypatch):

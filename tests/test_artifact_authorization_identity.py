@@ -755,10 +755,11 @@ def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
     issuer, scope, local_id, owned_artifact, monkeypatch
 ):
     """ENG-3787: only a person's save with "Notify people" chosen sends
-    ``notify_recipients`` (with the artifact's title and published URL) on
-    cowork's write of the rule. The lambda's upsert never carries it, and
-    neither does a re-publish from the stored access (live sync, autopublish)."""
-    from cowork.services.publish import published_artifact_access
+    ``notify_recipients`` with the people to tell (and the artifact's title
+    and published URL) on cowork's write of the rule. The lambda's upsert
+    never carries it, and neither does a re-publish from the stored access
+    (live sync, autopublish)."""
+    from cowork.services.publish import ShareNotify, published_artifact_access
 
     _session, project, _conversation, folder = owned_artifact
     metadata = json.loads((folder / "metadata.json").read_text())
@@ -781,14 +782,17 @@ def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
     def access_writes():
         return [body for path, body in issuer.calls if path == "/v1/internal/artifact-access/"]
 
-    person = str(uuid4())
-    run({"mode": "restricted", "emails": [], "org_allowed": False, "allowed_user_ids": [person]},
-        notify_recipients=True)
+    person, other, stranger = str(uuid4()), str(uuid4()), str(uuid4())
+    run({"mode": "restricted", "emails": ["out@else.com"], "org_allowed": False,
+         "allowed_user_ids": [person, other]},
+        notify=ShareNotify(user_ids=(person, stranger), emails=("out@else.com", "nope@else.com")))
     body = access_writes()[-1]
     assert (body["notify_recipients"], body["artifact_title"], body["artifact_url"]) == (
         True, "Q3 Revenue", "https://view.test/1",
     )
-    assert body["allowed_user_ids"] == [person]
+    # Only the people the saved rule names: never someone it doesn't share with.
+    assert (body["notify_user_ids"], body["notify_emails"]) == ([person], ["out@else.com"])
+    assert body["allowed_user_ids"] == [person, other]
     # Never handed to anton's publisher (the lambda's write), never stored.
     assert all("notify_recipients" not in (u["access"] or {}) for u in uploads)
     entry = json.loads((folder / ".published.json").read_text())["index.html"]
@@ -800,9 +804,14 @@ def test_a_notifying_save_asks_auth_to_email_with_title_and_url(
     assert len(access_writes()) == count + 1
     assert "notify_recipients" not in access_writes()[-1]
     # Nor when the flag rides inside the access object of a non-user publish.
-    run({"mode": "restricted", "emails": [], "allowed_user_ids": [person], "notify_recipients": True})
+    run({"mode": "restricted", "emails": [], "allowed_user_ids": [person],
+         "notify": {"user_ids": [person]}, "notify_recipients": True})
+    assert not {"notify_recipients", "notify_user_ids"} & set(access_writes()[-1])
+    assert not {"notify", "notify_recipients"} & set(uploads[-1]["access"] or {})
+    # A list naming nobody the rule holds notifies no one.
+    run({"mode": "restricted", "emails": [], "allowed_user_ids": [person]},
+        notify=ShareNotify(user_ids=(stranger,)))
     assert "notify_recipients" not in access_writes()[-1]
-    assert "notify_recipients" not in (uploads[-1]["access"] or {})
 
 
 def test_a_notifying_save_of_outside_emails_alone_still_writes_to_auth(
@@ -810,7 +819,9 @@ def test_a_notifying_save_of_outside_emails_alone_still_writes_to_auth(
 ):
     """No teams or people by id means the lambda wrote the whole rule, but a
     save that chose "Notify people" still makes cowork's write so auth emails
-    the addresses it added. Without notify, nothing extra is written."""
+    the addresses it added. Without anyone to notify, nothing extra is written."""
+    from cowork.services.publish import ShareNotify
+
     _session, project, _conversation, folder = owned_artifact
 
     def publish(_source, **kwargs):
@@ -831,13 +842,17 @@ def test_a_notifying_save_of_outside_emails_alone_still_writes_to_auth(
     access = {"mode": "restricted", "emails": ["out@else.com"], "org_allowed": False}
     run(access)
     assert access_writes() == []
-    run({**access, "emails": ["out@else.com", "new@else.com"]}, notify_recipients=True)
+    # An empty list (the app's boolean without lists) writes nothing extra.
+    run(access, notify=ShareNotify())
+    assert access_writes() == []
+    run({**access, "emails": ["out@else.com", "new@else.com"]}, notify=ShareNotify(emails=("new@else.com",)))
     [body] = access_writes()
     assert body["allowed_emails"] == ["out@else.com", "new@else.com"]
     assert (body["team_ids"], body["allowed_user_ids"]) == ([], [])
-    assert (body["notify_recipients"], body["artifact_title"], body["artifact_url"]) == (
-        True, "demo", "https://view.test/1",
+    assert (body["notify_recipients"], body["notify_user_ids"], body["notify_emails"]) == (
+        True, [], ["new@else.com"],
     )
+    assert (body["artifact_title"], body["artifact_url"]) == ("demo", "https://view.test/1")
     # A public share names nobody to notify: no write.
-    run({"mode": "public"}, notify_recipients=True)
+    run({"mode": "public"}, notify=ShareNotify(emails=("new@else.com",)))
     assert len(access_writes()) == 1

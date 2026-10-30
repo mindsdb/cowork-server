@@ -59,11 +59,11 @@ def publish_calls(monkeypatch):
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
                      password=None, access=None, scope=None, project_id=None,
-                     notify_recipients=False):
+                     notify=None):
         calls.append({
             "folder": artifact, "artifacts_base": artifacts_base, "api_key": api_key,
             "publish_url": publish_url, "access": access, "scope": scope,
-            "project_id": project_id, "notify_recipients": notify_recipients,
+            "project_id": project_id, "notify": notify,
         })
         return {"status": "ok", "url": "https://view.example/r/1"}
 
@@ -141,28 +141,43 @@ async def test_setting_access_republishes_with_the_chosen_audience(
     assert publish_calls[0]["project_id"] == "proj-1"
 
 
-async def test_a_save_that_chose_notify_passes_it_apart_from_the_access(
+async def test_a_save_that_chose_notify_passes_the_people_apart_from_the_access(
     as_owner, publish_calls, publish_context,
 ):
-    """ENG-3787: the app sends notify_recipients inside the access object.
-    It is this save's alone, so it is lifted out and passed on its own, never
-    left in the access that gets stored and re-published later."""
+    """ENG-3787: the app sends ``notify: {user_ids, emails}`` inside the
+    access object. It is this save's alone, so it is lifted out and passed on
+    its own, never left in the access that gets stored and re-published."""
     access = {"mode": "restricted", "emails": ["a@example.com"], "org_allowed": False}
+    person = "AAAAAAAA-1111-1111-1111-111111111111"
 
     await aw.set_artifact_access(
-        "proj", ARTIFACT_ID, aw._AccessBody(access={**access, "notify_recipients": True}), _Session(),
+        "proj", ARTIFACT_ID,
+        aw._AccessBody(access={**access, "notify": {"user_ids": [person], "emails": [" A@Example.com "]}}),
+        _Session(),
     )
-    assert publish_calls[-1]["notify_recipients"] is True
+    notify = publish_calls[-1]["notify"]
+    assert (notify.user_ids, notify.emails) == ((person.lower(),), ("a@example.com",))
     assert publish_calls[-1]["access"] == access
 
-    # Absent is false; so is anything but a literal true.
-    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session())
-    assert publish_calls[-1]["notify_recipients"] is False
-    await aw.set_artifact_access(
-        "proj", ARTIFACT_ID, aw._AccessBody(access={**access, "notify_recipients": "yes"}), _Session(),
-    )
-    assert publish_calls[-1]["notify_recipients"] is False
-    assert publish_calls[-1]["access"] == access
+    # Absent, empty, or the older boolean without lists: nobody to notify.
+    for extra in ({}, {"notify": {}}, {"notify": {"user_ids": [], "emails": []}},
+                  {"notify_recipients": True}):
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={**access, **extra}), _Session(),
+        )
+        assert publish_calls[-1]["notify"] is None
+        assert publish_calls[-1]["access"] == access
+
+
+async def test_a_malformed_notify_is_a_400(as_owner, publish_calls, publish_context):
+    for notify in ("everyone", {"emails": "a@example.com"}):
+        with pytest.raises(HTTPException) as caught:
+            await aw.set_artifact_access(
+                "proj", ARTIFACT_ID,
+                aw._AccessBody(access={"mode": "restricted", "emails": [], "notify": notify}), _Session(),
+            )
+        assert caught.value.status_code == 400
+    assert publish_calls == []
 
 
 async def test_sharing_publicly_is_passed_through_verbatim(

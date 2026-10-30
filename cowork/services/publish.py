@@ -580,24 +580,64 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
 _ORG_AUDIENCE_KEYS = ("team_ids", "allowed_user_ids")
 
 
-# The app's "Notify people" choice, sent inside the access object (ENG-3787).
-# Never part of the access anton's publisher or the stored entry sees: the
-# caller acting on a person's save lifts it out and passes it to
-# publish_artifact on its own, so a re-publish from the stored access (live
-# sync, autopublish, a retry) can never carry it.
-NOTIFY_RECIPIENTS_KEY = "notify_recipients"
+# The app's "Notify people" choice, sent inside the access object (ENG-3787):
+# ``notify: {user_ids: [...], emails: [...]}``, the individuals the person just
+# added and chose to tell. The older ``notify_recipients: true`` names nobody,
+# so it notifies no one. Never part of the access anton's publisher or the
+# stored entry sees: the caller acting on a person's save lifts it out and
+# passes it to publish_artifact on its own, so a re-publish from the stored
+# access (live sync, autopublish, a retry) can never carry it.
+_NOTIFY_KEYS = ("notify", "notify_recipients")
 
 # auth's bounds on what the share email names and links.
 _MAX_NOTIFY_TITLE_CHARS = 200
 _MAX_NOTIFY_URL_CHARS = 2048
 
 
-def pop_notify_recipients(access: dict | None) -> tuple[dict | None, bool]:
-    """``(access without notify_recipients, whether it was exactly true)``."""
-    if not isinstance(access, dict) or NOTIFY_RECIPIENTS_KEY not in access:
-        return access, False
-    out = dict(access)
-    return out, out.pop(NOTIFY_RECIPIENTS_KEY) is True
+class ShareNotify(NamedTuple):
+    """Who a person's save asks auth to email: people in the org by Keycloak
+    id, and anyone else by address."""
+
+    user_ids: tuple[str, ...] = ()
+    emails: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.user_ids or self.emails)
+
+
+def _notify_list(raw: Any, field: str) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"notify.{field} must be a list.")
+    return [str(v).strip() for v in raw if isinstance(v, str) and v.strip()]
+
+
+def pop_notify(access: dict | None) -> tuple[dict | None, ShareNotify]:
+    """``(access without its notify fields, who to notify)``. Raises
+    ValueError for a ``notify`` that isn't ``{user_ids?: [], emails?: []}``."""
+    if not isinstance(access, dict) or not any(k in access for k in _NOTIFY_KEYS):
+        return access, ShareNotify()
+    out = {k: v for k, v in access.items() if k not in _NOTIFY_KEYS}
+    raw = access.get("notify")
+    if raw is None:
+        return out, ShareNotify()
+    if not isinstance(raw, dict):
+        raise ValueError("notify must be an object with user_ids and emails.")
+    user_ids = dict.fromkeys(v.lower() for v in _notify_list(raw.get("user_ids"), "user_ids"))
+    emails = _normalize_emails(_notify_list(raw.get("emails"), "emails"))
+    return out, ShareNotify(user_ids=tuple(user_ids), emails=tuple(dict.fromkeys(emails)))
+
+
+def _notify_within(notify: ShareNotify, owner_side: dict) -> ShareNotify:
+    """Only people the saved rule actually names, by id or by address: a
+    notify list never reaches anyone the share doesn't."""
+    ids = {str(v).lower() for v in owner_side.get("allowed_user_ids") or []}
+    emails = {str(v).lower() for v in owner_side.get("emails") or []}
+    return ShareNotify(
+        user_ids=tuple(v for v in notify.user_ids if v in ids),
+        emails=tuple(v for v in notify.emails if v.lower() in emails),
+    )
 
 
 # auth's ArtifactAccess names (and the app's, ENG-3787) for the fields anton's
@@ -670,7 +710,12 @@ def _plan_access(
     teams and people must be written to auth after the publish
     (_sync_team_audience): it has some, or just lost them. Teams or people
     alone are restricted to them, never public (_with_team_audience)."""
-    access, _notify = pop_notify_recipients(canonical_access(access))
+    try:
+        access, _notify = pop_notify(canonical_access(access))
+    except ValueError:
+        # Only the person's own save carries notify, and its caller checked
+        # it; anything else just loses the field.
+        access = {k: v for k, v in canonical_access(access).items() if k not in _NOTIFY_KEYS}
     audience = (
         _org_audience(access, previous) if org_mode else {k: [] for k in _ORG_AUDIENCE_KEYS}
     )
@@ -702,7 +747,7 @@ def publish_artifact(
     access: dict | None = None,
     scope: TenantScope | None = None,
     project_id: str | None = None,
-    notify_recipients: bool = False,
+    notify: ShareNotify | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -727,12 +772,13 @@ def publish_artifact(
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
 
-    `notify_recipients` (ENG-3787) is true only for a person's own save of the
-    Share dialog with "Notify people" chosen. Auth then emails the people that
-    save newly adds; the write that carries it is this server's post-publish
-    write of the rule, made for a restricted org-mode share even without teams
-    or people by id, so people added by address alone are emailed too. Every
-    other publish (live sync, autopublish, a retry) leaves it false.
+    `notify` (ENG-3787) is set only for a person's own save of the Share
+    dialog with "Notify people" chosen: the individuals it added, by id and by
+    address. Auth emails them (those the saved rule names); the write that
+    carries the list is this server's post-publish write of the rule, made for
+    a restricted org-mode share even without teams or people by id, so people
+    added by address alone are emailed too. Every other publish (live sync,
+    autopublish, a retry) leaves it None.
     """
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
@@ -920,25 +966,32 @@ def publish_artifact(
                 entry["password_hash"] = password_hash
             published_map[published_key] = entry
             _write_published_map(published_json, published_map)
-            notify = bool(
-                notify_recipients
+            recipients = (
+                _notify_within(notify, owner_side)
+                if notify
                 and scope is not None
                 and scope.org_mode
                 and owner_side.get("mode") == "restricted"
+                else ShareNotify()
+            )
+            notice = (
+                {**_share_notice(published_dir, published_key, view_url), "recipients": recipients}
+                if recipients
+                else None
             )
             if team_audience:
                 _sync_team_audience(
                     artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
-                    notify=_share_notice(published_dir, published_key, view_url) if notify else None,
+                    notify=notice,
                 )
-            elif notify:
+            elif notice is not None:
                 # No teams or people by id, so the lambda's write was the whole
                 # rule; this one only asks auth to email the people the save
                 # added. Best effort: the share itself already stands.
                 try:
                     _sync_team_audience(
                         artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
-                        notify=_share_notice(published_dir, published_key, view_url),
+                        notify=notice,
                     )
                 except Exception:
                     logger.warning(
@@ -998,12 +1051,13 @@ def _share_notice(published_dir: Path, published_key: str, view_url: str) -> dic
 
 
 def _sync_team_audience(
-    *, artifact_id: str, scope: TenantScope, owner_side: dict, notify: dict[str, str] | None = None
+    *, artifact_id: str, scope: TenantScope, owner_side: dict, notify: dict[str, Any] | None = None
 ) -> None:
     """Write the restricted rule's teams, people by id and org-wide flag to
     auth, after the lambda wrote the rest of it (sync_artifact_team_access).
     ``notify`` (a person's save with "Notify people" chosen) carries the
-    title and URL the share email uses; None never notifies."""
+    ``recipients`` (ShareNotify) and the title and URL the share email uses;
+    None never notifies."""
     from cowork.services.artifact_access import ArtifactAccessUnavailable, sync_artifact_team_access
     from cowork.services.artifact_autopublish import _active_workspace_id
 
@@ -1019,7 +1073,8 @@ def _sync_team_audience(
         team_ids=list(owner_side.get("team_ids") or []),
         allowed_user_ids=list(owner_side.get("allowed_user_ids") or []),
         access_version=int(owner_side.get("access_version") or 1),
-        notify_recipients=notify is not None,
+        notify_user_ids=list(notify["recipients"].user_ids) if notify else [],
+        notify_emails=list(notify["recipients"].emails) if notify else [],
         artifact_title=(notify or {}).get("artifact_title", ""),
         artifact_url=(notify or {}).get("artifact_url", ""),
     )
