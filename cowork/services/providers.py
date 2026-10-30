@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -1519,6 +1520,14 @@ class WebToolKwargs(TypedDict, total=False):
     web_fetch_enabled: bool
 
 
+# anton's own setting names, so the CLI and a cowork-server read the same variables.
+_WEB_TOOL_ENV = {
+    "web_search_enabled": "ANTON_WEB_SEARCH_ENABLED",
+    "web_fetch_enabled": "ANTON_WEB_FETCH_ENABLED",
+}
+_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+
+
 def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     """ChatSessionConfig web-tool kwargs for a session that plans on ``planning_provider``.
 
@@ -1529,6 +1538,10 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     onto that flavor runs with both off. Every other session keeps anton's
     defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
     what its flavor provides.
+
+    ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
+    value in the server's env turn that tool off for every session; they never
+    turn one on.
     """
     from cowork.common.settings.user_settings import Provider
 
@@ -1536,8 +1549,13 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
         planning_provider is Provider.OPENAI_COMPATIBLE
         and openai_compatible_agent_api() == "responses"
     ):
-        return WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
-    return WebToolKwargs()
+        kwargs = WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
+    else:
+        kwargs = WebToolKwargs()
+    for field, env_name in _WEB_TOOL_ENV.items():
+        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
+            kwargs[field] = False
+    return kwargs
 
 
 def build_llm_client(
