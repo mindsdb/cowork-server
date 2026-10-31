@@ -39,20 +39,29 @@ _REFUSAL_REASONS = frozenset(
 #: start time. Written on the event loop; cowork.common.loop_watchdog reads a
 #: copy from its own thread when the loop stalls.
 _in_flight: dict[int, tuple[str, str, float]] = {}
-_IN_FLIGHT_LISTED = 20
+#: Requests listed from each end, the oldest and the newest.
+_IN_FLIGHT_LISTED_EACH = 10
 _PATH_CHARS = 200
 
 
 def in_flight_summary() -> str:
-    """The requests in flight, oldest first, as ``METHOD /path (age s)``."""
+    """The requests in flight, oldest first, as ``METHOD /path (age s)``.
+
+    Past twice _IN_FLIGHT_LISTED_EACH, the oldest and the newest of them,
+    with a count of the rest between. Open turn streams fill the oldest end,
+    so the request that arrived just before a stall is still named.
+    """
     now = monotonic()
     requests = sorted(_in_flight.copy().values(), key=lambda request: request[2])
+    unlisted = len(requests) - 2 * _IN_FLIGHT_LISTED_EACH
+    if unlisted > 0:
+        requests = requests[:_IN_FLIGHT_LISTED_EACH] + requests[-_IN_FLIGHT_LISTED_EACH:]
     listed = [
         f"{method} {path[:_PATH_CHARS]} ({now - started:.1f}s)"
-        for method, path, started in requests[:_IN_FLIGHT_LISTED]
+        for method, path, started in requests
     ]
-    if len(requests) > _IN_FLIGHT_LISTED:
-        listed.append(f"and {len(requests) - _IN_FLIGHT_LISTED} more")
+    if unlisted > 0:
+        listed.insert(_IN_FLIGHT_LISTED_EACH, f"{unlisted} more")
     return "; ".join(listed)
 
 

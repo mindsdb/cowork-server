@@ -323,10 +323,10 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     another pass over turns, channel tasks, scratchpad closes), and a margin
     for its unbounded closes.
 
-    The channel drain's wait_for waits for the tasks it cancels at its
-    timeout, and a cancelled channel turn writes its controller cancel flag
-    before it ends, so that drain can run CANCEL_REQUEST_SECONDS past its
-    own timeout."""
+    The channel drain cancels the tasks still running at its timeout, then
+    waits up to its cancel_timeout for them to unwind: a cancelled channel turn
+    writes its controller cancel flag, which takes up to
+    CANCEL_REQUEST_SECONDS, before it ends."""
     from cowork.channels.webhooks import drain_background_tasks
     from cowork.common.chat_session import drain_scratchpad_closes
     from cowork.draft_host.listener import (
@@ -335,11 +335,15 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
     from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 
+    channel_cancel_wait = (
+        inspect.signature(drain_background_tasks).parameters["cancel_timeout"].default
+    )
+    assert channel_cancel_wait >= CANCEL_REQUEST_SECONDS
     deployment = _rendered(values)
     teardown = (
         DRAFT_LISTENER_DRAIN_SECONDS
         + TURN_SHUTDOWN_GRACE_SECONDS
-        + _timeout_default(drain_background_tasks) + CANCEL_REQUEST_SECONDS
+        + _timeout_default(drain_background_tasks) + channel_cancel_wait
         + _timeout_default(drain_scratchpad_closes)
     )
     needed = (
@@ -399,3 +403,13 @@ def test_the_deployment_subchart_is_pinned_to_one_version():
     requirements = yaml.safe_load((CHART / "requirements.yaml").read_text())
     (subchart,) = [dep for dep in requirements["dependencies"] if dep["alias"] == "deployment"]
     assert subchart["version"] == DEPLOYMENT_SUBCHART_VERSION
+
+
+def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
+    """The slow-statement line is what the two PostgreSQL timeouts get chosen
+    from, so it is on everywhere hosted, and neither timeout is set yet."""
+    assert _entry(base, "SLOW_STATEMENT_LOG_MS").value == "1000"
+    for path in [BASE, *ENVIRONMENTS]:
+        names = {entry.name for entry in _env(path)}
+        assert "STATEMENT_TIMEOUT_MS" not in names, path.name
+        assert "IDLE_IN_TRANSACTION_TIMEOUT_MS" not in names, path.name

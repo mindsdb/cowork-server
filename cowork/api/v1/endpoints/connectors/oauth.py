@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_efs
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
@@ -248,13 +249,18 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
 # — there is no principal to check by construction, same as auth's own
 # OAuthCallbackView.
 @router.get("/{service}/callback", response_class=HTMLResponse, dependencies=[Depends(require(OpenByDesign))])
-def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
+async def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    # This runs only on the desktop: start_oauth refuses the sign-in wherever
-    # identity headers are trusted, and in org mode auth runs the handshake
-    # and its own callback.
-    html = oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope)
+    # A sign-in completes here only on the desktop: start_oauth refuses one
+    # wherever identity headers are trusted, and in org mode auth runs the
+    # handshake and its own callback. Any caller still reaches this route,
+    # and it reads and clears the pending sign-in and records its outcome in
+    # COWORK_HOME, the shared file store where hosted, so the callback runs on
+    # the file store's threads.
+    html = await run_efs(
+        lambda: oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope), scope=scope
+    )
     return HTMLResponse(content=html)
 
 

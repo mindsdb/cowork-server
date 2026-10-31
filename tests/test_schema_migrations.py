@@ -784,6 +784,38 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
             _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
 
 
+def _insert_queued_repair(connection, *, conversation_id: str, org_id=None):
+    connection.execute(
+        text(
+            "INSERT INTO queued_agent_repairs (id, org_id, conversation_id, slug) "
+            "VALUES (:id, :org_id, :conversation_id, 'fixme')"
+        ),
+        {"id": uuid.uuid4().hex, "org_id": org_id, "conversation_id": conversation_id},
+    )
+
+
+def test_queued_agent_repairs_hold_one_row_per_folder_in_each_org(tmp_path, monkeypatch):
+    """Two organizations' rows for one conversation and folder never collide,
+    and the rows with no org keep one per conversation and folder too."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "queued_agent_repairs.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    conversation_id = uuid.uuid4().hex
+
+    with engine.begin() as connection:
+        _insert_queued_repair(connection, conversation_id=conversation_id)
+        _insert_queued_repair(connection, conversation_id=conversation_id, org_id="org-a")
+        _insert_queued_repair(connection, conversation_id=conversation_id, org_id="org-b")
+
+    for org_id in (None, "org-a"):
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _insert_queued_repair(connection, conversation_id=conversation_id, org_id=org_id)
+
+
 def test_published_page_ownership_upgrade_is_unique_and_survives_rollback(tmp_path):
     from uuid import uuid4
     from sqlalchemy.exc import IntegrityError
@@ -854,6 +886,36 @@ def test_migrated_schema_holds_the_live_app_uniqueness_rules(tmp_path, monkeypat
     _downgrade_to(engine, uri, "3e4b5f7586d3")
     for table in ("live_app_launches", "live_app_shares", "live_app_copies"):
         assert not _has_table(db_path, table)
+
+
+def test_live_app_availability_migration_upgrades_and_preserves_a_pending_notice(tmp_path):
+    from uuid import uuid4
+
+    from sqlmodel import Session, select
+    from cowork.models.live_app import LiveAppAvailabilityWait
+
+    uri = _sqlite_uri(tmp_path / "availability.db")
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert not _has_table(tmp_path / "availability.db", "live_app_availability_waits")
+    _upgrade_to(engine, uri, "head")
+    generation = uuid4()
+    with Session(engine) as session:
+        session.add(LiveAppAvailabilityWait(
+            partition_id="partition", user_id="person", generation=generation, notified=True
+        ))
+        session.commit()
+    _upgrade_to(engine, uri, "head")
+    with Session(engine) as session:
+        row = session.exec(select(LiveAppAvailabilityWait)).one()
+        assert row.generation == generation and row.notified
+    # The schema enforces one unresolved refusal per person across workers.
+    from sqlalchemy.exc import IntegrityError
+    with Session(engine) as session:
+        session.add(LiveAppAvailabilityWait(partition_id="partition", user_id="person"))
+        with pytest.raises(IntegrityError):
+            session.commit()
+    engine.dispose()
 
 
 def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monkeypatch):
@@ -954,3 +1016,41 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
         assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
     engine.dispose()
+
+
+def test_artifact_locations_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact_locations.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert "conflicted" in _table_columns(db_path, "artifact_locations")
+    # Indexed for the conversations foreign key's ON DELETE CASCADE.
+    assert _has_index(db_path, "ix_artifact_locations_conversation_id")
+
+    _downgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert not _has_table(db_path, "artifact_locations")
+
+    _upgrade_to(engine, uri, "head")
+    assert _has_index(db_path, "ix_artifact_locations_conversation_id")
+
+
+def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch):
+    # Mirrors the upgrade guard, as task_objects' downgrade does.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact_locations_missing.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE artifact_locations"))
+
+    _downgrade_to(engine, uri, "a6e3c9f2b4d8")  # must not raise
+
+    assert _alembic_version(db_path) == "a6e3c9f2b4d8"

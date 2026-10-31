@@ -54,8 +54,9 @@ def retrieve_file(file_id: UUID, scoped: ScopedSessionDep):
 
 
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_file(file_id: UUID, scoped: ScopedSessionDep):
-    found = FileService(scoped).delete_file(file_id)
+async def delete_file(file_id: UUID, scope: Annotated[TenantScope, Depends(get_tenant_scope)]):
+    # The row and the stored bytes go together, on the file store's threads.
+    found = await run_efs_unit(lambda session: FileService(session).delete_file(file_id), scope=scope)
     if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 

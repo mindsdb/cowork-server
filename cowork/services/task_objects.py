@@ -12,7 +12,7 @@ from uuid import UUID
 
 
 from cowork.common.logger import log_context
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session, tenant_scope_required
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
@@ -351,33 +351,6 @@ def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
     return slugs, mtimes
 
 
-def _recover_turn_scope(conversation) -> TenantScope | None:
-    """The tenant scope for post-turn work, or None when there is none.
-
-    Primary source is the scope the conversation's session was wrapped with —
-    the ORIGINAL authorization context, never one derived from row data.
-    Fallback is the ambient scope bound at the turn boundary
-    (`use_settings_scope` in handlers.responses), which survives a detached or
-    expired session. Returning None is the fail-safe: callers skip their work
-    rather than inventing a tenant.
-    """
-    from sqlalchemy.orm import object_session
-
-    try:
-        _sess = object_session(conversation)
-    except Exception:
-        _sess = None
-    scope = scope_of_session(_sess) if _sess is not None else None
-    if scope is not None:
-        return scope
-    try:
-        from cowork.common.settings.user_settings import current_settings_scope
-
-        return current_settings_scope()
-    except Exception:
-        return None
-
-
 def record_new_artifacts(
     session: ScopedSession,
     *,
@@ -434,14 +407,18 @@ def record_new_artifacts(
                     extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
                 )
     if org_mode and project_id and artifact_ids:
-        from cowork.services.artifact_locations import Location, record_found_location
+        from cowork.services.artifact_locations import Location, record_made_folder
 
-        # A turn creates its folders in the project's shared root.
+        # A turn creates its folders in the project's shared root and sees
+        # only those, so it writes no location row; a folder whose id has a
+        # row naming another folder of the project marks the id conflicted.
         for slug in slugs:
             if slug not in artifact_ids:
                 continue
             try:
-                record_found_location(session, artifact_ids[slug], Location(UUID(str(project_id)), None, slug))
+                record_made_folder(
+                    session, artifact_id=artifact_ids[slug], location=Location(UUID(str(project_id)), None, slug),
+                )
             except Exception:
                 session.rollback()
                 logger.error(
@@ -449,41 +426,6 @@ def record_new_artifacts(
                     exc_info=True,
                     extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
                 )
-
-
-def _index_new_slugs(
-    conversation, conversation_id, project_id, slugs: list[str], scope: TenantScope | None
-) -> None:
-    """record_new_artifacts on a short session of its own. Best-effort."""
-    try:
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.session import get_open_session
-
-        if scope is None:
-            # Never invent a scope: desktop passes through; a partitioned
-            # deployment without the caller's scope skips indexing (fail-safe).
-            if tenant_scope_required():
-                logger.warning(
-                    "artifact indexing skipped: no tenant scope provided on a partitioned "
-                    "deployment (conversation %s)",
-                    conversation_id,
-                )
-                return
-            scope = LOCAL_SCOPE
-        with get_open_session(get_app_settings().database.uri) as session:
-            record_new_artifacts(
-                ScopedSession(session, scope),
-                conversation_id=conversation_id,
-                project_id=project_id,
-                slugs=slugs,
-                creator=getattr(conversation, "created_by", None),
-            )
-    except Exception:
-        logger.warning(
-            "Could not index artifacts created this turn",
-            exc_info=True,
-            extra=log_context(conversation_id=conversation_id, project_id=project_id, artifact_slugs=slugs or None),
-        )
 
 
 @dataclass(frozen=True)
@@ -500,6 +442,13 @@ class ArtifactChanges:
     # The id each created folder holds, read on the file store with the diff,
     # so recording the folder's location row needs no file store call.
     created_ids: dict[str, str] = field(default_factory=dict)
+    # The folders among `repair_slugs` the diff ruled on: it found no
+    # artifact folder there, or it opened the folder and, after its captures,
+    # found no repair in it still queued to this conversation. A folder it
+    # could not read, or whose queued repair it could not finish, is left
+    # out, so its queued_agent_repairs row stays for the next turn end. Empty
+    # when the diff listed the whole folder.
+    checked_repairs: set[str] = field(default_factory=set)
 
 
 # More names than this is not one turn's own work: the diff then covers the
@@ -510,8 +459,11 @@ _MAX_TRACKED_ARTIFACTS = 1000
 def tracked_artifacts_from_reply(data: Mapping) -> set[str] | None:
     """The folder names a remote turn's artifact tools touched, from its
     ``turn_completed`` reply, or None when the pod sent no usable list (an
-    older pod). Untrusted: the diff only ever intersects these names with the
-    folders it finds itself."""
+    older pod). Untrusted. With the queued repairs read too, the diff opens
+    each name as one folder directly below the pinned artifacts base
+    (artifact_folders_named), so a name holding ``..``, a separator or NUL, a
+    link, or a folder whose ``metadata.json`` isn't a plain file is left out.
+    Otherwise the diff intersects the names with the folders it lists."""
     touched = data.get("artifacts_touched")
     if (
         not isinstance(touched, list)
@@ -561,14 +513,25 @@ def turn_artifact_changes(
     deployment used to qualify (each conversation's pod had its own artifacts
     dir), but since ENG-2056 its pods share the project-level base, so the
     remote producer's pure diff carries the same concurrent-sibling caveat as
-    the desktop; the pod reports no tracked sets yet.
+    the desktop. A remote pod names the artifacts its tools touched on
+    `turn_completed`, and the remote producers pass that list as both tracked
+    sets; an older pod sends none, and every other exit has none.
 
     `attribute_by_provenance` is the remote producers' substitute for
-    `tracked_new` (ENG-2961): the pod reports no tracked sets, so a folder that
-    appeared is claimed only if its `metadata.json` provenance names this
+    `tracked_new` when the pod sent no list: a folder that appeared is
+    claimed only if its `metadata.json` provenance names this
     conversation (`artifact_ownership.turn_created_slugs`), and, when the turn
     did not complete cleanly, also if it has no provenance yet. Ignored when
     `tracked_new` is given.
+
+    `repair_slugs` are the folders recorded as holding an agent repair queued
+    to this conversation (queued_agent_repairs). With both tracked sets and
+    `repair_slugs` given, nothing else can be in the answer, so the diff opens
+    only those folders (artifact_folders_named) and lists nothing; the result's
+    `checked_repairs` names the repair folders it ruled on: one that holds no
+    artifact folder, or one it read that holds no repair still queued to this
+    conversation once the captures ran. Otherwise it lists the whole folder
+    and checks every artifact for a queued repair.
     """
     from cowork.services.artifacts import content_mtime_ns
     from cowork.services.artifact_revisions import (
@@ -577,14 +540,17 @@ def turn_artifact_changes(
     )
 
     base = Path(artifacts_base)
-    # With both tracked sets and the folders holding a repair queued to this
-    # conversation (`repair_slugs`, from queued_agent_repairs), nothing else
-    # can be in the answer, so only those folders are statted, not every
-    # folder in the project's artifacts.
+    checked_repairs: set[str] = set()
+    # With both tracked sets and the repair folders, only those folders are
+    # opened, not every folder in the project's artifacts.
     if tracked_new is not None and tracked_edits is not None and repair_slugs is not None:
         from cowork.services.artifact_identity import artifact_folders_named
 
-        after = artifact_folders_named(base, set(tracked_new) | set(tracked_edits) | set(repair_slugs))
+        named = artifact_folders_named(
+            base=base, slugs=set(tracked_new) | set(tracked_edits) | set(repair_slugs),
+        )
+        after = named.found
+        checked_repairs = set(repair_slugs) - named.unreadable
     else:
         after = snapshot_artifact_slugs(base)
     if tracked_new is None and attribute_by_provenance:
@@ -618,60 +584,22 @@ def turn_artifact_changes(
     for slug in after - touched:
         if has_queued_agent_repair(base / slug, conversation_key):
             capture_agent_revision(base / slug, conversation_id=conversation_key)
+    # A capture can leave a repair queued (the artifact's lock stayed held,
+    # or a read failed), so a repair folder the diff read counts as ruled on
+    # only once a strict read finds nothing in it still queued to this
+    # conversation. Otherwise its row stays for the next turn end.
+    for slug in checked_repairs & after:
+        try:
+            still_queued = has_queued_agent_repair(base / slug, conversation_key, strict=True)
+        except OSError:
+            still_queued = True
+        if still_queued:
+            checked_repairs.discard(slug)
     from cowork.services.artifact_identity import artifact_ids_below
 
-    return ArtifactChanges(created=new, touched=touched, created_ids=artifact_ids_below(base, new))
-
-
-def index_turn_artifacts(
-    conversation,
-    conversation_id,
-    project_id,
-    artifacts_base,
-    before: set[str],
-    before_mtimes: dict[str, int],
-    tracked_new: set[str] | None = None,
-    tracked_edits: set[str] | None = None,
-    attribute_by_provenance: bool = False,
-    completed_cleanly: bool = True,
-) -> tuple[list[str], set[str], TenantScope | None]:
-    """End-of-turn artifact bookkeeping, on a short session of its own.
-
-    Returns (new_slugs, touched_slugs, scope):
-      • new_slugs: artifacts this turn CREATED (ArtifactChanges.created),
-        each indexed as owned by this conversation;
-      • touched_slugs: ArtifactChanges.touched;
-      • scope: the tenant scope for post-turn work (see _recover_turn_scope).
-
-    The bounds and `attribute_by_provenance` are turn_artifact_changes'.
-
-    conversation_id/project_id are captured by the caller while the row is
-    unambiguously attached, so the ids never depend on the session still being
-    live/unexpired in this end-of-turn path. `conversation` itself is read only
-    for the tenant scope and, when owners are recorded, `created_by`.
-
-    Never raises. This runs in a turn's `finally`, so an exception here would
-    replace the turn's real outcome; on any internal failure it degrades to
-    ([], set(), None) and the next turn picks the work up.
-    """
-    try:
-        changes = turn_artifact_changes(
-            conversation_id=conversation_id,
-            artifacts_base=artifacts_base,
-            before=before,
-            before_mtimes=before_mtimes,
-            tracked_new=tracked_new,
-            tracked_edits=tracked_edits,
-            attribute_by_provenance=attribute_by_provenance,
-            completed_cleanly=completed_cleanly,
-        )
-        scope = _recover_turn_scope(conversation)
-        if changes.created:
-            _index_new_slugs(conversation, conversation_id, project_id, changes.created, scope)
-        return changes.created, changes.touched, scope
-    except Exception:
-        logger.warning("index_turn_artifacts failed", exc_info=True)
-        return [], set(), None
+    return ArtifactChanges(
+        created=new, touched=touched, created_ids=artifact_ids_below(base, new), checked_repairs=checked_repairs,
+    )
 
 
 def cards_for_slugs(
@@ -737,6 +665,7 @@ async def publish_and_card_turn_artifacts(
     project_id: str | None = None,
     project_name: str = "",
     project_label: str = "",
+    only_touched: bool = False,
 ) -> list[dict]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
@@ -764,11 +693,16 @@ async def publish_and_card_turn_artifacts(
     (non-new) slugs on it would mean a local edit never cards at all.
     `cards_for_slugs` builds a card straight from the local folder regardless of
     publish state, so every slug this turn touched is cardable there.
+
+    `only_touched` is for a remote turn whose pod named the artifacts its
+    tools touched: the reconciler then opens and publishes only the turn's
+    own folders, and leaves the rest of the project to its scheduled
+    self-heal (`artifact_autopublish.request_self_heal`).
     """
     from cowork.services.artifact_autopublish import autopublish_project_artifacts
 
     republished = await autopublish_project_artifacts(
-        artifacts_base, scope, touched=set(touched_slugs), project_id=project_id,
+        artifacts_base, scope, touched=set(touched_slugs), project_id=project_id, only_touched=only_touched,
     )
     if getattr(scope, "org_mode", False):
         carded = set(new_slugs) | (republished & set(touched_slugs))

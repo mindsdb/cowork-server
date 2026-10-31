@@ -49,6 +49,14 @@ jobs:
       contents: read
     uses: ./.github/workflows/tests-unit.yml
 
+  service-tests:
+    # The Redis and PostgreSQL contracts, on what staging is about to deploy.
+    # `release` doesn't need this job: a red here alerts through `notify` but
+    # doesn't hold up the desktop wheel.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests-services.yml
+
   build-deploy:
     # The container image, for the per-PR environments and whatever comes after.
     # Independent of the release chain on purpose: a scan finding should not hold
@@ -203,7 +211,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, build-deploy, wheels-available, release, publish]
+    needs: [unit-tests, service-tests, build-deploy, wheels-available, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read

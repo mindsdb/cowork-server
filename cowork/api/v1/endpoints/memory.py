@@ -32,7 +32,7 @@ from cowork.services.memory import (
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
-async def _with_memory_service(scope: TenantScope, principal: Principal | None, use):
+async def _with_memory_service(use, *, scope: TenantScope, principal: Principal | None):
     """``use(service)`` in a unit on the file store's threads: memory reads
     and writes the project row and the memory files together."""
 
@@ -49,7 +49,7 @@ async def list_memory(
     principal: Principal | None = Depends(get_principal),
 ):
     return await _with_memory_service(
-        scope, principal, lambda service: service.list_memory_sync(project_id=project_id)
+        lambda service: service.list_memory_sync(project_id=project_id), scope=scope, principal=principal
     )
 
 
@@ -74,14 +74,14 @@ async def update_memory(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PERSON_EDIT_REFUSED)
     try:
         return await _with_memory_service(
-            scope,
-            principal,
             lambda service: service.update_memory_sync(
                 scope=body.scope,
                 category=body.category,
                 content=body.content,
                 project_id=body.project_id,
             ),
+            scope=scope,
+            principal=principal,
         )
     except UnicodeError as e:
         # A slot whose stored bytes do not decode is a broken shared resource,
@@ -108,13 +108,13 @@ async def delete_memory(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_DELETE_REFUSED)
     try:
         await _with_memory_service(
-            scope,
-            principal,
             lambda service: service.delete_memory_sync(
                 scope=body.scope,
                 category=body.category,
                 project_id=body.project_id,
             ),
+            scope=scope,
+            principal=principal,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -128,5 +128,7 @@ async def reset_memory(
 ) -> MemoryReset:
     """Remove all of the caller's learned memory: their global tier and each
     project tier of theirs (MemoryService.reset_own_memory_sync)."""
-    reset = await _with_memory_service(scope, principal, lambda service: service.reset_own_memory_sync())
+    reset = await _with_memory_service(
+        lambda service: service.reset_own_memory_sync(), scope=scope, principal=principal
+    )
     return MemoryReset(removed=reset.removed)

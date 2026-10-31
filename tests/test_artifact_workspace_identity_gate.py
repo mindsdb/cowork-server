@@ -20,6 +20,7 @@ from cowork.api.v1 import artifact_scope
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from _async_stub import awaitable
+from draft_host_support import reviewed_and_read
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ def no_resolution(monkeypatch):
     def explode(*_args, **_kwargs):
         raise AssertionError("resolution reached with an unvalidated identity")
 
-    monkeypatch.setattr("cowork.api.v1.artifact_scope._resolve_in", explode)
+    monkeypatch.setattr("cowork.api.v1.artifact_scope.artifact_folders_holding", explode)
 
 
 @pytest.mark.parametrize(
@@ -67,11 +68,11 @@ def test_both_uuid_spellings_address_the_same_artifact(client, monkeypatch):
     the canonical 32-hex spelling either way — that is what metadata carries."""
     seen: list[str] = []
 
-    def capture(_sources, artifact_id):
+    def capture(_sources, *, artifact_id):
         seen.append(artifact_id)
         raise AssertionError("stop here; the id is what this test is about")
 
-    monkeypatch.setattr("cowork.api.v1.artifact_scope._resolve_in", capture)
+    monkeypatch.setattr("cowork.api.v1.artifact_scope.artifact_folders_holding", capture)
 
     dashed = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b"
     undashed = dashed.replace("-", "")
@@ -162,8 +163,8 @@ def served_xlsx(tmp_path, monkeypatch):
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        workspace_ep, "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, {"type": "file"}, True)),
+        workspace_ep, "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "file"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef/model.xlsx"
 
@@ -781,8 +782,8 @@ def served_html_app(tmp_path, monkeypatch):
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        workspace_ep, "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, {"type": "html-app"}, True)),
+        workspace_ep, "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef"
 

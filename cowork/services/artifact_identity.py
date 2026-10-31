@@ -11,6 +11,7 @@ the value, so the derivation is imported rather than reimplemented.
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -20,9 +21,10 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from enum import Enum
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 # Re-exported: `artifact_key()` is the canonical `artifact/<uuid>` key the
 # comments API, the auth rules and the upload lambda all agree on. Callers here
@@ -382,10 +384,25 @@ _identity_indexes: OrderedDict[
 _identity_indexes_lock = RLock()
 
 
-def _build_identity_index(base: PinnedDir, *, widen: bool = True) -> dict[str, tuple[str, ...]]:
+def _holds_no_id(exc: OSError) -> bool:
+    """Whether a read error means the entry holds no artifact id: it is gone,
+    is not a directory, or is a link, which no reader follows (ELOOP from
+    ``O_NOFOLLOW``). Any other error leaves unknown what the entry holds."""
+    return isinstance(exc, (FileNotFoundError, NotADirectoryError)) or exc.errno == errno.ELOOP
+
+
+def _build_identity_index(
+    base: PinnedDir, *, widen: bool = True, strict: bool = False
+) -> dict[str, tuple[str, ...]]:
     """Build an id-to-folder-name index below one pinned container. With
     ``widen`` off, a legacy short id is widened in memory only, and nothing is
-    written."""
+    written.
+
+    A folder that is gone, is a link, has no metadata file, or holds one that
+    does not parse holds no id. A folder that fails to read for any other
+    reason is left out too, unless ``strict``: then the error raises, for a
+    caller that records which folders hold an id and must not take a folder
+    it could not read for one holding none."""
     matches: dict[str, list[str]] = {}
     try:
         with dir_scandir(base) as entries:
@@ -397,9 +414,13 @@ def _build_identity_index(base: PinnedDir, *, widen: bool = True) -> dict[str, t
                         and entry.is_dir(follow_symlinks=False)
                     ):
                         folder_names.append(entry.name)
-                except OSError:
+                except OSError as exc:
+                    if strict and not _holds_no_id(exc):
+                        raise
                     continue
-    except OSError:
+    except OSError as exc:
+        if strict and not _holds_no_id(exc):
+            raise
         return {}
     # DirEntry's no-follow probe is an early filter; each openat below is the
     # race-safe decision if an entry changes after the scan.
@@ -415,7 +436,11 @@ def _build_identity_index(base: PinnedDir, *, widen: bool = True) -> dict[str, t
                     found, _metadata = ensure_full_id(folder.path, _pinned=folder)
                 else:
                     found, _metadata = read_full_id(folder)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (ValueError, json.JSONDecodeError):
+            continue
+        except OSError as exc:
+            if strict and not _holds_no_id(exc):
+                raise
             continue
         matches.setdefault(found, []).append(folder_name)
     return {artifact_id: tuple(folders) for artifact_id, folders in matches.items()}
@@ -604,20 +629,40 @@ def _resolved_from_source(
 
 def identities_below(source: "ProjectArtifacts") -> dict[str, tuple[str, ...]]:
     """Every id found in ``source``'s root, with the folders holding it, read
-    without writing. Empty for a missing root or a link in its chain."""
+    without writing. Empty for a missing root or a link in its chain. Any
+    other error opening the root or reading a folder raises (the index's
+    ``strict``), so the caller never takes a folder it could not read for
+    one holding no id."""
     try:
         with opened_artifact_root(source) as base:
-            return _build_identity_index(base, widen=False)
-    except (OSError, ValueError):
+            return _build_identity_index(base, widen=False, strict=True)
+    except OSError as exc:
+        if _holds_no_id(exc):
+            return {}
+        raise
+    except ValueError:
         return {}
 
 
-def artifact_folders_named(base: Path, slugs) -> set[str]:
+class NamedArtifactFolders(NamedTuple):
+    """What artifact_folders_named found among the names it was given. A name
+    in neither set holds no artifact folder."""
+
+    # Plain folders holding a plain metadata.json.
+    found: set[str]
+    # Names it could not read: a read error other than a missing entry or a
+    # link (_holds_no_id). Every name when opening ``base`` fails that way.
+    unreadable: set[str]
+
+
+def artifact_folders_named(*, base: Path, slugs: set[str]) -> NamedArtifactFolders:
     """The names among ``slugs`` that are artifact folders directly below
     ``base``: plain folders holding a plain ``metadata.json``. A name that
-    isn't one path component, a link, or a missing entry is left out. Stats
-    only the named folders, never the whole root."""
+    isn't one path component, a link, a missing entry or a folder without that
+    file holds none, and so does every name when ``base`` is missing or a
+    link. Stats only the named folders, never the whole root."""
     found: set[str] = set()
+    unreadable: set[str] = set()
     try:
         with pinned_dir(Path(base), nofollow_base=True) as root:
             for slug in slugs:
@@ -625,11 +670,14 @@ def artifact_folders_named(base: Path, slugs) -> set[str]:
                     with _opened_child_directory(root, slug) as folder:
                         if stat.S_ISREG(dir_stat(folder, "metadata.json", follow_symlinks=False).st_mode):
                             found.add(_component(slug))
-                except (OSError, ValueError):
+                except ValueError:
                     continue
-    except OSError:
-        return set()
-    return found
+                except OSError as exc:
+                    if not _holds_no_id(exc):
+                        unreadable.add(slug)
+    except OSError as exc:
+        return NamedArtifactFolders(found=set(), unreadable=set() if _holds_no_id(exc) else set(slugs))
+    return NamedArtifactFolders(found=found, unreadable=unreadable)
 
 
 def artifact_ids_below(base: Path, slugs) -> dict[str, str]:
@@ -650,16 +698,40 @@ def artifact_ids_below(base: Path, slugs) -> dict[str, str]:
     return ids
 
 
+class FolderCheck(Enum):
+    """What opening the folder a location row names found."""
+
+    #: The folder holds the requested id.
+    HOLDS = "holds"
+    #: The row is stale: the folder or its metadata file is gone, is not a
+    #: plain folder or file, or the folder holds another id.
+    STALE = "stale"
+    #: The folder could not be read: any other read error, a document that
+    #: does not parse, or a root replaced while it was open.
+    UNREADABLE = "unreadable"
+
+
+class RecordedFolder(NamedTuple):
+    """The folder a location row names and its metadata, when `check` is
+    HOLDS."""
+
+    check: FolderCheck
+    folder: Path | None = None
+    metadata: dict | None = None
+
+
 def resolve_recorded_folder(
     source: "ProjectArtifacts", slug: str, artifact_id: str
-) -> tuple[Path, dict] | None:
-    """The folder a location row names, when it still holds ``artifact_id``.
+) -> RecordedFolder:
+    """Open the folder a location row names and check it still holds
+    ``artifact_id``.
 
     ``source`` is a root the caller may already read, and ``slug`` comes from
     a row the server wrote from a folder name it found or made; it is opened
     as one validated, no-follow component below the pinned root. The request's
-    id is only compared with the folder's own. None when the folder is gone,
-    is not a plain folder, or holds another id: the row is stale.
+    id is only compared with the folder's own. A failed read is UNREADABLE,
+    never STALE, so a transient file store error does not move or drop the
+    row.
     """
     wanted = canonical_artifact_id(artifact_id)
     try:
@@ -667,28 +739,75 @@ def resolve_recorded_folder(
             with _opened_child_directory(base, slug) as folder:
                 found, metadata = ensure_full_id(folder.path, _pinned=folder)
             if not secrets.compare_digest(found, wanted):
-                return None
+                return RecordedFolder(FolderCheck.STALE)
             if not _root_still_current(source, base):
-                return None
-            return base.path / _component(slug), metadata
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
+                return RecordedFolder(FolderCheck.UNREADABLE)
+            return RecordedFolder(FolderCheck.HOLDS, base.path / _component(slug), metadata)
+    except OSError as exc:
+        return RecordedFolder(FolderCheck.STALE if _holds_no_id(exc) else FolderCheck.UNREADABLE)
+    except ValueError:
+        # json.JSONDecodeError is a ValueError too.
+        return RecordedFolder(FolderCheck.UNREADABLE)
+
+
+class HeldFolder(NamedTuple):
+    """A folder holding an artifact id, the root it was found in, and its
+    metadata."""
+
+    source: "ProjectArtifacts"
+    folder: Path
+    metadata: dict
+
+
+def artifact_folders_holding(
+    sources: list["ProjectArtifacts"], *, artifact_id: str
+) -> list[HeldFolder]:
+    """Every folder in ``sources`` that holds ``artifact_id``, in the order of
+    ``sources``. The roots must already be authorized for the caller; see
+    resolve_artifact_folder."""
+    wanted = canonical_artifact_id(artifact_id)
+    return [
+        HeldFolder(source, folder, metadata)
+        for source in sources
+        for folder, metadata in _resolved_from_source(source, wanted)
+    ]
+
+
+class FolderInRoot(NamedTuple):
+    """A folder found directly below one of a lookup's roots."""
+
+    source: "ProjectArtifacts"
+    folder: Path
+
+
+def folders_holding_strictly(
+    sources: list["ProjectArtifacts"], *, artifact_id: str
+) -> list[FolderInRoot]:
+    """Every folder in ``sources`` that holds ``artifact_id``, read past the
+    identity cache and without writing (identities_below). An error that
+    leaves unknown what a root or folder holds raises, so the list never
+    misses a folder because its read failed. The roots must already be
+    authorized for the caller."""
+    wanted = canonical_artifact_id(artifact_id)
+    held: list[FolderInRoot] = []
+    for source in sources:
+        identities = identities_below(source)
+        known = _matching_indexed_identity(tuple(identities), wanted)
+        if known is not None:
+            held.extend(FolderInRoot(source, source.base / name) for name in identities[known])
+    return held
 
 
 def resolve_artifact_folder(
     sources: list["ProjectArtifacts"], artifact_id: str
-) -> tuple["ProjectArtifacts", Path, dict]:
+) -> HeldFolder:
     """Resolve an id only inside roots already authorized for the caller.
 
     Root discovery and identity indexing never receive ``artifact_id``.  The
     request value selects a server-discovered identity in memory; only that
     trusted copy can enter the descriptor-relative revalidation path.
     """
-    wanted = canonical_artifact_id(artifact_id)
-    matches: list[tuple["ProjectArtifacts", Path, dict]] = []
-    for source in sources:
-        for folder, metadata in _resolved_from_source(source, wanted):
-            matches.append((source, folder, metadata))
+    matches = artifact_folders_holding(sources, artifact_id=artifact_id)
 
     if not matches:
         raise FileNotFoundError("Artifact not found")

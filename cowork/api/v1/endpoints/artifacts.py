@@ -13,10 +13,11 @@ import re
 import secrets
 import stat as stat_module
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -42,7 +43,6 @@ from cowork.api.v1.artifact_preview import (
     wants_html_preview,
 )
 from cowork.api.v1.artifact_scope import (
-    artifact_sources,
     artifact_sources_for_request,
     scoped_project_id_for_request,
 )
@@ -65,11 +65,13 @@ from cowork.services.artifact_roots import (
     artifacts_sources_for_scan,
     plan_project_roots,
     plan_scope_roots,
+    readable_sources,
     recorded_location,
 )
 from cowork.services.artifacts import (
     BackendPreviewRefused,
     ExecutionRefused,
+    ProjectArtifacts,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
@@ -171,6 +173,13 @@ def _legacy_artifact_for_sources(sources, folder_name: str):
     return None, None
 
 
+def _legacy_artifact_in_plan(plan: RootsPlan, folder_name: str):
+    """``_legacy_artifact_for_sources`` over the roots ``plan`` names that the
+    caller may read, found on the same thread, so a legacy delete's lookup is
+    one file store call."""
+    return _legacy_artifact_for_sources(readable_sources(plan), folder_name)
+
+
 # ``no-cache`` mirrors the FileResponse headers used elsewhere so a rebuilt
 # artifact is always re-fetched.
 # The two functions below hold the logic; the routes under them are thin adapters.
@@ -188,12 +197,31 @@ def _artifact_cards(session, sources) -> list[dict]:
     return _card_capabilities(session, sources=sources, cards=_list_artifacts(sources))
 
 
-async def _cards_for(scope: TenantScope, sources) -> list[dict]:
-    """``_artifact_cards`` with the folder walk on a file store thread and the
-    owner reads in a database unit, so no pooled connection waits on the file
-    server."""
-    cards = await run_efs(partial(_list_artifacts, sources), scope=scope)
-    return await run_db(partial(_card_capabilities, sources=sources, cards=cards), scope=scope)
+class _SourcesAndCards(NamedTuple):
+    """The file store half of a card list: the roots, and the cards of the
+    artifacts in them before the owner reads."""
+
+    sources: list[ProjectArtifacts]
+    cards: list[dict]
+
+
+def _sources_and_cards(find_sources: Callable[[], list[ProjectArtifacts]]) -> _SourcesAndCards:
+    """The roots ``find_sources`` finds and their cards, on the calling thread."""
+    sources = find_sources()
+    return _SourcesAndCards(sources=sources, cards=_list_artifacts(sources))
+
+
+async def _cards_for(
+    scope: TenantScope, find_sources: Callable[[], list[ProjectArtifacts]]
+) -> list[dict]:
+    """``_artifact_cards`` with the roots found and their folders walked in one
+    file store call, then the owner reads in a database unit, so no pooled
+    connection waits on the file server. ``find_sources`` runs in that file
+    store call."""
+    found = await run_efs(partial(_sources_and_cards, find_sources), scope=scope)
+    return await run_db(
+        partial(_card_capabilities, sources=found.sources, cards=found.cards), scope=scope
+    )
 
 
 def _card_capabilities(session, *, sources, cards: list[dict]) -> list[dict]:
@@ -300,10 +328,9 @@ def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
         ) from exc
 
 
-async def _scoped_project_roots(scope: TenantScope, project_id: UUID | str):
-    """``_scoped_project_sources`` for async callers: the same selector
-    boundary, with the database and the file store each read in a worker
-    thread of its own. Returns the server's project id and the roots."""
+async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> RootsPlan:
+    """The plan ``_scoped_project_sources`` reads, for async callers: the same
+    selector boundary, read in a database unit."""
     raw_project_ref = str(project_id)
     project_ref = os.path.basename(raw_project_ref)
     if project_ref != raw_project_ref:
@@ -311,10 +338,7 @@ async def _scoped_project_roots(scope: TenantScope, project_id: UUID | str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid project",
         )
-    plan = await run_db(partial(_plan_scoped_project, project_ref=project_ref), scope=scope)
-    # A project plan names exactly the one project it was read for.
-    (project,) = plan.projects
-    return project.id, await artifact_sources(plan, scope=scope)
+    return await run_db(partial(_plan_scoped_project, project_ref=project_ref), scope=scope)
 
 
 def _scoped_project_cards(session, project_ref: str) -> list[dict]:
@@ -754,7 +778,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return await _cards_for(scope, [source])
+            return await _cards_for(scope, lambda: [source])
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -765,10 +789,10 @@ async def list_artifacts(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid project",
             )
-        _project_id, sources = await _scoped_project_roots(scope, project_ref)
-        return await _cards_for(scope, sources)
+        plan = await _scoped_project_plan(scope, project_ref)
+        return await _cards_for(scope, partial(readable_sources, plan))
     plan = await run_db(plan_scope_roots, scope=scope)
-    return await _cards_for(scope, await artifact_sources(plan, scope=scope))
+    return await _cards_for(scope, partial(readable_sources, plan))
 
 
 
@@ -813,10 +837,14 @@ async def delete_artifact_for_request(
     # older desktop clients, but never use it when the caller supplied a UUID:
     # two conversations in one project can legitimately produce the same slug.
     ref = slug if isinstance(slug, _ArtifactDeleteRef) else _artifact_delete_ref(slug)
-    server_project_id, sources = await _scoped_project_roots(scope, project_id)
     source = None
     folder = None
     if ref.artifact_id is not None:
+        # Only the server's own project id: the review lookup below finds
+        # the project's roots itself.
+        server_project_id = await run_db(
+            lambda unit: scoped_project_id_for_request(unit, str(project_id)), scope=scope
+        )
         # Keep UUID validation and pass the basename output to the resolver:
         # SAST does not recognize UUID parsing or dataclass fields as a path
         # sanitizer. Parsing first rejects traversal instead of truncating it.
@@ -836,8 +864,9 @@ async def delete_artifact_for_request(
         # authorized root. It is never joined onto the root, and symlinked
         # artifact folders are not eligible for mutation.
         assert ref.legacy_slug is not None
+        plan = await _scoped_project_plan(scope, project_id)
         source, folder = await run_efs(
-            partial(_legacy_artifact_for_sources, sources, ref.legacy_slug), scope=scope
+            partial(_legacy_artifact_in_plan, plan, ref.legacy_slug), scope=scope
         )
     if source is None or folder is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
@@ -1535,8 +1564,8 @@ async def duplicate_live_app(
                 },
             )
         raise
-    _project_id, sources = await _scoped_project_roots(scope, str(body.project_id))
-    cards = await _cards_for(scope, sources)
+    plan = await _scoped_project_plan(scope, str(body.project_id))
+    cards = await _cards_for(scope, partial(readable_sources, plan))
     card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)
     if card is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The copy has no card")
