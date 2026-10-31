@@ -68,6 +68,8 @@ uv run --locked pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
+Every unit test runs under a guard for blocking work where it stops other requests (`tests/_blocking_guard.py`). A test fails when cowork code checks out a pooled database connection on the event loop. It also fails when, in org tenancy, cowork code reads, lists, writes, moves or deletes a file under `COWORK_HOME` on the event loop, or on a worker thread that `run_efs` didn't start, such as the file a returned Starlette `FileResponse` opens on anyio's threads. Move such work into `run_db` or `run_efs` (`cowork/db/units.py`). The sites the code has today are listed in the guard with their reasons, each by the function that blocks and the cowork call nearest the work, past the shared file helpers in `cowork/common/paths.py`, so new work below a listed function fails too. A listed site that no test reaches fails a full run, so remove its entry when you move the work. A run that can't tell, such as one test file or `--setup-only`, says in one line that it skipped that check.
+
 A few tests need a real Redis or PostgreSQL, because hosted Cowork runs on both: two replicas reading one Redis (`tests/integration/test_two_replicas.py`), and the migration and launch-lock contracts on PostgreSQL. They carry the `redis_service` or `postgres_service` marker and skip when their service is absent. `make test/services` runs only them. Point it at a disposable database, since the migration test downgrades it to an empty schema:
 
 ```sh

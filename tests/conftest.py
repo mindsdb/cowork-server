@@ -14,10 +14,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
+# Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
+# link takes branches a Linux run doesn't, so the blocking guard
+# (tests/_blocking_guard.py) would find different sites on each.
+TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-")).resolve()
 # Force isolation (assignment, not setdefault, never touch a real DB).
 os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
-os.environ["MASTER_KEY_PATH"] = str(TMP / "master.key")
+# Outside COWORK_HOME: the blocking guard (tests/_blocking_guard.py) counts
+# file work under COWORK_HOME, and the key's first read would be blamed on
+# whichever test decrypts first after get_fernet's cache clears. Hosted pods
+# take the key from COWORK_MASTER_KEY and read no file.
+os.environ["MASTER_KEY_PATH"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-key-")) / "master.key")
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 # Org mode roots every filesystem store at cowork_home() (see
@@ -463,3 +470,35 @@ def owned_logger(monkeypatch, caplog, tmp_path):
         logger.setLevel(level)
     for handler in handlers:
         handler.close()
+
+
+# ── Blocking work where it stops other requests (tests/_blocking_guard.py) ──
+
+_GUARD_REACHED: set["_blocking_guard.Site"] = set()
+
+
+@pytest.fixture(autouse=True)
+def blocking_work_guard():
+    """Fail a test that reaches a blocking site the guard's allowlist lacks."""
+    import _blocking_guard
+
+    with _blocking_guard.watching() as found:
+        yield
+    _GUARD_REACHED.update(found)
+    unlisted = _blocking_guard.unlisted(found)
+    if unlisted:
+        lines = "\n".join(_blocking_guard.site_line(site) for site in unlisted)
+        pytest.fail(
+            "blocking work where it stops other requests, not on "
+            f"tests/_blocking_guard.py's ALLOWLIST:\n{lines}",
+            pytrace=False,
+        )
+
+
+def pytest_sessionstart(session):
+    import _blocking_guard
+
+    session.config.pluginmanager.register(
+        _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
+        "cowork-blocking-guard-stale-entries",
+    )
