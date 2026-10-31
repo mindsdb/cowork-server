@@ -154,6 +154,21 @@ def _client() -> TestClient:
     return TestClient(cowork_server.create_app())
 
 
+_SECRET = "SECRET_TOKEN=do-not-serve-7f3a"
+
+
+def _replace_with_link(path: Path, target: Path) -> None:
+    """Replace a folder with a symlink, as a pre-sandbox cell could."""
+    import shutil
+
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(target, target_is_directory=True)
+
+
 @pytest.fixture
 def two_people(stack):
     """A owns `general/dash` (published) and `general/notes`; B owns an empty
@@ -396,6 +411,10 @@ def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people):
 
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+    served = client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B)
+    assert served.status_code == 404
+    assert "Quarterly forecast" not in served.text
+    assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A).status_code == 200
 
 
 def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monkeypatch):
@@ -420,6 +439,75 @@ def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monke
     assert client.delete("/api/v1/artifacts/", params={"path": str(notes)}, headers=B).status_code == 404
     assert notes.is_dir()
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+
+
+def test_serve_refuses_an_artifacts_folder_linked_to_the_projects_own_anton(two_people):
+    """With `.anton/artifacts` a link to `.anton`, the serve route would read
+    the project's saved secrets, `.anton/.env`, as an artifact."""
+    general = _general(ALICE)
+    (general / ".anton" / ".env").write_text(_SECRET, encoding="utf-8")
+    _replace_with_link(general / ".anton" / "artifacts", general / ".anton")
+    client = _client()
+
+    served = client.get("/api/v1/artifacts/serve/general/.env", headers=A)
+
+    # Body first: before the fix, the failure output shows the leaked secret.
+    assert _SECRET not in served.text, (served.status_code, served.text[:200])
+    assert served.status_code == 404
+
+
+def test_serve_refuses_an_anton_folder_linked_elsewhere(two_people, tmp_path):
+    general = _general(ALICE)
+    elsewhere = tmp_path / "elsewhere"
+    page = elsewhere / "artifacts" / "dash" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html>outside the project</html>", encoding="utf-8")
+    _replace_with_link(general / ".anton", elsewhere)
+    client = _client()
+
+    served = client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A)
+
+    assert served.status_code == 404
+    assert "outside the project" not in served.text
+
+
+@pytest.mark.parametrize(
+    ("bobs_link", "alices_target", "url"),
+    [
+        # B's artifacts folder reads A's whole `.anton`, secrets included.
+        ((".anton", "artifacts"), (".anton",), "/api/v1/artifacts/serve/general/.env"),
+        # B's `.anton` reads A's artifacts.
+        ((".anton",), (".anton",), "/api/v1/artifacts/serve/general/dash/index.html"),
+    ],
+)
+def test_serve_refuses_a_link_into_another_persons_anton(two_people, bobs_link, alices_target, url):
+    dash, _notes = two_people
+    alice = _general(ALICE)
+    (alice / ".anton" / ".env").write_text(_SECRET, encoding="utf-8")
+    _replace_with_link(_general(BOB).joinpath(*bobs_link), alice.joinpath(*alices_target))
+    client = _client()
+
+    served = client.get(url, headers=B)
+
+    assert _SECRET not in served.text, (served.status_code, served.text[:200])
+    assert "Quarterly forecast" not in served.text, (served.status_code, served.text[:200])
+    assert served.status_code == 404
+    assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A).status_code == 200
+
+
+def test_serve_refuses_a_link_inside_an_artifact_folder_that_leads_out(two_people):
+    """Passes before the fix too: a regression guard for the containment check,
+    which answers 400."""
+    dash, _notes = two_people
+    general = _general(ALICE)
+    (general / ".anton" / ".env").write_text(_SECRET, encoding="utf-8")
+    (dash / "leak.txt").symlink_to(general / ".anton" / ".env")
+    client = _client()
+
+    served = client.get("/api/v1/artifacts/serve/general/dash/leak.txt", headers=A)
+
+    assert served.status_code == 400
+    assert _SECRET not in served.text
 
 
 def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people):
