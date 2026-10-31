@@ -358,10 +358,23 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
-# Message for a turn cut off by boot recovery or shutdown, not by the model,
-# provider, or user Stop. Paired with GENERIC_TURN_ERROR_CODE, not a code of
-# its own — same as TurnInterrupted below.
+# Message for a turn the watchdog ended after it made no progress
+# (TurnLifecycle.timed_out), not the model, provider, or user Stop. Paired
+# with GENERIC_TURN_ERROR_CODE, not a code of its own — same as
+# TurnInterrupted below.
 INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
+
+# The server stopped while the turn ran: a shutdown, or a crash that boot
+# recovery finds afterwards. A code of its own because the next step differs
+# from anton_error: nothing about the request or the agent failed, the answer
+# streamed so far is kept, and sending the question again works once the
+# server is back. A proxy that outlives the server can send the same frame to
+# a client whose stream the crash cut.
+TURN_LOST_CODE = "turn_lost"
+TURN_LOST_MESSAGE = (
+    "The server stopped before this answer finished. The answer ends where it "
+    "was cut off. Please send your question again."
+)
 
 # anton ended a model call that sent no output within its deadline. Its own
 # message names the deadline, so it passes through; this is the fallback for
@@ -443,11 +456,15 @@ REMOTE_CANCEL_LITERAL = "cancelled"
 # per-stream-line cancel check needs stream lines to run and none exist
 # before the pod is Running.
 #
-# Ambiguous on its own: a replica taking SIGTERM during a rolling deploy
-# unwinds through the same handler, and reading that as a cancel would end
-# the turn with partial text, no error frame and no lookup id — the one
-# failure class that would come out of this change LESS visible. Callers
-# confirm it against the cancel flag before treating it as a Stop.
+# Ambiguous on its own: a controller replica without a shutdown drain also
+# sends it when its whole process is cancelled, as SIGINT in a local run
+# cancels every job task (a draining controller ends those turns with
+# "TurnInterrupted" instead). A hosted SIGTERM never gets there: as PID 1
+# such a controller ignores it until the kubelet kills it, and a peer later
+# reports the turn as lost. Reading this string as a cancel would end the
+# turn with partial text, no error frame and no lookup id: the one failure
+# class that would come out of this change LESS visible. Callers confirm it
+# against the cancel flag before treating it as a Stop.
 REMOTE_CANCEL_VIA_FAIL_JOB = "RuntimeError: cancelled"
 
 # live_pod.py raises a bare RuntimeError from two places when the pod never
@@ -1705,7 +1722,8 @@ def response_failed_payload(
     every remote-backend and in-process failure regardless of code, including
     the fully generic ``anton_error`` bucket, so a user report of "An
     unexpected error occurred" can still be pinned to this turn's server-side
-    logs. The direct and channel producers have none to offer and omit it.
+    logs. Every producer that builds this payload sets one. Boot recovery,
+    which seals a turn a restart killed, has none to offer and omits it.
 
     ``assistant_message_id`` is the persisted assistant Message's
     id when the failed turn still produced one (e.g. partial text before an

@@ -80,24 +80,20 @@ spec:
 {{ toYaml . | indent 14 }}
           {{- end }}
       ports:
-        - protocol: TCP
-          # Defaults to the port the container actually listens on, so the two
-          # cannot drift: a policy naming a port nothing serves drops every
-          # legitimate request while `helm template` stays clean.
-          port: {{ .Values.networkPolicy.port | default .Values.deployment.service.targetPort }}
+{{ include "cowork-server.policyPorts" . | indent 8 }}
 {{- end }}
 {{- with .Values.networkPolicy.nodeCidrs }}
     # (b) The nodes. Liveness and readiness probes come from the kubelet, so no
-    #     podSelector or namespaceSelector matches them.
+    #     podSelector or namespaceSelector matches them. The same ports as (a),
+    #     so a node that relays controller traffic reaches the draft host too.
     - from:
 {{- range . }}
         - ipBlock:
             cidr: {{ . | quote }}
 {{- end }}
+      # `with` rebound the dot to the CIDR list, so this needs the root.
       ports:
-        - protocol: TCP
-          # `with` rebound the dot to the CIDR list, so this needs the root.
-          port: {{ $.Values.networkPolicy.port | default $.Values.deployment.service.targetPort }}
+{{ include "cowork-server.policyPorts" $ | indent 8 }}
 {{- end }}
 {{- with .Values.networkPolicy.extraIngress }}
     # (c) Operator-supplied extra sources, verbatim ingress rules.

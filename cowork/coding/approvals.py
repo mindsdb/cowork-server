@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from cowork.coding.command_approvals import command_rule
-from cowork.coding.contracts import ApprovalDecision, PendingApproval
+from cowork.coding.contracts import ApprovalDecision, CodingEvent, EventType, PendingApproval
 from cowork.coding.redaction import redact_text
 
 
@@ -28,15 +28,25 @@ class ApprovalBroker:
         on_open: Callable[[str, PendingApproval], None],
         on_close: Callable[[str, PendingApproval, ApprovalDecision, str | None], None],
         get_command_grants: Callable[[str], list[str]],
+        is_read_only: Callable[[str], bool] = lambda _session_id: False,
+        on_refuse: Callable[[str, PendingApproval], None] = lambda _session_id, _pending: None,
     ) -> None:
         self._on_open = on_open
         self._on_close = on_close
         self._get_command_grants = get_command_grants
+        self._is_read_only = is_read_only
+        self._on_refuse = on_refuse
         self._lock = threading.RLock()
         self._waiters: dict[str, _Waiter] = {}
 
     def request(self, session_id: str, method: str, params: dict | None) -> dict[str, str]:
         pending = self._describe(method, params or {})
+        if self._is_read_only(session_id):
+            # Under on-request, Codex runs an accepted request outside the
+            # read-only sandbox, so no answer on a card can keep Read only.
+            # Decline before any card or remembered grant is consulted.
+            self._on_refuse(session_id, pending)
+            return {"decision": "decline"}
         rule = command_rule(method, params or {})
         waiter = _Waiter(
             session_id=session_id, pending=pending, event=threading.Event(),
@@ -121,6 +131,10 @@ class ApprovalBroker:
             raise first_error
 
     @staticmethod
+    def describe(method: str, params: dict | None) -> PendingApproval:
+        return ApprovalBroker._describe(method, params or {})
+
+    @staticmethod
     def _describe(method: str, params: dict) -> PendingApproval:
         kind = "elevated_action"
         title = "Approve elevated action"
@@ -168,3 +182,14 @@ class ApprovalBroker:
         if isinstance(value, dict):
             return ", ".join(f"{key}: {val}" for key, val in list(value.items())[:20])
         return ""
+
+
+def read_only_refusal(pending: PendingApproval) -> CodingEvent:
+    """Tell the person a request was declined because the task is Read only."""
+    return CodingEvent(
+        type=EventType.command_result,
+        title="Declined: this task is Read only",
+        text=f"Cowork declined the agent's request ({pending.title}). Switch the task to Ask first to allow changes.",
+        phase="failed",
+        data={"kind": pending.kind, "detail": pending.detail, "permissionMode": "read_only"},
+    )

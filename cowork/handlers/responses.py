@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cache, partial
@@ -98,6 +98,8 @@ from cowork.handlers.turn_errors import (
     SERVER_BUSY_CODE,
     STALLED_CODE,
     STALLED_TURN_MESSAGE,
+    TURN_LOST_CODE,
+    TURN_LOST_MESSAGE,
     auth_error_detail,
     friendly_turn_error,
     gate_reset_at,
@@ -111,6 +113,7 @@ from cowork.handlers.turn_errors import (
     server_busy_message,
 )
 from cowork.db.scoped import (
+    MissingTenantScopeError,
     ScopedSession,
     scope_from_principal,
     unsafe_unscoped_session,
@@ -234,9 +237,11 @@ async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bo
     """Whether a remote ``turn_failed`` is the user's own Stop, not a failure.
 
     ``REMOTE_CANCEL_LITERAL`` is proof on its own. ``REMOTE_CANCEL_VIA_FAIL_JOB``
-    is not: a controller replica taking SIGTERM mid-turn unwinds through the
-    same handler that a keepalive-driven cancel does, so the string cannot tell
-    a Stop from a rolling deploy killing the turn.
+    is not: a controller replica without a shutdown drain sends it too when its
+    whole process is cancelled mid-turn, as SIGINT in a local run does, through
+    the same handler that a keepalive-driven cancel uses. So the string cannot
+    tell a Stop from the process ending the turn. A hosted SIGTERM never takes
+    that path: such a controller runs as PID 1 and ignores it.
 
     The cancel flag separates them. ``/cancel`` writes it, the producer clears
     a stale one before each turn, and the keepalive-driven path never clears
@@ -306,11 +311,12 @@ async def _seal_unterminated_buffer(
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
 
-    ``request_id`` is the producing turn's own correlation id — the remote
-    one for ``_produce_remote``, the locally minted one for ``_run_turn``.
-    This is the hardest-failing turn (one that escaped every named ``except``),
-    so it's exactly the one a user is most likely to report. Still optional:
-    the direct/channel producers have no such id to offer.
+    ``request_id`` is the producing turn's own correlation id — the remote one
+    for ``_produce_remote``, the locally minted one for ``_run_turn``, the
+    caller's ``direct-`` id for ``_produce_direct``. This is the hardest-failing
+    turn (one that escaped every named ``except``), so it's exactly the one a
+    user is most likely to report. Every producer that reaches this now has one;
+    the parameter stays optional only so a test double can omit it.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
@@ -414,6 +420,25 @@ class _SavedAnswer:
     def assistant_message_id(self) -> str | None:
         """The row's id as the terminal frames carry it, or None."""
         return str(self.message_id) if self.message_id is not None else None
+
+
+# Saves that outlived the wait in _saved_by. Held here because the event loop
+# keeps only a weak reference to a task.
+_saves_past_their_deadline: set[asyncio.Task] = set()
+
+
+async def _saved_by(save: Awaitable[_SavedAnswer], *, deadline: float) -> _SavedAnswer:
+    """Run ``save`` in its own task and wait for it until the loop time
+    ``deadline``. One still running then goes on in the background and this
+    returns an empty _SavedAnswer, which names no row and no failure."""
+    task = asyncio.ensure_future(save)
+    loop = asyncio.get_running_loop()
+    await asyncio.wait([task], timeout=max(0.0, deadline - loop.time()))
+    if task.done():
+        return task.result()
+    _saves_past_their_deadline.add(task)
+    task.add_done_callback(_saves_past_their_deadline.discard)
+    return _SavedAnswer()
 
 
 @dataclass(frozen=True)
@@ -1211,6 +1236,12 @@ class ResponsesHandler:
 
         `question` is the text the turn was sent with (prompt_text), which a
         figure in the answer may repeat."""
+        # One id for the turn, not one per consumer: both halves quote it on a
+        # failure. The streaming half also carries it on the turn's identity,
+        # which registry.start records in the turn index on the Redis backend,
+        # so there the Reference a user reports resolves in the index too; the
+        # non-streaming half leaves only the log line.
+        corr = f"direct-{uuid4()}"
         if not request.stream:
             text = route.text
             sources = await self._direct_figure_sources(
@@ -1234,8 +1265,30 @@ class ResponsesHandler:
                 )
                 return _turn_anchor_id(user_message, assistant_message)
 
-            async with conversation_writes(conversation_id):
-                anchor_id = await run_db(save_turn, scope=self.scope)
+            try:
+                async with conversation_writes(conversation_id):
+                    anchor_id = await run_db(save_turn, scope=self.scope)
+            except (MissingTenantScopeError, PoolTimeoutError):
+                # server.py classifies both on purpose: a missing org scope is a
+                # 401, and a database with no free connection (DatabaseBusy
+                # included) is a 503 with Retry-After. The blanket clause below
+                # would answer either as a 500.
+                raise
+            except Exception:
+                # Without this the escape reaches the client as Starlette's bare
+                # 500: no body, no code, no id. Same shape the delegated
+                # non-streaming path raises, so a caller reads one body whichever
+                # producer answered.
+                logger.exception(
+                    "[responses] direct turn failed",
+                    extra=log_context(request_id=corr, conversation_id=conversation_id),
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=response_failed_payload(
+                        GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    ),
+                )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
@@ -1243,7 +1296,7 @@ class ResponsesHandler:
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
-        lifecycle = TurnLifecycle()
+        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr))
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -1255,6 +1308,7 @@ class ResponsesHandler:
                 question=question,
                 route=route,
                 buffer=buffer,
+                request_id=corr,
             ),
             org_id=self.scope.org_id,
             user_id=self.scope.user_id,
@@ -1288,6 +1342,7 @@ class ResponsesHandler:
         question: str,
         route: RouteDecision,
         buffer,
+        request_id: str,
     ) -> None:
         """Persist and emit a direct answer using the normal detached lifecycle.
 
@@ -1299,7 +1354,11 @@ class ResponsesHandler:
 
         The save, the frames that report it and the terminal record are one
         step a Stop cannot split: a Stop that lands during the save waits for
-        it, so the stream ends with what the database holds."""
+        it, so the stream ends with what the database holds.
+
+        ``request_id`` is the turn's correlation id, minted by the caller and
+        carried on the turn's identity, so that on the Redis backend the same
+        value reaches the turn index through ``registry.start``."""
         item_id = f"msg-{conv_id.hex[:12]}"
         delta = {
             "type": "response.output_text.delta",
@@ -1403,14 +1462,17 @@ class ResponsesHandler:
                 # frame says so with the wait, as a refused request's 503 does.
                 logger.warning(
                     "[responses] direct turn for conversation %s found no free database connection",
-                    conv_id,
+                    conv_id, extra=log_context(request_id=request_id, conversation_id=conv_id),
                 )
             else:
-                logger.exception("[responses] direct turn failed", extra=log_context(conversation_id=conv_id))
-            await buffer.append("sse", {"sse": _failed_frame_for(exc)})
+                logger.exception(
+                    "[responses] direct turn failed",
+                    extra=log_context(request_id=request_id, conversation_id=conv_id),
+                )
+            await buffer.append("sse", {"sse": _failed_frame_for(exc, request_id=request_id)})
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=request_id)
 
     def _select_producer(
         self,
@@ -1654,11 +1716,20 @@ class ResponsesHandler:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
 
+        Honours the user's memory settings the way the desktop harness does:
+        memory disabled, or the mode "off", writes nothing. A settings read that
+        fails writes nothing either, like every other error on this path.
+
         Never fails the turn — a lost memory is recoverable, a lost reply isn't.
         """
         if not entries:
             return
         try:
+            settings = get_user_settings(session.scope)
+            if not settings.memory_enabled or settings.memory_mode == "off":
+                logger.info("[responses] memory is off; dropped %d memory entr(ies) for conversation %s",
+                            len(entries), conv_id, extra=log_context(conversation_id=conv_id))
+                return
             conversation = ConversationService(session).get_conversation(conv_id)
             from cowork.models.project import Project
             from cowork.services.shared_resources import (
@@ -2090,6 +2161,10 @@ class ResponsesHandler:
                 await buffer.append("sse", {"sse": self._inject_completion_id(completed_frame, saved.message_id)})
             await buffer.close("completed")
 
+        async def save_as_it_stands() -> _SavedAnswer:
+            await record_artifacts(completed_cleanly=False)
+            return await persist(clean=False)
+
         async def end_turn(
             reason: TerminalReason, failed_frame: Callable[[str | None], str] | None = None,
         ) -> None:
@@ -2098,9 +2173,17 @@ class ResponsesHandler:
             and the terminal record. The cancel and error branches below run it
             under run_to_completion, so a second Stop or a shutdown that lands
             during a save waits for it, and the stream still ends the way this
-            turn did."""
-            await record_artifacts(completed_cleanly=False)
-            saved = await persist(clean=False)
+            turn did.
+
+            A turn a shutdown ended waits for its save only until
+            ``lifecycle.shutdown_frame_deadline``, so its frame reaches the
+            open stream before Uvicorn's request drain cuts it. A save still
+            running then goes on in the background, and the frame carries no
+            row id, as a failed save's does."""
+            if lifecycle.shutdown_frame_deadline is None:
+                saved = await save_as_it_stands()
+            else:
+                saved = await _saved_by(save_as_it_stands(), deadline=lifecycle.shutdown_frame_deadline)
             if lifecycle.discarded:
                 # Deleted while it saved: see finish().
                 return
@@ -2399,7 +2482,8 @@ class ResponsesHandler:
             if interrupted or lifecycle.stalled:
                 # Same split as _run_turn's branch; see there.
                 message, code = (
-                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    (TURN_LOST_MESSAGE, TURN_LOST_CODE) if lifecycle.shutting_down
+                    else (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
                     else (STALLED_TURN_MESSAGE, STALLED_CODE)
                 )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
@@ -2635,7 +2719,7 @@ class ResponsesHandler:
             # The ticker stops before finish() or any branch below closes the
             # buffer, so it can never write after the terminal record.
             async with model_wait.running(buffer=buffer):
-                async for sse_string in harness.formatter(stream, model, event_sink):
+                async for sse_string in harness.formatter(stream, model, event_sink, form_blocks=True):
                     if lifecycle.discarded:
                         # A frame sent after a turn delete's cancel landed, such
                         # as the turn's memory record: the delete removed this
@@ -2689,7 +2773,8 @@ class ResponsesHandler:
             interrupted = lifecycle.shutting_down or lifecycle.timed_out
             if interrupted or lifecycle.stalled:
                 message, code = (
-                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    (TURN_LOST_MESSAGE, TURN_LOST_CODE) if lifecycle.shutting_down
+                    else (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
                     else (STALLED_TURN_MESSAGE, STALLED_CODE)
                 )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
@@ -2842,10 +2927,12 @@ class ResponsesHandler:
             # Set after the branches above, each of which REPLACES `extra`
             # rather than adding to it — seeding it earlier would survive only
             # the unmapped path. Carried on every failure so the payload shape
-            # stays uniform, but only the unmapped branch tags its log line
-            # with the id, so a curated failure can reach the log with nothing
-            # to match a quoted reference against. The client renders it on
-            # the generic card alone, so there is nothing to quote for one.
+            # stays uniform. Both branches tag their log line with the id, but
+            # only the unmapped one does so above the deployed level floor:
+            # the curated line is INFO and staging/prod run at WARNING, so a
+            # curated failure's id can reach the log with nothing to match. The
+            # client renders it on the generic card alone, so there is nothing
+            # to quote for one anyway.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             # Append to collected_events BEFORE persisting — persist()

@@ -754,6 +754,7 @@ def publish_artifact(
                         returned_report_id, view_url,
                     )
                 raise
+        echoed_key = _lambda_artifact_key(result)
         if returned_report_id:
             history_item = {
                 "artifact": str(publish_target),
@@ -771,14 +772,14 @@ def publish_artifact(
             entry: dict[str, Any] = {
                 "report_id": returned_report_id,
                 "url": view_url,
-                # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
-                # so the comments panel can key threads after an app restart.
+                # The lambda's echo, else the key cowork sent. Comment routing reads
+                # `lambda_artifact_key` below, not this field.
                 "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
                 # The lambda's raw echo, or "" from an older lambda that sends none.
                 # Decides which scope the published page uses for comments; see
                 # services/comments_scope. Deliberately NOT merged with the field
                 # above, whose canonical fallback would read as an echo.
-                "lambda_artifact_key": _lambda_artifact_key(result),
+                "lambda_artifact_key": echoed_key,
                 "last_md5": result.get("md5", ""),
                 # Snapshot of the artifact's content mtime at publish time — the
                 # cheap gate for the `modified` badge (see card_for_folder). Uses
@@ -795,6 +796,13 @@ def publish_artifact(
             state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
             _save_state(state, scope=scope)
 
+        if scope is not None and scope.org_mode:
+            # Org comment routing never reads the record, so only the echo can
+            # point the renderer at the scope the published page uses.
+            response_key = echoed_key or canonical_artifact_key or ""
+        else:
+            # The card's key: desktop routing finds the cloud scope in the record.
+            response_key = canonical_artifact_key or echoed_key
         return {
             "status": "ok",
             "url": view_url,
@@ -803,8 +811,8 @@ def publish_artifact(
             "accessEmails": owner_side.get("emails", []),
             "orgAllowed": bool(owner_side.get("org_allowed")),
             "ownerOnly": bool(owner_side.get("owner_only")),
-            # Composite comments scope for the panel (Plan 5).
-            "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
+            # The renderer addresses comment requests by this key.
+            "artifactKey": response_key,
             "result": {k: v for k, v in result.items() if k != "file_payload"},
         }
 

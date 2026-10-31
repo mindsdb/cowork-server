@@ -1,4 +1,5 @@
-"""The cowork-server chart's datasource values: off by default, one identity, no duplicates.
+"""The cowork-server chart's values: datasource switches, the draft-preview
+host and the pod's shutdown.
 
 Cloud datasource grants for hosted turns sit behind ``COWORK_TURN_DATASOURCE_ENABLED``
 and ``COWORK_DATASOURCE_CAPABILITIES``. Three facts about the values files hold
@@ -19,16 +20,42 @@ the rollout together, and each fails quietly on its own:
   file: a duplicate renders fine and then either fails the upgrade or silently
   empties the variable. The controller's guard exists because that emptied its
   worker image in prod; this chart had no such guard.
+
+The draft-preview host is one Ingress, one container port and the
+``COWORK_DRAFT_*`` variables, all in the base and templated from two
+per-environment names, ``draftHost`` and ``webOrigin``. None of them fails at
+render time when they disagree: a wrong port answers 502, a host the listener
+does not know answers 404 (``draft_host_unknown``), a host outside the web
+build's list is refused by the page, and a wrong web origin blocks the frame
+(CSP frame-ancestors). So the tests pin every reference to its one name, keep
+the per-environment files to the names alone, and pin the names themselves.
+
+The shutdown values hold answers in progress through a rollout
+(README.md, "What a shutdown does to answers in progress"). Each environment
+renders the base values with its own file merged over them, and a PR
+environment renders the base alone, so each is checked as rendered:
+
+- No values file sets the image's command or args, which would replace the
+  Dockerfile's CMD and its uvicorn drain bound, and none sets a ``UVICORN_*``
+  variable, which uvicorn reads as an option outside the command.
+- The preStop sleep keeps the pod serving while the ingress stops routing to it.
+- The grace period covers the preStop, the pre-drain, uvicorn's bound and the
+  lifespan teardown's bounded waits, each read from where it is set.
+- A rollout starts every new pod before it stops an old one.
 """
 
 from __future__ import annotations
 
+import inspect
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
+
+from _hosted_command import graceful_shutdown_seconds, hosted_command, image_cmd
 
 CHART = Path(__file__).resolve().parents[1] / "deployment" / "cowork-server"
 BASE = CHART / "values.yaml"
@@ -41,6 +68,16 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # until it does; the gate's own change adds the environment here and sets
 # both deployment scalars in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset()
+# The draft host of each environment. cowork's web build frames exactly these
+# (src/shared/draft-link-origins.ts there) and refuses a link to any other.
+DRAFT_HOSTS = {
+    "dev": "draft-dev.mindshub.co",
+    "staging": "draft-staging.mindshub.co",
+    "prod": "draft.mindshub.co",
+}
+DRAFT_HOST = "{{ $.Values.draftHost }}"
+# The Ingress refuses to render without a host, which would make it a catch-all.
+REQUIRED_DRAFT_HOST = '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
 
 
 @dataclass(frozen=True)
@@ -141,3 +178,188 @@ def test_no_env_name_is_declared_twice_per_environment(base, env_values):
     names = [entry.name for entry in base + _env(env_values)]
     duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
     assert not duplicates, f"{env_values.name} renders {duplicates} more than once with values.yaml"
+
+
+def test_the_draft_host_is_off_in_the_base():
+    """A PR environment renders the base alone: no draft Ingress, and an empty
+    COWORK_DRAFT_PORT, which starts no listener."""
+    deployment = _deployment(BASE)
+    assert (deployment["draftHost"], deployment["webOrigin"]) == ("", "")
+    assert deployment["ingress_secondary"]["enabled"] is False
+
+
+def test_every_draft_host_reference_is_the_draft_host_name(base):
+    """The host the links point at, the hosts the listener answers for, the
+    Ingress host and the upstream Host the Ingress pins are one name, so a typo
+    cannot split them. The frame origin is the other name."""
+    secondary = _deployment(BASE)["ingress_secondary"]
+    assert _entry(base, "COWORK_DRAFT_HOSTS").value == DRAFT_HOST
+    assert _entry(base, "COWORK_DRAFT_ORIGIN").value == "{{ with $.Values.draftHost }}https://{{ . }}{{ end }}"
+    assert [host["host"] for host in secondary["hosts"]] == [REQUIRED_DRAFT_HOST]
+    assert secondary["annotations"]["nginx.ingress.kubernetes.io/upstream-vhost"] == DRAFT_HOST
+    assert _entry(base, "COWORK_WEB_ORIGIN").value == "{{ $.Values.webOrigin }}"
+
+
+def test_the_draft_port_is_the_draft_listener(base):
+    """The draft Ingress, the Service port it targets, the container port and
+    COWORK_DRAFT_PORT are one port, and the Service sends it to the container
+    port named draft, never to the API's. The listener binds
+    COWORK_SERVER_HOST, not the command's --host. A drift answers 502 or puts
+    the API app behind the draft host."""
+    deployment = _deployment(BASE)
+    port = {p["name"]: p["containerPort"] for p in deployment["additionalPorts"]}["draft"]
+    service = {p["name"]: p for p in deployment["service"]["additionalPorts"]}["draft"]
+    paths = [path for host in deployment["ingress_secondary"]["hosts"] for path in host["paths"]]
+    assert port != deployment["service"]["targetPort"]
+    assert _entry(base, "COWORK_DRAFT_PORT").value == f"{{{{ if $.Values.draftHost }}}}{port}{{{{ end }}}}"
+    assert (service["port"], service["targetPort"]) == (port, "draft")
+    assert [(p["path"], p["serviceName"], p["servicePort"]) for p in paths] == [("/_t/", deployment["name"], port)]
+    assert _entry(base, "COWORK_SERVER_HOST").value == "0.0.0.0"
+
+
+@pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
+def test_an_environment_names_its_draft_host_and_nothing_more(env_values):
+    """The rest stays in the base, so an override cannot pull one reference
+    away from the others. Helm replaces a list wholesale, so an environment
+    that set the ports or the Ingress hosts would drop the base's. The web app
+    is served from the primary Ingress host, the only page allowed to frame a
+    draft. An environment the web build has no draft host for keeps the base,
+    which is off."""
+    environment = env_values.stem.removeprefix("values-")
+    deployment = _deployment(env_values)
+    expected = DRAFT_HOSTS.get(environment)
+    assert deployment.get("draftHost") == expected, f"{env_values.name} names a draft host the web build does not frame"
+    if expected is None:
+        assert "webOrigin" not in deployment and "ingress_secondary" not in deployment, env_values.name
+    else:
+        primary = [host["host"] for host in (deployment.get("ingress") or {}).get("hosts") or []]
+        assert primary and deployment.get("webOrigin") == f"https://{primary[0]}", env_values.name
+        assert deployment.get("ingress_secondary") == {"enabled": True}, env_values.name
+    assert "additionalPorts" not in deployment
+    assert "additionalPorts" not in (deployment.get("service") or {})
+
+
+# What a pod's teardown may run past the waits that have a bound: the
+# closes of the scratchpads, the launched backends and the HTTP clients.
+UNBOUNDED_TEARDOWN_MARGIN_SECONDS = 10
+PRESTOP = ["/bin/sh", "-c", "sleep 15"]
+# Each file as an environment renders it; "values.yaml" alone is a PR environment.
+RENDERED = [BASE, *ENVIRONMENTS]
+
+
+def _merged(base: dict, overlay: dict) -> dict:
+    """Helm's merge of an overlay onto the base: maps merge key by key, any
+    other value replaces."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merged(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _rendered(path: Path) -> dict:
+    """The ``deployment:`` values an environment renders with."""
+    return _deployment(BASE) if path == BASE else _merged(_deployment(BASE), _deployment(path))
+
+
+def _prestop_seconds(deployment: dict) -> int:
+    command = deployment["lifecycle"]["preStop"]["exec"]["command"]
+    return int(re.fullmatch(r"sleep (\d+)", command[-1]).group(1))
+
+
+def _timeout_default(function) -> float:
+    return inspect.signature(function).parameters["timeout"].default
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_no_values_file_replaces_the_images_command(values):
+    """The Dockerfile's CMD carries uvicorn's drain bound; a chart command or
+    args would replace it (tests/_hosted_command.py)."""
+    image = _deployment(values).get("image") or {}
+    assert "command" not in image and "args" not in image, f"{values.name} sets the container command"
+    uvicorn_options = [
+        entry.name for entry in _env(values)
+        if entry.name.startswith("UVICORN_") or entry.name == "WEB_CONCURRENCY"
+    ]
+    assert not uvicorn_options, f"{values.name} sets uvicorn options outside the command: {uvicorn_options}"
+
+
+def test_the_image_command_is_the_final_stages_last_cmd(monkeypatch, tmp_path):
+    """Docker runs the final stage's last CMD; a CMD in an earlier stage, or
+    an earlier one in the final stage, never reaches the image."""
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python AS builder\n"
+        'CMD ["builder", "--timeout-graceful-shutdown", "2"]\n'
+        "FROM python AS final\n"
+        'CMD ["replaced"]\n'
+        'CMD ["final", "--timeout-graceful-shutdown", "20"]\n'
+    )
+    monkeypatch.setattr("_hosted_command.DOCKERFILE", dockerfile)
+
+    assert image_cmd() == ["final", "--timeout-graceful-shutdown", "20"]
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_the_pod_leaves_the_ingress_before_sigterm(values):
+    assert _rendered(values)["lifecycle"] == {"preStop": {"exec": {"command": PRESTOP}}}
+    assert _prestop_seconds(_rendered(values)) == 15
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_the_grace_period_covers_the_whole_shutdown(values):
+    """Counted from the pod's deletion: the preStop sleep, the pre-drain that
+    ends remote turns before uvicorn sees SIGTERM, uvicorn's drain bound, then
+    the lifespan teardown's bounded waits (the draft listener's own drain,
+    another pass over turns, channel tasks, scratchpad closes), and a margin
+    for its unbounded closes.
+
+    The channel drain's wait_for waits for the tasks it cancels at its
+    timeout, and a cancelled channel turn writes its controller cancel flag
+    before it ends, so that drain can run CANCEL_REQUEST_SECONDS past its
+    own timeout."""
+    from cowork.channels.webhooks import drain_background_tasks
+    from cowork.common.chat_session import drain_scratchpad_closes
+    from cowork.draft_host.listener import (
+        _GRACEFUL_SHUTDOWN_SECONDS as DRAFT_LISTENER_DRAIN_SECONDS,
+    )
+    from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
+    from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
+
+    deployment = _rendered(values)
+    teardown = (
+        DRAFT_LISTENER_DRAIN_SECONDS
+        + TURN_SHUTDOWN_GRACE_SECONDS
+        + _timeout_default(drain_background_tasks) + CANCEL_REQUEST_SECONDS
+        + _timeout_default(drain_scratchpad_closes)
+    )
+    needed = (
+        _prestop_seconds(deployment)
+        + TURN_SHUTDOWN_GRACE_SECONDS
+        + graceful_shutdown_seconds(hosted_command())
+        + teardown
+        + UNBOUNDED_TEARDOWN_MARGIN_SECONDS
+    )
+    assert deployment["terminationGracePeriodSeconds"] >= needed, (
+        f"{values.name}: grace {deployment['terminationGracePeriodSeconds']}s, shutdown needs {needed}s"
+    )
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_a_rollout_starts_every_new_pod_before_it_stops_an_old_one(values):
+    assert _rendered(values)["deploymentStrategy"] == {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxSurge": "100%", "maxUnavailable": 0},
+    }
+
+
+def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
+    """The slow-statement line is what the two PostgreSQL timeouts get chosen
+    from, so it is on everywhere hosted, and neither timeout is set yet."""
+    assert _entry(base, "SLOW_STATEMENT_LOG_MS").value == "1000"
+    for path in [BASE, *ENVIRONMENTS]:
+        names = {entry.name for entry in _env(path)}
+        assert "STATEMENT_TIMEOUT_MS" not in names, path.name
+        assert "IDLE_IN_TRANSACTION_TIMEOUT_MS" not in names, path.name
