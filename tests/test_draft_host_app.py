@@ -9,11 +9,14 @@ from __future__ import annotations
 import json
 import time
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
+import cowork.db.session as db_session
 from cowork.common.structured_logging import make_formatter
-from cowork.db.scoped import TenantScope
+from cowork.db import units
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.draft_host import app as draft_app_module
 from cowork.api.v1.artifact_preview import HTML_SANDBOX_CSP
 from cowork.draft_host.app import DRAFT_ROUTE, DRAFT_SANDBOX, EXPIRED_MESSAGE, create_draft_app, request_host
@@ -40,8 +43,10 @@ from draft_host_support import (
     fake_review,
     forge_identity,
     make_artifact,
+    reviewed_and_read,
     sign_claims,
 )
+from test_run_efs import holding
 
 
 @pytest.fixture
@@ -49,7 +54,7 @@ def seen(tmp_path, monkeypatch):
     calls: dict = {}
     source, folder, metadata = make_artifact(tmp_path)
     monkeypatch.setattr(
-        draft_app_module, "review_artifact_for_request", fake_review(source, folder, metadata, calls)
+        draft_app_module, "review_artifact_and_read", reviewed_and_read(fake_review(source, folder, metadata, calls))
     )
     return calls
 
@@ -363,7 +368,7 @@ def test_a_failure_is_logged_by_its_event_and_without_the_token(client, monkeypa
     def broken(*_args):
         raise RuntimeError(f"broken while reading /_t/{token}/index.html")
 
-    monkeypatch.setattr(draft_app_module, "review_artifact_for_request", broken)
+    monkeypatch.setattr(draft_app_module, "review_artifact_and_read", reviewed_and_read(broken))
     with caplog.at_level("WARNING"):
         response = client.get(f"/_t/{token}/index.html", headers=FETCH)
 
@@ -374,6 +379,58 @@ def test_a_failure_is_logged_by_its_event_and_without_the_token(client, monkeypa
     assert events["request_failed"].reason == "internal_server_error"
     for event in ("draft_host_failed", "request_failed"):
         assert token not in make_formatter().format(events[event])
+
+
+async def _get_on_this_loop(path: str) -> httpx.Response:
+    """A draft request served on the test's own loop, where the test holds
+    the file store and database slots (each loop has its own)."""
+    transport = httpx.ASGITransport(app=create_draft_app())
+    async with httpx.AsyncClient(transport=transport, base_url=f"https://{DRAFT_HOST}") as client:
+        return await client.get(path, headers=FETCH)
+
+
+def _assert_busy(response, caplog):
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    _assert_draft_headers(response)
+    assert events(caplog, "draft_host_failed") == []
+    [busy] = events(caplog, "draft_host_busy")
+    assert busy.levelname == "WARNING"
+    assert busy.exc_info is None
+
+
+@pytest.mark.parametrize(
+    "held, scope",
+    [
+        pytest.param(units.EFS_SHARE, TenantScope(org_mode=True, org_id=ORG, user_id=USER), id="own-share"),
+        pytest.param(units.EFS_SLOTS, LOCAL_SCOPE, id="every-slot"),
+    ],
+)
+async def test_a_busy_file_store_answers_503_with_retry_after(
+    draft_env, seen, monkeypatch, caplog, held, scope
+):
+    # The draft host is its own app, so cowork.server's busy handlers never
+    # see its refusals. The file read waits in the real run_efs.
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+
+    async with holding(held, scope):
+        with caplog.at_level("WARNING"):
+            response = await _get_on_this_loop(f"/_t/{draft_token()}/index.html")
+
+    _assert_busy(response, caplog)
+    assert events(caplog, "draft_host_busy")[0].error_type == "FilesystemBusy"
+
+
+async def test_a_busy_database_answers_503_with_retry_after(draft_env, monkeypatch, caplog):
+    # The real lookup reads its plan in run_db first; SQLite has one unit slot.
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+
+    async with units._slots(units._engine()):
+        with caplog.at_level("WARNING"):
+            response = await _get_on_this_loop(f"/_t/{draft_token()}/index.html")
+
+    _assert_busy(response, caplog)
+    assert events(caplog, "draft_host_busy")[0].error_type == "DatabaseBusy"
 
 
 def test_a_path_outside_the_route_is_logged_without_a_route(client, seen, caplog):
@@ -399,7 +456,7 @@ def test_a_fullstack_draft_serves_only_its_public_subtree(client, tmp_path, monk
         files={"static/index.html": DOC, "backend.py": "SECRET = 1"},
     )
     monkeypatch.setattr(
-        draft_app_module, "review_artifact_for_request", fake_review(source, folder, metadata, calls)
+        draft_app_module, "review_artifact_and_read", reviewed_and_read(fake_review(source, folder, metadata, calls))
     )
     token = draft_token()
 

@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -418,39 +419,20 @@ def record_new_artifacts(
                 )
 
 
-def _index_new_slugs(
-    conversation, conversation_id, project_id, slugs: list[str], scope: TenantScope | None
-) -> None:
-    """record_new_artifacts on a short session of its own. Best-effort."""
-    try:
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.session import get_open_session
-
-        if scope is None:
-            # Never invent a scope: desktop passes through; a partitioned
-            # deployment without the caller's scope skips indexing (fail-safe).
-            if tenant_scope_required():
-                logger.warning(
-                    "artifact indexing skipped: no tenant scope provided on a partitioned "
-                    "deployment (conversation %s)",
-                    conversation_id,
-                )
-                return
-            scope = LOCAL_SCOPE
-        with get_open_session(get_app_settings().database.uri) as session:
-            record_new_artifacts(
-                ScopedSession(session, scope),
-                conversation_id=conversation_id,
-                project_id=project_id,
-                slugs=slugs,
-                creator=getattr(conversation, "created_by", None),
-            )
-    except Exception:
+def turn_record_scope(scope: TenantScope | None, *, conversation_id) -> TenantScope | None:
+    """The scope to record a turn's new artifacts under, given the one
+    _recover_turn_scope found: that scope, or the desktop's local one when it
+    found none. None on a partitioned deployment that found none, and the
+    caller skips the record (fail-safe): it never invents a tenant."""
+    if scope is not None:
+        return scope
+    if tenant_scope_required():
         logger.warning(
-            "Could not index artifacts created this turn",
-            exc_info=True,
-            extra=log_context(conversation_id=conversation_id, project_id=project_id, artifact_slugs=slugs or None),
+            "artifact indexing skipped: no tenant scope provided on a partitioned deployment",
+            extra=log_context(conversation_id=conversation_id),
         )
+        return None
+    return LOCAL_SCOPE
 
 
 @dataclass(frozen=True)
@@ -555,57 +537,6 @@ def turn_artifact_changes(
     return ArtifactChanges(created=new, touched=touched)
 
 
-def index_turn_artifacts(
-    conversation,
-    conversation_id,
-    project_id,
-    artifacts_base,
-    before: set[str],
-    before_mtimes: dict[str, int],
-    tracked_new: set[str] | None = None,
-    tracked_edits: set[str] | None = None,
-    attribute_by_provenance: bool = False,
-    completed_cleanly: bool = True,
-) -> tuple[list[str], set[str], TenantScope | None]:
-    """End-of-turn artifact bookkeeping, on a short session of its own.
-
-    Returns (new_slugs, touched_slugs, scope):
-      • new_slugs: artifacts this turn CREATED (ArtifactChanges.created),
-        each indexed as owned by this conversation;
-      • touched_slugs: ArtifactChanges.touched;
-      • scope: the tenant scope for post-turn work (see _recover_turn_scope).
-
-    The bounds and `attribute_by_provenance` are turn_artifact_changes'.
-
-    conversation_id/project_id are captured by the caller while the row is
-    unambiguously attached, so the ids never depend on the session still being
-    live/unexpired in this end-of-turn path. `conversation` itself is read only
-    for the tenant scope and, when owners are recorded, `created_by`.
-
-    Never raises. This runs in a turn's `finally`, so an exception here would
-    replace the turn's real outcome; on any internal failure it degrades to
-    ([], set(), None) and the next turn picks the work up.
-    """
-    try:
-        changes = turn_artifact_changes(
-            conversation_id=conversation_id,
-            artifacts_base=artifacts_base,
-            before=before,
-            before_mtimes=before_mtimes,
-            tracked_new=tracked_new,
-            tracked_edits=tracked_edits,
-            attribute_by_provenance=attribute_by_provenance,
-            completed_cleanly=completed_cleanly,
-        )
-        scope = _recover_turn_scope(conversation)
-        if changes.created:
-            _index_new_slugs(conversation, conversation_id, project_id, changes.created, scope)
-        return changes.created, changes.touched, scope
-    except Exception:
-        logger.warning("index_turn_artifacts failed", exc_info=True)
-        return [], set(), None
-
-
 def cards_for_slugs(
     artifacts_base,
     slugs: list[str],
@@ -706,10 +637,17 @@ async def publish_and_card_turn_artifacts(
         carded = set(new_slugs) | (republished & set(touched_slugs))
     else:
         carded = set(touched_slugs)
-    return cards_for_slugs(
-        artifacts_base, sorted(carded),
-        scope=scope,
-        project_id=project_id, project_name=project_name, project_label=project_label,
+    from cowork.db.units import run_efs
+
+    return await run_efs(
+        partial(
+            cards_for_slugs,
+            artifacts_base, sorted(carded),
+            scope=scope,
+            project_id=project_id, project_name=project_name, project_label=project_label,
+        ),
+        scope=scope or LOCAL_SCOPE,
+        deadline=False,
     )
 
 

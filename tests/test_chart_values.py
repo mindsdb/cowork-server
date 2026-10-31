@@ -42,6 +42,13 @@ environment renders the base alone, so each is checked as rendered:
 - The grace period covers the preStop, the pre-drain, uvicorn's bound and the
   lifespan teardown's bounded waits, each read from where it is set.
 - A rollout starts every new pod before it stops an old one.
+
+The probes keep a slow dependency from restarting or unrouting the pod:
+readiness reads ``/api/v1/health/ready`` and liveness ``/api/v1/health/live``,
+neither of which touches the database, the file store or settings, and the
+liveness delay leaves the boot room to finish. The ``deployment`` subchart
+that renders them is pinned to one version, so a new release of it can't
+change them unreviewed.
 """
 
 from __future__ import annotations
@@ -316,10 +323,10 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     another pass over turns, channel tasks, scratchpad closes), and a margin
     for its unbounded closes.
 
-    The channel drain's wait_for waits for the tasks it cancels at its
-    timeout, and a cancelled channel turn writes its controller cancel flag
-    before it ends, so that drain can run CANCEL_REQUEST_SECONDS past its
-    own timeout."""
+    The channel drain cancels the tasks still running at its timeout, then
+    waits up to its cancel_timeout for them to unwind: a cancelled channel turn
+    writes its controller cancel flag, which takes up to
+    CANCEL_REQUEST_SECONDS, before it ends."""
     from cowork.channels.webhooks import drain_background_tasks
     from cowork.common.chat_session import drain_scratchpad_closes
     from cowork.draft_host.listener import (
@@ -328,11 +335,15 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
     from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 
+    channel_cancel_wait = (
+        inspect.signature(drain_background_tasks).parameters["cancel_timeout"].default
+    )
+    assert channel_cancel_wait >= CANCEL_REQUEST_SECONDS
     deployment = _rendered(values)
     teardown = (
         DRAFT_LISTENER_DRAIN_SECONDS
         + TURN_SHUTDOWN_GRACE_SECONDS
-        + _timeout_default(drain_background_tasks) + CANCEL_REQUEST_SECONDS
+        + _timeout_default(drain_background_tasks) + channel_cancel_wait
         + _timeout_default(drain_scratchpad_closes)
     )
     needed = (
@@ -353,6 +364,45 @@ def test_a_rollout_starts_every_new_pod_before_it_stops_an_old_one(values):
         "type": "RollingUpdate",
         "rollingUpdate": {"maxSurge": "100%", "maxUnavailable": 0},
     }
+
+
+# The liveness delay the boot has: kill comes at this plus failureThreshold *
+# periodSeconds, and staging boots under load took about 120s on 28 Oct.
+LIVENESS_DELAY_SECONDS = 180
+DEPLOYMENT_SUBCHART_VERSION = "1.0.47"
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_readiness_reads_the_route_that_does_no_io(values):
+    probe = _rendered(values)["readinessProbe"]
+    assert probe["enabled"] is True
+    assert probe["path"] == "/api/v1/health/ready"
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_liveness_reads_live_and_leaves_the_boot_its_delay(values):
+    probe = _rendered(values)["livenessProbe"]
+    assert probe["enabled"] is True
+    assert probe["path"] == "/api/v1/health/live"
+    assert probe["initialDelaySeconds"] == LIVENESS_DELAY_SECONDS
+    # The process may still be killed for a real hang: 60s of failures.
+    assert probe["failureThreshold"] * probe["periodSeconds"] == 60
+
+
+def test_both_probe_routes_are_async_so_they_never_wait_for_a_thread():
+    """A sync route runs on anyio's default threads, which sync dependencies
+    and file reads fill, so a probe there would fail with the pool and not
+    with the process."""
+    from cowork.api.v1.endpoints import health
+
+    assert inspect.iscoroutinefunction(health.live)
+    assert inspect.iscoroutinefunction(health.ready)
+
+
+def test_the_deployment_subchart_is_pinned_to_one_version():
+    requirements = yaml.safe_load((CHART / "requirements.yaml").read_text())
+    (subchart,) = [dep for dep in requirements["dependencies"] if dep["alias"] == "deployment"]
+    assert subchart["version"] == DEPLOYMENT_SUBCHART_VERSION
 
 
 def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
