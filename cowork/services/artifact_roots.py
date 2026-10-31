@@ -29,6 +29,7 @@ one, so both modes address artifacts the same way.
 """
 from __future__ import annotations
 
+import logging
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,8 @@ from cowork.services.artifacts import (
 
 if TYPE_CHECKING:
     from cowork.services.artifact_locations import Location
+
+logger = logging.getLogger(__name__)
 
 _ARTIFACTS_SUBPATH = (".anton", "artifacts")
 
@@ -174,10 +177,14 @@ class RootsPlan:
     `scan_scope`'s projects root, and `adopted` are desktop projects in a
     folder the user chose, outside that root. `owner_filter` keeps only the
     legacy conversation roots of `owned`, the conversations the caller owns,
-    which the same database unit reads.
+    which the same database unit reads. `partition` is the caller's partition
+    of the shared root (`projects.partition_of`): a project whose folder sits
+    in another one is left out when the plan is expanded, since that check
+    resolves the shared root.
     """
 
     projects: tuple[ProjectRow, ...] = ()
+    partition: str | None = None
     scan: bool = False
     scan_scope: TenantScope | None = None
     adopted: tuple[ProjectRow, ...] = ()
@@ -272,12 +279,13 @@ def plan_project_roots(
     else to look the folder up by. Never reachable from the artifacts list or
     from any mutation.
     """
-    from cowork.services.projects import ProjectService
+    from cowork.services.projects import ProjectService, partition_of
 
     service = ProjectService(session)
     owner_filter = not include_other_members and session.scope.org_mode
     return RootsPlan(
         projects=(_project_row(service, service.get_project(project_id)),),
+        partition=partition_of(session.scope),
         owner_filter=owner_filter,
         owned=owned_conversation_ids(session) if owner_filter else frozenset(),
     )
@@ -295,7 +303,7 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     project filter. In local mode, and for a scope that keeps projects shared,
     this falls back to the filesystem scan so the desktop list is unchanged.
     """
-    from cowork.services.projects import ProjectService
+    from cowork.services.projects import ProjectService, partition_of
 
     service = ProjectService(session)
     if not (_org_mode() or session.scope.partitioned_for(PersonalResource.PROJECTS)):
@@ -313,6 +321,7 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
         )
     return RootsPlan(
         projects=tuple(_project_row(service, project) for project in service.list_projects()),
+        partition=partition_of(session.scope),
         owner_filter=session.scope.org_mode,
         owned=owned_conversation_ids(session) if session.scope.org_mode else frozenset(),
     )
@@ -442,6 +451,26 @@ def _adopted_root(project: ProjectRow) -> _FoundRoot | None:
     )
 
 
+def _sits_in_another_partition(project: ProjectRow, *, partition: str | None) -> bool:
+    """Whether `project` names a folder in another person's partition
+    (`projects.sits_in_another_partition`), logged when it does: its
+    artifacts are left out."""
+    from cowork.services.projects import sits_in_another_partition
+
+    if not sits_in_another_partition(project.path, partition=partition):
+        return False
+    logger.warning(
+        "artifacts: a project names a folder in another person's partition, so its "
+        "artifacts are left out",
+        extra={
+            "event": "artifact_folder_refused",
+            "reason": "other_partition",
+            "project_id": str(project.id),
+        },
+    )
+    return True
+
+
 def discover_roots(plan: RootsPlan, *, strict: bool = False) -> DiscoveredRoots:
     """Expand `plan` on the file store. Opens no database session, so it can run
     on a file store thread (cowork.db.units.run_efs). With `strict`, a project
@@ -452,6 +481,8 @@ def discover_roots(plan: RootsPlan, *, strict: bool = False) -> DiscoveredRoots:
         roots += [_FoundRoot(source=source) for source in artifacts_sources_for_scan(scope=plan.scan_scope)]
         roots += [found for project in plan.adopted if (found := _adopted_root(project)) is not None]
     for project in plan.projects:
+        if _sits_in_another_partition(project, partition=plan.partition):
+            continue
         roots += _project_roots(project, strict=strict)
     return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter, owned=plan.owned)
 

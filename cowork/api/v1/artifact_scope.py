@@ -410,6 +410,16 @@ class _Found(NamedTuple):
     scanned: _Scanned | None = None
 
 
+def _in_another_partition(lookup: _Lookup) -> bool:
+    """Whether the row's project names a folder in another partition of the
+    shared root (projects.sits_in_another_partition). The lookup never opens
+    it, the same as root discovery leaves that project out, and treats the
+    row as stale."""
+    from cowork.services.projects import sits_in_another_partition
+
+    return sits_in_another_partition(str(lookup.source.trusted_anchor), partition=lookup.plan.partition)
+
+
 def _open_or_scan(
     lookup: _Lookup,
     *,
@@ -426,9 +436,13 @@ def _open_or_scan(
     thread (run_efs), so the lookup waits for a file store slot once."""
     opened = None
     if lookup.source is not None:
-        opened = _open_recorded(lookup, artifact_id=artifact_id, org_id=org_id, read=read)
-        if opened.reviewed is not None:
-            return _Found(opened)
+        if _in_another_partition(lookup):
+            # Never opened, and stale: the scan moves the row or drops it.
+            opened = _Opened(FolderCheck.STALE)
+        else:
+            opened = _open_recorded(lookup, artifact_id=artifact_id, org_id=org_id, read=read)
+            if opened.reviewed is not None:
+                return _Found(opened)
     scanned = _scan_found(discover_roots(lookup.plan), artifact_id=artifact_id, org_id=org_id, read=read)
     writes_a_fresh_row = keeps_rows and (lookup.row is None or _replaced_row(lookup, opened) is not None)
     if writes_a_fresh_row and len(scanned.folders) == 1:

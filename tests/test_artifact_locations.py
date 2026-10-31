@@ -45,9 +45,12 @@ from cowork.services import (
     artifact_location_backfill,
     artifact_locations,
     artifact_ownership,
+    artifact_roots,
 )
+from cowork.services.artifact_identity import FolderCheck
 from cowork.services.artifact_locations import (
     Location,
+    LocationRow,
     move_locations,
     record_checked_folders,
 )
@@ -583,6 +586,54 @@ async def test_a_root_the_lookups_discovery_could_not_list_still_counts_before_a
     assert (seen.folder, seen.is_own) == (plant.planted, True)
     assert _row(plant.org_id, plant.artifact_id) is None
     assert await _refused(plant.org_id, plant.owner, plant.project, plant.artifact_id, entry=entry_point) == 409
+
+
+def test_a_rows_folder_in_another_persons_partition_is_never_opened(tmp_path, monkeypatch):
+    """A row whose project names a folder in another partition of the shared
+    root is not opened. It counts as stale, so the lookup's scan moves or drops
+    it, and root discovery leaves that project out of the scan."""
+    shared_root = Path(os.path.realpath(get_app_settings().storage.shared_root))
+    project_dir = shared_root / str(uuid4()) / "projects" / "general"
+    source = artifact_scope.ProjectArtifacts(
+        base=project_dir / ".anton" / "artifacts", project_id=str(uuid4()), project_name="general",
+        trusted_anchor=project_dir, root_parts=(".anton", "artifacts"),
+    )
+    location = Location(UUID(source.project_id), None, "brief")
+    lookup = artifact_scope._Lookup(
+        artifact_roots.RootsPlan(partition=str(uuid4())), LocationRow(location, False), source, own=True, in_plan=True,
+    )
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("opened a folder in another person's partition")
+
+    monkeypatch.setattr(artifact_scope, "_open_recorded", refuse)
+    found = artifact_scope._open_or_scan(
+        lookup, artifact_id=str(uuid4()), org_id=None, read=lambda artifact: artifact, keeps_rows=True,
+    )
+
+    assert found.opened == artifact_scope._Opened(FolderCheck.STALE)
+    assert found.scanned is not None and found.scanned.refusal is not None
+
+
+def test_the_backfill_reads_no_project_in_another_organizations_partition(tmp_path, org_deployment, backfill_pending):
+    """A project whose stored path sits in another organization's folder of the
+    shared root, as one recorded through a linked folder would, is left out of
+    the backfill: its folders are not read and get no rows."""
+    other_org, org_id = str(uuid4()), str(uuid4())
+    shared_root = Path(os.path.realpath(get_app_settings().storage.shared_root))
+    path = shared_root / other_org / "projects" / f"proj-{uuid4().hex[:8]}"
+    path.mkdir(parents=True)
+    project = Project(id=uuid4(), name=path.name, path=str(path), org_id=org_id)
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        raw.add(project)
+        raw.commit()
+        raw.refresh(project)
+        raw.expunge(project)
+    artifact_id, _ = _write(project_root(project), "theirs")
+
+    artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=[project.id])
+
+    assert _row(org_id, artifact_id) is None
 
 
 def _no_strict_count(monkeypatch) -> None:
