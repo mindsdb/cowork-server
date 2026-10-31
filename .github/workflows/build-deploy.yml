@@ -123,6 +123,7 @@ jobs:
         with:
           image: ${{ needs.build.outputs.image }}
           snyk-token: ${{ secrets.SNYK_TOKEN }}
+          policy-path: .snyk
           # Advisory on a PR, blocking on a deploy branch: an upstream CVE should
           # not stop someone iterating, and should stop a release.
           allow-vulns: ${{ inputs.pr-environment && 'true' || '' }}
