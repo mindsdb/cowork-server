@@ -7,6 +7,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
+from anton.core.mcp.servers import mcp_server_url
+
 from cowork.coding.context import validate_directories
 from cowork.coding.contracts import (
     CodingEvent,
@@ -24,7 +26,7 @@ from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_models import CodeProject, ProjectCommand, canonical_model_id
+from cowork.coding.project_models import CodeProject, ProjectCommand, ProjectConnection, canonical_model_id
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import CommandResult, ProjectWorkspaceManager
 from cowork.coding.repository_setup import task_project
@@ -108,6 +110,14 @@ def task_title(prompt: str) -> str:
     return f"{compact[: TASK_TITLE_MAX_LENGTH - 1].rstrip()}…"
 
 
+def _connection_line(connection: ProjectConnection, *, local: bool) -> str:
+    line = f"- {connection.provider}: {connection.label or connection.name}"
+    # Only the local plane forwards a provider's own server; remote grants are per resource.
+    if local and mcp_server_url(connection.provider):
+        return line + f" — {connection.provider}'s own read-only tools on the mindshub_code server, named {connection.provider}__*"
+    return line + " — read one item by URL with mindshub_read_developer_context"
+
+
 def _project_setup_instructions(
     project: CodeProject,
     workspaces: list[TaskWorkspace],
@@ -131,7 +141,7 @@ def _project_setup_instructions(
     if project.connections:
         sections.append(
             "Connected developer tools available to the project:\n"
-            + "\n".join(f"- {item.provider}: {item.label or item.name}" for item in project.connections)
+            + "\n".join(_connection_line(item, local=bool(workspaces)) for item in project.connections)
             + "\nExternal writes require an explicit user action in MindsHub Code. Do not post or publish merely because work completed."
         )
     return sections
