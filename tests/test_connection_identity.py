@@ -50,6 +50,13 @@ class TestDeriveConnectionName:
             == "admin-acme-com"
         )
 
+    def test_roam_research_uses_graph_name(self):
+        creds = {"api_token": "roam-graph-token-x", "graph_name": "MyGraph"}
+        assert (
+            derive_connection_name("roam_research", "graph-api-token", creds)
+            == "mygraph"
+        )
+
     def test_oauth_method_has_no_name_from_returns_none(self):
         # The OAuth method declares no name_from (identity comes from userinfo) →
         # caller keeps its random fallback.
