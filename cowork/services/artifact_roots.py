@@ -29,6 +29,7 @@ one, so both modes address artifacts the same way.
 """
 from __future__ import annotations
 
+import logging
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,8 @@ from cowork.services.artifacts import (
     _org_mode,
     _scan_artifact_dirs,
 )
+
+logger = logging.getLogger(__name__)
 
 _ARTIFACTS_SUBPATH = (".anton", "artifacts")
 
@@ -217,6 +220,26 @@ def _project_row(service, project) -> ProjectRow:
     )
 
 
+def _readable_project_rows(service, projects) -> tuple[ProjectRow, ...]:
+    """`projects`' rows, leaving out a project that names a folder in another
+    person's partition (`ProjectService.sits_in_another_partition`)."""
+    rows: list[ProjectRow] = []
+    for project in projects:
+        if service.sits_in_another_partition(project):
+            logger.warning(
+                "artifacts: a project names a folder in another person's partition, so its "
+                "artifacts are left out",
+                extra={
+                    "event": "artifact_folder_refused",
+                    "reason": "other_partition",
+                    "project_id": str(project.id),
+                },
+            )
+            continue
+        rows.append(_project_row(service, project))
+    return tuple(rows)
+
+
 def plan_project_roots(
     session: ScopedSession, project_id: UUID, *, include_other_members: bool = False
 ) -> RootsPlan:
@@ -250,7 +273,7 @@ def plan_project_roots(
     service = ProjectService(session)
     owner_filter = not include_other_members and session.scope.org_mode
     return RootsPlan(
-        projects=(_project_row(service, service.get_project(project_id)),),
+        projects=_readable_project_rows(service, (service.get_project(project_id),)),
         owner_filter=owner_filter,
         owned=owned_conversation_ids(session) if owner_filter else frozenset(),
     )
@@ -285,7 +308,7 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
             ),
         )
     return RootsPlan(
-        projects=tuple(_project_row(service, project) for project in service.list_projects()),
+        projects=_readable_project_rows(service, service.list_projects()),
         owner_filter=session.scope.org_mode,
         owned=owned_conversation_ids(session) if session.scope.org_mode else frozenset(),
     )
