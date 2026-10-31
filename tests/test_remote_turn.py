@@ -596,6 +596,38 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
     assert diff.call_args.kwargs["completed_cleanly"] is (not failed)
 
 
+async def test_a_channel_turn_records_the_ids_of_the_folders_it_made(monkeypatch, tmp_path):
+    """The turn end passes each new folder's id, read with the turn's diff,
+    to the record, which marks the id conflicted when its row names another
+    folder."""
+    from unittest.mock import AsyncMock, Mock
+    from cowork.services import task_objects
+
+    context = (SimpleNamespace(created_by="user"), tmp_path, str(uuid4()), "Project")
+    _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
+    artifact_id = uuid4().hex
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", Mock(return_value=task_objects.ArtifactChanges(
+        created=["made"], touched={"made"}, created_ids={"made": artifact_id},
+    )))
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
+    recorded = {}
+    monkeypatch.setattr(task_objects, "record_new_artifacts", lambda session, **kwargs: recorded.update(kwargs))
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+    await _drain(remote_turn_events(
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
+        input_text="run", model="m", turn_rows=[],
+    ))
+
+    assert recorded["slugs"] == ["made"]
+    assert recorded["artifact_ids"] == {"made": artifact_id}
+
+
 @pytest.fixture
 def controller_flags(monkeypatch):
     """The Redis the controller's cancel flags are written to."""
@@ -788,7 +820,7 @@ def _turn_with_a_new_artifact(monkeypatch, *, diff=None, snapshot=None):
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
     recorded: list[_Recorded] = []
 
-    def record_new_artifacts(session, *, conversation_id, project_id, slugs, creator):
+    def record_new_artifacts(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
         recorded.append(_Recorded(slugs, project_id, creator, session.scope, on_efs_thread()))
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", record_new_artifacts)

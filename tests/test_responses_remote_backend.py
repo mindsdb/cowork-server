@@ -2667,6 +2667,58 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
 
 
+@pytest.mark.asyncio
+async def test_produce_remote_records_the_ids_of_the_folders_a_turn_made(monkeypatch, tmp_path):
+    """The turn end passes each new folder's id, read with the turn's diff,
+    to the record, so checking the id against its row needs no file store
+    call of its own."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    recorded = {}
+    monkeypatch.setattr(task_objects, "record_new_artifacts", lambda session, **kwargs: recorded.update(kwargs))
+
+    async def fake_autopublish(*args, **kwargs):
+        raise AssertionError("a failed turn must not publish")
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+    artifact_id = uuid4().hex
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        folder = _artifact(artifacts_base, "half-written")
+        metadata = json.loads((folder / "metadata.json").read_text())
+        (folder / "metadata.json").write_text(json.dumps({**metadata, "id": artifact_id}))
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "failed"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert recorded["slugs"] == ["half-written"]
+    assert recorded["artifact_ids"] == {"half-written": artifact_id}
+
+
 def _artifacts_context_at(monkeypatch, artifacts_base):
     conversation = _conversation_at(artifacts_base.parent.parent)
     monkeypatch.setattr(
@@ -2819,7 +2871,7 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator):
+    def spy_index_new(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)
@@ -2863,7 +2915,7 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator):
+    def spy_index_new(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)

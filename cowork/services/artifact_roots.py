@@ -33,6 +33,7 @@ import logging
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from cowork.db.personal_resources import PersonalResource
@@ -42,6 +43,9 @@ from cowork.services.artifacts import (
     _org_mode,
     _scan_artifact_dirs,
 )
+
+if TYPE_CHECKING:
+    from cowork.services.artifact_locations import Location
 
 logger = logging.getLogger(__name__)
 
@@ -82,28 +86,39 @@ def project_artifacts_base(project_path: str) -> Path:
     return _artifacts_base(project_path)
 
 
-def _is_real_directory(path: Path) -> bool:
-    """True only for a directory entry, never a link to one."""
+def _is_real_directory(path: Path, *, strict: bool = False) -> bool:
+    """True only for a directory entry, never a link to one. With `strict`, a
+    stat error other than FileNotFoundError or NotADirectoryError raises
+    instead of answering False."""
     try:
         return stat.S_ISDIR(path.stat(follow_symlinks=False).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
     except OSError:
+        if strict:
+            raise
         return False
 
 
-def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool) -> bool:
+def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool, strict: bool = False) -> bool:
     """Reject a link in the writable ``.anton/artifacts`` chain.
 
     This is an early discovery filter.  The identity service repeats the
     guarantee atomically by reopening both components relative to a pinned
     project directory, so replacing either entry after this check is refused at
-    use time too.
+    use time too. With `strict`, a stat error other than FileNotFoundError or
+    NotADirectoryError raises instead of answering False.
     """
     for component in (workspace / _ARTIFACTS_SUBPATH[0], workspace.joinpath(*_ARTIFACTS_SUBPATH)):
         try:
             mode = component.stat(follow_symlinks=False).st_mode
         except FileNotFoundError:
             return may_be_absent
+        except NotADirectoryError:
+            return False
         except OSError:
+            if strict:
+                raise
             return False
         if not stat.S_ISDIR(mode):
             return False
@@ -224,6 +239,16 @@ def _project_row(service, project) -> ProjectRow:
     )
 
 
+def scoped_project_row(session: ScopedSession, *, project_id: UUID) -> ProjectRow | None:
+    """`project_id`'s row as plain data, or None when the caller's scope has
+    no such project."""
+    from cowork.services.projects import ProjectNotFoundError, ProjectService
+
+    service = ProjectService(session)
+    try:
+        return _project_row(service, service.get_project(project_id))
+    except ProjectNotFoundError:
+        return None
 
 
 def plan_project_roots(
@@ -302,7 +327,51 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     )
 
 
-def _project_roots(project: ProjectRow) -> list[_FoundRoot]:
+def _project_source(project: ProjectRow, base: Path) -> ProjectArtifacts:
+    """A root of `project`, reopened from the project's directory one component
+    at a time."""
+    project_path = Path(project.path)
+    return ProjectArtifacts(
+        base=base,
+        project_id=str(project.id),
+        project_name=project.name,
+        trusted_anchor=project_path,
+        root_parts=base.relative_to(project_path).parts,
+        external=project.external,
+    )
+
+
+def recorded_source(project: ProjectRow, conversation_id: UUID | None) -> ProjectArtifacts:
+    """The one root a location row names (cowork.services.artifact_locations):
+    `project`'s shared root, or a conversation's legacy root. Built without
+    listing anything; `project` is a row the caller may read, and
+    `conversation_id` is a UUID, so it is one path component."""
+    if conversation_id is None:
+        return _project_source(project, _artifacts_base(project.path))
+    base = (Path(project.path) / CONVERSATIONS_DIRNAME / str(UUID(str(conversation_id)))).joinpath(*_ARTIFACTS_SUBPATH)
+    return _project_source(project, base)
+
+
+def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
+    """The location row for `folder`, found below `source`, or None for a root
+    no row describes (a desktop root, which has no project id)."""
+    from cowork.services.artifact_locations import Location
+
+    if source.project_id is None:
+        return None
+    parts = tuple(source.root_parts)
+    if parts == _ARTIFACTS_SUBPATH:
+        conversation_id = None
+    elif len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
+        conversation_id = _conversation_id(Path(parts[1]))
+        if conversation_id is None:
+            return None
+    else:
+        return None
+    return Location(UUID(source.project_id), conversation_id, folder.name)
+
+
+def _project_roots(project: ProjectRow, *, strict: bool = False) -> list[_FoundRoot]:
     """One project's roots. One on the desktop. In org mode (ENG-2056): the
     PROJECT-level base first, the primary location, where every new artifact
     lands and which every member of the project may read (project-wide
@@ -318,38 +387,37 @@ def _project_roots(project: ProjectRow) -> list[_FoundRoot]:
     Every root carries the SAME project identity: a conversation is where the
     bytes happen to live, not a thing the client addresses artifacts by, so
     cards stay project-addressed in both modes.
+
+    A conversations directory or workspace that fails to read is left out,
+    unless `strict`: then the error raises, for a caller that must know it
+    saw every root (the location backfill).
     """
     project_path = Path(project.path)
 
     def root(base: Path, **found) -> _FoundRoot:
-        return _FoundRoot(
-            source=ProjectArtifacts(
-                base=base,
-                project_id=str(project.id),
-                project_name=project.name,
-                trusted_anchor=project_path,
-                root_parts=base.relative_to(project_path).parts,
-                external=project.external,
-            ),
-            **found,
-        )
+        return _FoundRoot(source=_project_source(project, base), **found)
 
     roots = [root(_artifacts_base(project.path))]
     if not _org_mode():
         return roots
     conversations = project_path / CONVERSATIONS_DIRNAME
-    if not _is_real_directory(conversations):
+    if not _is_real_directory(conversations, strict=strict):
         # No legacy per-conversation dir at all is common and not an error:
         # the project-level base is still a valid, primary root.
         return roots
     try:
         children = sorted(conversations.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return roots
     except OSError:
+        if strict:
+            raise
         return roots
     return roots + [
         root(child.joinpath(*_ARTIFACTS_SUBPATH), legacy=True, conversation_id=_conversation_id(child))
         for child in children
-        if _is_real_directory(child) and _storage_components_are_safe(child, may_be_absent=False)
+        if _is_real_directory(child, strict=strict)
+        and _storage_components_are_safe(child, may_be_absent=False, strict=strict)
     ]
 
 
@@ -403,9 +471,11 @@ def _sits_in_another_partition(project: ProjectRow, *, partition: str | None) ->
     return True
 
 
-def discover_roots(plan: RootsPlan) -> DiscoveredRoots:
+def discover_roots(plan: RootsPlan, *, strict: bool = False) -> DiscoveredRoots:
     """Expand `plan` on the file store. Opens no database session, so it can run
-    on a file store thread (cowork.db.units.run_efs)."""
+    on a file store thread (cowork.db.units.run_efs). With `strict`, a project
+    root that fails to list or stat raises (_project_roots) instead of being
+    left out."""
     roots: list[_FoundRoot] = []
     if plan.scan:
         roots += [_FoundRoot(source=source) for source in artifacts_sources_for_scan(scope=plan.scan_scope)]
@@ -413,7 +483,7 @@ def discover_roots(plan: RootsPlan) -> DiscoveredRoots:
     for project in plan.projects:
         if _sits_in_another_partition(project, partition=plan.partition):
             continue
-        roots += _project_roots(project)
+        roots += _project_roots(project, strict=strict)
     return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter, owned=plan.owned)
 
 

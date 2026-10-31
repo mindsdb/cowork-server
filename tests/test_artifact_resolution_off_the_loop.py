@@ -616,8 +616,12 @@ async def test_taking_the_live_publish_lock_waits_out_a_busy_file_store(monkeypa
 # owner-only route checks ownership in a database unit after the lookup, so
 # it reads in one more call, and only once that check has passed.
 
-# The project row and owned conversations, then the lookup.
+# The project row, the owned conversations and the location row, then the
+# lookup.
 LOOKUP = ["run_db", "run_efs"]
+# A lookup whose location row does not answer it: the scan, then the unit that
+# records what the scan found, whose refusal is only logged.
+SCANNED_LOOKUP = [*LOOKUP, "record"]
 # The lookup, the owner check, then the route's one read.
 OWNER_READ = [*LOOKUP, "run_db", "run_efs"]
 
@@ -719,7 +723,7 @@ async def test_a_draft_link_names_its_file_in_the_lookups_file_store_call(
     assert response.status_code == 200, response.body
     assert json.loads(response.body)["url"].endswith("/index.html")
     assert names == [True]
-    assert hops == LOOKUP
+    assert hops == SCANNED_LOOKUP
 
 
 class _PinnedOpen(NamedTuple):
@@ -794,7 +798,7 @@ async def test_a_draft_file_is_never_opened_for_a_caller_the_lookup_refuses(
 
     assert refused.value.status_code == 404
     assert opens == []
-    assert hops == LOOKUP
+    assert hops == SCANNED_LOOKUP
 
 
 async def _edit(project_id: str, artifact_id: str, caller):
@@ -885,7 +889,8 @@ async def test_a_non_owner_is_refused_access_before_any_read(
         await artifact_workspace.artifact_access(str(row.id), artifact_id, _caller(tenancy.USER_A2))
 
     assert refused.value.status_code == status_code
-    # A reviewer's lookup passes and the owner check refuses; no grant ends
-    # at the lookup. Either way the access state is never read.
+    # A reviewer's lookup opens the row's folder and the owner check refuses;
+    # with no grant, the lookup scans, records its folder and refuses. Either
+    # way the access state is never read.
     assert access_reads == []
-    assert hops == ([*LOOKUP, "run_db"] if granted else LOOKUP)
+    assert hops == ([*LOOKUP, "run_db"] if granted else SCANNED_LOOKUP)
