@@ -13,6 +13,10 @@ caller's own bearer against the operator's host (same rules as
   a newly added id against, and what the app names stored ids with
   (``GET /hub/people/?ids=``). Never cached: a refusal has to reflect who is
   in the org now.
+- ``?emails=a,b``: the members of the active org who hold those addresses.
+  What the app asks about an address its capped directory doesn't have, so a
+  member past the cap is shared with by id rather than as an outside address
+  (``GET /hub/people/?emails=``). Never cached, for the same reason.
 
 Every failure is "unreachable", never an exception, including the auth
 service's 403 for a caller who is not a current member of the active org. The directory renders
@@ -23,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 from pydantic import BaseModel, Field
@@ -34,9 +38,10 @@ logger = logging.getLogger(__name__)
 
 ORG_MEMBERS_PATH = "/me/org-members/"
 
-# The auth service's bound on one ``ids`` lookup; a longer batch is chunked
-# rather than sent to be refused.
+# The access service's bounds on one ``ids`` and one ``emails`` lookup; a
+# longer batch is chunked rather than sent to be refused.
 MAX_IDS_PER_LOOKUP = 50
+MAX_EMAILS_PER_LOOKUP = 50
 
 
 class OrgMember(BaseModel):
@@ -76,30 +81,55 @@ def _rows(payload: Any) -> list[OrgMember] | None:
     return members
 
 
-async def org_members_by_ids(
-    *, bearer_token: str, ids: Iterable[str]
+async def _members_by(
+    *, bearer_token: str, field: Literal["id", "email"], values: Iterable[str], per_lookup: int
 ) -> list[OrgMember] | None:
-    """The members of the caller's active org among ``ids`` (Keycloak user
-    ids, compared lowercased), or None when the auth service couldn't be
-    asked. One call per MAX_IDS_PER_LOOKUP ids; any chunk failing makes the
-    whole answer None. An id it doesn't return is not a member."""
-    wanted = list(dict.fromkeys(i.strip().lower() for i in ids if i and i.strip()))
+    """The members of the caller's active org whose ``field`` is one of
+    ``values`` (compared lowercased), in the order asked, or None when the
+    access service couldn't be asked. One call per ``per_lookup`` values; any
+    chunk failing makes the whole answer None. A value it doesn't return is
+    no member's."""
+    wanted = list(dict.fromkeys(v.strip().lower() for v in values if v and v.strip()))
     if not wanted:
         return []
     if not bearer_token:
         return None
+    asked = set(wanted)
     found: dict[str, OrgMember] = {}
-    for start in range(0, len(wanted), MAX_IDS_PER_LOOKUP):
-        chunk = wanted[start : start + MAX_IDS_PER_LOOKUP]
-        path = f"{ORG_MEMBERS_PATH}?{urlencode({'ids': ','.join(chunk)})}"
+    for start in range(0, len(wanted), per_lookup):
+        chunk = wanted[start : start + per_lookup]
+        # The access service names each lookup by the field's plural: ids, emails.
+        path = f"{ORG_MEMBERS_PATH}?{urlencode({f'{field}s': ','.join(chunk)})}"
         members = _rows(await get_auth_json(path, bearer_token))
         if members is None:
             return None
         for member in members:
-            key = member.id.strip().lower()
-            if key in wanted:
+            key = getattr(member, field).strip().lower()
+            if key in asked:
                 found.setdefault(key, member)
-    return [found[i] for i in wanted if i in found]
+    return [found[v] for v in wanted if v in found]
+
+
+async def org_members_by_ids(
+    *, bearer_token: str, ids: Iterable[str]
+) -> list[OrgMember] | None:
+    """The members of the caller's active org among ``ids`` (Keycloak user
+    ids), or None when the access service couldn't be asked. An id it
+    doesn't return is not a member."""
+    return await _members_by(
+        bearer_token=bearer_token, field="id", values=ids, per_lookup=MAX_IDS_PER_LOOKUP
+    )
+
+
+async def org_members_by_emails(
+    *, bearer_token: str, emails: Iterable[str]
+) -> list[OrgMember] | None:
+    """The members of the caller's active org who hold ``emails``, or None
+    when the access service couldn't be asked. An address it doesn't return
+    is no member's, whether or not somebody outside the org holds it."""
+    return await _members_by(
+        bearer_token=bearer_token, field="email", values=emails, per_lookup=MAX_EMAILS_PER_LOOKUP
+    )
 
 
 async def list_org_directory(*, bearer_token: str) -> OrgDirectory:

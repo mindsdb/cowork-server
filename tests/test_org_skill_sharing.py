@@ -1622,6 +1622,84 @@ def test_hub_people_outside_org_mode_is_empty_and_reachable(monkeypatch):
     monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
     view = asyncio.run(hub_people_ep.get_hub_people(member_request(), LOCAL_SCOPE))
     assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
+    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), LOCAL_SCOPE, emails="bob@x.com"))
+    assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
+
+
+def test_hub_people_finds_a_member_past_the_directory_cap_by_address(monkeypatch):
+    """The directory the app lists is capped, so a member past the cap isn't
+    on it. The address someone types still names them, asked of the access
+    service, so the app shares with that person by id rather than inviting
+    the address as someone outside the org."""
+    calls: list[tuple[str, str]] = []
+
+    async def get_auth_json(path, bearer):
+        calls.append((path, bearer))
+        if path == "/me/org-members/":
+            return {"results": [{"id": EVE, "name": "Eve", "email": "eve@x.com"}], "truncated": True}
+        return {"results": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}]}
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    listed = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    assert listed.truncated and "bob@x.com" not in {p.email for p in listed.people}
+
+    view = asyncio.run(
+        hub_people_ep.get_hub_people(member_request(), scope, emails=" Bob@X.com, nobody@y.com,")
+    )
+    assert view.model_dump(by_alias=True) == {
+        "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": False,
+    }
+    # With the gateway's credential, lowercased, and uncached.
+    asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, emails="bob@x.com"))
+    assert calls[1:] == [
+        ("/me/org-members/?emails=bob%40x.com%2Cnobody%40y.com", MEMBER_BEARER),
+        ("/me/org-members/?emails=bob%40x.com", MEMBER_BEARER),
+    ]
+
+    async def down(path, bearer):
+        return None
+
+    monkeypatch.setattr(hub_people, "get_auth_json", down)
+    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, emails="bob@x.com"))
+    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
+
+
+def test_hub_people_refuses_ids_and_emails_together(monkeypatch):
+    async def get_auth_json(path, bearer):
+        raise AssertionError("the access service was asked")
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, ids=BOB, emails="bob@x.com"))
+    assert refused.value.status_code == 400
+
+
+def test_the_org_member_lookup_by_address_batches_and_fails_closed(monkeypatch):
+    calls: list[str] = []
+
+    async def get_auth_json(path, bearer):
+        calls.append(path)
+        return {"results": [{"id": BOB, "name": "Bob", "email": "Bob@x.com"}, {"id": EVE, "email": "eve@x.com"}]}
+
+    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    found = asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=["nobody@x.com", "BOB@x.com"]))
+    # Only what was asked; an address the access service didn't return is no member's.
+    assert [(m.id, m.name) for m in found] == [(BOB, "Bob")]
+    assert calls == ["/me/org-members/?emails=nobody%40x.com%2Cbob%40x.com"]
+
+    calls.clear()
+    asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=[f"p{i}@x.com" for i in range(60)]))
+    assert len(calls) == 2
+
+    async def down(path, bearer):
+        return None
+
+    monkeypatch.setattr(hub_people, "get_auth_json", down)
+    assert asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=["bob@x.com"])) is None
+    assert asyncio.run(hub_people.org_members_by_emails(bearer_token="", emails=["bob@x.com"])) is None
+    assert asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=[])) == []
 
 
 # ── hub teams ────────────────────────────────────────────────────────────────
