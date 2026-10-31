@@ -177,8 +177,8 @@ deployment:
   # of teardown before the kubelet's SIGKILL. During a file store stall the
   # teardown waits for no turn past those bounds. The event loop's close then
   # cuts an artifact diff that has not returned, so that turn's artifact rows
-  # are lost. A web answer still streaming at SIGTERM is saved anyway, as
-  # interrupted; one whose pod had finished starts its save only as the loop
+  # are lost. A web answer still streaming at SIGTERM is saved anyway,
+  # marked turn_lost; one whose pod had finished starts its save only as the loop
   # closes, and that save may not finish. A file store call already running
   # on the stuck mount keeps the process alive until the SIGKILL.
   terminationGracePeriodSeconds: 60

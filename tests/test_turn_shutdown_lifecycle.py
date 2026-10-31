@@ -20,7 +20,12 @@ import pytest
 
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
-from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, INTERRUPTED_TURN_MESSAGE
+from cowork.handlers.turn_errors import (
+    GENERIC_TURN_ERROR_CODE,
+    INTERRUPTED_TURN_MESSAGE,
+    TURN_LOST_CODE,
+    TURN_LOST_MESSAGE,
+)
 from cowork.streaming import cancellation
 from cowork.streaming.registry import (
     RunHandle, RunIdentity, ServerShuttingDown, TurnLifecycle, registry,
@@ -134,7 +139,7 @@ async def test_shutdown_cancels_and_persists_an_interrupted_turn(monkeypatch):
     assert handle.task.done()
     assert saved["assistant"] == "partial"
     assert any(
-        e.get("code") == GENERIC_TURN_ERROR_CODE and e.get("error") == INTERRUPTED_TURN_MESSAGE
+        e.get("code") == TURN_LOST_CODE and e.get("error") == TURN_LOST_MESSAGE
         for e in saved["events"]
     )
     # Distinct from a user Stop, which closes "cancelled" with no error event.
@@ -227,8 +232,11 @@ async def test_the_watchdog_and_shutdown_win_over_a_stall(monkeypatch, tmp_path,
 
     assert saved["assistant"] == "partial"
     assert saved["events"][-1]["type"] == "response.failed"
-    assert saved["events"][-1]["code"] == GENERIC_TURN_ERROR_CODE
-    assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
+    # Shutdown lost the turn; the watchdog ended one that made no progress.
+    assert (saved["events"][-1]["code"], saved["events"][-1]["error"]) == (
+        (TURN_LOST_CODE, TURN_LOST_MESSAGE) if cause == "shutdown"
+        else (GENERIC_TURN_ERROR_CODE, INTERRUPTED_TURN_MESSAGE)
+    )
     assert not [e for e in saved["events"] if e.get("code") == "stalled"]
 
 
@@ -337,7 +345,9 @@ async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, ca
         )
         assert handle.lifecycle.stalled is True
     elif cause != "user_stop":
-        assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
+        assert saved["events"][-1]["error"] == (
+            TURN_LOST_MESSAGE if cause == "shutdown" else INTERRUPTED_TURN_MESSAGE
+        )
 
 
 REGISTRY_LOGGER = "cowork.streaming.registry"
@@ -426,7 +436,7 @@ async def test_shutdown_stops_a_remote_turn_on_its_controller_and_saves_it_inter
     assert await controller_flags.keys("*") == ([flag] if remote else [])
     assert saved["assistant"] == "partial"
     assert saved["events"][-1]["type"] == "response.failed"
-    assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
+    assert saved["events"][-1]["error"] == TURN_LOST_MESSAGE
     assert list(read_records(buffer.path))[-1].type == "Interrupted"
 
 
@@ -692,7 +702,7 @@ async def test_a_turn_that_ends_at_shutdown_with_its_stream_open_is_sealed_as_in
     payload = _failed_payload(record)
     request_id = handle.lifecycle.identity.correlation_id
     assert (payload["error"], payload["code"], payload["request_id"]) == (
-        INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id,
+        TURN_LOST_MESSAGE, TURN_LOST_CODE, request_id,
     )
     [warning] = _warnings(caplog, REGISTRY_LOGGER)
     assert (warning.event, warning.request_id, warning.conversation_id) == (
@@ -756,7 +766,7 @@ async def test_a_save_still_running_at_the_frame_deadline_does_not_hold_up_the_f
 
         assert buffer.closed == "interrupted"
         payload = _failed_payload(buffer.records[-1])
-        assert (payload["error"], payload["code"]) == (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)
+        assert (payload["error"], payload["code"]) == (TURN_LOST_MESSAGE, TURN_LOST_CODE)
         assert "assistant_message_id" not in payload
         assert "assistant" not in saved
     finally:
@@ -764,7 +774,7 @@ async def test_a_save_still_running_at_the_frame_deadline_does_not_hold_up_the_f
         release_save.set()
     await asyncio.wait_for(save_landed.wait(), timeout=2)
     assert saved["assistant"] == "partial"
-    assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
+    assert saved["events"][-1]["error"] == TURN_LOST_MESSAGE
 
 
 def test_a_web_turns_answer_is_saved_when_the_event_loops_close_cuts_its_artifact_record(
@@ -772,10 +782,10 @@ def test_a_web_turns_answer_is_saved_when_the_event_loops_close_cuts_its_artifac
 ):
     """A shutdown ends a web turn mid-stream while every file store slot is
     taken, as calls stuck on a stalled mount take them. The turn's artifact
-    record waits for a slot, so its interrupted frame goes out at the frame
+    record waits for a slot, so its closing frame goes out at the frame
     deadline without a row id. The teardown then ends, and the event loop's
     close cancels the record still waiting. The answer is saved all the same,
-    as interrupted, before the loop closes."""
+    marked turn_lost, before the loop closes."""
     from cowork.services import task_objects
     from test_responses_remote_backend import (
         _FileStoreSlots, _artifact, _artifacts_context_at, _no_workspace_or_memory_units,
@@ -832,6 +842,4 @@ def test_a_web_turns_answer_is_saved_when_the_event_loops_close_cuts_its_artifac
 
     assert recorded == []
     assert saved["assistant"] == "partial"
-    assert (saved["events"][-1]["error"], saved["events"][-1]["code"]) == (
-        INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE,
-    )
+    assert (saved["events"][-1]["error"], saved["events"][-1]["code"]) == (TURN_LOST_MESSAGE, TURN_LOST_CODE)
