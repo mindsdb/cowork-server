@@ -1211,10 +1211,14 @@ def test_where_all_are_shared_a_skill_with_no_creator_is_the_operators(all_share
 # ── the desktop and hosted org tenancy ─────────────────────────────────────
 
 
-def _every_route_works(session, principal, *, upload_creator: str | None) -> None:
+def _every_route_works(
+    session, principal, *, upload_creator: str | None, own_creator: str | None = None
+) -> None:
     """Create, upload, list, read, edit, disable, rename and delete one skill
-    each, as the caller who made them. None is ``shared``, and nothing stamps
-    a creator: an upload keeps what its file says (``upload_creator``)."""
+    each, as the caller who made them. None is ``shared``. The desktop stamps
+    no creator, and an upload keeps what its file says (``upload_creator``);
+    hosted org tenancy stamps the caller on both (``own_creator``), for skill
+    sharing (cowork.services.skill_sharing)."""
     created = skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), session, principal)
     assert (created["shared"], created["capabilities"]) == (False, CHANGE_CAPABILITY)
     uploaded = skills_ep._upload_skill_bytes(
@@ -1222,7 +1226,7 @@ def _every_route_works(session, principal, *, upload_creator: str | None) -> Non
     )
     assert uploaded["shared"] is False
     service = SkillService(session.scope)
-    assert service.get_skill("my-notes").created_by is None
+    assert service.get_skill("my-notes").created_by == own_creator
     assert service.get_skill("uploaded").created_by == upload_creator
 
     listing = skills_ep.list_skills(session, principal)
@@ -1277,7 +1281,7 @@ def hosted(org_deployment, monkeypatch, tmp_path):
 def test_hosted_org_tenancy_keeps_every_skills_route(hosted):
     principal = Principal(user_id=ORG_USER, org_id=ORG_ID, email="member@example.com")
 
-    _every_route_works(hosted, principal, upload_creator=SUB_B)
+    _every_route_works(hosted, principal, upload_creator=ORG_USER, own_creator=ORG_USER)
 
     assert SkillService(hosted.scope).root.parent.name == ORG_ID
 

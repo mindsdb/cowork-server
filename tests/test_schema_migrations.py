@@ -366,6 +366,58 @@ def test_shared_resource_audit_upgrade_and_downgrade(tmp_path, monkeypatch):
     assert _has_table(db_path, "shared_resource_mutations")
 
 
+def test_skill_sharing_tables_upgrade_and_downgrade(tmp_path, monkeypatch):
+    """ENG-3787, one revision: skill_access, one row per skill per org, and
+    skill_user_setting, one person's own off per skill, one row per (org,
+    person, skill), including the desktop's rows, which carry no org."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "skill-sharing.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "skill_access")
+    assert _has_table(db_path, "skill_user_setting")
+    with engine.begin() as connection:
+        insert = text(
+            "INSERT INTO skill_access (id, org_id, skill_slug, org_allowed, always_on) "
+            "VALUES (:id, 'org', 'notes', 0, 0)"
+        )
+        connection.execute(insert, {"id": "a" * 32})
+        row = connection.execute(text("SELECT allowed_team_ids, allowed_user_ids FROM skill_access")).one()
+        assert tuple(row) == ("[]", "[]")
+        with pytest.raises(IntegrityError):
+            with connection.begin_nested():
+                connection.execute(insert, {"id": "b" * 32})
+
+        setting = text(
+            "INSERT INTO skill_user_setting (id, org_id, user_id, skill_slug, enabled) "
+            "VALUES (:id, :org, :user, :slug, 0)"
+        )
+        connection.execute(setting, {"id": "c" * 32, "org": "org", "user": "alice", "slug": "notes"})
+        connection.execute(setting, {"id": "d" * 32, "org": None, "user": "local", "slug": "pdf"})
+        # Another org's row, and the same person's no-org row, are distinct.
+        connection.execute(setting, {"id": "e" * 32, "org": "other", "user": "alice", "slug": "notes"})
+        connection.execute(setting, {"id": "f" * 32, "org": None, "user": "alice", "slug": "notes"})
+        for duplicate in (
+            {"id": "1" * 32, "org": "org", "user": "alice", "slug": "notes"},
+            # NULLs are distinct in the org-keyed constraint; the partial
+            # index still refuses a second no-org row.
+            {"id": "2" * 32, "org": None, "user": "local", "slug": "pdf"},
+        ):
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(setting, duplicate)
+
+    _downgrade_to(engine, uri, "a3734c9e5210")
+    assert not _has_table(db_path, "skill_access")
+    assert not _has_table(db_path, "skill_user_setting")
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "skill_access")
+    assert _has_table(db_path, "skill_user_setting")
+
+
 # ── ENG-338: attachment purpose re-keying (f7d2b9e4a1c6) ─────────────────
 
 ATTACH_REKEY_REV = "f7d2b9e4a1c6"

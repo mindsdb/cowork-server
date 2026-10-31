@@ -18,6 +18,9 @@ META_PROJECTS = "projects"
 # identity headers (cowork.creators). Built-ins, the operator's managed skills
 # and the operator view's own carry none.
 META_CREATED_BY = "created_by"
+# In hosted org mode it is also the scope's person, and tells a skill made
+# since sharing from one that predates it when the skill has no skill_access
+# row. Who a skill is shared with is that row's (cowork.models.skill_access).
 
 
 class Skill(AgentSkill):

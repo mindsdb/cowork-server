@@ -40,6 +40,7 @@ def _fake_handler(
         return ()
 
     monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
@@ -99,6 +100,48 @@ async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
     # Read in a unit of its own under the channel's scope, never on the
     # channel's shared session.
     assert reads == [(conv_id, session.scope)]
+
+
+@pytest.mark.asyncio
+async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypatch):
+    """ENG-3787: the pod recalls only what the request's skills block names,
+    so a channel turn sends one too: the fail-closed set (no member behind
+    it), and {} when there is nothing to send."""
+    _fake_handler(monkeypatch)
+    built: list[tuple] = []
+    sent: list[dict] = []
+    block = {"policy": {"files": {"SKILL.md": "---\nname: policy\n---\nx"}, "always_on": True}}
+
+    def remote_turn_skills(session, conv_id, **kwargs):
+        built.append((conv_id, kwargs))
+        return block
+
+    async def fake_replies(**kwargs):
+        sent.append(kwargs["skills"])
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", remote_turn_skills)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+    conv_id = uuid4()
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=conv_id, org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+    assert built == [(conv_id, {})]
+    assert sent == [block]
+
+
+def test_the_skills_block_is_empty_when_it_cant_be_built(monkeypatch):
+    """A failure sends {} (no skills), never no block, which the pod would
+    read as leave to recall its whole skills volume."""
+    import cowork.handlers.responses as responses_mod
+
+    class _Broken:
+        def __init__(self, session):
+            raise RuntimeError("no conversation")
+
+    monkeypatch.setattr(responses_mod, "ConversationService", _Broken)
+    assert responses_mod.remote_turn_skills(_FakeSession(), uuid4()) == {}
 
 
 @pytest.mark.asyncio

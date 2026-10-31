@@ -800,12 +800,91 @@ class _AccessBody(BaseModel):
 
     Passed through rather than re-modelled per mode: the publisher owns the
     schema (`{"mode": "public"}`, `{"mode": "password", "password": ...}`,
-    `{"mode": "restricted", "emails": [...], "org_allowed": bool,
+    `{"mode": "restricted", "allowed_emails": [...], "org_allowed": bool,
     "owner_only": bool}`) and validates it, so a second definition here could
-    only drift away from it.
+    only drift away from it. A restricted audience uses auth's ArtifactAccess
+    names (ENG-3787): `org_allowed`, `allowed_emails` (people outside the
+    org, by address; anton's `emails`, cowork.services.publish.access_from_app),
+    and in hosted org mode `allowed_team_ids` and `allowed_user_ids`
+    (Keycloak ids of people in the org), which this server writes to auth
+    itself (cowork.services.publish._sync_team_audience). The retired names
+    `emails`, `team_ids` and `org_wide` are a 400. Teams or people alone keep
+    the rule restricted to them, never public. `notify: {user_ids, emails}`
+    names the people this save added and chose to tell; auth emails them. It
+    applies to this save only and is never stored.
     """
 
     access: dict
+
+
+async def _checked_team_audience(access: dict, *, request: Request, session) -> dict:
+    """``access`` with its ``allowed_team_ids`` normalized and each one checked
+    to be a team the caller belongs to (an org admin may name any). 503 while
+    auth can't list the caller's teams, 400 for one they aren't in. The org's
+    default team is dropped from ``allowed_team_ids`` and sets
+    ``org_allowed``: its members are the whole organization.
+    ``allowed_user_ids`` is normalized and passed through: that each is a
+    member of the org is auth's check, on the write
+    (cowork.services.artifact_access.sync_artifact_team_access).
+
+    Outside hosted org mode ``access`` is returned as it is: there are no
+    teams or org members there, and publish._with_team_audience drops them,
+    keeping a rule that named them restricted to its owner."""
+    from cowork.principal import can_manage_org, get_principal, hub_credential
+    from cowork.services.hub_teams import fetch_hub_teams
+    from cowork.services.skill_sharing import normalize_team_ids, normalize_user_ids
+
+    if not session.scope.org_mode:
+        return access
+    if "allowed_user_ids" in access:
+        raw_people = access.get("allowed_user_ids") or []
+        if not isinstance(raw_people, list):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="allowed_user_ids must be a list."
+            )
+        try:
+            access = {**access, "allowed_user_ids": list(normalize_user_ids(raw_people))}
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if "allowed_team_ids" not in access:
+        return access
+    raw = access.get("allowed_team_ids") or []
+    if not isinstance(raw, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="allowed_team_ids must be a list."
+        )
+    try:
+        team_ids = list(normalize_team_ids(raw))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if not team_ids:
+        return {**access, "allowed_team_ids": team_ids}
+    is_admin = can_manage_org(get_principal(request))
+    listing = await fetch_hub_teams(
+        bearer_token=hub_credential(request),
+        org_id=session.scope.org_id or "",
+        user_id=session.scope.user_id or "",
+    )
+    if not listing.reachable and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Couldn't reach MindsHub to confirm your teams. Try again in a moment.",
+        )
+    out = dict(access)
+    # The org's default team has everyone in the org as members: naming it
+    # is "Everyone at <org>", which auth already has as org_allowed.
+    default_team_id = listing.default_team_id
+    if default_team_id and default_team_id in team_ids:
+        team_ids = [t for t in team_ids if t != default_team_id]
+        out["org_allowed"] = True
+    if not is_admin:
+        foreign = [t for t in team_ids if t not in listing.team_ids]
+        if foreign:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"You can only share with teams you belong to: {', '.join(foreign)}.",
+            )
+    return {**out, "allowed_team_ids": team_ids}
 
 
 def _owner_publish_context(session, folder: Path):
@@ -870,6 +949,7 @@ async def set_artifact_access(
     artifact_id: ArtifactIdDep,
     body: _AccessBody,
     session: ScopedSessionDep,
+    request: Request,
 ):
     """Re-publish this artifact with a new audience. Owner-only.
 
@@ -889,6 +969,15 @@ async def set_artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
+    from cowork.services.publish import access_from_app, pop_notify
+
+    # "Notify people" belongs to this save alone: lifted out here and passed
+    # on its own, so it is never stored with the access a later re-publish reads.
+    try:
+        access, notify = pop_notify(access_from_app(dict(body.access or {})))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    access = await _checked_team_audience(access, request=request, session=session)
     if not await _acquire_live_publish_lock(folder):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -916,9 +1005,10 @@ async def set_artifact_access(
                     artifacts_base=artifacts_base,
                     api_key=api_key,
                     publish_url=publish_url,
-                    access=dict(body.access or {}),
+                    access=access,
                     scope=session.scope,
                     project_id=source.project_id,
+                    notify=notify or None,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )

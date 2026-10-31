@@ -19,6 +19,8 @@ from cowork.api.v1.endpoints import (
     conversations,
     files,
     health,
+    hub_people,
+    hub_teams,
     hub_usage,
     hub_workspaces,
     live_apps,
@@ -99,6 +101,8 @@ api_router.include_router(coding_personal_skills.router, prefix="/coding/skills/
 api_router.include_router(coding_runtime.router, prefix="/coding/runtime", tags=["coding-runtime"])
 api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 api_router.include_router(hub_usage.router, prefix="/hub/usage", tags=["hub-usage"])
+api_router.include_router(hub_teams.router, prefix="/hub/teams", tags=["hub-teams"])
+api_router.include_router(hub_people.router, prefix="/hub/people", tags=["hub-people"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])
