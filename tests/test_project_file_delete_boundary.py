@@ -26,7 +26,7 @@ def _delete(base, relative: str, monkeypatch):
     monkeypatch.setattr(project_files, "ProjectService", Catalog)
     scoped = SimpleNamespace(scope=LOCAL_SCOPE)
     return project_files._delete_project_file(
-        "project", project_files._validated_project_path(relative), scoped
+        scoped, project_name="project", path=project_files._validated_project_path(relative), principal=None
     )
 
 

@@ -44,6 +44,7 @@ from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, 
 from cowork.handlers.turn_errors import (
     INTERRUPTED_TURN_MESSAGE,
     SERVER_BUSY_CODE,
+    TURN_LOST_MESSAGE,
     STALLED_CODE,
     STALLED_TURN_MESSAGE,
     server_busy_message,
@@ -570,7 +571,7 @@ async def test_a_cancel_during_the_turn_start_unit_waits_for_it_and_finalizes_th
     rows = [(r.role, r.pending) for r in _rows(conversation_id)]
     if cancel == "shutdown":
         last_kind, last = frames[-1]
-        assert (last_kind, last["error"]) == ("response.failed", INTERRUPTED_TURN_MESSAGE)
+        assert (last_kind, last["error"]) == ("response.failed", TURN_LOST_MESSAGE)
         assert "assistant_message_id" in last, last
         assert _terminal(conversation_id) == "Interrupted"
         # The interrupted turn's failure is saved as its answer.
@@ -965,7 +966,7 @@ async def test_an_interrupted_turn_whose_save_fails_is_left_for_boot_recovery(mo
     if how == "ui_stall":
         assert (last["code"], last["error"]) == (STALLED_CODE, STALLED_TURN_MESSAGE), last
     else:
-        assert last["error"] == INTERRUPTED_TURN_MESSAGE, last
+        assert last["error"] == (TURN_LOST_MESSAGE if how == "shutdown" else INTERRUPTED_TURN_MESSAGE), last
     assert _terminal(conversation_id) == "Interrupted"
     assert _rows(conversation_id) == [_Row(role="user", pending=True, seq=0)]
     # Boot recovery over this turn's buffer alone.

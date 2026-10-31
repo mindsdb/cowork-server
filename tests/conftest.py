@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
+# Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
+# link takes branches a Linux run doesn't, so the blocking guard
+# (tests/_blocking_guard.py) would find different sites on each.
+TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-")).resolve()
 # Force isolation (assignment, not setdefault, never touch a real DB).
 os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
 # Outside COWORK_HOME: the blocking guard (tests/_blocking_guard.py) counts
@@ -44,6 +47,10 @@ os.environ["COWORK_REQUIRE_AUTH"] = "false"
 
 import pytest
 from sqlmodel import Session, SQLModel
+
+# Lists every skipped test in CI and fails a run that requires every
+# prerequisite when one is left out without a reason (tests/skip_guard.py).
+from tests.skip_guard import pytest_addoption, pytest_configure  # noqa: E402,F401
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -467,8 +474,7 @@ def owned_logger(monkeypatch, caplog, tmp_path):
 
 # ── Blocking work where it stops other requests (tests/_blocking_guard.py) ──
 
-_GUARD_REACHED: set = set()
-_GUARD_RUN = {"deselected": False, "files": frozenset()}
+_GUARD_REACHED: set["_blocking_guard.Site"] = set()
 
 
 @pytest.fixture(autouse=True)
@@ -479,9 +485,9 @@ def blocking_work_guard():
     with _blocking_guard.watching() as found:
         yield
     _GUARD_REACHED.update(found)
-    unlisted = sorted(found - _blocking_guard.allowed_sites())
+    unlisted = _blocking_guard.unlisted(found)
     if unlisted:
-        lines = "\n".join(f"  ({site.path!r}, {site.function!r}, {site.kind!r})" for site in unlisted)
+        lines = "\n".join(_blocking_guard.site_line(site) for site in unlisted)
         pytest.fail(
             "blocking work where it stops other requests, not on "
             f"tests/_blocking_guard.py's ALLOWLIST:\n{lines}",
@@ -489,40 +495,10 @@ def blocking_work_guard():
         )
 
 
-def pytest_deselected(items):
-    _GUARD_RUN["deselected"] = True
-
-
-def pytest_collection_finish(session):
-    _GUARD_RUN["files"] = frozenset(Path(item.path) for item in session.items)
-
-
-def _a_full_unit_run(session) -> bool:
-    """Every unit test file collected, nothing deselected or filtered, and the
-    run not stopped early: only then is an allowlist entry no test reached
-    stale rather than unreached."""
-    option = session.config.option
-    if option.collectonly or _GUARD_RUN["deselected"] or option.keyword or option.markexpr:
-        return False
-    if session.shouldstop or session.shouldfail:
-        return False
-    tests_dir = Path(__file__).parent
-    every_file = {
-        path for path in tests_dir.rglob("test_*.py") if "integration" not in path.relative_to(tests_dir).parts
-    }
-    return every_file <= _GUARD_RUN["files"]
-
-
-def pytest_sessionfinish(session, exitstatus):
-    if exitstatus not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED) or not _a_full_unit_run(session):
-        return
+def pytest_sessionstart(session):
     import _blocking_guard
 
-    stale = sorted(_blocking_guard.allowed_sites() - _GUARD_REACHED)
-    if not stale:
-        return
-    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-    reporter.write_line("tests/_blocking_guard.py's ALLOWLIST names sites no test reached:", red=True)
-    for site in stale:
-        reporter.write_line(f"  ({site.path!r}, {site.function!r}, {site.kind!r})", red=True)
-    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    session.config.pluginmanager.register(
+        _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
+        "cowork-blocking-guard-stale-entries",
+    )

@@ -1,5 +1,6 @@
 import ipaddress
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -253,11 +254,12 @@ async def list_projects(
     # A database unit, not a file store one: the listing is rows plus one
     # check of the general project's folder, and file store slots held by
     # stuck artifact lookups must not refuse it.
-    return await run_db(lambda session: _list_projects(session, principal), scope=scope)
+    return await run_db(partial(_list_projects, principal=principal), scope=scope)
 
 
 def _list_projects(
     session: ScopedSession,
+    *,
     principal: Principal | None,
 ):
     service = ProjectService(session)
@@ -325,12 +327,13 @@ async def create_project(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _create_project(body, session, principal), scope=scope)
+    return await run_efs_unit(partial(_create_project, body=body, principal=principal), scope=scope)
 
 
 def _create_project(
-    body: ProjectCreateRequest,
     session: ScopedSession,
+    *,
+    body: ProjectCreateRequest,
     principal: Principal | None,
 ):
     access = SharedResourceAccess(session, principal)
@@ -404,13 +407,16 @@ async def update_project(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _update_project(project_id, body, session, principal), scope=scope)
+    return await run_efs_unit(
+        partial(_update_project, project_id=project_id, body=body, principal=principal), scope=scope
+    )
 
 
 def _update_project(
+    session: ScopedSession,
+    *,
     project_id: UUID,
     body: ProjectUpdateRequest,
-    session: ScopedSession,
     principal: Principal | None,
 ):
     service = ProjectService(session)
@@ -655,12 +661,13 @@ async def delete_project(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _delete_project(project_id, session, principal), scope=scope)
+    return await run_efs_unit(partial(_delete_project, project_id=project_id, principal=principal), scope=scope)
 
 
 def _delete_project(
-    project_id: UUID,
     session: ScopedSession,
+    *,
+    project_id: UUID,
     principal: Principal | None,
 ):
     service = ProjectService(session)

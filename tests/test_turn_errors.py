@@ -2499,6 +2499,12 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # Saved as a failure so a reload shows the stall card instead of a
         # partial answer that reads like a Stop.
         "stalled",
+        # The server stopped while the turn ran: a shutdown, or a crash that
+        # boot recovery finds. Split off anton_error because nothing about the
+        # request failed and sending it again works once the server is back.
+        # The renderer branch lands in mindsdb/cowork's ChatView.jsx + its
+        # turnFailureCards list.
+        "turn_lost",
         "anton_error",
     }
 

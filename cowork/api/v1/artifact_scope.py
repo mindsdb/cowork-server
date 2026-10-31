@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import os
 import secrets
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -13,12 +14,10 @@ from fastapi import HTTPException, status
 from cowork.db.scoped import ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_efs
 from cowork.services.artifact_roots import (
-    DiscoveredRoots,
     RootsPlan,
     artifacts_sources_for_project,
     artifacts_sources_for_scope,
     discover_roots,
-    owned_conversation_ids,
     plan_project_roots,
     plan_scope_roots,
 )
@@ -26,6 +25,8 @@ from cowork.services.artifacts import ProjectArtifacts, _org_mode
 
 if TYPE_CHECKING:
     from cowork.services.projects import ProjectService
+
+T = TypeVar("T")
 
 
 def _project_dir_matches(source, wanted: str) -> bool:
@@ -192,27 +193,6 @@ def _resolve_in(sources, artifact_id: str):
         ) from exc
 
 
-async def _discover(
-    plan: RootsPlan, *, scope: TenantScope
-) -> tuple[DiscoveredRoots, list[ProjectArtifacts]]:
-    """Expand a plan read in a database unit: the directories on the file
-    store, then the owner filter's one query, each in its own worker thread.
-    Returns what was found and the roots the caller may read."""
-    found = await run_efs(partial(discover_roots, plan), scope=scope)
-    ids = found.conversation_ids()
-    owned = (
-        await run_db(partial(owned_conversation_ids, conversation_ids=ids), scope=scope)
-        if ids else ()
-    )
-    return found, found.sources(owned)
-
-
-async def artifact_sources(plan: RootsPlan, *, scope: TenantScope) -> list[ProjectArtifacts]:
-    """The roots `plan` names that the caller may read, read off the event
-    loop and with no pooled connection held during the file store step."""
-    return (await _discover(plan, scope=scope))[1]
-
-
 class ResolvedArtifact(NamedTuple):
     """An artifact folder the caller may at least review.
 
@@ -228,6 +208,25 @@ class ResolvedArtifact(NamedTuple):
     is_own: bool
 
 
+def _reviewable_in(plan: RootsPlan, artifact_id: str, *, org_id: str | None) -> ResolvedArtifact:
+    """The file store half of `review_artifact_for_request`: the roots, the
+    owner filter, the folder and, for a reviewer, the owner's grant, all on
+    the calling thread."""
+    found = discover_roots(plan)
+    try:
+        return ResolvedArtifact(*_resolve_in(found.sources(), artifact_id), True)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND or not _org_mode():
+            raise
+
+    from cowork.services.artifact_draft_review import draft_review_allows
+
+    source, folder, metadata = _resolve_in(found.unfiltered(), artifact_id)
+    if not draft_review_allows(folder, org_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+    return ResolvedArtifact(source, folder, metadata, False)
+
+
 async def review_artifact_for_request(
     scope: TenantScope, project_ref: str, artifact_id: str
 ) -> ResolvedArtifact:
@@ -237,25 +236,58 @@ async def review_artifact_for_request(
     artifact without a grant is a 404 rather than a 403: the private case must
     not be distinguishable from a missing artifact.
 
-    The database and the file store are read in turn, each in its own worker
-    thread (run_db, run_efs): no pooled connection is held while a stat waits
-    on the file server, and the event loop never waits for either.
+    One database unit reads the project row and the conversations the caller
+    owns (run_db), then one file store call does the rest (run_efs): no pooled
+    connection is held while a stat waits on the file server, the event loop
+    never waits for either, and the lookup waits for a file store slot once.
     """
     plan = await run_db(partial(_plan_for_project_ref, project_ref=project_ref), scope=scope)
-    found, own = await _discover(plan, scope=scope)
-    try:
-        source, folder, metadata = await run_efs(partial(_resolve_in, own, artifact_id), scope=scope)
-        return ResolvedArtifact(source, folder, metadata, True)
-    except HTTPException as exc:
-        if exc.status_code != status.HTTP_404_NOT_FOUND or not _org_mode():
-            raise
+    return await run_efs(partial(_reviewable_in, plan, artifact_id, org_id=scope.org_id), scope=scope)
 
-    from cowork.services.artifact_draft_review import draft_review_allows
 
-    def reviewable():
-        source, folder, metadata = _resolve_in(found.unfiltered(), artifact_id)
-        if not draft_review_allows(folder, scope.org_id):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
-        return source, folder, metadata
+class ReviewedRead(NamedTuple, Generic[T]):
+    """An artifact the caller may at least review, and what a route's read of
+    it returned."""
 
-    return ResolvedArtifact(*await run_efs(reviewable, scope=scope), False)
+    artifact: ResolvedArtifact
+    value: T
+
+
+def _reviewable_and_read(
+    plan: RootsPlan,
+    artifact_id: str,
+    *,
+    org_id: str | None,
+    read: Callable[[ResolvedArtifact], T],
+) -> ReviewedRead[T]:
+    """`_reviewable_in`, then `read` on the artifact it found, on the calling
+    thread. `read` runs only once `_reviewable_in` returned, so never for a
+    caller it refused."""
+    artifact = _reviewable_in(plan, artifact_id, org_id=org_id)
+    return ReviewedRead(artifact, read(artifact))
+
+
+async def review_artifact_and_read(
+    scope: TenantScope,
+    project_ref: str,
+    artifact_id: str,
+    *,
+    read: Callable[[ResolvedArtifact], T],
+) -> ReviewedRead[T]:
+    """`review_artifact_for_request`, with the route's own blocking ``read`` of
+    the artifact run in the lookup's file store call, so the route waits for a
+    file store slot once, and its read is never refused a slot after the
+    lookup's work. A database unit the route runs after this, such as the
+    review entry's capabilities read, can still answer 503 when no connection
+    frees within POOL_TIMEOUT.
+
+    Only for a route whose authorization ends with the review: ``read`` runs
+    for a reviewer as well as the owner, so it may read only what a reviewer
+    may see. An owner-only route checks ownership in a database unit after
+    the lookup, and reads in a file store call of its own after that check.
+    """
+    plan = await run_db(partial(_plan_for_project_ref, project_ref=project_ref), scope=scope)
+    return await run_efs(
+        partial(_reviewable_and_read, plan, artifact_id, org_id=scope.org_id, read=read),
+        scope=scope,
+    )

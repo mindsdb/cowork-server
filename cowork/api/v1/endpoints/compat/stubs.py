@@ -10,15 +10,18 @@ import logging
 import mimetypes
 import os
 import shutil
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import log_context
-from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.units import FilesystemBusy, run_efs_unit
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
 logger = logging.getLogger(__name__)
@@ -121,6 +124,8 @@ async def upload_attachment(
             results.append(_to_attachment(saved))
         except MissingTenantScopeError:
             raise  # auth problem — the app-level handler answers 401
+        except (FilesystemBusy, PoolTimeoutError):
+            raise  # busy file store or database: the app-level handlers answer 503
         except Exception as exc:
             # Previously any failure here surfaced as an opaque 500 with no
             # server log (e.g. an over-long `purpose` failing model
@@ -139,16 +144,21 @@ async def upload_attachment(
 
 
 @attachments_router.delete("/{attachment_id}")
-def delete_attachment(attachment_id: UUID, scoped: ScopedSessionDep):
+async def delete_attachment(attachment_id: UUID, scope: Annotated[TenantScope, Depends(get_tenant_scope)]):
     from cowork.services.files import FileService
-    FileService(scoped).delete_file(attachment_id)
+    await run_efs_unit(lambda session: FileService(session).delete_file(attachment_id), scope=scope)
     return {"ok": True}
 
 
 @attachments_router.delete("/{project_name}/{session_id}/{attachment_id}")
-def delete_attachment_scoped(project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep):
+async def delete_attachment_scoped(
+    project_name: str,
+    session_id: str,
+    attachment_id: UUID,
+    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+):
     from cowork.services.files import FileService
-    FileService(scoped).delete_file(attachment_id)
+    await run_efs_unit(lambda session: FileService(session).delete_file(attachment_id), scope=scope)
     return {"ok": True}
 
 
@@ -160,7 +170,6 @@ async def attachment_raw(
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
 ):
     from cowork.api.v1.efs_file_response import EfsFileResponse
-    from cowork.db.units import run_efs_unit
     from cowork.services.files import FileService
     try:
         content_type, filename, path = await run_efs_unit(
@@ -208,9 +217,21 @@ def _unique_project_target(project_dir: Path, filename: str) -> Path:
 
 
 @attachments_router.post("/{project_name}/{session_id}/{attachment_id}/move-to-project")
-def move_attachment_to_project(
-    project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep
+async def move_attachment_to_project(
+    project_name: str,
+    session_id: str,
+    attachment_id: UUID,
+    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
 ):
+    # The copy into the project and the attachment's delete run together, as
+    # one unit on the file store's threads.
+    return await run_efs_unit(
+        partial(_move_attachment_to_project, project_name=project_name, attachment_id=attachment_id),
+        scope=scope,
+    )
+
+
+def _move_attachment_to_project(scoped: ScopedSession, *, project_name: str, attachment_id: UUID) -> dict[str, Any]:
     from cowork.services.files import FileService
     from cowork.services.projects import ProjectService
 

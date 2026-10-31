@@ -1,17 +1,21 @@
 """Database connection and session management using SQLAlchemy"""
 
+import hashlib
+import re
+import time
 from collections.abc import Callable
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
 from starlette.exceptions import HTTPException
 
-from cowork.common.logger import setup_logging
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.logger import get_logger, setup_logging
+from cowork.common.settings.app_settings import DatabaseSettings, get_app_settings
 
 logger = setup_logging()
+statement_logger = get_logger("cowork.db.statements")
 settings = get_app_settings()
 
 # Global cache for engines and session factories
@@ -31,6 +35,90 @@ def _is_expected_refusal(exc: BaseException) -> bool:
     status = exc.status_code
     return type(status) is int and 400 <= status < 500
 
+
+def postgres_session_options(database: DatabaseSettings) -> str:
+    """The libpq ``options`` that set each app connection's session timeouts,
+    or "" when both are off."""
+    options = []
+    if database.statement_timeout_ms:
+        options.append(f"-c statement_timeout={database.statement_timeout_ms}")
+    if database.idle_in_transaction_timeout_ms:
+        options.append(f"-c idle_in_transaction_session_timeout={database.idle_in_transaction_timeout_ms}")
+    return " ".join(options)
+
+
+_OPERATION_TABLE = re.compile(r"\b(?:FROM|INTO|UPDATE|JOIN)\s+\"?([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def statement_operation(statement: str) -> str:
+    """The statement's verb and first table, such as ``SELECT schedule_runs``.
+    Built from the SQL text alone, so no bound value reaches the log."""
+    words = statement.split(None, 1)
+    verb = words[0].upper() if words else "UNKNOWN"
+    table = _OPERATION_TABLE.search(statement)
+    return f"{verb} {table.group(1)}" if table else verb
+
+
+def statement_fingerprint(statement: str) -> str:
+    """A short, stable name for one statement's SQL text, so its slow runs
+    can be counted together."""
+    return hashlib.sha256(" ".join(statement.split()).encode()).hexdigest()[:12]
+
+
+def log_slow_statements(engine, *, threshold_ms: int) -> None:
+    """Log each statement on ``engine`` that takes at least ``threshold_ms``.
+
+    The line carries the statement's verb and first table and a fingerprint
+    of its SQL text, never the SQL or its parameters.
+    """
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _started(conn, cursor, statement, parameters, context, executemany):
+        conn.info["statement_started"] = time.perf_counter()
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def _finished(conn, cursor, statement, parameters, context, executemany):
+        started = conn.info.pop("statement_started", None)
+        if started is None:
+            return
+        duration_ms = (time.perf_counter() - started) * 1000
+        if duration_ms >= threshold_ms:
+            statement_logger.warning(
+                "Database statement was slow",
+                extra={
+                    "event": "db_statement_slow",
+                    "duration_ms": round(duration_ms),
+                    "operation": statement_operation(statement),
+                    "statement_fingerprint": statement_fingerprint(statement),
+                },
+            )
+
+
+def log_http_error(exc: HTTPException) -> None:
+    """Log an HTTPException that rolled a session back, unless it is an
+    expected refusal (``_is_expected_refusal``).
+
+    Starlette answers an HTTPException (FastAPI's subclasses it) itself and
+    logs nothing, so this line is the only record of what caused a 5xx, from
+    the request's session (get_session) or a unit's (cowork.db.units). The
+    cause's traceback goes through the handler filters, which replace a
+    database or provider chain; the exception's own detail is the client's
+    answer and stays out. The record names its caller as its site and
+    operation, the session whose work raised.
+    """
+    if _is_expected_refusal(exc):
+        return
+    cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    logger.error(
+        "Session error: error_type=%s status=%d cause=%s",
+        type(exc).__name__,
+        exc.status_code,
+        type(cause).__name__ if cause is not None else "none",
+        exc_info=cause,
+        stacklevel=2,
+    )
+
+
 def _create_engine(db_uri: str):
     is_sqlite = db_uri.startswith("sqlite")
     try:
@@ -41,8 +129,10 @@ def _create_engine(db_uri: str):
                 hide_parameters=True,
             )
         else:
+            options = postgres_session_options(settings.database)
             engine = create_engine(
                 db_uri,
+                connect_args={"options": options} if options else {},
                 hide_parameters=True,
                 pool_size=settings.database.pool_size,
                 max_overflow=settings.database.max_overflow,
@@ -50,6 +140,8 @@ def _create_engine(db_uri: str):
                 pool_recycle=settings.database.pool_recycle,
                 pool_pre_ping=settings.database.pool_pre_ping,
             )
+            if settings.database.slow_statement_log_ms:
+                log_slow_statements(engine, threshold_ms=settings.database.slow_statement_log_ms)
         return engine
     except Exception as e:
         error_msg = str(e).lower()
@@ -140,33 +232,21 @@ async def get_session():
                 getattr(e, "status_code", 503),
             )
         elif isinstance(e, HTTPException):
-            # Starlette answers an HTTPException (FastAPI's subclasses it)
-            # itself and logs nothing, so this line is the only record of what
-            # caused a 5xx. The cause's traceback goes through the handler
-            # filters, which replace a database or provider chain; the
-            # exception's own detail is the client's answer and stays out.
-            cause = e.__cause__ or (None if e.__suppress_context__ else e.__context__)
-            logger.error(
-                "Session error: error_type=%s status=%d cause=%s",
-                type(e).__name__,
-                e.status_code,
-                type(cause).__name__ if cause is not None else "none",
-                exc_info=cause,
-            )
+            log_http_error(e)
         else:
             # Any other exception goes on to Uvicorn, which logs its traceback
             # through the same filters, or to an app exception handler that
             # answers it. That includes an error that carries a status_code
             # without being an HTTPException, such as a provider SDK's.
             logger.error("Session error: error_type=%s", type(e).__name__)
-        await _off_the_loop(db, db.rollback)
+        await _off_the_loop(db, release=db.rollback)
         raise
     finally:
         logger.debug("🔒 Closing database session")
-        await _off_the_loop(db, db.close)
+        await _off_the_loop(db, release=db.close)
 
 
-async def _off_the_loop(db: SQLModelSession, release: Callable[[], None]) -> None:
+async def _off_the_loop(db: SQLModelSession, *, release: Callable[[], None]) -> None:
     """``release`` (the session's rollback or close) on the units' threads
     when the session holds a connection; inline when it never took one."""
     if not db.in_transaction():
