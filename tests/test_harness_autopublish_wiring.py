@@ -96,7 +96,7 @@ def test_remote_producer_publishes_only_after_the_reply_stream_ends_cleanly():
     publish reads the owners it writes."""
     src = _norm(r.ResponsesHandler._run_remote_turn)
     loop_at = src.index("async for kind, data in stream_remote_replies(")
-    record_at = src.index("changes = await record_artifacts(completed_cleanly=completed_cleanly)")
+    record_at = src.index("changes = await record_artifacts(completed_cleanly=completed_cleanly, touched=pod_touched)")
     publish_at = src.index("await publish_and_card_turn_artifacts(")
     assert loop_at < record_at < publish_at < src.index("ArtifactCreated(")
 

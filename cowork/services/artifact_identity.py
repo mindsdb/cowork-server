@@ -681,6 +681,43 @@ def identities_below(source: "ProjectArtifacts") -> dict[str, tuple[str, ...]]:
         return {}
 
 
+class NamedArtifactFolders(NamedTuple):
+    """What artifact_folders_named found among the names it was given. A name
+    in neither set holds no artifact folder."""
+
+    # Plain folders holding a plain metadata.json.
+    found: set[str]
+    # Names it could not read: a read error other than a missing entry or a
+    # link (_holds_no_id). Every name when opening ``base`` fails that way.
+    unreadable: set[str]
+
+
+def artifact_folders_named(*, base: Path, slugs: set[str]) -> NamedArtifactFolders:
+    """The names among ``slugs`` that are artifact folders directly below
+    ``base``: plain folders holding a plain ``metadata.json``. A name that
+    isn't one path component, a link, a missing entry or a folder without that
+    file holds none, and so does every name when ``base`` is missing or a
+    folder on the way to it is a link (``_opened_from_trusted_root``). Stats
+    only the named folders, never the whole root."""
+    found: set[str] = set()
+    unreadable: set[str] = set()
+    try:
+        with _opened_from_trusted_root(Path(base)) as root:
+            for slug in slugs:
+                try:
+                    with _opened_child_directory(root, slug) as folder:
+                        if stat.S_ISREG(dir_stat(folder, "metadata.json", follow_symlinks=False).st_mode):
+                            found.add(_component(slug))
+                except ValueError:
+                    continue
+                except OSError as exc:
+                    if not _holds_no_id(exc):
+                        unreadable.add(slug)
+    except OSError as exc:
+        return NamedArtifactFolders(found=set(), unreadable=set() if _holds_no_id(exc) else set(slugs))
+    return NamedArtifactFolders(found=found, unreadable=unreadable)
+
+
 def artifact_ids_below(base: Path, slugs) -> dict[str, str]:
     """The id each of ``slugs``' folders directly below ``base`` holds, read
     without writing. A folder that is gone, is a link or holds no readable id

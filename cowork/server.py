@@ -68,6 +68,7 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
+from cowork.services.artifact_autopublish import cancel_self_heals
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
 
 
@@ -229,11 +230,12 @@ async def _cancel_and_wait(task: asyncio.Task | None) -> None:
 async def _end_remote_turns() -> None:
     """End this replica's turns for a shutdown, where turns run remotely.
 
-    Refuses new turns and cancels the scheduler's poll loop, then ends every
-    turn in flight: RunRegistry.shutdown writes each remote turn's controller
-    cancel flag, and the turn's relay saves it as interrupted and writes
-    response.failed to its stream. Only then does it wait for the poll loop,
-    which finishes a database read it was in before it stops, and for the
+    Refuses new turns and cancels the scheduler's poll loop and the artifact
+    self-heals it started, then ends every turn in flight:
+    RunRegistry.shutdown writes each remote turn's controller cancel flag, and
+    the turn's relay saves it as interrupted and writes response.failed to its
+    stream. Only then does it wait for the poll loop, which finishes a database
+    read it was in before it stops, for the self-heals to unwind, and for the
     scheduled runs those turns belonged to, so each run's record lands.
     TURN_SHUTDOWN_GRACE_SECONDS bounds all of it. Each step does nothing for
     what an earlier call ended.
@@ -246,9 +248,11 @@ async def _end_remote_turns() -> None:
 
     registry.close()
     poll_loop = stop_scheduler()
+    self_heals = cancel_self_heals()
     _log_cancelled_turns(await registry.shutdown(timeout_seconds=remaining()))
-    if poll_loop is not None:
-        await asyncio.wait([poll_loop], timeout=remaining())
+    stopping = [task for task in (poll_loop, *self_heals) if task is not None]
+    if stopping:
+        await asyncio.wait(stopping, timeout=remaining())
     unfinished = await wait_for_scheduled_runs(timeout_seconds=remaining())
     if unfinished:
         logger.warning(

@@ -131,9 +131,10 @@ from cowork.services.product_permissions import (
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService
+from cowork.services.queued_repairs import QueuedRepairs
 from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
-from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
+from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result, tracked_artifacts_from_reply
 
 
 import logging
@@ -552,6 +553,10 @@ class _RemoteTurnArtifacts:
     directory: _RemoteArtifactsDir
     before_slugs: set[str]
     before_mtimes: dict[str, int]
+    # The rows of the folders holding an agent repair queued to the
+    # conversation (queued_agent_repairs), read before the pod runs: the
+    # repair is queued before its turn starts. None when they couldn't be read.
+    repairs: QueuedRepairs | None = None
     writes_allowed: bool = False
     recorded: bool = False
 
@@ -2002,7 +2007,9 @@ class ResponsesHandler:
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
 
-        async def record_artifacts(*, completed_cleanly: bool) -> ArtifactChanges | None:
+        async def record_artifacts(
+            *, completed_cleanly: bool, touched: set[str] | None = None,
+        ) -> ArtifactChanges | None:
             """Record what the pod did to the project's artifacts, once per
             turn, whichever way the turn ends, as the in-process harness's
             `finally` does: the folders it created are indexed as this
@@ -2011,13 +2018,20 @@ class ResponsesHandler:
             turn may not keep what the pod wrote (its workspace was not
             persistent), when it recorded them already, or when the diff
             failed. Outside org mode the next turn in the project reconciles
-            them; in org mode nothing does."""
+            them; in org mode nothing does. `touched` is the pod's own list of
+            the artifacts its tools touched: with it, the diff claims and
+            checks only those; without it, provenance decides what the turn
+            created, and every folder is checked for edits."""
+            from cowork.services.queued_repairs import forget_checked_repairs
             from cowork.services.task_objects import record_new_artifacts, turn_artifact_changes
 
             if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
                 return None
             turn_artifacts.recorded = True
             directory = turn_artifacts.directory
+            # With the pod's list, the folders holding a repair queued to this
+            # conversation are all the diff needs besides the touched ones.
+            repairs = turn_artifacts.repairs if touched is not None else None
 
             async def record() -> ArtifactChanges | None:
                 try:
@@ -2030,10 +2044,14 @@ class ResponsesHandler:
                             artifacts_base=directory.base,
                             before=turn_artifacts.before_slugs,
                             before_mtimes=turn_artifacts.before_mtimes,
-                            # ENG-2961: the project base is shared, so only folders
-                            # whose provenance names this conversation are its own.
+                            # The project base is shared, so only folders whose
+                            # provenance names this conversation are its own,
+                            # unless the pod named the folders its tools touched.
                             attribute_by_provenance=True,
+                            tracked_new=touched,
+                            tracked_edits=touched,
                             completed_cleanly=completed_cleanly,
+                            repair_slugs=repairs.slugs if repairs is not None else None,
                         ),
                         scope=scope,
                         deadline=False,
@@ -2083,7 +2101,13 @@ class ResponsesHandler:
             # or the record waits for a slot, or while either runs, waits for
             # both and the record's error log, so the rows are written once
             # and a refusal still names the slugs it left unrecorded.
-            return await run_to_completion(record())
+            changes = await run_to_completion(record())
+            if changes is not None:
+                # Last: the rows only spare the next turn end a folder check.
+                await forget_checked_repairs(
+                    conversation_id=conv_id, repairs=repairs, checked=changes.checked_repairs, scope=scope,
+                )
+            return changes
 
         async def persist(*, clean: bool) -> _SavedAnswer:
             """Save the answer as it stands, once per turn, in one unit.
@@ -2235,13 +2259,19 @@ class ResponsesHandler:
                 before_slugs, before_mtimes = await run_efs(
                     partial(snapshot_artifact_state, seed.artifacts.base), scope=scope, deadline=False
                 )
+                from cowork.services.queued_repairs import queued_repair_folders
+
                 turn_artifacts = _RemoteTurnArtifacts(
                     directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
+                    repairs=await queued_repair_folders(conversation_id=conv_id, scope=scope),
                 )
             # Set only on turn_completed: any other exit (Stop, cancel, failure)
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
             completed_cleanly = False
+            # The artifacts the pod's tools touched, from turn_completed; None
+            # for a pod that sends no list, and for every other exit.
+            pod_touched: set[str] | None = None
             # Whether the pod compacted or hard-truncated the turn's context:
             # its compacted step comes for both, its compaction reply for a
             # summary. Both arrive before the history frame.
@@ -2329,6 +2359,7 @@ class ResponsesHandler:
                     # `break`, not `return`: the record/publish/card block
                     # below must still run on a clean finish.
                     completed_cleanly = True
+                    pod_touched = tracked_artifacts_from_reply(data)
                     break
                 elif kind == "turn_failed":
                     if await _remote_cancel_confirmed(data.get("error"), corr):
@@ -2352,7 +2383,7 @@ class ResponsesHandler:
             # the artifacts in end_turn, with no publish and no cards, matching
             # the in-process path, where Stop/error produce no cards. Outside
             # org mode the next turn in the project reconciles the publish.
-            changes = await record_artifacts(completed_cleanly=completed_cleanly)
+            changes = await record_artifacts(completed_cleanly=completed_cleanly, touched=pod_touched)
             if changes is not None:
                 for card in await publish_and_card_turn_artifacts(
                     turn_artifacts.directory.base,
@@ -2361,6 +2392,9 @@ class ResponsesHandler:
                     scope=scope,
                     project_id=turn_artifacts.directory.project_id,
                     project_name=turn_artifacts.directory.project_name,
+                    # With the pod's list the publish opens only this turn's
+                    # folders too, and the project's self-heal is scheduled.
+                    only_touched=pod_touched is not None,
                 ):
                     yield ArtifactCreated(card)
 

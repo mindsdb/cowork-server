@@ -1262,22 +1262,34 @@ async def request_agent_repair(
     _source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
+    # Before the repair is queued, so the end of the conversation's turn
+    # checks this folder; a failed write queues nothing.
+    from cowork.services.queued_repairs import record_queued_repair, take_back_queued_repair
+
+    added_row = await run_db(
+        partial(record_queued_repair, conversation_id=body.conversationId, slug=folder.name), scope=scope
+    )
     try:
-        return await run_efs(
-            partial(
-                create_agent_repair,
-                folder,
-                metadata,
-                artifact_id,
-                expected_revision_id=body.expectedRevisionId,
-                comment_thread_id=body.commentThreadId,
-                selector=body.selector,
-                thread=[entry.model_dump() for entry in body.thread],
-                conversation_id=str(body.conversationId),
-                preview_errors=body.previewErrors,
-            ),
-            scope=scope,
-        )
+        try:
+            return await run_efs(
+                partial(
+                    create_agent_repair,
+                    folder,
+                    metadata,
+                    artifact_id,
+                    expected_revision_id=body.expectedRevisionId,
+                    comment_thread_id=body.commentThreadId,
+                    selector=body.selector,
+                    thread=[entry.model_dump() for entry in body.thread],
+                    conversation_id=str(body.conversationId),
+                    preview_errors=body.previewErrors,
+                ),
+                scope=scope,
+            )
+        except (FilesystemBusy, RevisionConflict, RepairAlreadyPending, RevisionValidationError, TimeoutError):
+            # Refused before anything was queued.
+            await take_back_queued_repair(conversation_id=body.conversationId, row_id=added_row, scope=scope)
+            raise
     except RevisionConflict as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

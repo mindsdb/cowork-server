@@ -784,6 +784,38 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
             _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
 
 
+def _insert_queued_repair(connection, *, conversation_id: str, org_id=None):
+    connection.execute(
+        text(
+            "INSERT INTO queued_agent_repairs (id, org_id, conversation_id, slug) "
+            "VALUES (:id, :org_id, :conversation_id, 'fixme')"
+        ),
+        {"id": uuid.uuid4().hex, "org_id": org_id, "conversation_id": conversation_id},
+    )
+
+
+def test_queued_agent_repairs_hold_one_row_per_folder_in_each_org(tmp_path, monkeypatch):
+    """Two organizations' rows for one conversation and folder never collide,
+    and the rows with no org keep one per conversation and folder too."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "queued_agent_repairs.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    conversation_id = uuid.uuid4().hex
+
+    with engine.begin() as connection:
+        _insert_queued_repair(connection, conversation_id=conversation_id)
+        _insert_queued_repair(connection, conversation_id=conversation_id, org_id="org-a")
+        _insert_queued_repair(connection, conversation_id=conversation_id, org_id="org-b")
+
+    for org_id in (None, "org-a"):
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _insert_queued_repair(connection, conversation_id=conversation_id, org_id=org_id)
+
+
 def test_published_page_ownership_upgrade_is_unique_and_survives_rollback(tmp_path):
     from uuid import uuid4
     from sqlalchemy.exc import IntegrityError
