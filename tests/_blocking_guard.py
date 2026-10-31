@@ -346,6 +346,8 @@ ALLOWLIST: tuple[Allowed, ...] = (
         'cowork/services/projects.py:ProjectService._in_scoped_root',
         'cowork/services/projects.py:ProjectService.ensure_dir_exists',
     ), "a run_db unit that also reads the turn's attachments"),
+    Allowed('cowork/api/v1/artifact_scope.py', '_plan_for_project_ref', THREAD_FILE_STORE, ('cowork/services/projects.py:ProjectService.sits_in_another_partition',), "a run_db unit whose roots plan resolves the shared root to leave out a project in another person's partition"),
+    Allowed('cowork/api/v1/endpoints/artifacts.py', '_plan_scoped_project', THREAD_FILE_STORE, ('cowork/services/projects.py:ProjectService.sits_in_another_partition',), "a run_db unit whose roots plan resolves the shared root to leave out a project in another person's partition"),
     Allowed('cowork/services/connectors/vault_secrets.py', '_restore_from_vault', THREAD_FILE_STORE, ('cowork/services/connectors/vault_secrets.py:_restore_from_vault',), "reads the organization's connection vault through asyncio.to_thread"),
     Allowed('cowork/services/publish.py', 'publish_artifact', THREAD_FILE_STORE, (ANY_LEAF,), "the agent's publish tool reads the artifact in its tool thread"),
 )

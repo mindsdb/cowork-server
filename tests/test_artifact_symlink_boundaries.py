@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from cowork import code_sandbox
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifact_identity, artifact_roots, artifacts
 from cowork.services.artifact_identity import ensure_full_id, resolve_artifact_folder
@@ -337,3 +339,55 @@ def test_pinned_delete_keeps_the_folder_when_unpublish_fails(tmp_path, monkeypat
         )
 
     assert folder.is_dir()
+
+
+ORG = "33333333-3333-4333-8333-333333333333"
+CONVERSATION = "22222222-2222-4222-8222-222222222222"
+LEGACY_ID = "44444444444444448444444444444444"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
+def test_org_storage_opens_every_folder_below_the_shared_root(tmp_path, monkeypatch, org_deployment):
+    """Hosted keeps each org's projects in the shared root, so an artifacts
+    folder there opens from that root with no folder below it followed: the
+    project's base and a legacy conversation root list for their owner, and a
+    link at the conversation or at the org folder reaches nothing."""
+    import shutil
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(home))
+    get_app_settings.cache_clear()
+    project = home / ORG / "projects" / "forecast"
+    conversation = project / "conversations" / CONVERSATION
+    _write_metadata(project / ".anton" / "artifacts" / "shared-report")
+    _write_metadata(conversation / ".anton" / "artifacts" / "legacy-report", LEGACY_ID)
+    legacy = ProjectArtifacts(
+        base=conversation / ".anton" / "artifacts",
+        project_id="project-1",
+        project_name=project.name,
+        trusted_anchor=project,
+        root_parts=("conversations", CONVERSATION, ".anton", "artifacts"),
+    )
+    sources = [_source(project), legacy]
+    artifact_identity._clear_identity_indexes()
+
+    assert code_sandbox.anchored_below_a_trusted_root(project).names == (ORG, "projects", "forecast")
+    assert sorted(card["slug"] for card in list_artifacts(sources)) == ["legacy-report", "shared-report"]
+    assert resolve_artifact_folder(sources, LEGACY_ID)[1].name == "legacy-report"
+
+    elsewhere = tmp_path / "elsewhere"
+    shutil.move(conversation, elsewhere)
+    conversation.symlink_to(elsewhere, target_is_directory=True)
+    artifact_identity._clear_identity_indexes()
+    assert [card["slug"] for card in list_artifacts(sources)] == ["shared-report"]
+    with pytest.raises(FileNotFoundError, match="Artifact not found"):
+        resolve_artifact_folder(sources, LEGACY_ID)
+
+    another_org = tmp_path / "another-org"
+    shutil.move(home / ORG, another_org)
+    (home / ORG).symlink_to(another_org, target_is_directory=True)
+    artifact_identity._clear_identity_indexes()
+    assert list_artifacts(sources) == []
+    with pytest.raises(FileNotFoundError, match="Artifact not found"):
+        resolve_artifact_folder(sources, FULL_ID)
