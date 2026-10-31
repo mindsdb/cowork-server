@@ -348,31 +348,8 @@ def test_turn_created_slugs_never_raises(tmp_path):
     assert ownership.turn_created_slugs(tmp_path, set(), "not-a-uuid") == set()
 
 
-def test_index_turn_artifacts_records_the_creator_as_owner(tmp_path, org_id, users):
-    project = make_project(tmp_path, org_id)
-    conversation_id = make_conversation(project, users[0])
-    source = project_root(project)
-    before, before_mtimes = task_objects.snapshot_artifact_state(source.base)
-    write_artifact(source.base, "fresh", conversation_id)
-    scope = TenantScope(org_mode=True, org_id=org_id, user_id=users[0])
-    with Session(_engine()) as raw:
-        session = ScopedSession(raw, scope)
-        conversation = session.get(Conversation, conversation_id)
-        new, touched, turn_scope = task_objects.index_turn_artifacts(
-            conversation, conversation_id, project.id, source.base,
-            before, before_mtimes,
-            tracked_new=ownership.turn_created_slugs(source.base, before, conversation_id),
-        )
-    assert new == ["fresh"]
-    assert turn_scope == scope
-    with scoped(org_id, users[1]) as session:
-        assert ownership.resolve_artifact_owner(session, source, "fresh") == (
-            ownership.OwnerResolution(users[0], "recorded")
-        )
-
-
 @pytest.mark.parametrize("completed_cleanly", [True, False])
-def test_index_turn_artifacts_attributes_by_provenance_with_one_listing(
+def test_turn_artifact_changes_attribute_by_provenance_with_one_listing(
     tmp_path, monkeypatch, completed_cleanly
 ):
     """The producers' path: the root is listed once, and the provenance filter
@@ -390,13 +367,11 @@ def test_index_turn_artifacts_attributes_by_provenance_with_one_listing(
         return real_listing(base)
 
     monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", _counted)
-    monkeypatch.setattr(task_objects, "_recover_turn_scope", lambda _c: None)
-    monkeypatch.setattr(task_objects, "_index_new_slugs", lambda *a: None)
-    new, touched, _scope = task_objects.index_turn_artifacts(
-        None, conversation_id, None, tmp_path, set(), {},
+    changes = task_objects.turn_artifact_changes(
+        conversation_id=conversation_id, artifacts_base=tmp_path, before=set(), before_mtimes={},
         attribute_by_provenance=True, completed_cleanly=completed_cleanly,
     )
     expected = ["mine"] if completed_cleanly else ["handmade", "mine"]
-    assert new == expected
-    assert touched == set(expected)
+    assert changes.created == expected
+    assert changes.touched == set(expected)
     assert len(listings) == 1

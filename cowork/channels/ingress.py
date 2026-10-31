@@ -148,17 +148,24 @@ class IngressManager:
     async def _poll_loop(self, channel_type: str, org_id: str | None, bridge: Any) -> None:
         offset: int | None = None
         while True:
+            # The offset the next poll sends confirms every event before it
+            # to the platform, so it moves past a batch only once the batch's
+            # intake succeeded.
+            confirmed = offset
             try:
-                events, offset = await bridge.poll(offset=offset)
+                events, offset = await bridge.poll(offset=confirmed)
+                if events:
+                    log.info("channel %s: poll fetched %d event(s)", channel_type, len(events))
+                    await intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # A failed intake, such as a pool that freed no connection in
+                # time, polls the same batch again; dedupe drops the events
+                # it already recorded.
+                offset = confirmed
                 log.exception("channel %s: poll cycle failed; backing off", channel_type)
                 await asyncio.sleep(_ERROR_BACKOFF_S)
-                continue
-            if events:
-                log.info("channel %s: poll fetched %d event(s)", channel_type, len(events))
-                await intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
 
 
 async def sync_channel_ingress(

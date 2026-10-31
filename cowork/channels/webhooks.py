@@ -13,8 +13,9 @@ from fastapi import APIRouter, Depends, Request, Response
 from cowork.api.v1.permissions import PlatformSignature, require
 from cowork.channels.plugin import ChannelPlugin
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_org
-from cowork.db.units import run_db
+from cowork.db.units import run_db, run_to_completion
 from cowork.services.channel_events import ChannelEventService
+from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -106,16 +107,45 @@ def _default_scheduler(coro: Coroutine[Any, Any, None]) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def drain_background_tasks(*, timeout: float = 3.0) -> None:
+async def drain_background_tasks(
+    *, timeout: float = 3.0, cancel_timeout: float = CANCEL_REQUEST_SECONDS,
+) -> None:
     """Await in-flight inbound processing. Call from shutdown so a task spawned
-    just before teardown isn't abandoned mid-run. Best-effort."""
+    just before teardown isn't abandoned mid-run. Best-effort.
+
+    Waits ``timeout`` for the tasks, cancels each one still running, then
+    waits up to ``cancel_timeout`` more for those to end. A cancelled channel
+    turn still writes its sandbox controller's cancel flag, records its
+    artifacts and queues its scratchpad close before it ends, and the event
+    loop's close cancels anything still running a second time, which would
+    cut that work. A turn still running after ``cancel_timeout`` is left
+    running: its end-of-turn bookkeeping runs under run_to_completion, which
+    a file store stall holds off with no bound, and waiting for it would hold
+    off every teardown step after this one. So the drain takes at most
+    ``timeout`` plus ``cancel_timeout``."""
     tasks = list(_background_tasks)
     if not tasks:
         return
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-    except asyncio.TimeoutError:
-        log.warning("%d channel inbound task(s) did not finish within %.1fs", len(tasks), timeout)
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    if pending:
+        for task in pending:
+            task.cancel()
+        log.warning(
+            "Cancelled channel inbound tasks still running at the shutdown drain's timeout",
+            extra={"event": "shutdown_channel_tasks_cancelled", "count": len(pending)},
+        )
+        unwound, unfinished = await asyncio.wait(pending, timeout=cancel_timeout)
+        done |= unwound
+        if unfinished:
+            log.warning(
+                "Cancelled channel inbound tasks still unwinding; shutdown goes on without them",
+                extra={"event": "shutdown_channel_tasks_unfinished", "count": len(unfinished)},
+            )
+    for task in done:
+        # Retrieve a failure, as gather(return_exceptions=True) would, so it
+        # neither escapes nor logs as never retrieved.
+        if not task.cancelled():
+            task.exception()
 
 
 def build_channel_webhook_router(
@@ -277,25 +307,32 @@ async def intake_events(
     always happens in the background.
 
     Each event is recorded in a unit of its own and scheduled before the next
-    one is read, so a failure part way through never leaves a recorded event
-    unscheduled, which its redelivery's dedupe would then drop."""
+    one is read. A cancel waits for the event in hand to be recorded and
+    scheduled, so it lands between events, never between an event's record
+    and its schedule: a recorded event left unscheduled would have its
+    redelivery dropped by dedupe. While the pool is full, that wait lasts up
+    to POOL_TIMEOUT."""
     sched = scheduler or _default_scheduler
     # Dedupe is per installation: LOCAL_SCOPE when no org was resolved
     # (local/desktop's one installation), the resolved org's scope otherwise.
     scope = scope_for_org(org_id)
-    for event in events:
+
+    async def record_and_schedule(event: Any) -> None:
         key = bridge.dedupe_key(event)
         intake = await run_db(
             partial(_record_inbound, channel_type=channel_type, key=key), scope=scope
         )
         if intake.duplicate:
             log.info("channel %s dropping duplicate inbound key=%s", channel_type, key)
-            continue
+            return
         if intake.event_id is None:
             log.info("channel %s dropping duplicate inbound (insert race) key=%s", channel_type, key)
-            continue
+            return
         log.info("channel %s: accepted inbound key=%s; dispatching to runtime", channel_type, key)
         sched(_process_event(channel_type, event, intake.event_id, sink, org_id=org_id))
+
+    for event in events:
+        await run_to_completion(record_and_schedule(event))
 
 
 async def _process_event(

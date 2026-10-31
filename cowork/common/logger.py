@@ -13,12 +13,11 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Error as SQLiteError
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from anton.core.llm.provider import CURATED_PROVIDER_ERRORS
 from psycopg import Error as PsycopgError
-from psycopg2 import Error as Psycopg2Error
 from sqlalchemy.exc import SQLAlchemyError, StatementError
 
 try:
@@ -37,7 +36,23 @@ except ImportError:
     HAS_RICH = False
 
 
-_DATABASE_ERROR_TYPES = (SQLAlchemyError, SQLiteError, PsycopgError, Psycopg2Error)
+if TYPE_CHECKING:
+    from psycopg2 import Error as Psycopg2Error
+
+
+_DATABASE_ERROR_TYPES = (SQLAlchemyError, SQLiteError, PsycopgError)
+
+
+def _database_error_types() -> tuple[type[BaseException], ...]:
+    """The database errors a log keeps the class, SQLSTATE and site of.
+
+    psycopg2's counts once something has imported psycopg2, as SQLAlchemy does for
+    a bare ``postgresql://`` URI; no psycopg2 error exists before then. Importing it
+    here would load psycopg2's own libpq, libssl and libcrypto into a server that
+    connects with psycopg, beside psycopg's copies.
+    """
+    psycopg2 = sys.modules.get("psycopg2")
+    return _DATABASE_ERROR_TYPES if psycopg2 is None else (*_DATABASE_ERROR_TYPES, psycopg2.Error)
 
 # The cowork package directory. A logging call whose file is outside it, such
 # as Uvicorn's request runner, only relays the error it logs.
@@ -75,9 +90,10 @@ def _exception_chain(*, exc: BaseException) -> Iterator[BaseException]:
             pending.append(current.__cause__)
 
 
-def find_database_error(*, exc: BaseException) -> SQLAlchemyError | SQLiteError | PsycopgError | Psycopg2Error | None:
+def find_database_error(*, exc: BaseException) -> "SQLAlchemyError | SQLiteError | PsycopgError | Psycopg2Error | None":
     """The first database error in ``exc``'s chain, even when an application exception wraps it."""
-    return next((error for error in _exception_chain(exc=exc) if isinstance(error, _DATABASE_ERROR_TYPES)), None)
+    database_errors = _database_error_types()
+    return next((error for error in _exception_chain(exc=exc) if isinstance(error, database_errors)), None)
 
 
 def _exception_candidates(*, record: logging.LogRecord) -> list[BaseException]:

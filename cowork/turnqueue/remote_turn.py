@@ -10,8 +10,13 @@ from uuid import UUID
 
 from cowork.common.logger import log_context
 from cowork.db.scoped import ScopedSession, TenantScope
-from cowork.db.units import run_db, run_efs
-from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
+from cowork.db.units import run_db, run_efs, run_to_completion
+from cowork.handlers.responses import (
+    ResponsesHandler,
+    _RemoteArtifactsDir,
+    save_turn_compaction,
+    save_turn_memory,
+)
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
@@ -155,15 +160,27 @@ async def remote_turn_events(
                 for event in step_stream_events(data):
                     yield event
             elif kind == "turn_memory":
-                # A channel turn runs for the org, not for one member, so it
-                # writes memory with no principal.
-                await run_db(
-                    partial(
-                        ResponsesHandler._persist_turn_memory,
-                        conv_id=conv_id, entries=data.get("entries") or [], principal=None,
-                    ),
-                    scope=scope,
-                )
+                entries = data.get("entries") or []
+                if entries and scope.org_mode:
+                    # A channel turn runs for its organization, with no member,
+                    # and in org tenancy neither memory tier takes an entry
+                    # without one: apply_turn_memory drops project entries that
+                    # carry no trusted member, and the person's tier
+                    # (GlobalMemoryStore) needs a user.
+                    logger.info(
+                        "channel turn memory not saved: an organization's channel turn has no member",
+                        extra=log_context(request_id=correlation_id, conversation_id=conv_id),
+                    )
+                else:
+                    # Outside org tenancy the turn writes memory with no
+                    # principal.
+                    await save_turn_memory(
+                        conv_id=conv_id,
+                        entries=entries,
+                        principal=None,
+                        scope=scope,
+                        request_id=correlation_id,
+                    )
             elif kind == "turn_history":
                 history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)
                 turn_rows[:] = [] if history is None else history.rows
@@ -171,12 +188,8 @@ async def remote_turn_events(
                     yield history
             elif kind == "turn_compaction":
                 compacted = True
-                await run_db(
-                    partial(
-                        ResponsesHandler._persist_remote_compaction,
-                        conv_id=conv_id, data=data, seed_info=seed_info,
-                    ),
-                    scope=scope,
+                await save_turn_compaction(
+                    conv_id=conv_id, data=data, seed_info=seed_info, scope=scope, request_id=correlation_id,
                 )
             elif kind == "turn_skill":
                 for entry in data.get("entries") or []:
@@ -199,14 +212,24 @@ async def remote_turn_events(
         raise
     finally:
         if artifacts is not None and artifact_writes_allowed:
-            new_slugs, touched_slugs = await _record_turn_artifacts(
+            # A cancel that lands while the diff or the record waits for a
+            # slot, or while either runs, waits for both, so the rows are
+            # written once. While the file store stalls, that wait has no
+            # bound. At shutdown, the drain of channel tasks waits up to its
+            # timeout plus its cancel_timeout. Then the event loop's close at
+            # the end of the teardown cancels a diff not yet returned, or a
+            # record still waiting for a slot, so this turn's rows are lost.
+            # Only a file store call already running on a stuck mount keeps
+            # the process alive, until the kubelet's SIGKILL: its worker
+            # thread is not a daemon thread.
+            new_slugs, touched_slugs = await run_to_completion(_record_turn_artifacts(
                 artifacts,
                 conv_id=conv_id,
                 scope=scope,
                 before_slugs=before_slugs,
                 before_mtimes=before_mtimes,
                 completed_cleanly=completed_cleanly,
-            )
+            ))
 
     if artifacts is not None and artifact_writes_allowed:
         for card in await publish_and_card_turn_artifacts(
@@ -257,7 +280,11 @@ async def _record_turn_artifacts(
             deadline=False,
         )
     except Exception:
-        logger.warning("could not diff the artifacts of channel turn %s", conv_id, exc_info=True)
+        logger.warning(
+            "Could not index artifacts created this turn",
+            exc_info=True,
+            extra=log_context(conversation_id=conv_id, project_id=artifacts.project_id),
+        )
         return [], set()
     if changes.created:
         try:
@@ -265,6 +292,8 @@ async def _record_turn_artifacts(
                 partial(
                     record_new_artifacts,
                     conversation_id=conv_id,
+                    # The context carries the id as text; the index row's
+                    # column takes a UUID.
                     project_id=UUID(artifacts.project_id) if artifacts.project_id else None,
                     slugs=changes.created,
                     creator=artifacts.creator,
@@ -272,14 +301,16 @@ async def _record_turn_artifacts(
                 scope=scope,
             )
         except Exception:
-            # record_new_artifacts logs each slug whose write fails itself;
-            # this covers the unit's own refusal or a failed commit.
+            # record_new_artifacts logs each slug whose index or owner write
+            # fails itself; this covers the unit's own refusal (a busy pool)
+            # or a failed commit. In org mode nothing records these folders
+            # later, so they keep no index row and their owner stays unknown.
             logger.error(
-                "could not record the artifacts a channel turn created",
+                "Could not record the artifacts a channel turn created",
                 exc_info=True,
                 extra=log_context(
-                    project_id=artifacts.project_id,
                     conversation_id=conv_id,
+                    project_id=artifacts.project_id,
                     artifact_slugs=changes.created,
                 ),
             )

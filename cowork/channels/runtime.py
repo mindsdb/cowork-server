@@ -30,7 +30,7 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.db.units import conversation_writes, run_db, run_efs
-from cowork.handlers.responses import ResponsesHandler
+from cowork.handlers.responses import stage_remote_workspace
 from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
@@ -530,10 +530,7 @@ class AntonChannelRuntime:
                 conversation=conversation, input=blocks, channel_context=channel_context,
                 trace_metadata=build_trace_metadata(),
             )
-        await run_db(
-            partial(ResponsesHandler._stage_remote_workspace_files, conv_id=conversation.id),
-            scope=scope,
-        )
+        await stage_remote_workspace(conv_id=conversation.id, scope=scope)
         # Known gap: channel_context (group/DM framing, per-channel instructions) has no
         # remote job field yet, so it's dropped here — unused on this path in org mode.
         return remote_turn_events(

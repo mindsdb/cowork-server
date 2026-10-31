@@ -326,7 +326,6 @@ async def test_a_turn_hands_its_stops_back_unless_it_finishes(monkeypatch, sessi
     monkeypatch.setattr(harness, "release_stop_notices", release)
     monkeypatch.setattr(harness, "read_earlier_answers", no_earlier_answers)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
     monkeypatch.setattr(autopublish, "autopublish_project_artifacts", no_autopublish)
     monkeypatch.setattr(harness.AntonHarness, "_build_chat_session", build)
