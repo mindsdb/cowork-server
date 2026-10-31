@@ -603,9 +603,9 @@
       "body": {
         "skills": [
           {
-            "id": "pdf",
-            "label": "pdf",
-            "name": "pdf",
+            "id": "documents",
+            "label": "documents",
+            "name": "documents",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -642,9 +642,9 @@
             }
           },
           {
-            "id": "skill-creator",
-            "label": "skill-creator",
-            "name": "skill-creator",
+            "id": "docx",
+            "label": "docx",
+            "name": "docx",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -681,9 +681,9 @@
             }
           },
           {
-            "id": "presentations",
-            "label": "presentations",
-            "name": "presentations",
+            "id": "gmail",
+            "label": "gmail",
+            "name": "gmail",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -798,9 +798,9 @@
             }
           },
           {
-            "id": "documents",
-            "label": "documents",
-            "name": "documents",
+            "id": "pdf",
+            "label": "pdf",
+            "name": "pdf",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -837,9 +837,9 @@
             }
           },
           {
-            "id": "docx",
-            "label": "docx",
-            "name": "docx",
+            "id": "presentations",
+            "label": "presentations",
+            "name": "presentations",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -876,9 +876,9 @@
             }
           },
           {
-            "id": "gmail",
-            "label": "gmail",
-            "name": "gmail",
+            "id": "skill-creator",
+            "label": "skill-creator",
+            "name": "skill-creator",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -1397,9 +1397,9 @@
       "body": {
         "skills": [
           {
-            "id": "pdf",
-            "label": "pdf",
-            "name": "pdf",
+            "id": "documents",
+            "label": "documents",
+            "name": "documents",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -1436,9 +1436,9 @@
             }
           },
           {
-            "id": "skill-creator",
-            "label": "skill-creator",
-            "name": "skill-creator",
+            "id": "docx",
+            "label": "docx",
+            "name": "docx",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -1475,9 +1475,9 @@
             }
           },
           {
-            "id": "presentations",
-            "label": "presentations",
-            "name": "presentations",
+            "id": "gmail",
+            "label": "gmail",
+            "name": "gmail",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -1592,9 +1592,9 @@
             }
           },
           {
-            "id": "documents",
-            "label": "documents",
-            "name": "documents",
+            "id": "pdf",
+            "label": "pdf",
+            "name": "pdf",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -1631,9 +1631,9 @@
             }
           },
           {
-            "id": "docx",
-            "label": "docx",
-            "name": "docx",
+            "id": "presentations",
+            "label": "presentations",
+            "name": "presentations",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,
@@ -1670,9 +1670,9 @@
             }
           },
           {
-            "id": "gmail",
-            "label": "gmail",
-            "name": "gmail",
+            "id": "skill-creator",
+            "label": "skill-creator",
+            "name": "skill-creator",
             "description": "<built-in text>",
             "declarative": "<built-in text>",
             "createdAt": null,

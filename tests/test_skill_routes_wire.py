@@ -49,11 +49,15 @@ def _normalized(value):
 
 
 def _listing(body: dict) -> dict:
-    """The list with each packaged built-in's text as "<built-in text>"."""
+    """The list with each packaged built-in's text as "<built-in text>", and
+    the built-ins in id order. Built-ins have no creation time, so the list
+    keeps them in the order the filesystem lists their folders, which differs
+    between machines; every other skill keeps the place the route gives it."""
+    builtins = iter(sorted((skill for skill in body["skills"] if skill.get("isBuiltin")), key=lambda skill: skill["id"]))
     skills = []
     for skill in body["skills"]:
         if skill.get("isBuiltin"):
-            skill = {key: ("<built-in text>" if key in _BUILTIN_TEXT else item) for key, item in skill.items()}
+            skill = {key: ("<built-in text>" if key in _BUILTIN_TEXT else item) for key, item in next(builtins).items()}
         skills.append(skill)
     return {**body, "skills": skills}
 
