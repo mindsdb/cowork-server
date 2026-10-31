@@ -34,6 +34,7 @@ from anton.core.artifacts.models import (
     extend_legacy_id,
     resolve_artifact_id,
 )
+from cowork.code_sandbox import anchored_below_a_trusted_root
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -78,10 +79,12 @@ def opened_artifact_root(source: "ProjectArtifacts") -> Iterator[PinnedDir]:
     """Pin an authorized artifacts root without following writable links.
 
     Resolvers created by :mod:`artifact_roots` carry a server-owned project
-    directory plus the relative storage components.  Opening those components
+    directory plus the relative storage components.  Opening the project
+    directory from the server's trusted root, and those components below it,
     one by one with ``O_NOFOLLOW`` closes both the ordinary symlink escape and
-    the check/swap/use race.  Explicit legacy/local sources have no anchor and
-    pin their base itself with ``O_NOFOLLOW`` instead.
+    the check/swap/use race (``_opened_from_trusted_root``).  Explicit
+    legacy/local sources have no anchor and pin their base itself with
+    ``O_NOFOLLOW`` instead.
     """
     base = Path(source.base)
     anchor_value = getattr(source, "trusted_anchor", None)
@@ -100,17 +103,40 @@ def opened_artifact_root(source: "ProjectArtifacts") -> Iterator[PinnedDir]:
     if not parts or normalized_base_parts != (*normalized_anchor_parts, *parts):
         raise ValueError("Artifact root does not match its trusted anchor")
 
-    # The project directory itself is writable storage and can be replaced by a
-    # symlink too. Pin its trusted parent, then open the basename and every root
-    # component relative to descriptors with O_NOFOLLOW. At no point is the
-    # already-authorized path re-walked as one joined string.
-    anchor_name = _component(anchor.name)
-    with pinned_dir(anchor.parent, nofollow_base=True) as parent:
-        with ExitStack() as opened:
-            root = opened.enter_context(_opened_child_directory(parent, anchor_name))
-            for part in parts:
-                root = opened.enter_context(_opened_child_directory(root, part))
-            yield root
+    # At no point is the already-authorized path re-walked as one joined string.
+    with _opened_from_trusted_root(anchor, *parts) as root:
+        yield root
+
+
+@contextmanager
+def _opened_from_trusted_root(anchor: Path, *names: str) -> Iterator[PinnedDir]:
+    """Pin ``anchor/<names...>``, opening every folder below the server's
+    trusted root that holds ``anchor`` relative to descriptors with
+    O_NOFOLLOW.
+
+    Every folder between that root and ``anchor`` is storage agent code could
+    write before the code sandbox: a person's partition folder in the shared
+    root, its ``projects`` store, the project folder. Any of them may be a
+    link, and a partition folder linked to another person's would hand over
+    that person's projects. The trusted root itself
+    (code_sandbox.anchored_below_a_trusted_root) is opened as configured, a
+    link included. An anchor outside every trusted root, such as an adopted
+    folder, trusts its parent instead.
+    """
+    lexical = Path(os.path.abspath(anchor))
+    anchored = anchored_below_a_trusted_root(lexical)
+    if anchored is None:
+        start, below = lexical.parent, (lexical.name,)
+    else:
+        # The root as ``anchor`` spells it, so every path opened below keeps
+        # the form the caller passed in.
+        start = Path(*lexical.parts[: len(lexical.parts) - len(anchored.names)])
+        below = anchored.names
+    with pinned_dir(start, nofollow_base=anchored is None) as top, ExitStack() as opened:
+        folder = top
+        for name in (*below, *names):
+            folder = opened.enter_context(_opened_child_directory(folder, name))
+        yield folder
 
 
 @contextmanager

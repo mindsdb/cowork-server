@@ -341,6 +341,33 @@ def test_a_link_at_one_of_cowork_homes_own_entries_is_refused(stack, tmp_path, n
     assert list(where_it_leads.iterdir()) == []
 
 
+@pytest.mark.parametrize("store", [None, "projects", "memory", "data-vault"], ids=["partition", "projects", "memory", "data-vault"])
+def test_a_link_at_a_persons_partition_or_store_is_refused(stack, tmp_path, store):
+    """Agent code before the sandbox could swap B's partition folder, or one
+    of its stores, for a link to A's, and the server would read and write A's
+    projects, memory and connections as B's."""
+    home = tmp_path / "home"
+    if store is None:
+        alices, bobs = _project(home, PARTITION_A), home / PARTITION_B
+    else:
+        alices, bobs = _project(home, PARTITION_A, store), _project(home, PARTITION_B) / store
+    _plant_link(bobs, alices)
+    message = _refusal()
+    assert message.startswith(f"COWORK_CODE_SANDBOX=landlock: {bobs} is a link")
+    assert "remove the link and put the real folder back" in message
+    assert list(alices.iterdir()) == []
+
+
+def test_real_partitions_and_stores_start(stack, tmp_path):
+    home = tmp_path / "home"
+    for partition in (PARTITION_A, PARTITION_B):
+        for store in ("projects", "memory", "data-vault"):
+            _project(home, partition, store)
+    # A link that names no partition is left to the other checks.
+    _plant_link(home / "not-a-partition", _project(tmp_path, "elsewhere"))
+    cowork_server.create_app()
+
+
 def test_cowork_homes_own_entries_start_as_real_files_and_folders(stack, tmp_path):
     home = tmp_path / "home"
     for name in ("streams", "tmp", "shared"):

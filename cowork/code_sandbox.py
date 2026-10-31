@@ -64,6 +64,7 @@ import os
 import stat
 from collections.abc import Iterable
 from contextlib import ExitStack
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urlsplit
@@ -80,7 +81,7 @@ from cowork.common.paths import (
     pinned_dir,
 )
 from cowork.common.settings.app_settings import AppSettings, get_app_settings
-from cowork.db.personal_resources import PersonalResource
+from cowork.db.personal_resources import STORE_RESOURCE, PersonalResource
 from cowork.db.scoped import TenantScope, scoped_storage_root
 
 if TYPE_CHECKING:
@@ -213,8 +214,9 @@ def _trusted_roots() -> list[Path]:
 class _TrustedRoots:
     """Configured roots resolved for one policy build, never descendant grants."""
 
-    def __init__(self) -> None:
-        self.resolved = {root: _real(root) for root in dict.fromkeys(_trusted_roots())}
+    def __init__(self, roots: Iterable[Path] | None = None) -> None:
+        configured = _trusted_roots() if roots is None else roots
+        self.resolved = {root: _real(root) for root in dict.fromkeys(configured)}
         self.forms = tuple(
             (Path(os.path.normcase(form)).parts, real)
             for root, real in self.resolved.items()
@@ -245,6 +247,21 @@ def _anchored(path: Path, *, roots: _TrustedRoots | None = None) -> _Anchored | 
         if best is None or len(names) > len(best.names):
             best = _Anchored(real, names)
     return best
+
+
+@lru_cache(maxsize=8)
+def _resolved_once(roots: tuple[Path, ...]) -> _TrustedRoots:
+    return _TrustedRoots(roots)
+
+
+def anchored_below_a_trusted_root(path: Path) -> _Anchored | None:
+    """``_anchored`` for the server's own opens of a person's storage on a
+    request, such as an artifacts folder (artifact_identity). Those run many
+    times a request, so the configured roots are resolved once per
+    configuration rather than once a call, where each would cost a stat per
+    folder in each root's path. Only the match uses the resolved roots: a
+    caller opens the root as ``path`` spells it."""
+    return _anchored(path, roots=_resolved_once(tuple(_trusted_roots())))
 
 
 def _granted_dir(
@@ -768,6 +785,26 @@ def _refuse_linked_cowork_home_entries() -> None:
             )
 
 
+def _refuse_linked_partitions(settings: AppSettings) -> None:
+    """Raise RuntimeError when a person's partition folder in the shared
+    root, or one of its stores (STORE_RESOURCE), is a link. The server isn't
+    locked, so it would read and write that person's projects, files, memory
+    and connections wherever the link leads, such as another person's
+    partition."""
+    shared_root = _real(Path(settings.storage.shared_root))
+    for partition in _partition_roots(shared_root):
+        folder = shared_root / partition.name
+        for entry in (folder, *(folder / store for store in STORE_RESOURCE)):
+            if entry.is_symlink():
+                raise RuntimeError(
+                    f"COWORK_CODE_SANDBOX=landlock: {entry} is a link, and the server reads "
+                    "and writes a person's space there outside the sandbox, so it would "
+                    "follow it wherever it leads, maybe into another person's space. Agent "
+                    "code that ran before the sandbox may have left it there: remove the "
+                    "link and put the real folder back, then start again."
+                )
+
+
 def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
     """Refuse to start where the agent's code would run unlocked, and say
     what a shared project leaves shared.
@@ -777,8 +814,10 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
     its launcher (_check_live_apps_startup); and with ``landlock``, org tenancy, remote
     turns, private connections with shared projects, an anton without the launcher or whose policy model refuses this
     server's policy, a kernel below the Landlock floor, a link at one of
-    cowork-home's own entries (_COWORK_HOME_ENTRIES), or a self-test that
-    can't confirm a denied path is denied. Then creates the shared folder.
+    cowork-home's own entries (_COWORK_HOME_ENTRIES), a link at a person's
+    partition folder or one of its stores (_refuse_linked_partitions), or a
+    self-test that can't confirm a denied path is denied. Then creates the
+    shared folder.
     """
     if settings.trust_identity_headers and settings.code_sandbox == "off":
         raise RuntimeError(
@@ -834,6 +873,7 @@ def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:
             "under Docker Engine 20.10.18 or later."
         )
     _refuse_linked_cowork_home_entries()
+    _refuse_linked_partitions(settings)
     try:
         _run_self_test()
     except Exception as error:

@@ -400,7 +400,9 @@ def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people):
 
 def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monkeypatch):
     """B's agent can replace B's whole `projects` root with a link to A's. The
-    path routes still reach none of A's artifacts through it."""
+    path routes still reach none of A's artifacts through it. The server starts
+    before the link appears, since it refuses to start with one
+    (test_code_sandbox.py)."""
     import shutil
 
     dash, notes = two_people
@@ -408,12 +410,12 @@ def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monke
         "cowork.services.publish.desktop_publish_credential",
         lambda: ("publish-key", "https://publish.example"),
     )
+    client = _client()
     bob_projects = _general(BOB).parent
     alice_projects = _general(ALICE).parent
     shutil.rmtree(bob_projects)
     bob_projects.symlink_to(alice_projects, target_is_directory=True)
     primary = str(dash / "index.html")
-    client = _client()
 
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B).status_code == 404
@@ -422,21 +424,60 @@ def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monke
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
 
 
-def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people):
-    """B's agent can replace B's whole partition folder with a link to A's. The
-    path routes still reach none of A's artifacts through it."""
+def _files_below(folder: Path) -> dict[str, bytes]:
+    """Every regular file below ``folder``, by its path there. Links are not followed."""
+    found: dict[str, bytes] = {}
+    for parent, _dirs, names in os.walk(folder):
+        for name in names:
+            path = Path(parent) / name
+            if not path.is_symlink():
+                found[str(path.relative_to(folder))] = path.read_bytes()
+    return found
+
+
+def _link_bobs_partition_to_alices() -> Path:
+    """Replace B's partition folder with a link to A's, as agent code that ran
+    before the sandbox could. Returns A's partition folder."""
     import shutil
 
-    dash, _notes = two_people
     bob_partition = _general(BOB).parent.parent
     alice_partition = _general(ALICE).parent.parent
     shutil.rmtree(bob_partition)
     bob_partition.symlink_to(alice_partition, target_is_directory=True)
-    primary = str(dash / "index.html")
-    client = _client()
+    return alice_partition
 
+
+@pytest.mark.parametrize("bobs_ref", ["own-project", "local"])
+def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people, bobs_ref):
+    """B's partition folder is a link to A's. No route reaches A's artifacts
+    through it: not by path, and not by id through B's own project or B's
+    `local` scan. B gets 404 or an empty list, and nothing changes in A's folder.
+    The server starts before the link appears, since it refuses to start with
+    one (test_code_sandbox.py)."""
+    dash, _notes = two_people
+    report = _report(_general(ALICE), "report", "# Quarterly forecast\n\nRevenue grew.\n")
+    ref = _general_id(BOB) if bobs_ref == "own-project" else "local"
+    client = _client()
+    alice_partition = _link_bobs_partition_to_alices()
+    artifact_id = _artifact_id(report)
+    workspace = f"/api/v1/artifacts/workspace/{ref}/{artifact_id}"
+    primary = str(dash / "index.html")
+    alices = client.get(f"/api/v1/artifacts/workspace/{_general_id(ALICE)}/{artifact_id}", headers=A)
+    assert alices.status_code == 200, alices.text
+    before = _files_below(alice_partition)
+
+    listed = client.get("/api/v1/artifacts/", headers=B)
+    assert listed.status_code == 200 and listed.json() == []
+    assert client.get(workspace, headers=B).status_code == 404
+    overwrite = {"content": "# Overwritten\n", "expectedRevisionId": alices.json()["revision"]["id"]}
+    assert client.put(workspace, json=overwrite, headers=B).status_code == 404
+    assert client.get(f"/api/v1/artifacts/drafts/{ref}/{artifact_id}/report.md", headers=B).status_code == 404
+    for export_format in ("docx", "html"):
+        assert client.post(f"{workspace}/export", json={"format": export_format}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B).status_code == 404
+
+    assert _files_below(alice_partition) == before
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
 
 
