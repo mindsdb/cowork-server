@@ -256,6 +256,11 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
                 config.cowork_root,
                 config.session_id,
             )),
+            # An optional server still starting when a turn begins is left out
+            # of that turn, and this one connects to each provider before it
+            # lists tools, so make Codex wait for it.
+            "mcp_servers.mindshub_code.required=true",
+            "mcp_servers.mindshub_code.startup_timeout_sec=30",
         ])
         # Codex starts MCP servers with a minimal environment, so without these
         # the server reads connections from the default home's vault, not this
