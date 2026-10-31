@@ -797,8 +797,9 @@ def _refuse_linked_cowork_home_entries() -> None:
     """Raise RuntimeError when one of _COWORK_HOME_ENTRIES is a link. The
     server isn't locked, so it would read and write wherever the link leads,
     such as every person's answer streams into the shared folder."""
+    home = cowork_home()
     _refuse_links(
-        (cowork_home() / name for name in _COWORK_HOME_ENTRIES),
+        (home / name for name in _COWORK_HOME_ENTRIES),
         what="it", leads="", real="file or folder",
     )
 
