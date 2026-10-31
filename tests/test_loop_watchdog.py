@@ -14,7 +14,7 @@ import time
 import anyio
 import httpx
 
-from cowork.common import loop_watchdog
+from cowork.common import loop_watchdog, request_logging
 from cowork.common.loop_watchdog import LoopWatchdog
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.db.units import loop_limiters
@@ -80,7 +80,12 @@ async def test_holding_the_default_thread_limiter_full_logs_one_saturation_namin
     watchdog = LoopWatchdog(loop_limiters())
     watchdog.start()
     try:
-        await asyncio.sleep(loop_watchdog.SATURATED_AFTER_S + 1)
+        # Held until the report, with room for a slow runner's thread starts
+        # and checks: the limiter is free once released, so a late report
+        # would never come.
+        deadline = time.monotonic() + loop_watchdog.SATURATED_AFTER_S + 3
+        while not _records(caplog, "limiter_saturated") and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
     finally:
         release.set()
         await asyncio.gather(*held)
@@ -89,3 +94,35 @@ async def test_holding_the_default_thread_limiter_full_logs_one_saturation_namin
     saturated = _records(caplog, "limiter_saturated")
     assert [record.limiter for record in saturated] == ["anyio_default"]
     assert saturated[0].duration_ms >= loop_watchdog.SATURATED_AFTER_S * 1000
+
+
+async def test_stopping_with_a_ping_waiting_logs_no_stall_and_does_not_hold_the_loop(caplog):
+    caplog.set_level(logging.WARNING, logger="cowork.common.loop_watchdog")
+    watchdog = LoopWatchdog({})
+    watchdog.start()
+    await asyncio.sleep(0.2)
+    # Busy for less than a stall, so the next ping is still waiting when the
+    # lifespan's shutdown stops the watchdog on the loop.
+    time.sleep(1.5)
+    stopping = time.monotonic()
+    watchdog.stop()
+    stop_took = time.monotonic() - stopping
+    await asyncio.to_thread(watchdog._thread.join, loop_watchdog.STALL_AFTER_S * 2)
+
+    assert _records(caplog, "event_loop_stalled") == []
+    assert stop_took < 0.5
+    assert not watchdog._thread.is_alive()
+
+
+def test_the_stall_line_names_the_newest_request_behind_long_streams(monkeypatch):
+    now = time.monotonic()
+    streams = {n: ("POST", "/api/v1/responses/", now - 120 + n) for n in range(25)}
+    newest = ("GET", "/api/v1/artifacts/workspace/p/a/review", now - 3)
+    monkeypatch.setattr(request_logging, "_in_flight", {**streams, 99: newest})
+
+    summary = request_logging.in_flight_summary().split("; ")
+
+    assert summary[-1].startswith("GET /api/v1/artifacts/workspace/p/a/review (3.")
+    assert summary[0].startswith("POST /api/v1/responses/ (120.")
+    assert summary[10] == "6 more"
+    assert len(summary) == 21

@@ -40,8 +40,8 @@ from draft_host_support import (
     events,
     fake_review,
     make_artifact,
+    reviewed_and_read,
 )
-from _async_stub import awaitable
 
 COWORK_HOST = "cowork.staging.mindshub.ai"
 # What a client sends to reach the API app through the draft Ingress.
@@ -132,7 +132,7 @@ async def test_the_draft_port_serves_the_draft_app_and_nothing_else(
     recorded: dict = {}
     source, folder, metadata = make_artifact(tmp_path)
     monkeypatch.setattr(
-        draft_app_module, "review_artifact_for_request", awaitable(fake_review(source, folder, metadata, recorded))
+        draft_app_module, "review_artifact_and_read", reviewed_and_read(fake_review(source, folder, metadata, recorded))
     )
     async with _client(listener.port) as client:
         served = await client.get(

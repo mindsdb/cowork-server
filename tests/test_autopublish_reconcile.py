@@ -699,3 +699,152 @@ async def test_reconciliation_reads_the_file_store_off_the_event_loop(
     assert out == {"rep"}
     assert steps == ["candidates", "plan"]
     assert ticks >= 40, f"the loop ticked {ticks} times across 1s of file store work"
+
+
+async def test_a_cancel_while_a_lock_release_waits_for_a_slot_still_frees_the_lock(
+    base, enabled, key, monkeypatch,
+):
+    """A Stop lands after a publish, while the release of its lock waits for
+    a file store slot during a stall of the mount. The cancel waits for the
+    release, so the lock is free once the slots are, and the next turn
+    publishes the slug rather than skip it as `lock_busy`."""
+    import asyncio
+    import threading
+
+    from cowork.db import units
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    publishing, finish = threading.Event(), threading.Event()
+
+    def blocked_publish(artifact, **kwargs):
+        publishing.set()
+        finish.wait(timeout=5)
+        return {"status": "ok", "url": "u"}
+
+    monkeypatch.setattr(ap, "publish_artifact", blocked_publish)
+    slots = units._efs_slots()
+    holders = [object() for _ in range(units.EFS_SLOTS)]
+    reconcile = asyncio.create_task(
+        ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    )
+    try:
+        assert await asyncio.to_thread(publishing.wait, 5)
+        for holder in holders:
+            await slots.acquire_on_behalf_of(holder)
+        finish.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while slots.statistics().tasks_waiting == 0:
+            assert loop.time() < deadline, "the lock release never waited for a slot"
+            await asyncio.sleep(0.01)
+        reconcile.cancel()
+        await asyncio.sleep(0.2)
+        assert not reconcile.done(), "the cancel did not wait for the lock release"
+    finally:
+        finish.set()
+        for holder in holders:
+            if holder in slots.statistics().borrowers:
+                slots.release_on_behalf_of(holder)
+    await asyncio.wait_for(asyncio.gather(reconcile, return_exceptions=True), timeout=5)
+
+    assert reconcile.cancelled()
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_cancel_while_the_lock_is_taken_frees_the_lock_it_took(
+    base, enabled, key, published, monkeypatch,
+):
+    """A Stop lands while the take of a slug's publish lock runs on a file
+    store thread. The cancel waits for the take, then frees the lock it took,
+    so the next turn publishes the slug rather than skip it as `lock_busy`
+    until its TTL."""
+    import asyncio
+    import threading
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    taken, may_return = threading.Event(), threading.Event()
+
+    def slow_acquire(artifacts_base, slug, *, ttl_s):
+        took = locks.acquire(artifacts_base, slug, ttl_s=ttl_s)
+        taken.set()
+        may_return.wait(timeout=5)
+        return took
+
+    monkeypatch.setattr(ap, "acquire", slow_acquire)
+    reconcile = asyncio.create_task(
+        ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    )
+    try:
+        assert await asyncio.to_thread(taken.wait, 5)
+        reconcile.cancel()
+        await asyncio.sleep(0.1)
+        assert not reconcile.done(), "the cancel did not wait for the lock take"
+    finally:
+        may_return.set()
+    await asyncio.wait_for(asyncio.gather(reconcile, return_exceptions=True), timeout=5)
+
+    assert reconcile.cancelled()
+    assert published == []
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_cancel_while_the_publish_key_is_minted_frees_the_lock(
+    base, enabled, published, monkeypatch,
+):
+    """A Stop lands after the slug's publish lock is taken, while the publish
+    key is minted. No publish has started, so the cancel frees the lock."""
+    import asyncio
+
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+    minting = asyncio.Event()
+
+    class SlowKey:
+        instance_id = "inst-1"
+
+        def __init__(self, *a, **kw):
+            pass
+
+        async def get(self):
+            minting.set()
+            await asyncio.Event().wait()
+
+        async def revoke(self):
+            pass
+
+    monkeypatch.setattr(ap, "PublishKey", SlowKey)
+    reconcile = asyncio.create_task(
+        ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+    )
+    await asyncio.wait_for(minting.wait(), timeout=5)
+    assert locks.acquire(base, "rep", ttl_s=600) is False, "the reconcile did not hold the lock"
+    reconcile.cancel()
+    await asyncio.wait_for(asyncio.gather(reconcile, return_exceptions=True), timeout=5)
+
+    assert reconcile.cancelled()
+    assert published == []
+    assert locks.acquire(base, "rep", ttl_s=600) is True
+
+
+async def test_a_publish_key_mint_that_raises_frees_the_lock(base, enabled, published, monkeypatch, caplog):
+    """The slug's publish lock is taken, then minting the publish key raises
+    something other than an authority failure: here the settings it reads
+    fail to load. No publish has started, so the lock is freed, and the
+    reconcile logs the failure rather than raise it."""
+    import logging
+
+    def settings_that_fail_to_load():
+        raise RuntimeError("settings failed to load")
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.TurnQueueSettings", settings_that_fail_to_load)
+    _make(base, "rep", files={"report.html": "<html></html>"}, meta={"slug": "rep", "type": "html-app"})
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == set()
+    assert published == []
+    assert locks.acquire(base, "rep", ttl_s=600) is True, "the failed mint left the lock held"
+    failures = [r for r in caplog.records if r.name == ap.logger.name and r.exc_info]
+    assert [(r.getMessage(), type(r.exc_info[1])) for r in failures] == [
+        ("artifact autopublish reconciliation failed", RuntimeError),
+    ]

@@ -382,7 +382,7 @@ async def test_generic_non_artifact_paths_keep_their_existing_resource_authority
 
     call = authority(monkeypatch, body={"allowed": False})
     await project_files._authorize_artifact_file_mutation(
-        project_files._validated_project_path(path), SimpleNamespace(scope=ORG)
+        project_files._validated_project_path(path), ORG
     )
     assert call == []
 
@@ -396,7 +396,7 @@ async def test_artifact_parent_paths_continue_after_a_current_grant(monkeypatch,
 
     calls = authority(monkeypatch, body={"allowed": True})
     await project_files._authorize_artifact_file_mutation(
-        project_files._validated_project_path(path), SimpleNamespace(scope=ORG)
+        project_files._validated_project_path(path), ORG
     )
     assert len(calls) == 1
 

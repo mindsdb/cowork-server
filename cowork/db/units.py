@@ -305,7 +305,8 @@ async def _drain(task: asyncio.Future[Any]) -> None:
 #: mount keeps its thread until the file server answers, so this is also the
 #: most threads a stalled mount can take.
 EFS_SLOTS = 16
-#: Slots one person may hold at once.
+#: Slots one person, or one organization's work with no person, may hold at
+#: once.
 EFS_SHARE = 4
 
 _EFS_SLOTS: RunVar[anyio.CapacityLimiter] = RunVar("cowork_efs_slots")
@@ -327,18 +328,25 @@ def _efs_slots() -> anyio.CapacityLimiter:
 def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
     """The caller's share of the EFS slots, or None where one person owns the
     deployment (the desktop, the operator view) and there is nobody to keep
-    apart. A share lives while someone waits for it or holds it."""
-    if not scope.partitioned or not scope.user_id:
+    apart. A share lives while someone waits for it or holds it.
+
+    Work in a partitioned scope with no person, such as a channel turn
+    (scope_for_org), shares as one person keyed ``org:<org_id>``, so one
+    organization's channel bookkeeping cannot take every slot. That key
+    never matches a person's, which is their identity provider's subject id.
+    """
+    if not scope.partitioned:
         return None
+    key = scope.user_id or f"org:{scope.org_id}"
     try:
         shares = _EFS_SHARES.get()
     except LookupError:
         shares = WeakValueDictionary()
         _EFS_SHARES.set(shares)
-    share = shares.get(scope.user_id)
+    share = shares.get(key)
     if share is None:
         share = anyio.CapacityLimiter(EFS_SHARE)
-        shares[scope.user_id] = share
+        shares[key] = share
     return share
 
 

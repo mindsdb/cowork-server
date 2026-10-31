@@ -24,11 +24,11 @@ from urllib.request import urlopen
 import pytest
 
 from _hosted_command import GRACEFUL_SHUTDOWN_FLAG, graceful_shutdown_seconds, hosted_command
+from cowork.handlers.turn_errors import TURN_LOST_CODE, TURN_LOST_MESSAGE
 
 
 REPO = Path(__file__).resolve().parents[1]
 PARTIAL = "persist this partial answer"
-INTERRUPTED = "The response was interrupted before it finished. Please try again."
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="requires SIGTERM and SIGKILL")
 
 
@@ -178,8 +178,8 @@ def _assert_interrupted(history):
     ]
     failures = [event for event in events if event.get("type") == "response.failed"]
     assert len(failures) == 1
-    assert failures[0]["code"] == "anton_error"
-    assert failures[0]["error"] == INTERRUPTED
+    assert failures[0]["code"] == TURN_LOST_CODE
+    assert failures[0]["error"] == TURN_LOST_MESSAGE
 
 
 @pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGKILL], ids=["sigterm", "sigkill"])
@@ -280,7 +280,7 @@ def test_sigterm_ends_an_open_remote_answer_on_its_stream_and_stops_its_controll
     assert events, f"nothing after the partial answer:\n{log.read_text()}"
     last_event, last_data = events[-1]
     assert last_event == "response.failed"
-    assert last_data["error"] == INTERRUPTED
+    assert last_data["error"] == TURN_LOST_MESSAGE
     # Well inside the request drain's bound: the pre-drain wrote it, not the
     # lifespan's shutdown, which runs only after the drain.
     assert ended_after < graceful_shutdown_seconds(hosted_command()), ended_after

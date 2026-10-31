@@ -1,7 +1,7 @@
 """Inline artifact cards — the guarantee that every artifact a turn produces
 gets an openable card that survives reload.
 
-Covers the shared end-of-turn path (services.task_objects.index_turn_artifacts
+Covers the shared end-of-turn path (services.task_objects.turn_artifact_changes
 + services.artifacts.card_for_folder), the serve URL a turn's card opens
 through, and the persistence fix that lets an artifact-only turn (no body
 text) keep its `response.artifact_created` event.

@@ -16,10 +16,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import log_context
 from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.units import FilesystemBusy
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
 logger = logging.getLogger(__name__)
@@ -122,6 +124,8 @@ async def upload_attachment(
             results.append(_to_attachment(saved))
         except MissingTenantScopeError:
             raise  # auth problem — the app-level handler answers 401
+        except (FilesystemBusy, PoolTimeoutError):
+            raise  # busy file store or database: the app-level handlers answer 503
         except Exception as exc:
             # Previously any failure here surfaced as an opaque 500 with no
             # server log (e.g. an over-long `purpose` failing model

@@ -118,6 +118,8 @@ _LIVE_APP_SLOTS_API = (
     "live_app_slot_addresses",
     "SlotStatus",
     "LiveAppLauncher",
+    "LiveAppHost",
+    "LiveAppLaunchError",
     "LAUNCH_FILES",
     "LAUNCH_DIRS",
     "MAX_LAUNCH_FILES",
@@ -663,6 +665,10 @@ def _live_apps_gap() -> str | None:
     missing = [name for name in _LIVE_APP_SLOTS_API if not hasattr(live_app_slots, name)]
     if missing:
         return f"has a live_app_slots without {', '.join(missing)}"
+    missing_hooks = [name for name in ("launch_lock", "slots_full", "slots_available")
+                     if not callable(getattr(live_app_slots.LiveAppHost, name, None))]
+    if missing_hooks:
+        return f"has a LiveAppHost without {', '.join(missing_hooks)}"
     from anton.core.session import ChatSessionConfig
 
     if "live_app_host" not in inspect.signature(ChatSessionConfig).parameters:
