@@ -321,7 +321,7 @@ class _Endpoint:
     def call(self):
         from cowork.api.v1.endpoints.settings import recommended_models
 
-        return asyncio.run(recommended_models(FakeRequest(), self.session, LOCAL_SCOPE))
+        return asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
 
     def stored(self, key):
         from cowork.services.settings import SettingService

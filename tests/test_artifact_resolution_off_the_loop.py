@@ -38,6 +38,7 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifact_workspace
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db import units
+from cowork.db.scoped import TenantScope
 from cowork.draft_host import app as draft_app
 from cowork.models.project import Project
 from cowork.server import create_app
@@ -629,11 +630,9 @@ async def owned(session, tmp_path, org_deployment, cleanup_tmp_projects, granted
     return str(row.id), card["id"]
 
 
-@contextlib.contextmanager
-def _caller(session, user_id: str = tenancy.USER_A):
-    """A request's session for ``user_id`` of ORG_A, on its own connection."""
-    with Session(session.get_bind()) as own:
-        yield tenancy._scoped(own, tenancy.ORG_A, user_id)
+def _caller(user_id: str = tenancy.USER_A) -> TenantScope:
+    """The tenant scope a request of ``user_id`` of ORG_A carries."""
+    return TenantScope(org_mode=True, org_id=tenancy.ORG_A, user_id=user_id)
 
 
 def _access_reads(monkeypatch) -> list[Path]:
@@ -667,14 +666,13 @@ def _on_efs_threads(monkeypatch, module, name: str) -> list[bool]:
 
 @pytest.mark.parametrize(("user_id", "role"), [(tenancy.USER_A, "owner"), (tenancy.USER_A2, "reviewer")])
 async def test_a_review_entry_reads_its_revision_in_the_lookups_file_store_call(
-    owned, session, monkeypatch, user_id, role,
+    owned, monkeypatch, user_id, role,
 ):
     project_id, artifact_id = owned
     reads = _on_efs_threads(monkeypatch, artifact_workspace, "current_source")
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with _caller(session, user_id) as caller:
-        entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, caller)
+    entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, _caller(user_id))
 
     assert entry["capabilities"]["role"] == role
     assert entry["currentRevision"]["artifactId"] == artifact_id
@@ -685,7 +683,7 @@ async def test_a_review_entry_reads_its_revision_in_the_lookups_file_store_call(
 
 @pytest.mark.parametrize("error", [FileNotFoundError, OSError, ValueError, TimeoutError])
 async def test_a_review_entry_with_no_readable_source_still_answers_without_a_revision(
-    owned, session, monkeypatch, error,
+    owned, monkeypatch, error,
 ):
     project_id, artifact_id = owned
 
@@ -695,8 +693,7 @@ async def test_a_review_entry_with_no_readable_source_still_answers_without_a_re
     monkeypatch.setattr(artifact_workspace, "current_source", unreadable)
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with _caller(session, tenancy.USER_A2) as reviewer:
-        entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, reviewer)
+    entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, _caller(tenancy.USER_A2))
 
     assert entry["currentRevision"] is None
     assert entry["capabilities"]["role"] == "reviewer"
@@ -715,8 +712,7 @@ async def test_a_draft_link_names_its_file_in_the_lookups_file_store_call(
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
     try:
-        with _caller(session) as caller:
-            response = await artifact_workspace.create_draft_link(str(row.id), artifact_id, caller)
+        response = await artifact_workspace.create_draft_link(str(row.id), artifact_id, _caller())
     finally:
         get_app_settings.cache_clear()
 
@@ -756,8 +752,8 @@ async def _preview(route: str, project_id: str, artifact_id: str, caller):
             project_id, artifact_id, "index.html", SimpleNamespace(query_params={}), caller
         )
     grant = draft_app._DraftGrant(
-        user_id=str(caller.scope.user_id),
-        org_id=str(caller.scope.org_id),
+        user_id=str(caller.user_id),
+        org_id=str(caller.org_id),
         project_ref=project_id,
         artifact_id=artifact_id,
     )
@@ -767,15 +763,14 @@ async def _preview(route: str, project_id: str, artifact_id: str, caller):
 
 @pytest.mark.parametrize("route", ["drafts", "draft_host"])
 @pytest.mark.parametrize("user_id", [tenancy.USER_A, tenancy.USER_A2], ids=["owner", "reviewer"])
-async def test_a_draft_file_is_opened_in_the_lookups_file_store_call(owned, session, monkeypatch, route, user_id):
+async def test_a_draft_file_is_opened_in_the_lookups_file_store_call(owned, monkeypatch, route, user_id):
     """Every asset of a preview is a request of its own, so the path checks
     and the open run in the lookup's file store call: one wait for a slot."""
     project_id, artifact_id = owned
     opens = _pinned_opens(monkeypatch)
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with _caller(session, user_id) as caller:
-        response = await _preview(route, project_id, artifact_id, caller)
+    response = await _preview(route, project_id, artifact_id, _caller(user_id))
 
     assert response.status_code == 200
     assert opens == [_PinnedOpen(("index.html",), True)]
@@ -794,8 +789,8 @@ async def test_a_draft_file_is_never_opened_for_a_caller_the_lookup_refuses(
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
     # A co-member, and the owner never opened the draft for review.
-    with pytest.raises(HTTPException) as refused, _caller(session, tenancy.USER_A2) as other:
-        await _preview(route, str(row.id), artifact_id, other)
+    with pytest.raises(HTTPException) as refused:
+        await _preview(route, str(row.id), artifact_id, _caller(tenancy.USER_A2))
 
     assert refused.value.status_code == 404
     assert opens == []
@@ -836,34 +831,34 @@ async def _restore_the_first_revision(project_id: str, artifact_id: str, caller)
 
 
 @pytest.mark.parametrize("route", ["workspace", "save", "access", "comments_access", "restore"])
-async def test_an_owner_route_reads_once_after_its_owner_check(owned, session, monkeypatch, route):
+async def test_an_owner_route_reads_once_after_its_owner_check(owned, monkeypatch, route):
     project_id, artifact_id = owned
     synced: list[Path] = []
 
-    async def sync_live_artifact(_session, folder, *, project_id=None):
+    async def sync_live_artifact(_scope, folder, *, project_id=None):
         synced.append(folder)
 
     # A save that changed the source republishes a live artifact afterwards:
     # its own operation, with the publish lock's waits, not the route's read.
     monkeypatch.setattr(artifact_workspace, "_sync_live_artifact", sync_live_artifact)
-    with _caller(session) as caller:
-        if route == "save":
-            call = await _edit(project_id, artifact_id, caller)
-        elif route == "restore":
-            call = await _restore_the_first_revision(project_id, artifact_id, caller)
-        else:
-            call = {
-                "workspace": partial(artifact_workspace.artifact_source, project_id, artifact_id, caller, path=None),
-                "access": partial(artifact_workspace.artifact_access, project_id, artifact_id, caller),
-                "comments_access": partial(
-                    artifact_workspace.enable_artifact_comments, project_id, artifact_id, caller
-                ),
-            }[route]
-        synced.clear()
-        access_reads = _access_reads(monkeypatch)
-        hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
+    caller = _caller()
+    if route == "save":
+        call = await _edit(project_id, artifact_id, caller)
+    elif route == "restore":
+        call = await _restore_the_first_revision(project_id, artifact_id, caller)
+    else:
+        call = {
+            "workspace": partial(artifact_workspace.artifact_source, project_id, artifact_id, caller, path=None),
+            "access": partial(artifact_workspace.artifact_access, project_id, artifact_id, caller),
+            "comments_access": partial(
+                artifact_workspace.enable_artifact_comments, project_id, artifact_id, caller
+            ),
+        }[route]
+    synced.clear()
+    access_reads = _access_reads(monkeypatch)
+    hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-        await call()
+    await call()
 
     assert hops == OWNER_READ
     assert len(synced) == (1 if route in ("save", "restore") else 0)
@@ -886,8 +881,8 @@ async def test_a_non_owner_is_refused_access_before_any_read(
     access_reads = _access_reads(monkeypatch)
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with pytest.raises(HTTPException) as refused, _caller(session, tenancy.USER_A2) as reviewer:
-        await artifact_workspace.artifact_access(str(row.id), artifact_id, reviewer)
+    with pytest.raises(HTTPException) as refused:
+        await artifact_workspace.artifact_access(str(row.id), artifact_id, _caller(tenancy.USER_A2))
 
     assert refused.value.status_code == status_code
     # A reviewer's lookup passes and the owner check refuses; no grant ends

@@ -193,7 +193,6 @@ async def test_put_settings_key_400s_on_an_unservable_model(monkeypatch):
             await upsert_setting(
                 "planning_model",
                 SettingUpsertRequest(value="deepseek-v4-flash"),
-                session,
                 LOCAL_SCOPE,
                 None,
             )
@@ -206,7 +205,6 @@ async def test_put_settings_key_400s_on_an_unservable_model(monkeypatch):
         await upsert_setting(
             "planning_model",
             SettingUpsertRequest(value="mindshub_air"),
-            session,
             LOCAL_SCOPE,
             None,
         )
@@ -241,7 +239,6 @@ async def test_an_unreachable_catalog_never_blocks_a_settings_save(monkeypatch):
         await upsert_setting(
             "planning_model",
             SettingUpsertRequest(value="some-model-we-cannot-verify"),
-            session,
             LOCAL_SCOPE,
             None,
         )
@@ -293,7 +290,7 @@ async def test_switching_minds_to_byok_in_one_put_is_not_blocked(monkeypatch):
                 "planning_provider": "anthropic",
                 "anthropic_api_key": "sk-ant-xyz",
                 "planning_model": "claude-sonnet-4-6",
-            }), session, LOCAL_SCOPE, None,
+            }), LOCAL_SCOPE, None,
         )
         s = svc.load()
         assert s.planning_model == "claude-sonnet-4-6"
@@ -341,7 +338,7 @@ async def test_switching_byok_to_minds_in_one_put_is_gated(monkeypatch):
                 SettingsBulkUpsertRequest(values={
                     "planning_provider": "minds_cloud",
                     "planning_model": "deepseek-v4-flash",
-                }), session, LOCAL_SCOPE, None,
+                }), LOCAL_SCOPE, None,
             )
         assert exc.value.status_code == 400
         assert fetched, "the gate must consult the catalog for the PENDING provider"

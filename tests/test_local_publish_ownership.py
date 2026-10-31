@@ -490,7 +490,7 @@ def test_every_publish_path_refuses_another_testers_page(publisher, monkeypatch,
         with pytest.raises(publish.PublishOwnedByOtherUser):
             publish.update_artifact(str(page), scope=BOB)
     else:
-        assert asyncio.run(_sync_live_artifact(SimpleNamespace(scope=BOB), page.parent)) is False
+        assert asyncio.run(_sync_live_artifact(BOB, page.parent)) is False
     assert publisher.pages == before
     assert len(publisher.uploads) == before_uploads
 
@@ -594,13 +594,13 @@ def test_the_slug_delete_route_checks_the_requesting_tester(publisher, monkeypat
     before = copy.deepcopy(publisher.pages)
 
     with Session(engine) as raw, pytest.raises(HTTPException) as caught:
-        asyncio.run(delete_artifact_for_request(ScopedSession(raw, BOB), artifact_id, project_id=project_id))
+        asyncio.run(delete_artifact_for_request(BOB, artifact_id, project_id=project_id))
     assert caught.value.status_code == 409
     assert caught.value.detail["code"] == publish.OWNED_BY_OTHER_USER_CODE
     assert folder.is_dir() and publisher.pages == before and publisher.deletes == []
 
     with Session(engine) as raw:
-        asyncio.run(delete_artifact_for_request(ScopedSession(raw, ALICE), artifact_id, project_id=project_id))
+        asyncio.run(delete_artifact_for_request(ALICE, artifact_id, project_id=project_id))
     assert publisher.deletes == [published["result"]["report_id"]]
     assert not folder.exists()
 

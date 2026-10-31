@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, require
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.db.session import get_session
+from cowork.db.units import run_db
 from cowork.schemas.channels import (
     ChannelAgentResponse,
     ChannelAgentUpdateRequest,
@@ -35,10 +36,10 @@ from cowork.services.channel_lifecycle import (
     ChannelLifecycleService,
     LifecycleNotImplementedError,
 )
-from cowork.services.channels import ChannelConfigService, UnknownChannelError
+from cowork.services.channels import ChannelConfigService, UnknownChannelError, check_channel_connection
 from cowork.harnesses.base import available_harness_ids
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# AuthenticatedInOrgMode, declared explicitly: a ScopedSession already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
 # whenever org mode has no org in scope. Declaring it too makes the
 # requirement visible to a route walker instead of something only
@@ -48,6 +49,7 @@ from cowork.harnesses.base import available_harness_ids
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 SessionDep = Annotated[Session, Depends(get_session)]
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 def _live_adapters(request: Request):
@@ -149,11 +151,14 @@ async def set_config(
     channel_type: str,
     body: ChannelConfigUpdateRequest,
     request: Request,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
 ) -> ChannelConfigResponse:
     _require_org_ready(channel_type)
     try:
-        result = ChannelConfigService(scoped).set_config(channel_type, body.values)
+        result = await run_db(
+            lambda session: ChannelConfigService(session).set_config(channel_type, body.values),
+            scope=scope,
+        )
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
     except ValueError as e:
@@ -161,8 +166,8 @@ async def set_config(
 
     adapters = _live_adapters(request)
     if adapters is not None:
-        await adapters.refresh(channel_type, scoped.scope.org_id, session=scoped)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+        await adapters.refresh(channel_type, scope.org_id)
+    await _reconcile_ingress(request, channel_type, scope.org_id)
     return result
 
 
@@ -172,11 +177,13 @@ async def set_config(
     dependencies=[Depends(require(AuthenticatedOrgAdmin))],
 )
 async def delete_config(
-    channel_type: str, request: Request, scoped: ScopedSessionDep
+    channel_type: str, request: Request, scope: ScopeDep
 ) -> None:
     _require_org_ready(channel_type)
     try:
-        deleted = ChannelConfigService(scoped).delete_config(channel_type)
+        deleted = await run_db(
+            lambda session: ChannelConfigService(session).delete_config(channel_type), scope=scope
+        )
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
     if not deleted:
@@ -187,8 +194,8 @@ async def delete_config(
     # Tear the live adapter down — its credentials are gone.
     adapters = _live_adapters(request)
     if adapters is not None:
-        await adapters.remove(channel_type, scoped.scope.org_id)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+        await adapters.remove(channel_type, scope.org_id)
+    await _reconcile_ingress(request, channel_type, scope.org_id)
 
 
 @router.post(
@@ -197,24 +204,24 @@ async def delete_config(
     dependencies=[Depends(require(AuthenticatedOrgAdmin))],
 )
 async def reload_channel(
-    channel_type: str, request: Request, scoped: ScopedSessionDep
+    channel_type: str, request: Request, scope: ScopeDep
 ) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
     _require_org_ready(channel_type)
     try:
-        ChannelConfigService(scoped).get_config(channel_type)
+        await run_db(lambda session: ChannelConfigService(session).get_config(channel_type), scope=scope)
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
     adapters = _live_adapters(request)
     active = False
     if adapters is not None:
-        active = await adapters.refresh(channel_type, scoped.scope.org_id, session=scoped)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+        active = await adapters.refresh(channel_type, scope.org_id)
+    await _reconcile_ingress(request, channel_type, scope.org_id)
     return ChannelReloadResponse(channel_type=channel_type, active=active)
 
 
 @router.post("/{channel_type}/test-connection", response_model=ChannelTestConnectionResponse)
-async def test_connection(channel_type: str, scoped: ScopedSessionDep) -> ChannelTestConnectionResponse:
+async def test_connection(channel_type: str, scope: ScopeDep) -> ChannelTestConnectionResponse:
     """Calls the platform to check the STORED credentials actually
     authenticate.
 
@@ -226,7 +233,7 @@ async def test_connection(channel_type: str, scoped: ScopedSessionDep) -> Channe
     credentials resolve to at the platform, so a member can confirm the
     connection without being able to change what it points at."""
     try:
-        result = await ChannelConfigService(scoped).test_connection(channel_type)
+        result = await check_channel_connection(channel_type, scope=scope)
     except UnknownChannelError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
     return ChannelTestConnectionResponse(channel_type=channel_type, ok=result.ok, detail=result.detail)
@@ -263,14 +270,14 @@ def delete_binding(binding_id: UUID, scoped: ScopedSessionDep) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")
 
 
-def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecycleService:
+def _lifecycle_service(request: Request, scope: TenantScope) -> ChannelLifecycleService:
     adapters = _live_adapters(request)
     if adapters is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="channels runtime not initialized",
         )
-    return ChannelLifecycleService(scoped, adapters)
+    return ChannelLifecycleService(scope, adapters)
 
 
 @router.post(
@@ -279,10 +286,10 @@ def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecy
     dependencies=[Depends(require(AuthenticatedOrgAdmin))],
 )
 async def setup_channel(
-    channel_type: str, request: Request, scoped: ScopedSessionDep
+    channel_type: str, request: Request, scope: ScopeDep
 ) -> ChannelLifecycleResponse:
     _require_org_ready(channel_type)
-    svc = _lifecycle_service(request, scoped)
+    svc = _lifecycle_service(request, scope)
     try:
         result = await svc.setup(channel_type)
     except UnknownChannelError:
@@ -294,7 +301,7 @@ async def setup_channel(
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+    await _reconcile_ingress(request, channel_type, scope.org_id)
     return ChannelLifecycleResponse(channel_type=channel_type, action="setup", active=result.active, detail=result.detail)
 
 
@@ -304,10 +311,10 @@ async def setup_channel(
     dependencies=[Depends(require(AuthenticatedOrgAdmin))],
 )
 async def teardown_channel(
-    channel_type: str, request: Request, scoped: ScopedSessionDep
+    channel_type: str, request: Request, scope: ScopeDep
 ) -> ChannelLifecycleResponse:
     _require_org_ready(channel_type)
-    svc = _lifecycle_service(request, scoped)
+    svc = _lifecycle_service(request, scope)
     try:
         result = await svc.teardown(channel_type)
     except UnknownChannelError:
@@ -319,5 +326,5 @@ async def teardown_channel(
         )
     except LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-    await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
+    await _reconcile_ingress(request, channel_type, scope.org_id)
     return ChannelLifecycleResponse(channel_type=channel_type, action="teardown", active=result.active, detail=result.detail)

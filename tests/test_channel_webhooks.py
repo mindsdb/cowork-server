@@ -156,7 +156,7 @@ def _delete_channel_events(*dedupe_keys: str) -> None:
 async def test_intake_events_stamps_the_resolved_org(monkeypatch, org_deployment):
     captured = []
     try:
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-a"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured), org_id=ORG_A,
         )
@@ -181,14 +181,14 @@ async def test_intake_events_isolates_dedupe_across_orgs(org_deployment):
     captured_a: list = []
     captured_b: list = []
     try:
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_a), org_id=ORG_A,
         )
         for coro in captured_a:
             await coro
 
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_b), org_id=ORG_B,
         )
@@ -199,6 +199,53 @@ async def test_intake_events_isolates_dedupe_across_orgs(org_deployment):
             await coro
     finally:
         _delete_channel_events("evt-shared")
+
+
+async def test_a_cancel_while_an_event_is_recorded_still_schedules_it(monkeypatch, org_deployment):
+    """A cancel of the intake (a credentials change, a lost lease, shutdown)
+    lands while an event's record unit runs. The unit commits the row, and
+    the cancel waits for the event's schedule too: a recorded event left
+    unscheduled would have its redelivery dropped as a duplicate, and the
+    message would never get a reply."""
+    import threading
+
+    inside = threading.Event()
+    release = threading.Event()
+    real_record = webhooks._record_inbound
+
+    def slow_record(session, **kwargs):
+        inside.set()
+        release.wait(timeout=5)
+        return real_record(session, **kwargs)
+
+    monkeypatch.setattr(webhooks, "_record_inbound", slow_record)
+    captured: list = []
+    try:
+        intake = asyncio.create_task(intake_events(
+            "slack", _FakeBridge(), [{"key": "evt-cancelled"}],
+            sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured), org_id=ORG_A,
+        ))
+        deadline = time.monotonic() + 5
+        while not inside.is_set():
+            assert time.monotonic() < deadline, "the record unit never ran"
+            await asyncio.sleep(0.01)
+        intake.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await intake
+
+        session = get_open_session()
+        try:
+            svc = ChannelEventService(ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A)))
+            recorded = svc.is_duplicate_inbound("slack", "evt-cancelled")
+        finally:
+            session.close()
+        assert (recorded, len(captured)) == (True, 1)
+    finally:
+        release.set()
+        for coro in captured:
+            coro.close()
+        _delete_channel_events("evt-cancelled")
 
 
 # --- Real plugins' extractors: pulled unverified, used only as a lookup key ---

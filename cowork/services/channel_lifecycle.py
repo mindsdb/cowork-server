@@ -6,7 +6,8 @@ from cowork.channels.lifecycle import LifecycleContext, LifecycleError, Lifecycl
 from cowork.channels.plugin import ChannelPlugin
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import TenantScope
+from cowork.db.units import run_db
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
 
 _LOCAL_ENVS = {"local", "dev", "development", "test"}
@@ -40,20 +41,22 @@ class LifecycleNotImplementedError(Exception):
 
 
 class ChannelLifecycleService:
-    def __init__(self, session: ScopedSession, adapters, registry: PluginRegistry | None = None) -> None:
-        self.session = session
+    """A channel's setup and teardown. Each credential read and write is a
+    unit of its own, so no pooled connection waits on the platform."""
+
+    def __init__(self, scope: TenantScope, adapters, registry: PluginRegistry | None = None) -> None:
+        self.scope = scope
         self.adapters = adapters
         self.registry = registry if registry is not None else get_registry()
-        self.config = ChannelConfigService(session, registry=self.registry)
 
     async def setup(self, channel_type: str) -> LifecycleResult:
         plugin = self._require_lifecycle(channel_type)
         webhook_url = self._resolve_webhook_url(plugin)
-        return await plugin.lifecycle.setup(self._context(plugin, webhook_url))
+        return await plugin.lifecycle.setup(await self._context(plugin, webhook_url))
 
     async def teardown(self, channel_type: str) -> LifecycleResult:
         plugin = self._require_lifecycle(channel_type)
-        return await plugin.lifecycle.teardown(self._context(plugin, None))
+        return await plugin.lifecycle.teardown(await self._context(plugin, None))
 
     def _require_lifecycle(self, channel_type: str) -> ChannelPlugin:
         plugin = self.registry.get(channel_type)
@@ -63,16 +66,19 @@ class ChannelLifecycleService:
             raise LifecycleNotImplementedError(channel_type)
         return plugin
 
-    def _context(self, plugin: ChannelPlugin, webhook_url: str | None) -> LifecycleContext:
+    async def _context(self, plugin: ChannelPlugin, webhook_url: str | None) -> LifecycleContext:
         channel_type = plugin.channel_type
 
-        def persist(values: dict[str, str]) -> None:
-            self.config.set_config(channel_type, values)
+        def config(session) -> ChannelConfigService:
+            return ChannelConfigService(session, registry=self.registry)
 
-        org_id = self.session.scope.org_id
+        async def persist(values: dict[str, str]) -> None:
+            await run_db(lambda session: config(session).set_config(channel_type, values), scope=self.scope)
+
+        org_id = self.scope.org_id
 
         async def refresh() -> bool:
-            return await self.adapters.refresh(channel_type, org_id, session=self.session)
+            return await self.adapters.refresh(channel_type, org_id)
 
         async def remove() -> None:
             await self.adapters.remove(channel_type, org_id)
@@ -80,7 +86,9 @@ class ChannelLifecycleService:
         return LifecycleContext(
             channel_type=channel_type,
             webhook_url=webhook_url,
-            credentials=self.config.load_credentials(channel_type),
+            credentials=await run_db(
+                lambda session: config(session).load_credentials(channel_type), scope=self.scope
+            ),
             persist_credentials=persist,
             refresh_adapter=refresh,
             remove_adapter=remove,

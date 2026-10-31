@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 from collections.abc import Callable
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi import UploadFile
@@ -23,7 +23,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.file import File
 from cowork.models.project import Project
 from cowork.principal import Principal
-from cowork.services.files import FileService, attachment_purpose
+from cowork.services.files import FileService, attachment_purpose, save_upload
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -328,10 +328,9 @@ async def test_compat_upload_leaves_a_busy_store_to_the_503_handlers(units_read_
     from test_run_efs import holding
 
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
-    scoped = ScopedSession(Session(units_read_engine), _scope(ORG_A))
 
     def upload():
-        return stubs.upload_attachment("general", str(uuid4()), scoped=scoped, files=[_upload("notes.txt")])
+        return stubs.upload_attachment("general", str(uuid4()), scope=_scope(ORG_A), files=[_upload("notes.txt")])
 
     if busy == "file_store":
         async with holding(units.EFS_SLOTS, LOCAL_SCOPE):
@@ -349,12 +348,47 @@ async def test_compat_upload_leaves_a_busy_store_to_the_503_handlers(units_read_
 async def test_upload_filename_cannot_escape_root(units_read_engine, tmp_path, name):
     # The upload's row is written in a database unit, on the app's engine.
     svc = _svc(units_read_engine, _scope(ORG_A))
-    res = await svc.create_file(_upload(name), purpose="assistants")
-    stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
+    res = await save_upload(_upload(name), purpose="assistants", scope=_scope(ORG_A))
+    stored = Path(svc._get_file_model(res.id).path).resolve()
     # org-first layout: bytes contained under <shared>/<org>/files
     assert (tmp_path / ORG_A / "files").resolve() in stored.parents
     assert stored.name in ("pwned", "upload")                # basename or fallback
     assert not (tmp_path / "etc").exists()
+
+
+async def test_a_cancel_while_the_uploads_row_commits_keeps_its_bytes(units_read_engine, monkeypatch):
+    """A cancel lands while the row's unit runs, as at process exit for a
+    channel turn's attachment. run_db lets the unit commit before the cancel
+    propagates, so the bytes the row names must stay on disk."""
+    import asyncio
+    import threading
+    import time
+
+    from cowork.services import files as files_mod
+
+    inside = threading.Event()
+    real_insert = files_mod._insert_file
+
+    def slow_insert(session, *, file):
+        inside.set()
+        time.sleep(0.3)
+        return real_insert(session, file=file)
+
+    monkeypatch.setattr(files_mod, "_insert_file", slow_insert)
+    upload = asyncio.ensure_future(files_mod.store_file(
+        scope=_scope(ORG_A), filename="a.txt", content_type="text/plain", data=b"hi", purpose="assistants",
+    ))
+    deadline = time.monotonic() + 5
+    while not inside.is_set():
+        assert time.monotonic() < deadline, "the row's unit never ran"
+        await asyncio.sleep(0.01)
+    upload.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    with Session(units_read_engine) as session:
+        (row,) = session.exec(select(File)).all()
+    assert Path(row.path).read_bytes() == b"hi"
 
 
 def test_delete_never_rmtrees_an_escaped_legacy_path(engine, tmp_path):

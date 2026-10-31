@@ -138,7 +138,7 @@ class IngressManager:
                 async for events in bridge.stream_events():
                     if events:
                         log.info("channel %s: stream delivered %d event(s)", channel_type, len(events))
-                        intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
+                        await intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -148,17 +148,24 @@ class IngressManager:
     async def _poll_loop(self, channel_type: str, org_id: str | None, bridge: Any) -> None:
         offset: int | None = None
         while True:
+            # The offset the next poll sends confirms every event before it
+            # to the platform, so it moves past a batch only once the batch's
+            # intake succeeded.
+            confirmed = offset
             try:
-                events, offset = await bridge.poll(offset=offset)
+                events, offset = await bridge.poll(offset=confirmed)
+                if events:
+                    log.info("channel %s: poll fetched %d event(s)", channel_type, len(events))
+                    await intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # A failed intake, such as a pool that freed no connection in
+                # time, polls the same batch again; dedupe drops the events
+                # it already recorded.
+                offset = confirmed
                 log.exception("channel %s: poll cycle failed; backing off", channel_type)
                 await asyncio.sleep(_ERROR_BACKOFF_S)
-                continue
-            if events:
-                log.info("channel %s: poll fetched %d event(s)", channel_type, len(events))
-                intake_events(channel_type, bridge, events, sink=self._sink, org_id=org_id)
 
 
 async def sync_channel_ingress(
@@ -193,6 +200,20 @@ async def sync_channel_ingress(
 _RECONCILE_INTERVAL_S = 30.0
 
 
+def _org_installations(session) -> set[tuple[str, str]]:
+    """(channel_type, org_id) of every org's installation, as a unit. It reads
+    across orgs, so it runs in SYSTEM_SCOPE on the raw session."""
+    from sqlmodel import select
+
+    from cowork.db.scoped import unsafe_unscoped_session
+    from cowork.models.channel import ChannelInstallation
+
+    rows = unsafe_unscoped_session(session).exec(
+        select(ChannelInstallation).where(ChannelInstallation.org_id.is_not(None))
+    ).all()
+    return {(r.channel_type, r.org_id) for r in rows}
+
+
 async def reconcile_once(manager: IngressManager, adapters: Any) -> None:
     """One reconciliation pass across every org-scoped channel installation.
 
@@ -202,19 +223,10 @@ async def reconcile_once(manager: IngressManager, adapters: Any) -> None:
     any locally running (channel_type, org_id) whose installation is gone —
     covering both "a new org just configured Discord" and "a config got
     deleted on a different replica than the one holding the connection"."""
-    from sqlmodel import select
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_db
 
-    from cowork.db.session import get_open_session
-    from cowork.models.channel import ChannelInstallation
-
-    session = get_open_session()
-    try:
-        rows = session.exec(
-            select(ChannelInstallation).where(ChannelInstallation.org_id.is_not(None))
-        ).all()
-        desired = {(r.channel_type, r.org_id) for r in rows}
-    finally:
-        session.close()
+    desired = await run_db(_org_installations, scope=SYSTEM_SCOPE)
 
     for channel_type, org_id in desired:
         await adapters.get_or_refresh(channel_type, org_id)

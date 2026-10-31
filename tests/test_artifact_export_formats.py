@@ -345,7 +345,7 @@ async def test_the_org_workspace_response_offers_formats_to_an_owner_who_may_man
     _role_permissions(monkeypatch, artifact_manage=True)
     with _scoped(org_world.org_id, org_world.creator) as session:
         result = await workspace_ep.artifact_source(
-            str(org_world.project.id), org_world.ids["mine"], session, path=None
+            str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
         )
 
     assert result["capabilities"]["exportFormats"] == offered
@@ -362,7 +362,7 @@ async def test_while_org_export_is_off_the_workspace_response_never_walks_the_fo
     _role_permissions(monkeypatch, artifact_manage=True)
     with _scoped(org_world.org_id, org_world.creator) as session:
         result = await workspace_ep.artifact_source(
-            str(org_world.project.id), org_world.ids["mine"], session, path=None
+            str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
         )
 
     assert result["capabilities"]["exportFormats"] == []
@@ -376,7 +376,7 @@ async def test_the_workspace_response_offers_nothing_once_artifact_manage_is_gon
     _role_permissions(monkeypatch, artifact_manage=False)
     with _scoped(org_world.org_id, org_world.creator) as session:
         result = await workspace_ep.artifact_source(
-            str(org_world.project.id), org_world.ids["mine"], session, path=None
+            str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
         )
 
     assert result["capabilities"]["canEdit"] is False
@@ -388,7 +388,7 @@ async def test_a_reviewer_never_reaches_the_workspace_response(org_world, monkey
     with _scoped(org_world.org_id, org_world.member) as session:
         with pytest.raises(HTTPException) as refused:
             await workspace_ep.artifact_source(
-                str(org_world.project.id), org_world.ids["mine"], session, path=None
+                str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
             )
 
     assert refused.value.status_code == 403
@@ -407,7 +407,7 @@ async def test_the_live_recheck_keeps_formats_only_with_artifact_manage(
     }
 
     current = await workspace_ep._current_capabilities(
-        SimpleNamespace(scope=TenantScope(org_mode=True, org_id="org", user_id="user")),
+        TenantScope(org_mode=True, org_id="org", user_id="user"),
         capabilities,
     )
 

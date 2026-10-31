@@ -25,7 +25,8 @@ from cowork.channels.plugin import (
 )
 from cowork.channels.registry import PluginRegistry
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
-from cowork.services.channels import ChannelConfigService, UnknownChannelError
+from cowork.services.channels import ChannelConfigService, UnknownChannelError, check_channel_connection
+from _fakes import units_on_engine
 
 
 def _run(coro):
@@ -189,9 +190,10 @@ def _plugin_without_verify() -> ChannelPlugin:
 
 
 @pytest.fixture()
-def engine():
+def engine(monkeypatch):
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)
+    units_on_engine(monkeypatch, eng)
     return eng
 
 
@@ -202,7 +204,7 @@ def test_service_test_connection_calls_the_plugin_verify_hook_with_stored_creds(
     svc = ChannelConfigService(scoped, registry=registry)
     svc.set_config("slack", {"bot_token": "xoxb-real"})
 
-    result = _run(svc.test_connection("slack"))
+    result = _run(check_channel_connection("slack", scope=LOCAL_SCOPE, registry=registry))
 
     assert result.ok is True
     assert result.detail == "Connected to Acme"
@@ -211,18 +213,14 @@ def test_service_test_connection_calls_the_plugin_verify_hook_with_stored_creds(
 def test_service_test_connection_reports_unsupported_without_a_verify_hook(engine):
     registry = PluginRegistry()
     registry.register(_plugin_without_verify())
-    scoped = ScopedSession(Session(engine), LOCAL_SCOPE)
-    svc = ChannelConfigService(scoped, registry=registry)
 
-    result = _run(svc.test_connection("telegram"))
+    result = _run(check_channel_connection("telegram", scope=LOCAL_SCOPE, registry=registry))
 
     assert result.ok is False
 
 
 def test_service_test_connection_unknown_channel_raises(engine):
     registry = PluginRegistry()
-    scoped = ScopedSession(Session(engine), LOCAL_SCOPE)
-    svc = ChannelConfigService(scoped, registry=registry)
 
     with pytest.raises(UnknownChannelError):
-        _run(svc.test_connection("ghost"))
+        _run(check_channel_connection("ghost", scope=LOCAL_SCOPE, registry=registry))

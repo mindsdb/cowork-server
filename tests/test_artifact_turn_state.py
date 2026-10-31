@@ -318,27 +318,3 @@ async def test_org_mode_still_requires_a_successful_republish_to_card_an_edit(
 
     assert cards == []
 
-
-def test_scope_falls_back_to_the_ambient_turn_scope(conv, monkeypatch):
-    # A detached or expired session yields no scope. The turn boundary binds an
-    # ambient one (use_settings_scope in handlers.responses), and it survives
-    # that — otherwise a whole class of "artifact never published" would depend
-    # on session lifetime.
-    from cowork.db.scoped import TenantScope
-
-    ambient = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
-    monkeypatch.setattr(t, "scope_of_session", lambda _s: None)
-    monkeypatch.setattr(
-        "cowork.common.settings.user_settings.current_settings_scope", lambda: ambient
-    )
-
-    assert t._recover_turn_scope(conv) is ambient
-
-
-def test_scope_is_none_when_neither_source_has_one(conv, monkeypatch):
-    monkeypatch.setattr(t, "scope_of_session", lambda _s: None)
-    monkeypatch.setattr(
-        "cowork.common.settings.user_settings.current_settings_scope", lambda: None
-    )
-
-    assert t._recover_turn_scope(conv) is None

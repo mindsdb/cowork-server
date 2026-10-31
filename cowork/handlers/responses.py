@@ -115,6 +115,7 @@ from cowork.handlers.turn_errors import (
 from cowork.db.scoped import (
     MissingTenantScopeError,
     ScopedSession,
+    TenantScope,
     scope_from_principal,
     unsafe_unscoped_session,
 )
@@ -1648,11 +1649,14 @@ class ResponsesHandler:
         The pod writes artifacts into `<project>/.anton/artifacts/` on the shared
         mount, so cowork-server reads the same directory the worker just wrote —
         this is the whole reason the in-process flow transplants onto the remote
-        path unchanged. `conversation` comes back attached to `session` because
-        a channel turn recovers the tenant scope from the session the row is
-        bound to (`_recover_turn_scope`); the ids, the project name and (on the
-        remote producer, _read_remote_turn_inputs) the creator are read here,
-        while it is unambiguously attached, rather than after the turn.
+        path unchanged. `conversation` comes back attached to `session` so its
+        caller reads the creator (`created_by`) in the same unit, which the
+        turn's end records as the owner of the artifacts the turn created:
+        `_read_remote_turn_inputs` for a browser turn and
+        `_read_channel_turn_inputs` for a channel turn. The ids and the project
+        name are read here too, while the row is attached, rather than after
+        the turn. The turn's tenant scope comes from its caller, not from this
+        row.
 
         None on any failure: no artifact card and no autopublish is better than
         a failed turn. Outside org mode the next turn in this project
@@ -1978,54 +1982,6 @@ class ResponsesHandler:
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
 
-        async def save_memory(entries: list) -> None:
-            """Apply what the pod asked to remember, as it arrives. Never
-            fails the turn: a lost memory is recoverable, a lost reply isn't."""
-            if not entries:
-                return
-            try:
-                await run_db(
-                    partial(
-                        self._persist_turn_memory,
-                        conv_id=conv_id, entries=entries, principal=self.principal,
-                    ),
-                    scope=scope,
-                )
-            except PoolTimeoutError:
-                logger.warning(
-                    "[responses] no database connection freed in time to apply memory for "
-                    "conversation %s", conv_id, extra={"request_id": corr},
-                )
-            except Exception:
-                logger.exception(
-                    "[responses] failed to apply memory",
-                    extra=log_context(request_id=corr, conversation_id=conv_id),
-                )
-
-        async def save_compaction(data: dict, seed_info: dict | None) -> None:
-            """Save the summary the pod folded earlier history into, as it
-            arrives: the cutoff names a message from an earlier turn, so it
-            stays correct even if this turn goes on to fail. Never fails the
-            turn: without it the next turn replays in full."""
-            try:
-                await run_db(
-                    partial(
-                        self._persist_remote_compaction,
-                        conv_id=conv_id, data=data, seed_info=seed_info,
-                    ),
-                    scope=scope,
-                )
-            except PoolTimeoutError:
-                logger.warning(
-                    "[responses] no database connection freed in time to save the compaction for "
-                    "conversation %s", conv_id, extra={"request_id": corr},
-                )
-            except Exception:
-                logger.exception(
-                    "[responses] failed to persist history compaction",
-                    extra=log_context(request_id=corr, conversation_id=conv_id),
-                )
-
         async def record_artifacts(*, completed_cleanly: bool) -> ArtifactChanges | None:
             """Record what the pod did to the project's artifacts, once per
             turn, whichever way the turn ends, as the in-process harness's
@@ -2309,7 +2265,13 @@ class ResponsesHandler:
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":
-                    await save_memory(data.get("entries") or [])
+                    await save_turn_memory(
+                        conv_id=conv_id,
+                        entries=data.get("entries") or [],
+                        principal=self.principal,
+                        scope=scope,
+                        request_id=corr,
+                    )
                 elif kind == "turn_history":
                     # Sanitized at the boundary (remote_turn_history): the pod
                     # is semi-trusted and these rows reach both the DB and
@@ -2323,7 +2285,9 @@ class ResponsesHandler:
                         yield history
                 elif kind == "turn_compaction":
                     compacted = True
-                    await save_compaction(data, seed.seed_info)
+                    await save_turn_compaction(
+                        conv_id=conv_id, data=data, seed_info=seed.seed_info, scope=scope, request_id=corr,
+                    )
                 elif kind == "turn_skill":
                     # Not persisted like memory: a draft is the user's decision.
                     # Yielding SkillCreated puts it through the same formatter the
@@ -2381,19 +2345,7 @@ class ResponsesHandler:
 
         try:
             # Stage attachments + project instructions before the pod runs.
-            try:
-                await run_db(partial(self._stage_remote_workspace_files, conv_id=conv_id), scope=scope)
-            except PoolTimeoutError:
-                # A full pool is not a missing file: the turn is refused
-                # (server_busy) rather than run without what the user sent.
-                raise
-            except Exception:
-                # Staging never fails the turn (_stage_remote_workspace_files
-                # degrades on its own); this is its unit failing to connect or
-                # to commit.
-                logger.exception(
-                    "[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id),
-                )
+            await stage_remote_workspace(conv_id=conv_id, scope=scope)
             # Save the question (pending) as this producer's first write
             # (ENG-1231); see the note in handle(). Committed before
             # streaming, so a refresh/reconnect mid-turn shows the question
@@ -3326,6 +3278,103 @@ class ResponsesHandler:
             status=ResponseStatus.completed,
             content=[ResponseOutputContent(text=text)],
             figure_sources=figure_sources,
+        )
+
+
+async def stage_remote_workspace(*, conv_id: UUID, scope: TenantScope) -> None:
+    """Stage what a remote turn's pod reads from the shared mount
+    (ResponsesHandler._stage_remote_workspace_files), in a unit, before the
+    pod runs. The browser and the channel producers both stage here.
+
+    A full pool is not a missing file: PoolTimeoutError propagates, so the
+    turn is refused (server_busy) rather than run without what the user sent.
+    Staging itself degrades on its own, so any other failure is the unit's
+    own connect or commit; it is logged, and the turn runs without the
+    staged files.
+    """
+    try:
+        await run_db(
+            partial(ResponsesHandler._stage_remote_workspace_files, conv_id=conv_id), scope=scope,
+        )
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.exception(
+            "[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id),
+        )
+
+
+async def save_turn_memory(
+    *,
+    conv_id: UUID,
+    entries: list,
+    principal: Principal | None,
+    scope: TenantScope,
+    request_id: str | None,
+) -> None:
+    """Apply what a remote turn's pod asked to remember, in a unit, as it
+    arrives. The browser and the channel producers both save memory here.
+
+    Never fails the turn: a lost memory is recoverable, a lost reply isn't.
+    A pool that frees no connection within POOL_TIMEOUT drops the entries
+    with a WARNING, and any other failure with an ERROR.
+    """
+    if not entries:
+        return
+    try:
+        await run_db(
+            partial(
+                ResponsesHandler._persist_turn_memory,
+                conv_id=conv_id, entries=entries, principal=principal,
+            ),
+            scope=scope,
+        )
+    except PoolTimeoutError:
+        logger.warning(
+            "[responses] no database connection freed in time to apply a turn's memory",
+            extra=log_context(request_id=request_id, conversation_id=conv_id),
+        )
+    except Exception:
+        logger.exception(
+            "[responses] failed to apply memory",
+            extra=log_context(request_id=request_id, conversation_id=conv_id),
+        )
+
+
+async def save_turn_compaction(
+    *,
+    conv_id: UUID,
+    data: dict,
+    seed_info: dict | None,
+    scope: TenantScope,
+    request_id: str | None,
+) -> None:
+    """Save the summary a remote turn's pod folded earlier history into, in a
+    unit, as it arrives: the cutoff names a message from an earlier turn, so
+    it stays correct even if this turn goes on to fail. The browser and the
+    channel producers both save compaction here.
+
+    Never fails the turn: without the summary the next turn replays in full.
+    A pool that frees no connection within POOL_TIMEOUT drops it with a
+    WARNING, and any other failure with an ERROR.
+    """
+    try:
+        await run_db(
+            partial(
+                ResponsesHandler._persist_remote_compaction,
+                conv_id=conv_id, data=data, seed_info=seed_info,
+            ),
+            scope=scope,
+        )
+    except PoolTimeoutError:
+        logger.warning(
+            "[responses] no database connection freed in time to save a turn's compaction",
+            extra=log_context(request_id=request_id, conversation_id=conv_id),
+        )
+    except Exception:
+        logger.exception(
+            "[responses] failed to persist history compaction",
+            extra=log_context(request_id=request_id, conversation_id=conv_id),
         )
 
 

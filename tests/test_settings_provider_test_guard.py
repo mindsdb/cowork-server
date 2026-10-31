@@ -66,13 +66,10 @@ def _deployment(monkeypatch, **fields):
     settings = UserSettings(**fields)
 
     class _Service:
-        def __init__(self, *a, **kw):
-            pass
-
         def load(self):
             return settings
 
-    monkeypatch.setattr(settings_endpoint, "SettingService", _Service)
+    monkeypatch.setattr(settings_endpoint, "unit_setting_service", lambda session: _Service())
     monkeypatch.setattr(settings_endpoint, "resolve_stored_key", lambda s, ptype: STORED_KEY)
     return settings
 
@@ -91,7 +88,7 @@ def stored(monkeypatch):
 def _test_providers(body):
     return asyncio.run(
         settings_endpoint.test_providers(
-            session=None, scope=LOCAL_SCOPE, body=settings_endpoint._TestProvidersBody(providers=body)
+            scope=LOCAL_SCOPE, body=settings_endpoint._TestProvidersBody(providers=body)
         )
     )
 

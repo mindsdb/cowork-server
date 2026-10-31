@@ -11,7 +11,7 @@ from uuid import UUID
 
 
 from cowork.common.logger import log_context
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session, tenant_scope_required
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
@@ -336,33 +336,6 @@ def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
     return slugs, mtimes
 
 
-def _recover_turn_scope(conversation) -> TenantScope | None:
-    """The tenant scope for post-turn work, or None when there is none.
-
-    Primary source is the scope the conversation's session was wrapped with —
-    the ORIGINAL authorization context, never one derived from row data.
-    Fallback is the ambient scope bound at the turn boundary
-    (`use_settings_scope` in handlers.responses), which survives a detached or
-    expired session. Returning None is the fail-safe: callers skip their work
-    rather than inventing a tenant.
-    """
-    from sqlalchemy.orm import object_session
-
-    try:
-        _sess = object_session(conversation)
-    except Exception:
-        _sess = None
-    scope = scope_of_session(_sess) if _sess is not None else None
-    if scope is not None:
-        return scope
-    try:
-        from cowork.common.settings.user_settings import current_settings_scope
-
-        return current_settings_scope()
-    except Exception:
-        return None
-
-
 def record_new_artifacts(
     session: ScopedSession,
     *,
@@ -417,22 +390,6 @@ def record_new_artifacts(
                     exc_info=True,
                     extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
                 )
-
-
-def turn_record_scope(scope: TenantScope | None, *, conversation_id) -> TenantScope | None:
-    """The scope to record a turn's new artifacts under, given the one
-    _recover_turn_scope found: that scope, or the desktop's local one when it
-    found none. None on a partitioned deployment that found none, and the
-    caller skips the record (fail-safe): it never invents a tenant."""
-    if scope is not None:
-        return scope
-    if tenant_scope_required():
-        logger.warning(
-            "artifact indexing skipped: no tenant scope provided on a partitioned deployment",
-            extra=log_context(conversation_id=conversation_id),
-        )
-        return None
-    return LOCAL_SCOPE
 
 
 @dataclass(frozen=True)

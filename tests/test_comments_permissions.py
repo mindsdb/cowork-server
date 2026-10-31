@@ -33,7 +33,7 @@ def _stub_business_logic(monkeypatch):
     trivial success — isolates the permission dependency from artifact
     resolution and the real proxy/local-journal logic."""
     monkeypatch.setattr(
-        comments_module, "resolve_comments_route", lambda user_dir, report_id, *, session=None: ("u", "r")
+        comments_module, "resolve_comments_route", lambda user_dir, report_id, *, tenant_scope=None: ("u", "r")
     )
 
     async def fake_stream(request, user_dir, report_id):
