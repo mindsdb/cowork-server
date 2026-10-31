@@ -353,3 +353,13 @@ def test_a_rollout_starts_every_new_pod_before_it_stops_an_old_one(values):
         "type": "RollingUpdate",
         "rollingUpdate": {"maxSurge": "100%", "maxUnavailable": 0},
     }
+
+
+def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
+    """The slow-statement line is what the two PostgreSQL timeouts get chosen
+    from, so it is on everywhere hosted, and neither timeout is set yet."""
+    assert _entry(base, "SLOW_STATEMENT_LOG_MS").value == "1000"
+    for path in [BASE, *ENVIRONMENTS]:
+        names = {entry.name for entry in _env(path)}
+        assert "STATEMENT_TIMEOUT_MS" not in names, path.name
+        assert "IDLE_IN_TRANSACTION_TIMEOUT_MS" not in names, path.name

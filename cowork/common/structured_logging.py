@@ -49,6 +49,7 @@ EVENT_FIELDS = frozenset(
         "model_alias",
         "managed_connection_file",
         "retryable",
+        "statement_fingerprint",
     ]
 )
 HEALTH_PATHS = frozenset(
