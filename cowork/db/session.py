@@ -1,15 +1,20 @@
 """Database connection and session management using SQLAlchemy"""
 
-from sqlalchemy import create_engine
+import hashlib
+import re
+import time
+
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
 from starlette.exceptions import HTTPException
 
-from cowork.common.logger import setup_logging
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.logger import get_logger, setup_logging
+from cowork.common.settings.app_settings import DatabaseSettings, get_app_settings
 
 logger = setup_logging()
+statement_logger = get_logger("cowork.db.statements")
 settings = get_app_settings()
 
 # Global cache for engines and session factories
@@ -29,6 +34,64 @@ def _is_expected_refusal(exc: BaseException) -> bool:
     status = exc.status_code
     return type(status) is int and 400 <= status < 500
 
+def postgres_session_options(database: DatabaseSettings) -> str:
+    """The libpq ``options`` that set each app connection's session timeouts,
+    or "" when both are off."""
+    options = []
+    if database.statement_timeout_ms:
+        options.append(f"-c statement_timeout={database.statement_timeout_ms}")
+    if database.idle_in_transaction_timeout_ms:
+        options.append(f"-c idle_in_transaction_session_timeout={database.idle_in_transaction_timeout_ms}")
+    return " ".join(options)
+
+
+_OPERATION_TABLE = re.compile(r"\b(?:FROM|INTO|UPDATE|JOIN)\s+\"?([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def statement_operation(statement: str) -> str:
+    """The statement's verb and first table, such as ``SELECT schedule_runs``.
+    Built from the SQL text alone, so no bound value reaches the log."""
+    words = statement.split(None, 1)
+    verb = words[0].upper() if words else "UNKNOWN"
+    table = _OPERATION_TABLE.search(statement)
+    return f"{verb} {table.group(1)}" if table else verb
+
+
+def statement_fingerprint(statement: str) -> str:
+    """A short, stable name for one statement's SQL text, so its slow runs
+    can be counted together."""
+    return hashlib.sha256(" ".join(statement.split()).encode()).hexdigest()[:12]
+
+
+def log_slow_statements(engine, *, threshold_ms: int) -> None:
+    """Log each statement on ``engine`` that takes at least ``threshold_ms``.
+
+    The line carries the statement's verb and first table and a fingerprint
+    of its SQL text, never the SQL or its parameters.
+    """
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _started(conn, cursor, statement, parameters, context, executemany):
+        conn.info["statement_started"] = time.perf_counter()
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def _finished(conn, cursor, statement, parameters, context, executemany):
+        started = conn.info.pop("statement_started", None)
+        if started is None:
+            return
+        duration_ms = (time.perf_counter() - started) * 1000
+        if duration_ms >= threshold_ms:
+            statement_logger.warning(
+                "Database statement was slow",
+                extra={
+                    "event": "db_statement_slow",
+                    "duration_ms": round(duration_ms),
+                    "operation": statement_operation(statement),
+                    "statement_fingerprint": statement_fingerprint(statement),
+                },
+            )
+
+
 def _create_engine(db_uri: str):
     is_sqlite = db_uri.startswith("sqlite")
     try:
@@ -39,8 +102,10 @@ def _create_engine(db_uri: str):
                 hide_parameters=True,
             )
         else:
+            options = postgres_session_options(settings.database)
             engine = create_engine(
                 db_uri,
+                connect_args={"options": options} if options else {},
                 hide_parameters=True,
                 pool_size=settings.database.pool_size,
                 max_overflow=settings.database.max_overflow,
@@ -48,6 +113,8 @@ def _create_engine(db_uri: str):
                 pool_recycle=settings.database.pool_recycle,
                 pool_pre_ping=settings.database.pool_pre_ping,
             )
+            if settings.database.slow_statement_log_ms:
+                log_slow_statements(engine, threshold_ms=settings.database.slow_statement_log_ms)
         return engine
     except Exception as e:
         error_msg = str(e).lower()

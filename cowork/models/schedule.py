@@ -54,6 +54,19 @@ class Schedule(BaseSQLModel, table=True):
 
 class ScheduleRun(BaseSQLModel, table=True):
     __tablename__ = "schedule_runs"
+    # One run per cron slot. Every replica polls the same schedules, and the
+    # insert that names a slot is the claim: a second replica's insert for
+    # that slot fails here, so the slot starts one run (cowork.scheduler).
+    __table_args__ = (
+        sa.Index(
+            "uq_schedule_runs_slot",
+            "schedule_id",
+            "slot_at",
+            unique=True,
+            sqlite_where=sa.text("slot_at IS NOT NULL"),
+            postgresql_where=sa.text("slot_at IS NOT NULL"),
+        ),
+    )
 
     schedule_id: UUID = Field(
         sa_column=sa.Column(
@@ -81,3 +94,13 @@ class ScheduleRun(BaseSQLModel, table=True):
         description="Conversation created during this run",
     )
     is_manual: bool = Field(default=False, description="True if triggered via run-now endpoint")
+    slot_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="The cron slot this run claimed; NULL for a manual run, or once the run gave its slot back",
+    )
+    lease_expires_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="Until when the process running it has renewed its claim; a running run past this is dead",
+    )

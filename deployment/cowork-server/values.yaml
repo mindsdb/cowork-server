@@ -399,6 +399,13 @@ deployment:
           name: cowork-db
           key: database_uri
 
+    # Log each PostgreSQL statement that takes a second or more (event
+    # db_statement_slow), so statement_timeout and
+    # idle_in_transaction_session_timeout can be set from what hosted
+    # statements take. Both timeouts stay off until then.
+    - name: SLOW_STATEMENT_LOG_MS
+      value: "1000"
+
     # Fernet master key for encrypting sensitive settings at rest. Without it
     # the server generates a key into an ephemeral per-pod file, so a restart
     # or a second replica cannot decrypt what an earlier pod wrote. Sourced
