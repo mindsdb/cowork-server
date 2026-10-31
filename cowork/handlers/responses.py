@@ -127,6 +127,8 @@ from cowork.services.product_permissions import (
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
+from cowork.schemas.turn_skills import TurnSkills
+from cowork.services.skill_sharing import SkillViewer
 from cowork.services.skills import SkillService
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
 
@@ -537,21 +539,24 @@ class _RemoteTurnInputs:
     # project, or None when it could not be resolved (_remote_agent_files).
     files: AgentFiles | None
     # The skills the caller sees, the pod's whole recallable set
-    # (remote_turn_skills); {} when they see none.
-    skills: dict
+    # (remote_turn_skills); empty when they see none.
+    skills: TurnSkills
 
 
-def remote_turn_skills(session: ScopedSession, conv_id: UUID, *, viewer=None) -> dict:
+def remote_turn_skills(
+    session: ScopedSession, conv_id: UUID, *, viewer: SkillViewer | None = None
+) -> TurnSkills:
     """The skills block for a cloud turn's request: every skill the pod's
     agent may recall in it, and the always-on ones flagged and first
-    (cowork.services.skills.build_turn_skills). In hosted org mode only the
+    (cowork.services.skills.build_turn_skills). In MindsHub mode only the
     skills ``viewer`` sees; without one (a scheduled or channel turn, or one
     whose teams couldn't be read) the fail-closed viewer's.
 
-    Never None: the pod treats a request without the block as one that may
-    recall anything on its skills volume, which holds every member's skills,
-    so every turn path sends one. A failure sends ``{}``, a turn with no
-    skills, rather than failing the turn or falling back to the volume.
+    Never None: the pod's anton recalls only what a block names, and falls
+    back to whatever org skills tree its pod mounts for a request without
+    one, which can hold every member's skills, so every turn path sends one.
+    A failure sends an empty block, a turn with no skills, rather than
+    failing the turn or leaving the pod to fall back.
     """
     from cowork.services.skills import build_turn_skills
 
@@ -678,7 +683,7 @@ class ResponsesHandler:
         *,
         principal: Principal | None = None,
         interactive: bool = True,
-        hub_bearer: str = "",
+        mindshub_bearer: str = "",
     ) -> None:
         self.principal = principal
         self.scope = scope_from_principal(principal)
@@ -687,10 +692,10 @@ class ResponsesHandler:
         # sharing. Empty for a turn with no caller present, such as a
         # scheduled one: that turn gets the fail-closed set, without skills
         # shared only with a team.
-        self.hub_bearer = hub_bearer
-        # Hosted org skill sharing's view of the caller, resolved once per
-        # remote turn before its inputs are read (remote_turn_skills).
-        self._skill_viewer = None
+        self.mindshub_bearer = mindshub_bearer
+        # Skill sharing's view of the caller in MindsHub mode, resolved once
+        # per remote turn before its inputs are read (remote_turn_skills).
+        self._skill_viewer: SkillViewer | None = None
         # The harness this turn runs: the request's own pick or the stored
         # setting, resolved by handle() from the settings its first unit reads.
         # Anton itself is built lazily, only after Cowork delegates a turn:
@@ -1586,14 +1591,14 @@ class ResponsesHandler:
         )
 
     async def _resolve_skill_viewer(self, scope) -> None:
-        """Hosted org skill sharing's view of the caller, for this turn's
-        skills. Never fails the turn: a failure leaves the fail-closed view
-        (build_turn_skills)."""
+        """Skill sharing's view of the caller in MindsHub mode, for this
+        turn's skills. Never fails the turn: a failure leaves the fail-closed
+        view (build_turn_skills)."""
         from cowork.services.skill_sharing import resolve_skill_viewer
 
         try:
             self._skill_viewer = await resolve_skill_viewer(
-                scope=scope, principal=self.principal, bearer_token=self.hub_bearer
+                scope=scope, principal=self.principal, bearer_token=self.mindshub_bearer
             )
         except Exception:
             logger.warning("[responses] could not resolve the caller's teams for skills", exc_info=True)
@@ -1601,8 +1606,8 @@ class ResponsesHandler:
 
     @staticmethod
     def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
-        """Stage the project-level files the pod can't otherwise see — the
-        conversation's attachments and the project's anton.md instructions —
+        """Stage the project-level files the pod can't otherwise see (the
+        conversation's attachments and the project's anton.md instructions)
         into the conversation workspace on the shared mount, and seed this
         org's skill store with the packaged builtins if it hasn't been yet.
 
@@ -2290,9 +2295,8 @@ class ResponsesHandler:
             # compaction against exactly the history seeded here, so
             # re-reading it when the reply arrives could map the count onto a
             # different list.
-            # The caller's teams and permissions, read from the auth service
-            # (cached per caller) before the seed, which selects the skills
-            # they see.
+            # The caller's teams and permissions, read from MindsHub (cached
+            # per caller) before the seed, which selects the skills they see.
             await self._resolve_skill_viewer(scope)
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
             # A unit of its own, so a failed read can't abort the seed's.

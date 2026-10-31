@@ -1,31 +1,33 @@
-"""Hosted org skill sharing (ENG-3787): who sees, uses and changes a skill.
+"""Skill sharing in MindsHub mode: who sees, uses and changes a skill.
 
-In hosted org tenancy every member reads one skill store, and who each skill
-is shared with is its row in ``skill_access`` (named as the auth service's ArtifactAccess:
-``org_allowed``, ``allowed_team_ids``, ``allowed_user_ids``, plus
-``always_on``): only its owner (a new skill's row), people by Keycloak id,
-teams, or the whole organization. A skill from before sharing gets an
-org-wide row once, owned by its attribution's creator, the first time its
-org's rows are read; a folder with no row after that is its recorded
-creator's alone, or nobody's with none. Org-wide and team skills are
-recalled on demand like any other unless marked always on, which puts them
-in every turn's prompt of the people they reach.
+In MindsHub mode every member reads one skill store, and who each skill
+is shared with is its row in ``skill_access``, under MindsHub's artifact
+rule names (``org_allowed``, ``allowed_team_ids``, ``allowed_user_ids``),
+plus ``always_on``: only its owner (a new skill's row), people by user id,
+teams, or everyone at the org. A skill from before sharing gets a row
+shared with everyone once, owned by its attribution's creator, the first
+time its org's rows are read; a folder with no row after that is its
+recorded creator's alone, or nobody's with none. Skills shared with
+everyone or a team are recalled on demand like any other unless marked
+always on, which puts them in every turn's prompt of the org or the team
+they reach; they stay on demand for people named personally.
 
 Handlers are called directly with an explicit SkillViewer, the suite's
 convention for org routes (cowork.server wires the identity middleware only
-when the process starts in org mode). The auth service is stubbed at
-get_auth_json.
+when the process starts in MindsHub mode). MindsHub is stubbed at
+get_mindshub_reply.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -36,16 +38,23 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from cowork.api.v1.endpoints import hub_people as hub_people_ep
-from cowork.api.v1.endpoints import hub_teams as hub_teams_ep
+from cowork.api.v1.endpoints import mindshub_people as mindshub_people_ep
+from cowork.api.v1.endpoints import mindshub_teams as mindshub_teams_ep
+from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.api.v1.endpoints.artifact_workspace import ARTIFACT_ORG_REFUSAL
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, unsafe_unscoped_session
+from cowork.db.scoped import (
+    LOCAL_SCOPE,
+    ScopedSession,
+    TenantMismatchError,
+    TenantScope,
+    unsafe_unscoped_session,
+)
 from cowork.models.skill import META_CREATED_BY, Skill
 from cowork.models.skill_access import SkillAccess
 from cowork.principal import ORG_MANAGE_ROLE, Principal
-from cowork.models.skill_user_setting import SkillUserSetting
+from cowork.models.skill_user_setting import LOCAL_PERSON_ID, SkillUserSetting
 from cowork.schemas.skills import (
     SkillCreateRequest,
     SkillEnabledForMeRequest,
@@ -53,7 +62,7 @@ from cowork.schemas.skills import (
     SkillUpdateRequest,
 )
 from cowork.models.shared_resource import SharedResourceAttribution
-from cowork.services import hub_people, hub_teams
+from cowork.services import mindshub_people, mindshub_teams
 from cowork.services.shared_resources import SKILL, SharedResourceAccess
 from cowork.services.skill_access import (
     access_row,
@@ -63,9 +72,8 @@ from cowork.services.skill_access import (
     stage_only_owner,
     stage_rename,
 )
+from cowork.services.sharing_contract import MAX_PEOPLE_PER_RULE
 from cowork.services.skill_sharing import (
-    HUB_UNAVAILABLE,
-    MAX_SHARED_PEOPLE,
     SkillAccessRule,
     SkillViewer,
     access_rule_for,
@@ -81,6 +89,7 @@ from cowork.services.skills import (
 )
 from cowork.services.skill_user_settings import off_for_me as user_off_for_me
 from cowork.services.skill_user_settings import stage_enabled_for_me
+from cowork.schemas.turn_skills import TurnSkillEntry
 from cowork.turnqueue.producer import _fit_request
 from tests._org_sharing import (
     ADMIN,
@@ -92,20 +101,29 @@ from tests._org_sharing import (
     EVE,
     MAL,
     MEMBER_BEARER,
+    TEAM_ALL,
+    TEAM_ELSEWHERE,
     TEAM_ENG,
     TEAM_OPS,
-    access_service_answers,
+    mindshub_sharing_answers,
     artifact_rule,
+    auth_replies,
     member_request,
+    mindshub_answers,
 )
 
 ORG_ID = "33333333-3333-4333-8333-333333333333"
+# The wire code of a 503 for MindsHub that couldn't be asked, as the app and
+# the other repos' builders name it.
+MINDSHUB_UNREACHABLE = "mindshub_unreachable"
+OTHER_ORG_ID = "44444444-4444-4444-8444-444444444444"
 
 NOTHING_SHARED = {"orgAllowed": False, "allowedTeamIds": [], "allowedUserIds": [], "alwaysOn": False}
 
 
 def _viewer(
-    user: str, *, teams=(), admin=False, share_org=False, write_org=False, known=True, perms_known=True,
+    user: str, *, teams=(), admin=False, share_org=False, write_org=False, share_artifacts_org=False,
+    known=True, perms_known=True,
 ) -> SkillViewer:
     return SkillViewer(
         user_id=user,
@@ -113,8 +131,9 @@ def _viewer(
         team_ids=frozenset(teams),
         teams_known=known,
         is_admin=admin,
-        can_share_org=admin or share_org,
-        can_write_org=admin or write_org,
+        can_share_skills_org=admin or share_org,
+        can_write_skills_org=admin or write_org,
+        can_share_artifacts_org=admin or share_artifacts_org,
         permissions_known=admin or perms_known,
     )
 
@@ -180,11 +199,11 @@ def _share(
     request = SkillSharingRequest(**body)
     scoped = ctx.as_(user)
     viewer = viewer or _viewer(user, teams=(TEAM_ENG,), admin=admin)
-    stored = asyncio.run(skills_ep.stored_sharing_rule(slug, scoped, viewer))
+    stored = asyncio.run(sharing_ep.stored_sharing_rule(slug, scoped, viewer))
     verified = asyncio.run(
-        skills_ep.verify_people_in_org(request, viewer, stored, members or _members())
+        sharing_ep.verify_people_in_org(request, viewer, stored, members or _members())
     )
-    return skills_ep.set_skill_sharing(slug, request, scoped, _principal(user, admin=admin), viewer, verified)
+    return sharing_ep.set_skill_sharing(slug, request, scoped, _principal(user, admin=admin), viewer, verified)
 
 
 def _listed(org, user: str, viewer: SkillViewer) -> dict[str, dict]:
@@ -222,17 +241,38 @@ def _store_rule(org, slug: str, rule: SkillAccessRule) -> None:
 # ── the table ────────────────────────────────────────────────────────────────
 
 
+def test_a_scope_keys_the_uuid_tables_by_its_org_as_a_uuid(org):
+    """skill_access and skill_user_setting key their rows by an org UUID
+    column, and the scoped session stamps, filters and checks them by the
+    scope's org as a UUID: the same org written in capitals reads the same
+    rows, another org's stay out of reach, and an org id that isn't a UUID
+    fails closed rather than matching nothing or everything."""
+    alice = org.as_(ALICE)
+    stage_only_owner(alice, slug="notes", owner_user_id=ALICE)
+    stage_enabled_for_me(alice, "notes", False)
+    alice.commit()
+    assert [row.org_id for row in alice.exec(alice.select(SkillAccess)).all()] == [UUID(ORG_ID)]
+    assert [row.org_id for row in alice.exec(alice.select(SkillUserSetting)).all()] == [UUID(ORG_ID)]
+
+    assert set(access_rows(org.as_(BOB, org_id=ORG_ID.upper()))) == {"notes"}
+    assert access_rows(org.as_(BOB, org_id=OTHER_ORG_ID)) == {}
+    with pytest.raises(TenantMismatchError):
+        access_rows(org.as_(BOB, org_id="org-a"))
+    with pytest.raises(TenantMismatchError):
+        stage_enabled_for_me(org.as_(ALICE, org_id="org-a"), "notes", False)
+
+
 def test_the_table_keeps_one_row_per_skill_per_org(org):
     session = org.as_(ALICE)
-    stage_only_owner(session, "notes", ALICE)
+    stage_only_owner(session, slug="notes", owner_user_id=ALICE)
     session.commit()
     row = access_row(session, "notes")
     assert (row.org_id, row.owner_user_id, row.org_allowed, row.allowed_team_ids, row.allowed_user_ids,
-            row.always_on) == (ORG_ID, ALICE, False, [], [], False)
+            row.always_on) == (UUID(ORG_ID), UUID(ALICE), False, [], [], False)
     assert row.created_at is not None and row.modified_at is not None
 
     # A rule saved again updates the same row; always_on only sticks on a
-    # skill shared org-wide or with a team.
+    # skill shared with everyone or with a team.
     stage_access(session, "notes", SkillAccessRule(
         owner_user_id=ALICE, allowed_team_ids=(TEAM_ENG,), allowed_user_ids=(BOB,), always_on=True,
     ))
@@ -247,13 +287,13 @@ def test_the_table_keeps_one_row_per_skill_per_org(org):
     assert rows["solo"].always_on is False
 
     # Another org neither sees nor collides with these rows.
-    other = org.as_(BOB, org_id="44444444-4444-4444-8444-444444444444")
+    other = org.as_(BOB, org_id=OTHER_ORG_ID)
     assert access_rows(other) == {}
-    stage_only_owner(other, "notes", BOB)
+    stage_only_owner(other, slug="notes", owner_user_id=BOB)
     other.commit()
-    assert access_row(org.as_(ALICE), "notes").owner_user_id == ALICE
+    assert access_row(org.as_(ALICE), "notes").owner_user_id == UUID(ALICE)
 
-    stage_rename(session, "notes", "solo")  # drops the stale row the new name had
+    stage_rename(session, old_slug="notes", new_slug="solo")  # drops the stale row the new name had
     session.commit()
     assert set(access_rows(session)) == {"solo"}
     assert access_rows(session)["solo"].allowed_team_ids == [TEAM_ENG]
@@ -287,7 +327,7 @@ def test_a_new_skill_is_only_its_creators(org):
     assert created["canEdit"] is True
     assert created["owner"] == {"id": ALICE, "email": "alice@x.com"}
     row = _row(org, "alice-notes")
-    assert (row.owner_user_id, row.org_allowed, row.allowed_team_ids, row.allowed_user_ids) == (ALICE, False, [], [])
+    assert (row.owner_user_id, row.org_allowed, row.allowed_team_ids, row.allowed_user_ids) == (UUID(ALICE), False, [], [])
     # Nothing about access or ownership is in SKILL.md: the owner is the
     # row's, and the creator the attribution's.
     metadata = SkillService(org.as_(ALICE).scope).get_skill("alice-notes").metadata
@@ -309,7 +349,7 @@ def test_an_upload_gets_a_row_shared_with_nobody_whatever_its_file_claims(org):
     assert (uploaded["section"], uploaded["access"]) == ("mine", NOTHING_SHARED)
     # The file's claimed creator is dropped, not kept as a second owner.
     assert SkillService(org.as_(ALICE).scope).get_skill("uploaded").created_by is None
-    assert _row(org, "uploaded").owner_user_id == ALICE
+    assert _row(org, "uploaded").owner_user_id == UUID(ALICE)
     assert "uploaded" not in _listed(org, DAVE, _viewer(DAVE, teams=(TEAM_OPS,)))
 
 
@@ -331,9 +371,9 @@ def _attributed(org, slug: str, creator: str | None, *, pending: bool = False, e
     session.commit()
 
 
-def test_a_skill_from_before_sharing_gets_an_org_wide_row_once(org):
+def test_a_skill_from_before_sharing_gets_a_row_shared_with_everyone_once(org):
     """The org's first read of its rows gives each skill of the store with no
-    row an org-wide one (what every member saw before sharing), owned by its
+    row one shared with everyone (what every member saw before sharing), owned by its
     attribution's creator; built-ins get none. Once: a folder written around
     the API afterwards is nobody's."""
     alice = org.as_(ALICE).scope
@@ -345,11 +385,11 @@ def test_a_skill_from_before_sharing_gets_an_org_wide_row_once(org):
     assert (seen["section"], seen["access"]["orgAllowed"], seen["access"]["alwaysOn"], seen["canEdit"]) == (
         "org", True, False, False,
     )
-    # Changing an org-wide skill someone else owns takes skills.write_org.
+    # Changing someone else's skill shared with everyone takes skills.write_org.
     assert _listed(org, BOB, _viewer(BOB, write_org=True))["house-style"]["canEdit"] is True
     rows = access_rows(org.as_(ALICE))
     assert {slug: (row.org_allowed, row.owner_user_id, row.always_on) for slug, row in rows.items()} == {
-        "house-style": (True, None, False), "alice-guide": (True, ALICE, False),
+        "house-style": (True, None, False), "alice-guide": (True, UUID(ALICE), False),
     }
     assert "house-style" in build_turn_skills(
         org.as_(BOB).scope, project_name="general", viewer=_viewer(BOB), session=org.as_(BOB),
@@ -361,7 +401,28 @@ def test_a_skill_from_before_sharing_gets_an_org_wide_row_once(org):
     assert _listed(org, ADMIN, _viewer(ADMIN, admin=True))["written-later"]["owner"]["id"] is None
 
 
-def test_an_uploaded_skill_from_before_sharing_stays_org_wide_and_its_creator_keeps_it(org):
+def test_a_skill_from_before_sharing_that_fails_to_parse_still_gets_its_row_shared_with_everyone(org):
+    """The one-time backfill gives every skill folder of the store its row,
+    whether or not its SKILL.md parses then. One an agent left broken at the
+    org's first read keeps the access every member had, so once the
+    file is fixed the others see it again rather than losing it for good."""
+    scope = org.as_(ALICE).scope
+    _legacy_skill(scope, "onboarding")
+    _legacy_skill(scope, "house-style")
+    skill_file = SkillService(scope).root / "house-style" / "SKILL.md"
+    readable = skill_file.read_text()
+    skill_file.write_text("---\nname: [unclosed\n---\nBody.")
+
+    # The org's first read runs the backfill, with house-style unreadable.
+    listed = _listed(org, BOB, _viewer(BOB))
+    assert ("onboarding" in listed, "house-style" in listed) == (True, False)
+    row = _row(org, "house-style")
+    assert (row.org_allowed, row.owner_user_id) == (True, None)
+    skill_file.write_text(readable)
+    assert _listed(org, BOB, _viewer(BOB))["house-style"]["section"] == "org"
+
+
+def test_an_uploaded_skill_from_before_sharing_stays_shared_with_everyone_and_its_creator_keeps_it(org):
     """Its SKILL.md names another creator, which decides nothing: the
     attribution's creator owns it. They edit it, take it back from everyone
     and delete it with neither skills.write_org nor skills.share_org; a
@@ -383,7 +444,7 @@ def test_an_uploaded_skill_from_before_sharing_stays_org_wide_and_its_creator_ke
             _viewer(BOB),
         ),
         403,
-        skills_ep.ORG_WIDE_EDIT_REFUSAL,
+        skills_ep.ORG_ALLOWED_EDIT_REFUSAL,
     )
     assert _listed(org, ALICE, alice)["uploaded-guide"]["canEdit"] is True
     edited = skills_ep.update_skill(
@@ -394,7 +455,7 @@ def test_an_uploaded_skill_from_before_sharing_stays_org_wide_and_its_creator_ke
     out = _share(org, ALICE, "uploaded-guide", alice, org_allowed=False)
     assert (out["access"]["orgAllowed"], out["section"]) == (False, "mine")
     assert "uploaded-guide" not in _listed(org, CAROL, _viewer(CAROL))
-    # Making it org-wide again still takes skills.share_org.
+    # Sharing it with everyone again still takes skills.share_org.
     _refused(lambda: _share(org, ALICE, "uploaded-guide", alice, org_allowed=True), 403, "skills.share_org")
 
     skills_ep.delete_skill("uploaded-notes", org.as_(ALICE), _principal(ALICE), alice)
@@ -422,15 +483,16 @@ def test_two_backfills_of_one_org_at_once_write_each_row_once(org, monkeypatch):
 
     session = org.as_(ALICE)
     rows = session.exec(session.select(SkillAccess)).all()
-    assert [(row.skill_slug, row.org_allowed, row.owner_user_id) for row in rows] == [("house-style", True, ALICE)]
+    assert [(row.skill_slug, row.org_allowed, row.owner_user_id) for row in rows] == [("house-style", True, UUID(ALICE))]
     marks = session.exec(session.select(Setting).where(Setting.key == skill_access.BACKFILL_SETTING_KEY)).all()
     assert [(mark.scope, mark.org_id) for mark in marks] == [("org", ORG_ID)]
 
 
-def test_a_creator_id_too_long_for_the_row_leaves_the_skill_ownerless(org):
-    """An attribution id longer than skill_access.owner_user_id holds (one
-    the database has but the model would refuse) leaves the skill org-wide
-    with no owner, rather than failing the org's first read every time."""
+def test_a_creator_id_that_is_not_a_uuid_leaves_the_skill_ownerless(org):
+    """An attribution id that isn't a UUID (one the database has but
+    skill_access.owner_user_id, a UUID column, can't hold) leaves the skill
+    shared with everyone with no owner, rather than failing the org's first
+    read every time."""
     _legacy_skill(org.as_(ALICE).scope, "old-skill")
     session = org.as_(ALICE)
     unsafe_unscoped_session(session).execute(
@@ -469,7 +531,7 @@ def test_a_create_a_crash_cut_short_is_its_creators_and_recovery_gives_it_its_ro
     seen = _listed(org, ALICE, _viewer(ALICE))["crashed"]
     assert (seen["section"], seen["access"], seen["canEdit"]) == ("mine", NOTHING_SHARED, True)
     row = _row(org, "crashed")
-    assert (row.owner_user_id, row.org_allowed, row.allowed_team_ids, row.allowed_user_ids) == (ALICE, False, [], [])
+    assert (row.owner_user_id, row.org_allowed, row.allowed_team_ids, row.allowed_user_ids) == (UUID(ALICE), False, [], [])
     assert "crashed" not in _listed(org, BOB, _viewer(BOB, write_org=True))
 
 
@@ -493,11 +555,11 @@ def test_a_skill_made_after_the_backfill_with_no_row_is_its_creators(org):
     assert _listed(org, ADMIN, _viewer(ADMIN, admin=True))["made-during-rollout"]["owner"]["id"] == ALICE
 
     _share(org, ALICE, "made-during-rollout", _viewer(ALICE), allowed_user_ids=[BOB])
-    assert _row(org, "made-during-rollout").owner_user_id == ALICE
+    assert _row(org, "made-during-rollout").owner_user_id == UUID(ALICE)
     assert "made-during-rollout" in _listed(org, BOB, _viewer(BOB))
 
 
-def test_a_new_skill_is_never_org_wide_while_it_is_being_created(org, monkeypatch):
+def test_a_new_skill_is_never_shared_with_everyone_while_it_is_being_created(org, monkeypatch):
     """The org's first read can land right after a create finalizes its
     claim. Its row commits with the claim, so the backfill never takes a new
     skill for one from before sharing and shares it with everyone."""
@@ -514,7 +576,7 @@ def test_a_new_skill_is_never_org_wide_while_it_is_being_created(org, monkeypatc
 
     assert "brand-new" not in seen[0]
     row = _row(org, "brand-new")
-    assert (row.org_allowed, row.owner_user_id) == (False, ALICE)
+    assert (row.org_allowed, row.owner_user_id) == (False, UUID(ALICE))
 
 
 def test_the_listing_reads_the_orgs_rows_in_one_query(org, monkeypatch):
@@ -582,35 +644,40 @@ def test_an_unreachable_team_listing_hides_team_only_skills(org):
     )
 
 
-def test_the_viewer_resolves_teams_and_permissions_from_the_access_service_and_fails_closed(monkeypatch):
-    hub_teams.reset_caches_for_tests()
+def test_the_viewer_resolves_teams_and_permissions_from_mindshub_and_fails_closed(monkeypatch):
+    mindshub_teams.reset_caches_for_tests()
     answers = {
-        hub_teams.TEAMS_PATH: {"results": [{"id": TEAM_ENG, "display_name": "Eng", "is_default": False}]},
-        hub_teams.ENTITLEMENTS_PATH: {"permissions": ["skills.share_org"]},
+        mindshub_teams.TEAMS_PATH: {"results": [{"id": TEAM_ENG, "display_name": "Eng", "is_default": False}]},
+        mindshub_teams.ENTITLEMENTS_PATH: {"permissions": ["skills.share_org", "artifacts.share_org"]},
     }
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         return answers.get(path)
 
-    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
     viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token="t"))
-    assert (viewer.team_ids, viewer.teams_known, viewer.can_share_org, viewer.can_write_org) == (
-        frozenset({TEAM_ENG}), True, True, False,
-    )
+    assert (
+        viewer.team_ids, viewer.teams_known, viewer.can_share_skills_org, viewer.can_write_skills_org,
+        viewer.can_share_artifacts_org,
+    ) == (frozenset({TEAM_ENG}), True, True, False, True)
     assert viewer.email == "bob@x.com"
 
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
     answers.clear()
     blind = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token="t"))
-    assert (blind.team_ids, blind.teams_known, blind.can_share_org) == (frozenset(), False, False)
+    assert (blind.team_ids, blind.teams_known, blind.can_share_skills_org, blind.can_share_artifacts_org) == (
+        frozenset(), False, False, False,
+    )
     admin = asyncio.run(resolve_skill_viewer(
         scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ADMIN),
         principal=_principal(ADMIN, admin=True), bearer_token="t",
     ))
-    assert (admin.can_share_org, admin.can_write_org) == (True, True)
+    assert (admin.can_share_skills_org, admin.can_write_skills_org, admin.can_share_artifacts_org) == (
+        True, True, True,
+    )
     assert asyncio.run(resolve_skill_viewer(scope=LOCAL_SCOPE, principal=None, bearer_token="t")) is None
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
 
 
 # ── PUT /skills/{slug}/sharing ───────────────────────────────────────────────
@@ -631,6 +698,37 @@ def test_sharing_normalizes_people_and_keeps_teams(org):
     _refused(lambda: _share(org, ALICE, "shared", allowed_user_ids=["not an id"]), 400, "not a valid person id")
 
 
+def test_a_team_named_in_uppercase_is_stored_canonical_and_reaches_the_team(org):
+    """MindsHub lists a team by its lowercase UUID. An admin's share naming
+    it in uppercase is stored lowercase, so the team's members see the
+    skill."""
+    _create(org, ALICE, "eng-guide")
+    out = _share(org, ADMIN, "eng-guide", _viewer(ADMIN, admin=True), admin=True, allowed_team_ids=[TEAM_ENG.upper()])
+    assert out["access"]["allowedTeamIds"] == [TEAM_ENG]
+    assert _row(org, "eng-guide").allowed_team_ids == [TEAM_ENG]
+    assert _listed(org, BOB, _viewer(BOB, teams=(TEAM_ENG,)))["eng-guide"]["section"] == "team"
+
+
+def test_an_id_that_is_not_a_uuid_is_a_400_naming_it_and_asks_mindshub_nothing(org):
+    """MindsHub keys people and teams by UUID. A person id that isn't one is
+    a 400 naming it before any member lookup, never the retryable 503 a
+    lookup MindsHub refuses would read as; a team id that isn't one is a 400
+    too, an admin's included, and nothing is stored."""
+    _create(org, ALICE, "shared")
+    calls: list = []
+    _refused(
+        lambda: _share(org, ALICE, "shared", members=_members(calls=calls), allowed_user_ids=[BOB, "bob"]),
+        400, "'bob' is not a valid person id.",
+    )
+    assert calls == []
+    _refused(
+        lambda: _share(org, ADMIN, "shared", _viewer(ADMIN, admin=True), admin=True, allowed_team_ids=["Eng"]),
+        400, "'Eng' is not a valid team id.",
+    )
+    row = _row(org, "shared")
+    assert (row.allowed_user_ids, row.allowed_team_ids) == ([], [])
+
+
 def test_only_the_owner_or_an_admin_changes_teams_and_people(org):
     _create(org, ALICE, "shared")
     _share(org, ALICE, "shared", allowed_team_ids=[TEAM_ENG])
@@ -640,7 +738,7 @@ def test_only_the_owner_or_an_admin_changes_teams_and_people(org):
     out = _share(org, ADMIN, "shared", admin, admin=True, allowed_team_ids=[TEAM_ENG, TEAM_OPS])
     # An admin may name a team they aren't in, and the owner stays the owner.
     assert out["access"]["allowedTeamIds"] == [TEAM_ENG, TEAM_OPS]
-    assert _row(org, "shared").owner_user_id == ALICE
+    assert _row(org, "shared").owner_user_id == UUID(ALICE)
 
 
 def test_a_team_must_be_one_the_sharer_belongs_to(org):
@@ -654,12 +752,12 @@ def test_a_team_must_be_one_the_sharer_belongs_to(org):
     _share(org, ALICE, "shared", blind, allowed_team_ids=[TEAM_ENG], allowed_user_ids=[BOB])
 
 
-def test_org_wide_takes_the_share_org_capability(org):
+def test_sharing_with_everyone_takes_the_share_org_capability(org):
     _create(org, ALICE, "shared")
 
     _refused(lambda: _share(org, ALICE, "shared", org_allowed=True), 403, "skills.share_org")
     out = _share(org, ALICE, "shared", _viewer(ALICE, share_org=True), org_allowed=True)
-    # Its owner's own skill moves to the org section once org-wide.
+    # Its owner's own skill moves to the org section once shared with everyone.
     assert (out["access"]["orgAllowed"], out["section"]) == (True, "org")
     assert _listed(org, ALICE, _viewer(ALICE, share_org=True))["shared"]["section"] == "org"
     assert _row(org, "shared").org_allowed is True
@@ -668,21 +766,21 @@ def test_org_wide_takes_the_share_org_capability(org):
     assert (out["access"]["orgAllowed"], _row(org, "shared").org_allowed) == (False, False)
 
 
-def test_org_wide_also_takes_owning_the_skill_or_admin(org):
+def test_sharing_with_everyone_also_takes_owning_the_skill_or_admin(org):
     """skills.share_org alone doesn't let someone a skill was shared with
-    make it org-wide, or take that back: the owner or an admin decides."""
+    share it with everyone, or take that back: the owner or an admin decides."""
     _create(org, ALICE, "team-skill")
     _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], allowed_user_ids=[BOB])
     bob = _viewer(BOB, teams=(TEAM_ENG,), share_org=True)
 
     _refused(
-        lambda: _share(org, BOB, "team-skill", bob, org_allowed=True), 403, skills_ep.SHARING_OWNER_REFUSAL,
+        lambda: _share(org, BOB, "team-skill", bob, org_allowed=True), 403, sharing_ep.SHARING_OWNER_REFUSAL,
     )
     assert _row(org, "team-skill").org_allowed is False
     out = _share(org, ADMIN, "team-skill", _viewer(ADMIN, admin=True, share_org=True), admin=True, org_allowed=True)
     assert out["access"]["orgAllowed"] is True
     _refused(
-        lambda: _share(org, BOB, "team-skill", bob, org_allowed=False), 403, skills_ep.SHARING_OWNER_REFUSAL,
+        lambda: _share(org, BOB, "team-skill", bob, org_allowed=False), 403, sharing_ep.SHARING_OWNER_REFUSAL,
     )
     out = _share(org, ALICE, "team-skill", _viewer(ALICE, teams=(TEAM_ENG,), share_org=True), org_allowed=False)
     assert out["access"]["orgAllowed"] is False
@@ -690,7 +788,7 @@ def test_org_wide_also_takes_owning_the_skill_or_admin(org):
 
 def test_an_owners_skill_is_listed_by_its_audience(org):
     """The owner's section follows who the skill reaches: only them or
-    people is "mine", a team is "team", org-wide is "org"."""
+    people is "mine", a team is "team", everyone is "org"."""
     _create(org, ALICE, "mine")
     alice = _viewer(ALICE, teams=(TEAM_ENG,), share_org=True)
     assert _listed(org, ALICE, alice)["mine"]["section"] == "mine"
@@ -706,15 +804,12 @@ def test_an_owners_skill_is_listed_by_its_audience(org):
     assert out["section"] == "mine"
 
 
-TEAM_ALL = "team-everyone"
-
-
 def _with_default(viewer: SkillViewer) -> SkillViewer:
     """``viewer`` in an org whose default team (everyone) is TEAM_ALL."""
     return replace(viewer, team_ids=viewer.team_ids | {TEAM_ALL}, default_team_id=TEAM_ALL)
 
 
-def test_sharing_with_the_default_team_is_sharing_org_wide(org):
+def test_sharing_with_the_default_team_is_sharing_with_everyone(org):
     _create(org, ALICE, "shared")
 
     member = _with_default(_viewer(ALICE, teams=(TEAM_ENG,)))
@@ -731,42 +826,42 @@ def test_sharing_with_the_default_team_is_sharing_org_wide(org):
     assert (row.org_allowed, row.allowed_team_ids) == (True, [TEAM_ENG])
 
 
-def test_a_stored_default_team_share_reads_as_org_wide(org):
+def test_a_stored_default_team_share_reads_as_shared_with_everyone(org):
     _create(org, ALICE, "everyone")
     _store_rule(org, "everyone", SkillAccessRule(owner_user_id=ALICE, allowed_team_ids=(TEAM_ALL,), always_on=True))
     bob = _with_default(_viewer(BOB))
     seen = _listed(org, BOB, bob)["everyone"]
     assert (seen["section"], seen["access"]["orgAllowed"], seen["access"]["allowedTeamIds"]) == ("org", True, [])
-    # Org-wide's edit rule: a member of the default team alone doesn't change it.
+    # Everyone's edit rule: a member of the default team alone doesn't change it.
     assert seen["canEdit"] is False
-    assert _listed(org, BOB, replace(bob, can_write_org=True))["everyone"]["canEdit"] is True
+    assert _listed(org, BOB, replace(bob, can_write_skills_org=True))["everyone"]["canEdit"] is True
     assert build_turn_skills(org.as_(BOB).scope, project_name="general", viewer=bob, session=org.as_(BOB))[
         "everyone"
-    ]["always_on"] is True
-    # Rewritten as org-wide the next time its access is saved.
+    ].always_on is True
+    # Rewritten as org_allowed the next time its access is saved.
     _share(org, ALICE, "everyone", _with_default(_viewer(ALICE)), allowed_user_ids=[CAROL])
     row = _row(org, "everyone")
     assert (row.org_allowed, row.allowed_team_ids, row.allowed_user_ids) == (True, [], [CAROL])
 
 
-def test_the_viewer_learns_the_default_team_from_the_access_service(monkeypatch):
-    hub_teams.reset_caches_for_tests()
+def test_the_viewer_learns_the_default_team_from_mindshub(monkeypatch):
+    mindshub_teams.reset_caches_for_tests()
 
-    async def get_auth_json(path, bearer):
-        if path == hub_teams.TEAMS_PATH:
+    async def mindshub_read(path, bearer):
+        if path == mindshub_teams.TEAMS_PATH:
             return {"results": [{"id": TEAM_ENG}, {"id": TEAM_ALL, "is_default": True}]}
         return {"permissions": []}
 
-    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", auth_replies(mindshub_read))
     viewer = asyncio.run(resolve_skill_viewer(
         scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE),
         principal=_principal(ALICE), bearer_token="t",
     ))
     assert viewer.default_team_id == TEAM_ALL
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
 
 
-def test_an_org_mode_shared_only_body_changes_nothing(org):
+def test_a_mindshub_mode_shared_only_body_changes_nothing(org):
     """The personal-partition body, {"shared": bool}, reaches the org route as
     an audience with nothing set, which keeps what the skill has."""
     _create(org, ALICE, "shared")
@@ -816,7 +911,7 @@ def test_a_rename_moves_the_row_and_a_delete_removes_it(org):
     assert renamed["access"]["allowedTeamIds"] == [TEAM_ENG]
     assert _row(org, "team-skill") is None
     row = _row(org, "eng-skill")
-    assert (row.owner_user_id, row.allowed_team_ids, row.allowed_user_ids) == (ALICE, [TEAM_ENG], [CAROL])
+    assert (row.owner_user_id, row.allowed_team_ids, row.allowed_user_ids) == (UUID(ALICE), [TEAM_ENG], [CAROL])
     assert "eng-skill" in _listed(org, CAROL, _viewer(CAROL))
 
     skills_ep.delete_skill("eng-skill", org.as_(BOB), _principal(BOB), bob)
@@ -824,10 +919,10 @@ def test_a_rename_moves_the_row_and_a_delete_removes_it(org):
     # A new skill of the old name starts over as its creator's alone.
     _create(org, DAVE, "eng-skill")
     assert "eng-skill" not in _listed(org, CAROL, _viewer(CAROL))
-    assert _row(org, "eng-skill").owner_user_id == DAVE
+    assert _row(org, "eng-skill").owner_user_id == UUID(DAVE)
 
 
-def test_an_org_wide_skill_takes_write_org_to_change_unless_you_own_it(org):
+def test_a_skill_shared_with_everyone_takes_write_org_to_change_unless_you_own_it(org):
     _create(org, ALICE, "policy")
     _share(org, ALICE, "policy", _viewer(ALICE, share_org=True), org_allowed=True)
 
@@ -836,7 +931,7 @@ def test_an_org_wide_skill_takes_write_org_to_change_unless_you_own_it(org):
             "policy", SkillUpdateRequest(instructions=f"{user} edit"), org.as_(user), _principal(user), viewer,
         )
 
-    # Its owner keeps changing it, org-wide or not.
+    # Its owner keeps changing it, whoever it is shared with.
     assert edit(ALICE, _viewer(ALICE))["declarative"] == f"{ALICE} edit"
     _refused(lambda: edit(CAROL, _viewer(CAROL)), 403, "skills.write_org")
     _refused(
@@ -929,36 +1024,38 @@ def test_an_edit_rechecks_a_sharing_change_made_while_it_waited(org, monkeypatch
     assert SkillService(org.as_(ALICE).scope).get_skill("team-skill").instructions == "Body of team-skill."
 
 
-# ── the credential and the auth service being unreachable ────────────────────
+# ── the credential and MindsHub being unreachable ────────────────────
 
 
 def test_a_credential_from_another_org_grants_nothing(org, monkeypatch):
     """A Member of this org presents, in X-MindsHub-Authorization, a
     credential from another org of theirs whose entitlements list
     skills.share_org. The viewer reads teams and permissions with the
-    Authorization the gateway validated, so making a skill org-wide is still
-    a 403, and every read to the auth service carried that bearer."""
-    hub_teams.reset_caches_for_tests()
+    Authorization the gateway validated, so sharing a skill with everyone is still
+    a 403, and every read to MindsHub carried that bearer."""
+    mindshub_teams.reset_caches_for_tests()
     asked: list[tuple[str, str]] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         asked.append((path, bearer))
         if bearer == "other-org-credential":
             return {"permissions": ["skills.share_org", "skills.write_org"], "results": []}
-        if path == hub_teams.ENTITLEMENTS_PATH:
+        if path == mindshub_teams.ENTITLEMENTS_PATH:
             return {"permissions": []}
         return {"results": [{"id": TEAM_ENG}]}
 
-    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", auth_replies(mindshub_read))
     _create(org, ALICE, "shared")
     scope = org.as_(ALICE).scope
     viewer = asyncio.run(skills_ep.get_skill_viewer(member_request(), scope, _principal(ALICE)))
 
-    assert (viewer.can_share_org, viewer.can_write_org, viewer.permissions_known) == (False, False, True)
-    _refused(lambda: _share(org, ALICE, "shared", viewer, org_allowed=True), 403, skills_ep.SHARING_ORG_REFUSAL)
+    assert (viewer.can_share_skills_org, viewer.can_write_skills_org, viewer.permissions_known) == (
+        False, False, True,
+    )
+    _refused(lambda: _share(org, ALICE, "shared", viewer, org_allowed=True), 403, sharing_ep.SHARING_ORG_REFUSAL)
     assert _row(org, "shared").org_allowed is False
     assert {bearer for _path, bearer in asked} == {MEMBER_BEARER}
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
 
 
 def test_the_turn_reads_the_callers_teams_with_the_gateway_credential(monkeypatch):
@@ -967,8 +1064,8 @@ def test_the_turn_reads_the_callers_teams_with_the_gateway_credential(monkeypatc
     built: list[str] = []
 
     class _Handler:
-        def __init__(self, *, principal, hub_bearer):
-            built.append(hub_bearer)
+        def __init__(self, *, principal, mindshub_bearer):
+            built.append(mindshub_bearer)
             raise RuntimeError("stop here")
 
     monkeypatch.setattr(responses_ep, "ResponsesHandler", _Handler)
@@ -979,8 +1076,8 @@ def test_the_turn_reads_the_callers_teams_with_the_gateway_credential(monkeypatc
 
 
 def test_an_unreachable_permissions_read_is_a_503_not_a_403(org):
-    """While the auth service can't list the caller's permissions, a change
-    that rests on them answers 503 hub_unavailable, never the 403 that says
+    """While MindsHub can't list the caller's permissions, a change
+    that rests on them answers 503 mindshub_unreachable, never the 403 that says
     they lack a permission they may hold."""
     _create(org, ALICE, "shared")
     blind = _viewer(ALICE, teams=(TEAM_ENG,), perms_known=False)
@@ -989,7 +1086,7 @@ def test_an_unreachable_permissions_read_is_a_503_not_a_403(org):
         with pytest.raises(HTTPException) as caught:
             _share(org, ALICE, "shared", replace(blind, team_ids=blind.team_ids | {TEAM_ALL}, default_team_id=TEAM_ALL),
                    **change)
-        assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+        assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
     assert _row(org, "shared").org_allowed is False
     # A change that needs no permission still goes through.
     assert _share(org, ALICE, "shared", blind, allowed_user_ids=[BOB])["access"]["allowedUserIds"] == [BOB]
@@ -997,13 +1094,13 @@ def test_an_unreachable_permissions_read_is_a_503_not_a_403(org):
     _share(org, ADMIN, "shared", _viewer(ADMIN, admin=True), admin=True, org_allowed=True)
     with pytest.raises(HTTPException) as caught:
         _share(org, BOB, "shared", _viewer(BOB, perms_known=False), always_on=True)
-    assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+    assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
     with pytest.raises(HTTPException) as caught:
         skills_ep.update_skill(
             "shared", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB), _principal(BOB),
             _viewer(BOB, perms_known=False),
         )
-    assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+    assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
 
 
 def test_an_unreachable_team_listing_is_a_503_for_a_team_change(org):
@@ -1013,35 +1110,35 @@ def test_an_unreachable_team_listing_is_a_503_for_a_team_change(org):
 
     with pytest.raises(HTTPException) as caught:
         _share(org, ALICE, "team-skill", _viewer(ALICE, known=False), allowed_team_ids=[TEAM_ENG, TEAM_OPS])
-    assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+    assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
     # Carol, named on it, would be a 403 if her teams were known; unknown, a 503.
     with pytest.raises(HTTPException) as caught:
         _share(org, CAROL, "team-skill", _viewer(CAROL, known=False), always_on=True)
-    assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+    assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
     _refused(lambda: _share(org, CAROL, "team-skill", _viewer(CAROL), always_on=True), 403)
 
 
 def test_the_viewer_knows_when_permissions_could_not_be_read(monkeypatch):
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
 
-    async def get_auth_json(path, bearer):
-        return {"results": [{"id": TEAM_ENG}]} if path == hub_teams.TEAMS_PATH else None
+    async def mindshub_read(path, bearer):
+        return {"results": [{"id": TEAM_ENG}]} if path == mindshub_teams.TEAMS_PATH else None
 
-    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
     viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token="t"))
-    assert (viewer.teams_known, viewer.permissions_known, viewer.can_share_org) == (True, False, False)
+    assert (viewer.teams_known, viewer.permissions_known, viewer.can_share_skills_org) == (True, False, False)
     admin = asyncio.run(resolve_skill_viewer(
         scope=TenantScope(org_mode=True, org_id=ORG_ID, user_id=ADMIN),
         principal=_principal(ADMIN, admin=True), bearer_token="t",
     ))
-    assert (admin.permissions_known, admin.can_share_org) == (True, True)
-    hub_teams.reset_caches_for_tests()
+    assert (admin.permissions_known, admin.can_share_skills_org) == (True, True)
+    mindshub_teams.reset_caches_for_tests()
 
 
 def test_adding_a_team_while_the_teams_are_unreadable_is_a_503_even_for_an_admin(org):
     """The org's default team is never stored: named among the teams it is
-    org-wide. While the caller's teams can't be read the default team can't
+    everyone. While the caller's teams can't be read the default team can't
     be told apart, so a change that adds a team is a 503, an admin's
     included, and nothing is written. Keeping the teams the skill has still
     saves."""
@@ -1050,7 +1147,7 @@ def test_adding_a_team_while_the_teams_are_unreadable_is_a_503_even_for_an_admin
     admin = _viewer(ADMIN, admin=True, known=False)
     with pytest.raises(HTTPException) as caught:
         _share(org, ADMIN, "shared", admin, admin=True, allowed_team_ids=[TEAM_ENG, TEAM_ALL])
-    assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+    assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
     row = _row(org, "shared")
     assert (row.org_allowed, row.allowed_team_ids) == (False, [TEAM_ENG])
     out = _share(org, ADMIN, "shared", admin, admin=True, allowed_team_ids=[TEAM_ENG], allowed_user_ids=[BOB])
@@ -1059,31 +1156,31 @@ def test_adding_a_team_while_the_teams_are_unreadable_is_a_503_even_for_an_admin
 
 def test_a_kept_team_the_org_deleted_stays_and_grants_nothing(org):
     """A team deleted after the skill was shared with it is kept on the
-    owner's next save, which asks the auth service for no list of the org's
+    owner's next save, which asks MindsHub for no list of the org's
     teams: its id matches no one's teams, so it grants nothing."""
     _create(org, ALICE, "shared")
-    _store_rule(org, "shared", SkillAccessRule(owner_user_id=ALICE, allowed_team_ids=(TEAM_ENG, "team-gone")))
+    _store_rule(org, "shared", SkillAccessRule(owner_user_id=ALICE, allowed_team_ids=(TEAM_ENG, TEAM_ELSEWHERE)))
     out = _share(org, ALICE, "shared", _viewer(ALICE, teams=(TEAM_ENG,)), allowed_user_ids=[BOB])
-    assert out["access"]["allowedTeamIds"] == [TEAM_ENG, "team-gone"]
-    assert "shared" not in _listed(org, CAROL, _viewer(CAROL, teams=("team-other",)))
+    assert out["access"]["allowedTeamIds"] == [TEAM_ENG, TEAM_ELSEWHERE]
+    assert "shared" not in _listed(org, CAROL, _viewer(CAROL, teams=(TEAM_OPS,)))
 
 
-def test_a_skill_is_shared_with_at_most_the_access_services_number_of_people(org):
+def test_a_skill_is_shared_with_at_most_mindshubs_number_of_people(org):
     _create(org, ALICE, "shared")
-    people = [str(uuid4()) for _ in range(MAX_SHARED_PEOPLE + 1)]
+    people = [str(uuid4()) for _ in range(MAX_PEOPLE_PER_RULE + 1)]
     _refused(
         lambda: _share(org, ALICE, "shared", allowed_user_ids=people),
         400,
-        f"A skill can be shared with at most {MAX_SHARED_PEOPLE} people.",
+        f"A skill can be shared with at most {MAX_PEOPLE_PER_RULE} people.",
     )
-    assert MAX_SHARED_PEOPLE == 100
+    assert MAX_PEOPLE_PER_RULE == 100
 
 
 # ── always on ────────────────────────────────────────────────────────────────
 
 
-ALWAYS_ON_UNSHARED = "Only skills shared with the organization or a team can be always on."
-ALWAYS_ON_ORG = skills_ep.ALWAYS_ON_ORG_REFUSAL
+ALWAYS_ON_UNSHARED = "Only a skill shared with everyone or with a team can be always on."
+ALWAYS_ON_ORG = sharing_ep.ALWAYS_ON_ORG_REFUSAL
 
 
 def _stored_always_on(org, slug: str) -> bool:
@@ -1110,7 +1207,7 @@ def test_always_on_needs_an_org_or_team_share(org):
     assert (out["access"]["alwaysOn"], _stored_always_on(org, "private")) == (True, True)
 
 
-def test_an_org_wide_skill_takes_share_org_to_be_always_on(org):
+def test_a_skill_shared_with_everyone_takes_share_org_to_be_always_on(org):
     _legacy_skill(org.as_(ALICE).scope, "house-style")
     _create(org, ALICE, "rules")
     _share(org, ALICE, "rules", _viewer(ALICE, share_org=True), org_allowed=True)
@@ -1125,7 +1222,7 @@ def test_an_org_wide_skill_takes_share_org_to_be_always_on(org):
     out = _share(org, ADMIN, "rules", _viewer(ADMIN, admin=True), admin=True, always_on=False)
     assert out["access"]["alwaysOn"] is False
     assert _stored_always_on(org, "rules") is False
-    # A skill from before sharing is org-wide, so it can be made always on too.
+    # A skill from before sharing is shared with everyone, so it can be made always on too.
     out = _share(org, BOB, "house-style", _viewer(BOB, share_org=True), always_on=True)
     assert (out["access"]["orgAllowed"], out["access"]["alwaysOn"]) == (True, True)
     assert (_row(org, "house-style").org_allowed, _row(org, "house-style").always_on) == (True, True)
@@ -1161,7 +1258,7 @@ def test_the_sharing_body_accepts_the_camel_case_spelling(org):
     _create(org, ALICE, "team-skill")
     body = SkillSharingRequest.model_validate({"allowedTeamIds": [TEAM_ENG], "alwaysOn": True, "orgAllowed": None})
     assert (body.allowed_team_ids, body.always_on) == ([TEAM_ENG], True)
-    out = skills_ep.set_skill_sharing(
+    out = sharing_ep.set_skill_sharing(
         "team-skill", body, org.as_(ALICE), _principal(ALICE), _viewer(ALICE, teams=(TEAM_ENG,)),
     )
     assert out["access"]["alwaysOn"] is True
@@ -1225,27 +1322,27 @@ def test_the_pod_gets_only_visible_skills_with_always_on_first(org):
         org.as_(BOB).scope, project_name="general", viewer=_viewer(BOB, teams=(TEAM_ENG,)), session=org.as_(BOB),
     )
 
-    always_on = [slug for slug, entry in block.items() if entry.get("always_on")]
+    always_on = [slug for slug, entry in block.items() if entry.always_on]
     assert always_on == ["alpha-org", "beta-team"]
     assert list(block)[:2] == always_on
     assert {"gamma-person", "bob-own", "zeta-legacy", "omega-legacy-claims", "delta-org", "eta-team"} <= set(block)
-    assert not any(block[slug].get("always_on") for slug in ("zeta-legacy", "omega-legacy-claims", "delta-org"))
+    assert not any(block[slug].always_on for slug in ("zeta-legacy", "omega-legacy-claims", "delta-org"))
     assert not {"dave-private", "off-org", "elsewhere-team"} & set(block)
-    assert not any(block[slug].get("always_on") for slug in BUILTIN_SKILL_SLUGS if slug in block)
-    assert block["alpha-org"]["files"]["SKILL.md"].startswith("---\n")
+    assert not any(block[slug].always_on for slug in BUILTIN_SKILL_SLUGS if slug in block)
+    assert block["alpha-org"].files["SKILL.md"].startswith("---\n")
     # Without the rows (no session) every skill is nobody's but a built-in.
     blind = build_turn_skills(org.as_(BOB).scope, project_name="general", viewer=_viewer(BOB, teams=(TEAM_ENG,)))
     assert set(blind) <= set(BUILTIN_SKILL_SLUGS)
 
 
-def test_a_turn_without_a_viewer_gets_only_org_wide_skills_always_on(org):
+def test_a_turn_without_a_viewer_gets_only_skills_shared_with_everyone_always_on(org):
     """No caller credential (a scheduled or channel turn): the fail-closed
-    viewer's set, so only org-wide skills apply always on, and no team-only
+    viewer's set, so only skills shared with everyone apply always on, and no team-only
     skill is there to recall."""
     _turn_fixture(org)
 
     block = build_turn_skills(org.as_(BOB).scope, project_name="general", viewer=None, session=org.as_(BOB))
-    assert [slug for slug, entry in block.items() if entry.get("always_on")] == ["alpha-org"]
+    assert [slug for slug, entry in block.items() if entry.always_on] == ["alpha-org"]
     assert not {"beta-team", "eta-team", "dave-private"} & set(block)
     assert {"alpha-org", "delta-org", "gamma-person", "bob-own"} <= set(block)
 
@@ -1266,7 +1363,7 @@ def test_the_request_sheds_on_demand_skills_before_always_on_ones(monkeypatch):
     assert list(fitted["skills"]) == ["rule"]
 
     # Not even the always-on ones fit: the block stays, empty, so the pod
-    # recalls nothing rather than its whole skills volume.
+    # recalls nothing rather than fall back to a mounted skills tree.
     params = {"input": "hi", "skills": {"rule": {"files": {"SKILL.md": "r" * 3000}, "always_on": True}}}
     assert _fit_request(params, "conv")["skills"] == {}
 
@@ -1308,6 +1405,40 @@ def test_the_request_sheds_on_demand_skills_one_at_a_time_before_project_memory(
     fitted = fit(size("rule") - 1)
     assert ("memory" in fitted, list(fitted["skills"])) == (False, ["rule"])
     assert _request_wire_size(fitted) == size("rule", with_memory=False)
+
+
+def test_the_shed_and_drop_warnings_carry_their_values_as_fields(monkeypatch, caplog):
+    """The JSON log keeps a line's message template and drops its % values,
+    so the shed and drop warnings say which turn and how much in fields: the
+    conversation, how many skills went, and the request's size against its
+    cap."""
+    from cowork.turnqueue import producer
+
+    monkeypatch.setattr(producer, "_MAX_REQUEST_BYTES", 2000)
+    monkeypatch.setattr(producer, "_REQUEST_BYTES_MARGIN", 0)
+    params = {
+        "input": "hi",
+        "memory": {"project": {"rules": "m" * 3000}},
+        "skills": {"big": {"files": {"SKILL.md": "b" * 3000}}, "bigger": {"files": {"SKILL.md": "c" * 3000}}},
+    }
+    with caplog.at_level(logging.WARNING, logger="cowork.turnqueue.producer"):
+        _fit_request(params, "conv-7")
+    warned = {
+        r.event: r for r in caplog.records
+        if r.name == "cowork.turnqueue.producer" and r.levelno == logging.WARNING and hasattr(r, "event")
+    }
+    shed, dropped = warned["turn_skills_shed"], warned["turn_memory_dropped"]
+    assert (shed.conversation_id, shed.count, shed.cap_bytes, shed.args) == ("conv-7", 2, 2000, ())
+    assert shed.request_bytes > shed.cap_bytes
+    assert (dropped.conversation_id, dropped.cap_bytes, dropped.args) == ("conv-7", 2000, ())
+    # The deployments' JSON log keeps each of those fields.
+    from cowork.common.structured_logging import make_formatter
+
+    line = json.loads(make_formatter().format(shed))
+    assert {k: line.get(k) for k in ("event", "conversation_id", "count", "request_bytes", "cap_bytes")} == {
+        "event": "turn_skills_shed", "conversation_id": "conv-7", "count": 2,
+        "request_bytes": shed.request_bytes, "cap_bytes": 2000,
+    }
 
 
 def test_the_producer_sends_the_skills_block(monkeypatch):
@@ -1355,13 +1486,33 @@ def test_the_producer_sends_the_skills_block(monkeypatch):
         with pytest.raises(RuntimeError):
             await gen.__anext__()
 
-    block = {"rule": {"files": {"SKILL.md": "---\nname: rule\n---\nx"}, "always_on": True}}
+    block = {
+        "rule": TurnSkillEntry(files={"SKILL.md": "---\nname: rule\n---\nx"}, always_on=True),
+        "notes": TurnSkillEntry(files={"SKILL.md": "---\nname: notes\n---\ny"}),
+    }
     asyncio.run(run(block))
     asyncio.run(run({}))
     asyncio.run(run(None))
-    assert captured[0]["skills"] == block
+    # The wire the pod reads: always_on only on an always-on skill.
+    assert captured[0]["skills"] == {
+        "rule": {"files": {"SKILL.md": "---\nname: rule\n---\nx"}, "always_on": True},
+        "notes": {"files": {"SKILL.md": "---\nname: notes\n---\ny"}},
+    }
     assert captured[1]["skills"] == {}
     assert captured[2]["skills"] == {}
+
+
+def test_a_turn_skill_entry_is_frozen():
+    """The producer serializes the entries build_turn_skills made, so no field
+    of one can be reassigned on the way, as in the pod's own model."""
+    from pydantic import ValidationError
+
+    entry = TurnSkillEntry(files={"SKILL.md": "x"})
+    with pytest.raises(ValidationError):
+        entry.always_on = True
+    with pytest.raises(ValidationError):
+        entry.files = {}
+    assert entry == TurnSkillEntry(files={"SKILL.md": "x"})
 
 
 # ── desktop and local deployments ────────────────────────────────────────────
@@ -1377,26 +1528,52 @@ def test_local_deployments_are_unchanged(monkeypatch, tmp_path):
         service.create_skill("desk", "Desk body.")
         assert SkillService(LOCAL_SCOPE).get_skill("desk").created_by is None
         assert build_turn_skills(LOCAL_SCOPE, project_name="general") == {
-            "desk": {"files": {"SKILL.md": (service.root / "desk" / "SKILL.md").read_text()}}
+            "desk": TurnSkillEntry(files={"SKILL.md": (service.root / "desk" / "SKILL.md").read_text()})
         }
-        assert skills_ep.skill_sharing_capabilities(None) == {
-            "enabled": False, "canShareOrg": False, "canWriteOrg": False, "orgName": None,
+        # Nothing to ask outside MindsHub mode, so nothing is unknown.
+        assert sharing_ep.skill_sharing_capabilities(None) == {
+            "enabled": False, "canShareSkillsOrg": False, "canWriteSkillsOrg": False,
+            "canShareArtifactsOrg": False, "permissionsKnown": True, "teamsKnown": True,
         }
     finally:
         get_app_settings.cache_clear()
 
 
 def test_sharing_capabilities_report_the_viewer():
-    assert skills_ep.skill_sharing_capabilities(_viewer(BOB, share_org=True)) == {
-        "enabled": True, "canShareOrg": True, "canWriteOrg": False, "orgName": None,
+    assert sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_org=True)) == {
+        "enabled": True, "canShareSkillsOrg": True, "canWriteSkillsOrg": False,
+        "canShareArtifactsOrg": False, "permissionsKnown": True, "teamsKnown": True,
     }
-    assert skills_ep.skill_sharing_capabilities(_viewer(ADMIN, admin=True))["canWriteOrg"] is True
+    admin = sharing_ep.skill_sharing_capabilities(_viewer(ADMIN, admin=True))
+    assert (admin["canShareSkillsOrg"], admin["canWriteSkillsOrg"], admin["canShareArtifactsOrg"]) == (
+        True, True, True,
+    )
+    artifacts_only = sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_artifacts_org=True))
+    assert (artifacts_only["canShareSkillsOrg"], artifacts_only["canShareArtifactsOrg"]) == (False, True)
+
+
+def test_sharing_capabilities_say_when_mindshub_could_not_be_asked(monkeypatch):
+    """A false capability while MindsHub couldn't be asked is "couldn't
+    ask", not "may not": the answer says which, so the app shows "Couldn't
+    reach MindsHub" instead of a permission lock."""
+    mindshub_sharing_answers(monkeypatch, teams=None, permissions=None)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
+    viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token=MEMBER_BEARER))
+    answer = sharing_ep.skill_sharing_capabilities(viewer)
+    assert (answer["enabled"], answer["canShareSkillsOrg"], answer["permissionsKnown"], answer["teamsKnown"]) == (
+        True, False, False, False,
+    )
+    mindshub_sharing_answers(monkeypatch, permissions=("skills.share_org",))
+    viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token=MEMBER_BEARER))
+    answer = sharing_ep.skill_sharing_capabilities(viewer)
+    assert (answer["canShareSkillsOrg"], answer["permissionsKnown"], answer["teamsKnown"]) == (True, True, True)
+    mindshub_teams.reset_caches_for_tests()
 
 
 # ── people must be in the org ────────────────────────────────────────────────
 
 
-def test_sharing_with_people_all_in_the_org_asks_the_access_service_once(org):
+def test_sharing_with_people_all_in_the_org_asks_mindshub_once(org):
     _create(org, ALICE, "shared")
     calls: list = []
     out = _share(org, ALICE, "shared", members=_members(calls=calls), allowed_user_ids=[BOB, CAROL.upper()])
@@ -1414,7 +1591,7 @@ def test_sharing_with_someone_outside_the_org_is_refused_naming_them(org):
     assert _row(org, "shared").allowed_user_ids == []
 
 
-def test_sharing_with_people_while_the_access_service_is_unreachable_is_a_503(org):
+def test_sharing_with_people_while_mindshub_is_unreachable_is_a_503(org):
     _create(org, ALICE, "shared")
 
     async def unreachable(asked):
@@ -1449,7 +1626,7 @@ def test_an_id_added_without_the_check_is_a_conflict(org):
     confirm (the skill changed in between) isn't written."""
     _create(org, ALICE, "shared")
     _refused(
-        lambda: skills_ep.set_skill_sharing(
+        lambda: sharing_ep.set_skill_sharing(
             "shared", SkillSharingRequest(allowed_user_ids=[BOB]), org.as_(ALICE), _principal(ALICE),
             _viewer(ALICE), frozenset(),
         ),
@@ -1457,14 +1634,38 @@ def test_an_id_added_without_the_check_is_a_conflict(org):
     )
 
 
-def test_the_route_lookup_asks_the_access_service_by_id(monkeypatch):
+def test_the_stored_rule_read_lets_a_database_failure_through(org, monkeypatch):
+    """The check before PUT /sharing takes its lock reads the stored rule to
+    ask MindsHub only about people it adds. None only for a skill the caller
+    can't see or whose name is refused; a database failure raises rather
+    than reading as "no stored rule", which would ask about every person
+    kept and answer 503 for an edit that adds nobody."""
+    from sqlalchemy.exc import OperationalError
+
+    _create(org, ALICE, "shared")
+    viewer = _viewer(ALICE)
+    assert asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE), viewer)) == SkillAccessRule(
+        owner_user_id=ALICE,
+    )
+    assert asyncio.run(sharing_ep.stored_sharing_rule("missing", org.as_(ALICE), viewer)) is None
+    assert asyncio.run(sharing_ep.stored_sharing_rule("Not A Slug", org.as_(ALICE), viewer)) is None
+
+    def database_down(self, skill):
+        raise OperationalError("SELECT", {}, Exception("database is down"))
+
+    monkeypatch.setattr(SkillService, "access_rule", database_down)
+    with pytest.raises(OperationalError):
+        asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE), viewer))
+
+
+def test_the_route_lookup_asks_mindshub_by_id(monkeypatch):
     calls: list[tuple[str, str]] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         calls.append((path, bearer))
         return {"results": [{"id": BOB.upper(), "name": "Bob", "email": "bob@x.com"}]}
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
     lookup = get_org_member_lookup(member_request())
     assert asyncio.run(lookup([BOB, EVE])) == frozenset({BOB})
     # With the gateway's credential, never the client-set one.
@@ -1474,184 +1675,194 @@ def test_the_route_lookup_asks_the_access_service_by_id(monkeypatch):
 def test_the_org_membership_lookup_batches_and_fails_closed(monkeypatch):
     calls: list[str] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         calls.append(path)
-        return {"results": [{"id": "u1", "name": "Bob", "email": "bob@x.com"}, {"id": "stranger"}]}
+        return {"results": [{"id": BOB, "name": "Bob", "email": "bob@x.com"}, {"id": EVE}]}
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
-    found = asyncio.run(hub_people.org_members_by_ids(bearer_token="t", ids=["U1", "u2"]))
-    # Only what was asked; an id the auth service didn't return is not a member.
-    assert [(m.id, m.name) for m in found] == [("u1", "Bob")]
-    assert calls == ["/me/org-members/?ids=u1%2Cu2"]
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
+    found = asyncio.run(mindshub_people.org_members_by_ids(bearer_token="t", ids=[BOB.upper(), CAROL]))
+    # Only what was asked; an id MindsHub didn't return is not a member.
+    assert [(m.id, m.name) for m in found] == [(BOB, "Bob")]
+    assert calls == [f"/me/org-members/?ids={BOB}%2C{CAROL}"]
 
     calls.clear()
-    asyncio.run(hub_people.org_members_by_ids(bearer_token="t", ids=[f"p{i}" for i in range(60)]))
+    asyncio.run(mindshub_people.org_members_by_ids(bearer_token="t", ids=[str(uuid4()) for _ in range(60)]))
     assert len(calls) == 2
 
     async def down(path, bearer):
         return None
 
-    monkeypatch.setattr(hub_people, "get_auth_json", down)
-    assert asyncio.run(hub_people.org_members_by_ids(bearer_token="t", ids=["u1"])) is None
-    assert asyncio.run(hub_people.org_members_by_ids(bearer_token="", ids=["u1"])) is None
-    assert asyncio.run(hub_people.org_members_by_ids(bearer_token="t", ids=[])) == []
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(down))
+    assert asyncio.run(mindshub_people.org_members_by_ids(bearer_token="t", ids=[BOB])) is None
+    assert asyncio.run(mindshub_people.org_members_by_ids(bearer_token="", ids=[BOB])) is None
+    assert asyncio.run(mindshub_people.org_members_by_ids(bearer_token="t", ids=[])) == []
 
 
 # ── hub people ───────────────────────────────────────────────────────────────
 
 
-def test_hub_people_names_stored_ids(monkeypatch):
+def test_mindshub_people_names_stored_ids(monkeypatch):
     calls: list[str] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         assert bearer == MEMBER_BEARER
         calls.append(path)
         return {"results": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}]}
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, ids=f"{BOB}, {EVE},"))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=f"{BOB}, {EVE},"))
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": False,
     }
     # Uncached.
-    asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, ids=BOB))
+    asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=BOB))
     assert calls == [f"/me/org-members/?ids={BOB}%2C{EVE}", f"/me/org-members/?ids={BOB}"]
 
     async def down(path, bearer):
         return None
 
-    monkeypatch.setattr(hub_people, "get_auth_json", down)
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, ids=BOB))
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(down))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=BOB))
     assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), LOCAL_SCOPE, ids=BOB))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), LOCAL_SCOPE, ids=BOB))
     assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
 
 
-def test_hub_people_asks_the_access_service_for_the_directory_without_params(monkeypatch):
+def test_mindshub_people_asks_mindshub_for_the_directory_without_params(monkeypatch):
     calls: list[str] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         calls.append(path)
         return {"results": [], "truncated": False}
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope))
     assert calls == ["/me/org-members/"]
 
 
-def test_hub_people_reads_the_org_directory_fresh_every_time(monkeypatch):
+def test_mindshub_people_reads_the_org_directory_fresh_every_time(monkeypatch):
     """The app is the directory's only reader and keeps its own copy, so this
-    server keeps none: every read asks the auth service, so a member who
+    server keeps none: every read asks MindsHub, so a member who
     joined a minute ago is listed."""
     calls: list[tuple[str, str]] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         calls.append((path, bearer))
         return {
             "results": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}, {"name": "no id"}],
             "truncated": True,
         }
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope))
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": True,
     }
     assert calls == [("/me/org-members/", MEMBER_BEARER)]
-    asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope))
     assert calls == [("/me/org-members/", MEMBER_BEARER)] * 2
-    asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, ids=BOB))
+    asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=BOB))
     assert calls[-1][0] == f"/me/org-members/?ids={BOB}"
     # Another caller asks with their own credential.
     other = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
-    asyncio.run(hub_people_ep.get_hub_people(member_request(bearer="other"), other))
+    asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(bearer="other"), other))
     assert calls[-1] == ("/me/org-members/", "other")
 
 
-def test_hub_people_failure_is_unreachable_and_the_next_read_asks_again(monkeypatch):
+def test_mindshub_people_failure_is_unreachable_and_the_next_read_asks_again(monkeypatch):
     calls: list[str] = []
     answers = [None, {"results": [{"id": BOB}]}]
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         calls.append(path)
         return answers[min(len(calls), len(answers)) - 1]
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope))
     assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope))
     assert len(calls) == 2
-    # A plain list or no flag from the auth service: not truncated.
+    # A plain list or no flag from MindsHub: not truncated.
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "people": [{"id": BOB, "name": "", "email": ""}], "truncated": False,
     }
 
 
-def test_hub_people_the_access_service_refusing_the_caller_is_unreachable(monkeypatch):
-    """The auth service answers 403 to someone who is not a current member of
-    the active org: no directory and no lookup, reported rather than raised."""
-    from cowork.services import hub_workspaces
+def test_mindshub_people_a_refusal_from_mindshub_is_a_refusal_never_unreachable(monkeypatch):
+    """MindsHub answers 403 to someone who is not a current member of the
+    active org, and 429 to a caller it is throttling: it was asked and said
+    no, so the directory and a lookup answer that refusal, never the
+    retryable "couldn't reach MindsHub". Only no answer at all, or a 5xx, is
+    unreachable."""
+    from cowork.services import mindshub_client
 
     seen: list[str] = []
+    status_code = 403
     real_client = httpx.AsyncClient
 
     def client(**kwargs):
         def handle(request: httpx.Request) -> httpx.Response:
             seen.append(request.url.path)
-            return httpx.Response(403, json={"detail": "Not a member of this organization."})
+            return httpx.Response(status_code, json={"detail": "Not a member of this organization."})
 
         return real_client(transport=httpx.MockTransport(handle), **kwargs)
 
-    monkeypatch.setattr(hub_workspaces.httpx, "AsyncClient", client)
+    monkeypatch.setattr(mindshub_client.httpx, "AsyncClient", client)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    for status_code, answered, code in ((403, 403, "mindshub_refused"), (401, 403, "mindshub_refused"),
+                                        (400, 400, "mindshub_refused"), (429, 429, "mindshub_throttled")):
+        for query in ({}, {"ids": BOB}, {"emails": "bob@x.com"}):
+            with pytest.raises(HTTPException) as refused:
+                asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, **query))
+            assert (refused.value.status_code, refused.value.detail["code"]) == (answered, code)
+    assert seen and all(path.endswith("/me/org-members/") for path in seen)
+
+    status_code = 503
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=BOB))
     assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, ids=BOB))
-    assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
-    assert [path.endswith("/me/org-members/") for path in seen] == [True, True]
 
 
-def test_hub_people_outside_org_mode_is_empty_and_reachable(monkeypatch):
-    async def get_auth_json(path, bearer):
-        raise AssertionError("the auth service was asked outside org mode")
+def test_mindshub_people_outside_mindshub_mode_is_empty_and_reachable(monkeypatch):
+    async def mindshub_read(path, bearer):
+        raise AssertionError("MindsHub was asked outside MindsHub mode")
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), LOCAL_SCOPE))
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), LOCAL_SCOPE))
     assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), LOCAL_SCOPE, emails="bob@x.com"))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), LOCAL_SCOPE, emails="bob@x.com"))
     assert view.model_dump(by_alias=True) == {"reachable": True, "people": [], "truncated": False}
 
 
-def test_hub_people_finds_a_member_past_the_directory_cap_by_address(monkeypatch):
+def test_mindshub_people_finds_a_member_past_the_directory_cap_by_address(monkeypatch):
     """The directory the app lists is capped, so a member past the cap isn't
     on it. The address someone types still names them, asked of the access
     service, so the app shares with that person by id rather than inviting
     the address as someone outside the org."""
     calls: list[tuple[str, str]] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         calls.append((path, bearer))
         if path == "/me/org-members/":
             return {"results": [{"id": EVE, "name": "Eve", "email": "eve@x.com"}], "truncated": True}
         return {"results": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}]}
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
-    listed = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope))
+    listed = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope))
     assert listed.truncated and "bob@x.com" not in {p.email for p in listed.people}
 
     view = asyncio.run(
-        hub_people_ep.get_hub_people(member_request(), scope, emails=" Bob@X.com, nobody@y.com,")
+        mindshub_people_ep.get_mindshub_people(member_request(), scope, emails=" Bob@X.com, nobody@y.com,")
     )
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "people": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}], "truncated": False,
     }
     # With the gateway's credential, lowercased, and uncached.
-    asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, emails="bob@x.com"))
+    asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, emails="bob@x.com"))
     assert calls[1:] == [
         ("/me/org-members/?emails=bob%40x.com%2Cnobody%40y.com", MEMBER_BEARER),
         ("/me/org-members/?emails=bob%40x.com", MEMBER_BEARER),
@@ -1660,101 +1871,296 @@ def test_hub_people_finds_a_member_past_the_directory_cap_by_address(monkeypatch
     async def down(path, bearer):
         return None
 
-    monkeypatch.setattr(hub_people, "get_auth_json", down)
-    view = asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, emails="bob@x.com"))
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(down))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, emails="bob@x.com"))
     assert view.model_dump(by_alias=True) == {"reachable": False, "people": [], "truncated": False}
 
 
-def test_hub_people_refuses_ids_and_emails_together(monkeypatch):
-    async def get_auth_json(path, bearer):
-        raise AssertionError("the access service was asked")
+def test_mindshub_people_refuses_ids_and_emails_together(monkeypatch):
+    async def mindshub_read(path, bearer):
+        raise AssertionError("MindsHub was asked")
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
     with pytest.raises(HTTPException) as refused:
-        asyncio.run(hub_people_ep.get_hub_people(member_request(), scope, ids=BOB, emails="bob@x.com"))
+        asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=BOB, emails="bob@x.com"))
     assert refused.value.status_code == 400
 
 
 def test_the_org_member_lookup_by_address_batches_and_fails_closed(monkeypatch):
     calls: list[str] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         calls.append(path)
         return {"results": [{"id": BOB, "name": "Bob", "email": "Bob@x.com"}, {"id": EVE, "email": "eve@x.com"}]}
 
-    monkeypatch.setattr(hub_people, "get_auth_json", get_auth_json)
-    found = asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=["nobody@x.com", "BOB@x.com"]))
-    # Only what was asked; an address the access service didn't return is no member's.
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
+    found = asyncio.run(mindshub_people.org_members_by_emails(bearer_token="t", emails=["nobody@x.com", "BOB@x.com"]))
+    # Only what was asked; an address MindsHub didn't return is no member's.
     assert [(m.id, m.name) for m in found] == [(BOB, "Bob")]
     assert calls == ["/me/org-members/?emails=nobody%40x.com%2Cbob%40x.com"]
 
     calls.clear()
-    asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=[f"p{i}@x.com" for i in range(60)]))
+    asyncio.run(mindshub_people.org_members_by_emails(bearer_token="t", emails=[f"p{i}@x.com" for i in range(60)]))
     assert len(calls) == 2
 
     async def down(path, bearer):
         return None
 
-    monkeypatch.setattr(hub_people, "get_auth_json", down)
-    assert asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=["bob@x.com"])) is None
-    assert asyncio.run(hub_people.org_members_by_emails(bearer_token="", emails=["bob@x.com"])) is None
-    assert asyncio.run(hub_people.org_members_by_emails(bearer_token="t", emails=[])) == []
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(down))
+    assert asyncio.run(mindshub_people.org_members_by_emails(bearer_token="t", emails=["bob@x.com"])) is None
+    assert asyncio.run(mindshub_people.org_members_by_emails(bearer_token="", emails=["bob@x.com"])) is None
+    assert asyncio.run(mindshub_people.org_members_by_emails(bearer_token="t", emails=[])) == []
+
+
+def _never_asked(path, bearer):
+    raise AssertionError(f"MindsHub was asked {path}")
+
+
+def _refusal_body(response) -> tuple[int, dict]:
+    return response.status_code, json.loads(response.body)
+
+
+def test_mindshub_people_refuses_a_malformed_address_naming_it_before_asking_mindshub(monkeypatch):
+    """MindsHub refuses a whole lookup for one address it doesn't take, which
+    would leave every address in the batch at "couldn't check" however often
+    the app asked again. Each address is checked first by MindsHub's own rule:
+    one it wouldn't take answers 400 invalid_email naming every such address,
+    and MindsHub is never asked."""
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", _never_asked)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    refused = asyncio.run(mindshub_people_ep.get_mindshub_people(
+        member_request(), scope, emails="ann@acme.com, Jo@Acme.c, bob..smith@acme.com",
+    ))
+    assert _refusal_body(refused) == (400, {
+        "code": "invalid_email", "detail": "Each entry must be an email address.",
+        "emails": ["jo@acme.c", "bob..smith@acme.com"],
+    })
+
+
+def test_the_member_lookup_takes_an_address_exactly_when_mindshub_does():
+    """is_email_address is MindsHub's rule, Django 6.0's validate_email,
+    which MindsHub applies to each lowercased address. The expected answers
+    are Django's own for these inputs: Django is MindsHub's dependency, not
+    this server's, so they are copied here."""
+    django_answers = {
+        "ann@acme.com": True, "ann@acme.co.uk": True, "ann+tag@acme.io": True, "a@b.cd": True,
+        "ann@localhost": True, "ann@[127.0.0.1]": True, "ann@[::1]": True, "ann@acme.xn--p1ai": True,
+        "ann@bücher.de": True,
+        "jo@acme.c": False, "bob..smith@acme.com": False, ".ann@acme.com": False, "ann.@acme.com": False,
+        "ann@acme": False, "ann@-acme.com": False, "ann@acme-.com": False, "ann@acme..com": False,
+        "ann@acme.c0m": False, "ann@[300.1.1.1]": False, '"ann smith"@acme.com': False,
+        "ann smith@acme.com": False, "@acme.com": False, "ann@": False, "ann": False, "ann@acme.com.": False,
+        # 320 characters, Django's bound, and one past it.
+        "a" * 311 + "@acme.com": True, "a" * 312 + "@acme.com": False,
+    }
+    assert {address: mindshub_people.is_email_address(address) for address in django_answers} == django_answers
+
+
+def test_mindshub_people_refuses_an_id_that_is_not_a_uuid_before_asking_mindshub(monkeypatch):
+    """MindsHub keys people by UUID and refuses a whole lookup for one that
+    isn't, so such an id answers 400 invalid_id naming it, and MindsHub is
+    never asked. An id is asked in its canonical lowercase form."""
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", _never_asked)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    refused = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=f"{BOB}, bob, 42"))
+    assert _refusal_body(refused) == (
+        400, {"code": "invalid_id", "detail": "Each id must be a UUID.", "ids": ["bob", "42"]},
+    )
+
+    asked: list[str] = []
+
+    async def members(path, bearer):
+        asked.append(path)
+        return {"results": [{"id": BOB, "name": "Bob B", "email": "bob@x.com"}]}
+
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(members))
+    view = asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, ids=f"{BOB.upper()},{BOB}"))
+    assert [p.id for p in view.people] == [BOB]
+    assert asked == [f"/me/org-members/?ids={BOB}"]
+
+
+def test_mindshub_people_refuses_more_than_four_lookups_worth_before_asking_mindshub(monkeypatch):
+    """Each 50 values is one MindsHub lookup, asked in turn, so one request is
+    bounded by count: more than 200 distinct ids or addresses answers 400 and
+    asks MindsHub nothing. 200 are asked, in four lookups."""
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", _never_asked)
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    ids = [str(uuid4()) for _ in range(mindshub_people_ep.MAX_IDS_PER_REQUEST + 1)]
+    emails = [f"p{i}@x.com" for i in range(mindshub_people_ep.MAX_EMAILS_PER_REQUEST + 1)]
+    for query in ({"ids": ",".join(ids)}, {"emails": ",".join(emails)}):
+        with pytest.raises(HTTPException) as refused:
+            asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, **query))
+        assert refused.value.status_code == 400
+
+    asked: list[str] = []
+
+    async def members(path, bearer):
+        asked.append(path)
+        return {"results": []}
+
+    monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(members))
+    asyncio.run(mindshub_people_ep.get_mindshub_people(member_request(), scope, emails=",".join(emails[:-1])))
+    assert len(asked) == 4
 
 
 # ── hub teams ────────────────────────────────────────────────────────────────
 
 
-def test_hub_teams_lists_the_callers_teams_and_caches_them(monkeypatch):
-    hub_teams.reset_caches_for_tests()
+class _Clock:
+    """A monotonic clock a test moves by hand."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _throttle_records(caplog, outcome: str) -> list:
+    return [
+        r for r in caplog.records
+        if r.name == "cowork.services.mindshub_teams" and r.levelno == logging.WARNING
+        and getattr(r, "event", None) == "mindshub_throttled" and r.outcome == outcome
+    ]
+
+
+def test_a_throttled_read_keeps_the_last_known_teams_and_permissions_for_a_while(monkeypatch, caplog):
+    """MindsHub's 429 is its own state, never "unreachable": while it
+    throttles the caller, the teams and permissions it last gave are served
+    again and the throttle is logged, so team skills don't drop from turns.
+    Only for _MAX_THROTTLED_AGE_S after MindsHub gave them, so a caller who
+    keeps the throttle full can't keep a team or permission taken away;
+    with no answer that recent, or none at all, they are unknown."""
+    from cowork.services import mindshub_client
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    mindshub_teams.reset_caches_for_tests()
+    clock = _Clock()
+    monkeypatch.setattr(mindshub_client, "time", clock)
+    throttled = {"on": False}
+    asked: list[str] = []
+
+    async def mindshub(path, bearer):
+        asked.append(path)
+        if throttled["on"]:
+            return MindsHubReply(MindsHubAnswer.THROTTLED, status_code=429)
+        if path == mindshub_teams.TEAMS_PATH:
+            return MindsHubReply(MindsHubAnswer.OK, payload={"results": [{"id": TEAM_ENG}]}, status_code=200)
+        return MindsHubReply(MindsHubAnswer.OK, payload={"permissions": ["skills.share_org"]}, status_code=200)
+
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", mindshub)
+
+    def read():
+        return asyncio.run(mindshub_teams.fetch_teams_and_permissions(bearer_token="t", org_id=ORG_ID, user_id=BOB))
+
+    # Throttled before MindsHub ever answered: nothing known to serve.
+    throttled["on"] = True
+    with caplog.at_level(logging.WARNING, logger="cowork.services.mindshub_teams"):
+        teams, permissions = read()
+    assert (teams.reachable, permissions.reachable) == (False, False)
+    assert len(_throttle_records(caplog, "unknown")) == 2
+
+    mindshub_teams.reset_caches_for_tests()
+    throttled["on"] = False
+    read()
+    throttled["on"] = True
+    caplog.clear()
+    for elapsed in (61.0, 77.0, 93.0, 109.0):
+        clock.now = 1000.0 + elapsed
+        with caplog.at_level(logging.WARNING, logger="cowork.services.mindshub_teams"):
+            teams, permissions = read()
+        assert (teams.reachable, teams.team_ids, permissions.permissions) == (
+            True, frozenset({TEAM_ENG}), frozenset({"skills.share_org"}),
+        )
+    assert len(_throttle_records(caplog, "served_last_known")) == 8
+    # Asked again only once the throttled answer's short TTL passed.
+    asked.clear()
+    clock.now = 1000.0 + 110.0
+    read()
+    assert asked == []
+
+    clock.now = 1000.0 + 125.0
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cowork.services.mindshub_teams"):
+        teams, permissions = read()
+    assert (teams.reachable, permissions.reachable) == (False, False)
+    assert len(_throttle_records(caplog, "unknown")) == 2
+    mindshub_teams.reset_caches_for_tests()
+
+
+def test_a_teams_read_mindshub_refuses_is_no_teams_not_unreachable(monkeypatch):
+    """MindsHub's 403 is an answer: the caller is in no team and holds no
+    permission it lists. Never "couldn't reach MindsHub", so a refusal that
+    rests on it is a 403 or 400 naming the real cause, not a 503."""
+    mindshub_teams.reset_caches_for_tests()
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", mindshub_answers(403))
+    teams, permissions = asyncio.run(
+        mindshub_teams.fetch_teams_and_permissions(bearer_token="t", org_id=ORG_ID, user_id=BOB)
+    )
+    assert (teams.reachable, teams.team_ids, permissions.reachable, permissions.permissions) == (
+        True, frozenset(), True, frozenset(),
+    )
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", mindshub_answers(503))
+    mindshub_teams.reset_caches_for_tests()
+    teams, permissions = asyncio.run(
+        mindshub_teams.fetch_teams_and_permissions(bearer_token="t", org_id=ORG_ID, user_id=BOB)
+    )
+    assert (teams.reachable, permissions.reachable) == (False, False)
+    mindshub_teams.reset_caches_for_tests()
+
+
+
+def test_mindshub_teams_lists_the_callers_teams_and_caches_them(monkeypatch):
+    mindshub_teams.reset_caches_for_tests()
     calls: list[str] = []
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         # With the gateway's credential, never the client-set one.
         assert bearer == MEMBER_BEARER
         calls.append(path)
         return {"results": [{"id": TEAM_ENG, "display_name": "Eng", "is_default": True}, {"display_name": "no id"}]}
 
-    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
-    view = asyncio.run(hub_teams_ep.get_hub_teams(member_request(), scope))
+    view = asyncio.run(mindshub_teams_ep.get_mindshub_teams(member_request(), scope))
     assert view.model_dump(by_alias=True) == {
         "reachable": True, "teams": [{"id": TEAM_ENG, "displayName": "Eng", "isDefault": True}],
     }
-    asyncio.run(hub_teams_ep.get_hub_teams(member_request(), scope))
-    assert calls == [hub_teams.TEAMS_PATH]
-    hub_teams.reset_caches_for_tests()
+    asyncio.run(mindshub_teams_ep.get_mindshub_teams(member_request(), scope))
+    assert calls == [mindshub_teams.TEAMS_PATH]
+    mindshub_teams.reset_caches_for_tests()
 
 
-def test_hub_teams_outside_org_mode_is_empty_and_reachable(monkeypatch):
+def test_mindshub_teams_outside_mindshub_mode_is_empty_and_reachable(monkeypatch):
     """No organization, so no teams to share with, and no credential sent:
     on the desktop the Authorization is this server's own."""
 
-    async def get_auth_json(path, bearer):
-        raise AssertionError("the auth service was asked outside org mode")
+    async def mindshub_read(path, bearer):
+        raise AssertionError("MindsHub was asked outside MindsHub mode")
 
-    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
-    view = asyncio.run(hub_teams_ep.get_hub_teams(member_request(), LOCAL_SCOPE))
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", auth_replies(mindshub_read))
+    view = asyncio.run(mindshub_teams_ep.get_mindshub_teams(member_request(), LOCAL_SCOPE))
     assert view.model_dump(by_alias=True) == {"reachable": True, "teams": []}
 
 
-def test_hub_teams_unreachable_lists_none(monkeypatch):
-    hub_teams.reset_caches_for_tests()
+def test_mindshub_teams_unreachable_lists_none(monkeypatch):
+    mindshub_teams.reset_caches_for_tests()
 
-    async def get_auth_json(path, bearer):
+    async def mindshub_read(path, bearer):
         return None
 
-    monkeypatch.setattr(hub_teams, "get_auth_json", get_auth_json)
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", auth_replies(mindshub_read))
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
-    view = asyncio.run(hub_teams_ep.get_hub_teams(member_request(), scope))
+    view = asyncio.run(mindshub_teams_ep.get_mindshub_teams(member_request(), scope))
     assert view.model_dump(by_alias=True) == {"reachable": False, "teams": []}
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
 
 
 # ── artifacts ────────────────────────────────────────────────────────────────
 
 
-# What an org-mode entry of .published.json keeps for a restricted artifact.
+# What a MindsHub-mode entry of .published.json keeps for a restricted artifact.
 _ENTRY = {"mode": "restricted", "requires_password": False, "access_version": 2}
 
 
@@ -1762,38 +2168,44 @@ def test_teams_and_people_reach_anton_as_owner_only_and_are_never_sent_back():
     """anton's publisher knows no teams or people: alone they reach it as
     owner-only. A publish that names none (live sync, autopublish) takes them
     from the stored rule and changes nothing about them, so it writes none
-    and the auth service keeps what it holds; only a list a save changes is
+    and MindsHub keeps what it holds; only a list a save changes is
     written."""
-    from cowork.services.publish import AudienceChanges, _plan_access, _with_team_audience, kept_access
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+    from cowork.services.artifact_audience import AudienceChanges, for_publisher
+    from cowork.services.publish import _plan_access, kept_access
 
-    access = {
-        "mode": "restricted", "emails": [], "org_allowed": False, "allowed_team_ids": [TEAM_ENG],
-        "allowed_user_ids": [BOB],
-    }
-    assert _with_team_audience(access) == {
+    access = ArtifactAccessRequest(
+        mode="restricted", allowed_emails=[], org_allowed=False, allowed_team_ids=[TEAM_ENG],
+        allowed_user_ids=[BOB],
+    )
+    assert for_publisher(access) == {
         "mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True,
     }
-    assert _with_team_audience({"mode": "public"}) == {"mode": "public"}
+    assert for_publisher(ArtifactAccessRequest(mode="public")) == {"mode": "public"}
+    assert for_publisher(None) is None
     stored = artifact_rule(teams=[TEAM_OPS], people=[CAROL])
     republish = _plan_access(None, kept_access(_ENTRY, org_mode=True), _ENTRY, stored=stored)
     assert (republish.changes, republish.access_version) == (AudienceChanges(), 2)
     assert (republish.audience.allowed_team_ids, republish.audience.allowed_user_ids) == ([TEAM_OPS], [CAROL])
     assert republish.effective_access == {"mode": "restricted", "emails": [], "org_allowed": False}
     # A save naming the same people in another order changes nothing either.
-    same = _plan_access(None, {**access, "allowed_team_ids": [TEAM_OPS], "allowed_user_ids": [CAROL]}, _ENTRY,
-                        stored=stored)
+    same = _plan_access(
+        None, access.model_copy(update={"allowed_team_ids": [TEAM_OPS], "allowed_user_ids": [CAROL]}), _ENTRY,
+        stored=stored,
+    )
     assert same.changes == AudienceChanges()
-    changed = _plan_access(None, {**access, "allowed_team_ids": [TEAM_OPS]}, _ENTRY, stored=stored)
+    changed = _plan_access(None, access.model_copy(update={"allowed_team_ids": [TEAM_OPS]}), _ENTRY, stored=stored)
     assert (changed.changes, changed.access_version) == (AudienceChanges(allowed_user_ids=[BOB]), 3)
 
 
 def test_a_re_publish_sends_the_stored_org_flag_and_emails_never_the_entrys():
     """Live sync, autopublish and every other re-publish take who the
-    artifact is shared with from the auth service's rule. An entry an agent
+    artifact is shared with from MindsHub's rule. An entry an agent
     wrote, or one stored before that, saying everyone, an outside address or
     a team, sends none of it: the publish sends what the rule holds, at the
     same version, and the entry it stores keeps no audience."""
-    from cowork.services.publish import AudienceChanges, _plan_access, kept_access
+    from cowork.services.artifact_audience import AudienceChanges
+    from cowork.services.publish import _plan_access, kept_access
 
     planted = {
         **_ENTRY, "emails": ["mal@else.com"], "org_allowed": True, "owner_only": False,
@@ -1803,10 +2215,10 @@ def test_a_re_publish_sends_the_stored_org_flag_and_emails_never_the_entrys():
     assert plan.effective_access == {"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}
     assert (plan.changes, plan.access_version) == (AudienceChanges(), 2)
     assert plan.owner_side == _ENTRY
-    # A rule that is already org-wide stays org-wide, and one that names
+    # A rule that is already shared with everyone stays shared with everyone, and one that names
     # nobody stays restricted to its owner, never public.
-    org_wide = _plan_access(None, kept_access(_ENTRY, org_mode=True), _ENTRY, stored=artifact_rule(org=True))
-    assert org_wide.effective_access == {"mode": "restricted", "emails": [], "org_allowed": True}
+    everyone = _plan_access(None, kept_access(_ENTRY, org_mode=True), _ENTRY, stored=artifact_rule(org=True))
+    assert everyone.effective_access == {"mode": "restricted", "emails": [], "org_allowed": True}
     nobody = _plan_access(None, kept_access(_ENTRY, org_mode=True), _ENTRY, stored=artifact_rule())
     assert (nobody.effective_access["mode"], nobody.audience.names_nobody, nobody.access_version) == (
         "restricted", True, 2,
@@ -1817,17 +2229,19 @@ def test_a_people_only_restriction_stays_restricted_never_public_or_nobody():
     """What the app sends for "only these people in my org": every other
     field empty and owner_only false. anton's publisher reads that as an
     empty selection and would publish it public; the plan keeps it restricted
-    to the owner there and widens it to the people in the auth service."""
-    from cowork.services.publish import AudienceChanges, _plan_access, access_from_app, kept_access
+    to the owner there and widens it to the people in MindsHub."""
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+    from cowork.services.artifact_audience import AudienceChanges
+    from cowork.services.publish import _plan_access, kept_access
 
-    app_body = access_from_app({
+    app_body = ArtifactAccessRequest.model_validate({
         "mode": "restricted", "org_allowed": False, "allowed_team_ids": [], "allowed_user_ids": [BOB],
         "allowed_emails": [], "owner_only": False,
     })
     plan = _plan_access(None, app_body, None, stored=artifact_rule())
     assert plan.effective_access == {"mode": "restricted", "emails": [], "org_allowed": False}
     assert plan.owner_side == {"mode": "restricted", "requires_password": False, "access_version": 1}
-    # Written to the auth service with the people: not public, and not the
+    # Written to MindsHub with the people: not public, and not the
     # owner alone.
     assert plan.changes == AudienceChanges(allowed_user_ids=[BOB])
     # Republished once the rule holds Bob: still restricted, nothing written.
@@ -1835,36 +2249,41 @@ def test_a_people_only_restriction_stays_restricted_never_public_or_nobody():
     again = _plan_access(None, kept_access(plan.owner_side, org_mode=True), plan.owner_side, stored=holds_bob)
     assert (again.effective_access["mode"], again.changes) == ("restricted", AudienceChanges())
     # Taking the people away (nothing else picked) is the owner alone, written
-    # to the auth service so their access is revoked there too.
-    cleared = _plan_access(None, {**app_body, "allowed_user_ids": [], "owner_only": True}, plan.owner_side,
-                           stored=holds_bob)
+    # to MindsHub so their access is revoked there too.
+    cleared = _plan_access(
+        None, app_body.model_copy(update={"allowed_user_ids": [], "owner_only": True}), plan.owner_side,
+        stored=holds_bob,
+    )
     assert (cleared.owner_side["mode"], cleared.changes) == ("restricted", AudienceChanges(allowed_user_ids=[]))
     assert cleared.access_version > plan.access_version
-    # Outside org mode there are no org members, and still no public rule.
+    # Outside MindsHub mode there are no org members, and still no public rule.
     local = _plan_access(None, app_body, None, stored=None)
     assert (local.effective_access["mode"], local.owner_side["owner_only"], local.changes) == (
         "restricted", True, AudienceChanges(),
     )
 
 
-def test_the_app_sends_the_access_services_four_audience_names_and_nothing_else():
+def test_the_app_sends_mindshubs_four_audience_names_and_nothing_else():
     """org_allowed, allowed_team_ids, allowed_user_ids and allowed_emails;
-    allowed_emails is anton's emails. A retired name is refused, naming the
-    one to send, rather than dropped."""
-    from cowork.services.publish import AudienceChanges, _plan_access, access_from_app
+    allowed_emails is anton's emails. A top-level emails, which an app tab
+    loaded from an older build sends, is refused, naming the field to
+    send, rather than dropped."""
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+    from cowork.services.artifact_audience import AudienceChanges
+    from cowork.services.publish import _plan_access
 
-    assert access_from_app({
+    assert ArtifactAccessRequest.model_validate({
         "mode": "restricted", "org_allowed": True, "allowed_team_ids": [TEAM_ENG],
         "allowed_user_ids": [BOB], "allowed_emails": ["e@else.com"],
-    }) == {
+    }).publisher_access() == {
         "mode": "restricted", "org_allowed": True, "allowed_team_ids": [TEAM_ENG],
         "allowed_user_ids": [BOB], "emails": ["e@else.com"],
     }
-    for retired, name in (("emails", "allowed_emails"), ("team_ids", "allowed_team_ids"), ("org_wide", "org_allowed")):
-        with pytest.raises(ValueError, match=name):
-            access_from_app({"mode": "restricted", retired: []})
+    with pytest.raises(ValueError, match="send allowed_emails"):
+        ArtifactAccessRequest.model_validate({"mode": "restricted", "emails": []})
     plan = _plan_access(
-        None, {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "org_allowed": True}, None, stored=artifact_rule(),
+        None, ArtifactAccessRequest(mode="restricted", allowed_team_ids=[TEAM_ENG], org_allowed=True), None,
+        stored=artifact_rule(),
     )
     assert (plan.changes, plan.audience.org_allowed, plan.audience.names_nobody) == (
         AudienceChanges(allowed_team_ids=[TEAM_ENG]), True, False,
@@ -1872,7 +2291,7 @@ def test_the_app_sends_the_access_services_four_audience_names_and_nothing_else(
 
 
 def _echo(seen: list):
-    """The auth service's upsert, as far as these tests need it: it records
+    """MindsHub's upsert, as far as these tests need it: it records
     the body and echoes the lists it was sent."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1886,7 +2305,7 @@ def _echo(seen: list):
     return handler
 
 
-_INTERNAL_SETTINGS = SimpleNamespace(auth_internal_base_url="https://auth.test", auth_internal_secret="s")
+_INTERNAL_SETTINGS = SimpleNamespace(auth_internal_base_url="https://mindshub.test", auth_internal_secret="s")
 _ORG_SCOPE = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
 
 
@@ -1914,21 +2333,21 @@ def _read(handler):
     )
 
 
-def test_the_team_and_people_audience_is_written_to_the_access_service():
-    """Only the lists a save changed, under the auth service's names; the
+def test_the_team_and_people_audience_is_written_to_mindshub():
+    """Only the lists a save changed, under MindsHub's names; the
     emails and the org flag are the lambda's to write. The answer is what the
     rule holds."""
     seen: list[dict] = []
     held = _write(_echo(seen), allowed_team_ids=[TEAM_ENG], allowed_user_ids=[BOB])
     assert seen == [{
-        "url": "https://auth.test/v1/internal/artifact-access/",
+        "url": "https://mindshub.test/v1/internal/artifact-access/",
         "body": {
             "artifact_id": "artifact/1", "owner_keycloak_id": ALICE, "organization_id": ORG_ID,
             "workspace_id": None, "allowed_team_ids": [TEAM_ENG], "allowed_user_ids": [BOB], "access_version": 3,
         },
     }]
     assert (held.allowed_team_ids, held.allowed_user_ids, held.org_allowed) == ([TEAM_ENG], [BOB], False)
-    # A list left out is left out of the write, for the auth service to keep.
+    # A list left out is left out of the write, for MindsHub to keep.
     _write(_echo(seen), allowed_user_ids=[CAROL])
     assert "allowed_team_ids" not in seen[-1]["body"]
 
@@ -1954,7 +2373,7 @@ def test_the_rule_is_read_as_stored_and_no_rule_is_none():
 
     assert _read(handler) == artifact_rule(org=True, teams=[TEAM_ENG], people=[BOB], emails=["e@else.com"])
     assert seen == [{
-        "url": "https://auth.test/v1/internal/artifact-access/read/",
+        "url": "https://mindshub.test/v1/internal/artifact-access/read/",
         "body": {"artifact_id": "artifact/1", "owner_keycloak_id": ALICE, "organization_id": ORG_ID},
         "secret": "s",
     }]
@@ -1973,7 +2392,7 @@ def test_the_rule_is_read_as_stored_and_no_rule_is_none():
             _read(handler)
 
 
-def test_the_access_service_refusing_a_non_member_is_a_400_naming_them():
+def test_mindshub_refusing_a_non_member_is_a_400_naming_them():
     from cowork.services.artifact_access import ArtifactAudienceRejected
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1985,8 +2404,8 @@ def test_the_access_service_refusing_a_non_member_is_a_400_naming_them():
     assert isinstance(caught.value, ValueError) and EVE in str(caught.value)
 
 
-def test_the_access_service_refusing_a_foreign_team_is_a_400_naming_it():
-    """The auth service's unknown_team body names the teams in allowed_team_ids."""
+def test_mindshub_refusing_a_foreign_team_is_a_400_naming_it():
+    """MindsHub's unknown_team body names the teams in allowed_team_ids."""
     from cowork.services.artifact_access import ArtifactAudienceRejected
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1997,8 +2416,8 @@ def test_the_access_service_refusing_a_foreign_team_is_a_400_naming_it():
     assert TEAM_OPS in str(caught.value)
 
 
-def test_any_400_from_the_access_service_is_a_400_naming_why_never_a_retryable_503():
-    """A field the auth service won't take (too many people, a malformed id)
+def test_any_400_from_mindshub_is_a_400_naming_why_never_a_retryable_503():
+    """A field MindsHub won't take (too many people, a malformed id)
     is a 400 with no code: retrying can't help, so it is never
     ArtifactAccessUnavailable."""
     from cowork.services.artifact_access import ArtifactAccessUnavailable, ArtifactAudienceRejected
@@ -2027,11 +2446,30 @@ def test_any_400_from_the_access_service_is_a_400_naming_why_never_a_retryable_5
         _write(outage, allowed_user_ids=[BOB])
 
 
-def test_a_409_or_403_from_the_access_service_is_a_refusal_never_a_retryable_503():
+def test_a_field_error_on_a_list_item_reads_as_a_sentence():
+    """MindsHub's field error on one item of a list field nests it under the
+    item's index; the person reads its message, never a Python dict."""
+    from cowork.services.artifact_access import ArtifactAudienceRejected
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={
+            "allowed_team_ids": {"0": ["Must be a valid UUID."], "2": ["Must be a valid UUID."]},
+            "allowed_user_ids": ["Ensure this field has no more than 100 elements."],
+        })
+
+    with pytest.raises(ArtifactAudienceRejected) as caught:
+        _write(handler, allowed_team_ids=[TEAM_ENG])
+    assert str(caught.value) == (
+        "The sharing change was refused: allowed_team_ids: Must be a valid UUID.; "
+        "allowed_user_ids: Ensure this field has no more than 100 elements."
+    )
+
+
+def test_a_409_or_403_from_mindshub_is_a_refusal_never_a_retryable_503():
     """A recorded owner or organization that doesn't match (409), or an
     owner whose role no longer allows artifact changes (403), gets the same
     answer however often it is asked: ArtifactAccessRefused carrying the
-    auth service's detail, on the write and on the read alike, saying which
+    MindsHub's detail, on the write and on the read alike, saying which
     of the two it refused."""
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
 
@@ -2047,12 +2485,12 @@ def test_a_409_or_403_from_the_access_service_is_a_refusal_never_a_retryable_503
         for call, refused in ((lambda h: _write(h, allowed_user_ids=[BOB]), "the change"), (_read, "the read")):
             with pytest.raises(ArtifactAccessRefused) as caught:
                 call(handler)
-            assert str(caught.value) == f"The sharing service refused {refused}: {detail}"
+            assert str(caught.value) == f"MindsHub refused {refused}: {detail}"
             assert not isinstance(caught.value, ArtifactAccessUnavailable)
 
 
 def test_a_200_that_does_not_echo_the_teams_and_people_is_a_failure():
-    """An auth service that drops the new fields answers 200 and stores
+    """A MindsHub that drops the new fields answers 200 and stores
     nothing: the share must not read as saved."""
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
@@ -2066,14 +2504,22 @@ def test_a_200_that_does_not_echo_the_teams_and_people_is_a_failure():
 
 
 def test_the_access_write_carries_notify_only_when_asked():
+    from cowork.services.artifact_audience import ShareNotice, ShareNotify
+
     seen: list[dict] = []
     _write(_echo(seen), allowed_user_ids=[BOB])
     _write(
-        _echo(seen), allowed_user_ids=[BOB], notify_user_ids=[BOB], notify_emails=["e@else.com"],
-        artifact_title="Q3", artifact_url="https://view.test/1",
+        _echo(seen), allowed_user_ids=[BOB],
+        notice=ShareNotice(
+            artifact_title="Q3", artifact_url="https://view.test/1",
+            recipients=ShareNotify(user_ids=(BOB,), emails=("e@else.com",)),
+        ),
     )
-    # Empty lists are nobody to notify.
-    _write(_echo(seen), allowed_user_ids=[BOB], notify_user_ids=[], notify_emails=[], artifact_title="Q3")
+    # A notice with nobody in it notifies nobody.
+    _write(
+        _echo(seen), allowed_user_ids=[BOB],
+        notice=ShareNotice(artifact_title="Q3", artifact_url="", recipients=ShareNotify()),
+    )
     notify_keys = {"notify_recipients", "notify_user_ids", "notify_emails", "artifact_title", "artifact_url"}
     assert not notify_keys & set(seen[0]["body"])
     assert {k: seen[1]["body"][k] for k in notify_keys} == {
@@ -2083,10 +2529,10 @@ def test_the_access_write_carries_notify_only_when_asked():
     assert not notify_keys & set(seen[2]["body"])
 
 
-def test_the_post_publish_write_sends_the_changes_and_returns_the_access_services_answer(monkeypatch):
+def test_the_post_publish_write_sends_the_changes_and_returns_mindshubs_answer(monkeypatch):
     from cowork.services import artifact_access, artifact_autopublish
     from cowork.services.artifact_access import ArtifactAudience
-    from cowork.services.publish import AudienceChanges, _sync_team_audience
+    from cowork.services.artifact_audience import AudienceChanges, sync_team_audience
 
     sent: list[dict] = []
     answer = ArtifactAudience(org_allowed=False, allowed_team_ids=[TEAM_ENG], allowed_user_ids=[])
@@ -2097,16 +2543,16 @@ def test_the_post_publish_write_sends_the_changes_and_returns_the_access_service
 
     monkeypatch.setattr(artifact_access, "sync_artifact_team_access", sync)
     monkeypatch.setattr(artifact_autopublish, "_active_workspace_id", lambda scope: None)
-    held = _sync_team_audience(
+    held = sync_team_audience(
         artifact_id="a", scope=_ORG_SCOPE, access_version=4, changes=AudienceChanges(allowed_user_ids=[BOB]),
     )
     assert (sent[0]["allowed_team_ids"], sent[0]["allowed_user_ids"], sent[0]["access_version"]) == (None, [BOB], 4)
-    # What the publish reports is the auth service's answer, not the request.
+    # What the publish reports is MindsHub's answer, not the request.
     assert held == answer
 
 
 def test_an_org_entry_says_nothing_of_who_an_artifact_is_shared_with(tmp_path, monkeypatch):
-    """In hosted org mode the card and the access route read no audience from
+    """In MindsHub mode the card and the access route read no audience from
     .published.json, even from an entry stored before it stopped keeping
     one, and a re-publish keeps the mode alone (GET /access reads the rule).
     On the desktop the entry is still the record."""
@@ -2127,23 +2573,28 @@ def test_an_org_entry_says_nothing_of_who_an_artifact_is_shared_with(tmp_path, m
     assert read["accessMode"] == "restricted"
     assert (read["accessEmails"], read["orgAllowed"], read["ownerOnly"], read["allowedTeamIds"],
             read["allowedUserIds"]) == ([], False, False, [], [])
-    assert published_artifact_access(folder, artifacts_base=folder.parent, org_mode=True) == {
+    assert published_artifact_access(folder, artifacts_base=folder.parent, org_mode=True).publisher_access() == {
         "mode": "restricted", "owner_only": True,
     }
 
     monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
     read = _published_access_for(folder, folder / "index.html")
     assert (read["accessEmails"], read["orgAllowed"], read["allowedTeamIds"]) == (["e@else.com"], True, [])
-    assert published_artifact_access(folder, artifacts_base=folder.parent, org_mode=False) == {
+    assert published_artifact_access(folder, artifacts_base=folder.parent, org_mode=False).publisher_access() == {
         "mode": "restricted", "emails": ["e@else.com"], "org_allowed": True, "owner_only": False,
     }
 
 
 def _check(access, *, principal=None, stored=None, scope=None, reads=None):
-    """PUT /access's check of ``access``, with ``stored`` as the artifact's
-    rule in the auth service (nobody but the owner by default); each read of
-    it is counted in ``reads``. The access the check hands the publish."""
+    """PUT /access's reading and check of ``access``, the app's save, with
+    ``stored`` as the artifact's rule in MindsHub (nobody but the owner by
+    default); each read of it is counted in ``reads``. The access the check
+    hands the publish, as anton's publisher is handed it. A save the route
+    can't read is its 400 (access_refusal)."""
+    from pydantic import ValidationError
+
     from cowork.api.v1.endpoints import artifact_workspace as aw
+    from cowork.schemas.artifact_access import ArtifactAccessRequest, access_refusal
 
     rule = stored or artifact_rule()
 
@@ -2152,10 +2603,14 @@ def _check(access, *, principal=None, stored=None, scope=None, reads=None):
             reads.append(rule)
         return rule
 
+    try:
+        parsed = ArtifactAccessRequest.model_validate(access)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=access_refusal(exc.errors(include_url=False))) from exc
     session = SimpleNamespace(scope=scope or _ORG_SCOPE)
     return asyncio.run(aw._checked_team_audience(
-        access, request=member_request(principal or _principal(ALICE)), session=session, stored_rule=stored_rule,
-    )).access
+        parsed, request=member_request(principal or _principal(ALICE)), session=session, stored_rule=stored_rule,
+    )).access.publisher_access()
 
 
 _AS_ADMIN = {"principal": _principal(ADMIN, admin=True), "scope": TenantScope(org_mode=True, org_id=ORG_ID, user_id=ADMIN)}
@@ -2163,8 +2618,8 @@ _AS_ADMIN = {"principal": _principal(ADMIN, admin=True), "scope": TenantScope(or
 
 def test_artifact_people_are_normalized_and_checked_only_when_they_change(monkeypatch):
     asked: list = []
-    access_service_answers(monkeypatch, asked=asked)
-    out = _check({"mode": "restricted", "allowed_user_ids": [f" {BOB.upper()}", BOB], "emails": ["e@else.com"]})
+    mindshub_sharing_answers(monkeypatch, asked=asked)
+    out = _check({"mode": "restricted", "allowed_user_ids": [f" {BOB.upper()}", BOB], "allowed_emails": ["e@else.com"]})
     assert out == {"mode": "restricted", "allowed_user_ids": [BOB], "emails": ["e@else.com"]}
     assert len(asked) == 1
     # The people the rule already holds: nothing is written, so none is asked about.
@@ -2176,25 +2631,29 @@ def test_artifact_people_are_normalized_and_checked_only_when_they_change(monkey
     with pytest.raises(HTTPException) as caught:
         _check({"mode": "restricted", "allowed_user_ids": "nope"})
     assert caught.value.status_code == 400
-    # Outside org mode, or for a save that isn't restricted, the access is
+    # Outside MindsHub mode, or for a save that isn't restricted, the access is
     # left as it is: the plan keeps people picked alone private
     # (test_a_people_only_restriction_stays_restricted...).
     access = {"mode": "restricted", "allowed_user_ids": [BOB], "owner_only": False}
     assert _check(access, scope=LOCAL_SCOPE) == access
-    assert _check({"mode": "public", "allowed_user_ids": "nope"}) == {"mode": "public", "allowed_user_ids": "nope"}
+    assert _check({"mode": "public", "allowed_user_ids": [BOB]}) == {"mode": "public", "allowed_user_ids": [BOB]}
+    # A field that isn't the shape it must be is a 400 whatever the mode.
+    with pytest.raises(HTTPException) as caught:
+        _check({"mode": "public", "allowed_user_ids": "nope"})
+    assert (caught.value.status_code, caught.value.detail) == (400, "allowed_user_ids must be a list.")
 
 
 def test_an_artifact_save_refuses_a_non_member_it_adds_before_anything_is_published(monkeypatch):
     """Every person a save names is asked about in one batched lookup before
-    the publish, so the auth service's not_a_member fires only in a race. One
+    the publish, so MindsHub's not_a_member fires only in a race. One
     the save adds who isn't a member is a 400 naming them. One the rule
-    holds who has left the org is dropped: the auth service keeps a departed
+    holds who has left the org is dropped: MindsHub keeps a departed
     person's id on the rule and refuses it on the next write. The caller's
     own id is never asked about. While the lookup can't be asked, a 503."""
     from cowork.services.artifact_access import NOT_A_MEMBER_REFUSAL
 
     asked: list = []
-    access_service_answers(monkeypatch, members=(BOB, DAVE), asked=asked)
+    mindshub_sharing_answers(monkeypatch, members=(BOB, DAVE), asked=asked)
     stored = artifact_rule(people=[BOB, CAROL])
     with pytest.raises(HTTPException) as caught:
         _check({"mode": "restricted", "allowed_user_ids": [BOB, CAROL, EVE, DAVE]}, stored=stored)
@@ -2206,10 +2665,10 @@ def test_an_artifact_save_refuses_a_non_member_it_adds_before_anything_is_publis
     assert out["allowed_user_ids"] == [BOB, ALICE, DAVE]
     assert set(parse_qs(urlsplit(asked[-1][0]).query)["ids"][0].split(",")) == {BOB, CAROL, DAVE}
 
-    access_service_answers(monkeypatch, members_down=True)
+    mindshub_sharing_answers(monkeypatch, members_down=True)
     with pytest.raises(HTTPException) as caught:
         _check({"mode": "restricted", "allowed_user_ids": [BOB, DAVE]}, stored=stored)
-    assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+    assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
 
 
 def test_an_artifact_save_refuses_the_callers_own_address(monkeypatch):
@@ -2219,32 +2678,54 @@ def test_an_artifact_save_refuses_the_callers_own_address(monkeypatch):
 
     reads: list = []
     with pytest.raises(HTTPException) as caught:
-        _check({"mode": "restricted", "emails": ["e@else.com", " Alice@X.com"]}, reads=reads)
+        _check({"mode": "restricted", "allowed_emails": ["e@else.com", " Alice@X.com"]}, reads=reads)
     assert (caught.value.status_code, caught.value.detail) == (400, OWN_EMAIL_REFUSAL)
     assert reads == []
     # The caller's own address is compared lowercased too.
     mixed_case = Principal(user_id=ALICE, org_id=ORG_ID, email=" Alice@X.com ")
     with pytest.raises(HTTPException) as caught:
-        _check({"mode": "restricted", "emails": ["alice@x.com"]}, principal=mixed_case)
+        _check({"mode": "restricted", "allowed_emails": ["alice@x.com"]}, principal=mixed_case)
     assert (caught.value.status_code, caught.value.detail) == (400, OWN_EMAIL_REFUSAL)
-    assert _check({"mode": "restricted", "emails": ["e@else.com"]}) == {"mode": "restricted", "emails": ["e@else.com"]}
+    assert _check({"mode": "restricted", "allowed_emails": ["e@else.com"]}) == {"mode": "restricted", "emails": ["e@else.com"]}
 
 
-def test_an_artifact_is_shared_with_at_most_the_access_services_number_of_people(monkeypatch):
-    people = [str(uuid4()) for _ in range(MAX_SHARED_PEOPLE + 1)]
+def test_an_artifact_is_shared_with_at_most_mindshubs_number_of_people(monkeypatch):
+    people = [str(uuid4()) for _ in range(MAX_PEOPLE_PER_RULE + 1)]
     with pytest.raises(HTTPException) as caught:
         _check({"mode": "restricted", "allowed_user_ids": people})
     assert caught.value.status_code == 400
-    assert caught.value.detail == f"An artifact can be shared with at most {MAX_SHARED_PEOPLE} people."
+    assert caught.value.detail == f"An artifact can be shared with at most {MAX_PEOPLE_PER_RULE} people."
+
+
+def test_an_artifact_save_refuses_an_id_that_is_not_a_uuid_before_any_lookup(monkeypatch):
+    """A person or team id that isn't a UUID is a 400 naming it before
+    MindsHub is asked anything or anything is published, an admin's
+    included; a notify list naming one is refused the same way."""
+    from cowork.schemas.artifact_access import ShareNotifyRequest
+    from cowork.services.artifact_audience import share_notify
+
+    asked: list = []
+    mindshub_sharing_answers(monkeypatch, asked=asked)
+    for access, detail in (
+        ({"mode": "restricted", "allowed_user_ids": [BOB, "bob"]}, "'bob' is not a valid person id."),
+        ({"mode": "restricted", "allowed_team_ids": ["Eng"]}, "'Eng' is not a valid team id."),
+    ):
+        with pytest.raises(HTTPException) as caught:
+            _check(access, **_AS_ADMIN)
+        assert (caught.value.status_code, caught.value.detail) == (400, detail)
+    assert asked == []
+    with pytest.raises(ValueError, match="bob"):
+        share_notify(ShareNotifyRequest(user_ids=[BOB, "bob"]))
+    assert share_notify(ShareNotifyRequest(user_ids=[BOB.upper()])).user_ids == (BOB,)
 
 
 def test_setting_artifact_access_checks_the_teams_it_adds(monkeypatch):
     """A team the stored rule doesn't have must be one the caller is in; an
     admin may name any. A team the rule has is kept unchecked: the owner may
-    have left it, and the auth service drops a deleted team from every rule
+    have left it, and MindsHub drops a deleted team from every rule
     itself. What the entry shows decides nothing."""
     asked: list = []
-    access_service_answers(monkeypatch, asked=asked)
+    mindshub_sharing_answers(monkeypatch, asked=asked)
     ok = _check({"mode": "restricted", "allowed_team_ids": [f" {TEAM_ENG} "]})
     assert ok == {"mode": "restricted", "allowed_team_ids": [TEAM_ENG]}
     # Read with the gateway's credential, never the client-set one.
@@ -2254,38 +2735,40 @@ def test_setting_artifact_access_checks_the_teams_it_adds(monkeypatch):
     assert (caught.value.status_code, caught.value.detail) == (
         400, f"You can only share with teams you belong to: {TEAM_OPS}.",
     )
+    mindshub_sharing_answers(monkeypatch, org_teams=(TEAM_ENG, TEAM_OPS))
     assert _check({"mode": "restricted", "allowed_team_ids": [TEAM_OPS]}, **_AS_ADMIN)["allowed_team_ids"] == [TEAM_OPS]
     # The owner left OPS, which the rule has: kept, beside a team they add.
     kept = _check({"mode": "restricted", "allowed_team_ids": [TEAM_OPS, TEAM_ENG]}, stored=artifact_rule(teams=[TEAM_OPS]))
     assert kept["allowed_team_ids"] == [TEAM_OPS, TEAM_ENG]
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
 
 
 def test_an_artifact_save_adding_a_team_while_they_are_unreadable_is_a_503_even_for_an_admin(monkeypatch):
-    """The org's default team is never sent to the auth service: naming it is
+    """The org's default team is never sent to MindsHub: naming it is
     org_allowed. While the caller's teams can't be read it can't be told
     apart, so a save that adds a team is a 503 for everyone, an admin
     included. A save that keeps the rule's teams writes none, so it goes
     through."""
-    access_service_answers(monkeypatch, teams=None)
+    mindshub_sharing_answers(monkeypatch, teams=None)
     stored = artifact_rule(teams=[TEAM_ENG])
     for who in ({}, _AS_ADMIN):
         with pytest.raises(HTTPException) as caught:
             _check({"mode": "restricted", "allowed_team_ids": [TEAM_ENG, TEAM_ALL]}, stored=stored, **who)
-        assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
+        assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
     assert _check(
-        {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "emails": ["e@else.com"]}, stored=stored, **_AS_ADMIN,
+        {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "allowed_emails": ["e@else.com"]}, stored=stored, **_AS_ADMIN,
     ) == {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "emails": ["e@else.com"]}
-    hub_teams.reset_caches_for_tests()
+    mindshub_teams.reset_caches_for_tests()
 
 
 def test_sharing_an_artifact_with_everyone_takes_share_org_only_to_turn_it_on(monkeypatch):
-    """As for a skill: making an artifact org-wide, by everyone at the org or
-    its default team, takes skills.share_org (or an admin); a 503 while the
-    permissions can't be read. The stored rule decides whether a save makes
-    it org-wide: an owner without share_org can still save an artifact that
-    is already org-wide, and an entry saying so decides nothing."""
-    access_service_answers(monkeypatch, default=TEAM_ALL)
+    """Sharing an artifact with everyone, by everyone at the org or its
+    default team, takes artifacts.share_org (or an admin), never the skill
+    capability; a 503 while the permissions can't be read. The stored rule
+    decides whether a save shares it with everyone: an owner without the
+    capability can still save an artifact already shared with everyone, and
+    an entry saying so decides nothing."""
+    mindshub_sharing_answers(monkeypatch, default=TEAM_ALL)
     for access in (
         {"mode": "restricted", "org_allowed": True},
         {"mode": "restricted", "allowed_team_ids": [TEAM_ALL, TEAM_ENG]},
@@ -2293,23 +2776,28 @@ def test_sharing_an_artifact_with_everyone_takes_share_org_only_to_turn_it_on(mo
         with pytest.raises(HTTPException) as caught:
             _check(access)
         assert (caught.value.status_code, caught.value.detail) == (403, ARTIFACT_ORG_REFUSAL)
-    already = _check({"mode": "restricted", "org_allowed": True, "emails": ["e@else.com"]}, stored=artifact_rule(org=True))
+    already = _check({"mode": "restricted", "org_allowed": True, "allowed_emails": ["e@else.com"]}, stored=artifact_rule(org=True))
     assert already == {"mode": "restricted", "org_allowed": True, "emails": ["e@else.com"]}
 
-    access_service_answers(monkeypatch, default=TEAM_ALL, permissions=("skills.share_org",))
+    # The skill capability alone shares no artifact with everyone.
+    mindshub_sharing_answers(monkeypatch, default=TEAM_ALL, permissions=("skills.share_org",))
+    with pytest.raises(HTTPException) as caught:
+        _check({"mode": "restricted", "org_allowed": True})
+    assert (caught.value.status_code, caught.value.detail) == (403, ARTIFACT_ORG_REFUSAL)
+    mindshub_sharing_answers(monkeypatch, default=TEAM_ALL, permissions=("artifacts.share_org",))
     assert _check({"mode": "restricted", "allowed_team_ids": [TEAM_ALL, TEAM_ENG]}) == {
         "mode": "restricted", "allowed_team_ids": [TEAM_ENG], "org_allowed": True,
     }
-    access_service_answers(monkeypatch, default=TEAM_ALL)
+    mindshub_sharing_answers(monkeypatch, default=TEAM_ALL)
     assert _check(
         {"mode": "restricted", "allowed_team_ids": [TEAM_ALL], "org_allowed": False}, **_AS_ADMIN,
     ) == {"mode": "restricted", "allowed_team_ids": [], "org_allowed": True}
 
-    access_service_answers(monkeypatch, permissions=None)
+    mindshub_sharing_answers(monkeypatch, permissions=None)
     with pytest.raises(HTTPException) as caught:
         _check({"mode": "restricted", "org_allowed": True})
-    assert (caught.value.status_code, caught.value.detail["code"]) == (503, HUB_UNAVAILABLE)
-    hub_teams.reset_caches_for_tests()
+    assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
+    mindshub_teams.reset_caches_for_tests()
 
 
 # ── off for me (a person's own on/off) ───────────────────────────────────────
@@ -2317,7 +2805,7 @@ def test_sharing_an_artifact_with_everyone_takes_share_org_only_to_turn_it_on(mo
 
 def _me(org, user: str, slug: str, enabled: bool, viewer: SkillViewer | None = None) -> dict:
     """PUT /skills/{slug}/me as ``user``."""
-    return skills_ep.set_skill_enabled_for_me(
+    return sharing_ep.set_skill_enabled_for_me(
         slug, SkillEnabledForMeRequest(enabled=enabled), org.as_(user), _principal(user),
         viewer or _viewer(user, teams=(TEAM_ENG,)),
     )
@@ -2381,9 +2869,9 @@ def test_an_always_on_skill_off_for_me_leaves_my_turns_only(org):
 
     block = _turn(org, BOB, bob)
     assert "alpha-org" not in block
-    assert [slug for slug, entry in block.items() if entry.get("always_on")] == ["beta-team"]
+    assert [slug for slug, entry in block.items() if entry.always_on] == ["beta-team"]
     carol = _viewer(CAROL, teams=(TEAM_ENG,))
-    assert [slug for slug, entry in _turn(org, CAROL, carol).items() if entry.get("always_on")] == [
+    assert [slug for slug, entry in _turn(org, CAROL, carol).items() if entry.always_on] == [
         "alpha-org", "beta-team",
     ]
 
@@ -2394,7 +2882,7 @@ def test_disabling_for_everyone_still_takes_edit_rights(org):
     _create(org, ALICE, "policy")
     _share(org, ALICE, "policy", _viewer(ALICE, share_org=True), org_allowed=True)
 
-    # Carol only reads the team skill and Bob the org-wide one: each turns it
+    # Carol only reads the team skill and Bob the one shared with everyone: each turns it
     # off for themselves, never for everyone.
     carol = _listed(org, CAROL, _viewer(CAROL))["team-skill"]
     assert (carol["canDisableForEveryone"], carol["visibleToOthers"]) == (False, True)
@@ -2469,7 +2957,7 @@ def test_off_for_me_needs_a_skill_the_caller_sees(org):
 def test_settings_are_per_org(org):
     _legacy_skill(org.as_(ALICE).scope, "house-style")
     _me(org, ALICE, "house-style", False)
-    assert set(user_off_for_me(org.as_(ALICE, org_id="other-org"))) == set()
+    assert set(user_off_for_me(org.as_(ALICE, org_id=OTHER_ORG_ID))) == set()
 
 
 def test_off_for_me_on_the_desktop(monkeypatch, tmp_path):
@@ -2485,7 +2973,7 @@ def test_off_for_me_on_the_desktop(monkeypatch, tmp_path):
             scoped = ScopedSession(raw, LOCAL_SCOPE)
             listed = {s["id"]: s for s in skills_ep.list_skills(scoped, None, None)["skills"]}
             assert (listed["desk"]["visibleToOthers"], listed["desk"]["enabledForMe"]) == (False, True)
-            out = skills_ep.set_skill_enabled_for_me("desk", SkillEnabledForMeRequest(enabled=False), scoped, None, None)
+            out = sharing_ep.set_skill_enabled_for_me("desk", SkillEnabledForMeRequest(enabled=False), scoped, None, None)
             assert out["enabledForMe"] is False
             assert user_off_for_me(scoped) == frozenset({"desk"})
             assert "desk" not in build_turn_skills(LOCAL_SCOPE, project_name="general", session=scoped)
@@ -2513,14 +3001,18 @@ def test_off_for_me_on_the_desktop_keeps_one_row_and_on_clears_every_one(monkeyp
             scoped = ScopedSession(raw, LOCAL_SCOPE)
             stage_enabled_for_me(scoped, "desk", False)
             scoped.commit()
-            raw.add(SkillUserSetting(org_id=None, user_id="local", skill_slug="desk", enabled=False))
+            # The desktop's one person is the nil UUID, with no org.
+            assert [(row.org_id, row.user_id) for row in scoped.exec(scoped.select(SkillUserSetting)).all()] == [
+                (None, UUID(int=0))
+            ]
+            raw.add(SkillUserSetting(org_id=None, user_id=LOCAL_PERSON_ID, skill_slug="desk", enabled=False))
             with pytest.raises(IntegrityError):
                 raw.flush()
             raw.rollback()
 
             # A twin from a database without the index.
             raw.exec(text("DROP INDEX uq_skill_user_setting_user_skill_no_org"))
-            raw.add(SkillUserSetting(org_id=None, user_id="local", skill_slug="desk", enabled=False))
+            raw.add(SkillUserSetting(org_id=None, user_id=LOCAL_PERSON_ID, skill_slug="desk", enabled=False))
             raw.commit()
             assert stage_enabled_for_me(scoped, "desk", True) is True
             scoped.commit()

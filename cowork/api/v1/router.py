@@ -19,10 +19,10 @@ from cowork.api.v1.endpoints import (
     conversations,
     files,
     health,
-    hub_people,
-    hub_teams,
-    hub_usage,
-    hub_workspaces,
+    mindshub_people,
+    mindshub_teams,
+    mindshub_usage,
+    mindshub_workspaces,
     live_apps,
     memory,
     pins,
@@ -35,6 +35,7 @@ from cowork.api.v1.endpoints import (
     shared_projects,
     search,
     settings,
+    skill_sharing,
     skills,
 )
 from cowork.api.v1.endpoints.connectors import (
@@ -82,6 +83,9 @@ api_router.include_router(responses.router, prefix="/responses", tags=["response
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
+# The sharing routes first: GET /skills/sharing-capabilities must match before
+# the skills router's GET /skills/{skill_id} reads it as a skill's id.
+api_router.include_router(skill_sharing.router, prefix="/skills", tags=["skills"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
@@ -99,10 +103,10 @@ api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
 api_router.include_router(coding_personal_skills.router, prefix="/coding/skills/personal", tags=["coding"])
 api_router.include_router(coding_runtime.router, prefix="/coding/runtime", tags=["coding-runtime"])
-api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
-api_router.include_router(hub_usage.router, prefix="/hub/usage", tags=["hub-usage"])
-api_router.include_router(hub_teams.router, prefix="/hub/teams", tags=["hub-teams"])
-api_router.include_router(hub_people.router, prefix="/hub/people", tags=["hub-people"])
+api_router.include_router(mindshub_workspaces.router, prefix="/hub/workspaces", tags=["mindshub-workspaces"])
+api_router.include_router(mindshub_usage.router, prefix="/hub/usage", tags=["mindshub-usage"])
+api_router.include_router(mindshub_teams.router, prefix="/hub/teams", tags=["mindshub-teams"])
+api_router.include_router(mindshub_people.router, prefix="/hub/people", tags=["mindshub-people"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])

@@ -7,16 +7,18 @@ import mimetypes
 import os
 import stat
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
@@ -43,7 +45,13 @@ from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
+from cowork.schemas.artifact_access import (
+    ArtifactAccessRequest,
+    ArtifactAccessView,
+    access_refusal,
+)
 from cowork.schemas.base import CamelResponse
+from cowork.services.sharing_contract import ARTIFACTS_SHARE_ORG, AudienceField
 from cowork.services.artifact_export import (
     ExportRefusal,
     ExportRefused,
@@ -487,8 +495,8 @@ async def _sync_live_artifact(
     org_mode = scope is not None and getattr(scope, "org_mode", False)
     try:
         try:
-            # In hosted org mode who a restricted artifact is shared with is
-            # read from the auth service's rule by the publish itself, and a
+            # In MindsHub mode who a restricted artifact is shared with is
+            # read from MindsHub's rule by the publish itself, and a
             # failed read fails this sync rather than guessing.
             access = await run_in_threadpool(
                 published_artifact_access,
@@ -810,34 +818,67 @@ async def artifact_review_entry(
 
 
 class _AccessBody(BaseModel):
-    """The access selection, in `anton.publish_access.resolve_access` shape.
+    """The Share dialog's save: ``access``, an ArtifactAccessRequest. A body
+    that isn't one answers 400 with a sentence saying what is wrong
+    (_AccessSaveRoute).
 
-    Passed through rather than re-modelled per mode: the publisher owns the
-    schema (`{"mode": "public"}`, `{"mode": "password", "password": ...}`,
-    `{"mode": "restricted", "allowed_emails": [...], "org_allowed": bool,
-    "owner_only": bool}`) and validates it, so a second definition here could
-    only drift away from it. A restricted audience uses the auth service's
-    ArtifactAccess names (ENG-3787): `org_allowed`, `allowed_emails` (people
-    outside the org, by address; anton's `emails`,
-    cowork.services.publish.access_from_app), and in hosted org mode
-    `allowed_team_ids` and `allowed_user_ids` (Keycloak ids of people in the
-    org), which this server writes to the auth service itself
-    (cowork.services.publish._sync_team_audience). In hosted org mode a field
-    a restricted save leaves out keeps what the auth service's rule holds.
-    The retired names `emails`, `team_ids` and `org_wide` are a 400. Teams or
-    people alone keep the rule restricted to them, never public. `notify:
-    {user_ids, emails}` names the people this save added and chose to tell;
-    the auth service emails them. It applies to this save only and is never
-    stored.
+    A restricted audience goes by MindsHub's artifact rule names:
+    ``org_allowed``, ``allowed_emails`` (people outside the org, by address),
+    and in MindsHub mode ``allowed_team_ids`` and ``allowed_user_ids`` (user
+    ids of people in the org), which this server writes to MindsHub itself
+    (cowork.services.artifact_audience.sync_team_audience). In MindsHub mode a
+    field a restricted save leaves out keeps what MindsHub's rule holds. A
+    top-level ``emails`` is a 400 saying to send ``allowed_emails``. Teams or
+    people alone keep the rule restricted to them, never public. ``notify:
+    {user_ids, emails}`` names the people this save added and chose to tell;
+    MindsHub emails them. It applies to this save only and is never stored.
     """
 
-    access: dict
+    access: ArtifactAccessRequest
 
 
-# Sharing an artifact with everyone takes what sharing a skill with everyone
-# takes (cowork.api.v1.endpoints.skills.SHARING_ORG_REFUSAL).
+# Where the save's access object sits in a validation error's location.
+_ACCESS_IN_BODY = ("body", "access")
+ACCESS_BODY_REFUSAL = "Send the access to save as an object under access."
+
+
+def _access_save_refusal(errors: Sequence[Any]) -> str | None:
+    """The 400 sentence for an access save FastAPI couldn't read, from its
+    validation ``errors``: access_refusal for errors inside ``access``,
+    named from inside it, and ACCESS_BODY_REFUSAL for a body with no access
+    object at all. None when an error isn't the body's, such as a path
+    parameter's, which keeps FastAPI's own answer."""
+    if not errors or any(tuple(error["loc"][:1]) != _ACCESS_IN_BODY[:1] for error in errors):
+        return None
+    if any(tuple(error["loc"][:2]) != _ACCESS_IN_BODY for error in errors):
+        return ACCESS_BODY_REFUSAL
+    return access_refusal({**error, "loc": tuple(error["loc"][2:])} for error in errors)
+
+
+class _AccessSaveRoute(APIRoute):
+    """PUT .../access: a body that isn't a save answers 400 with a sentence
+    saying what is wrong with it (_access_save_refusal), which the Share
+    dialog shows as it is, never FastAPI's 422 with a list of errors."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def route_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                refusal = _access_save_refusal(exc.errors())
+                if refusal is None:
+                    raise
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=refusal) from None
+
+        return route_handler
+
+
+# Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
+# which MindsHub also checks when the rule is written.
 ARTIFACT_ORG_REFUSAL = (
-    "Sharing an artifact with everyone in the organization requires the skills.share_org "
+    f"Sharing an artifact with everyone in the organization requires the {ARTIFACTS_SHARE_ORG} "
     "permission or an organization admin."
 )
 
@@ -845,26 +886,23 @@ ARTIFACT_ORG_REFUSAL = (
 OWN_EMAIL_REFUSAL = "Your own email address can't be added: you can always open your own artifact."
 
 
-def _id_list(access: dict, key: str) -> list:
-    raw = access.get(key) or []
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{key} must be a list.")
-    return raw
-
-
 class CheckedAccess(NamedTuple):
     """A save's access after _checked_team_audience, and the artifact's
     rule it was checked against: None when the check didn't read it."""
 
-    access: dict
+    access: ArtifactAccessRequest
     stored: ArtifactRule | None = None
 
 
 async def _checked_team_audience(
-    access: dict, *, request: Request, session, stored_rule: Callable[[], Awaitable[ArtifactRule]]
+    access: ArtifactAccessRequest,
+    *,
+    request: Request,
+    session,
+    stored_rule: Callable[[], Awaitable[ArtifactRule]],
 ) -> CheckedAccess:
     """``access``, a restricted save of the share dialog, checked against the
-    caller and against the artifact's rule as the auth service stores it
+    caller and against the artifact's rule as MindsHub stores it
     (``stored_rule``, read only when the save names teams, people or the org
     flag), the one record of who the artifact is shared with. What the
     artifact's .published.json says decides nothing: an agent can write it.
@@ -872,37 +910,48 @@ async def _checked_team_audience(
     against the same rule (publish_artifact's ``stored``).
 
     - The caller's own address among the emails is a 400.
-    - Teams and people are normalized, at most MAX_SHARED_TEAMS and
-      MAX_SHARED_PEOPLE each (400), before anything is published.
+    - Teams and people are normalized, at most MAX_TEAMS_PER_RULE and
+      MAX_PEOPLE_PER_RULE each (400), before anything is published.
     - The org's default team is never sent: naming it sets ``org_allowed``
       (skill_sharing.default_team_as_org). While the caller's teams can't be
       read the default team can't be told apart, so a save that adds a team
-      is a 503 ``hub_unavailable``, an admin's included.
-    - ``org_allowed`` the stored rule doesn't have takes ``skills.share_org``
-      (403), as making a skill org-wide does. An owner without it can still
-      save an artifact that is already org-wide.
+      is a 503 ``mindshub_unreachable``, an admin's included.
+    - ``org_allowed`` the stored rule doesn't have takes
+      ``artifacts.share_org`` (403). An owner without it can still save an
+      artifact already shared with everyone.
     - A team the stored rule doesn't have must be one the caller belongs to
-      (400; an org admin may name any). A team it has is kept unchecked: the
-      auth service drops a deleted team's id from every rule itself.
+      (400), by the caller's teams read now, past the cache
+      (mindshub_teams.read_mindshub_teams_now): a team deleted since the
+      cached read is refused here, before anything is published, never by
+      MindsHub after the upload (503 while they can't be read, 429 while
+      MindsHub throttles the caller). An org admin may name any team of the
+      organization: one they aren't in is checked against the organization's
+      teams, read now (mindshub_teams.org_team_ids), and one that isn't the
+      organization's is a 400 before anything is published (503 while they
+      can't be read). A team the rule has is kept unchecked: MindsHub drops a
+      deleted team's id from every rule itself.
     - When the save changes the people, each one it names is asked about in
       one batched org-member lookup (503 while it can't be asked). One the
       stored rule doesn't have must be a member (400 naming them). One it
-      has who has left the org is dropped: the auth service keeps a departed
-      person's id on the rule and refuses it on the next write.
+      has who has left the org is dropped: MindsHub keeps a departed person's
+      id on the rule and refuses it on the next write.
 
     The caller's teams and permissions, and the org's members, are read with
     the Authorization the gateway validated (cowork.principal.caller_bearer).
 
-    Outside hosted org mode, and for a save that isn't restricted, ``access``
+    Outside MindsHub mode, and for a save that isn't restricted, ``access``
     is returned as it is: there are no teams or org members there, and
-    publish._with_team_audience keeps a rule that names them restricted to
-    its owner."""
+    artifact_audience.for_publisher keeps a rule that names them
+    restricted to its owner."""
     from cowork.principal import caller_bearer, get_principal
-    from cowork.services.artifact_access import NOT_A_MEMBER_REFUSAL
-    from cowork.services.skill_sharing import (
+    from cowork.services.artifact_access import FOREIGN_TEAM_REFUSAL, NOT_A_MEMBER_REFUSAL
+    from cowork.services.mindshub_client import (
         PERMISSIONS_UNREACHABLE,
         TEAMS_UNREACHABLE,
-        HubUnavailable,
+        MindsHubUnreachable,
+    )
+    from cowork.services.mindshub_teams import org_team_ids, read_mindshub_teams_now
+    from cowork.services.skill_sharing import (
         default_team_as_org,
         get_org_member_lookup,
         members_checked,
@@ -911,30 +960,22 @@ async def _checked_team_audience(
         resolve_skill_viewer,
     )
 
-    if not session.scope.org_mode or access.get("mode") != "restricted":
+    if not session.scope.org_mode or not access.restricted:
         return CheckedAccess(access)
-    out = dict(access)
     principal = get_principal(request)
     own_email = (principal.email if principal is not None else "").strip().lower()
-    if own_email and own_email in {str(e).strip().lower() for e in out.get("emails") or []}:
+    if own_email and own_email in {e.strip().lower() for e in access.allowed_emails or []}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=OWN_EMAIL_REFUSAL)
     try:
-        team_ids = (
-            list(normalize_team_ids(_id_list(out, "allowed_team_ids"), subject="an artifact"))
-            if "allowed_team_ids" in out
-            else []
-        )
-        user_ids = (
-            list(normalize_user_ids(_id_list(out, "allowed_user_ids"), subject="an artifact"))
-            if "allowed_user_ids" in out
-            else []
-        )
+        team_ids = list(normalize_team_ids(access.allowed_team_ids or [], subject="an artifact"))
+        user_ids = list(normalize_user_ids(access.allowed_user_ids or [], subject="an artifact"))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    org_allowed = access.org_allowed
     rule: ArtifactRule | None = None
-    if team_ids or user_ids or out.get("org_allowed"):
+    if team_ids or user_ids or org_allowed:
         rule = await stored_rule()
-        if team_ids or (out.get("org_allowed") and not rule.org_allowed):
+        if team_ids or (org_allowed and not rule.org_allowed):
             viewer = await resolve_skill_viewer(
                 scope=session.scope, principal=principal, bearer_token=caller_bearer(request)
             )
@@ -943,22 +984,47 @@ async def _checked_team_audience(
             teams = default_team_as_org(team_ids, viewer.default_team_id)
             team_ids = list(teams.team_ids)
             if teams.named_default:
-                out["org_allowed"] = True
+                org_allowed = True
             added = [t for t in team_ids if t not in rule.allowed_team_ids]
             if added and not viewer.teams_known:
                 # Without the caller's teams the default team can't be told
-                # apart, and the auth service is never sent it.
-                raise HubUnavailable(TEAMS_UNREACHABLE)
-            if out.get("org_allowed") and not rule.org_allowed and not viewer.can_share_org:
+                # apart, and MindsHub is never sent it.
+                raise MindsHubUnreachable(TEAMS_UNREACHABLE)
+            if org_allowed and not rule.org_allowed and not viewer.can_share_artifacts_org:
                 if not viewer.permissions_known:
-                    raise HubUnavailable(PERMISSIONS_UNREACHABLE)
+                    raise MindsHubUnreachable(PERMISSIONS_UNREACHABLE)
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ARTIFACT_ORG_REFUSAL)
-            outside = [t for t in added if t not in viewer.team_ids]
+            outside: list[str] = []
+            if added:
+                # The caller's teams read now: one deleted since the cached
+                # read would pass here and be refused by MindsHub only after
+                # the upload had made the save's emails and org flag live.
+                current = await read_mindshub_teams_now(
+                    bearer_token=caller_bearer(request),
+                    org_id=session.scope.org_id or "",
+                    user_id=session.scope.user_id or "",
+                )
+                if not current.reachable:
+                    raise MindsHubUnreachable(TEAMS_UNREACHABLE)
+                outside = [t for t in added if t not in current.team_ids]
             if outside and not viewer.is_admin:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"You can only share with teams you belong to: {', '.join(outside)}.",
                 )
+            if outside:
+                # An admin's team they aren't in. Checked before the publish:
+                # MindsHub would refuse it only after the lambda had already
+                # made the save's emails and org flag live.
+                org_teams = await org_team_ids(bearer_token=caller_bearer(request))
+                if org_teams is None:
+                    raise MindsHubUnreachable(TEAMS_UNREACHABLE)
+                foreign = [t for t in outside if t not in org_teams]
+                if foreign:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"{FOREIGN_TEAM_REFUSAL}: {', '.join(foreign)}",
+                    )
         stored_people = {u.lower() for u in rule.allowed_user_ids}
         if user_ids and set(user_ids) != stored_people:
             me = (session.scope.user_id or "").lower()
@@ -970,11 +1036,14 @@ async def _checked_team_audience(
                 refusal=NOT_A_MEMBER_REFUSAL,
             )
             user_ids = [u for u in user_ids if u == me or u in members]
-    if "allowed_user_ids" in out:
-        out["allowed_user_ids"] = user_ids
-    if "allowed_team_ids" in out:
-        out["allowed_team_ids"] = team_ids
-    return CheckedAccess(out, rule)
+    checked = access.model_copy(
+        update={
+            AudienceField.ORG_ALLOWED.value: org_allowed,
+            AudienceField.ALLOWED_TEAM_IDS.value: team_ids if access.allowed_team_ids is not None else None,
+            AudienceField.ALLOWED_USER_IDS.value: user_ids if access.allowed_user_ids is not None else None,
+        }
+    )
+    return CheckedAccess(checked, rule)
 
 
 def _owner_publish_context(session, folder: Path):
@@ -1007,33 +1076,35 @@ def _artifact_primary(folder: Path, metadata: dict | None):
     return _pick_primary(folder, _user_files(folder), primary_hint=(metadata or {}).get("primary"))
 
 
-@router.get("/workspace/{project_ref}/{artifact_id}/access")
+@router.get("/workspace/{project_ref}/{artifact_id}/access", response_model=ArtifactAccessView)
 async def artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
-):
+) -> ArtifactAccessView:
     """The owner's full access state for the Share control.
 
     Owner-only, and that is the point. The artifact CARD drops `accessEmails`
-    and `accessPassword` in org mode because one artifacts root is shared by the
-    whole organization, so the card cannot tell owner from co-member. This route
-    can: `_owner_workspace` refuses anyone else, so the owner gets back what they
-    need to pre-fill the dialog without widening what a card exposes.
+    and `accessPassword` in MindsHub mode because one artifacts root is shared
+    by everyone in the organization, so the card cannot tell owner from
+    co-member. This route can: `_owner_workspace` refuses anyone else, so the
+    owner gets back what they need to pre-fill the dialog without widening
+    what a card exposes.
 
-    In hosted org mode who a restricted artifact is shared with comes from
-    its rule as the auth service stores it, the one record of it
+    In MindsHub mode who a restricted artifact is shared with comes from its
+    rule as MindsHub stores it, the one record of it
     (cowork.services.publish.stored_artifact_rule): 503 while it can't be
-    read, 409 when the auth service refuses the read. The pod can write
+    read, 409 when MindsHub refuses the read. The pod can write
     .published.json, so an entry that isn't restricted is checked too: when
-    the auth service still holds a rule for the artifact
+    MindsHub still holds a rule for the artifact
     (cowork.services.publish.rule_held_over_entry, the check a re-publish
     makes before it goes ahead), the artifact is restricted to that rule's
     audience, which is what this answers.
     """
+    from cowork.models.artifact_owner_choice import AccessMode
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
-    from cowork.services.artifacts import _published_access_for
-    from cowork.services.publish import audience_fields, rule_held_over_entry, stored_artifact_rule
+    from cowork.services.artifacts import published_access_view
+    from cowork.services.publish import rule_held_over_entry, stored_artifact_rule
 
     source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
     primary = await run_in_threadpool(_artifact_primary, folder, metadata)
@@ -1042,11 +1113,11 @@ async def artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    state = await run_in_threadpool(_published_access_for, folder, primary)
+    state = await run_in_threadpool(published_access_view, folder, primary)
     if not session.scope.org_mode:
         return state
     read_rule: Callable[..., ArtifactRule | None] = (
-        stored_artifact_rule if state["accessMode"] == "restricted" else rule_held_over_entry
+        stored_artifact_rule if state.access_mode is AccessMode.RESTRICTED else rule_held_over_entry
     )
     try:
         rule = await run_in_threadpool(
@@ -1060,14 +1131,9 @@ async def artifact_access(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except ArtifactAccessRefused as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    if rule is not None:
-        state.update(
-            accessMode="restricted", accessProtected=False, accessPassword="", **audience_fields(rule),
-        )
-    return state
+    return state if rule is None else state.restricted_to(rule)
 
 
-@router.put("/workspace/{project_ref}/{artifact_id}/access")
 async def set_artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1093,12 +1159,14 @@ async def set_artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    from cowork.services.publish import access_from_app, pop_notify, stored_artifact_rule
+    from cowork.services.artifact_audience import share_notify
+    from cowork.services.publish import stored_artifact_rule
 
-    # "Notify people" belongs to this save alone: lifted out here and passed
-    # on its own, so it is never stored with the access a later re-publish reads.
+    # "Notify people" belongs to this save alone: read here and passed on its
+    # own, so it is never stored with the access a later re-publish reads.
+    access = body.access
     try:
-        access, notify = pop_notify(access_from_app(dict(body.access or {})))
+        notify = share_notify(access.notify)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -1189,6 +1257,14 @@ async def set_artifact_access(
             await run_in_threadpool(release, folder.parent, folder.name)
         if key is not None and not publish_abandoned:
             await key.revoke()
+
+
+router.add_api_route(
+    "/workspace/{project_ref}/{artifact_id}/access",
+    set_artifact_access,
+    methods=["PUT"],
+    route_class_override=_AccessSaveRoute,
+)
 
 
 class CommentsAccessResponse(CamelResponse):

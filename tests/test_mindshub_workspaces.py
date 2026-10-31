@@ -1,11 +1,11 @@
 """The MindsHub workspace selector: the listing and the stored pick.
 
-The org cases call the handlers directly with an explicitly built TenantScope.
+The MindsHub-mode cases call the handlers directly with an explicitly built TenantScope.
 `cowork.server.app` wires the principal middleware only when the process started
-in org mode, so a TestClient request would silently run under LOCAL_SCOPE and
+in MindsHub mode, so a TestClient request would silently run under LOCAL_SCOPE and
 prove nothing about per-user isolation.
 
-Outbound HTTP is stubbed at `_get_json`, which is also what lets a test assert
+Outbound HTTP is stubbed at `get_mindshub_json`, which is also what lets a test assert
 that a caller with no bearer is never asked for a listing at all.
 """
 from __future__ import annotations
@@ -17,16 +17,17 @@ import pytest
 from fastapi import HTTPException
 from sqlmodel import Session
 
-from cowork.api.v1.endpoints import hub_workspaces as ep
+from cowork.api.v1.endpoints import mindshub_workspaces as ep
 from cowork.common.settings.app_settings import (
     default_minds_auth_host,
     get_app_settings,
 )
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.db.session import get_engine
-from cowork.principal import HEADER_HUB_CREDENTIAL, caller_bearer, hub_credential
-from cowork.schemas.hub_workspaces import HubWorkspaceActivateRequest
-from cowork.services import hub_workspaces as svc
+from cowork.principal import HEADER_HUB_CREDENTIAL, caller_bearer, mindshub_credential
+from cowork.schemas.mindshub_workspaces import MindsHubWorkspaceActivateRequest
+from cowork.services import mindshub_client
+from cowork.services import mindshub_workspaces as svc
 from cowork.services.settings import SettingService
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
@@ -75,7 +76,7 @@ def _rows(*, archived: bool = False) -> dict:
 
 
 class FakeRequest:
-    """Just enough Request for `hub_credential`.
+    """Just enough Request for `mindshub_credential`.
 
     Sends the credential the way the desktop shell has to: its own header, not
     Authorization, which Electron overwrites with the loopback token.
@@ -124,7 +125,7 @@ def _clean_state():
 
 @pytest.fixture
 def calls(monkeypatch):
-    """Stub `_get_json` and record every path asked for.
+    """Stub `get_mindshub_json` and record every path asked for.
 
     Answers are seeded per test by mutating `answers`; a path with no entry
     answers None, which is the unreachable case.
@@ -136,7 +137,7 @@ def calls(monkeypatch):
         asked.append(path)
         return answers.get(path)
 
-    monkeypatch.setattr(svc, "_get_json", _fake)
+    monkeypatch.setattr(svc, "get_mindshub_json", _fake)
     return type("Calls", (), {"asked": asked, "answers": answers})()
 
 
@@ -162,8 +163,8 @@ def _view(session, scope, bearer: str = "jwt-abc"):
 
 
 def test_no_bearer_reads_as_unreachable_without_asking(session, calls):
-    """No bearer, no request: `fetch_hub_workspaces` short-circuits before it
-    would otherwise ask auth for a listing nobody could be authorized against."""
+    """No bearer, no request: `fetch_mindshub_workspaces` short-circuits before it
+    would otherwise ask MindsHub for a listing nobody could be authorized against."""
     view = _view(session, _scope(), bearer="")
 
     assert view.enabled is True
@@ -251,8 +252,8 @@ def test_stored_pick_naming_nothing_live_falls_back_to_default(session, calls):
 
 def _activate(session, scope, workspace_id: str, bearer: str = "jwt-abc"):
     return asyncio.run(
-        ep.set_active_hub_workspace(
-            HubWorkspaceActivateRequest(workspace_id=workspace_id),
+        ep.set_active_mindshub_workspace(
+            MindsHubWorkspaceActivateRequest(workspace_id=workspace_id),
             FakeRequest(bearer),
             session,
             scope,
@@ -395,17 +396,31 @@ def test_the_archived_refusal_survives_a_write_through_the_settings_route(sessio
     assert caught.value.status_code == 409
 
 
-def test_a_reachable_listing_is_cached_for_the_long_ttl(session, calls):
-    """A listing auth actually answered stays cached well past the short TTL."""
+class _Clock:
+    """A monotonic clock a test moves by hand, for the shared caller cache."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    moved = _Clock()
+    monkeypatch.setattr(mindshub_client, "time", moved)
+    return moved
+
+
+def test_a_reachable_listing_is_cached_for_the_long_ttl(session, calls, clock):
+    """A listing MindsHub actually answered stays cached well past the short TTL."""
     calls.answers[WORKSPACES] = _rows()
     assert _view(session, _scope()).reachable is True
     asked_once = calls.asked.count(WORKSPACES)
 
-    # Age the entry past _TTL_FAIL but leave it well inside _TTL_OK.
-    key = next(iter(svc._listing_cache))
-    stamped, listing = svc._listing_cache[key]
-    assert listing.reachable is True
-    svc._listing_cache[key] = (stamped - (svc._TTL_FAIL + 1), listing)
+    # Past the short TTL but well inside the long one.
+    clock.now += svc._listing_cache.ttl_fail_s + 1
 
     assert _view(session, _scope()).reachable is True
     assert calls.asked.count(WORKSPACES) == asked_once, (
@@ -413,33 +428,25 @@ def test_a_reachable_listing_is_cached_for_the_long_ttl(session, calls):
     )
 
 
-def test_an_unreachable_listing_keeps_the_short_ttl(session, calls):
+def test_an_unreachable_listing_keeps_the_short_ttl(session, calls, clock):
     """The other half: an unreachable listing is cached, but only briefly."""
     assert _view(session, _scope()).reachable is False
     asked_once = calls.asked.count(WORKSPACES)
 
-    key = next(iter(svc._listing_cache))
-    stamped, listing = svc._listing_cache[key]
-    assert listing.reachable is False
-    svc._listing_cache[key] = (stamped - (svc._TTL_FAIL + 1), listing)
+    clock.now += svc._listing_cache.ttl_fail_s + 1
 
     _view(session, _scope())
 
     assert calls.asked.count(WORKSPACES) == asked_once + 1
 
 
-def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(session, calls):
+def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(session, calls, clock):
     """Nothing re-reads a departed caller's key, so nothing would ever drop it."""
     calls.answers[WORKSPACES] = _rows()
     _view(session, LOCAL_SCOPE, bearer="jwt-someone-who-leaves")
     assert len(svc._listing_cache) == 1
 
-    stale = {
-        k: (stamped - (svc._MAX_TTL_S + 1), v)
-        for k, (stamped, v) in svc._listing_cache.items()
-    }
-    svc._listing_cache.clear()
-    svc._listing_cache.update(stale)
+    clock.now += svc._listing_cache.keep_s + 1
 
     _view(session, LOCAL_SCOPE, bearer="jwt-somebody-else")
 
@@ -515,7 +522,7 @@ def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
     admin who could steer this read would harvest members' bearers.
 
     Asserted on the URL and header actually built, rather than by grepping the
-    module: this is the only test that exercises `_get_json`, since every other
+    module: this is the only test that exercises `get_mindshub_json`, since every other
     test in this file stubs it.
     """
     monkeypatch.setenv("ENV", "staging")
@@ -547,10 +554,10 @@ def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
             seen.append((url, headers or {}))
             return FakeResponse()
 
-    monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(mindshub_client.httpx, "AsyncClient", FakeClient)
 
     listing = asyncio.run(
-        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
+        svc.fetch_mindshub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
 
     assert listing.reachable is True
@@ -565,7 +572,7 @@ def test_the_route_answers_the_same_view_its_builder_does(session, calls):
     calls.answers[WORKSPACES] = _rows()
 
     view = asyncio.run(
-        ep.get_hub_workspaces(FakeRequest(), session, _scope())
+        ep.get_mindshub_workspaces(FakeRequest(), session, _scope())
     )
 
     assert view.enabled is True
@@ -621,12 +628,12 @@ def test_every_transport_failure_reads_as_unreachable(monkeypatch, failure):
                 await asyncio.sleep(30)
             return FakeResponse()
 
-    monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
-    monkeypatch.setattr(svc, "_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(mindshub_client.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(mindshub_client, "_TIMEOUT_S", 0.05)
 
     started = time.monotonic()
     listing = asyncio.run(
-        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
+        svc.fetch_mindshub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
     elapsed = time.monotonic() - started
 
@@ -672,8 +679,8 @@ def test_resolve_active_with_no_workspaces_is_nothing_rather_than_a_crash():
 def test_resolve_active_falls_through_to_the_first_row_with_no_default():
     """An organization whose default workspace the caller has no grant on."""
     rows = [
-        svc.HubWorkspace(id=WS_CLIENT_A, display_name="Client A"),
-        svc.HubWorkspace(id=WS_ARCHIVED, display_name="Old"),
+        svc.MindsHubWorkspace(id=WS_CLIENT_A, display_name="Client A"),
+        svc.MindsHubWorkspace(id=WS_ARCHIVED, display_name="Old"),
     ]
 
     assert svc.resolve_active(rows, "").id == WS_CLIENT_A
@@ -702,10 +709,10 @@ def test_an_http_refusal_is_not_mistaken_for_an_empty_organization(monkeypatch):
         async def get(self, url, headers=None):
             return FakeResponse()
 
-    monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(mindshub_client.httpx, "AsyncClient", FakeClient)
 
     listing = asyncio.run(
-        svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
+        svc.fetch_mindshub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
 
     assert listing.reachable is False
@@ -780,7 +787,7 @@ def test_the_hub_header_wins_over_the_loopback_authorization():
         },
     )()
 
-    assert hub_credential(request) == "real-user-jwt"
+    assert mindshub_credential(request) == "real-user-jwt"
     # The other helper is untouched, so the model-catalog fetch cannot be steered
     # by a client setting the hub header.
     assert caller_bearer(request) == "loopback-token-not-the-users"
@@ -793,7 +800,7 @@ def test_the_web_shell_falls_back_to_authorization(monkeypatch):
     try:
         request = type("R", (), {"headers": {"Authorization": "Bearer web-jwt"}})()
 
-        assert hub_credential(request) == "web-jwt"
+        assert mindshub_credential(request) == "web-jwt"
     finally:
         get_app_settings.cache_clear()
 
@@ -812,7 +819,7 @@ def test_a_desktop_install_never_forwards_the_servers_own_token(monkeypatch):
     try:
         request = type("R", (), {"headers": {"Authorization": "Bearer the-loopback-token"}})()
 
-        assert hub_credential(request) == ""
+        assert mindshub_credential(request) == ""
     finally:
         get_app_settings.cache_clear()
 
@@ -828,13 +835,13 @@ def test_a_malformed_hub_header_falls_back_rather_than_forwarding_junk(value, mo
             {"headers": {HEADER_HUB_CREDENTIAL: value, "Authorization": "Bearer fallback"}},
         )()
 
-        assert hub_credential(request) == "fallback"
+        assert mindshub_credential(request) == "fallback"
     finally:
         get_app_settings.cache_clear()
 
 
-def test_hub_credential_with_no_request_is_empty():
-    assert hub_credential(None) == ""
+def test_mindshub_credential_with_no_request_is_empty():
+    assert mindshub_credential(None) == ""
 
 
 # ── A pick auth refuses at mint time ─────────────────────────────────
@@ -851,7 +858,7 @@ def test_a_refused_pick_is_cleared(session, org_tenancy):
     and clearing the stored value makes the turn path agree with it."""
     SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
 
-    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+    svc.forget_stale_mindshub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
 
     assert _stored_pick(_scope()) == ""
 
@@ -861,7 +868,7 @@ def test_a_newer_pick_is_not_cleared(session, org_tenancy):
     refusal; that newer choice must survive the stale one being cleared."""
     SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_DEFAULT)
 
-    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+    svc.forget_stale_mindshub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
 
     assert _stored_pick(_scope()) == WS_DEFAULT
 
@@ -870,7 +877,7 @@ def test_clearing_is_scoped_to_the_caller(session, org_tenancy):
     SettingService(session, _scope(ORG_A, USER_A)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
     SettingService(session, _scope(ORG_A, USER_A2)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
 
-    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+    svc.forget_stale_mindshub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
 
     assert _stored_pick(_scope(ORG_A, USER_A)) == ""
     assert _stored_pick(_scope(ORG_A, USER_A2)) == WS_CLIENT_A
@@ -890,7 +897,7 @@ def test_a_refused_pick_is_cleared_on_a_local_deployment(session, monkeypatch):
     try:
         SettingService(session, LOCAL_SCOPE).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
 
-        svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+        svc.forget_stale_mindshub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
 
         assert _stored_pick(LOCAL_SCOPE) == ""
         engine = get_engine(get_app_settings().database.uri)
@@ -911,4 +918,19 @@ def test_a_failed_clear_does_not_raise(monkeypatch):
 
     monkeypatch.setattr("cowork.db.session.get_open_session", broken_session)
 
-    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+    svc.forget_stale_mindshub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+
+def test_the_mindshub_routes_are_listed_under_mindshubs_name():
+    """The /hub/* routes keep their paths; the API's docs group them under
+    MindsHub's name."""
+    from cowork.api.v1.router import api_router
+
+    tags = {route.path: route.tags for route in api_router.routes if "/hub/" in getattr(route, "path", "")}
+    assert tags == {
+        "/api/v1/hub/workspaces/": ["mindshub-workspaces"],
+        "/api/v1/hub/workspaces/active": ["mindshub-workspaces"],
+        "/api/v1/hub/usage/": ["mindshub-usage"],
+        "/api/v1/hub/teams/": ["mindshub-teams"],
+        "/api/v1/hub/people/": ["mindshub-people"],
+    }

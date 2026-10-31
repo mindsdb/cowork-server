@@ -12,7 +12,7 @@ from typing import Literal
 
 import httpx
 
-from cowork.services.hub_workspaces import forget_stale_hub_workspace
+from cowork.services.mindshub_workspaces import forget_stale_mindshub_workspace
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
                     "turn key mint: workspace %s refused for user %s; retrying on the default",
                     workspace_id, user_id,
                 )
-                forget_stale_hub_workspace(org_id=org_id, user_id=user_id, workspace_id=workspace_id)
+                forget_stale_mindshub_workspace(org_id=org_id, user_id=user_id, workspace_id=workspace_id)
                 del body["workspace_id"]
                 resp = await client.post(url, json=body, headers=headers)
             if resp.status_code == 403 and _error_code(resp) == "permission_denied":

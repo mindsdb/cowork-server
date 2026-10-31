@@ -104,7 +104,7 @@ async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypatch):
-    """ENG-3787: the pod recalls only what the request's skills block names,
+    """The pod recalls only what the request's skills block names,
     so a channel turn sends one too: the fail-closed set (no member behind
     it), and {} when there is nothing to send."""
     _fake_handler(monkeypatch)
@@ -132,8 +132,8 @@ async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypa
 
 
 def test_the_skills_block_is_empty_when_it_cant_be_built(monkeypatch):
-    """A failure sends {} (no skills), never no block, which the pod would
-    read as leave to recall its whole skills volume."""
+    """A failure sends {} (no skills), never no block, which would let the
+    pod fall back to a mounted skills tree."""
     import cowork.handlers.responses as responses_mod
 
     class _Broken:

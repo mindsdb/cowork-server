@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 
 from cowork.services.publish import (
     PublisherUnavailable,
@@ -86,7 +87,7 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep):
             api_key=api_key,
             publish_url=publish_url,
             password=req.password,
-            access=req.access.model_dump() if req.access else None,
+            access=ArtifactAccessRequest.of_publisher(req.access.model_dump()) if req.access else None,
             scope=scope,
         )
     except FileNotFoundError as e:

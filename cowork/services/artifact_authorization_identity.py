@@ -22,7 +22,7 @@ from cowork.services.artifact_identity import artifact_key
 
 
 @contextmanager
-def _session(scope: TenantScope):
+def authorization_session(scope: TenantScope):
     if not scope.org_mode or not scope.org_id or not scope.user_id:
         raise ArtifactAccessUnavailable(
             "Artifact authorization requires a signed-in organization"
@@ -52,7 +52,7 @@ def existing_authorization_key(
     local_id: str, scope: TenantScope, *, owner_user_id: str | None = None
 ) -> str | None:
     """Read an existing alias. Never contact auth or allocate during a read."""
-    with _session(scope) as session:
+    with authorization_session(scope) as session:
         row = _row(session, local_id)
         if row is None:
             return None
@@ -121,7 +121,7 @@ def ensure_authorization_key(
             "Only the artifact owner can authorize this draft"
         )
     local_id = UUID(local_id).hex
-    with _session(scope) as session:
+    with authorization_session(scope) as session:
         row = _row(session, local_id)
         if row is None:
             row = ArtifactIdentity(
@@ -144,7 +144,7 @@ def ensure_authorization_key(
         request_id = row.id
 
     canonical = _allocate_or_adopt(local_id, owner_user_id, scope, request_id)
-    with _session(scope) as session:
+    with authorization_session(scope) as session:
         row = _row(session, local_id, lock=True)
         _check_owner(row, owner_user_id)
         if row.canonical_artifact_id and row.canonical_artifact_id != canonical:
@@ -175,7 +175,7 @@ def publish_authorization_key(
         resolve_artifact_owner,
     )
 
-    with _session(scope) as session:
+    with authorization_session(scope) as session:
         try:
             source = artifact_root_for_base(session, project_id, artifacts_base)
         except (TypeError, ValueError) as exc:

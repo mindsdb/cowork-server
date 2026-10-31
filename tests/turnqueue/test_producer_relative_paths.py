@@ -89,7 +89,7 @@ async def test_only_project_memory_is_shipped_in_anton_job_params(captured):
     )
     params = captured["payload"]["params"]
     # No skills were passed: the block is still there, empty, since the pod
-    # recalls only what it names (ENG-3787).
+    # recalls only what it names.
     assert params["skills"] == {}
     assert params["memory"] == {"project": project_memory}
 

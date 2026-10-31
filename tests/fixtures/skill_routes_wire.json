@@ -1,0 +1,1810 @@
+{
+  "single_user": {
+    "create": {
+      "status": 201,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "wire-notes",
+        "declarative": "Notes body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": false
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "upload": {
+      "status": 201,
+      "body": {
+        "id": "wire-upload",
+        "label": "wire-upload",
+        "name": "wire-upload",
+        "description": "Uploaded for the wire test.",
+        "declarative": "\nUploaded body.\n",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": false
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "read": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "wire-notes",
+        "declarative": "Notes body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": false
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "edit": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": false
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "off_for_me": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": false,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": false
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "sharing_1": {
+      "status": 401,
+      "body": {
+        "detail": "Unauthorized"
+      }
+    },
+    "list": {
+      "status": 200,
+      "body": {
+        "skills": [
+          {
+            "id": "wire-upload",
+            "label": "wire-upload",
+            "name": "wire-upload",
+            "description": "Uploaded for the wire test.",
+            "declarative": "\nUploaded body.\n",
+            "createdAt": "<time>",
+            "updatedAt": "<time>",
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": true,
+            "visibleToOthers": false,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": "<time>"
+            },
+            "isBuiltin": false,
+            "shared": false,
+            "capabilities": {
+              "canEdit": true,
+              "canDelete": true,
+              "canDisable": true,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": true,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "wire-notes",
+            "label": "wire-notes",
+            "name": "wire-notes",
+            "description": "Notes for the wire test.",
+            "declarative": "Changed body.",
+            "createdAt": "<time>",
+            "updatedAt": "<time>",
+            "enabled": true,
+            "enabledForMe": false,
+            "canDisableForEveryone": true,
+            "visibleToOthers": false,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": "<time>"
+            },
+            "isBuiltin": false,
+            "shared": false,
+            "capabilities": {
+              "canEdit": true,
+              "canDelete": true,
+              "canDisable": true,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": true,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          }
+        ],
+        "canShare": false
+      }
+    }
+  },
+  "single_tenant": {
+    "create": {
+      "status": 201,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "wire-notes",
+        "declarative": "Notes body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "upload": {
+      "status": 201,
+      "body": {
+        "id": "wire-upload",
+        "label": "wire-upload",
+        "name": "wire-upload",
+        "description": "Uploaded for the wire test.",
+        "declarative": "\nUploaded body.\n",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "read": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "wire-notes",
+        "declarative": "Notes body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "edit": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "off_for_me": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": false,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "sharing_1": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": true,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": true,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "sharing_2": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": null,
+          "lastModifiedBy": null,
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": null,
+          "email": null
+        }
+      }
+    },
+    "list": {
+      "status": 200,
+      "body": {
+        "skills": [
+          {
+            "id": "pdf",
+            "label": "pdf",
+            "name": "pdf",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "skill-creator",
+            "label": "skill-creator",
+            "name": "skill-creator",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "presentations",
+            "label": "presentations",
+            "name": "presentations",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "google-sheets",
+            "label": "google-sheets",
+            "name": "google-sheets",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "google-slides",
+            "label": "google-slides",
+            "name": "google-slides",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "documents",
+            "label": "documents",
+            "name": "documents",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "docx",
+            "label": "docx",
+            "name": "docx",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "gmail",
+            "label": "gmail",
+            "name": "gmail",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "wire-upload",
+            "label": "wire-upload",
+            "name": "wire-upload",
+            "description": "Uploaded for the wire test.",
+            "declarative": "\nUploaded body.\n",
+            "createdAt": "<time>",
+            "updatedAt": "<time>",
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": true,
+            "visibleToOthers": false,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": "<time>"
+            },
+            "isBuiltin": false,
+            "shared": false,
+            "capabilities": {
+              "canEdit": true,
+              "canDelete": true,
+              "canDisable": true,
+              "canShare": true
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": true,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "wire-notes",
+            "label": "wire-notes",
+            "name": "wire-notes",
+            "description": "Notes for the wire test.",
+            "declarative": "Changed body.",
+            "createdAt": "<time>",
+            "updatedAt": "<time>",
+            "enabled": true,
+            "enabledForMe": false,
+            "canDisableForEveryone": true,
+            "visibleToOthers": false,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": "<time>"
+            },
+            "isBuiltin": false,
+            "shared": false,
+            "capabilities": {
+              "canEdit": true,
+              "canDelete": true,
+              "canDisable": true,
+              "canShare": true
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": true,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          }
+        ],
+        "canShare": true
+      }
+    }
+  },
+  "mindshub": {
+    "create": {
+      "status": 201,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "wire-notes",
+        "declarative": "Notes body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "upload": {
+      "status": 201,
+      "body": {
+        "id": "wire-upload",
+        "label": "wire-upload",
+        "name": "wire-upload",
+        "description": "Uploaded for the wire test.",
+        "declarative": "\nUploaded body.\n",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "read": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "wire-notes",
+        "declarative": "Notes body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "edit": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": true,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "off_for_me": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": false,
+        "canDisableForEveryone": true,
+        "visibleToOthers": false,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [],
+          "allowedUserIds": [],
+          "alwaysOn": false
+        },
+        "section": "mine",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "sharing_1": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": false,
+        "canDisableForEveryone": true,
+        "visibleToOthers": true,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [
+            "a1b2c3d4-0000-4000-8000-0000000000e1"
+          ],
+          "allowedUserIds": [],
+          "alwaysOn": true
+        },
+        "section": "team",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "sharing_2": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": false,
+        "canDisableForEveryone": true,
+        "visibleToOthers": true,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": false,
+          "allowedTeamIds": [
+            "a1b2c3d4-0000-4000-8000-0000000000e1"
+          ],
+          "allowedUserIds": [
+            "a1b2c3d4-0000-4000-8000-00000000a002"
+          ],
+          "alwaysOn": true
+        },
+        "section": "team",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "sharing_3": {
+      "status": 200,
+      "body": {
+        "id": "wire-notes",
+        "label": "wire-notes",
+        "name": "wire-notes",
+        "description": "Notes for the wire test.",
+        "declarative": "Changed body.",
+        "createdAt": "<time>",
+        "updatedAt": "<time>",
+        "enabled": true,
+        "enabledForMe": false,
+        "canDisableForEveryone": true,
+        "visibleToOthers": true,
+        "projects": [],
+        "attribution": {
+          "createdBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedBy": {
+            "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+            "email": "owner@example.com"
+          },
+          "lastModifiedAt": "<time>"
+        },
+        "isBuiltin": false,
+        "shared": false,
+        "capabilities": {
+          "canEdit": true,
+          "canDelete": true,
+          "canDisable": true,
+          "canShare": true
+        },
+        "access": {
+          "orgAllowed": true,
+          "allowedTeamIds": [
+            "a1b2c3d4-0000-4000-8000-0000000000e1"
+          ],
+          "allowedUserIds": [
+            "a1b2c3d4-0000-4000-8000-00000000a002"
+          ],
+          "alwaysOn": true
+        },
+        "section": "org",
+        "canEdit": true,
+        "owner": {
+          "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+          "email": "owner@example.com"
+        }
+      }
+    },
+    "list": {
+      "status": 200,
+      "body": {
+        "skills": [
+          {
+            "id": "pdf",
+            "label": "pdf",
+            "name": "pdf",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "skill-creator",
+            "label": "skill-creator",
+            "name": "skill-creator",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "presentations",
+            "label": "presentations",
+            "name": "presentations",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "google-sheets",
+            "label": "google-sheets",
+            "name": "google-sheets",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "google-slides",
+            "label": "google-slides",
+            "name": "google-slides",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "documents",
+            "label": "documents",
+            "name": "documents",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "docx",
+            "label": "docx",
+            "name": "docx",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "gmail",
+            "label": "gmail",
+            "name": "gmail",
+            "description": "<built-in text>",
+            "declarative": "<built-in text>",
+            "createdAt": null,
+            "updatedAt": null,
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": false,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": null,
+              "lastModifiedBy": null,
+              "lastModifiedAt": null
+            },
+            "isBuiltin": true,
+            "shared": false,
+            "capabilities": {
+              "canEdit": false,
+              "canDelete": false,
+              "canDisable": false,
+              "canShare": false
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "org",
+            "canEdit": false,
+            "owner": {
+              "id": null,
+              "email": null
+            }
+          },
+          {
+            "id": "wire-upload",
+            "label": "wire-upload",
+            "name": "wire-upload",
+            "description": "Uploaded for the wire test.",
+            "declarative": "\nUploaded body.\n",
+            "createdAt": "<time>",
+            "updatedAt": "<time>",
+            "enabled": true,
+            "enabledForMe": true,
+            "canDisableForEveryone": true,
+            "visibleToOthers": false,
+            "projects": [],
+            "attribution": {
+              "createdBy": {
+                "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+                "email": "owner@example.com"
+              },
+              "lastModifiedBy": {
+                "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+                "email": "owner@example.com"
+              },
+              "lastModifiedAt": "<time>"
+            },
+            "isBuiltin": false,
+            "shared": false,
+            "capabilities": {
+              "canEdit": true,
+              "canDelete": true,
+              "canDisable": true,
+              "canShare": true
+            },
+            "access": {
+              "orgAllowed": false,
+              "allowedTeamIds": [],
+              "allowedUserIds": [],
+              "alwaysOn": false
+            },
+            "section": "mine",
+            "canEdit": true,
+            "owner": {
+              "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+              "email": "owner@example.com"
+            }
+          },
+          {
+            "id": "wire-notes",
+            "label": "wire-notes",
+            "name": "wire-notes",
+            "description": "Notes for the wire test.",
+            "declarative": "Changed body.",
+            "createdAt": "<time>",
+            "updatedAt": "<time>",
+            "enabled": true,
+            "enabledForMe": false,
+            "canDisableForEveryone": true,
+            "visibleToOthers": true,
+            "projects": [],
+            "attribution": {
+              "createdBy": {
+                "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+                "email": "owner@example.com"
+              },
+              "lastModifiedBy": {
+                "userId": "a1b2c3d4-0000-4000-8000-00000000a001",
+                "email": "owner@example.com"
+              },
+              "lastModifiedAt": "<time>"
+            },
+            "isBuiltin": false,
+            "shared": false,
+            "capabilities": {
+              "canEdit": true,
+              "canDelete": true,
+              "canDisable": true,
+              "canShare": true
+            },
+            "access": {
+              "orgAllowed": true,
+              "allowedTeamIds": [
+                "a1b2c3d4-0000-4000-8000-0000000000e1"
+              ],
+              "allowedUserIds": [
+                "a1b2c3d4-0000-4000-8000-00000000a002"
+              ],
+              "alwaysOn": true
+            },
+            "section": "org",
+            "canEdit": true,
+            "owner": {
+              "id": "a1b2c3d4-0000-4000-8000-00000000a001",
+              "email": "owner@example.com"
+            }
+          }
+        ],
+        "canShare": false
+      }
+    }
+  }
+}

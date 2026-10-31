@@ -14,13 +14,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
+import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 
+# Imported before any fixture patches publish_artifact: artifact_autopublish
+# binds publish_artifact by name when it is first imported, and
+# publish_context's patch of it by path would otherwise first import it while
+# publish_calls holds the fake, for every later test in the run.
+import cowork.services.artifact_autopublish  # noqa: F401
 from cowork.api.v1.endpoints import artifact_workspace as aw
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import TenantScope, get_scoped_session
+from cowork.schemas.artifact_access import ArtifactAccessRequest
+from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.services import artifact_locks
 from tests._org_sharing import (
     BOB,
@@ -28,12 +37,19 @@ from tests._org_sharing import (
     DAVE,
     EVE,
     MEMBER_BEARER,
-    access_service_answers,
+    TEAM_ELSEWHERE,
+    TEAM_ENG,
+    TEAM_OPS,
+    mindshub_answers,
+    mindshub_sharing_answers,
     artifact_rule,
     member_request,
 )
 
-ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
+# The gateway forwards every org and person id as a UUID.
+ORG_SCOPE = TenantScope(
+    org_mode=True, org_id="0a0a0a0a-0000-4000-8000-000000000001", user_id="0b0b0b0b-0000-4000-8000-000000000001"
+)
 ARTIFACT_ID = "11111111-1111-1111-1111-111111111111"
 
 
@@ -48,7 +64,7 @@ _MEMBER_REQUEST = member_request()
 
 @pytest.fixture
 def folder(tmp_path):
-    base = tmp_path / "org-1" / "proj" / ".anton" / "artifacts"
+    base = tmp_path / ORG_SCOPE.org_id / "proj" / ".anton" / "artifacts"
     f = base / "rep"
     f.mkdir(parents=True)
     (f / "report.html").write_text("<html></html>")
@@ -75,9 +91,12 @@ def publish_calls(monkeypatch):
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
                      password=None, access=None, scope=None, project_id=None,
                      notify=None, stored=None, owner_save=False):
+        # publish_artifact takes the model; what it hands anton is its
+        # publisher_access.
+        assert isinstance(access, ArtifactAccessRequest)
         calls.append({
             "folder": artifact, "artifacts_base": artifacts_base, "api_key": api_key,
-            "publish_url": publish_url, "access": access, "scope": scope,
+            "publish_url": publish_url, "access": access.publisher_access(), "scope": scope,
             "project_id": project_id, "notify": notify, "stored": stored,
             "owner_save": owner_save,
         })
@@ -146,7 +165,7 @@ async def test_setting_access_republishes_with_the_chosen_audience(
     )
 
     assert out["url"] == "https://view.example/r/1"
-    # The auth service's allowed_emails reaches anton's publisher as its emails.
+    # MindsHub's allowed_emails reaches anton's publisher as its emails.
     assert publish_calls[0]["access"] == {
         "mode": "restricted", "emails": ["a@example.com"], "org_allowed": False,
     }
@@ -163,7 +182,7 @@ async def test_setting_access_republishes_with_the_chosen_audience(
 async def test_a_save_that_chose_notify_passes_the_people_apart_from_the_access(
     as_owner, publish_calls, publish_context,
 ):
-    """ENG-3787: the app sends ``notify: {user_ids, emails}`` inside the
+    """The app sends ``notify: {user_ids, emails}`` inside the
     access object. It is this save's alone, so it is lifted out and passed on
     its own, never left in the access that gets stored and re-published."""
     access = {"mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False}
@@ -188,35 +207,64 @@ async def test_a_save_that_chose_notify_passes_the_people_apart_from_the_access(
         assert publish_calls[-1]["access"] == published
 
 
-async def test_a_retired_audience_name_is_a_400(as_owner, publish_calls, publish_context):
-    """ENG-3787: the app sends the auth service's four names (org_allowed,
-    allowed_team_ids, allowed_user_ids, allowed_emails); an older name is
-    refused rather than dropped, so it can't shrink an audience unnoticed."""
-    for retired in ("emails", "team_ids", "org_wide"):
-        with pytest.raises(HTTPException) as caught:
-            await aw.set_artifact_access(
-                "proj", ARTIFACT_ID,
-                aw._AccessBody(access={"mode": "restricted", retired: []}), _Session(), _REQUEST,
-            )
-        assert caught.value.status_code == 400
+async def _put_access(body) -> httpx.Response:
+    """PUT .../access over HTTP, through the route as the app mounts it, so
+    FastAPI reads the body: the session is the org scope's, and the owner and
+    the publish are the tests' fixtures."""
+    app = FastAPI()
+    app.include_router(aw.router)
+    app.dependency_overrides[get_scoped_session] = _Session
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        return await client.put(f"/workspace/proj/{ARTIFACT_ID}/access", json=body)
+
+
+async def test_a_top_level_emails_is_a_400(as_owner, publish_calls, publish_context):
+    """The app sends MindsHub's four names (org_allowed, allowed_team_ids,
+    allowed_user_ids, allowed_emails). A top-level emails, which an app tab
+    loaded from an older build sends, is refused rather than dropped, so
+    it can't shrink an audience unnoticed."""
+    answer = await _put_access({"access": {"mode": "restricted", "emails": []}})
+    assert (answer.status_code, answer.json()) == (
+        400, {"detail": "emails is not an access field; send allowed_emails."},
+    )
     assert publish_calls == []
 
 
-async def test_a_malformed_notify_is_a_400(as_owner, publish_calls, publish_context):
-    for notify in ("everyone", {"emails": "a@example.com"}):
-        with pytest.raises(HTTPException) as caught:
-            await aw.set_artifact_access(
-                "proj", ARTIFACT_ID,
-                aw._AccessBody(access={"mode": "restricted", "allowed_emails": [], "notify": notify}),
-                _Session(), _REQUEST,
-            )
-        assert caught.value.status_code == 400
+async def test_a_malformed_save_is_a_400_with_a_sentence_never_a_422(as_owner, publish_calls, publish_context):
+    """The Share dialog shows a refusal's detail as it is, so a save FastAPI
+    can't read answers 400 with one sentence naming what is wrong, never
+    FastAPI's 422 with a list of errors. Fields are named from inside the
+    access object, as the dialog sends them."""
+    refusals = [
+        ({"access": {"mode": "restricted", "allowed_user_ids": "nope"}}, "allowed_user_ids must be a list."),
+        ({"access": {"mode": "everyone"}}, "mode: Input should be 'restricted', 'password' or 'public'."),
+        ({"access": {"mode": "restricted", "org_allowed": "maybe"}}, "org_allowed must be true or false."),
+        ({"access": {"mode": "restricted", "notify": "everyone"}}, "notify must be an object."),
+        ({"access": {"mode": "restricted", "notify": {"emails": "a@example.com"}}}, "notify.emails must be a list."),
+        ({"access": "public"}, "access must be an object."),
+        ({}, "access: Field required."),
+        (["public"], aw.ACCESS_BODY_REFUSAL),
+    ]
+    for body, detail in refusals:
+        answer = await _put_access(body)
+        assert (answer.status_code, answer.json()) == (400, {"detail": detail}), body
     assert publish_calls == []
+
+
+async def test_a_save_ignores_fields_it_does_not_know(as_owner, publish_calls, publish_context):
+    """A field the save doesn't define, inside access or beside it, is
+    ignored rather than refused: team_ids and org_wide among them."""
+    answer = await _put_access({
+        "access": {"mode": "restricted", "allowed_emails": ["a@example.com"], "team_ids": ["t"], "org_wide": True},
+        "extra": 1,
+    })
+    assert answer.status_code == 200, answer.text
+    assert publish_calls[-1]["access"] == {"mode": "restricted", "emails": ["a@example.com"]}
 
 
 @pytest.fixture
 def stored_rule(monkeypatch):
-    """The artifact's rule as the auth service stores it, which the route
+    """The artifact's rule as MindsHub stores it, which the route
     reads with cowork.services.publish.stored_artifact_rule: nobody but the
     owner until a test sets ``rule``. Each read is counted in ``reads``.
     For an entry that isn't restricted the route reads
@@ -246,11 +294,11 @@ def stored_rule(monkeypatch):
 async def test_sharing_with_everyone_takes_share_org_before_anything_is_published(
     as_owner, publish_calls, publish_context, stored_rule, monkeypatch,
 ):
-    """ENG-3787: "Everyone at the org" on an artifact takes skills.share_org,
-    as it does for a skill, read with the gateway's credential. A member
-    without it gets a 403 and nothing is published."""
+    """"Everyone at the org" on an artifact takes artifacts.share_org, read
+    with the gateway's credential. A member without it, the skill capability
+    alone included, gets a 403 and nothing is published."""
     asked: list = []
-    access_service_answers(monkeypatch, asked=asked)
+    mindshub_sharing_answers(monkeypatch, asked=asked)
     everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": []}
     with pytest.raises(HTTPException) as caught:
         await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
@@ -261,7 +309,13 @@ async def test_sharing_with_everyone_takes_share_org_before_anything_is_publishe
     assert stored_rule.reads == [(as_owner, as_owner.parent, ORG_SCOPE, "proj-1")]
     assert _lock_is_free(as_owner)
 
-    access_service_answers(monkeypatch, permissions=("skills.share_org",))
+    mindshub_sharing_answers(monkeypatch, permissions=("skills.share_org",))
+    with pytest.raises(HTTPException) as caught:
+        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
+    assert (caught.value.status_code, caught.value.detail) == (403, aw.ARTIFACT_ORG_REFUSAL)
+    assert publish_calls == []
+
+    mindshub_sharing_answers(monkeypatch, permissions=("artifacts.share_org",))
     await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
     assert publish_calls[-1]["access"]["org_allowed"] is True
 
@@ -278,12 +332,12 @@ def _planted(folder, **entry) -> None:
 async def test_an_entry_an_agent_planted_never_lets_a_member_share_with_everyone(
     as_owner, publish_calls, publish_context, stored_rule, monkeypatch,
 ):
-    """ENG-3787: .published.json says the rule is org-wide already, but an
-    agent can write that file, and the rule the auth service stores says
+    """.published.json says the rule is shared with everyone already, but an
+    agent can write that file, and the rule MindsHub stores says
     otherwise. So a member without skills.share_org who asks for everyone
     still gets the 403, and nothing is published."""
     _planted(as_owner, org_allowed=True)
-    access_service_answers(monkeypatch)
+    mindshub_sharing_answers(monkeypatch)
     everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": []}
     with pytest.raises(HTTPException) as caught:
         await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
@@ -294,14 +348,128 @@ async def test_an_entry_an_agent_planted_never_lets_a_member_share_with_everyone
 async def test_a_member_keeps_an_artifact_already_shared_with_everyone(
     as_owner, publish_calls, publish_context, stored_rule, monkeypatch,
 ):
-    """Only making an artifact org-wide takes skills.share_org. A member who
+    """Only sharing an artifact with everyone takes artifacts.share_org. A member who
     owns one the rule already shares with everyone saves it again, say to
     add an address, without it."""
     stored_rule.rule = artifact_rule(org=True)
-    access_service_answers(monkeypatch)
+    mindshub_sharing_answers(monkeypatch)
     access = {"mode": "restricted", "org_allowed": True, "allowed_emails": ["e@else.com"]}
     await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(), _MEMBER_REQUEST)
     assert publish_calls[-1]["access"] == {"mode": "restricted", "org_allowed": True, "emails": ["e@else.com"]}
+
+
+async def test_an_admins_team_from_outside_the_org_is_a_400_before_anything_is_published(
+    as_owner, publish_calls, publish_context, stored_rule, monkeypatch,
+):
+    """An admin may name any team of the organization, so a team they aren't
+    in is checked against the organization's teams, read now, before the
+    publish: MindsHub refuses a team from elsewhere only after the lambda
+    has made the save's new emails live. While those teams can't be read the
+    save is a 503. Nothing is published either way, and a team of the
+    organization the admin isn't in is published."""
+    from cowork.services.artifact_access import FOREIGN_TEAM_REFUSAL
+
+    admin = member_request(Principal(
+        user_id=ORG_SCOPE.user_id, org_id=ORG_SCOPE.org_id, email="admin@x.com",
+        roles=frozenset({ORG_MANAGE_ROLE}),
+    ))
+    save = {"mode": "restricted", "allowed_emails": ["new@else.com"], "allowed_team_ids": [TEAM_ELSEWHERE]}
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,), org_teams=(TEAM_ENG, TEAM_OPS))
+    with pytest.raises(HTTPException) as caught:
+        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=save), _Session(), admin)
+    assert (caught.value.status_code, caught.value.detail) == (400, f"{FOREIGN_TEAM_REFUSAL}: {TEAM_ELSEWHERE}")
+
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,), org_teams_down=True)
+    with pytest.raises(HTTPException) as caught:
+        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=save), _Session(), admin)
+    assert caught.value.status_code == 503
+    assert publish_calls == []
+    assert _lock_is_free(as_owner)
+
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,), org_teams=(TEAM_ENG, TEAM_OPS))
+    ops = {**save, "allowed_team_ids": [TEAM_OPS]}
+    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=ops), _Session(), admin)
+    assert publish_calls[-1]["access"]["allowed_team_ids"] == [TEAM_OPS]
+
+
+def _cache_the_callers_teams(*team_ids: str) -> None:
+    """The caller's teams as the per-caller cache holds them from a read
+    MindsHub answered a moment ago."""
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import CallerCacheKey
+
+    key = CallerCacheKey.for_caller(org_id=ORG_SCOPE.org_id, user_id=ORG_SCOPE.user_id, bearer_token=MEMBER_BEARER)
+    listing = mindshub_teams.MindsHubTeamListing(
+        teams=[mindshub_teams.MindsHubTeam(id=team_id) for team_id in team_ids], reachable=True,
+    )
+    mindshub_teams._teams_cache.put(key, listing)
+
+
+async def test_a_team_deleted_since_the_cached_read_is_refused_before_anything_is_published(
+    as_owner, publish_calls, publish_context, stored_rule, monkeypatch,
+):
+    """The caller's teams are cached for a minute, so a team deleted within
+    it still reads as theirs there. A save that adds a team reads the
+    caller's teams from MindsHub now, so the deleted team is the 400 a team
+    they aren't in gets, before anything is published, never MindsHub's
+    unknown_team after the upload has made the save's emails live. The
+    cache keeps that answer. A team MindsHub still lists is published."""
+    from cowork.services import mindshub_teams
+
+    asked: list = []
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,), asked=asked)
+    _cache_the_callers_teams(TEAM_ENG, TEAM_OPS)
+    save = {"mode": "restricted", "allowed_emails": ["new@else.com"], "allowed_team_ids": [TEAM_OPS]}
+
+    with pytest.raises(HTTPException) as caught:
+        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=save), _Session(), _MEMBER_REQUEST)
+
+    assert (caught.value.status_code, caught.value.detail) == (
+        400, f"You can only share with teams you belong to: {TEAM_OPS}.",
+    )
+    assert publish_calls == []
+    assert _lock_is_free(as_owner)
+    assert (mindshub_teams.TEAMS_PATH, MEMBER_BEARER) in asked
+    cached = await mindshub_teams.fetch_mindshub_teams(
+        bearer_token=MEMBER_BEARER, org_id=ORG_SCOPE.org_id, user_id=ORG_SCOPE.user_id,
+    )
+    assert cached.team_ids == {TEAM_ENG}
+
+    eng = {**save, "allowed_team_ids": [TEAM_ENG]}
+    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=eng), _Session(), _MEMBER_REQUEST)
+    assert publish_calls[-1]["access"]["allowed_team_ids"] == [TEAM_ENG]
+
+
+@pytest.mark.parametrize(("mindshub_status", "answer", "throttle_logged"), [(503, 503, 0), (429, 429, 1)])
+async def test_a_save_adding_a_team_waits_while_mindshub_cant_list_the_callers_teams_now(
+    as_owner, publish_calls, publish_context, stored_rule, monkeypatch, caplog,
+    mindshub_status, answer, throttle_logged,
+):
+    """The cached teams never stand in for the read a save that adds a team
+    makes: while MindsHub can't answer it the save is a 503, and while it
+    throttles the caller a 429, with nothing published. The throttle is
+    logged, as every throttled teams read is."""
+    from cowork.services import mindshub_teams
+
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,))
+    _cache_the_callers_teams(TEAM_ENG)
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", mindshub_answers(mindshub_status))
+    save = {"mode": "restricted", "allowed_emails": [], "allowed_team_ids": [TEAM_ENG]}
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.mindshub_teams"), \
+            pytest.raises(HTTPException) as caught:
+        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=save), _Session(), _MEMBER_REQUEST)
+
+    assert caught.value.status_code == answer
+    assert publish_calls == []
+    assert _lock_is_free(as_owner)
+    refused = [
+        record for record in caplog.records
+        if record.name == "cowork.services.mindshub_teams" and record.levelno == logging.WARNING
+        and getattr(record, "event", None) == "mindshub_throttled"
+        and getattr(record, "outcome", None) == "refused" and record.route == mindshub_teams.TEAMS_PATH
+    ]
+    assert len(refused) == throttle_logged
 
 
 async def test_a_team_an_agent_planted_in_the_entry_is_checked_like_any_other(
@@ -309,15 +477,15 @@ async def test_a_team_an_agent_planted_in_the_entry_is_checked_like_any_other(
 ):
     """A team in .published.json the member isn't in, sent back beside a
     team of theirs, is refused as one they don't belong to, not kept: the
-    rule the auth service stores doesn't have it, and the entry can't vouch
+    rule MindsHub stores doesn't have it, and the entry can't vouch
     for it."""
-    _planted(as_owner, owner_only=True, allowed_team_ids=["team-other"])
-    access_service_answers(monkeypatch, teams=("team-mine",))
-    access = {"mode": "restricted", "allowed_team_ids": ["team-other", "team-mine"], "allowed_emails": []}
+    _planted(as_owner, owner_only=True, allowed_team_ids=[TEAM_OPS])
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,))
+    access = {"mode": "restricted", "allowed_team_ids": [TEAM_OPS, TEAM_ENG], "allowed_emails": []}
     with pytest.raises(HTTPException) as caught:
         await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(), _MEMBER_REQUEST)
     assert (caught.value.status_code, caught.value.detail) == (
-        400, "You can only share with teams you belong to: team-other.",
+        400, f"You can only share with teams you belong to: {TEAM_OPS}.",
     )
     assert publish_calls == []
 
@@ -325,11 +493,11 @@ async def test_a_team_an_agent_planted_in_the_entry_is_checked_like_any_other(
 async def test_a_person_who_left_the_org_does_not_block_adding_someone_else(
     as_owner, publish_calls, publish_context, stored_rule, monkeypatch,
 ):
-    """ENG-3787: Carol left the org. The auth service keeps her id on the
+    """Carol left the org. MindsHub keeps her id on the
     rule and would refuse it on the next write, and the share dialog sends
     her back. The owner adds Dave: the save goes through without Carol."""
     stored_rule.rule = artifact_rule(people=[BOB, CAROL])
-    access_service_answers(monkeypatch, members=(BOB, DAVE))
+    mindshub_sharing_answers(monkeypatch, members=(BOB, DAVE))
     access = {"mode": "restricted", "allowed_user_ids": [BOB, CAROL, DAVE], "allowed_emails": []}
     await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(), _MEMBER_REQUEST)
     assert publish_calls[-1]["access"]["allowed_user_ids"] == [BOB, DAVE]
@@ -338,16 +506,16 @@ async def test_a_person_who_left_the_org_does_not_block_adding_someone_else(
 async def test_a_save_hands_the_rule_its_check_read_to_the_publish(
     as_owner, publish_calls, publish_context, stored_rule, monkeypatch,
 ):
-    """ENG-3787: a save that names teams, people or the org flag reads the
+    """A save that names teams, people or the org flag reads the
     artifact's rule once, under the publish lock, to check it, and passes
     that rule to publish_artifact as ``stored``, so the publish plans against
     the rule the check judged without reading it again. A save the check
     reads nothing for leaves it None, for the publish to read. Either way it
     is the owner's own save (``owner_save``), never refused as a mode an
     agent changed."""
-    stored_rule.rule = artifact_rule(teams=["team-mine"])
-    access_service_answers(monkeypatch, teams=("team-mine",))
-    team = {"mode": "restricted", "allowed_team_ids": ["team-mine"], "allowed_emails": []}
+    stored_rule.rule = artifact_rule(teams=[TEAM_ENG])
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,))
+    team = {"mode": "restricted", "allowed_team_ids": [TEAM_ENG], "allowed_emails": []}
     await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=team), _Session(), _MEMBER_REQUEST)
     assert len(stored_rule.reads) == 1
     assert publish_calls[-1]["stored"] is stored_rule.rule
@@ -366,7 +534,7 @@ async def test_adding_someone_outside_the_org_is_a_400_before_anything_is_publis
     and org part of the change never goes live beside a refusal."""
     from cowork.services.artifact_access import NOT_A_MEMBER_REFUSAL
 
-    access_service_answers(monkeypatch, members=(BOB,))
+    mindshub_sharing_answers(monkeypatch, members=(BOB,))
     access = {"mode": "restricted", "allowed_user_ids": [BOB, EVE], "allowed_emails": ["e@else.com"]}
     with pytest.raises(HTTPException) as caught:
         await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(), _MEMBER_REQUEST)
@@ -374,20 +542,20 @@ async def test_adding_someone_outside_the_org_is_a_400_before_anything_is_publis
     assert publish_calls == []
 
 
-async def test_notify_is_bounded_at_the_access_services_limits_before_anything_is_published(
+async def test_notify_is_bounded_at_mindshubs_limits_before_anything_is_published(
     as_owner, publish_calls, publish_context,
 ):
-    """The auth service emails at most 100 addresses and 100 people from one
+    """MindsHub emails at most 100 addresses and 100 people from one
     save, and refuses more. A save naming more is a 400 here, before the
     publish, rather than a share that lands with nobody told."""
-    from cowork.services.skill_sharing import MAX_NOTIFY_EMAILS, MAX_SHARED_PEOPLE
+    from cowork.services.sharing_contract import MAX_NOTIFY_EMAILS, MAX_PEOPLE_PER_RULE
 
     emails = [f"p{n}@else.com" for n in range(MAX_NOTIFY_EMAILS + 1)]
-    people = [f"{n:08d}-1111-4111-8111-111111111111" for n in range(MAX_SHARED_PEOPLE + 1)]
+    people = [f"{n:08d}-1111-4111-8111-111111111111" for n in range(MAX_PEOPLE_PER_RULE + 1)]
     base = {"mode": "restricted", "allowed_emails": emails}
     for notify, detail in (
         ({"emails": emails}, f"notify can name at most {MAX_NOTIFY_EMAILS} email addresses."),
-        ({"user_ids": people}, f"notify can name at most {MAX_SHARED_PEOPLE} people."),
+        ({"user_ids": people}, f"notify can name at most {MAX_PEOPLE_PER_RULE} people."),
     ):
         with pytest.raises(HTTPException) as caught:
             await aw.set_artifact_access(
@@ -401,7 +569,7 @@ async def test_notify_is_bounded_at_the_access_services_limits_before_anything_i
     assert len(publish_calls[-1]["notify"].emails) == MAX_NOTIFY_EMAILS
 
 
-async def test_the_access_service_refusing_the_share_is_a_409_never_a_retryable_503(
+async def test_mindshub_refusing_the_share_is_a_409_never_a_retryable_503(
     as_owner, publish_context, stored_rule, monkeypatch,
 ):
     """The artifact's recorded owner or organization doesn't match, or the
@@ -411,7 +579,7 @@ async def test_the_access_service_refusing_the_share_is_a_409_never_a_retryable_
     from cowork.services.artifact_access import ArtifactAccessRefused
 
     def refuse(*_args, **_kwargs):
-        raise ArtifactAccessRefused("The sharing service refused the change: Your role does not allow it.")
+        raise ArtifactAccessRefused("MindsHub refused the change: Your role does not allow it.")
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", refuse)
     with pytest.raises(HTTPException) as caught:
@@ -420,19 +588,19 @@ async def test_the_access_service_refusing_the_share_is_a_409_never_a_retryable_
             _Session(), _REQUEST,
         )
     assert (caught.value.status_code, caught.value.detail) == (
-        409, "The sharing service refused the change: Your role does not allow it.",
+        409, "MindsHub refused the change: Your role does not allow it.",
     )
     assert _lock_is_free(as_owner)
 
     _planted(as_owner)
-    stored_rule.rule = ArtifactAccessRefused("The sharing service refused the read: no.")
+    stored_rule.rule = ArtifactAccessRefused("MindsHub refused the read: no.")
     with pytest.raises(HTTPException) as caught:
         await aw.artifact_access("proj", ARTIFACT_ID, _Session())
     assert caught.value.status_code == 409
 
 
 async def test_too_many_people_is_a_400_before_anything_is_published(as_owner, publish_calls, publish_context):
-    """The auth service takes at most 100 people on a rule; more is refused
+    """MindsHub takes at most 100 people on a rule; more is refused
     here, about the artifact, before the bundle is published."""
     people = [f"{n:08d}-1111-4111-8111-111111111111" for n in range(101)]
     with pytest.raises(HTTPException) as caught:
@@ -582,22 +750,22 @@ async def test_access_is_not_changed_when_no_publish_credential_is_available(
 
 async def test_owner_reads_back_the_email_list_a_card_would_withhold(as_owner, stored_rule):
     """Pre-filling "selected users" needs the emails the org card strips. In
-    org mode they, and everyone else the artifact is shared with, come from
-    the rule the auth service stores, never from .published.json."""
+    MindsHub mode they, and everyone else the artifact is shared with, come from
+    the rule MindsHub stores, never from .published.json."""
     (as_owner / ".published.json").write_text(json.dumps({
         "report.html": {
             "report_id": "rid", "url": "u", "published": True,
             "mode": "restricted", "emails": ["planted@else.com"],
-            "org_allowed": True, "owner_only": False, "allowed_team_ids": ["team-planted"],
+            "org_allowed": True, "owner_only": False, "allowed_team_ids": [TEAM_ELSEWHERE],
         },
     }))
-    stored_rule.rule = artifact_rule(teams=["team-eng"], people=[BOB], emails=["a@example.com"])
+    stored_rule.rule = artifact_rule(teams=[TEAM_ENG], people=[BOB], emails=["a@example.com"])
 
-    out = await aw.artifact_access("proj", ARTIFACT_ID, _Session())
+    out = (await aw.artifact_access("proj", ARTIFACT_ID, _Session())).model_dump(by_alias=True, mode="json")
 
     assert out["accessMode"] == "restricted"
     assert (out["accessEmails"], out["orgAllowed"], out["ownerOnly"], out["allowedTeamIds"], out["allowedUserIds"]) == (
-        ["a@example.com"], False, False, ["team-eng"], [BOB],
+        ["a@example.com"], False, False, [TEAM_ENG], [BOB],
     )
     assert stored_rule.reads == [(as_owner, as_owner.parent, ORG_SCOPE, "proj-1")]
 
@@ -611,9 +779,9 @@ async def test_the_access_read_is_a_503_while_the_rule_cannot_be_read(as_owner, 
     with pytest.raises(HTTPException) as caught:
         await aw.artifact_access("proj", ARTIFACT_ID, _Session())
     assert caught.value.status_code == 503
-    # A public artifact the auth service holds no rule for stays public.
+    # A public artifact MindsHub holds no rule for stays public.
     (as_owner / ".published.json").write_text(json.dumps({"report.html": {"report_id": "r", "mode": "public"}}))
-    assert (await aw.artifact_access("proj", ARTIFACT_ID, _Session()))["accessMode"] == "public"
+    assert (await aw.artifact_access("proj", ARTIFACT_ID, _Session())).access_mode == "public"
     assert len(stored_rule.reads) == 1
     assert stored_rule.held_reads == [(as_owner, as_owner.parent, ORG_SCOPE, "proj-1")]
     # Nor a guess that it is public while the check for a rule can't be made.
@@ -650,7 +818,7 @@ async def test_owner_reads_back_an_owner_only_artifact(as_owner, stored_rule):
         },
     }))
 
-    out = await aw.artifact_access("proj", ARTIFACT_ID, _Session())
+    out = (await aw.artifact_access("proj", ARTIFACT_ID, _Session())).model_dump(by_alias=True, mode="json")
 
     assert out["ownerOnly"] is True
     assert out["accessEmails"] == []

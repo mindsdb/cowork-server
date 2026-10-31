@@ -63,8 +63,9 @@ from cowork.services.skill_links import (
 # Re-exported beside the other sharing texts and errors, for the routes and the
 # operator command.
 from cowork.shared_skills import SKILL_SHARING_BUSY, SharedSkillsBusyError  # noqa: F401
+from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills
 from cowork.services.skill_sharing import (
-    BUILTIN_ORG_WIDE,
+    BUILTIN_RULE,
     SkillAccessRule,
     SkillViewer,
     access_rule_for,
@@ -264,12 +265,27 @@ def select_turn_skills(
 ) -> list[TurnSkill]:
     """The skills of ``service``'s store that a turn in ``project_name`` uses
     (_selected_turn_skills)."""
-    return [turn_skill for turn_skill, _skill in _selected_turn_skills(service, project_name)]
+    return [selected.turn_skill for selected in _selected_turn_skills(service, project_name)]
+
+
+class SelectedSkill(NamedTuple):
+    """A skill a turn uses, and its parsed SKILL.md."""
+
+    turn_skill: TurnSkill
+    skill: Skill
+
+
+class AlwaysOnSplit(NamedTuple):
+    """A turn's selected skills, split by whether the pod puts them in every
+    turn's prompt (_split_always_on)."""
+
+    always_on: list[TurnSkill]
+    on_demand: list[TurnSkill]
 
 
 def _selected_turn_skills(
     service: SkillService, project_name: str | None
-) -> list[tuple[TurnSkill, Skill]]:
+) -> list[SelectedSkill]:
     """The skills of ``service``'s store that a turn in ``project_name`` uses,
     each with its parsed SKILL.md.
 
@@ -277,7 +293,7 @@ def _selected_turn_skills(
     empty or names this project, less the ones the scope's person turned off
     for themselves (SkillService.off_for_me), packaged built-ins included.
 
-    Slug and files both come from the DIRECTORY, not frontmatter ``name`` — the
+    Slug and files both come from the DIRECTORY, not frontmatter ``name``: the
     two can drift on a hand-edited store, and resolving by frontmatter could
     ship another (e.g. disabled) skill's files. Every drop is logged.
     """
@@ -285,7 +301,7 @@ def _selected_turn_skills(
     if not root.exists():
         return []
     off_for_me = service.off_for_me()
-    selected: list[tuple[TurnSkill, Skill]] = []
+    selected: list[SelectedSkill] = []
     for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         slug = skill_dir.name
         if not service.allows_skill(slug) or slug in off_for_me:
@@ -312,14 +328,15 @@ def _selected_turn_skills(
             continue
         if not service.visible_to_viewer(skill):
             continue
-        selected.append((TurnSkill(slug=slug, path=skill_dir), skill))
+        selected.append(SelectedSkill(TurnSkill(slug=slug, path=skill_dir), skill))
     return selected
 
 
 def _always_on_rank(service: SkillService, slug: str, skill: Skill) -> int | None:
-    """0 for an always-on org-wide skill, 1 for an always-on one shared with
-    one of the viewer's teams, None for a skill that is only on demand.
-    Packaged built-ins are never always-on: they read as org-wide only
+    """0 for an always-on skill shared with everyone, 1 for an always-on one
+    shared with one of the viewer's teams, None for a skill that is only on
+    demand, a skill shared with the viewer personally among them. Packaged
+    built-ins are never always on: they read as shared with everyone only
     because they predate sharing."""
     if is_builtin_skill(slug):
         return None
@@ -336,26 +353,24 @@ def _always_on_rank(service: SkillService, slug: str, skill: Skill) -> int | Non
     return None
 
 
-def _split_always_on(
-    service: SkillService, selected: list[tuple[TurnSkill, Skill]]
-) -> tuple[list[TurnSkill], list[TurnSkill]]:
-    """``(always_on, on_demand)`` of a turn's selected skills, in hosted org
-    mode: always on are the ones org-wide or shared with one of the viewer's
-    teams and marked ``always_on`` in their skill_access row, org-wide first,
-    then team, each by slug; the rest keep their order. Outside hosted org
+def _split_always_on(service: SkillService, selected: list[SelectedSkill]) -> AlwaysOnSplit:
+    """A turn's selected skills by always on, in MindsHub mode: always on
+    are the ones shared with everyone or with one of the viewer's teams and
+    marked ``always_on`` in their skill_access row, everyone's first, then
+    the team's, each by slug; the rest keep their order. Outside MindsHub
     mode nothing is always on."""
     if not service.org_sharing:
-        return [], [turn_skill for turn_skill, _skill in selected]
+        return AlwaysOnSplit(always_on=[], on_demand=[chosen.turn_skill for chosen in selected])
     ranked: list[tuple[int, str, TurnSkill]] = []
     on_demand: list[TurnSkill] = []
-    for turn_skill, skill in selected:
-        rank = _always_on_rank(service, turn_skill.slug, skill)
+    for chosen in selected:
+        rank = _always_on_rank(service, chosen.turn_skill.slug, chosen.skill)
         if rank is None:
-            on_demand.append(turn_skill)
+            on_demand.append(chosen.turn_skill)
         else:
-            ranked.append((rank, turn_skill.slug, turn_skill))
+            ranked.append((rank, chosen.turn_skill.slug, chosen.turn_skill))
     always_on = [turn_skill for _rank, _slug, turn_skill in sorted(ranked, key=lambda r: r[:2])]
-    return always_on, on_demand
+    return AlwaysOnSplit(always_on=always_on, on_demand=on_demand)
 
 
 def shared_turn_skills(
@@ -414,22 +429,23 @@ def build_turn_skills(
     project_name: str | None = None,
     viewer: SkillViewer | None = None,
     session: ScopedSession | None = None,
-) -> dict[str, dict]:
-    """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``, and
-    ``"always_on": true`` on each skill the turn applies on every task.
+) -> TurnSkills:
+    """Skills for a remote turn, by slug: each one's files
+    (TurnSkillEntry.files), and ``always_on`` on each skill the turn applies
+    on every task.
 
     Org-keyed through the passed `scope` (the producer binds no ambient scope).
     Selection is select_turn_skills's, by ``project_name``, else this project's
-    folder name. In hosted org mode only the skills ``viewer`` sees go in (a
+    folder name. In MindsHub mode only the skills ``viewer`` sees go in (a
     missing viewer is the fail-closed one), and the always-on ones
     (_split_always_on) come first, in their order, since the pod renders
     them in the order it reads them. Who each skill is shared with is read
     from ``session``'s skill_access rows (SkillService).
 
-    This is every skill the pod's agent can recall in the turn: the pod
-    treats the block as the whole recallable set (anton#722), so a skill the
-    caller doesn't see is never there to recall, whatever its skills volume
-    holds. Every cloud turn sends it, empty when the caller sees nothing
+    This is every skill the pod's agent can recall in the turn: the pod's
+    anton recalls only what a block names (its cloud turn contract's
+    ``skills``), so a skill the caller doesn't see is never there to recall.
+    Every cloud turn sends it, empty when the caller sees nothing
     (cowork.handlers.responses.remote_turn_skills).
     """
     if sharing_applies(scope):
@@ -445,20 +461,17 @@ def build_turn_skills(
         project_name = Path(project_path).name if project_path else None
 
     # One selection, split by always-on: each SKILL.md is parsed once.
-    always_on, rest = _split_always_on(svc, _selected_turn_skills(svc, project_name))
-    always_on_slugs = {skill.slug for skill in always_on}
-    out: dict[str, dict] = {}
-    for skill in [*always_on, *rest]:
+    split = _split_always_on(svc, _selected_turn_skills(svc, project_name))
+    always_on_slugs = {skill.slug for skill in split.always_on}
+    out: TurnSkills = {}
+    for skill in [*split.always_on, *split.on_demand]:
         files = _skill_wire_files(skill.path, svc.root)
         if files is None:
             logger.warning(
                 "turn skills: dropping %r (no SKILL.md within size bounds)", skill.slug
             )
             continue
-        entry: dict = {"files": files}
-        if skill.slug in always_on_slugs:
-            entry["always_on"] = True
-        out[skill.slug] = entry
+        out[skill.slug] = TurnSkillEntry(files=files, always_on=skill.slug in always_on_slugs)
     return out
 
 
@@ -681,11 +694,11 @@ class SkillService:
     ) -> None:
         settings = get_app_settings()
         self._scope = scope
-        # Hosted org mode only (cowork.services.skill_sharing): who reads the
+        # MindsHub mode only (cowork.services.skill_sharing): who reads the
         # store, so the listing, reads and turns keep to what they see. None
         # reads the whole store, as the project-rename cascade and seeding do.
         self.viewer = viewer
-        # Hosted org mode only: the session whose org's skill_access rows say
+        # MindsHub mode only: the session whose org's skill_access rows say
         # who each skill is shared with (cowork.services.skill_access), read
         # once per instance, after the org's skills from before sharing got
         # theirs (backfill_legacy_access). Without one no row or creator is
@@ -724,12 +737,12 @@ class SkillService:
     @property
     def org_sharing(self) -> bool:
         """Whether this store's skills carry per-skill sharing: the general
-        store in hosted org mode (cowork.services.skill_sharing)."""
+        store in MindsHub mode (cowork.services.skill_sharing)."""
         return self.store_name == "skills" and sharing_applies(self._scope)
 
     def visible_to_viewer(self, skill: Skill) -> bool:
         """Whether this instance's viewer sees ``skill``, one of the store's
-        own. Always outside hosted org mode, without a viewer, and for a
+        own. Always outside MindsHub mode, without a viewer, and for a
         packaged built-in."""
         if not self.org_sharing or self.viewer is None or is_builtin_skill(skill.name):
             return True
@@ -744,20 +757,21 @@ class SkillService:
             if not self._backfilled:
                 backfill_legacy_access(
                     self._session,
-                    lambda: [s.name for s in self.list_skills() if not is_builtin_skill(s.name)],
+                    lambda: [slug for slug in self.store_slugs() if not is_builtin_skill(slug)],
                 )
                 self._backfilled = True
             self._rows = access_rows(self._session)
         return self._rows
 
     def access_rule(self, skill: Skill) -> SkillAccessRule:
-        """Who ``skill``, one of the store's own, is shared with in hosted org
+        """Who ``skill``, one of the store's own, is shared with in MindsHub
         mode, and who owns it: its skill_access row's rule, or with no row the
         creator its SharedResourceAttribution records alone (access_rule_for).
-        A packaged built-in is org-wide and never always on. The org's default
-        team is left as stored; SkillViewer.effective reads it as org-wide."""
+        A packaged built-in is shared with everyone and never always on. The
+        org's default team is left as stored; SkillViewer.effective reads it
+        as everyone."""
         if is_builtin_skill(skill.name):
-            return BUILTIN_ORG_WIDE
+            return BUILTIN_RULE
         row = self._access_rows().get(skill.name)
         if row is None and self._session is not None and self.org_sharing:
             from cowork.services.shared_resources import SKILL, SharedResourceAccess
@@ -1004,7 +1018,7 @@ class SkillService:
         recorded: the changer's (cowork.creators.Changer.creator), never a
         value the caller passed.
 
-        In hosted org mode, nothing, and any creator an uploaded SKILL.md
+        In MindsHub mode, nothing, and any creator an uploaded SKILL.md
         claims is dropped: the skill's owner is its skill_access row's
         (the route writes it beside the skill) and its creator its
         SharedResourceAttribution's, so a third copy in the file could only
@@ -1330,6 +1344,31 @@ class SkillService:
                 metadata.pop(META_PROJECTS, None)
 
     # ── reads ────────────────────────────────────────────────────────────────
+    def store_slugs(self) -> list[str]:
+        """Every skill folder of the store, by name, whether or not its
+        SKILL.md parses: each direct child directory whose name allows_skill
+        and validate_name accept and that holds a SKILL.md. What the one-time
+        backfill gives a row (cowork.services.skill_access.backfill_legacy_access),
+        so a skill whose file can't be read at that moment keeps its row
+        shared with everyone for when the file is fixed; list_skills leaves
+        such a folder out."""
+        if not self.root.exists():
+            return []
+        slugs: list[str] = []
+        for entry in self.root.iterdir():
+            if not (
+                self.allows_skill(entry.name)
+                and entry.is_dir()
+                and (entry / SKILL_FILE).exists()
+            ):
+                continue
+            try:
+                validate_name(entry.name)
+            except ValueError:
+                continue
+            slugs.append(entry.name)
+        return sorted(slugs)
+
     def list_skills(self) -> list[Skill]:
         if not self.root.exists():
             return []
@@ -1881,7 +1920,7 @@ class SkillService:
 
     def stage_org_access(self, slug: str, rule: SkillAccessRule) -> bool:
         """Stage ``rule`` as who ``slug``, one of the store's own, is shared
-        with, in hosted org mode, in this instance's session; the caller
+        with, in MindsHub mode, in this instance's session; the caller
         commits it. Who may is the caller's to check
         (cowork.services.skill_sharing.SkillViewer). False, staging nothing,
         when the skill already has a row that reads this way."""

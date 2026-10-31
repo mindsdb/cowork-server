@@ -18,9 +18,11 @@ from cowork.services.skills import SkillService, build_turn_skills
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
+# The gateway forwards every person id as a UUID.
+USER = "1c0f2b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 
 
-def _org(org: str | None, user: str = "u") -> TenantScope:
+def _org(org: str | None, user: str = USER) -> TenantScope:
     return TenantScope(org_mode=True, org_id=org, user_id=user)
 
 
@@ -54,7 +56,7 @@ def turn(skills_root):
     """build_turn_skills as a cloud turn calls it, with the turn's database
     session, whose skill_access rows say who sees each skill. The skills these
     tests write straight to the store have no row, so the org's first read
-    gives each one shared org-wide, as for a skill from before sharing
+    gives each one shared with everyone, as for a skill from before sharing
     (cowork.services.skill_access.backfill_legacy_access), and the selection
     rules below see every one of them."""
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -78,7 +80,7 @@ def test_turn_skills_payload_is_org_scoped(skills_root, turn):
 
     payload = turn(_org(ORG_A))
     assert list(payload) == ["report"]
-    assert "steps" in payload["report"]["files"]["SKILL.md"]
+    assert "steps" in payload["report"].files["SKILL.md"]
 
     assert turn(_org(ORG_B)) == {}   # invisible cross-org
 
@@ -123,7 +125,7 @@ def test_payload_carries_the_whole_directory_as_text(skills_root, turn):
     (d / ".hidden").write_text("x", encoding="utf-8")              # never authored content
     (d / "image.png").write_bytes(b"\x89PNG\x00\xff\xfe")          # binary → skipped
 
-    files = turn(_org(ORG_A))["multi"]["files"]
+    files = turn(_org(ORG_A))["multi"].files
     assert set(files) == {"SKILL.md", "references/recipe.md", "helper.py"}
     assert files["references/recipe.md"] == "- tip"
 
@@ -136,7 +138,7 @@ def test_oversized_sibling_is_skipped_not_truncated(skills_root, turn, monkeypat
     (svc.root / "big" / "huge.md").write_text("x" * 500, encoding="utf-8")
     monkeypatch.setattr(skills_mod, "_TURN_SKILL_FILE_MAX", 400)
 
-    files = turn(_org(ORG_A))["big"]["files"]
+    files = turn(_org(ORG_A))["big"].files
     # A truncated script/reference that half-applies is worse than an absent one.
     assert "huge.md" not in files and "SKILL.md" in files
 
@@ -186,7 +188,7 @@ def test_slug_is_the_directory_name_not_the_frontmatter(skills_root, turn):
 
     payload = turn(_org(ORG_A))
     assert list(payload) == ["impostor"]
-    assert "DISABLED CONTENT" not in payload["impostor"]["files"]["SKILL.md"]
+    assert "DISABLED CONTENT" not in payload["impostor"].files["SKILL.md"]
 
 
 def test_symlinks_cannot_pull_in_another_orgs_files(skills_root, turn):
@@ -205,7 +207,7 @@ def test_symlinks_cannot_pull_in_another_orgs_files(skills_root, turn):
 
     payload = turn(_org(ORG_A))
     dumped = str(payload)
-    assert set(payload["evil"]["files"]) == {"SKILL.md"}
+    assert set(payload["evil"].files) == {"SKILL.md"}
     assert "ORG B SECRET" not in dumped
 
 

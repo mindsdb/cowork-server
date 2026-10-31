@@ -19,6 +19,10 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from pydantic import ValidationError
+
+from cowork.models.artifact_owner_choice import AccessMode
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -36,19 +40,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Owner-side publish access for a FIRST auto-publish. A re-publish preserves
-# whatever the owner has since chosen — see `_access_for`.
+# whatever the owner has since chosen (`_access_for`).
 #
 # `owner_only` is NOT decoration. `anton.publish_access.resolve_access` treats
 # "restricted with neither emails, nor an org, nor owner_only" as a caller
-# mistake and degrades it to `public`, so `{"mode": "restricted", "emails": []}`
-# would make every auto-published artifact world-readable. The flag is what
-# makes "only the owner" expressible instead of collapsing into that hole.
+# mistake and degrades it to `public`, so a restricted access with no emails
+# alone would make every auto-published artifact world-readable. The flag is
+# what makes "only the owner" expressible instead of collapsing into that hole.
 #
-# This used to be `org_allowed: True` — every auto-published artifact readable by
-# the whole organization. An artifact is now private until its owner shares it
-# (ENG-2316), which is the behaviour the Share control in the viewer exists to
-# change.
-AUTOPUBLISH_ACCESS: dict = {"mode": "restricted", "emails": [], "owner_only": True}
+# An auto-published artifact is private to its owner until they share it,
+# which is what the Share control in the viewer changes.
+AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_emails=[], owner_only=True)
 
 # Below this much remaining budget a publish is not started at all: entering
 # `wait_for` with a sliver of time only guarantees a timeout, an abandoned upload
@@ -76,22 +78,22 @@ class PublishDecision:
     published_entry: dict | None = None
 
 
-def _access_for(decision: PublishDecision) -> dict:
+def _access_for(decision: PublishDecision) -> ArtifactAccessRequest:
     """The access to publish this artifact with.
 
     A first publish gets the owner-only default. A re-publish MUST preserve what
-    the owner has since chosen — reapplying the default here would silently
-    revoke a share every time the agent touched the artifact, which is the whole
-    reason the Share control would otherwise be untrustworthy (ENG-2316).
+    the owner has since chosen: reapplying the default here would silently
+    revoke a share every time the agent touched the artifact, and the Share
+    control could not be trusted.
 
     `kept_access` is the canonical reconstruction, and it carries `owner_only`
     for exactly this reason: without that key an owner-only entry rebuilds as
-    an empty selection and degrades to public. This path is hosted org mode
-    only, so a restricted artifact's audience comes from the auth service's
+    an empty selection and degrades to public. This path is MindsHub mode
+    only, so a restricted artifact's audience comes from MindsHub's
     rule, which publish_artifact reads; a failed read fails this publish.
     """
     if not decision.published_entry:
-        return dict(AUTOPUBLISH_ACCESS)
+        return AUTOPUBLISH_ACCESS
     return kept_access(decision.published_entry, org_mode=True)
 
 
@@ -136,7 +138,10 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     if not isinstance(entry, dict) or not entry.get("report_id"):
         return PublishDecision("new", None, is_fullstack, current_mtime)
     if entry.get("published") is False:
-        # Explicitly unpublished — never resurrect it on our own.
+        # Explicitly unpublished: never resurrect it on our own. The pod can
+        # flip this flag back; publish_artifact refuses that re-publish while
+        # the owner's recorded choice says unpublished
+        # (cowork.services.artifact_owner_choice).
         return PublishDecision(None, REASON_UNPUBLISHED, is_fullstack, current_mtime)
 
     published_mtime = entry.get("published_mtime")
@@ -325,7 +330,7 @@ async def _publish_one(
     publish_url: str,
     timeout_s: float,
     scope,
-    access: dict | None = None,
+    access: ArtifactAccessRequest | None = None,
     project_id: str | None = None,
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises.
@@ -342,7 +347,7 @@ async def _publish_one(
                 artifacts_base=Path(artifacts_base),
                 api_key=api_key,
                 publish_url=publish_url,
-                access=dict(access) if access else dict(AUTOPUBLISH_ACCESS),
+                access=access or AUTOPUBLISH_ACCESS,
                 # Required, not optional, on this path: the publisher reads
                 # datasource secrets from the org-keyed connector vault, and
                 # `vault_for_scope(None)` raises on an org deployment rather
@@ -480,6 +485,19 @@ async def autopublish_project_artifacts(
                 if remaining < _MIN_START_BUDGET_S:
                     _record("deferred", slug=slug, reason="budget")
                     continue
+                try:
+                    access = _access_for(decision)
+                except ValidationError:
+                    # The pod can write the entry, so its access fields can
+                    # hold any type: this artifact's re-publish fails, and the
+                    # rest of the pass goes on.
+                    _record("failed", slug=slug, error="ValidationError")
+                    logger.warning(
+                        "artifact autopublish could not read the kept access",
+                        extra={"artifact_slug": slug},
+                        exc_info=True,
+                    )
+                    continue
                 if not acquire(base, slug, ttl_s=lock_ttl):
                     _record("lock_busy", slug=slug)
                     continue
@@ -495,7 +513,7 @@ async def autopublish_project_artifacts(
                     return published
                 if await _publish_one(
                     base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
-                    _access_for(decision), project_id=project_id,
+                    access, project_id=project_id,
                 ):
                     published.add(slug)
     except asyncio.CancelledError:

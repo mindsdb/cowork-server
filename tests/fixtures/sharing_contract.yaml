@@ -1,0 +1,22 @@
+# The audience names and bounds cowork/services/sharing_contract.py holds,
+# written down apart from it (tests/test_sharing_contract.py). Each bound's
+# comment there says whether MindsHub owns it or this server does.
+audience_fields:
+  - org_allowed
+  - allowed_team_ids
+  - allowed_user_ids
+  - allowed_emails
+bounds:
+  MAX_PEOPLE_PER_RULE: 100
+  MAX_TEAMS_PER_RULE: 100
+  MAX_NOTIFY_EMAILS: 100
+  MAX_NOTIFY_TITLE_CHARS: 200
+  MAX_NOTIFY_URL_CHARS: 2048
+  MAX_IDS_PER_LOOKUP: 50
+  MAX_EMAILS_PER_LOOKUP: 50
+  MAX_IDS_PER_REQUEST: 200
+  MAX_EMAILS_PER_REQUEST: 200
+  MAX_EMAIL_CHARS: 320
+  MAX_IDS_QUERY_CHARS: 8000
+  MAX_EMAILS_QUERY_CHARS: 64800
+  MAX_DIRECTORY_ROWS: 500

@@ -6,6 +6,7 @@ about not holding a finished turn open longer than a bounded time.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -72,8 +73,9 @@ def published(monkeypatch):
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
                      access=None, scope=None, project_id=None):
-        calls.append({"folder": artifact, "api_key": api_key, "access": access, "scope": scope,
-                      "project_id": project_id})
+        # The access as anton's publisher is handed it.
+        calls.append({"folder": artifact, "api_key": api_key, "access": access.publisher_access(),
+                      "scope": scope, "project_id": project_id})
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
                            "last_md5": "m", "published_mtime": 9_999_999_999},
@@ -200,13 +202,13 @@ async def test_new_artifact_is_published_owner_only(base, enabled, key, publishe
 
 async def test_republish_keeps_the_access_the_owner_chose(base, enabled, key, published):
     """Re-applying the first-publish default here would silently revoke a share
-    every time the agent touched the artifact — which would make the Share
-    control untrustworthy rather than merely incomplete (ENG-2316).
+    every time the agent touched the artifact, which would make the Share
+    control untrustworthy rather than merely incomplete.
 
     The re-publish keeps the restricted mode and names nobody: who the
-    artifact is shared with is read from the auth service's rule by the
+    artifact is shared with is read from MindsHub's rule by the
     publish itself (cowork.services.publish._plan_access), never taken from
-    the entry, which an agent can write (ENG-3787)."""
+    the entry, which an agent can write."""
     folder = _make(base, "rep", files={"index.html": "<html>v2</html>"},
                    meta={"slug": "rep", "type": "html-app"})
     (folder / ".published.json").write_text(json.dumps({
@@ -262,7 +264,7 @@ async def test_scope_is_threaded_into_the_publisher(base, enabled, key, publishe
 
 async def test_publish_key_carries_the_active_hub_workspace(base, enabled, published, monkeypatch):
     """The caller's picked MindsHub workspace (UserSettings.hub_workspace_id,
-    written by the hub_workspaces selector) must reach the publish key mint,
+    written by the mindshub_workspaces selector) must reach the publish key mint,
     the same as it reaches the execution turn key."""
     captured = {}
 
@@ -497,6 +499,58 @@ async def test_publish_failure_leaves_no_record_so_next_turn_retries(base, enabl
     assert out == set()
     assert not (base / "rep" / ".published.json").exists()
     assert ap.needs_publish(base / "rep", base).action == "new"
+
+
+def _make_published(base, slug, *, entry: dict, mtime: int):
+    """An artifact published before, whose content changed since: its
+    entry is ``entry`` plus a stale md5, and its files are dated ``mtime``."""
+    folder = _make(base, slug, files={"index.html": f"<html>{slug} v2</html>"},
+                   meta={"slug": slug, "type": "html-app"})
+    (folder / ".published.json").write_text(json.dumps({
+        "index.html": {
+            "report_id": f"rid-{slug}", "url": "u", "published": True,
+            "last_md5": "stale", "published_mtime": 0, **entry,
+        },
+    }))
+    os.utime(folder / "index.html", (mtime, mtime))
+    return folder
+
+
+async def test_an_entry_with_access_fields_of_the_wrong_type_fails_only_its_own_republish(
+    base, enabled, key, published,
+):
+    """The pod can write an artifact's .published.json, so its access fields
+    can hold anything, such as a password that is a number. That entry's
+    re-publish fails, its lock is released, and the artifacts after it in
+    the same pass are still published."""
+    _make_published(base, "bad", entry={"mode": "password", "access_password": 1234}, mtime=2_000_000_000)
+    _make_published(base, "good", entry={"mode": "public"}, mtime=1_000_000_000)
+
+    out = await ap.autopublish_project_artifacts(
+        base, ORG_SCOPE, project_id=PROJECT_ID, touched={"bad", "good"},
+    )
+
+    assert out == {"good"}
+    assert [call["folder"].name for call in published] == ["good"]
+    assert locks.acquire(base, "bad", ttl_s=600) is True
+
+
+async def test_a_restricted_entry_is_kept_restricted_whatever_its_audience_fields_hold(
+    base, enabled, key, published,
+):
+    """In MindsHub mode a restricted entry's audience fields aren't the
+    record (MindsHub's rule is), so a value of the wrong type there, such as
+    emails as one string, doesn't stop the re-publish: it stays restricted
+    and names nobody, as any restricted entry's does."""
+    _make_published(
+        base, "rep", entry={"mode": "restricted", "emails": "someone@example.com", "owner_only": "yes"},
+        mtime=1_000_000_000,
+    )
+
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == {"rep"}
+    assert published[0]["access"] == {"mode": "restricted", "owner_only": True}
 
 
 async def test_busy_lock_skips_the_slug(base, enabled, key, published):

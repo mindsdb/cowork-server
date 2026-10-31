@@ -1,7 +1,8 @@
-"""The auth service's artifact access rules: the one that lets an organization
-review a private draft, and the sharing rule of a published artifact."""
+"""MindsHub's artifact access rules: the one that lets an organization review
+a private draft, and the sharing rule of a published artifact."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import httpx
@@ -11,13 +12,16 @@ from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import TenantScope
 from cowork.services.artifact_identity import artifact_key
 
+if TYPE_CHECKING:
+    from cowork.services.artifact_audience import ShareNotice
+
 
 class ArtifactAccessUnavailable(RuntimeError):
     pass
 
 
 class ArtifactAccessRefused(RuntimeError):
-    """The auth service refused an artifact rule's read or write with a 409
+    """MindsHub refused an artifact rule's read or write with a 409
     or a 403: the artifact's recorded owner or organization doesn't match
     the caller's, or the owner's role no longer allows artifact changes.
     Carries its detail. Asking again gets the same answer, so the access
@@ -25,23 +29,27 @@ class ArtifactAccessRefused(RuntimeError):
 
 
 class ArtifactAudienceRejected(ValueError):
-    """The auth service refused a restricted rule's write with a 400: a team
+    """MindsHub refused a restricted rule's write with a 400: a team
     outside the artifact's organization, a person who isn't a member of it,
     or a field it won't take. A ValueError, so the access route answers 400
     with the reason; a retry of the same rule can never succeed, so it is
     never the retryable 503."""
 
 
-# What the auth service's not_a_member refusal, and the access route's own
-# check of the people a save adds, tell the person.
+# What MindsHub's not_a_member refusal, and the access route's own check of
+# the people a save adds, tell the person.
 NOT_A_MEMBER_REFUSAL = (
     "Only people in your organization can be added by name; share with anyone else by email"
 )
+# What MindsHub's unknown_team refusal, and the access route's own check of a
+# team an admin adds, tell the person.
+FOREIGN_TEAM_REFUSAL = "Each team must be a team of your organization"
 
 
 class ArtifactAudience(BaseModel):
-    """The org flag, teams and people of an artifact's rule, under the
-    ArtifactAccess names, as the auth service echoes them after a write."""
+    """The org flag, teams and people of an artifact's rule, under MindsHub's
+    artifact rule names (cowork.services.sharing_contract.AudienceField), as
+    MindsHub echoes them after a write."""
 
     org_allowed: bool
     allowed_team_ids: list[str]
@@ -49,7 +57,7 @@ class ArtifactAudience(BaseModel):
 
 
 class ArtifactRule(ArtifactAudience):
-    """An artifact's rule as the auth service stores it (read_artifact_access):
+    """An artifact's rule as MindsHub stores it (read_artifact_access):
     the one record of who a restricted artifact is shared with. Its
     .published.json entry keeps the mode and the password, never this.
     ``allowed_emails`` are people outside the organization, by address."""
@@ -58,8 +66,8 @@ class ArtifactRule(ArtifactAudience):
 
     @classmethod
     def nobody(cls) -> ArtifactRule:
-        """No one but the owner: what an artifact the auth service holds no
-        rule for is shared with."""
+        """No one but the owner: what an artifact MindsHub holds no rule for
+        is shared with."""
         return cls(org_allowed=False, allowed_team_ids=[], allowed_user_ids=[], allowed_emails=[])
 
     @property
@@ -68,6 +76,32 @@ class ArtifactRule(ArtifactAudience):
         return not (
             self.org_allowed or self.allowed_team_ids or self.allowed_user_ids or self.allowed_emails
         )
+
+
+class _ArtifactRuleKey(BaseModel):
+    """Which rule a call to MindsHub's internal artifact-access routes is
+    about, and whose: the artifact's recorded owner and organization."""
+
+    artifact_id: str
+    owner_keycloak_id: str
+    organization_id: str
+
+
+class _ArtifactRuleWrite(_ArtifactRuleKey):
+    """A restricted rule's teams and people, written beside what the lambda
+    wrote (sync_artifact_team_access). Only the fields a call sets go on the
+    wire: MindsHub keeps a field the caller leaves out."""
+
+    workspace_id: str | None
+    access_version: int
+    allowed_team_ids: list[str] | None = None
+    allowed_user_ids: list[str] | None = None
+    # A person's save with "Notify people" chosen: MindsHub emails them.
+    notify_recipients: bool | None = None
+    notify_user_ids: list[str] | None = None
+    notify_emails: list[str] | None = None
+    artifact_title: str | None = None
+    artifact_url: str | None = None
 
 
 def _json_body(response: httpx.Response) -> dict | None:
@@ -79,20 +113,29 @@ def _json_body(response: httpx.Response) -> dict | None:
 
 
 def _refusal_detail(response: httpx.Response, *, refused: str) -> str:
-    """The auth service's 409 or 403 as one sentence saying it ``refused``
-    the call ("the change", "the read"); "" for any other answer."""
+    """MindsHub's 409 or 403 as one sentence saying it ``refused`` the call
+    ("the change", "the read"); "" for any other answer."""
     if response.status_code not in (403, 409):
         return ""
     body = _json_body(response) or {}
     detail = body.get("detail") if isinstance(body.get("detail"), str) else body.get("code")
-    return f"The sharing service refused {refused}: {detail}" if detail else (
-        f"The sharing service refused {refused}."
-    )
+    return f"MindsHub refused {refused}: {detail}" if detail else f"MindsHub refused {refused}."
+
+
+def _field_messages(why: object) -> list[str]:
+    """The messages of one field's validation error, however MindsHub nests
+    them: a string, a list of them, or, for an item of a list field, a dict
+    of the item's index to its own error."""
+    if isinstance(why, dict):
+        return [message for nested in why.values() for message in _field_messages(nested)]
+    if isinstance(why, list):
+        return [message for nested in why for message in _field_messages(nested)]
+    return [str(why)]
 
 
 def _rejection_reason(response: httpx.Response) -> str:
-    """The auth service's 400 as one sentence naming what it refused; "" for
-    any other answer."""
+    """MindsHub's 400 as one sentence naming what it refused; "" for any
+    other answer."""
     if response.status_code != 400:
         return ""
     body = _json_body(response)
@@ -103,37 +146,37 @@ def _rejection_reason(response: httpx.Response) -> str:
         return f"{NOT_A_MEMBER_REFUSAL}: {ids}"
     if body.get("code") == "unknown_team":
         ids = ", ".join(str(i) for i in body.get("allowed_team_ids") or [])
-        return f"Each team must be a team of your organization: {ids}"
+        return f"{FOREIGN_TEAM_REFUSAL}: {ids}"
     if isinstance(body.get("detail"), str) and body["detail"]:
         return f"The sharing change was refused: {body['detail']}"
-    # A field validation error: {"<field>": ["<why>", ...], ...}.
+    # A field validation error: {"<field>": ["<why>", ...], ...}, or for an
+    # item of a list field {"<field>": {"<index>": ["<why>"]}}.
     fields = "; ".join(
-        f"{field}: {' '.join(str(m) for m in why) if isinstance(why, list) else why}"
-        for field, why in body.items()
+        f"{field}: {' '.join(dict.fromkeys(_field_messages(why)))}" for field, why in body.items()
     )
     return f"The sharing change was refused: {fields}" if fields else "The sharing change was refused."
 
 
 def _post_internal(
     route: str,
-    body: dict,
+    body: _ArtifactRuleKey,
     *,
     settings: TurnQueueSettings,
     client: httpx.Client | None,
     failure: str,
     refused: str,
 ) -> httpx.Response:
-    """POST ``body`` to the auth service's internal artifact-access ``route``
-    with the shared secret, and return its answer. A 409 or 403 is
-    ArtifactAccessRefused, saying the sharing service ``refused`` the call;
-    no answer at all is ArtifactAccessUnavailable (``failure``). Every other
-    answer is the caller's to read."""
+    """POST ``body``, the fields it sets, to MindsHub's internal
+    artifact-access ``route`` with the shared secret, and return its answer.
+    A 409 or 403 is ArtifactAccessRefused, saying MindsHub ``refused`` the
+    call; no answer at all is ArtifactAccessUnavailable (``failure``). Every
+    other answer is the caller's to read."""
     owns_client = client is None
     client = client or httpx.Client(timeout=5.0)
     try:
         response = client.post(
             f"{settings.auth_internal_base_url.rstrip('/')}/v1/internal/artifact-access/{route}",
-            json=body,
+            json=body.model_dump(mode="json", exclude_unset=True),
             headers={"X-Internal-Auth": settings.auth_internal_secret},
         )
     except httpx.HTTPError as exc:
@@ -255,8 +298,8 @@ async def revoke_draft_review_access(
 
 
 def _internal_settings(scope: TenantScope, settings: TurnQueueSettings | None) -> TurnQueueSettings:
-    """The auth service's internal endpoint and secret, for a call about an
-    artifact of ``scope``'s organization."""
+    """MindsHub's internal endpoint and secret, for a call about an artifact
+    of ``scope``'s organization."""
     if not scope.org_mode or not scope.org_id:
         raise ArtifactAccessUnavailable("Sharing with the organization requires a signed-in organization")
     settings = settings or TurnQueueSettings()
@@ -273,10 +316,10 @@ def read_artifact_access(
     settings: TurnQueueSettings | None = None,
     client: httpx.Client | None = None,
 ) -> ArtifactRule | None:
-    """The artifact's rule as the auth service stores it (ENG-3787), the one
-    record of who a restricted artifact is shared with: ``org_allowed``,
+    """The artifact's rule as MindsHub stores it, the one record of who a
+    restricted artifact is shared with: ``org_allowed``,
     ``allowed_team_ids``, ``allowed_user_ids`` and ``allowed_emails``. None
-    when it holds none (its 404 ``no_rule``): in hosted org mode only a
+    when it holds none (its 404 ``no_rule``): in MindsHub mode only a
     restricted publish leaves a rule, and a public or password one, or an
     unpublish, deletes it.
 
@@ -292,11 +335,11 @@ def read_artifact_access(
     failure = "Could not read who the artifact is shared with"
     response = _post_internal(
         "read/",
-        {
-            "artifact_id": artifact_id,
-            "owner_keycloak_id": str(owner_user_id),
-            "organization_id": str(scope.org_id),
-        },
+        _ArtifactRuleKey(
+            artifact_id=artifact_id,
+            owner_keycloak_id=str(owner_user_id),
+            organization_id=str(scope.org_id),
+        ),
         settings=settings,
         client=client,
         failure=failure,
@@ -321,65 +364,59 @@ def sync_artifact_team_access(
     access_version: int,
     allowed_team_ids: list[str] | None = None,
     allowed_user_ids: list[str] | None = None,
-    notify_user_ids: list[str] | None = None,
-    notify_emails: list[str] | None = None,
-    artifact_title: str = "",
-    artifact_url: str = "",
+    notice: ShareNotice | None = None,
     settings: TurnQueueSettings | None = None,
     client: httpx.Client | None = None,
 ) -> ArtifactAudience:
-    """Write a restricted artifact's teams and people to the auth service
-    (ENG-3787), and return the org flag, teams and people its rule holds
-    after the write.
+    """Write a restricted artifact's teams and people to MindsHub, and return
+    the org flag, teams and people its rule holds after the write.
 
     The publish lambda writes the rest of the rule (emails and the org flag,
     from the anton publisher's access block) and leaves the teams and people
-    as they were, and so does this write for a list it is given as None: the
-    auth service keeps a field the caller omits. So only a person's own save
-    sends a list, the one it changed, under the ArtifactAccess names
-    ``allowed_team_ids`` and ``allowed_user_ids`` (Keycloak ids of people in
-    the org), with the version the lambda wrote. The auth service checks each
-    team belongs to the org and each person is a member of it, and refuses
-    the whole rule otherwise; any 400 it answers is ArtifactAudienceRejected,
+    as they were, and so does this write for a list it is given as None:
+    MindsHub keeps a field the caller omits. So only a person's own save
+    sends a list, the one it changed, under MindsHub's names
+    ``allowed_team_ids`` and ``allowed_user_ids`` (user ids of people in the
+    org), with the version the lambda wrote. MindsHub checks each team
+    belongs to the org and each person is a member of it, and refuses the
+    whole rule otherwise; any 400 it answers is ArtifactAudienceRejected,
     naming what it refused, and a 409 or 403 is ArtifactAccessRefused. Called
     after a successful publish, so it lands second. Raises
     ArtifactAccessUnavailable when it can't write, or when its 200 doesn't
-    echo the org flag and both lists (an auth service that drops them never
-    stored them), so a restricted publish never reports an audience the auth
-    service doesn't hold.
+    echo the org flag and both lists (a MindsHub that drops them never stored
+    them), so a restricted publish never reports an audience MindsHub doesn't
+    hold.
 
-    ``notify_user_ids`` and ``notify_emails`` are the people a person's own
-    save chose to tell: with either non-empty the write carries the auth
-    service's ``notify_recipients: true`` and both lists, and it emails them,
-    naming the artifact by ``artifact_title`` and linking ``artifact_url``.
-    The lambda's write, a re-sync and a retry never carry any of it.
+    ``notice`` is a person's own save with "Notify people" chosen: with
+    recipients, the write carries MindsHub's ``notify_recipients: true``,
+    the people to tell by id and by address, and the artifact's title and
+    link the email names. The lambda's write, a re-sync and a retry never
+    carry any of it.
     """
     if not owner_user_id:
         raise ArtifactAccessUnavailable("Artifact ownership could not be established")
     settings = _internal_settings(scope, settings)
     failure = "Could not share the artifact with the selected teams and people"
+    write = _ArtifactRuleWrite(
+        artifact_id=artifact_id,
+        owner_keycloak_id=str(owner_user_id),
+        organization_id=str(scope.org_id),
+        workspace_id=workspace_id or None,
+        access_version=access_version,
+    )
+    if allowed_team_ids is not None:
+        write.allowed_team_ids = list(allowed_team_ids)
+    if allowed_user_ids is not None:
+        write.allowed_user_ids = list(allowed_user_ids)
+    if notice is not None and notice.recipients:
+        write.notify_recipients = True
+        write.notify_user_ids = list(notice.recipients.user_ids)
+        write.notify_emails = list(notice.recipients.emails)
+        write.artifact_title = notice.artifact_title
+        write.artifact_url = notice.artifact_url
     response = _post_internal(
         "",
-        {
-            "artifact_id": artifact_id,
-            "owner_keycloak_id": str(owner_user_id),
-            "organization_id": str(scope.org_id),
-            "workspace_id": workspace_id or None,
-            **({"allowed_team_ids": list(allowed_team_ids)} if allowed_team_ids is not None else {}),
-            **({"allowed_user_ids": list(allowed_user_ids)} if allowed_user_ids is not None else {}),
-            "access_version": access_version,
-            **(
-                {
-                    "notify_recipients": True,
-                    "notify_user_ids": list(notify_user_ids or []),
-                    "notify_emails": list(notify_emails or []),
-                    "artifact_title": artifact_title,
-                    "artifact_url": artifact_url,
-                }
-                if notify_user_ids or notify_emails
-                else {}
-            ),
-        },
+        write,
         settings=settings,
         client=client,
         failure=failure,
@@ -394,5 +431,5 @@ def sync_artifact_team_access(
         return ArtifactAudience.model_validate(response.json())
     except (ValueError, ValidationError) as exc:
         raise ArtifactAccessUnavailable(
-            "The sharing service didn't confirm the artifact's teams and people"
+            "MindsHub didn't confirm the artifact's teams and people"
         ) from exc

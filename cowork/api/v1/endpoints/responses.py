@@ -238,7 +238,7 @@ async def responses(
     _refuse_while_answering(
         conversation=responses_request.conversation, scope=scope_from_principal(principal)
     )
-    handler = ResponsesHandler(principal=principal, hub_bearer=caller_bearer(request))
+    handler = ResponsesHandler(principal=principal, mindshub_bearer=caller_bearer(request))
     if responses_request.cancel_on_disconnect:
         watch = DisconnectWatch(request.receive)
         try:

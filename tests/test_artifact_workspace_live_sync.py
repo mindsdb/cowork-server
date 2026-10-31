@@ -214,9 +214,9 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
     assert calls[0][1]["api_key"] == "turn-key"
     assert calls[0][1]["publish_url"] == "https://api.staging.example"
     # The restricted mode, naming nobody: the publish reads who the artifact
-    # is shared with from the auth service's rule, never from the entry an
-    # agent can write (cowork.services.publish._plan_access, ENG-3787).
-    assert calls[0][1]["access"] == {"mode": "restricted", "owner_only": True}
+    # is shared with from MindsHub's rule, never from the entry an
+    # agent can write (cowork.services.publish._plan_access).
+    assert calls[0][1]["access"].publisher_access() == {"mode": "restricted", "owner_only": True}
     assert calls[0][1]["scope"] is ORG_SCOPE
     assert revoked == [True]
     assert calls[0][1]["project_id"] == "project-1"
@@ -256,7 +256,7 @@ async def test_desktop_save_uses_the_configured_publish_environment(artifact, mo
     assert result is True
     assert calls[0][1]["api_key"] == "desktop-key"
     assert calls[0][1]["publish_url"] == "https://api.desktop.example"
-    assert calls[0][1]["access"] == {"mode": "public"}
+    assert calls[0][1]["access"].publisher_access() == {"mode": "public"}
     assert calls[0][1]["scope"] is LOCAL_SCOPE
 
 

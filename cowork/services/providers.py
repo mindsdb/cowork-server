@@ -20,7 +20,7 @@ from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
-from cowork.services.hub_workspaces import sweep_cache
+from cowork.services.mindshub_client import sweep_cache
 
 if TYPE_CHECKING:
     from cowork.common.settings.app_settings import OpenAICompatibleAPI
@@ -386,8 +386,8 @@ _minds_models_cache: OrderedDict[_ListingCacheKey, tuple[float, MindsModelListin
 def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
     """Cache ``listing`` under ``key``: expired entries go first, then any past the cap.
 
-    Swept on write, the one place the cache grows, with the hub workspace
-    caches' ``sweep_cache``. A departed caller's entry is never read or
+    Swept on write, the one place the cache grows, with the MindsHub client's
+    ``sweep_cache``. A departed caller's entry is never read or
     overwritten again, so nothing else would drop it.
     """
     sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S)

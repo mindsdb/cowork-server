@@ -1,4 +1,4 @@
-"""One person's own on/off for one skill (ENG-3787).
+"""One person's own on/off for one skill.
 
 A skill's ``enabled`` (its SKILL.md metadata, cowork.models.skill.META_ENABLED)
 turns it off for everyone who reads it. This row turns it off for one person
@@ -11,19 +11,25 @@ a managed skill takes a row too without any skill_access row. A rename moves
 a skill's rows and a delete removes them, as skill_access's. A missing row
 means on; only ``enabled=False`` rows are kept.
 
-Scoped like skill_access: by organization in hosted org mode (and in a
-personal scope that keeps skills per person), with no org on the desktop and
-wherever skills are left shared. ``user_id`` is the person's Keycloak id or
-sub, or cowork.services.skill_user_settings.LOCAL_USER for the desktop's one
-person.
+Scoped like skill_access: by organization in MindsHub mode (and in
+single-tenant mode, where skills are kept per person), with no org on the
+desktop and wherever skills are left shared. ``user_id`` is the person's user
+id, or LOCAL_PERSON_ID for the desktop's one person.
 """
 
 from __future__ import annotations
+
+from uuid import UUID
 
 import sqlalchemy as sa
 from sqlmodel import Field
 
 from cowork.models.base import BaseSQLModel
+
+# The desktop's one person, and the person of a deployment's operator view,
+# which name nobody in their scope: the nil UUID, so the column stays a
+# non-null UUID and both unique indexes below keep their rows unique.
+LOCAL_PERSON_ID = UUID(int=0)
 
 
 class SkillUserSetting(BaseSQLModel, table=True):
@@ -45,9 +51,9 @@ class SkillUserSetting(BaseSQLModel, table=True):
         ),
     )
 
-    org_id: str | None = Field(
-        default=None, index=True, max_length=36, description="Owning organization or partition"
+    org_id: UUID | None = Field(
+        default=None, index=True, description="Owning organization or partition"
     )
-    user_id: str = Field(max_length=255, description="The person this setting is theirs")
+    user_id: UUID = Field(description="The person this setting is theirs")
     skill_slug: str = Field(max_length=255, description="The skill's folder name")
     enabled: bool = Field(default=True, description="False: off in this person's turns")
