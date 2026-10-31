@@ -457,7 +457,7 @@ def _link_bobs_partition_to_alices() -> Path:
 
 
 @pytest.mark.parametrize("bobs_ref", ["own-project", "local"])
-def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people, bobs_ref):
+def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people, bobs_ref, caplog):
     """B's partition folder is a link to A's. No route reaches A's artifacts
     through it: not by path, and not by id through B's own project or B's
     `local` scan. B gets 404 or an empty list, and nothing changes in A's folder.
@@ -475,9 +475,11 @@ def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people, bobs_
     assert alices.status_code == 200, alices.text
     before = _files_below(alice_partition)
 
+    with caplog.at_level("WARNING", logger="cowork.services.artifact_identity"):
+        assert client.get(workspace, headers=B).status_code == 404
+    assert any(getattr(record, "reason", None) == "linked_folder" for record in caplog.records)
     listed = client.get("/api/v1/artifacts/", headers=B)
     assert listed.status_code == 200 and listed.json() == []
-    assert client.get(workspace, headers=B).status_code == 404
     overwrite = {"content": "# Overwritten\n", "expectedRevisionId": alices.json()["revision"]["id"]}
     assert client.put(workspace, json=overwrite, headers=B).status_code == 404
     assert client.get(f"/api/v1/artifacts/drafts/{ref}/{artifact_id}/report.md", headers=B).status_code == 404
@@ -521,7 +523,12 @@ def test_a_project_recorded_through_a_linked_partition_reaches_no_one_elses_arti
     with caplog.at_level("WARNING", logger="cowork.services.artifact_roots"):
         listed = client.get("/api/v1/artifacts/", headers=B)
     assert listed.status_code == 200 and listed.json() == []
-    assert "a folder in another person's partition" in caplog.text
+    assert any(
+        getattr(record, "event", None) == "artifact_folder_refused"
+        and record.reason == "other_partition"
+        and record.project_id == _general_id(BOB)
+        for record in caplog.records
+    )
     assert client.get(workspace, headers=B).status_code == 404
     overwrite = {"content": "# Overwritten\n", "expectedRevisionId": alices.json()["revision"]["id"]}
     assert client.put(workspace, json=overwrite, headers=B).status_code == 404

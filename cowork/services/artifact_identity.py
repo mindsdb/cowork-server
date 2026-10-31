@@ -143,9 +143,9 @@ def _opened_from_trusted_root(anchor: Path, *names: str) -> Iterator[PinnedDir]:
                 # a link or a file is not, and the routes answer it as missing.
                 if isinstance(error, NotADirectoryError) or error.errno == errno.ELOOP:
                     logger.warning(
-                        "artifacts: %s is a link or not a folder, so the artifacts "
-                        "below it are left out",
-                        folder.path / name,
+                        "artifacts: a folder on the way to an artifacts folder is a link "
+                        "or not a folder, so the artifacts below it are left out",
+                        extra={"event": "artifact_folder_refused", "reason": "linked_folder"},
                     )
                 raise
         yield folder

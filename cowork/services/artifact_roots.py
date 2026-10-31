@@ -213,10 +213,13 @@ def _sources_for(
     service = ProjectService(session)
     if service.sits_in_another_partition(project):
         logger.warning(
-            "artifacts: project %s names %s, a folder in another person's partition, "
-            "so its artifacts are left out",
-            project.id,
-            project.path,
+            "artifacts: a project names a folder in another person's partition, so its "
+            "artifacts are left out",
+            extra={
+                "event": "artifact_folder_refused",
+                "reason": "other_partition",
+                "project_id": str(project.id),
+            },
         )
         return []
     project_path = Path(project.path)
