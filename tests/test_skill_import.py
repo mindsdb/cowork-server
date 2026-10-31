@@ -319,9 +319,9 @@ def test_rename_into_a_destination_claimed_after_the_check_conflicts(
     """
     alice = _scoped(org_engine, ALICE)
     skills_api._create_skill(
-        SkillCreateRequest(label="alpha skill", instructions="original"),
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="alpha skill", instructions="original"),
+        principal=_principal(ALICE),
     )
     service = SkillService(alice.scope)
     original_bytes = (service._skill_dir("alpha-skill") / "SKILL.md").read_bytes()
@@ -341,10 +341,10 @@ def test_rename_into_a_destination_claimed_after_the_check_conflicts(
 
     with pytest.raises(HTTPException) as conflict:
         skills_api._update_skill(
-            "alpha-skill",
-            SkillUpdateRequest(label="beta skill"),
             alice,
-            _principal(ALICE),
+            skill_id="alpha-skill",
+            body=SkillUpdateRequest(label="beta skill"),
+            principal=_principal(ALICE),
         )
 
     assert conflict.value.status_code == 409
@@ -360,9 +360,9 @@ def test_rename_reports_a_lost_attribution_key_race_as_a_conflict(
 ):
     alice = _scoped(org_engine, ALICE)
     skills_api._create_skill(
-        SkillCreateRequest(label="racing skill", instructions="original"),
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="racing skill", instructions="original"),
+        principal=_principal(ALICE),
     )
     service = SkillService(alice.scope)
     original_bytes = (service._skill_dir("racing-skill") / "SKILL.md").read_bytes()
@@ -378,10 +378,10 @@ def test_rename_reports_a_lost_attribution_key_race_as_a_conflict(
 
     with pytest.raises(HTTPException) as conflict:
         skills_api._update_skill(
-            "racing-skill",
-            SkillUpdateRequest(label="won by somebody else"),
             alice,
-            _principal(ALICE),
+            skill_id="racing-skill",
+            body=SkillUpdateRequest(label="won by somebody else"),
+            principal=_principal(ALICE),
         )
 
     assert conflict.value.status_code == 409
@@ -400,9 +400,9 @@ def test_update_through_an_alias_audits_the_canonical_slug(org_engine):
     """
     alice = _scoped(org_engine, ALICE)
     skills_api._create_skill(
-        SkillCreateRequest(label="canonical skill", instructions="original"),
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="canonical skill", instructions="original"),
+        principal=_principal(ALICE),
     )
     service = SkillService(alice.scope)
     (service.root / "alias-skill").symlink_to(
@@ -411,10 +411,10 @@ def test_update_through_an_alias_audits_the_canonical_slug(org_engine):
     )
 
     edited = skills_api._update_skill(
-        "alias-skill",
-        SkillUpdateRequest(instructions="edited through the alias"),
         alice,
-        _principal(ALICE),
+        skill_id="alias-skill",
+        body=SkillUpdateRequest(instructions="edited through the alias"),
+        principal=_principal(ALICE),
     )
 
     assert edited["id"] == "canonical-skill"
@@ -427,9 +427,9 @@ def test_update_through_an_alias_audits_the_canonical_slug(org_engine):
 def test_delete_through_an_alias_audits_the_canonical_slug(org_engine):
     alice = _scoped(org_engine, ALICE)
     skills_api._create_skill(
-        SkillCreateRequest(label="deletable skill", instructions="original"),
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="deletable skill", instructions="original"),
+        principal=_principal(ALICE),
     )
     service = SkillService(alice.scope)
     (service.root / "alias-skill").symlink_to(
@@ -437,7 +437,7 @@ def test_delete_through_an_alias_audits_the_canonical_slug(org_engine):
         target_is_directory=True,
     )
 
-    skills_api._delete_skill("alias-skill", alice, _principal(ALICE))
+    skills_api._delete_skill(alice, skill_id="alias-skill", principal=_principal(ALICE))
 
     assert alice.exec(alice.select(SharedResourceAttribution)).all() == []
     events = alice.exec(alice.select(SharedResourceMutation)).all()
@@ -467,9 +467,9 @@ def test_create_reserves_no_claim_for_an_occupied_slug(org_engine, monkeypatch):
 
     with pytest.raises(HTTPException) as conflict:
         skills_api._create_skill(
-            SkillCreateRequest(label="occupied skill", instructions="second writer"),
             alice,
-            _principal(ALICE),
+            body=SkillCreateRequest(label="occupied skill", instructions="second writer"),
+            principal=_principal(ALICE),
         )
 
     assert conflict.value.status_code == 409

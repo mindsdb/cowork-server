@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from cowork.db.units import run_efs, run_on_unit_threads
+from cowork.db.units import run_efs, run_efs_cleanup, run_on_unit_threads
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -314,6 +314,37 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDeci
     return planned
 
 
+async def _release(artifacts_base: Path, slug: str, *, scope) -> None:
+    """Free a slug's publish lock. It waits for a file store slot rather than
+    failing, and a cancel that lands while it waits or runs waits for it: a
+    lock left behind makes every later turn skip the slug as `lock_busy` until
+    its TTL runs out."""
+    await run_efs_cleanup(partial(release, artifacts_base, slug), scope=scope)
+
+
+async def _acquire(artifacts_base: Path, slug: str, *, ttl_s: float, scope) -> bool:
+    """Take a slug's publish lock. True when taken. It waits for a file store
+    slot rather than failing.
+
+    A cancel that lands while it waits for a slot leaves at once, and the
+    lock is never taken. One that lands once the take runs waits for it, as
+    run_efs does, and then frees a lock it took: the caller never sees that
+    True, so nothing else would free the lock before its TTL."""
+    taken = False
+
+    def take() -> bool:
+        nonlocal taken
+        taken = acquire(artifacts_base, slug, ttl_s=ttl_s)
+        return taken
+
+    try:
+        return await run_efs(take, scope=scope, deadline=False)
+    except asyncio.CancelledError:
+        if taken:
+            await _release(artifacts_base, slug, scope=scope)
+        raise
+
+
 async def _publish_one(
     artifacts_base: Path,
     slug: str,
@@ -350,23 +381,27 @@ async def _publish_one(
             timeout=timeout_s,
         )
     except asyncio.TimeoutError:
-        # to_thread is not cancellable: the upload is still running and may yet
-        # write .published.json. So the lock is deliberately NOT released and no
-        # retry is attempted — the next turn reads the record and sees the real
-        # state. The TTL is what eventually frees the slug.
+        # to_thread is not cancellable: an upload already running goes on and
+        # may yet write .published.json. So the lock is deliberately NOT
+        # released and no retry is attempted: the next turn reads the record
+        # and sees the real state. The TTL is what eventually frees the slug.
+        # The lock is kept whether the upload is running or still queued for
+        # its thread, since nothing here tells the two apart. A cancel (a
+        # Stop, a shutdown) that lands once the upload is handed to its thread
+        # keeps the lock the same way: it propagates past every handler here.
         _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}")
         return False
     except PublishOwnedByOtherUser:
         # The upload service holds this report_id for another account, so a
         # retry cannot succeed and a fresh report_id would publish a copy. A
         # skip like `not_owner`, not a failure; no thread is left running.
-        await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
+        await _release(artifacts_base, slug, scope=scope)
         _record("skipped", slug=slug, reason="owned_by_other_user")
         return False
     except PublishTooLarge:
         # Every retry of the same bundle is refused again, and the 413 is
         # already logged by the classifier: a skip, not a failure.
-        await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
+        await _release(artifacts_base, slug, scope=scope)
         _record("skipped", slug=slug, reason="too_large")
         return False
     except Exception as exc:
@@ -374,14 +409,14 @@ async def _publish_one(
         # resolver, PublisherUnavailable) leaves NO running thread, so holding the
         # lock for its whole TTL would block self-heal for minutes and break the
         # "next turn retries" promise.
-        await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
+        await _release(artifacts_base, slug, scope=scope)
         _record("failed", slug=slug, error=type(exc).__name__)
         # publish_artifact has already logged a PublishRejected's traceback.
         logger.warning(
             "artifact autopublish failed for %s", slug, exc_info=not isinstance(exc, PublishRejected),
         )
         return False
-    await run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False)
+    await _release(artifacts_base, slug, scope=scope)
     _record("published", slug=slug)
     return True
 
@@ -478,19 +513,25 @@ async def autopublish_project_artifacts(
                 if remaining < _MIN_START_BUDGET_S:
                     _record("deferred", slug=slug, reason="budget")
                     continue
-                if not await run_efs(
-                    partial(acquire, base, slug, ttl_s=lock_ttl), scope=scope, deadline=False
-                ):
+                if not await _acquire(base, slug, ttl_s=lock_ttl, scope=scope):
                     _record("lock_busy", slug=slug)
                     continue
                 try:
                     api_key = await key.get()
                 except (ProductPermissionDenied, ProductPermissionUnavailable):
-                    await run_efs(partial(release, base, slug), scope=scope, deadline=False)
+                    await _release(base, slug, scope=scope)
                     _record("no_key", slug=slug)
                     return published
+                except BaseException:
+                    # A cancel, or a failure such as a settings load that
+                    # raises. No publish has started, so nothing else would
+                    # free the lock before its TTL. Past this point, the only
+                    # await before the publish thread starts is a release,
+                    # which a cancel waits for.
+                    await _release(base, slug, scope=scope)
+                    raise
                 if not api_key:
-                    await run_efs(partial(release, base, slug), scope=scope, deadline=False)
+                    await _release(base, slug, scope=scope)
                     _record("no_key", slug=slug)
                     return published
                 if await _publish_one(

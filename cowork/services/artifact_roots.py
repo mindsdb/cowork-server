@@ -30,7 +30,6 @@ one, so both modes address artifacts the same way.
 from __future__ import annotations
 
 import stat
-from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -84,28 +83,39 @@ def project_artifacts_base(project_path: str) -> Path:
     return _artifacts_base(project_path)
 
 
-def _is_real_directory(path: Path) -> bool:
-    """True only for a directory entry, never a link to one."""
+def _is_real_directory(path: Path, *, strict: bool = False) -> bool:
+    """True only for a directory entry, never a link to one. With `strict`, a
+    stat error other than FileNotFoundError or NotADirectoryError raises
+    instead of answering False."""
     try:
         return stat.S_ISDIR(path.stat(follow_symlinks=False).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
     except OSError:
+        if strict:
+            raise
         return False
 
 
-def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool) -> bool:
+def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool, strict: bool = False) -> bool:
     """Reject a link in the writable ``.anton/artifacts`` chain.
 
     This is an early discovery filter.  The identity service repeats the
     guarantee atomically by reopening both components relative to a pinned
     project directory, so replacing either entry after this check is refused at
-    use time too.
+    use time too. With `strict`, a stat error other than FileNotFoundError or
+    NotADirectoryError raises instead of answering False.
     """
     for component in (workspace / _ARTIFACTS_SUBPATH[0], workspace.joinpath(*_ARTIFACTS_SUBPATH)):
         try:
             mode = component.stat(follow_symlinks=False).st_mode
         except FileNotFoundError:
             return may_be_absent
+        except NotADirectoryError:
+            return False
         except OSError:
+            if strict:
+                raise
             return False
         if not stat.S_ISDIR(mode):
             return False
@@ -163,7 +173,8 @@ class RootsPlan:
     legacy conversation roots. `scan` asks for the desktop scan of
     `scan_scope`'s projects root, and `adopted` are desktop projects in a
     folder the user chose, outside that root. `owner_filter` keeps only the
-    legacy conversation roots of conversations the caller owns.
+    legacy conversation roots of `owned`, the conversations the caller owns,
+    which the same database unit reads.
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -171,6 +182,7 @@ class RootsPlan:
     scan_scope: TenantScope | None = None
     adopted: tuple[ProjectRow, ...] = ()
     owner_filter: bool = False
+    owned: frozenset[UUID] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -185,18 +197,13 @@ class _FoundRoot:
 @dataclass(frozen=True)
 class DiscoveredRoots:
     """The roots `discover_roots` found, in discovery order, before the owner
-    filter."""
+    filter, with the plan's owner filter and owned conversations."""
 
     roots: tuple[_FoundRoot, ...]
     owner_filter: bool
+    owned: frozenset[UUID] = frozenset()
 
-    def conversation_ids(self) -> list[UUID]:
-        """The conversations whose ownership `sources` needs, for one query."""
-        if not self.owner_filter:
-            return []
-        return [root.conversation_id for root in self.roots if root.conversation_id is not None]
-
-    def sources(self, owned: Collection[UUID] = ()) -> list[ProjectArtifacts]:
+    def sources(self) -> list[ProjectArtifacts]:
         """The roots the caller may read. With the owner filter, a legacy root
         stays only when its conversation is in `owned`, which covers a
         directory name that is not a conversation id at all."""
@@ -204,7 +211,7 @@ class DiscoveredRoots:
             root.source
             for root in self.roots
             if not (self.owner_filter and root.legacy)
-            or (root.conversation_id is not None and root.conversation_id in owned)
+            or (root.conversation_id is not None and root.conversation_id in self.owned)
         ]
 
     def unfiltered(self) -> list[ProjectArtifacts]:
@@ -223,6 +230,18 @@ def _project_row(service, project) -> ProjectRow:
         # the desktop rail reaches (it addresses artifacts by project id).
         external=service.directory_is_external(project),
     )
+
+
+def scoped_project_row(session: ScopedSession, *, project_id: UUID) -> ProjectRow | None:
+    """`project_id`'s row as plain data, or None when the caller's scope has
+    no such project."""
+    from cowork.services.projects import ProjectNotFoundError, ProjectService
+
+    service = ProjectService(session)
+    try:
+        return _project_row(service, service.get_project(project_id))
+    except ProjectNotFoundError:
+        return None
 
 
 def plan_project_roots(
@@ -256,9 +275,11 @@ def plan_project_roots(
     from cowork.services.projects import ProjectService
 
     service = ProjectService(session)
+    owner_filter = not include_other_members and session.scope.org_mode
     return RootsPlan(
         projects=(_project_row(service, service.get_project(project_id)),),
-        owner_filter=not include_other_members and session.scope.org_mode,
+        owner_filter=owner_filter,
+        owned=owned_conversation_ids(session) if owner_filter else frozenset(),
     )
 
 
@@ -293,6 +314,7 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     return RootsPlan(
         projects=tuple(_project_row(service, project) for project in service.list_projects()),
         owner_filter=session.scope.org_mode,
+        owned=owned_conversation_ids(session) if session.scope.org_mode else frozenset(),
     )
 
 
@@ -340,7 +362,7 @@ def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None
     return Location(UUID(source.project_id), conversation_id, folder.name)
 
 
-def _project_roots(project: ProjectRow) -> list[_FoundRoot]:
+def _project_roots(project: ProjectRow, *, strict: bool = False) -> list[_FoundRoot]:
     """One project's roots. One on the desktop. In org mode (ENG-2056): the
     PROJECT-level base first, the primary location, where every new artifact
     lands and which every member of the project may read (project-wide
@@ -356,6 +378,10 @@ def _project_roots(project: ProjectRow) -> list[_FoundRoot]:
     Every root carries the SAME project identity: a conversation is where the
     bytes happen to live, not a thing the client addresses artifacts by, so
     cards stay project-addressed in both modes.
+
+    A conversations directory or workspace that fails to read is left out,
+    unless `strict`: then the error raises, for a caller that must know it
+    saw every root (the location backfill).
     """
     project_path = Path(project.path)
 
@@ -366,18 +392,23 @@ def _project_roots(project: ProjectRow) -> list[_FoundRoot]:
     if not _org_mode():
         return roots
     conversations = project_path / CONVERSATIONS_DIRNAME
-    if not _is_real_directory(conversations):
+    if not _is_real_directory(conversations, strict=strict):
         # No legacy per-conversation dir at all is common and not an error:
         # the project-level base is still a valid, primary root.
         return roots
     try:
         children = sorted(conversations.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return roots
     except OSError:
+        if strict:
+            raise
         return roots
     return roots + [
         root(child.joinpath(*_ARTIFACTS_SUBPATH), legacy=True, conversation_id=_conversation_id(child))
         for child in children
-        if _is_real_directory(child) and _storage_components_are_safe(child, may_be_absent=False)
+        if _is_real_directory(child, strict=strict)
+        and _storage_components_are_safe(child, may_be_absent=False, strict=strict)
     ]
 
 
@@ -411,38 +442,39 @@ def _adopted_root(project: ProjectRow) -> _FoundRoot | None:
     )
 
 
-def discover_roots(plan: RootsPlan) -> DiscoveredRoots:
+def discover_roots(plan: RootsPlan, *, strict: bool = False) -> DiscoveredRoots:
     """Expand `plan` on the file store. Opens no database session, so it can run
-    on a file store thread (cowork.db.units.run_efs)."""
+    on a file store thread (cowork.db.units.run_efs). With `strict`, a project
+    root that fails to list or stat raises (_project_roots) instead of being
+    left out."""
     roots: list[_FoundRoot] = []
     if plan.scan:
         roots += [_FoundRoot(source=source) for source in artifacts_sources_for_scan(scope=plan.scan_scope)]
         roots += [found for project in plan.adopted if (found := _adopted_root(project)) is not None]
     for project in plan.projects:
-        roots += _project_roots(project)
-    return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter)
+        roots += _project_roots(project, strict=strict)
+    return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter, owned=plan.owned)
 
 
-def owned_conversation_ids(session: ScopedSession, conversation_ids: list[UUID]) -> set[UUID]:
-    """The subset of `conversation_ids` the caller owns, in one query."""
+def readable_sources(plan: RootsPlan) -> list[ProjectArtifacts]:
+    """The roots `plan` names that the caller may read. File store work only:
+    the plan already holds the owner filter's answer, so async code runs this
+    inside a file store call (cowork.db.units.run_efs), with the work on the
+    roots it finds."""
+    return discover_roots(plan).sources()
+
+
+def owned_conversation_ids(session: ScopedSession) -> frozenset[UUID]:
+    """Every conversation the caller owns, in one query, for a plan's owner
+    filter."""
     from cowork.services.conversations import ConversationService
 
-    return ConversationService(session).owned_ids(conversation_ids)
-
-
-def _sources(session: ScopedSession, plan: RootsPlan) -> list[ProjectArtifacts]:
-    """`plan`'s roots, with the database and the file store read in turn on the
-    calling thread. For code already running in a worker thread with a
-    session; async code reads the three steps through run_db and run_efs
-    (cowork.api.v1.artifact_scope.artifact_sources)."""
-    found = discover_roots(plan)
-    ids = found.conversation_ids()
-    return found.sources(owned_conversation_ids(session, ids) if ids else ())
+    return frozenset(ConversationService(session).owned_ids())
 
 
 def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts]:
     """Every artifacts root the caller can read; see `plan_scope_roots`."""
-    return _sources(session, plan_scope_roots(session))
+    return readable_sources(plan_scope_roots(session))
 
 
 def artifacts_sources_for_project(
@@ -455,12 +487,9 @@ def artifacts_sources_for_project(
     a caller that addresses by slug has to look in each. Desktop always yields
     exactly one.
     """
-    plan = plan_project_roots(session, project_id, include_other_members=include_other_members)
-    found = discover_roots(plan)
-    if include_other_members:
-        return found.unfiltered()
-    ids = found.conversation_ids()
-    return found.sources(owned_conversation_ids(session, ids) if ids else ())
+    return readable_sources(
+        plan_project_roots(session, project_id, include_other_members=include_other_members)
+    )
 
 
 def artifacts_sources_for_scan(*, scope: TenantScope | None) -> list[ProjectArtifacts]:

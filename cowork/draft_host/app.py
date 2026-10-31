@@ -19,6 +19,7 @@ from functools import partial
 from http import HTTPStatus
 from uuid import UUID
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException
@@ -28,16 +29,15 @@ from starlette.responses import HTMLResponse, PlainTextResponse, Response
 from starlette.routing import Match, Route
 
 from cowork.api.v1.artifact_preview import wants_comment_layer
-from cowork.api.v1.artifact_scope import review_artifact_for_request
+from cowork.api.v1.artifact_scope import review_artifact_and_read
 from cowork.api.v1.endpoints.artifact_workspace import (
-    _draft_file_parts,
     _draft_file_response,
     _draft_selectors,
 )
 from cowork.common.request_logging import RequestLoggingMiddleware
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import scope_for_identity
-from cowork.db.units import run_efs
+from cowork.db.units import FilesystemBusy, busy_retry_seconds
 from cowork.draft_host.token import DraftTokenError, verify_draft_token
 
 logger = logging.getLogger(__name__)
@@ -205,17 +205,23 @@ def _unauthorized(request: Request) -> Response:
 
 async def _draft_response(request: Request, grant: _DraftGrant) -> Response:
     """Resolve and open the file as the token's user, the database and the file
-    store each read in a worker thread of its own (run_db, run_efs)."""
+    store each read in a worker thread of its own (run_db, run_efs). The path
+    checks and the open run in the lookup's own file store call, once it has
+    authorized the token's user."""
     scope = scope_for_identity(org_id=grant.org_id, user_id=grant.user_id)
     project_selector, artifact_selector = _draft_selectors(grant.project_ref, grant.artifact_id)
-    source, folder, metadata, _is_own = await review_artifact_for_request(
-        scope, project_selector, artifact_selector
+    _artifact, response = await review_artifact_and_read(
+        scope,
+        project_selector,
+        artifact_selector,
+        read=partial(
+            _draft_file_response,
+            rel_path=request.path_params["rel_path"],
+            scope=scope,
+            comments=wants_comment_layer(request),
+        ),
     )
-    parts = _draft_file_parts(request.path_params["rel_path"], metadata)
-    return await run_efs(
-        partial(_draft_file_response, source, folder, parts, comments=wants_comment_layer(request)),
-        scope=scope,
-    )
+    return response
 
 
 def _status_phrase(status_code: int) -> str:
@@ -245,6 +251,19 @@ async def _serve_draft(request: Request) -> Response:
         return await _draft_response(request, grant)
     except HTTPException as exc:
         return PlainTextResponse(_status_phrase(exc.status_code), status_code=exc.status_code)
+    except (FilesystemBusy, PoolTimeoutError) as exc:
+        # This app never reaches the API's busy handlers (cowork.server), so it
+        # answers a busy file store or database the way they do: 503 with
+        # Retry-After, and a WARNING, since nothing here is broken.
+        logger.warning(
+            "Draft refused with 503: no file store slot or database connection freed in time",
+            extra={"event": "draft_host_busy", "error_type": type(exc).__name__},
+        )
+        return PlainTextResponse(
+            HTTPStatus.SERVICE_UNAVAILABLE.phrase,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            headers={"Retry-After": str(busy_retry_seconds())},
+        )
     except Exception:
         logger.exception("Draft file failed", extra={"event": "draft_host_failed"})
         return PlainTextResponse("Internal Server Error", status_code=500)

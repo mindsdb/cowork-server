@@ -504,7 +504,7 @@ def _mount_page(*, tmp_path, scope) -> str:
 def _preview(*, token: str, scope):
     from cowork.api.v1.endpoints.project_files import _preview_asset as preview_asset
 
-    return preview_asset(token, "page.html", scope=scope)
+    return preview_asset(token=token, rel_path="page.html", scope=scope)
 
 
 def test_another_person_cannot_use_a_preview_token(tmp_path):
@@ -561,7 +561,7 @@ def _mount_token(target, base, scope):
 def _asset_for(token, rel_path, scope):
     from cowork.api.v1.endpoints.project_files import _preview_asset as preview_asset
 
-    return preview_asset(token, rel_path, scope)
+    return preview_asset(token=token, rel_path=rel_path, scope=scope)
 
 
 def test_a_shared_projects_private_workspace_is_not_reachable_through_a_root_token(tmp_path):

@@ -49,10 +49,12 @@ EVENT_FIELDS = frozenset(
         "model_alias",
         "managed_connection_file",
         "retryable",
+        "statement_fingerprint",
         # cowork.common.loop_watchdog and the lifespan's step timings.
         "stack",
         "in_flight",
         "limiter",
+        "step",
         "steps",
     ]
 )

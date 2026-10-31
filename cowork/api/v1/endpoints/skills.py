@@ -249,12 +249,13 @@ async def list_skills(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _list_skills(session, principal), scope=scope)
+    return await run_efs_unit(partial(_list_skills, principal=principal), scope=scope)
 
 
 def _list_skills(
     scoped: ScopedSession,
-    principal: Principal | None = None,
+    *,
+    principal: Principal | None,
 ):
     # Seeded here for an org that opens this menu before it has ever chatted.
     # The turn payload seeds too, so whichever comes first wins; see
@@ -282,13 +283,14 @@ async def create_skill(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _create_skill(body, session, principal), scope=scope)
+    return await run_efs_unit(partial(_create_skill, body=body, principal=principal), scope=scope)
 
 
 def _create_skill(
-    body: SkillCreateRequest,
     scoped: ScopedSession,
-    principal: Principal | None = None,
+    *,
+    body: SkillCreateRequest,
+    principal: Principal | None,
 ):
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
@@ -347,7 +349,7 @@ def _upload_skill_bytes(
     raw: bytes,
     filename: str | None,
     scoped: ScopedSession,
-    principal: Principal | None = None,
+    principal: Principal | None,
     *,
     shared: bool = False,
 ) -> dict:
@@ -431,7 +433,7 @@ def _upload_skill_in_new_session(
     raw: bytes,
     filename: str | None,
     scope: TenantScope,
-    principal: Principal | None = None,
+    principal: Principal | None,
     *,
     shared: bool = False,
 ) -> dict:
@@ -449,13 +451,14 @@ async def get_skill(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _get_skill(skill_id, session, principal), scope=scope)
+    return await run_efs_unit(partial(_get_skill, skill_id=skill_id, principal=principal), scope=scope)
 
 
 def _get_skill(
-    skill_id: str,
     scoped: ScopedSession,
-    principal: Principal | None = None,
+    *,
+    skill_id: str,
+    principal: Principal | None,
 ):
     service = SkillService(scoped.scope)
     try:
@@ -474,14 +477,15 @@ async def update_skill(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _update_skill(skill_id, body, session, principal), scope=scope)
+    return await run_efs_unit(partial(_update_skill, skill_id=skill_id, body=body, principal=principal), scope=scope)
 
 
 def _update_skill(
+    scoped: ScopedSession,
+    *,
     skill_id: str,
     body: SkillUpdateRequest,
-    scoped: ScopedSession,
-    principal: Principal | None = None,
+    principal: Principal | None,
 ):
     service = SkillService(scoped.scope)
     access = SharedResourceAccess(scoped, principal)
@@ -641,18 +645,6 @@ async def set_skill_sharing(
     # the desktop) has nothing to share and gets a 401 in either mode.
     principal: Principal = Depends(require(Authenticated)),
 ):
-    return await run_efs_unit(lambda session: _set_skill_sharing(skill_id, body, session, principal), scope=scope)
-
-
-def _set_skill_sharing(
-    skill_id: str,
-    body: SkillSharingRequest,
-    scoped: ScopedSession,
-    # Authenticated, beside the router's AuthenticatedInOrgMode: a person
-    # shares their own skill, so a caller with no person (the operator view,
-    # the desktop) has nothing to share and gets a 401 in either mode.
-    principal: Principal,
-):
     """Share one of the caller's own skills with everyone, read-only, or stop
     sharing it. Both directions are idempotent.
 
@@ -663,6 +655,18 @@ def _set_skill_sharing(
     caller's own store holds no such skill; 409 for a share a check refuses,
     with the reason; 503 while another change holds the list.
     """
+    return await run_efs_unit(
+        partial(_set_skill_sharing, skill_id=skill_id, body=body, principal=principal), scope=scope
+    )
+
+
+def _set_skill_sharing(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    body: SkillSharingRequest,
+    principal: Principal,
+):
     service = SkillService(scoped.scope)
     try:
         service.refuse_unless_sharing_available()
@@ -692,13 +696,14 @@ async def delete_skill(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(lambda session: _delete_skill(skill_id, session, principal), scope=scope)
+    return await run_efs_unit(partial(_delete_skill, skill_id=skill_id, principal=principal), scope=scope)
 
 
 def _delete_skill(
-    skill_id: str,
     scoped: ScopedSession,
-    principal: Principal | None = None,
+    *,
+    skill_id: str,
+    principal: Principal | None,
 ):
     service = SkillService(scoped.scope)
     access = SharedResourceAccess(scoped, principal)

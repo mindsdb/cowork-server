@@ -333,7 +333,10 @@ async def store_file(
     file.path = str(dest)
     try:
         return await run_db(partial(_insert_file, file=file), scope=scope)
-    except BaseException:
+    except Exception:
+        # Not on a cancel: run_db lets a unit that already holds its
+        # connection commit before the cancel propagates, so the row may name
+        # these bytes. A cancel before that leaves a folder no row names.
         await run_efs(partial(shutil.rmtree, file_dir, ignore_errors=True), scope=scope)
         raise
 

@@ -2,7 +2,10 @@
 
 A lookup by artifact id reads its row and opens that one folder, instead of
 listing every artifacts root in the project. One row per (org_id,
-artifact_id); the desktop writes none.
+artifact_id); the desktop writes none. `conflicted` marks an id held by two
+folders of the row's project, whose lookups list the project's roots again.
+conversation_id is indexed for its ON DELETE CASCADE, so deleting a
+conversation does not scan the table.
 
 Revision ID: b5c8e2f4a9d1
 Revises: a6e3c9f2b4d8
@@ -39,6 +42,7 @@ def upgrade() -> None:
         sa.Column("project_id", sa.Uuid(), nullable=False),
         sa.Column("conversation_id", sa.Uuid(), nullable=True),
         sa.Column("slug", sa.String(length=255), nullable=False),
+        sa.Column("conflicted", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -57,9 +61,13 @@ def upgrade() -> None:
         sa.UniqueConstraint("org_id", "artifact_id", name="uq_artifact_locations_org_artifact"),
     )
     op.create_index("ix_artifact_locations_project_id", "artifact_locations", ["project_id"])
+    op.create_index("ix_artifact_locations_conversation_id", "artifact_locations", ["conversation_id"])
 
 
 def downgrade() -> None:
     """Downgrade schema."""
+    if not _has_table("artifact_locations"):
+        return
+    op.drop_index("ix_artifact_locations_conversation_id", table_name="artifact_locations")
     op.drop_index("ix_artifact_locations_project_id", table_name="artifact_locations")
     op.drop_table("artifact_locations")

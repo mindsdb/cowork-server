@@ -50,7 +50,7 @@ def _builtin() -> str:
 
 
 def test_listing_seeds_read_only_builtins_with_no_author(scoped):
-    listed = skills_ep._list_skills(scoped(_person()), None)["skills"]
+    listed = skills_ep._list_skills(scoped(_person()), principal=None)["skills"]
 
     by_id = {skill["id"]: skill for skill in listed}
     assert set(BUILTIN_SKILL_SLUGS) <= set(by_id)
@@ -65,7 +65,9 @@ def test_renaming_your_own_skill_works(scoped):
     scope = _person()
     SkillService(scope).create_skill("my-notes", "Do the thing.")
 
-    renamed = skills_ep._update_skill("my-notes", SkillUpdateRequest(label="my-renamed"), scoped(scope), None)
+    renamed = skills_ep._update_skill(
+        scoped(scope), skill_id="my-notes", body=SkillUpdateRequest(label="my-renamed"), principal=None
+    )
 
     assert renamed["id"] == "my-renamed"
     assert renamed["capabilities"]["canEdit"] is True
@@ -78,13 +80,17 @@ def test_renaming_into_or_editing_a_builtin_is_refused(scoped):
     SkillService(scope).create_skill("my-notes", "Do the thing.")
 
     with pytest.raises(HTTPException) as into:
-        skills_ep._update_skill("my-notes", SkillUpdateRequest(label=_builtin()), scoped(scope), None)
+        skills_ep._update_skill(
+            scoped(scope), skill_id="my-notes", body=SkillUpdateRequest(label=_builtin()), principal=None
+        )
     assert into.value.status_code == 403
     with pytest.raises(HTTPException) as edit:
-        skills_ep._update_skill(_builtin(), SkillUpdateRequest(instructions="x"), scoped(scope), None)
+        skills_ep._update_skill(
+            scoped(scope), skill_id=_builtin(), body=SkillUpdateRequest(instructions="x"), principal=None
+        )
     assert edit.value.status_code == 403
     with pytest.raises(HTTPException) as delete:
-        skills_ep._delete_skill(_builtin(), scoped(scope), None)
+        skills_ep._delete_skill(scoped(scope), skill_id=_builtin(), principal=None)
     assert delete.value.status_code == 403
 
 
@@ -98,14 +104,16 @@ def test_with_shared_skills_a_builtin_copy_is_the_operator_views(scoped, skills_
     shutil.copytree(BUILTIN_SKILLS_DIR / _builtin(), skills_root / _builtin())
     person = _person(resources=frozenset())
     for scope, editable in ((person, False), (LOCAL_SCOPE, True)):
-        listed = {s["id"]: s for s in skills_ep._list_skills(scoped(scope), None)["skills"]}
+        listed = {s["id"]: s for s in skills_ep._list_skills(scoped(scope), principal=None)["skills"]}
         assert listed[_builtin()]["capabilities"]["canEdit"] is editable
 
     with pytest.raises(HTTPException) as refused:
-        skills_ep._update_skill(_builtin(), SkillUpdateRequest(instructions="mine now"), scoped(person), None)
+        skills_ep._update_skill(
+            scoped(person), skill_id=_builtin(), body=SkillUpdateRequest(instructions="mine now"), principal=None
+        )
     assert (refused.value.status_code, refused.value.detail) == (403, SHARED_SKILL_REFUSAL)
     edited = skills_ep._update_skill(
-        _builtin(), SkillUpdateRequest(instructions="the operator's"), scoped(LOCAL_SCOPE), None
+        scoped(LOCAL_SCOPE), skill_id=_builtin(), body=SkillUpdateRequest(instructions="the operator's"), principal=None
     )
     assert edited["declarative"] == "the operator's"
 
@@ -135,7 +143,7 @@ def test_a_desktop_rename_into_an_existing_name_answers_409(desktop):
     service.create_skill("b-skill", "B.")
 
     with pytest.raises(HTTPException) as taken:
-        skills_ep._update_skill("a-skill", SkillUpdateRequest(label="b-skill"), desktop, None)
+        skills_ep._update_skill(desktop, skill_id="a-skill", body=SkillUpdateRequest(label="b-skill"), principal=None)
 
     assert taken.value.status_code == 409
     assert service.get_skill("a-skill").instructions.strip() == "A."

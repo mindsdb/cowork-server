@@ -14,6 +14,7 @@ from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, get_tenant_scope
 from _async_stub import awaitable
+from test_artifact_roots import _count_hops
 
 
 PROJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -47,7 +48,7 @@ def test_scope_comes_from_dependency_and_cannot_be_supplied_in_query(
 
     params = {"session": "../../untrusted", "scope": "../../untrusted"}
     if route == "draft":
-        monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(capture))
+        monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(capture))
         method = "get"
         path = f"/api/v1/artifacts/drafts/local/{ARTIFACT_ID.hex}/index.html"
         schema_path = "/api/v1/artifacts/drafts/{project_ref}/{artifact_id}/{rel_path}"
@@ -75,10 +76,10 @@ def test_scope_comes_from_dependency_and_cannot_be_supplied_in_query(
 def test_malformed_draft_project_is_rejected_before_review(
     client, monkeypatch, project_ref,
 ):
-    def unexpected_review(*_args):
+    def unexpected_review(*_args, **_kwargs):
         pytest.fail("invalid project reached artifact review resolution")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(unexpected_review))
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(unexpected_review))
 
     response = client.get(
         f"/api/v1/artifacts/drafts/{project_ref}/{ARTIFACT_ID.hex}/index.html"
@@ -92,10 +93,10 @@ def test_malformed_draft_project_is_rejected_before_review(
 async def test_path_prefixed_uuid_is_rejected_instead_of_selecting_its_basename(
     monkeypatch, selector, prefix,
 ):
-    def unexpected_review(*_args):
+    def unexpected_review(*_args, **_kwargs):
         pytest.fail("a path-prefixed identity reached artifact review resolution")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(unexpected_review))
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(unexpected_review))
     project_ref = prefix + str(PROJECT_ID) if selector == "project" else "local"
     artifact_id = prefix + ARTIFACT_ID.hex if selector == "artifact" else ARTIFACT_ID.hex
 
@@ -115,11 +116,11 @@ def test_valid_draft_selectors_reach_review_as_canonical_identities(
 ):
     seen = []
 
-    def review(_session, project, artifact):
+    def review(_session, project, artifact, **_kwargs):
         seen.append((project, artifact))
         raise HTTPException(status_code=404, detail="No artifact in test catalog")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(review))
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(review))
 
     response = client.get(
         f"/api/v1/artifacts/drafts/{project_ref}/{artifact_id}/index.html"
@@ -136,9 +137,13 @@ def test_delete_uuid_reaches_review_with_the_scoped_project(
 ):
     seen = []
     monkeypatch.setattr(
-        artifacts_ep, "_scoped_project_roots",
-        awaitable(lambda _scope, _project_id: (PROJECT_ID, [])),
+        artifacts_ep, "scoped_project_id_for_request", lambda _session, _project_ref: PROJECT_ID
     )
+
+    def unexpected_discovery(*_args):
+        pytest.fail("a delete by id planned the project's roots before its review lookup")
+
+    monkeypatch.setattr(artifacts_ep, "_scoped_project_plan", awaitable(unexpected_discovery))
 
     def review(_session, project, artifact):
         seen.append((project, artifact))
@@ -155,12 +160,16 @@ def test_delete_uuid_reaches_review_with_the_scoped_project(
 
 
 def test_delete_legacy_slug_still_uses_the_scoped_directory_catalog(client, monkeypatch):
+    plan = object()
     sources = [object()]
     seen = []
     monkeypatch.setattr(
-        artifacts_ep, "_scoped_project_roots",
-        awaitable(lambda _scope, _project_id: (PROJECT_ID, sources)),
+        artifacts_ep, "_scoped_project_plan", awaitable(lambda _scope, _project_id: plan)
     )
+
+    def readable(found_plan):
+        assert found_plan is plan
+        return sources
 
     def resolve_legacy(authorized_sources, slug):
         seen.append((authorized_sources, slug))
@@ -169,8 +178,10 @@ def test_delete_legacy_slug_still_uses_the_scoped_directory_catalog(client, monk
     def unexpected_review(*_args):
         pytest.fail("legacy slug entered the UUID review resolver")
 
+    monkeypatch.setattr(artifacts_ep, "readable_sources", readable)
     monkeypatch.setattr(artifacts_ep, "_legacy_artifact_for_sources", resolve_legacy)
     monkeypatch.setattr(artifact_scope, "review_artifact_for_request", awaitable(unexpected_review))
+    hops = _count_hops(monkeypatch, artifacts_ep)
 
     response = client.delete(
         "/api/v1/artifacts/quarterly-report", params={"project_id": str(PROJECT_ID)},
@@ -178,6 +189,10 @@ def test_delete_legacy_slug_still_uses_the_scoped_directory_catalog(client, monk
 
     assert response.status_code == 404, response.text
     assert seen == [(sources, "quarterly-report")]
+    # The roots and the folder among them in one file store call: each wait
+    # for a slot can refuse the delete, so a second one could refuse it with
+    # the lookup's work done.
+    assert hops == ["run_efs"]
 
 
 @pytest.mark.parametrize("slug", ["..%5Coutside", "report%00", "%2e", "%2e%2e"])
@@ -187,7 +202,7 @@ def test_malformed_delete_slug_is_rejected_before_catalog_resolution(
     def unexpected_resolution(*_args):
         pytest.fail("invalid artifact selector reached the project catalog")
 
-    monkeypatch.setattr(artifacts_ep, "_scoped_project_roots", awaitable(unexpected_resolution))
+    monkeypatch.setattr(artifacts_ep, "_scoped_project_plan", awaitable(unexpected_resolution))
 
     response = client.delete(
         f"/api/v1/artifacts/{slug}", params={"project_id": str(PROJECT_ID)},

@@ -204,7 +204,7 @@ def _list_files(engine, project_name: str) -> dict:
     from cowork.api.v1.endpoints.project_files import _list_project_files as list_project_files
 
     return list_project_files(
-        project_name, ScopedSession(Session(engine), LOCAL_SCOPE), None
+        ScopedSession(Session(engine), LOCAL_SCOPE), project_name=project_name, principal=None
     )
 
 
