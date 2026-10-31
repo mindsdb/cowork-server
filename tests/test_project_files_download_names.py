@@ -14,6 +14,7 @@ from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
 from cowork.models.project import Project
+from cowork.db.scoped import LOCAL_SCOPE
 
 pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
@@ -95,7 +96,7 @@ def test_pinned_stream_closes_descriptor_when_response_cannot_be_built(tmp_path,
     monkeypatch.setattr(project_files, "PinnedStreamingResponse", FailingResponse)
 
     with pytest.raises(RuntimeError):
-        project_files._pinned_stream(target, tmp_path, media_type="text/plain", headers={})
+        project_files._pinned_stream(target, tmp_path, media_type="text/plain", headers={}, scope=LOCAL_SCOPE)
 
     assert len(opened) == 1
     assert not _still_open(*opened[0])
@@ -108,7 +109,7 @@ def test_pinned_stream_closes_descriptor_when_client_leaves_before_the_body(tmp_
     target.write_bytes(b"x")
     opened = _track_pinned_files(monkeypatch, project_files)
     response = project_files._pinned_stream(
-        target, tmp_path, media_type="text/plain", headers={}
+        target, tmp_path, media_type="text/plain", headers={}, scope=LOCAL_SCOPE
     )
 
     async def receive():

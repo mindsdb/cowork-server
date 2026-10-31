@@ -5,6 +5,7 @@ for a unit that has started."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import threading
 import time
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import event
 
@@ -269,3 +271,81 @@ def test_a_pool_timeout_under_one_second_is_rejected(monkeypatch):
     monkeypatch.setenv("POOL_TIMEOUT", "0")
     with pytest.raises(ValidationError):
         DatabaseSettings(_env_file=None)
+
+
+async def test_a_native_cancel_waits_for_work_on_the_unit_threads():
+    """Stop cancels a turn's task natively, and anyio's shield holds off only
+    anyio's own cancel scopes. The caller still waits for work handed to the
+    unit threads (a session's rollback, a settings read) before it unwinds."""
+    finished = []
+
+    def work() -> None:
+        time.sleep(0.3)
+        finished.append(time.monotonic())
+
+    caller = asyncio.create_task(units.run_on_unit_threads(work))
+    await asyncio.sleep(0.05)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    unwound = time.monotonic()
+
+    assert finished and finished[0] <= unwound
+
+
+def _session_errors(caplog) -> list:
+    return [
+        record for record in caplog.records
+        if record.name == units.db_session.logger.name and record.levelno == logging.ERROR
+    ]
+
+
+@pytest.mark.parametrize("run", ["run_db", "run_efs_unit"])
+async def test_a_unit_that_answers_a_5xx_logs_its_status_and_cause(run, caplog, owned_logger):
+    """Starlette answers an HTTPException without a log line, so a 5xx a unit
+    raises, such as a lock that stayed busy, is recorded with its cause, as
+    the request session records one. A 4xx is the route's intended answer."""
+    def busy(session):
+        try:
+            raise TimeoutError("the lock stayed busy")
+        except TimeoutError as cause:
+            raise HTTPException(status_code=503, detail="busy") from cause
+
+    def missing(session):
+        raise HTTPException(status_code=404, detail="missing")
+
+    owned_logger(units.db_session.logger.name)
+    for fn in (busy, missing):
+        with pytest.raises(HTTPException):
+            await getattr(units, run)(fn, scope=LOCAL_SCOPE)
+
+    [record] = _session_errors(caplog)
+    assert record.getMessage() == "Session error: error_type=HTTPException status=503 cause=TimeoutError"
+
+
+async def test_a_route_on_a_file_store_unit_logs_the_5xx_it_answers(
+    org_deployment, monkeypatch, caplog, owned_logger
+):
+    """The line comes from the real call site: a project create whose name
+    lock stays busy answers 503 from inside its unit."""
+    import httpx
+
+    from cowork.server import create_app
+    from cowork.services.projects import ProjectNameLockBusyError, ProjectService
+
+    def busy(self, *args, **kwargs):
+        raise ProjectNameLockBusyError("the project-name lock stayed busy")
+
+    monkeypatch.setattr(ProjectService, "create_project", busy)
+    identity = {"X-User-Id": "6e7d2a1f-3c8b-4d4e-9f0a-1b2c3d4e5f60", "X-Organization-Id": "5d6c1f0e-2b7a-4c3d-8e9f-0a1b2c3d4e5f"}
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    # After create_app, which sets up the app's logging again.
+    owned_logger(units.db_session.logger.name)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/projects/", json={"name": f"busy-{uuid4().hex[:8]}"}, headers=identity)
+
+    assert response.status_code == 503, response.text
+    [record] = _session_errors(caplog)
+    assert record.getMessage() == (
+        "Session error: error_type=HTTPException status=503 cause=ProjectNameLockBusyError"
+    )

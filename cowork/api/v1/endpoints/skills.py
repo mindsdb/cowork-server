@@ -1,10 +1,10 @@
 import logging
 from contextlib import ExitStack, nullcontext
+from functools import partial
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
-from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.permissions import Authenticated, AuthenticatedInOrgMode, require
 from cowork.db.personal_resources import PersonalResource
@@ -14,6 +14,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
+from cowork.db.units import run_efs, run_efs_unit
 from cowork.db.session import get_open_session
 from cowork.models.skill import Skill
 from cowork.models.shared_resource import SharedResourceAttribution
@@ -49,6 +50,8 @@ from cowork.services.skills import (
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 logger = logging.getLogger(__name__)
 
 
@@ -242,9 +245,17 @@ def _reserve_free_slug(
 
 
 @router.get("/", response_model=SkillListResponse)
-def list_skills(
-    scoped: ScopedSessionDep,
+async def list_skills(
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_list_skills, principal=principal), scope=scope)
+
+
+def _list_skills(
+    scoped: ScopedSession,
+    *,
+    principal: Principal | None,
 ):
     # Seeded here for an org that opens this menu before it has ever chatted.
     # The turn payload seeds too, so whichever comes first wins; see
@@ -267,10 +278,19 @@ def list_skills(
     status_code=status.HTTP_201_CREATED,
     response_model=SkillResponse,
 )
-def create_skill(
+async def create_skill(
     body: SkillCreateRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_create_skill, body=body, principal=principal), scope=scope)
+
+
+def _create_skill(
+    scoped: ScopedSession,
+    *,
+    body: SkillCreateRequest,
+    principal: Principal | None,
 ):
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
@@ -403,13 +423,9 @@ async def upload_skill(
     shared: Annotated[bool, Form()] = False,
 ):
     raw = await file.read()
-    return await run_in_threadpool(
-        _upload_skill_in_new_session,
-        raw,
-        file.filename,
-        scope,
-        principal,
-        shared=shared,
+    return await run_efs(
+        partial(_upload_skill_in_new_session, raw, file.filename, scope, principal, shared=shared),
+        scope=scope,
     )
 
 
@@ -430,10 +446,19 @@ def _upload_skill_in_new_session(
 
 
 @router.get("/{skill_id}", response_model=SkillResponse)
-def get_skill(
+async def get_skill(
     skill_id: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_get_skill, skill_id=skill_id, principal=principal), scope=scope)
+
+
+def _get_skill(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    principal: Principal | None,
 ):
     service = SkillService(scoped.scope)
     try:
@@ -446,11 +471,21 @@ def get_skill(
 
 
 @router.put("/{skill_id}", response_model=SkillResponse)
-def update_skill(
+async def update_skill(
     skill_id: str,
     body: SkillUpdateRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_update_skill, skill_id=skill_id, body=body, principal=principal), scope=scope)
+
+
+def _update_skill(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    body: SkillUpdateRequest,
+    principal: Principal | None,
 ):
     service = SkillService(scoped.scope)
     access = SharedResourceAccess(scoped, principal)
@@ -601,10 +636,10 @@ def update_skill(
 
 
 @router.put("/{skill_id}/sharing", response_model=SkillResponse)
-def set_skill_sharing(
+async def set_skill_sharing(
     skill_id: str,
     body: SkillSharingRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     # Authenticated, beside the router's AuthenticatedInOrgMode: a person
     # shares their own skill, so a caller with no person (the operator view,
     # the desktop) has nothing to share and gets a 401 in either mode.
@@ -620,6 +655,18 @@ def set_skill_sharing(
     caller's own store holds no such skill; 409 for a share a check refuses,
     with the reason; 503 while another change holds the list.
     """
+    return await run_efs_unit(
+        partial(_set_skill_sharing, skill_id=skill_id, body=body, principal=principal), scope=scope
+    )
+
+
+def _set_skill_sharing(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    body: SkillSharingRequest,
+    principal: Principal,
+):
     service = SkillService(scoped.scope)
     try:
         service.refuse_unless_sharing_available()
@@ -644,10 +691,19 @@ def set_skill_sharing(
 
 
 @router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_skill(
+async def delete_skill(
     skill_id: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_delete_skill, skill_id=skill_id, principal=principal), scope=scope)
+
+
+def _delete_skill(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    principal: Principal | None,
 ):
     service = SkillService(scoped.scope)
     access = SharedResourceAccess(scoped, principal)

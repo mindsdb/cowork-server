@@ -1128,3 +1128,34 @@ async def test_a_channel_turns_artifact_bookkeeping_leaves_the_event_loop_free(m
     assert elapsed >= 2 * slow
     # A free loop ticks about 100 times a second here; a blocked one stops.
     assert ticks >= 50 * elapsed * 0.5, f"{ticks} ticks in {elapsed:.1f}s"
+
+
+@pytest.mark.asyncio
+async def test_a_busy_file_store_fails_the_channel_turn_before_its_seed_history_is_built(monkeypatch):
+    """With no file store slot free, the vault's secrets cannot be registered,
+    and a seed history scrubbed by key shape alone would carry a saved
+    password to the pod. The turn fails instead, as it does on a busy pool."""
+    import cowork.db.session as db_session
+    from cowork.db import units
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import FilesystemBusy
+    from test_run_efs import holding
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    seeded = []
+    _fake_handler(monkeypatch, remote_seed_history=lambda s, c: seeded.append(c) or ([], None))
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    session = _FakeSession()
+    async with holding(units.EFS_SLOTS, LOCAL_SCOPE):
+        with pytest.raises(FilesystemBusy):
+            await _drain(remote_turn_events(
+                scope=session.scope, conv_id=uuid4(), org_id="org-123", user_id=None,
+                input_text="hi", model="anton", turn_rows=[],
+            ))
+
+    assert seeded == []

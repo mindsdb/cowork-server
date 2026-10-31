@@ -7,6 +7,7 @@ import pytest
 from fastapi.responses import StreamingResponse
 
 from cowork.api.v1.endpoints import project_files as project_files_ep
+from cowork.db.scoped import LOCAL_SCOPE
 
 CSV_CRLF = b"id,name\r\n1,alpha\r\n2,beta\r\n"
 BINARY_WITH_EOF_MARK = b"PK\x03\x04\x1a\r\n\x00\x1a\n\xff"
@@ -24,6 +25,7 @@ def _stream(target, base):
         base,
         media_type="text/csv",
         headers={"Cache-Control": "private, max-age=300"},
+        scope=LOCAL_SCOPE,
     )
 
 

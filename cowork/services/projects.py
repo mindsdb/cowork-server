@@ -170,6 +170,37 @@ class ProjectRenameStage:
     skill_rewrites_applied: bool = False
 
 
+def partition_of(scope: TenantScope) -> str | None:
+    """The partition of the shared root that holds `scope`'s projects, or None
+    when its projects are not kept per person."""
+    if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
+        return None
+    return str(scope.org_id)
+
+
+def sits_in_another_partition(path: str, *, partition: str | None) -> bool:
+    """Whether a project folder at `path` sits in a partition of the shared
+    root other than `partition`, the caller's (partition_of).
+
+    Rows are stored resolved (`_project_path`), so a project recorded while
+    the person's partition folder was a link to someone else's, which agent
+    code from before the code sandbox could leave, names that person's
+    folder, and still names it once the link is gone. No folder on that path
+    is a link any more, so a walk that refuses links can't tell it apart.
+    Resolving the shared root is file store work, so this runs on a file
+    store thread (cowork.db.units.run_efs).
+    """
+    if partition is None:
+        return False
+    shared_root = Path(os.path.realpath(get_app_settings().storage.shared_root))
+    try:
+        name = Path(path).relative_to(shared_root).parts[0]
+        is_partition = str(UUID(name)) == name
+    except (ValueError, IndexError):
+        return False
+    return is_partition and name != partition
+
+
 class ProjectService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
@@ -688,27 +719,6 @@ class ProjectService:
         except (OSError, RuntimeError):
             return False
         return parent != root
-
-    def sits_in_another_partition(self, project: Project) -> bool:
-        """Whether a person's project names a folder in another person's
-        partition in the shared root.
-
-        Rows are stored resolved (`_project_path`), so a project recorded while
-        the person's partition folder was a link to someone else's, which agent
-        code from before the code sandbox could leave, names that person's
-        folder, and still names it once the link is gone. No folder on that path
-        is a link any more, so a walk that refuses links can't tell it apart.
-        """
-        scope = self.session.scope
-        if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
-            return False
-        shared_root = Path(os.path.realpath(get_app_settings().storage.shared_root))
-        try:
-            name = Path(project.path).relative_to(shared_root).parts[0]
-            is_partition = str(UUID(name)) == name
-        except (ValueError, IndexError):
-            return False
-        return is_partition and name != str(scope.org_id)
 
     def _within_root(self, path: Path) -> bool:
         try:
