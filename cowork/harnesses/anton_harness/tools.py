@@ -25,7 +25,7 @@ import logging
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 import uuid
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -46,6 +46,10 @@ from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
+
+if TYPE_CHECKING:
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
@@ -63,7 +67,7 @@ def _published_state(raw_path: str) -> dict:
     return published_state(raw_path, scope=current_settings_scope())
 
 
-def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
+def _publish_artifact(raw_path: str, access: ArtifactAccessRequest | None = None) -> dict:
     """Desktop publish for the agent's own `publish_or_preview` tool.
 
     Resolves the artifact, its root and the credential the same way the HTTP
@@ -91,12 +95,14 @@ def _published_owner_state(raw_path: str) -> dict:
     return published_owner_state(raw_path, scope=current_settings_scope())
 
 
-def _access_from_state(entry: dict) -> dict:
+def _access_from_state(entry: dict) -> ArtifactAccessRequest:
     """Rebuild input access from a stored .published.json entry.
 
     Single source of truth: anton.publish_access.access_from_owner_side."""
     from anton.publish_access import access_from_owner_side
-    return access_from_owner_side(entry)
+
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+    return ArtifactAccessRequest.of_publisher(access_from_owner_side(entry))
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
@@ -279,6 +285,11 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         return f"publish_or_preview: unknown action '{action}'"
 
     # Resolve the access spec: explicit tool fields > preserve previous > public.
+    from pydantic import ValidationError
+
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.schemas.artifact_access import ArtifactAccessRequest, access_refusal
+
     access_mode = tc_input.get("access_mode")
     if access_mode == "password":
         pw = (tc_input.get("password") or "").strip()
@@ -288,7 +299,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 "from the publish panel (Access → Password) — do NOT ask for the "
                 "password in chat and never invent one."
             )
-        access = {"mode": "password", "password": pw}
+        access = ArtifactAccessRequest(mode=AccessMode.PASSWORD, password=pw)
     elif access_mode == "restricted":
         from anton.publish_access import parse_emails
         valid, invalid = parse_emails(tc_input.get("emails") or [])
@@ -299,18 +310,33 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 "INVALID: these are not valid email addresses: "
                 f"{', '.join(invalid)}. Fix them or omit them, then call the tool again."
             )
-        access = {"mode": "restricted",
-                  "emails": valid,
-                  "org_allowed": bool(tc_input.get("org_allowed")),
-                  "owner_only": bool(tc_input.get("owner_only"))}
+        access = ArtifactAccessRequest(
+            mode=AccessMode.RESTRICTED,
+            allowed_emails=valid,
+            org_allowed=bool(tc_input.get("org_allowed")),
+            owner_only=bool(tc_input.get("owner_only")),
+        )
     elif access_mode == "public":
-        access = {"mode": "public"}
+        access = ArtifactAccessRequest(mode=AccessMode.PUBLIC)
     else:
         # No access fields: preserve the artifact's previous access on re-publish.
-        # NOTE: _published_owner_state (not _published_state) — the latter drops
+        # NOTE: _published_owner_state (not _published_state): the latter drops
         # mode/access_password, which would silently reset to public.
         prev = _published_owner_state(abs_path)
-        access = _access_from_state(prev) if prev.get("report_id") else {"mode": "public"}
+        try:
+            access = (
+                _access_from_state(prev) if prev.get("report_id") else ArtifactAccessRequest(mode=AccessMode.PUBLIC)
+            )
+        except ValidationError as exc:
+            # The entry is a file the agent can write, so its access fields can
+            # hold any type; publishing without them would change who sees it.
+            reason = access_refusal(exc.errors(include_url=False))
+            logger.info("Cowork publish refused: the kept access can't be read")
+            return (
+                f"PUBLISH FAILED: The access saved with this artifact can't be read: {reason} "
+                "Tell the user to choose its access from the publish panel, and don't pick "
+                "one for them."
+            )
 
     # action == 'publish' — delegate to the service (single source of truth for
     # target resolution, fullstack bundling, vault secrets, access, history,

@@ -7,7 +7,7 @@ from pydantic import Field
 from cowork.schemas.base import CamelRequest, CamelResponse
 
 
-class HubWorkspaceRow(CamelResponse):
+class MindsHubWorkspaceRow(CamelResponse):
     """One row in the selector."""
 
     id: str
@@ -18,7 +18,7 @@ class HubWorkspaceRow(CamelResponse):
     role: str = ""
 
 
-class HubWorkspaceView(CamelResponse):
+class MindsHubWorkspaceView(CamelResponse):
     """Everything the selector needs from one request.
 
     One response rather than three so a menu open costs one round trip.
@@ -33,11 +33,11 @@ class HubWorkspaceView(CamelResponse):
 
     enabled: bool = False
     reachable: bool = False
-    workspaces: list[HubWorkspaceRow] = Field(default_factory=list)
+    workspaces: list[MindsHubWorkspaceRow] = Field(default_factory=list)
     active_workspace_id: Optional[str] = None
 
 
-class HubWorkspaceActivateRequest(CamelRequest):
+class MindsHubWorkspaceActivateRequest(CamelRequest):
     """Which workspace to switch to."""
 
     workspace_id: str

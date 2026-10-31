@@ -14,20 +14,40 @@ import tempfile
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
 from pydantic import SecretStr
 
 from cowork.code_sandbox import refuse_planted_links
+from cowork.common.logger import log_context
 from cowork.common.paths import cowork_home, pod_local_only
 # Imported for its side effect on the module namespace as well as its use:
 # tests monkeypatch `publish.get_app_settings`, so removing it because a
 # linter sees no local call breaks them. noqa keeps that from recurring.
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
+from cowork.models.artifact_owner_choice import AccessMode
+from cowork.schemas.artifact_access import (
+    PUBLISHER_EMAILS_FIELD,
+    ArtifactAccessRequest,
+    ArtifactAudienceView,
+    ArtifactPublishResult,
+)
+from cowork.services.artifact_audience import (
+    ENTRY_AUDIENCE_FIELDS,
+    ORG_AUDIENCE_FIELDS,
+    PUBLISHER_OWNER_ONLY_FIELD,
+    AudienceChanges,
+    ShareNotify,
+    for_publisher,
+    notify_within,
+    share_notice,
+    sync_team_audience,
+)
 from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.sharing_contract import AudienceField
 from cowork.services.providers import (
     is_mindshub_publish_url,
     normalize_publish_url,
@@ -36,7 +56,6 @@ from cowork.services.providers import (
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
-from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
 from cowork.services.artifacts import (
@@ -54,6 +73,7 @@ from cowork.services.artifacts import (
 # from the harness turn path where that is dead weight.
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+    from cowork.services.artifact_access import ArtifactRule
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +149,31 @@ class PublishRejected(RuntimeError):
     a shared-storage path, so org routes show this type's text and hide the
     other's.
     """
+
+
+class AccessModeChanged(PublishRejected):
+    """A re-publish in MindsHub mode that isn't a person's save (live
+    sync, autopublish) found a .published.json entry that isn't restricted
+    while MindsHub still holds a restricted rule for the artifact,
+    under its identity or under a key the entry recorded. Only a restricted
+    publish leaves a rule there, and a public or password one deletes it, so
+    the entry's mode changed after the owner's last save: the pod can write
+    that file, and metadata.json too. A re-publish of a page the entry names
+    no key for is refused the same way, since no rule can be read for it.
+    Refused before anything is uploaded, so the artifact never goes public
+    or password-protected over the rule (_access_mode_refusal).
+
+    Also a re-publish that would open the artifact wider than the sharing its
+    owner last chose, as recorded where the pod can't write
+    (cowork.services.artifact_owner_choice): a password artifact whose entry
+    the pod rewrote to public, or one the record says is unpublished.
+
+    No route shows its text. Live sync and autopublish log the refusal and
+    report a failed publish, and the owner's own save (``owner_save``)
+    never raises it; that save is what ends it."""
+
+    def __init__(self) -> None:
+        super().__init__("The artifact's sharing changed outside the Share dialog")
 
 
 class UploadError(NamedTuple):
@@ -574,162 +619,253 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
-# A restricted rule's org audience beyond emails and the org flag (ENG-3787):
-# teams, and people in the org by Keycloak user id, under auth's ArtifactAccess
-# names, which the app sends and the stored entry keeps. Auth holds both;
-# anton's publisher knows neither, so this server writes them to auth itself.
-_ORG_AUDIENCE_KEYS = ("allowed_team_ids", "allowed_user_ids")
-
-# The app's names for a restricted rule's audience (ENG-3787), auth's
-# ArtifactAccess ones: org_allowed, allowed_team_ids, allowed_user_ids and
-# allowed_emails. anton's publisher reads emails by its own older name.
-_APP_EMAILS_KEY = "allowed_emails"
-# Names the app no longer sends: refused rather than silently dropped, so a
-# mismatched client can't shrink an audience without noticing.
-_RETIRED_ACCESS_KEYS = {
-    "emails": "allowed_emails",
-    "team_ids": "allowed_team_ids",
-    "org_wide": "org_allowed",
-}
-
-# The app's "Notify people" choice, sent inside the access object (ENG-3787):
-# ``notify: {user_ids: [...], emails: [...]}``, the individuals the person just
-# added and chose to tell. Never part of the access anton's publisher or the
-# stored entry sees: the caller acting on a person's save lifts it out and
-# passes it to publish_artifact on its own, so a re-publish from the stored
-# access (live sync, autopublish, a retry) can never carry it.
-_NOTIFY_KEY = "notify"
-
-# auth's bounds on what the share email names and links.
-_MAX_NOTIFY_TITLE_CHARS = 200
-_MAX_NOTIFY_URL_CHARS = 2048
-# The viewer hosts auth's share email links to (dev and PR envs share dev's);
-# the publish lambda's view_url is on one of them.
-_NOTIFY_URL_HOSTS = frozenset({"view.dev.mindshub.ai", "view.staging.mindshub.ai", "view.mindshub.ai"})
+def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
+    """The access a re-publish that isn't a person's save keeps (live sync,
+    autopublish, an update): the entry's mode and password. In MindsHub mode
+    a restricted entry doesn't say who the rule shares with, so this names
+    nobody and publish_artifact takes all of it from MindsHub's rule
+    (_plan_access); ``owner_only`` keeps a rule that names nobody restricted
+    to its owner, never public. The pod can write the entry, so in MindsHub
+    mode publish_artifact checks the mode this builds before anything
+    uploads: one that isn't restricted while MindsHub still holds a rule, or
+    one wider than the sharing the owner last chose
+    (cowork.services.artifact_owner_choice), is refused (AccessModeChanged).
+    Elsewhere the entry is the record (anton's access_from_owner_side)."""
+    publisher_access = access_from_owner_side(entry)
+    if org_mode and publisher_access.get("mode") == AccessMode.RESTRICTED:
+        # The entry's audience fields aren't the record here, so they are
+        # neither kept nor read.
+        return ArtifactAccessRequest(mode=AccessMode.RESTRICTED, owner_only=True)
+    return ArtifactAccessRequest.of_publisher(publisher_access)
 
 
-class ShareNotify(NamedTuple):
-    """Who a person's save asks auth to email: people in the org by Keycloak
-    id, and anyone else by address."""
+class AccessPlan(NamedTuple):
+    """One publish's access (_plan_access)."""
 
-    user_ids: tuple[str, ...] = ()
-    emails: tuple[str, ...] = ()
-
-    def __bool__(self) -> bool:
-        return bool(self.user_ids or self.emails)
-
-
-def _notify_list(raw: Any, field: str) -> list[str]:
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ValueError(f"notify.{field} must be a list.")
-    return [str(v).strip() for v in raw if isinstance(v, str) and v.strip()]
-
-
-def pop_notify(access: dict | None) -> tuple[dict | None, ShareNotify]:
-    """``(access without its notify field, who to notify)``. Raises
-    ValueError for a ``notify`` that isn't ``{user_ids?: [], emails?: []}``."""
-    if not isinstance(access, dict) or _NOTIFY_KEY not in access:
-        return access, ShareNotify()
-    out = {k: v for k, v in access.items() if k != _NOTIFY_KEY}
-    raw = access.get(_NOTIFY_KEY)
-    if raw is None:
-        return out, ShareNotify()
-    if not isinstance(raw, dict):
-        raise ValueError("notify must be an object with user_ids and emails.")
-    user_ids = dict.fromkeys(v.lower() for v in _notify_list(raw.get("user_ids"), "user_ids"))
-    emails = _normalize_emails(_notify_list(raw.get("emails"), "emails"))
-    return out, ShareNotify(user_ids=tuple(user_ids), emails=tuple(dict.fromkeys(emails)))
-
-
-def access_from_app(access: dict) -> dict:
-    """The app's access object (ENG-3787) as this module and anton's publisher
-    read it: ``allowed_emails`` (people outside the org, by address) becomes
-    anton's ``emails``; ``org_allowed``, ``allowed_team_ids`` and
-    ``allowed_user_ids`` pass through as they are. ValueError naming the
-    field to use for a retired name (``emails``, ``team_ids``, ``org_wide``)."""
-    for retired, name in _RETIRED_ACCESS_KEYS.items():
-        if retired in access:
-            raise ValueError(f"{retired} is not an access field; send {name}.")
-    out = dict(access)
-    if _APP_EMAILS_KEY in out:
-        out["emails"] = out.pop(_APP_EMAILS_KEY)
-    return out
-
-
-def _notify_within(notify: ShareNotify, owner_side: dict) -> ShareNotify:
-    """Only people the saved rule actually names, by id or by address: a
-    notify list never reaches anyone the share doesn't."""
-    ids = {str(v).lower() for v in owner_side.get("allowed_user_ids") or []}
-    emails = {str(v).lower() for v in owner_side.get("emails") or []}
-    return ShareNotify(
-        user_ids=tuple(v for v in notify.user_ids if v in ids),
-        emails=tuple(v for v in notify.emails if v.lower() in emails),
-    )
-
-
-def _org_audience(access: dict | None, previous: Any) -> dict[str, list[str]]:
-    """The teams and people a restricted publish shares with: each the
-    request's when it names it, else the previous publish's, so an access
-    change that leaves them out keeps them."""
-    prev = previous if isinstance(previous, dict) and previous.get("mode") == "restricted" else {}
-    source = {}
-    for key in _ORG_AUDIENCE_KEYS:
-        values = access.get(key) if isinstance(access, dict) and key in access else prev.get(key)
-        source[key] = [str(v) for v in values or []]
-    return source
-
-
-def _with_team_audience(access: dict | None, audience: dict[str, list[str]]) -> dict | None:
-    """``access`` as anton's publisher reads it, which knows no teams and no
-    people by id. A selection of teams or people alone is owner-only there,
-    so the lambda writes a restricted rule that sync_artifact_team_access
-    then widens; teams or people named where they can't apply (outside org
-    mode, ``audience`` is empty) stay owner-only too, never the public rule
-    anton falls back to for an empty selection.
-    """
-    if not isinstance(access, dict) or access.get("mode") != "restricted":
-        return access
-    out = {k: v for k, v in access.items() if k not in _ORG_AUDIENCE_KEYS}
-    named = any(access.get(key) for key in _ORG_AUDIENCE_KEYS)
-    if (any(audience.values()) or named) and not out.get("emails") and not out.get("org_allowed"):
-        out["owner_only"] = True
-    return out
+    # What anton's publisher is given, as anton's resolve_access answers it,
+    # and the versions it sends.
+    effective_access: dict[str, Any]
+    pwd_version: int
+    access_version: int
+    # What the entry stores: the mode, the password and the versions, and
+    # outside MindsHub mode who a restricted rule shares with.
+    owner_side: dict
+    # Who the restricted rule shares with after this publish, as far as this
+    # server knows; None for a publish that isn't restricted.
+    audience: ArtifactRule | None
+    # The team and people lists this publish changes, for
+    # sync_team_audience to write.
+    changes: AudienceChanges
 
 
 def _plan_access(
-    password: str | None, access: dict | None, previous: Any, *, org_mode: bool
-) -> tuple[dict, int, int, dict, bool]:
-    """anton's resolve_access, with the org audience (ENG-3787) around it:
-    ``(effective_access, pwd_version, access_version, owner_side,
-    team_audience)``. ``team_audience`` is whether the restricted rule's
-    teams and people must be written to auth after the publish
-    (_sync_team_audience): it has some, or just lost them. Teams or people
-    alone are restricted to them, never public (_with_team_audience)."""
-    if isinstance(access, dict):
-        # Only the person's own save carries notify, and its caller lifted it
-        # out already; anything else just loses the field.
-        access = {k: v for k, v in access.items() if k != _NOTIFY_KEY}
-    audience = (
-        _org_audience(access, previous) if org_mode else {k: [] for k in _ORG_AUDIENCE_KEYS}
-    )
-    prev_restricted = isinstance(previous, dict) and previous.get("mode") == "restricted"
-    prev_audience = _org_audience(None, previous)
+    password: str | None,
+    access: ArtifactAccessRequest | None,
+    previous: Any,
+    *,
+    stored: ArtifactRule | None,
+) -> AccessPlan:
+    """anton's resolve_access, with the org audience around it. ``access``
+    reaches anton in its publisher's shape here, once (for_publisher).
+
+    In MindsHub mode ``stored`` is the artifact's rule as MindsHub stores it,
+    read for every restricted publish (publish_artifact): the one record of
+    who the artifact is shared with. A restricted publish takes each of the
+    emails, the org flag, the teams and the people from ``access`` when it
+    names it, else from ``stored``. So a re-publish that isn't a person's save
+    (kept_access) sends what the rule holds and writes no team or person, and
+    a team MindsHub dropped from the rule when it was deleted is never sent
+    back. Only a team or people list that differs from the stored one is
+    written (``changes``), and that bumps the version, as a changed email
+    list does. The version is judged against what the rule holds, never
+    against the entry, which keeps the mode, the password and the versions
+    only.
+
+    Outside MindsHub mode, and for a publish that isn't restricted,
+    ``stored`` is None: the entry is the record anton's publisher keeps, and
+    teams and people don't apply. Teams or people alone are restricted to
+    them, never public (for_publisher).
+    """
+    from cowork.services.artifact_access import ArtifactRule
+
+    prev_restricted = isinstance(previous, dict) and previous.get("mode") == AccessMode.RESTRICTED
+    if stored is not None and access is not None and access.restricted:
+        # Each audience field the access leaves out (None) is the rule's.
+        access = access.model_copy(update={
+            field.value: getattr(stored, field) for field in AudienceField if getattr(access, field) is None
+        })
+        if prev_restricted:
+            previous = {
+                **previous,
+                PUBLISHER_EMAILS_FIELD: stored.allowed_emails,
+                AudienceField.ORG_ALLOWED: stored.org_allowed,
+                PUBLISHER_OWNER_ONLY_FIELD: not stored.allowed_emails and not stored.org_allowed,
+            }
     effective_access, pwd_version, access_version, owner_side = _resolve_access(
-        password, _with_team_audience(access, audience), previous
+        password, for_publisher(access), previous
     )
-    team_audience = owner_side.get("mode") == "restricted" and (
-        any(audience.values()) or any(prev_audience.values())
+    if owner_side.get("mode") != AccessMode.RESTRICTED:
+        return AccessPlan(
+            effective_access, pwd_version, access_version, owner_side, None, AudienceChanges()
+        )
+    if stored is None or access is None:
+        audience = ArtifactRule(
+            org_allowed=bool(owner_side.get(AudienceField.ORG_ALLOWED)),
+            allowed_emails=list(owner_side.get(PUBLISHER_EMAILS_FIELD) or []),
+            allowed_team_ids=[],
+            allowed_user_ids=[],
+        )
+        return AccessPlan(
+            effective_access, pwd_version, access_version, owner_side, audience, AudienceChanges()
+        )
+    named = {field.value: [str(v) for v in getattr(access, field) or []] for field in ORG_AUDIENCE_FIELDS}
+    changes = AudienceChanges(**{
+        field: values for field, values in named.items() if set(values) != set(getattr(stored, field))
+    })
+    if changes and prev_restricted:
+        # A changed audience invalidates the viewer grants already issued, as
+        # a changed email list does.
+        access_version = max(access_version, (previous.get("access_version", 0) or 0) + 1)
+    audience = ArtifactRule(
+        org_allowed=bool(owner_side.get(AudienceField.ORG_ALLOWED)),
+        allowed_emails=list(owner_side.get(PUBLISHER_EMAILS_FIELD) or []),
+        **named,
     )
-    if team_audience:
-        if audience != prev_audience and prev_restricted:
-            # A changed audience invalidates the viewer grants already
-            # issued, as a changed email list does.
-            prev_version = previous.get("access_version", 0) or 0
-            access_version = max(access_version, prev_version + 1)
-        owner_side.update(**audience, access_version=access_version)
-    return effective_access, pwd_version, access_version, owner_side, team_audience
+    owner_side = {
+        **{k: v for k, v in owner_side.items() if k not in ENTRY_AUDIENCE_FIELDS},
+        "access_version": access_version,
+    }
+    return AccessPlan(effective_access, pwd_version, access_version, owner_side, audience, changes)
+
+
+def _rule_key(canonical_key: str | None, entry: Any) -> str:
+    """The key an artifact's rule is stored under: its identity, else, for a
+    legacy loose file with none, the key the upload service gave the publish
+    ``entry`` records. The one source of that key, for the read before a
+    publish and for every write after it."""
+    if canonical_key:
+        return canonical_key
+    return str(entry.get("artifact_key") or "") if isinstance(entry, dict) else ""
+
+
+def _prior_rule_keys(canonical_key: str | None, entry: Any) -> list[str]:
+    """Every key a rule the last publish left could sit under: _rule_key's
+    pick, then each key ``entry`` recorded for that publish (``artifact_key``
+    and the lambda's ``lambda_artifact_key``) when it differs. The pod can
+    write metadata.json, which moves _rule_key's pick, but not the rule the
+    MindsHub already holds. Empty when none is known."""
+    recorded = (
+        [str(entry.get(field) or "") for field in ("artifact_key", "lambda_artifact_key")]
+        if isinstance(entry, dict)
+        else []
+    )
+    return [key for key in dict.fromkeys([_rule_key(canonical_key, entry), *recorded]) if key]
+
+
+def _access_mode_refusal(
+    canonical_key: str | None, entry: Any, *, reuses_report: bool, scope: TenantScope
+) -> Literal["rule_held", "no_rule_key"] | None:
+    """Why a re-publish in MindsHub mode that isn't a person's save and
+    isn't restricted must not go ahead (AccessModeChanged), or None. The
+    MindsHub holds a rule under one of the keys the last publish could
+    have left it under (_prior_rule_keys): ``rule_held``. Or the publish
+    reuses a page the entry names no key for, so no rule can be read:
+    ``no_rule_key``. A failed read raises."""
+    keys = _prior_rule_keys(canonical_key, entry)
+    if not keys:
+        return "no_rule_key" if reuses_report else None
+    if _held_rule(keys, scope) is not None:
+        return "rule_held"
+    return None
+
+
+def _held_rule(keys: list[str], scope: TenantScope) -> ArtifactRule | None:
+    """The first rule MindsHub holds under ``keys``, in order, or
+    None when it holds none. A failed read raises."""
+    for key in keys:
+        rule = _read_rule(key, scope)
+        if rule is not None:
+            return rule
+    return None
+
+
+def _authorization_key(
+    published_dir: Path, artifacts_base: Path, project_id: str | None, scope: TenantScope | None
+) -> str | None:
+    """One identity spans private drafts, published versions, and comments:
+    the artifact's, from its metadata. A legacy loose file has no metadata
+    and keeps the service-generated key (None)."""
+    if not (published_dir / "metadata.json").is_file():
+        return None
+    from cowork.services.artifact_identity import artifact_key, ensure_full_id
+
+    artifact_id, _metadata = ensure_full_id(published_dir)
+    if scope is not None and scope.org_mode:
+        from cowork.services.artifact_authorization_identity import publish_authorization_key
+
+        return publish_authorization_key(
+            artifact_id, artifacts_base, published_dir.name, project_id, scope
+        )
+    return artifact_key(artifact_id)
+
+
+def _read_rule(rule_key: str, scope: TenantScope) -> ArtifactRule | None:
+    """The artifact's rule as MindsHub stores it under ``rule_key``
+    (read_artifact_access), or None when it holds none, as for an artifact
+    with no key yet. A failed read raises, so a publish never guesses who it
+    shares with."""
+    from cowork.services.artifact_access import read_artifact_access
+
+    if not rule_key:
+        return None
+    return read_artifact_access(
+        artifact_id=rule_key, scope=scope, owner_user_id=str(scope.user_id or "")
+    )
+
+
+def _stored_rule(rule_key: str, scope: TenantScope) -> ArtifactRule:
+    """Who the artifact is shared with (_read_rule): nobody but the owner
+    when MindsHub holds no rule for it."""
+    from cowork.services.artifact_access import ArtifactRule
+
+    rule = _read_rule(rule_key, scope)
+    return ArtifactRule.nobody() if rule is None else rule
+
+
+def stored_artifact_rule(
+    artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
+) -> ArtifactRule:
+    """Who ``artifact`` is shared with, as MindsHub's rule stores it, read
+    under the key publish_artifact publishes it with. What
+    the access route checks a save against and shows; .published.json never
+    says it in MindsHub mode."""
+    _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
+    previous = _load_published_map(published_dir).get(published_key)
+    canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+    return _stored_rule(_rule_key(canonical_key, previous), scope)
+
+
+def rule_held_over_entry(
+    artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
+) -> ArtifactRule | None:
+    """The rule MindsHub holds for ``artifact`` under a key its live
+    .published.json entry's last publish could have left it under
+    (_prior_rule_keys, the keys _access_mode_refusal reads before a
+    re-publish), or None: for no live entry, or no rule. The access route
+    reads it for an entry that isn't restricted. Only a restricted publish
+    leaves a rule in MindsHub mode, so a rule held there means the pod
+    rewrote the entry's mode after the owner's last save, and the rule, not
+    the entry, says who the artifact is shared with. A failed read raises."""
+    _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
+    entry = _load_published_map(published_dir).get(published_key)
+    if not isinstance(entry, dict) or not entry.get("published", True):
+        return None
+    canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+    return _held_rule(_prior_rule_keys(canonical_key, entry), scope)
 
 
 def publish_artifact(
@@ -739,10 +875,12 @@ def publish_artifact(
     api_key: str,
     publish_url: str,
     password: str | None = None,
-    access: dict | None = None,
+    access: ArtifactAccessRequest | None = None,
     scope: TenantScope | None = None,
     project_id: str | None = None,
     notify: ShareNotify | None = None,
+    stored: ArtifactRule | None = None,
+    owner_save: bool = False,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -767,13 +905,42 @@ def publish_artifact(
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
 
-    `notify` (ENG-3787) is set only for a person's own save of the Share
-    dialog with "Notify people" chosen: the individuals it added, by id and by
-    address. Auth emails them (those the saved rule names); the write that
-    carries the list is this server's post-publish write of the rule, made for
-    a restricted org-mode share even without teams or people by id, so people
-    added by address alone are emailed too. Every other publish (live sync,
-    autopublish, a retry) leaves it None.
+    `access` is who the publish opens the artifact for, under MindsHub's
+    names (ArtifactAccessRequest): a person's save of the Share dialog as
+    they chose it, what the desktop publish route or the agent's publish
+    tool was asked for, or what kept_access rebuilds from the entry for a
+    live sync, an autopublish or an update. It becomes anton's publisher's
+    shape once, at the call into anton's resolve_access (_plan_access).
+
+    `notify` is set only for a person's own save of the Share dialog with
+    "Notify people" chosen: the individuals it added, by id and by address.
+    MindsHub emails them (those the saved rule names); the write that carries
+    the list is this server's post-publish write of the rule
+    (sync_team_audience), made for a restricted MindsHub-mode share even
+    without teams or people by id, so people added by address alone are
+    emailed too. Every other publish (live sync, autopublish, a retry) leaves
+    it None.
+
+    `stored` is the artifact's rule the access route already read under the
+    publish lock to check this save, so the save reads the rule once and is
+    planned against the rule it was checked against. Every other caller
+    leaves it None, and a restricted publish in MindsHub mode reads the rule
+    itself.
+
+    `owner_save` is True only for a person's own save of the Share dialog
+    (PUT /access), whose access is what they chose. Any other publish in
+    MindsHub mode (live sync, autopublish) takes its mode from the
+    .published.json entry, which the pod can write. One that isn't
+    restricted reads the rule first, under the artifact's identity and under
+    each key the entry recorded. While MindsHub still holds one, the entry's
+    mode changed after the owner's last save, and a re-publish of a page the
+    entry names no key for can't be checked: either is refused
+    (AccessModeChanged) and logged before anything is uploaded.
+
+    In MindsHub mode the owner's save also records the mode it publishes in
+    (cowork.services.artifact_owner_choice), where the pod can't write, and
+    every other publish is checked against that record before anything
+    uploads: one wider than the owner's choice is refused the same way.
     """
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
@@ -797,6 +964,12 @@ def publish_artifact(
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
+    from cowork.services.artifact_owner_choice import (
+        OwnerChoice,
+        narrow_before_save,
+        record_owner_choice,
+        republish_widening,
+    )
     from cowork.services.published_page_ownership import publication_owner
 
     with publication_owner(
@@ -818,28 +991,78 @@ def publish_artifact(
             if report_id is None:
                 previous = None
 
+        canonical_artifact_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+        org_scope = scope if scope is not None and scope.org_mode else None
+        restricted = access is not None and access.restricted
+        refusal = (
+            _access_mode_refusal(
+                canonical_artifact_key, previous, reuses_report=report_id is not None, scope=org_scope
+            )
+            if org_scope is not None and not owner_save and not restricted
+            else None
+        )
+        if refusal is not None:
+            logger.warning(
+                "Refused a re-publish whose .published.json entry isn't restricted: "
+                "MindsHub still holds a restricted rule for the artifact, "
+                "or the entry names no key to read one under",
+                extra={
+                    "event": "artifact_access_mode_changed",
+                    "reason": refusal,
+                    **log_context(project_id=project_id, artifact_slug=published_dir.name),
+                },
+            )
+            raise AccessModeChanged()
+
         # Resolve the effective access (mode + version) from the request and the
         # prior publish. Versions bump only when the password / restricted list
-        # changed so previously issued viewer grants invalidate.
-        effective_access, pwd_version, access_version, owner_side, team_audience = _plan_access(
-            password, access, previous, org_mode=scope is not None and scope.org_mode
+        # changed so previously issued viewer grants invalidate. In MindsHub
+        # mode who a restricted publish shares with starts from the artifact's
+        # rule as MindsHub stores it: the one the caller read for this
+        # save, else read here. A failed read fails the publish.
+        if org_scope is None or not restricted:
+            stored = None
+        elif stored is None:
+            stored = _stored_rule(_rule_key(canonical_artifact_key, previous), org_scope)
+        plan = _plan_access(password, access, previous, stored=stored)
+        owner_side = plan.owner_side
+        # Who the rule shares with: the plan's, then MindsHub's answer
+        # to this publish's write, if it makes one.
+        audience = plan.audience
+        # The sharing the owner chose, recorded where the pod can't write
+        # (cowork.services.artifact_owner_choice). Any other re-publish is
+        # judged by the mode it resolved to, against the narrowest choice
+        # recorded under a key its rule could sit under, and refused before
+        # anything is uploaded when it would open the artifact wider. The
+        # owner's own save narrows the record before the upload and records
+        # its choice once the upload is live.
+        chosen = (
+            OwnerChoice(
+                access_mode=AccessMode(owner_side.get("mode", AccessMode.PUBLIC)), published=True
+            )
+            if org_scope is not None
+            else None
         )
-
-        # One identity spans private drafts, published versions, and comments. A
-        # legacy loose file has no metadata and keeps the service-generated key.
-        canonical_artifact_key: str | None = None
-        if (published_dir / "metadata.json").is_file():
-            from cowork.services.artifact_identity import artifact_key, ensure_full_id
-
-            artifact_id, _metadata = ensure_full_id(published_dir)
-            if scope is not None and scope.org_mode:
-                from cowork.services.artifact_authorization_identity import publish_authorization_key
-
-                canonical_artifact_key = publish_authorization_key(
-                    artifact_id, artifacts_base, published_dir.name, project_id, scope
+        if chosen is not None and not owner_save:
+            widened = republish_widening(
+                keys=_prior_rule_keys(canonical_artifact_key, previous),
+                mode=chosen.access_mode,
+                scope=org_scope,
+            )
+            if widened is not None:
+                logger.warning(
+                    "Refused a re-publish that would open the artifact wider than its owner chose",
+                    extra={
+                        "event": "artifact_access_mode_changed",
+                        "reason": widened.value,
+                        **log_context(project_id=project_id, artifact_slug=published_dir.name),
+                    },
                 )
-            else:
-                canonical_artifact_key = artifact_key(artifact_id)
+                raise AccessModeChanged()
+        if chosen is not None and owner_save:
+            narrow_before_save(
+                key=_rule_key(canonical_artifact_key, previous), chosen=chosen, scope=org_scope
+            )
 
         # Markdown is rendered to a throwaway index.html that we hand to the
         # publisher; `.html` and fullstack publish their real target directly.
@@ -859,9 +1082,9 @@ def publish_artifact(
                 report_id=report_id,
                 publish_url=publish_url,
                 ssl_verify=ssl_verify,
-                access=effective_access,
-                access_version=access_version,
-                pwd_version=pwd_version,
+                access=plan.effective_access,
+                access_version=plan.access_version,
+                pwd_version=plan.pwd_version,
                 artifact_key=canonical_artifact_key,
                 # Resolve datasource secrets from cowork's own vault
                 # (`~/.cowork/data-vault`), not anton's default
@@ -932,9 +1155,11 @@ def publish_artifact(
                 "reportId": returned_report_id,
                 "publishedAt": _utc_now_iso(),
             }
-            # Owner-side only — .published.json never enters the bundle. `owner_side`
+            # Owner-side only: .published.json never enters the bundle. `owner_side`
             # carries `mode` (+ `access_password`/`pwd_version` for password, or
-            # `emails`/`org_allowed`/`access_version` for restricted), and always
+            # `emails`/`org_allowed`/`access_version` for restricted; in
+            # MindsHub mode `access_version` alone, since who a restricted rule shares
+            # with is MindsHub's rule's to say), and always
             # `requires_password` for back-compat with older readers. Password mode
             # also keeps the `password_hash` anton sent, handed back as
             # `previous_access` on the next publish.
@@ -959,48 +1184,45 @@ def publish_artifact(
             }
             if password_hash:
                 entry["password_hash"] = password_hash
-            if team_audience:
-                # The new teams and people are stored only once auth holds
-                # them (_sync_team_audience below). Until then the entry keeps
-                # the previous publish's, which is what auth still has: the
-                # lambda's write leaves a rule's teams and people as they were.
-                # A failed write then leaves an entry that says so, and a retry
-                # sees a changed audience and bumps the version again.
-                entry.update(_org_audience(None, previous))
             published_map[published_key] = entry
             _write_published_map(published_json, published_map)
+            if chosen is not None and owner_save:
+                record_owner_choice(
+                    key=_rule_key(canonical_artifact_key, entry), choice=chosen, scope=org_scope
+                )
             recipients = (
-                _notify_within(notify, owner_side)
-                if notify
-                and scope is not None
-                and scope.org_mode
-                and owner_side.get("mode") == "restricted"
+                notify_within(notify, audience)
+                if notify and org_scope is not None and audience is not None
                 else ShareNotify()
             )
             notice = (
-                {**_share_notice(published_dir, published_key, view_url), "recipients": recipients}
+                share_notice(published_dir, published_key, view_url, recipients=recipients)
                 if recipients
                 else None
             )
-            if team_audience:
-                _sync_team_audience(
-                    artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
-                    notify=notice,
+            if plan.changes:
+                # Only a restricted publish in MindsHub mode plans changes.
+                assert org_scope is not None and audience is not None
+                echoed = sync_team_audience(
+                    artifact_id=_rule_key(canonical_artifact_key, entry), scope=org_scope,
+                    access_version=plan.access_version, changes=plan.changes, notice=notice,
                 )
-                entry.update({key: owner_side[key] for key in _ORG_AUDIENCE_KEYS})
-                _write_published_map(published_json, published_map)
+                audience = audience.model_copy(update=echoed.model_dump())
             elif notice is not None:
-                # No teams or people by id, so the lambda's write was the whole
-                # rule; this one only asks auth to email the people the save
-                # added. Best effort: the share itself already stands.
+                # No teams or people changed, so the lambda's write was the
+                # whole change; this one only asks MindsHub to email the
+                # people the save added. Best effort: the share itself
+                # already stands.
+                assert org_scope is not None and audience is not None
                 try:
-                    _sync_team_audience(
-                        artifact_id=entry["artifact_key"], scope=scope, owner_side=owner_side,
-                        notify=notice,
+                    echoed = sync_team_audience(
+                        artifact_id=_rule_key(canonical_artifact_key, entry), scope=org_scope,
+                        access_version=plan.access_version, changes=AudienceChanges(), notice=notice,
                     )
+                    audience = audience.model_copy(update=echoed.model_dump())
                 except Exception:
                     logger.warning(
-                        "Could not ask auth to notify the people an artifact was shared with",
+                        "Could not ask MindsHub to notify the people an artifact was shared with",
                         exc_info=True,
                     )
             state = _load_state(scope=scope)
@@ -1014,79 +1236,14 @@ def publish_artifact(
         else:
             # The card's key: desktop routing finds the cloud scope in the record.
             response_key = canonical_artifact_key or echoed_key
-        return {
-            "status": "ok",
-            "url": view_url,
-            "accessMode": owner_side.get("mode", "public"),
-            "accessProtected": bool(owner_side.get("requires_password")),
-            "accessEmails": owner_side.get("emails", []),
-            "orgAllowed": bool(owner_side.get("org_allowed")),
-            # Nobody else picked: not teams or people alone, which anton's
-            # publisher is told as owner-only (_with_team_audience).
-            "ownerOnly": bool(owner_side.get("owner_only"))
-            and not (owner_side.get("allowed_team_ids") or owner_side.get("allowed_user_ids")),
-            "allowedTeamIds": list(owner_side.get("allowed_team_ids") or []),
-            "allowedUserIds": list(owner_side.get("allowed_user_ids") or []),
-            # The renderer addresses comment requests by this key.
-            "artifactKey": response_key,
-            "result": {k: v for k, v in result.items() if k != "file_payload"},
-        }
-
-
-def _share_notice(published_dir: Path, published_key: str, view_url: str) -> dict[str, str]:
-    """What auth's share email names and links: the artifact's title (its
-    metadata name, else its folder or file name) and the published URL the
-    recipient opens, within auth's bounds. A URL that isn't an https link on
-    one of the viewer hosts auth links to is left out."""
-    title = ""
-    try:
-        meta = json.loads((published_dir / "metadata.json").read_text(encoding="utf-8"))
-        if isinstance(meta, dict):
-            title = str(meta.get("title") or meta.get("name") or "")
-    except (OSError, ValueError):
-        pass
-    title = " ".join((title or published_dir.name or published_key or "").split())
-    url = view_url if isinstance(view_url, str) else ""
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        parsed = None
-    if parsed is None or parsed.scheme != "https" or parsed.hostname not in _NOTIFY_URL_HOSTS:
-        url = ""
-    return {
-        "artifact_title": title[:_MAX_NOTIFY_TITLE_CHARS],
-        "artifact_url": url if len(url) <= _MAX_NOTIFY_URL_CHARS else "",
-    }
-
-
-def _sync_team_audience(
-    *, artifact_id: str, scope: TenantScope, owner_side: dict, notify: dict[str, Any] | None = None
-) -> None:
-    """Write the restricted rule's teams, people by id and org-wide flag to
-    auth, after the lambda wrote the rest of it (sync_artifact_team_access).
-    ``notify`` (a person's save with "Notify people" chosen) carries the
-    ``recipients`` (ShareNotify) and the title and URL the share email uses;
-    None never notifies."""
-    from cowork.services.artifact_access import ArtifactAccessUnavailable, sync_artifact_team_access
-    from cowork.services.artifact_autopublish import _active_workspace_id
-
-    if not artifact_id:
-        raise ArtifactAccessUnavailable("The artifact has no identity to share with teams")
-    sync_artifact_team_access(
-        artifact_id=artifact_id,
-        scope=scope,
-        owner_user_id=str(scope.user_id or ""),
-        workspace_id=_active_workspace_id(scope),
-        allowed_emails=list(owner_side.get("emails") or []),
-        org_allowed=bool(owner_side.get("org_allowed")),
-        allowed_team_ids=list(owner_side.get("allowed_team_ids") or []),
-        allowed_user_ids=list(owner_side.get("allowed_user_ids") or []),
-        access_version=int(owner_side.get("access_version") or 1),
-        notify_user_ids=list(notify["recipients"].user_ids) if notify else [],
-        notify_emails=list(notify["recipients"].emails) if notify else [],
-        artifact_title=(notify or {}).get("artifact_title", ""),
-        artifact_url=(notify or {}).get("artifact_url", ""),
-    )
+        return ArtifactPublishResult(
+            url=view_url,
+            access_mode=AccessMode(owner_side.get("mode", AccessMode.PUBLIC)),
+            access_protected=bool(owner_side.get("requires_password")),
+            artifact_key=response_key or "",
+            result={k: v for k, v in result.items() if k != "file_payload"},
+            **ArtifactAudienceView.of(audience).model_dump(),
+        ).model_dump(by_alias=True, mode="json")
 
 
 def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
@@ -1229,8 +1386,11 @@ def unpublish_artifact(
         return {"status": "ok"}
 
 
-def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
-    """Return the stored access for a live artifact, or raise when it is not live.
+def published_artifact_access(
+    artifact: Path, *, artifacts_base: Path, org_mode: bool
+) -> ArtifactAccessRequest:
+    """Return the access a re-publish of a live artifact keeps (kept_access),
+    or raise when it is not live.
 
     Credential resolution deliberately lives outside this helper. Callers can
     therefore distinguish an unpublished draft from a publish failure before
@@ -1250,12 +1410,7 @@ def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
     entry = published_map.get(published_key)
     if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
         raise FileNotFoundError("No published version to update")
-    access = access_from_owner_side(entry)
-    if access.get("mode") == "restricted":
-        for key in _ORG_AUDIENCE_KEYS:
-            if entry.get(key):
-                access[key] = list(entry[key])
-    return access
+    return kept_access(entry, org_mode=org_mode)
 
 
 def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
@@ -1271,7 +1426,9 @@ def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
     # report that, not "configure your API key".
     found = desktop_artifact_and_base(raw_path, scope=scope)
     artifact, artifacts_base = found.artifact, found.artifacts_base
-    access = published_artifact_access(artifact, artifacts_base=artifacts_base)
+    access = published_artifact_access(
+        artifact, artifacts_base=artifacts_base, org_mode=scope is not None and scope.org_mode
+    )
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
     api_key, publish_url = desktop_publish_credential()

@@ -226,7 +226,7 @@ def test_shared_resource_authorization_and_contract_through_http(client):
     skill = skill_created.json()
     assert skill["attribution"]["createdBy"]["userId"] == USER_A
     assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable", "canShare"}
-    # Hosted org sharing (ENG-3787): the owner chooses who a new skill reaches,
+    # Sharing in MindsHub mode: the owner chooses who a new skill reaches,
     # and it starts as theirs alone.
     assert skill["capabilities"]["canShare"] is True
     assert (skill["section"], skill["access"]["orgAllowed"]) == ("mine", False)

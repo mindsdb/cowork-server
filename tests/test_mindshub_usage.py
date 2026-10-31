@@ -1,7 +1,7 @@
 """The usage read: free monthly tokens, wallet balance, auto top up.
 
-Outbound HTTP is stubbed at the shared `get_auth_json`, same as the workspace tests,
-so each case seeds the auth bodies and asserts the one view the desktop gets.
+Outbound HTTP is stubbed at the shared `get_mindshub_json`, same as the workspace tests,
+so each case seeds MindsHub's bodies and asserts the one view the desktop gets.
 """
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from cowork.api.v1.endpoints import hub_usage as ep
+from cowork.api.v1.endpoints import mindshub_usage as ep
 from cowork.api.v1.router import api_router
 from cowork.db.scoped import TenantScope
 from cowork.principal import HEADER_HUB_CREDENTIAL, Principal, get_principal
-from cowork.services import hub_usage as svc
+from cowork.services import mindshub_usage as svc
 
 PATH = "/api/v1/hub/usage/"
 PRINCIPAL = Principal(user_id="user-a", org_id="org-a")
@@ -93,7 +93,7 @@ def calls(monkeypatch):
         asked.append(path)
         return answers.get(path)
 
-    monkeypatch.setattr(svc, "get_auth_json", _fake)
+    monkeypatch.setattr(svc, "get_mindshub_json", _fake)
     return type("Calls", (), {"asked": asked, "answers": answers})()
 
 
@@ -102,7 +102,7 @@ def _scope() -> TenantScope:
 
 
 def _fetch(bearer: str = "jwt-abc", user_id: str = "user-a", org_id: str = "org-a"):
-    return asyncio.run(svc.fetch_hub_usage(bearer_token=bearer, org_id=org_id, user_id=user_id))
+    return asyncio.run(svc.fetch_mindshub_usage(bearer_token=bearer, org_id=org_id, user_id=user_id))
 
 
 def test_no_bearer_is_unreachable_and_asks_nothing(calls):
@@ -375,15 +375,23 @@ def test_a_desktop_account_switch_does_not_reuse_the_previous_usage(calls):
     assert calls.asked.count(svc.ENTITLEMENTS_PATH) == 2
 
 
-def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(calls):
+def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(calls, monkeypatch):
     """Nothing re-reads a departed caller's key, so nothing would ever drop it."""
+    from cowork.services import mindshub_client
+
+    class _Clock:
+        now = 1000.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = _Clock()
+    monkeypatch.setattr(mindshub_client, "time", clock)
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
     _fetch(bearer="jwt-someone-who-leaves", org_id="", user_id="")
     assert len(svc._cache) == 1
 
-    stale = {k: (stamped - (svc._MAX_TTL_S + 1), v) for k, (stamped, v) in svc._cache.items()}
-    svc._cache.clear()
-    svc._cache.update(stale)
+    clock.now += svc._cache.keep_s + 1
 
     _fetch(bearer="jwt-somebody-else", org_id="", user_id="")
 
@@ -461,7 +469,7 @@ def test_the_route_answers_the_same_view_the_service_does(calls):
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
     calls.answers[svc.WALLET_PATH] = WALLET
 
-    view = asyncio.run(ep.get_hub_usage(FakeRequest(), _scope()))
+    view = asyncio.run(ep.get_mindshub_usage(FakeRequest(), _scope()))
 
     assert view.reachable is True
     assert view.balance.usd == 8.42
@@ -486,7 +494,7 @@ def test_route_allows_an_authenticated_member_in_org_mode(monkeypatch):
     async def _fake(path, bearer_token):
         return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
 
-    monkeypatch.setattr(svc, "get_auth_json", _fake)
+    monkeypatch.setattr(svc, "get_mindshub_json", _fake)
 
     resp = _client(principal=PRINCIPAL).get(
         PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}
@@ -507,7 +515,7 @@ def test_the_wire_carries_the_camel_cased_percentage_the_desktop_reads(monkeypat
     async def _fake(path, bearer_token):
         return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
 
-    monkeypatch.setattr(svc, "get_auth_json", _fake)
+    monkeypatch.setattr(svc, "get_mindshub_json", _fake)
 
     body = _client(principal=None).get(
         PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}
@@ -525,7 +533,7 @@ def test_route_is_unchanged_in_local_mode_with_no_principal(monkeypatch):
     async def _fake(path, bearer_token):
         return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
 
-    monkeypatch.setattr(svc, "get_auth_json", _fake)
+    monkeypatch.setattr(svc, "get_mindshub_json", _fake)
 
     resp = _client(principal=None).get(
         PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}
@@ -548,7 +556,7 @@ def test_the_wire_sends_a_null_refill_time_for_an_ineligible_org(monkeypatch):
             svc.WALLET_PATH: WALLET,
         }.get(path)
 
-    monkeypatch.setattr(svc, "get_auth_json", _fake)
+    monkeypatch.setattr(svc, "get_mindshub_json", _fake)
 
     body = _client(principal=None).get(
         PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}

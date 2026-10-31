@@ -5,7 +5,7 @@ from typing import Optional
 from cowork.schemas.base import CamelResponse
 
 
-class HubFreeTokens(CamelResponse):
+class MindsHubFreeTokens(CamelResponse):
     """The free MindsHub Air allowance, as a proportion.
 
     Auth does not publish the size of the allowance, so there is no token count
@@ -32,7 +32,7 @@ class HubFreeTokens(CamelResponse):
     resets_at: Optional[str] = None
 
 
-class HubBalance(CamelResponse):
+class MindsHubBalance(CamelResponse):
     """The paid wallet."""
 
     usd: float = 0.0
@@ -42,7 +42,7 @@ class HubBalance(CamelResponse):
     alert: str = ""
 
 
-class HubAutoTopUp(CamelResponse):
+class MindsHubAutoTopUp(CamelResponse):
     enabled: bool = False
     threshold_usd: Optional[float] = None
     # Auth tops the balance up TO this amount, it does not add this amount.
@@ -51,7 +51,7 @@ class HubAutoTopUp(CamelResponse):
     status: str = "ok"
 
 
-class HubCreditSpend(CamelResponse):
+class MindsHubCreditSpend(CamelResponse):
     """Paid credit spent in the current usage period, as the console shows it."""
 
     usd: float = 0.0
@@ -59,7 +59,7 @@ class HubCreditSpend(CamelResponse):
     period_end: Optional[str] = None
 
 
-class HubUsageView(CamelResponse):
+class MindsHubUsageView(CamelResponse):
     """Everything the usage surfaces need, in one round trip.
 
     ``reachable`` false means auth could not be asked at all. Each block is
@@ -69,7 +69,7 @@ class HubUsageView(CamelResponse):
 
     reachable: bool = False
     is_billing_owner: bool = False
-    free_tokens: Optional[HubFreeTokens] = None
-    balance: Optional[HubBalance] = None
-    auto_top_up: Optional[HubAutoTopUp] = None
-    credit_spend: Optional[HubCreditSpend] = None
+    free_tokens: Optional[MindsHubFreeTokens] = None
+    balance: Optional[MindsHubBalance] = None
+    auto_top_up: Optional[MindsHubAutoTopUp] = None
+    credit_spend: Optional[MindsHubCreditSpend] = None

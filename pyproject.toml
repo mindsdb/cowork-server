@@ -230,10 +230,3 @@ markers = [
     "postdeploy: runs against a deployed cowork-server; skips unless COWORK_BASE_URL is set",
     "production_read_only: GET-only smoke selected by the production nightly",
 ]
-
-# TEMPORARY (ENG-3787): always-on org and team skills need anton's pod renderer
-# (mindsdb/anton#722), which no anton-agent release has yet. Points the PR
-# environment at that branch. Remove this table and re-lock once #722 is
-# released, before this PR merges.
-[tool.uv.sources]
-anton-agent = { git = "https://github.com/mindsdb/anton", branch = "jorge/eng-3787-cowork-mvp-share-skills-and-artifacts-with-the-org-teams-and" }

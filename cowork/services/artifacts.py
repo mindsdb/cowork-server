@@ -42,6 +42,8 @@ from cowork.common.paths import (
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
+from cowork.models.artifact_owner_choice import AccessMode
+from cowork.schemas.artifact_access import ArtifactAccessView
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
 from anton.core.artifacts.store import iter_content_files
 
@@ -656,69 +658,75 @@ def _is_modified(
     return False
 
 
-def _published_access_for(
+def published_access_view(
     folder: Path,
     primary: Path | None,
     *,
     published_map: dict | None = None,
-) -> dict:
+) -> ArtifactAccessView:
     """Owner-side access state for the primary file, from `.published.json`.
 
-    Returns ``accessMode`` (public|password|restricted) plus the mode-specific
-    state needed to pre-fill the publish dialog on re-publish:
-    ``accessProtected``/``accessPassword`` (password) and
-    ``accessEmails``/``orgAllowed``/``ownerOnly`` (restricted). The plaintext password and
-    the email list are owner-only — `.published.json` never enters the
-    published bundle — so callers must only return this to the artifact's owner
-    (the local/authenticated session).
+    The mode (public|password|restricted) plus the mode-specific state needed
+    to pre-fill the publish dialog on re-publish: the password (password) and
+    who a restricted artifact is shared with. The plaintext password and the
+    email list are owner-only (`.published.json` never enters the published
+    bundle), so callers must only return this to the artifact's owner (the
+    local/authenticated session).
+
+    In MindsHub mode the entry doesn't say who a restricted artifact is
+    shared with: MindsHub's rule is the one record of it, which GET /access
+    reads (cowork.services.publish.stored_artifact_rule). So the audience
+    fields stay empty here, even for an entry written before that, and a
+    card never shows a copy that could have gone stale or been planted. An
+    entry whose mode is none of the three reads as public, the mode anton's
+    publisher republishes it in.
     """
-    out = {
-        "accessMode": "public",
-        "accessProtected": False,
-        "accessPassword": "",
-        "accessEmails": [],
-        "orgAllowed": False,
-        "ownerOnly": False,
-        # Hosted org team sharing (ENG-3787), restricted mode only.
-        "allowedTeamIds": [],
-        # People in the org by Keycloak user id; outside people stay in
-        # accessEmails.
-        "allowedUserIds": [],
-        # Composite comments scope {user_dir}/{report_id} (Plan 5); "" when
-        # unpublished or published before the key was persisted.
-        "artifactKey": "",
-    }
     if primary is None:
-        return out
+        return ArtifactAccessView()
     try:
         pmap = published_map if published_map is not None else _load_published_map(folder)
         entry = pmap.get(primary.name)
         # A soft-deleted record (published=False) is no longer live, so it must
         # not report a password/restricted mode — that would draw a lock icon on
         # an artifact whose publishedUrl is empty. Legacy entries have no flag.
-        if isinstance(entry, dict) and entry.get("published", True):
-            # `mode` is authoritative; fall back to the legacy requires_password
-            # flag for artifacts published before the mode field existed.
-            mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
-            out["accessMode"] = mode
-            out["artifactKey"] = entry.get("artifact_key", "") or ""
-            if mode == "password":
-                out["accessProtected"] = True
-                out["accessPassword"] = entry.get("access_password", "") or ""
-            elif mode == "restricted":
-                out["accessEmails"] = entry.get("emails", []) or []
-                out["orgAllowed"] = bool(entry.get("org_allowed"))
-                out["allowedTeamIds"] = list(entry.get("allowed_team_ids") or [])
-                out["allowedUserIds"] = list(entry.get("allowed_user_ids") or [])
-                # Stored for anton's publisher when teams or people alone are
-                # picked (publish._with_team_audience); to the app it means
-                # nobody else picked.
-                out["ownerOnly"] = bool(entry.get("owner_only")) and not (
-                    out["allowedTeamIds"] or out["allowedUserIds"]
-                )
+        if not (isinstance(entry, dict) and entry.get("published", True)):
+            return ArtifactAccessView()
+        # `mode` is authoritative; fall back to the legacy requires_password
+        # flag for artifacts published before the mode field existed.
+        recorded = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
+        mode = AccessMode(recorded) if recorded in set(AccessMode) else AccessMode.PUBLIC
+        artifact_key = entry.get("artifact_key", "") or ""
+        if mode is AccessMode.PASSWORD:
+            return ArtifactAccessView(
+                access_mode=mode,
+                artifact_key=artifact_key,
+                access_protected=True,
+                access_password=entry.get("access_password", "") or "",
+            )
+        if mode is AccessMode.RESTRICTED and not _org_mode():
+            return ArtifactAccessView(
+                access_mode=mode,
+                artifact_key=artifact_key,
+                access_emails=entry.get("emails", []) or [],
+                org_allowed=bool(entry.get("org_allowed")),
+                owner_only=bool(entry.get("owner_only")),
+            )
+        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key)
     except Exception:
-        pass
-    return out
+        return ArtifactAccessView()
+
+
+def _published_access_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> dict:
+    """published_access_view, under the app's names, for the artifact card's
+    access fields."""
+    return published_access_view(folder, primary, published_map=published_map).model_dump(
+        by_alias=True, mode="json"
+    )
 
 
 def _external_project_artifacts_base(

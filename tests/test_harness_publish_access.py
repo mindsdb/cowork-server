@@ -39,7 +39,7 @@ async def test_harness_forwards_explicit_password(tmp_path):
              "access_mode": "password", "password": "hunter2"},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"] == {"mode": "password", "password": "hunter2"}
+    assert kwargs["access"].publisher_access() == {"mode": "password", "password": "hunter2"}
     assert "Published" in getattr(out, "content", out)
 
 
@@ -55,7 +55,28 @@ async def test_harness_preserves_previous(tmp_path):
             _session(tmp_path), {"file_path": str(f), "action": "publish"},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"] == {"mode": "password", "password": "old"}  # NOT public
+    assert kwargs["access"].publisher_access() == {"mode": "password", "password": "old"}  # NOT public
+
+
+@pytest.mark.asyncio
+async def test_harness_refuses_previous_access_it_cant_read(tmp_path):
+    """The kept entry is a file the agent can write, so a password that is a
+    number there is refused with a sentence, and nothing publishes: kept
+    without it, the artifact would publish to a different audience."""
+    f = _artifact(tmp_path)
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    prev_state = {"published": True, "url": "u", "report_id": "r",
+                  "mode": "password", "requires_password": True, "access_password": 1234}
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_owner_state", return_value=prev_state):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+    assert out == (
+        "PUBLISH FAILED: The access saved with this artifact can't be read: password must be text. "
+        "Tell the user to choose its access from the publish panel, and don't pick one for them."
+    )
+    fake.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -69,7 +90,7 @@ async def test_harness_forwards_owner_only(tmp_path):
              "access_mode": "restricted", "emails": [], "owner_only": True},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"] == {
+    assert kwargs["access"].publisher_access() == {
         "mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True,
     }
 
@@ -85,8 +106,8 @@ async def test_harness_restricted_without_owner_only_omits_flag(tmp_path):
              "access_mode": "restricted", "emails": ["a@x.com"]},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"]["owner_only"] is False
-    assert kwargs["access"]["emails"] == ["a@x.com"]
+    assert kwargs["access"].publisher_access()["owner_only"] is False
+    assert kwargs["access"].publisher_access()["emails"] == ["a@x.com"]
 
 
 @pytest.mark.asyncio
@@ -101,7 +122,7 @@ async def test_harness_restricted_normalizes_emails(tmp_path):
              "access_mode": "restricted", "emails": [" A@X.com ", "a@x.com"]},
         )
     _, kwargs = fake.call_args
-    assert kwargs["access"]["emails"] == ["a@x.com"]
+    assert kwargs["access"].publisher_access()["emails"] == ["a@x.com"]
 
 
 @pytest.mark.asyncio

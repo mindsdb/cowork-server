@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.services import publish as p
 
 # What the autopublish reconciler will publish a NEW artifact with. `owner_only`
@@ -18,8 +19,8 @@ from cowork.services import publish as p
 # with neither emails, nor org, nor owner_only to `public`
 # (anton/publish_access.py), so without it every auto-published artifact would be
 # world-readable. It is what makes "only the owner" expressible at all, and an
-# artifact stays private until its owner shares it (ENG-2316).
-AUTOPUBLISH_ACCESS = {"mode": "restricted", "emails": [], "owner_only": True}
+# artifact stays private until its owner shares it.
+AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode="restricted", allowed_emails=[], owner_only=True)
 
 
 def test_installed_publisher_accepts_stable_artifact_key():
@@ -67,7 +68,7 @@ def test_publish_passes_caller_key_and_url_to_publisher(artifact, monkeypatch):
     out = p.publish_artifact(
         folder, artifacts_base=base,
         api_key="turnkey-abc", publish_url="https://api.staging.mindshub.ai",
-        access=dict(AUTOPUBLISH_ACCESS),
+        access=AUTOPUBLISH_ACCESS,
     )
 
     assert out["url"] == "https://view.example/r/1"
@@ -94,7 +95,7 @@ def test_publish_writes_published_json_with_report_id(artifact, monkeypatch):
 
     p.publish_artifact(folder, artifacts_base=base, api_key="k",
                        publish_url="https://api.staging.mindshub.ai",
-                       access=dict(AUTOPUBLISH_ACCESS))
+                       access=AUTOPUBLISH_ACCESS)
 
     entry = json.loads((folder / ".published.json").read_text())["report.html"]
     assert entry["report_id"] == "rid-1"
@@ -118,7 +119,7 @@ def test_republish_reuses_stored_report_id(artifact, monkeypatch):
     monkeypatch.setattr("anton.publisher.publish", fake_publish)
     kw = dict(artifacts_base=base, api_key="k",
               publish_url="https://api.staging.mindshub.ai",
-              access={"mode": "restricted", "emails": []})
+              access=ArtifactAccessRequest(mode="restricted", allowed_emails=[]))
 
     p.publish_artifact(folder, **kw)
     p.publish_artifact(folder, **kw)
@@ -136,7 +137,7 @@ def test_published_json_write_is_atomic_no_tmp_left_behind(artifact, monkeypatch
 
     p.publish_artifact(folder, artifacts_base=base, api_key="k",
                        publish_url="https://api.staging.mindshub.ai",
-                       access=dict(AUTOPUBLISH_ACCESS))
+                       access=AUTOPUBLISH_ACCESS)
 
     leftovers = [x.name for x in folder.iterdir() if x.name.startswith(".published.json.")]
     assert leftovers == []
@@ -162,7 +163,7 @@ def test_restricted_without_org_or_emails_degrades_to_public(artifact, monkeypat
 
     p.publish_artifact(folder, artifacts_base=base, api_key="k",
                        publish_url="https://api.staging.mindshub.ai",
-                       access={"mode": "restricted", "emails": []})
+                       access=ArtifactAccessRequest(mode="restricted", allowed_emails=[]))
 
     assert seen["access"] == {"mode": "public"}
 
@@ -184,7 +185,7 @@ def test_unpublish_uses_caller_key_and_soft_deletes(artifact, monkeypatch):
     )
     p.publish_artifact(folder, artifacts_base=base, api_key="k",
                        publish_url="https://api.staging.mindshub.ai",
-                       access=dict(AUTOPUBLISH_ACCESS))
+                       access=AUTOPUBLISH_ACCESS)
 
     seen = {}
     monkeypatch.setattr("anton.publisher.unpublish",
@@ -209,7 +210,7 @@ def test_unpublish_404_is_treated_as_already_gone_and_logs_orphan(artifact, monk
     )
     p.publish_artifact(folder, artifacts_base=base, api_key="k",
                        publish_url="https://api.staging.mindshub.ai",
-                       access=dict(AUTOPUBLISH_ACCESS))
+                       access=AUTOPUBLISH_ACCESS)
 
     def boom(ident, **kw):
         raise RuntimeError("HTTP Error 404: Not Found")
@@ -236,7 +237,7 @@ def test_unpublish_other_error_propagates(artifact, monkeypatch):
     )
     p.publish_artifact(folder, artifacts_base=base, api_key="k",
                        publish_url="https://api.staging.mindshub.ai",
-                       access=dict(AUTOPUBLISH_ACCESS))
+                       access=AUTOPUBLISH_ACCESS)
 
     def boom(ident, **kw):
         raise RuntimeError("HTTP Error 500: Server Error")
@@ -294,6 +295,6 @@ def test_agent_publish_tool_wrapper_still_works(artifact, monkeypatch):
         lambda raw, *, scope: (folder, base, "desktop-key", "https://api.staging.mindshub.ai"),
     )
 
-    out = htools._publish_artifact(str(folder), access={"mode": "public"})
+    out = htools._publish_artifact(str(folder), access=ArtifactAccessRequest(mode="public"))
 
     assert out["status"] == "ok"
