@@ -380,22 +380,31 @@ def test_the_proxy_forwards_only_to_the_callers_live_backend(stack, monkeypatch,
     assert forwarded == ["http://127.0.0.1:5000/data"]
 
 
-def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people):
-    """B's agent can replace B's `.anton/artifacts` with a link to A's. The
-    path routes still reach none of A's artifacts through it."""
+@pytest.mark.parametrize("level", [".anton", "artifacts"])
+def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people, level):
+    """B's agent can replace B's `.anton`, or its `artifacts` folder, with a
+    link to A's. The path routes, serve included, still reach none of A's
+    artifacts through it."""
     import shutil
 
     dash, _notes = two_people
-    b_artifacts = _general(BOB) / ".anton" / "artifacts"
-    if b_artifacts.exists():
-        shutil.rmtree(b_artifacts)
-    b_artifacts.parent.mkdir(parents=True, exist_ok=True)
-    b_artifacts.symlink_to(dash.parent, target_is_directory=True)
+    b_anton = _general(BOB) / ".anton"
+    if level == ".anton":
+        bobs, alices = b_anton, dash.parent.parent
+    else:
+        bobs, alices = b_anton / "artifacts", dash.parent
+    if bobs.exists():
+        shutil.rmtree(bobs)
+    bobs.parent.mkdir(parents=True, exist_ok=True)
+    bobs.symlink_to(alices, target_is_directory=True)
     primary = str(dash / "index.html")
+    serve = "/api/v1/artifacts/serve/general/dash/index.html"
     client = _client()
 
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
+    assert client.get(serve, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+    assert client.get(serve, headers=A).status_code == 200
 
 
 def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monkeypatch):
@@ -474,11 +483,55 @@ def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people, bobs_
     assert client.get(f"/api/v1/artifacts/drafts/{ref}/{artifact_id}/report.md", headers=B).status_code == 404
     for export_format in ("docx", "html"):
         assert client.post(f"{workspace}/export", json={"format": export_format}, headers=B).status_code == 404
+    repair = {
+        "expectedRevisionId": "r1",
+        "commentThreadId": "t1",
+        "thread": [{"text": "fix"}],
+        "conversationId": str(uuid4()),
+    }
+    assert client.post(f"{workspace}/agent-repairs", json=repair, headers=B).status_code == 404
+    assert client.put(f"{workspace}/access", json={"access": {"mode": "public"}}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B).status_code == 404
 
     assert _files_below(alice_partition) == before
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+
+
+def test_a_project_recorded_through_a_linked_partition_reaches_no_one_elses_artifacts(stack, caplog):
+    """B's partition folder was a link to A's when B's `general` was recorded,
+    so the row names A's folder, and still names it once the link is gone and
+    the real folder is back. No link is left on that path, and B still reaches
+    none of A's artifacts through the row."""
+    alice_general = _general(ALICE)
+    report = _report(alice_general, "report", "# Quarterly forecast\n\nRevenue grew.\n")
+    alice_partition = alice_general.parent.parent
+    bob_partition = alice_partition.parent / PARTITION_B
+    bob_partition.symlink_to(alice_partition, target_is_directory=True)
+    assert _general(BOB) == alice_general
+    bob_partition.unlink()
+    (bob_partition / "projects").mkdir(parents=True)
+    client = _client()
+    artifact_id = _artifact_id(report)
+    workspace = f"/api/v1/artifacts/workspace/{_general_id(BOB)}/{artifact_id}"
+    alices = client.get(f"/api/v1/artifacts/workspace/{_general_id(ALICE)}/{artifact_id}", headers=A)
+    assert alices.status_code == 200, alices.text
+    before = _files_below(alice_partition)
+
+    with caplog.at_level("WARNING", logger="cowork.services.artifact_roots"):
+        listed = client.get("/api/v1/artifacts/", headers=B)
+    assert listed.status_code == 200 and listed.json() == []
+    assert "a folder in another person's partition" in caplog.text
+    assert client.get(workspace, headers=B).status_code == 404
+    overwrite = {"content": "# Overwritten\n", "expectedRevisionId": alices.json()["revision"]["id"]}
+    assert client.put(workspace, json=overwrite, headers=B).status_code == 404
+    assert client.get(f"/api/v1/artifacts/drafts/{_general_id(BOB)}/{artifact_id}/report.md", headers=B).status_code == 404
+    for export_format in ("docx", "html"):
+        assert client.post(f"{workspace}/export", json={"format": export_format}, headers=B).status_code == 404
+    assert client.get("/api/v1/artifacts/serve/general/report/report.md", headers=B).status_code == 404
+
+    assert _files_below(alice_partition) == before
+    assert client.get(f"/api/v1/artifacts/workspace/{_general_id(ALICE)}/{artifact_id}", headers=A).status_code == 200
 
 
 def test_serve_by_project_name_reads_the_callers_own_project(two_people):

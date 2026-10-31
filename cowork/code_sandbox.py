@@ -770,19 +770,37 @@ def _is_viewer_login_url(value: str) -> bool:
 _COWORK_HOME_ENTRIES = (".env", ".master_key", "streams", "tmp", "shared")
 
 
+def _refuse_links(entries: Iterable[Path], *, what: str, leads: str, real: str) -> None:
+    """Raise RuntimeError naming the first of ``entries`` that is a link, or
+    that the server can't check. The server isn't locked, so it would read
+    and write ``what`` wherever the link leads. ``leads`` ends that sentence
+    and ``real`` names what to put back."""
+    for entry in entries:
+        try:
+            linked = entry.is_symlink()
+        except OSError as error:
+            raise RuntimeError(
+                f"COWORK_CODE_SANDBOX=landlock: the server can't check whether {entry} is "
+                f"a link ({error.strerror or error}). Give the server's user access to it, then "
+                "start again."
+            ) from error
+        if linked:
+            raise RuntimeError(
+                f"COWORK_CODE_SANDBOX=landlock: {entry} is a link, and the server reads "
+                f"and writes {what} outside the sandbox, so it would follow it wherever it "
+                f"leads{leads}. Agent code that ran before the sandbox may have left it "
+                f"there: remove the link and put the real {real} back, then start again."
+            )
+
+
 def _refuse_linked_cowork_home_entries() -> None:
     """Raise RuntimeError when one of _COWORK_HOME_ENTRIES is a link. The
     server isn't locked, so it would read and write wherever the link leads,
     such as every person's answer streams into the shared folder."""
-    for name in _COWORK_HOME_ENTRIES:
-        entry = cowork_home() / name
-        if entry.is_symlink():
-            raise RuntimeError(
-                f"COWORK_CODE_SANDBOX=landlock: {entry} is a link, and the server reads "
-                "and writes it outside the sandbox, so it would follow it wherever it "
-                "leads. Agent code that ran before the sandbox may have left it there: "
-                "remove the link and put the real file or folder back, then start again."
-            )
+    _refuse_links(
+        (cowork_home() / name for name in _COWORK_HOME_ENTRIES),
+        what="it", leads="", real="file or folder",
+    )
 
 
 def _refuse_linked_partitions(settings: AppSettings) -> None:
@@ -794,15 +812,11 @@ def _refuse_linked_partitions(settings: AppSettings) -> None:
     shared_root = _real(Path(settings.storage.shared_root))
     for partition in _partition_roots(shared_root):
         folder = shared_root / partition.name
-        for entry in (folder, *(folder / store for store in STORE_RESOURCE)):
-            if entry.is_symlink():
-                raise RuntimeError(
-                    f"COWORK_CODE_SANDBOX=landlock: {entry} is a link, and the server reads "
-                    "and writes a person's space there outside the sandbox, so it would "
-                    "follow it wherever it leads, maybe into another person's space. Agent "
-                    "code that ran before the sandbox may have left it there: remove the "
-                    "link and put the real folder back, then start again."
-                )
+        _refuse_links(
+            (folder, *(folder / store for store in STORE_RESOURCE)),
+            what="a person's space there", leads=", maybe into another person's space",
+            real="folder",
+        )
 
 
 def check_startup(settings: AppSettings, *, remote_turns: bool) -> None:

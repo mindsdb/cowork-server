@@ -11,6 +11,7 @@ the value, so the derivation is imported rather than reimplemented.
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -135,7 +136,18 @@ def _opened_from_trusted_root(anchor: Path, *names: str) -> Iterator[PinnedDir]:
     with pinned_dir(start, nofollow_base=anchored is None) as top, ExitStack() as opened:
         folder = top
         for name in (*below, *names):
-            folder = opened.enter_context(_opened_child_directory(folder, name))
+            try:
+                folder = opened.enter_context(_opened_child_directory(folder, name))
+            except OSError as error:
+                # A missing folder is ordinary (a project with no artifacts yet);
+                # a link or a file is not, and the routes answer it as missing.
+                if isinstance(error, NotADirectoryError) or error.errno == errno.ELOOP:
+                    logger.warning(
+                        "artifacts: %s is a link or not a folder, so the artifacts "
+                        "below it are left out",
+                        folder.path / name,
+                    )
+                raise
         yield folder
 
 
