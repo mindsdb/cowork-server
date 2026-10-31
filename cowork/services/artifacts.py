@@ -724,8 +724,19 @@ def _external_project_artifacts_base(
     project = service.get_project_by_name_or_none(project_name)
     if project is None or not service.directory_is_external(project):
         return None
-    base = Path(project.path) / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    return _real_artifacts_dir(Path(project.path))
+
+
+def _real_artifacts_dir(project_dir: Path) -> Path | None:
+    """``project_dir``'s `.anton/artifacts`, or None when it's missing or
+    either folder is a link: the scan skips such a project too
+    (_scan_artifact_dirs), since a link to another person's folder would serve
+    their files as this project's."""
+    from cowork.services.artifact_roots import _storage_components_are_safe
+
+    if not _storage_components_are_safe(project_dir, may_be_absent=False):
+        return None
+    return project_dir / ".anton" / "artifacts"
 
 
 def _project_artifacts_base(
@@ -763,8 +774,7 @@ def _project_artifacts_base(
         return None
     if candidate not in registered:
         return None
-    base = candidate / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    return _real_artifacts_dir(candidate)
 
 
 def serve_url_for(
