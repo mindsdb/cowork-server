@@ -45,7 +45,7 @@ from cowork.services.artifact_owner_backfill import (
     _sentinel_present,
     _write_sentinel,
 )
-from cowork.services.artifact_roots import ProjectRow, _project_roots, recorded_location
+from cowork.services.artifact_roots import ProjectRow, _project_roots, _sits_in_another_partition, recorded_location
 from cowork.services.shared_resources import advisory_lock_key
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,10 @@ def run_artifact_location_backfill(
                 if not org_id:
                     continue
                 project = ProjectRow(id=UUID(str(project_id)), name=name, path=path, external=False)
+                # In org tenancy an organization's partition of the shared root
+                # is its id (projects.partition_of).
+                if _sits_in_another_partition(project, partition=str(org_id)):
+                    continue
                 try:
                     found = _found_locations(project, stop=stop)
                 except OSError as exc:

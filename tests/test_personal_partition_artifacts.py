@@ -380,27 +380,38 @@ def test_the_proxy_forwards_only_to_the_callers_live_backend(stack, monkeypatch,
     assert forwarded == ["http://127.0.0.1:5000/data"]
 
 
-def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people):
-    """B's agent can replace B's `.anton/artifacts` with a link to A's. The
-    path routes still reach none of A's artifacts through it."""
+@pytest.mark.parametrize("level", [".anton", "artifacts"])
+def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people, level):
+    """B's agent can replace B's `.anton`, or its `artifacts` folder, with a
+    link to A's. The path routes, serve included, still reach none of A's
+    artifacts through it."""
     import shutil
 
     dash, _notes = two_people
-    b_artifacts = _general(BOB) / ".anton" / "artifacts"
-    if b_artifacts.exists():
-        shutil.rmtree(b_artifacts)
-    b_artifacts.parent.mkdir(parents=True, exist_ok=True)
-    b_artifacts.symlink_to(dash.parent, target_is_directory=True)
+    b_anton = _general(BOB) / ".anton"
+    if level == ".anton":
+        bobs, alices = b_anton, dash.parent.parent
+    else:
+        bobs, alices = b_anton / "artifacts", dash.parent
+    if bobs.exists():
+        shutil.rmtree(bobs)
+    bobs.parent.mkdir(parents=True, exist_ok=True)
+    bobs.symlink_to(alices, target_is_directory=True)
     primary = str(dash / "index.html")
+    serve = "/api/v1/artifacts/serve/general/dash/index.html"
     client = _client()
 
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
+    assert client.get(serve, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+    assert client.get(serve, headers=A).status_code == 200
 
 
 def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monkeypatch):
     """B's agent can replace B's whole `projects` root with a link to A's. The
-    path routes still reach none of A's artifacts through it."""
+    path routes still reach none of A's artifacts through it. The server starts
+    before the link appears, since it refuses to start with one
+    (test_code_sandbox.py)."""
     import shutil
 
     dash, notes = two_people
@@ -408,12 +419,12 @@ def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monke
         "cowork.services.publish.desktop_publish_credential",
         lambda: ("publish-key", "https://publish.example"),
     )
+    client = _client()
     bob_projects = _general(BOB).parent
     alice_projects = _general(ALICE).parent
     shutil.rmtree(bob_projects)
     bob_projects.symlink_to(alice_projects, target_is_directory=True)
     primary = str(dash / "index.html")
-    client = _client()
 
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B).status_code == 404
@@ -422,22 +433,143 @@ def test_a_linked_projects_root_reaches_no_one_elses_artifacts(two_people, monke
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
 
 
-def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people):
-    """B's agent can replace B's whole partition folder with a link to A's. The
-    path routes still reach none of A's artifacts through it."""
+def _files_below(folder: Path) -> dict[str, bytes]:
+    """Every regular file below ``folder``, by its path there. Links are not followed."""
+    found: dict[str, bytes] = {}
+    for parent, _dirs, names in os.walk(folder):
+        for name in names:
+            path = Path(parent) / name
+            if not path.is_symlink():
+                found[str(path.relative_to(folder))] = path.read_bytes()
+    return found
+
+
+def _link_bobs_partition_to_alices() -> Path:
+    """Replace B's partition folder with a link to A's, as agent code that ran
+    before the sandbox could. Returns A's partition folder."""
     import shutil
 
-    dash, _notes = two_people
     bob_partition = _general(BOB).parent.parent
     alice_partition = _general(ALICE).parent.parent
     shutil.rmtree(bob_partition)
     bob_partition.symlink_to(alice_partition, target_is_directory=True)
-    primary = str(dash / "index.html")
-    client = _client()
+    return alice_partition
 
+
+@pytest.mark.parametrize("bobs_ref", ["own-project", "local"])
+def test_a_linked_partition_dir_reaches_no_one_elses_artifacts(two_people, bobs_ref, caplog):
+    """B's partition folder is a link to A's. No route reaches A's artifacts
+    through it: not by path, and not by id through B's own project or B's
+    `local` scan. B gets 404 or an empty list, and nothing changes in A's folder.
+    The server starts before the link appears, since it refuses to start with
+    one (test_code_sandbox.py)."""
+    dash, _notes = two_people
+    report = _report(_general(ALICE), "report", "# Quarterly forecast\n\nRevenue grew.\n")
+    ref = _general_id(BOB) if bobs_ref == "own-project" else "local"
+    client = _client()
+    alice_partition = _link_bobs_partition_to_alices()
+    artifact_id = _artifact_id(report)
+    workspace = f"/api/v1/artifacts/workspace/{ref}/{artifact_id}"
+    primary = str(dash / "index.html")
+    alices = client.get(f"/api/v1/artifacts/workspace/{_general_id(ALICE)}/{artifact_id}", headers=A)
+    assert alices.status_code == 200, alices.text
+    before = _files_below(alice_partition)
+
+    with caplog.at_level("WARNING", logger="cowork.services.artifact_identity"):
+        assert client.get(workspace, headers=B).status_code == 404
+    assert any(getattr(record, "reason", None) == "linked_folder" for record in caplog.records)
+    listed = client.get("/api/v1/artifacts/", headers=B)
+    assert listed.status_code == 200 and listed.json() == []
+    overwrite = {"content": "# Overwritten\n", "expectedRevisionId": alices.json()["revision"]["id"]}
+    assert client.put(workspace, json=overwrite, headers=B).status_code == 404
+    assert client.get(f"/api/v1/artifacts/drafts/{ref}/{artifact_id}/report.md", headers=B).status_code == 404
+    for export_format in ("docx", "html"):
+        assert client.post(f"{workspace}/export", json={"format": export_format}, headers=B).status_code == 404
+    repair = {
+        "expectedRevisionId": "r1",
+        "commentThreadId": "t1",
+        "thread": [{"text": "fix"}],
+        "conversationId": str(uuid4()),
+    }
+    assert client.post(f"{workspace}/agent-repairs", json=repair, headers=B).status_code == 404
+    assert client.put(f"{workspace}/access", json={"access": {"mode": "public"}}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
     assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=B).status_code == 404
+
+    assert _files_below(alice_partition) == before
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
+
+
+def test_a_project_recorded_through_a_linked_partition_reaches_no_one_elses_artifacts(stack, caplog):
+    """B's partition folder was a link to A's when B's `general` was recorded,
+    so the row names A's folder, and still names it once the link is gone and
+    the real folder is back. No link is left on that path, and B still reaches
+    none of A's artifacts through the row."""
+    alice_general = _general(ALICE)
+    report = _report(alice_general, "report", "# Quarterly forecast\n\nRevenue grew.\n")
+    alice_partition = alice_general.parent.parent
+    bob_partition = alice_partition.parent / PARTITION_B
+    bob_partition.symlink_to(alice_partition, target_is_directory=True)
+    assert _general(BOB) == alice_general
+    bob_partition.unlink()
+    (bob_partition / "projects").mkdir(parents=True)
+    client = _client()
+    artifact_id = _artifact_id(report)
+    workspace = f"/api/v1/artifacts/workspace/{_general_id(BOB)}/{artifact_id}"
+    alices = client.get(f"/api/v1/artifacts/workspace/{_general_id(ALICE)}/{artifact_id}", headers=A)
+    assert alices.status_code == 200, alices.text
+    before = _files_below(alice_partition)
+
+    with caplog.at_level("WARNING", logger="cowork.services.artifact_roots"):
+        listed = client.get("/api/v1/artifacts/", headers=B)
+    assert listed.status_code == 200 and listed.json() == []
+    assert any(
+        getattr(record, "event", None) == "artifact_folder_refused"
+        and record.reason == "other_partition"
+        and record.project_id == _general_id(BOB)
+        for record in caplog.records
+    )
+    assert client.get(workspace, headers=B).status_code == 404
+    overwrite = {"content": "# Overwritten\n", "expectedRevisionId": alices.json()["revision"]["id"]}
+    assert client.put(workspace, json=overwrite, headers=B).status_code == 404
+    assert client.get(f"/api/v1/artifacts/drafts/{_general_id(BOB)}/{artifact_id}/report.md", headers=B).status_code == 404
+    for export_format in ("docx", "html"):
+        assert client.post(f"{workspace}/export", json={"format": export_format}, headers=B).status_code == 404
+    assert client.get("/api/v1/artifacts/serve/general/report/report.md", headers=B).status_code == 404
+
+    assert _files_below(alice_partition) == before
+    assert client.get(f"/api/v1/artifacts/workspace/{_general_id(ALICE)}/{artifact_id}", headers=A).status_code == 200
+
+
+def test_a_turn_end_in_a_linked_partition_reads_no_one_elses_artifact_ids(two_people):
+    """A turn's end reads the ids of its new folders by name below its
+    project's artifacts folder. With B's partition folder a link to A's, B's
+    folder yields none of A's ids, while A's own folder still does."""
+    from cowork.services.artifact_identity import artifact_ids_below
+
+    dash, notes = two_people
+    bobs_artifacts = _general(BOB) / ".anton" / "artifacts"
+    _link_bobs_partition_to_alices()
+    slugs = {"dash", "notes"}
+
+    assert artifact_ids_below(bobs_artifacts, slugs) == {}
+    assert artifact_ids_below(dash.parent, slugs) == {"dash": _artifact_id(dash), "notes": _artifact_id(notes)}
+
+
+def test_a_turn_end_in_a_linked_partition_names_no_one_elses_artifact_folders(two_people):
+    """A turn's end opens the folders its pod named below its project's
+    artifacts folder. With B's partition folder a link to A's, B's folder
+    names none of A's folders and leaves none unread, while A's own folder
+    names both."""
+    from cowork.services.artifact_identity import NamedArtifactFolders, artifact_folders_named
+
+    dash, _notes = two_people
+    bobs_artifacts = _general(BOB) / ".anton" / "artifacts"
+    _link_bobs_partition_to_alices()
+    slugs = {"dash", "notes"}
+
+    assert artifact_folders_named(base=bobs_artifacts, slugs=slugs) == NamedArtifactFolders(found=set(), unreadable=set())
+    assert artifact_folders_named(base=dash.parent, slugs=slugs).found == slugs
 
 
 def test_serve_by_project_name_reads_the_callers_own_project(two_people):

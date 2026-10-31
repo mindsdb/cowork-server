@@ -479,14 +479,14 @@ async def test_a_repair_queued_while_the_turn_ends_is_finished_by_the_next_turn(
 async def test_a_turn_end_that_could_not_open_the_artifacts_keeps_the_rows(monkeypatch, tmp_path):
     from cowork.services import artifact_identity
 
-    real_pinned_dir = artifact_identity.pinned_dir
+    real_open_child = artifact_identity._opened_child_directory
 
-    def unreadable_artifacts(path, *args, **kwargs):
-        if Path(path).name == "artifacts":
+    def unreadable_artifacts(parent, name, *args, **kwargs):
+        if name == "artifacts":
             raise OSError(errno.EIO, "Input/output error")
-        return real_pinned_dir(path, *args, **kwargs)
+        return real_open_child(parent, name, *args, **kwargs)
 
-    monkeypatch.setattr(artifact_identity, "pinned_dir", unreadable_artifacts)
+    monkeypatch.setattr(artifact_identity, "_opened_child_directory", unreadable_artifacts)
     conv_id = uuid4()
 
     await _remote_turn(

@@ -424,7 +424,7 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
         ("cowork/code_sandbox.py", "_forbidden_roots.forbidden", "cowork_home()"),
         ("cowork/code_sandbox.py", "_trusted_roots", "cowork_home()"),
         ("cowork/code_sandbox.py", "_run_self_test.scratch", "cowork_home() / 'tmp'"),
-        ("cowork/code_sandbox.py", "_refuse_linked_cowork_home_entries.entry", "cowork_home() / name"),
+        ("cowork/code_sandbox.py", "_refuse_linked_cowork_home_entries.home", "cowork_home()"),
         # This local-only backfill reads shared history solely to reject
         # unattributed page ids; it never runs on an org deployment.
         (
