@@ -36,7 +36,7 @@ from cowork.api.v1.artifact_scope import (
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.db.units import FilesystemBusy, run_db, run_efs
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
@@ -232,10 +232,12 @@ def _draft_stream(
     size: int,
     media_type: str,
     *,
+    scope: TenantScope,
     extra_headers: dict[str, str] | None = None,
 ):
     """Stream at most *size* bytes from the pinned descriptor and close every
-    held handle.
+    held handle, reading and closing on the file store's threads in *scope*
+    (PinnedStreamingResponse).
 
     No ``Content-Length``: the agent may still be writing the file, and a
     length taken from ``fstat`` would then disagree with the bytes read, which
@@ -244,15 +246,10 @@ def _draft_stream(
     size at authorization) still bounds the body, so a file that keeps growing
     cannot keep the response open.
     """
-    def chunks():
-        try:
-            yield from read_bounded(fd, size)
-        finally:
-            resources.close()
-
     return PinnedStreamingResponse(
-        chunks(),
+        read_bounded(fd, size),
         resources=resources,
+        scope=scope,
         media_type=media_type,
         headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
@@ -331,6 +328,7 @@ def _draft_file_response(
     artifact: ResolvedArtifact,
     rel_path: str,
     *,
+    scope: TenantScope,
     comments: bool,
     download: bool = False,
 ):
@@ -342,7 +340,8 @@ def _draft_file_response(
     and the open share the lookup's file store call, and run only once the
     lookup authorized the caller. HTML goes out as the preview document unless
     ``download`` asks for the bytes; every other file, and HTML that is not
-    UTF-8, streams from the pinned descriptor.
+    UTF-8, streams from the pinned descriptor, read on the file store's
+    threads in ``scope``.
     """
     parts = _draft_file_parts(rel_path, artifact.metadata)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
@@ -366,14 +365,14 @@ def _draft_file_response(
             if download else None
         )
         return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+            resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra,
         )
     except BaseException:
         resources.close()
         raise
 
 
-def _artifact_id_from_path(artifact_id: UUID) -> str:
+async def _artifact_id_from_path(artifact_id: UUID) -> str:
     """The identity gate for every route in this file.
 
     Declaring the path parameter as a `UUID` makes FastAPI answer 422 before any
@@ -508,7 +507,7 @@ async def _sync_live_artifact(
             return False
 
         if scope.org_mode:
-            artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
+            artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
             api_key = await key.get()
             if not api_key:
                 logger.warning("Could not synchronize live artifact %s: no publish key", folder)
@@ -1004,7 +1003,7 @@ async def set_artifact_access(
     publish_abandoned = False
     publish_started = False
     try:
-        artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
+        artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
         api_key = await key.get()
         if not api_key:
             raise HTTPException(
@@ -1540,6 +1539,7 @@ async def serve_private_draft(
         read=partial(
             _draft_file_response,
             rel_path=rel_path,
+            scope=scope,
             comments=wants_comment_layer(request),
             download=download or wants_download(request),
         ),

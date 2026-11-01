@@ -21,7 +21,6 @@ from cowork.draft_host import app as draft_app_module
 from cowork.api.v1.artifact_preview import HTML_SANDBOX_CSP
 from cowork.draft_host.app import DRAFT_ROUTE, DRAFT_SANDBOX, EXPIRED_MESSAGE, create_draft_app, request_host
 from cowork.draft_host.token import DRAFT_TTL_SECONDS
-from cowork.principal import get_principal
 from cowork.services.comments_layer import ACTIVATION_PARAM
 from cowork.services.preview_html import prepare_preview_html
 
@@ -132,7 +131,7 @@ def test_the_identity_comes_from_the_token_and_forged_headers_are_ignored(client
     real_flag = draft_app_module.wants_comment_layer
 
     def capture(request):
-        principals.append(get_principal(request))
+        principals.append(getattr(request.state, "principal", None))
         return real_flag(request)
 
     monkeypatch.setattr(draft_app_module, "wants_comment_layer", capture)

@@ -165,10 +165,10 @@ def test_pending_claims_hide_attribution_and_fail_capabilities_closed(org_engine
     )
     assert instruction_claim is not None and instruction_token is not None
     instruction_response = jsonable_encoder(
-        project_files.get_project_instructions(
-            project.name,
+        project_files._get_project_instructions(
             alice,
-            _principal(ALICE),
+            project_name=project.name,
+            principal=_principal(ALICE),
         )["file"]
     )
     assert instruction_response["attribution"] == {
@@ -189,7 +189,7 @@ def test_pending_claims_hide_attribution_and_fail_capabilities_closed(org_engine
         label=skill_slug,
         instructions="pending bytes",
     )
-    skill_response = skills.get_skill(skill_slug, alice, _principal(ALICE))
+    skill_response = skills._get_skill(alice, skill_id=skill_slug, principal=_principal(ALICE))
     assert skill_response["attribution"] == {
         "createdBy": None,
         "lastModifiedBy": None,
@@ -308,14 +308,14 @@ def test_project_creator_admin_and_general_policy(org_engine):
     )
 
     bob = _scoped(org_engine, BOB)
-    foreign_skill = skills.create_skill(
-        SkillCreateRequest(
+    foreign_skill = skills._create_skill(
+        bob,
+        body=SkillCreateRequest(
             label="Foreign linked skill",
             instructions="Keep the project link current",
             projects=[project.name],
         ),
-        bob,
-        _principal(BOB),
+        principal=_principal(BOB),
     )
     skill_service = SkillService(alice.scope)
     skill_service.ensure_builtin_skills()
@@ -328,31 +328,31 @@ def test_project_creator_admin_and_general_policy(org_engine):
     builtin.metadata = {**builtin.metadata, META_PROJECTS: project.name}
     skill_service._write(builtin)
     with pytest.raises(HTTPException) as denied:
-        projects.update_project(
-            project.id,
-            ProjectUpdateRequest(name="stolen"),
+        projects._update_project(
             bob,
-            _principal(BOB),
+            project_id=project.id,
+            body=ProjectUpdateRequest(name="stolen"),
+            principal=_principal(BOB),
         )
     assert denied.value.status_code == 403
 
     before_events = len(alice.exec(alice.select(SharedResourceMutation)).all())
-    selected = projects.update_project(
-        project.id,
-        ProjectUpdateRequest(name=f"  {project.name}  ", is_active=True),
+    selected = projects._update_project(
         bob,
-        _principal(BOB),
+        project_id=project.id,
+        body=ProjectUpdateRequest(name=f"  {project.name}  ", is_active=True),
+        principal=_principal(BOB),
     )
     assert selected["is_active"] is True
     assert len(alice.exec(alice.select(SharedResourceMutation)).all()) == before_events
     selected_attribution = selected["attribution"].model_dump(by_alias=True)
     assert selected_attribution["lastModifiedBy"]["userId"] == ALICE
 
-    renamed = projects.update_project(
-        project.id,
-        ProjectUpdateRequest(name="monthly-reports"),
+    renamed = projects._update_project(
         alice,
-        _principal(ALICE),
+        project_id=project.id,
+        body=ProjectUpdateRequest(name="monthly-reports"),
+        principal=_principal(ALICE),
     )
     assert renamed["name"] == "monthly-reports"
     assert renamed["capabilities"].can_rename is True
@@ -370,10 +370,10 @@ def test_project_creator_admin_and_general_policy(org_engine):
     }
     assert encoded_project["capabilities"]["canRun"] is True
     assert encoded_project["capabilities"]["canWriteFiles"] is True
-    linked = skills.get_skill(
-        foreign_skill["id"],
+    linked = skills._get_skill(
         alice,
-        _principal(ALICE),
+        skill_id=foreign_skill["id"],
+        principal=_principal(ALICE),
     )
     assert linked["projects"] == ["monthly-reports"]
     assert linked["attribution"]["lastModifiedBy"]["userId"] == BOB
@@ -392,19 +392,19 @@ def test_project_creator_admin_and_general_policy(org_engine):
         legacy_id = legacy.id
     assert legacy.created_by is None
     with pytest.raises(HTTPException) as denied_legacy:
-        projects.update_project(
-            legacy_id,
-            ProjectUpdateRequest(name="member-renamed"),
+        projects._update_project(
             bob,
-            _principal(BOB),
+            project_id=legacy_id,
+            body=ProjectUpdateRequest(name="member-renamed"),
+            principal=_principal(BOB),
         )
     assert denied_legacy.value.status_code == 403
     admin = _scoped(org_engine, ADMIN)
-    updated = projects.update_project(
-        legacy_id,
-        ProjectUpdateRequest(name="admin-renamed"),
+    updated = projects._update_project(
         admin,
-        _principal(ADMIN, admin=True),
+        project_id=legacy_id,
+        body=ProjectUpdateRequest(name="admin-renamed"),
+        principal=_principal(ADMIN, admin=True),
     )
     assert updated["name"] == "admin-renamed"
     assert updated["attribution"].created_by is None
@@ -413,11 +413,11 @@ def test_project_creator_admin_and_general_policy(org_engine):
     general = ProjectService(admin).ensure_general_for_scope()
     assert general is not None
     with pytest.raises(HTTPException) as immutable:
-        projects.update_project(
-            general.id,
-            ProjectUpdateRequest(name="not-general"),
+        projects._update_project(
             admin,
-            _principal(ADMIN, admin=True),
+            project_id=general.id,
+            body=ProjectUpdateRequest(name="not-general"),
+            principal=_principal(ADMIN, admin=True),
         )
     assert immutable.value.status_code == 403
 
@@ -432,11 +432,11 @@ def test_project_update_returns_not_found_for_an_unknown_scoped_project(org_engi
 
     for hidden_id in (uuid4(), foreign_project.id):
         with pytest.raises(HTTPException) as missing:
-            projects.update_project(
-                hidden_id,
-                ProjectUpdateRequest(is_active=True),
+            projects._update_project(
                 alice,
-                _principal(ALICE),
+                project_id=hidden_id,
+                body=ProjectUpdateRequest(is_active=True),
+                principal=_principal(ALICE),
             )
 
         assert missing.value.status_code == 404
@@ -445,15 +445,15 @@ def test_project_update_returns_not_found_for_an_unknown_scoped_project(org_engi
 
 def test_project_collision_normalized_noop_stays_member_selectable(org_engine):
     alice = _scoped(org_engine, ALICE)
-    first = projects.create_project(
-        ProjectCreateRequest(name="collision"),
+    first = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="collision"),
+        principal=_principal(ALICE),
     )
-    second = projects.create_project(
-        ProjectCreateRequest(name="collision"),
+    second = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="collision"),
+        principal=_principal(ALICE),
     )
     assert first["name"] == "collision"
     assert second["name"] == "collision-2"
@@ -462,11 +462,11 @@ def test_project_collision_normalized_noop_stays_member_selectable(org_engine):
     ]
 
     bob = _scoped(org_engine, BOB)
-    selected = projects.update_project(
-        second["id"],
-        ProjectUpdateRequest(name="  collision  ", is_active=True),
+    selected = projects._update_project(
         bob,
-        _principal(BOB),
+        project_id=second["id"],
+        body=ProjectUpdateRequest(name="  collision  ", is_active=True),
+        principal=_principal(BOB),
     )
 
     assert selected["name"] == "collision-2"
@@ -478,17 +478,17 @@ def test_project_collision_normalized_noop_stays_member_selectable(org_engine):
 
 def test_project_rename_cannot_claim_the_unprovisioned_general_name(org_engine):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="default-name-hijack"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="default-name-hijack"),
+        principal=_principal(ALICE),
     )
 
-    renamed = projects.update_project(
-        project["id"],
-        ProjectUpdateRequest(name=GENERAL_PROJECT),
+    renamed = projects._update_project(
         alice,
-        _principal(ALICE),
+        project_id=project["id"],
+        body=ProjectUpdateRequest(name=GENERAL_PROJECT),
+        principal=_principal(ALICE),
     )
     general = ProjectService(alice).ensure_general_for_scope()
 
@@ -512,15 +512,15 @@ def test_concurrent_project_renames_allocate_distinct_names(
     )
     SQLModel.metadata.create_all(race_engine)
     alice = _scoped(race_engine, ALICE)
-    first = projects.create_project(
-        ProjectCreateRequest(name="rename-source-one"),
+    first = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="rename-source-one"),
+        principal=_principal(ALICE),
     )
-    second = projects.create_project(
-        ProjectCreateRequest(name="rename-source-two"),
+    second = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="rename-source-two"),
+        principal=_principal(ALICE),
     )
     namespace_barrier = Barrier(2)
     original_coordination_lock = SharedResourceAccess.coordination_lock
@@ -541,11 +541,11 @@ def test_concurrent_project_renames_allocate_distinct_names(
     def rename(project_id):
         scoped = _scoped(race_engine, ALICE)
         try:
-            return projects.update_project(
-                project_id,
-                ProjectUpdateRequest(name="shared-rename-target"),
+            return projects._update_project(
                 scoped,
-                _principal(ALICE),
+                project_id=project_id,
+                body=ProjectUpdateRequest(name="shared-rename-target"),
+                principal=_principal(ALICE),
             )
         finally:
             scoped.close()
@@ -581,10 +581,10 @@ def test_project_create_and_rename_share_the_name_namespace(
     )
     SQLModel.metadata.create_all(race_engine)
     alice = _scoped(race_engine, ALICE)
-    source = projects.create_project(
-        ProjectCreateRequest(name="create-rename-source"),
+    source = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="create-rename-source"),
+        principal=_principal(ALICE),
     )
     namespace_barrier = Barrier(2)
     original_coordination_lock = SharedResourceAccess.coordination_lock
@@ -605,11 +605,11 @@ def test_project_create_and_rename_share_the_name_namespace(
     def rename():
         scoped = _scoped(race_engine, ALICE)
         try:
-            return projects.update_project(
-                source["id"],
-                ProjectUpdateRequest(name="shared-create-rename-target"),
+            return projects._update_project(
                 scoped,
-                _principal(ALICE),
+                project_id=source["id"],
+                body=ProjectUpdateRequest(name="shared-create-rename-target"),
+                principal=_principal(ALICE),
             )
         finally:
             scoped.close()
@@ -617,10 +617,10 @@ def test_project_create_and_rename_share_the_name_namespace(
     def create():
         scoped = _scoped(race_engine, ALICE)
         try:
-            return projects.create_project(
-                ProjectCreateRequest(name="shared-create-rename-target"),
+            return projects._create_project(
                 scoped,
-                _principal(ALICE),
+                body=ProjectCreateRequest(name="shared-create-rename-target"),
+                principal=_principal(ALICE),
             )
         finally:
             scoped.close()
@@ -649,22 +649,22 @@ def test_project_rename_restores_directory_and_all_skill_bytes_on_repair_failure
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="atomic-rename"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="atomic-rename"),
+        principal=_principal(ALICE),
     )
     old_path = Path(project["path"])
     (old_path / "ordinary.txt").write_text("keep me", encoding="utf-8")
     created_skills = [
-        skills.create_skill(
-            SkillCreateRequest(
+        skills._create_skill(
+            alice,
+            body=SkillCreateRequest(
                 label=label,
                 instructions=f"{label} content",
                 projects=[project["name"]],
             ),
-            alice,
-            _principal(ALICE),
+            principal=_principal(ALICE),
         )
         for label in ("atomic alpha", "atomic beta")
     ]
@@ -691,11 +691,11 @@ def test_project_rename_restores_directory_and_all_skill_bytes_on_repair_failure
     monkeypatch.setattr(SkillService, "_write", fail_second_repair)
 
     with pytest.raises(RuntimeError, match="second skill repair failed"):
-        projects.update_project(
-            project["id"],
-            ProjectUpdateRequest(name="atomic-renamed"),
+        projects._update_project(
             alice,
-            _principal(ALICE),
+            project_id=project["id"],
+            body=ProjectUpdateRequest(name="atomic-renamed"),
+            principal=_principal(ALICE),
         )
 
     current = ProjectService(alice).get_project(project["id"])
@@ -718,10 +718,10 @@ def test_project_rename_compensates_audit_and_db_commit_failures(
     failure_point,
 ):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name=f"{failure_point}-rename"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name=f"{failure_point}-rename"),
+        principal=_principal(ALICE),
     )
     old_path = Path(project["path"])
     instructions = old_path / ".anton" / "anton.md"
@@ -732,14 +732,14 @@ def test_project_rename_compensates_audit_and_db_commit_failures(
         PROJECT_INSTRUCTIONS,
         project_resource_key(project["id"]),
     )
-    created_skill = skills.create_skill(
-        SkillCreateRequest(
+    created_skill = skills._create_skill(
+        alice,
+        body=SkillCreateRequest(
             label=f"{failure_point} linked skill",
             instructions="keep exact bytes",
             projects=[project["name"]],
         ),
-        alice,
-        _principal(ALICE),
+        principal=_principal(ALICE),
     )
     skill_service = SkillService(alice.scope)
     skill_file = skill_service._skill_dir(created_skill["id"]) / "SKILL.md"
@@ -764,11 +764,11 @@ def test_project_rename_compensates_audit_and_db_commit_failures(
         failure = "project commit failed"
 
     with pytest.raises(RuntimeError, match=failure):
-        projects.update_project(
-            project["id"],
-            ProjectUpdateRequest(name=f"{failure_point}-renamed"),
+        projects._update_project(
             alice,
-            _principal(ALICE),
+            project_id=project["id"],
+            body=ProjectUpdateRequest(name=f"{failure_point}-renamed"),
+            principal=_principal(ALICE),
         )
 
     current = ProjectService(alice).get_project(project["id"])
@@ -787,10 +787,10 @@ def test_project_rename_does_not_surface_post_commit_refresh_failure(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="refresh-safe-rename"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="refresh-safe-rename"),
+        principal=_principal(ALICE),
     )
     old_path = Path(project["path"])
 
@@ -798,11 +798,11 @@ def test_project_rename_does_not_surface_post_commit_refresh_failure(
         raise RuntimeError("refresh unavailable after commit")
 
     monkeypatch.setattr(alice, "refresh", fail_refresh)
-    renamed = projects.update_project(
-        project["id"],
-        ProjectUpdateRequest(name="refresh-safe-renamed"),
+    renamed = projects._update_project(
         alice,
-        _principal(ALICE),
+        project_id=project["id"],
+        body=ProjectUpdateRequest(name="refresh-safe-renamed"),
+        principal=_principal(ALICE),
     )
 
     assert renamed["name"] == "refresh-safe-renamed"
@@ -829,10 +829,10 @@ def test_project_create_does_not_surface_post_commit_refresh_failure(
         raise RuntimeError("refresh unavailable after commit")
 
     monkeypatch.setattr(alice, "refresh", fail_refresh)
-    created = projects.create_project(
-        ProjectCreateRequest(name="refresh-safe-create"),
+    created = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="refresh-safe-create"),
+        principal=_principal(ALICE),
     )
 
     assert created["name"] == "refresh-safe-create"
@@ -861,10 +861,10 @@ def test_project_create_populates_server_timestamps_without_expiration(org_engin
 
 def test_project_rename_rejects_a_pending_instruction_first_write(org_engine):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="instruction-race"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="instruction-race"),
+        principal=_principal(ALICE),
     )
     access = SharedResourceAccess(alice, _principal(ALICE))
     claim, token = access.reserve_claim(
@@ -874,11 +874,11 @@ def test_project_rename_rejects_a_pending_instruction_first_write(org_engine):
     assert claim is not None and token is not None
 
     with pytest.raises(HTTPException) as conflict:
-        projects.update_project(
-            project["id"],
-            ProjectUpdateRequest(name="instruction-race-renamed"),
+        projects._update_project(
             alice,
-            _principal(ALICE),
+            project_id=project["id"],
+            body=ProjectUpdateRequest(name="instruction-race-renamed"),
+            principal=_principal(ALICE),
         )
 
     assert conflict.value.status_code == 409
@@ -899,17 +899,17 @@ def test_project_rename_waits_for_an_existing_instruction_writer(
     )
     SQLModel.metadata.create_all(race_engine)
     alice = _scoped(race_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="instruction-lock-race"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="instruction-lock-race"),
+        principal=_principal(ALICE),
     )
-    project_files.write_project_file(
-        project["name"],
-        project_files._validated_project_path(".anton/anton.md"),
-        project_files._FileWriteRequest(content="writer's completed bytes"),
+    project_files._write_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project["name"],
+        path=project_files._validated_project_path(".anton/anton.md"),
+        req=project_files._FileWriteRequest(content="writer's completed bytes"),
+        principal=_principal(ALICE),
     )
     rename_reached_instruction_guard = Event()
     original_guard = projects._guard_project_instructions_for_move
@@ -927,11 +927,11 @@ def test_project_rename_waits_for_an_existing_instruction_writer(
     def rename_project():
         scoped = _scoped(race_engine, ALICE)
         try:
-            return projects.update_project(
-                project["id"],
-                ProjectUpdateRequest(name="instruction-lock-renamed"),
+            return projects._update_project(
                 scoped,
-                _principal(ALICE),
+                project_id=project["id"],
+                body=ProjectUpdateRequest(name="instruction-lock-renamed"),
+                principal=_principal(ALICE),
             )
         finally:
             scoped.close()
@@ -970,10 +970,10 @@ def test_project_rename_waits_for_memory_writer_and_audit_failure_stays_converge
     )
     SQLModel.metadata.create_all(race_engine)
     alice = _scoped(race_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="memory-lock-race"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="memory-lock-race"),
+        principal=_principal(ALICE),
     )
     MemoryService(alice, _principal(ALICE))._write(
         MemoryScope.project,
@@ -1029,11 +1029,11 @@ def test_project_rename_waits_for_memory_writer_and_audit_failure_stays_converge
     def rename_project():
         scoped = _scoped(race_engine, ALICE)
         try:
-            return projects.update_project(
-                project["id"],
-                ProjectUpdateRequest(name="memory-lock-renamed"),
+            return projects._update_project(
                 scoped,
-                _principal(ALICE),
+                project_id=project["id"],
+                body=ProjectUpdateRequest(name="memory-lock-renamed"),
+                principal=_principal(ALICE),
             )
         finally:
             scoped.close()
@@ -1071,15 +1071,15 @@ def test_project_rename_serializes_and_rejects_a_stale_skill_project_add(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="reference-race"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="reference-race"),
+        principal=_principal(ALICE),
     )
-    skill = skills.create_skill(
-        SkillCreateRequest(label="reference race skill", instructions="content"),
+    skill = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="reference race skill", instructions="content"),
+        principal=_principal(ALICE),
     )
     rename_holds_reference_lock = Event()
     finish_rename = Event()
@@ -1108,11 +1108,11 @@ def test_project_rename_serializes_and_rejects_a_stale_skill_project_add(
     def rename_project():
         scoped = _scoped(org_engine, ALICE)
         try:
-            return projects.update_project(
-                project["id"],
-                ProjectUpdateRequest(name="reference-race-renamed"),
+            return projects._update_project(
                 scoped,
-                _principal(ALICE),
+                project_id=project["id"],
+                body=ProjectUpdateRequest(name="reference-race-renamed"),
+                principal=_principal(ALICE),
             )
         finally:
             scoped.close()
@@ -1121,11 +1121,11 @@ def test_project_rename_serializes_and_rejects_a_stale_skill_project_add(
         scoped = _scoped(org_engine, ALICE)
         try:
             try:
-                skills.update_skill(
-                    skill["id"],
-                    SkillUpdateRequest(projects=[project["name"]]),
+                skills._update_skill(
                     scoped,
-                    _principal(ALICE),
+                    skill_id=skill["id"],
+                    body=SkillUpdateRequest(projects=[project["name"]]),
+                    principal=_principal(ALICE),
                 )
             except HTTPException as exc:
                 return exc.status_code
@@ -1153,25 +1153,25 @@ def test_project_delete_and_general_matrix(org_engine):
     bob = _scoped(org_engine, BOB)
     admin = _scoped(org_engine, ADMIN)
 
-    creator_target = projects.create_project(
-        ProjectCreateRequest(name="creator-delete"),
+    creator_target = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="creator-delete"),
+        principal=_principal(ALICE),
     )
     with pytest.raises(HTTPException) as peer_denied:
-        projects.delete_project(creator_target["id"], bob, _principal(BOB))
+        projects._delete_project(bob, project_id=creator_target["id"], principal=_principal(BOB))
     assert peer_denied.value.status_code == 403
-    projects.delete_project(creator_target["id"], alice, _principal(ALICE))
+    projects._delete_project(alice, project_id=creator_target["id"], principal=_principal(ALICE))
 
-    admin_target = projects.create_project(
-        ProjectCreateRequest(name="admin-delete"),
+    admin_target = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="admin-delete"),
+        principal=_principal(ALICE),
     )
-    projects.delete_project(
-        admin_target["id"],
+    projects._delete_project(
         admin,
-        _principal(ADMIN, admin=True),
+        project_id=admin_target["id"],
+        principal=_principal(ADMIN, admin=True),
     )
 
     foreign = ScopedSession(
@@ -1181,7 +1181,7 @@ def test_project_delete_and_general_matrix(org_engine):
     foreign_target = ProjectService(foreign).create_project("other-org")
     for hidden_id in (uuid4(), foreign_target.id):
         with pytest.raises(HTTPException) as hidden:
-            projects.delete_project(hidden_id, alice, _principal(ALICE))
+            projects._delete_project(alice, project_id=hidden_id, principal=_principal(ALICE))
         assert hidden.value.status_code == 404
 
     general = ProjectService(alice).ensure_general_for_scope()
@@ -1192,22 +1192,22 @@ def test_project_delete_and_general_matrix(org_engine):
         (admin, _principal(ADMIN, admin=True)),
     ):
         with pytest.raises(HTTPException) as rename_denied:
-            projects.update_project(
-                general.id,
-                ProjectUpdateRequest(name="replace-general"),
+            projects._update_project(
                 scoped,
-                principal,
+                project_id=general.id,
+                body=ProjectUpdateRequest(name="replace-general"),
+                principal=principal,
             )
         assert rename_denied.value.status_code == 403
         with pytest.raises(HTTPException) as delete_denied:
-            projects.delete_project(general.id, scoped, principal)
+            projects._delete_project(scoped, project_id=general.id, principal=principal)
         assert delete_denied.value.status_code == 403
 
-    selected_general = projects.update_project(
-        general.id,
-        ProjectUpdateRequest(name=GENERAL_PROJECT, is_active=True),
+    selected_general = projects._update_project(
         bob,
-        _principal(BOB),
+        project_id=general.id,
+        body=ProjectUpdateRequest(name=GENERAL_PROJECT, is_active=True),
+        principal=_principal(BOB),
     )
     assert selected_general["name"] == GENERAL_PROJECT
 
@@ -1218,10 +1218,10 @@ def test_project_delete_and_general_matrix(org_engine):
 @pytest.mark.asyncio
 async def test_skill_and_project_memory_creator_gates(org_engine):
     alice = _scoped(org_engine, ALICE)
-    created = skills.create_skill(
-        SkillCreateRequest(label="Quarterly report", instructions="Draft it"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="Quarterly report", instructions="Draft it"),
+        principal=_principal(ALICE),
     )
     assert created["capabilities"]["canEdit"] is True
     assert created["attribution"]["createdBy"]["userId"] == ALICE
@@ -1240,46 +1240,46 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
 
     bob = _scoped(org_engine, BOB)
     with pytest.raises(HTTPException) as denied_skill:
-        skills.update_skill(
-            created["id"],
-            SkillUpdateRequest(enabled=False),
+        skills._update_skill(
             bob,
-            _principal(BOB),
+            skill_id=created["id"],
+            body=SkillUpdateRequest(enabled=False),
+            principal=_principal(BOB),
         )
     assert denied_skill.value.status_code == 403
 
     admin = _scoped(org_engine, ADMIN)
-    disabled = skills.update_skill(
-        created["id"],
-        SkillUpdateRequest(enabled=False),
+    disabled = skills._update_skill(
         admin,
-        _principal(ADMIN, admin=True),
+        skill_id=created["id"],
+        body=SkillUpdateRequest(enabled=False),
+        principal=_principal(ADMIN, admin=True),
     )
     assert disabled["enabled"] is False
     assert disabled["attribution"]["createdBy"]["userId"] == ALICE
     assert disabled["attribution"]["lastModifiedBy"]["userId"] == ADMIN
 
-    edited = skills.update_skill(
-        created["id"],
-        SkillUpdateRequest(instructions="Creator revision"),
+    edited = skills._update_skill(
         alice,
-        _principal(ALICE),
+        skill_id=created["id"],
+        body=SkillUpdateRequest(instructions="Creator revision"),
+        principal=_principal(ALICE),
     )
     assert edited["declarative"] == "Creator revision"
     with pytest.raises(HTTPException) as denied_delete:
-        skills.delete_skill(created["id"], bob, _principal(BOB))
+        skills._delete_skill(bob, skill_id=created["id"], principal=_principal(BOB))
     assert denied_delete.value.status_code == 403
-    skills.delete_skill(created["id"], alice, _principal(ALICE))
+    skills._delete_skill(alice, skill_id=created["id"], principal=_principal(ALICE))
 
-    admin_delete = skills.create_skill(
-        SkillCreateRequest(label="Admin delete", instructions="Temporary"),
+    admin_delete = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="Admin delete", instructions="Temporary"),
+        principal=_principal(ALICE),
     )
-    skills.delete_skill(
-        admin_delete["id"],
+    skills._delete_skill(
         admin,
-        _principal(ADMIN, admin=True),
+        skill_id=admin_delete["id"],
+        principal=_principal(ADMIN, admin=True),
     )
     skill_events = alice.exec(
         alice.select(SharedResourceMutation).where(
@@ -1298,18 +1298,18 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
         instructions="No attribution row",
     )
     with pytest.raises(HTTPException) as legacy_peer_denied:
-        skills.update_skill(
-            "legacy-skill",
-            SkillUpdateRequest(instructions="Peer edit"),
+        skills._update_skill(
             bob,
-            _principal(BOB),
+            skill_id="legacy-skill",
+            body=SkillUpdateRequest(instructions="Peer edit"),
+            principal=_principal(BOB),
         )
     assert legacy_peer_denied.value.status_code == 403
-    legacy_skill = skills.update_skill(
-        "legacy-skill",
-        SkillUpdateRequest(instructions="Admin edit"),
+    legacy_skill = skills._update_skill(
         admin,
-        _principal(ADMIN, admin=True),
+        skill_id="legacy-skill",
+        body=SkillUpdateRequest(instructions="Admin edit"),
+        principal=_principal(ADMIN, admin=True),
     )
     assert legacy_skill["attribution"]["createdBy"] is None
     assert legacy_skill["attribution"]["lastModifiedBy"]["userId"] == ADMIN
@@ -1414,13 +1414,13 @@ def test_two_members_cannot_both_create_the_same_skill(
         scoped = _scoped(race_engine, user_id)
         try:
             barrier.wait(timeout=5)
-            response = skills.create_skill(
-                SkillCreateRequest(
+            response = skills._create_skill(
+                scoped,
+                body=SkillCreateRequest(
                     label="race-skill",
                     instructions=instructions,
                 ),
-                scoped,
-                _principal(user_id),
+                principal=_principal(user_id),
             )
         except HTTPException as exc:
             return ("error", user_id, instructions, exc.status_code)
@@ -1483,21 +1483,21 @@ def test_packaged_skills_are_immutable_for_every_org_role(org_engine):
         (_scoped(org_engine, ADMIN), _principal(ADMIN, admin=True)),
     ]
     for scoped, principal in callers:
-        response = skills.get_skill(victim, scoped, principal)
+        response = skills._get_skill(scoped, skill_id=victim, principal=principal)
         assert response["isBuiltin"] is True
         assert response["capabilities"]["canEdit"] is False
         assert response["capabilities"]["canDelete"] is False
         assert response["capabilities"]["canDisable"] is False
         with pytest.raises(HTTPException) as edit_denied:
-            skills.update_skill(
-                victim,
-                SkillUpdateRequest(enabled=False),
+            skills._update_skill(
                 scoped,
-                principal,
+                skill_id=victim,
+                body=SkillUpdateRequest(enabled=False),
+                principal=principal,
             )
         assert edit_denied.value.status_code == 403
         with pytest.raises(HTTPException) as delete_denied:
-            skills.delete_skill(victim, scoped, principal)
+            skills._delete_skill(scoped, skill_id=victim, principal=principal)
         assert delete_denied.value.status_code == 403
 
 
@@ -1516,15 +1516,15 @@ def test_builtin_identity_fails_closed_when_package_assets_are_missing(
     )
 
     admin = _scoped(org_engine, ADMIN)
-    response = skills.get_skill(victim, admin, _principal(ADMIN, admin=True))
+    response = skills._get_skill(admin, skill_id=victim, principal=_principal(ADMIN, admin=True))
     assert response["isBuiltin"] is True
     assert response["capabilities"]["canEdit"] is False
     with pytest.raises(HTTPException) as denied:
-        skills.update_skill(
-            victim,
-            SkillUpdateRequest(instructions="replace packaged content"),
+        skills._update_skill(
             admin,
-            _principal(ADMIN, admin=True),
+            skill_id=victim,
+            body=SkillUpdateRequest(instructions="replace packaged content"),
+            principal=_principal(ADMIN, admin=True),
         )
     assert denied.value.status_code == 403
 
@@ -1542,9 +1542,9 @@ def test_builtin_identity_uses_directory_slug_when_frontmatter_drifts(org_engine
 
     admin = _scoped(org_engine, ADMIN)
     principal = _principal(ADMIN, admin=True)
-    response = skills.get_skill(victim, admin, principal)
+    response = skills._get_skill(admin, skill_id=victim, principal=principal)
     listed = {
-        item["id"]: item for item in skills.list_skills(admin, principal)["skills"]
+        item["id"]: item for item in skills._list_skills(admin, principal=principal)["skills"]
     }
 
     for item in (response, listed[victim]):
@@ -1557,15 +1557,15 @@ def test_builtin_identity_uses_directory_slug_when_frontmatter_drifts(org_engine
             "canShare": False,
         }
     with pytest.raises(HTTPException) as edit_denied:
-        skills.update_skill(
-            victim,
-            SkillUpdateRequest(instructions="replace packaged content"),
+        skills._update_skill(
             admin,
-            principal,
+            skill_id=victim,
+            body=SkillUpdateRequest(instructions="replace packaged content"),
+            principal=principal,
         )
     assert edit_denied.value.status_code == 403
     with pytest.raises(HTTPException) as delete_denied:
-        skills.delete_skill(victim, admin, principal)
+        skills._delete_skill(admin, skill_id=victim, principal=principal)
     assert delete_denied.value.status_code == 403
     assert skill_file.read_bytes() == original_bytes.replace(
         b"name: documents", b"name: renamed-documents", 1
@@ -1577,16 +1577,16 @@ def test_builtin_identity_uses_directory_slug_when_frontmatter_drifts(org_engine
 
 def test_local_mode_keeps_project_and_builtin_mutations(org_engine):
     local = ScopedSession(Session(org_engine), LOCAL_SCOPE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="local-project"),
+    project = projects._create_project(
         local,
-        None,
+        body=ProjectCreateRequest(name="local-project"),
+        principal=None,
     )
-    renamed = projects.update_project(
-        project["id"],
-        ProjectUpdateRequest(name="local-renamed"),
+    renamed = projects._update_project(
         local,
-        None,
+        project_id=project["id"],
+        body=ProjectUpdateRequest(name="local-renamed"),
+        principal=None,
     )
     assert renamed["name"] == "local-renamed"
     assert renamed["capabilities"].can_delete is True
@@ -1620,20 +1620,20 @@ def test_local_mode_keeps_project_and_builtin_mutations(org_engine):
     target = service.root / victim
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(BUILTIN_SKILLS_DIR / victim, target)
-    response = skills.get_skill(victim, local, None)
+    response = skills._get_skill(local, skill_id=victim, principal=None)
     assert response["isBuiltin"] is True
     assert response["capabilities"]["canEdit"] is True
-    skills.update_skill(
-        victim,
-        SkillUpdateRequest(enabled=False),
+    skills._update_skill(
         local,
-        None,
+        skill_id=victim,
+        body=SkillUpdateRequest(enabled=False),
+        principal=None,
     )
-    skills.delete_skill(victim, local, None)
+    skills._delete_skill(local, skill_id=victim, principal=None)
     assert not target.exists()
 
     project_path = Path(renamed["path"])
-    projects.delete_project(renamed["id"], local, None)
+    projects._delete_project(local, project_id=renamed["id"], principal=None)
     assert local.get(Project, renamed["id"]) is None
     assert not project_path.exists()
 
@@ -2374,15 +2374,15 @@ def test_process_resource_lock_has_a_bounded_wait(org_engine, monkeypatch):
 
 def test_stale_skill_waiter_cannot_leave_a_ghost_attribution(org_engine):
     alice = _scoped(org_engine, ALICE)
-    created = skills.create_skill(
-        SkillCreateRequest(label="reusable slug", instructions="First version"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="reusable slug", instructions="First version"),
+        principal=_principal(ALICE),
     )
     slug = created["id"]
     stale_service = SkillService(alice.scope)
     assert stale_service.get_skill(slug).name == slug
-    skills.delete_skill(slug, alice, _principal(ALICE))
+    skills._delete_skill(alice, skill_id=slug, principal=_principal(ALICE))
 
     admin = _scoped(org_engine, ADMIN)
     with pytest.raises(HTTPException) as gone:
@@ -2399,10 +2399,10 @@ def test_stale_skill_waiter_cannot_leave_a_ghost_attribution(org_engine):
     assert admin.exec(admin.select(SharedResourceAttribution)).all() == []
 
     bob = _scoped(org_engine, BOB)
-    recreated = skills.create_skill(
-        SkillCreateRequest(label="reusable slug", instructions="Second version"),
+    recreated = skills._create_skill(
         bob,
-        _principal(BOB),
+        body=SkillCreateRequest(label="reusable slug", instructions="Second version"),
+        principal=_principal(BOB),
     )
     assert recreated["attribution"]["createdBy"]["userId"] == BOB
 
@@ -2441,10 +2441,10 @@ def test_stale_incomplete_skill_claim_is_cleaned_before_create(org_engine):
         encoding="utf-8",
     )
 
-    created = skills.create_skill(
-        SkillCreateRequest(label=slug, instructions="Recovered content"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label=slug, instructions="Recovered content"),
+        principal=_principal(ALICE),
     )
 
     assert created["id"] == slug
@@ -2463,11 +2463,11 @@ def test_stale_complete_skill_claim_is_recovered_before_mutations(org_engine):
     update_slug = "recovered-before-update"
     _leave_expired_complete_skill_claim(alice, update_slug)
 
-    updated = skills.update_skill(
-        update_slug,
-        SkillUpdateRequest(instructions="Updated after recovery"),
+    updated = skills._update_skill(
         alice,
-        _principal(ALICE),
+        skill_id=update_slug,
+        body=SkillUpdateRequest(instructions="Updated after recovery"),
+        principal=_principal(ALICE),
     )
 
     assert updated["declarative"] == "Updated after recovery"
@@ -2486,7 +2486,7 @@ def test_stale_complete_skill_claim_is_recovered_before_mutations(org_engine):
     _leave_expired_complete_skill_claim(alice, delete_slug)
     admin = _scoped(org_engine, ADMIN)
 
-    skills.delete_skill(delete_slug, admin, _principal(ADMIN, admin=True))
+    skills._delete_skill(admin, skill_id=delete_slug, principal=_principal(ADMIN, admin=True))
 
     assert not SkillService(alice.scope)._skill_dir(delete_slug).exists()
     delete_events = alice.exec(
@@ -2542,20 +2542,20 @@ async def test_skill_upload_endpoint_offloads_the_owned_session_worker(monkeypat
     principal = _principal(ALICE)
     upload = UploadFile(filename="worker.md", file=io.BytesIO(b"skill bytes"))
 
-    async def fake_run_in_threadpool(function, *args, **kwargs):
-        captured["function"] = function
-        captured["args"] = args
-        captured["kwargs"] = kwargs
+    async def fake_run_efs(work, *, scope):
+        captured["work"] = work
+        captured["scope"] = scope
         return {"worker": True}
 
-    monkeypatch.setattr(skills, "run_in_threadpool", fake_run_in_threadpool)
+    monkeypatch.setattr(skills, "run_efs", fake_run_efs)
 
     result = await skills.upload_skill(upload, scope, principal)
 
     assert result == {"worker": True}
-    assert captured["function"] is skills._upload_skill_in_new_session
-    assert captured["args"] == (b"skill bytes", "worker.md", scope, principal)
-    assert captured["kwargs"] == {"shared": False}
+    assert captured["work"].func is skills._upload_skill_in_new_session
+    assert captured["work"].args == (b"skill bytes", "worker.md", scope, principal)
+    assert captured["work"].keywords == {"shared": False}
+    assert captured["scope"] == scope
 
 
 @pytest.mark.asyncio
@@ -2626,37 +2626,24 @@ def test_skill_upload_worker_closes_its_session_on_failure(monkeypatch):
     assert raw_session.closed == 1
 
 
-def test_memory_endpoints_run_as_sync_workers():
+async def test_memory_endpoints_run_their_work_as_one_unit_on_the_file_store_threads(monkeypatch):
+    """Memory reads the project row and the memory files together, so each
+    route runs that work as one unit on the file store's threads, never on
+    the event loop or on anyio's default threads."""
     import inspect
 
-    assert not inspect.iscoroutinefunction(memory_endpoints.list_memory)
-    assert not inspect.iscoroutinefunction(memory_endpoints.update_memory)
-    assert not inspect.iscoroutinefunction(memory_endpoints.delete_memory)
+    scopes = []
 
+    async def recording_unit(fn, *, scope, deadline=True):
+        scopes.append(scope)
+        return []
 
-def test_memory_worker_closes_its_owned_session(monkeypatch):
-    class RawSession:
-        def __init__(self):
-            self.closed = 0
+    monkeypatch.setattr(memory_endpoints, "run_efs_unit", recording_unit)
 
-        def close(self):
-            self.closed += 1
-
-    raw_session = RawSession()
-    scoped = SimpleNamespace(scope=LOCAL_SCOPE)
-    monkeypatch.setattr(memory_endpoints, "get_open_session", lambda: raw_session)
-    monkeypatch.setattr(
-        memory_endpoints,
-        "ScopedSession",
-        lambda raw, scope: scoped,
-    )
-
-    with pytest.raises(RuntimeError, match="worker failed"):
-        with memory_endpoints._memory_service(LOCAL_SCOPE, None) as service:
-            assert service.session is scoped
-            raise RuntimeError("worker failed")
-
-    assert raw_session.closed == 1
+    for route in (memory_endpoints.list_memory, memory_endpoints.update_memory, memory_endpoints.delete_memory):
+        assert inspect.iscoroutinefunction(route)
+    assert await memory_endpoints.list_memory(LOCAL_SCOPE, None, None) == []
+    assert scopes == [LOCAL_SCOPE]
 
 
 def test_skill_noop_semantic_actions_and_delete_compensation(
@@ -2664,10 +2651,10 @@ def test_skill_noop_semantic_actions_and_delete_compensation(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    created = skills.create_skill(
-        SkillCreateRequest(label="audit skill", instructions="Initial"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="audit skill", instructions="Initial"),
+        principal=_principal(ALICE),
     )
     slug = created["id"]
     service = SkillService(alice.scope)
@@ -2676,11 +2663,11 @@ def test_skill_noop_semantic_actions_and_delete_compensation(
     before_updated = created["updatedAt"]
     before_events = alice.exec(alice.select(SharedResourceMutation)).all()
 
-    noop = skills.update_skill(
-        slug,
-        SkillUpdateRequest(instructions="Initial", enabled=True),
+    noop = skills._update_skill(
         alice,
-        _principal(ALICE),
+        skill_id=slug,
+        body=SkillUpdateRequest(instructions="Initial", enabled=True),
+        principal=_principal(ALICE),
     )
     assert noop["updatedAt"] == before_updated
     assert skill_file.read_bytes() == before_bytes
@@ -2688,15 +2675,15 @@ def test_skill_noop_semantic_actions_and_delete_compensation(
         before_events
     )
 
-    changed = skills.update_skill(
-        slug,
-        SkillUpdateRequest(
+    changed = skills._update_skill(
+        alice,
+        skill_id=slug,
+        body=SkillUpdateRequest(
             label="audit skill renamed",
             instructions="Changed",
             enabled=False,
         ),
-        alice,
-        _principal(ALICE),
+        principal=_principal(ALICE),
     )
     renamed_slug = changed["id"]
     assert renamed_slug != slug
@@ -2705,11 +2692,11 @@ def test_skill_noop_semantic_actions_and_delete_compensation(
     ]
     assert actions == ["create", "rename", "update", "disable"]
 
-    reenabled = skills.update_skill(
-        renamed_slug,
-        SkillUpdateRequest(enabled=True),
+    reenabled = skills._update_skill(
         alice,
-        _principal(ALICE),
+        skill_id=renamed_slug,
+        body=SkillUpdateRequest(enabled=True),
+        principal=_principal(ALICE),
     )
     assert reenabled["enabled"] is True
     actions = [
@@ -2722,7 +2709,7 @@ def test_skill_noop_semantic_actions_and_delete_compensation(
 
     monkeypatch.setattr(SharedResourceAccess, "record_delete", fail_delete)
     with pytest.raises(RuntimeError, match="audit unavailable"):
-        skills.delete_skill(renamed_slug, alice, _principal(ALICE))
+        skills._delete_skill(alice, skill_id=renamed_slug, principal=_principal(ALICE))
     assert service.get_skill(renamed_slug).instructions == "Changed"
     attribution = SharedResourceAccess(alice, _principal(ALICE))._find(
         SKILL,
@@ -2739,10 +2726,10 @@ def test_skill_rename_conflict_restores_source_when_destination_claim_races(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    created = skills.create_skill(
-        SkillCreateRequest(label="rename claim source", instructions="Original"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="rename claim source", instructions="Original"),
+        principal=_principal(ALICE),
     )
     source_slug = created["id"]
     destination_slug = "rename-claim-destination"
@@ -2769,11 +2756,11 @@ def test_skill_rename_conflict_restores_source_when_destination_claim_races(
     )
 
     with pytest.raises(HTTPException) as conflict:
-        skills.update_skill(
-            source_slug,
-            SkillUpdateRequest(label="rename claim destination"),
+        skills._update_skill(
             alice,
-            _principal(ALICE),
+            skill_id=source_slug,
+            body=SkillUpdateRequest(label="rename claim destination"),
+            principal=_principal(ALICE),
         )
 
     assert conflict.value.status_code == 409
@@ -2800,10 +2787,10 @@ def test_skill_rename_authorizes_source_before_disclosing_destination_claim(
     org_engine,
 ):
     alice = _scoped(org_engine, ALICE)
-    created = skills.create_skill(
-        SkillCreateRequest(label="private rename source", instructions="Original"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="private rename source", instructions="Original"),
+        principal=_principal(ALICE),
     )
     destination_slug = "claimed-rename-destination"
     claim, claim_token = SharedResourceAccess(
@@ -2814,11 +2801,11 @@ def test_skill_rename_authorizes_source_before_disclosing_destination_claim(
 
     bob = _scoped(org_engine, BOB)
     with pytest.raises(HTTPException) as denied:
-        skills.update_skill(
-            created["id"],
-            SkillUpdateRequest(label="claimed rename destination"),
+        skills._update_skill(
             bob,
-            _principal(BOB),
+            skill_id=created["id"],
+            body=SkillUpdateRequest(label="claimed rename destination"),
+            principal=_principal(BOB),
         )
 
     assert denied.value.status_code == 403
@@ -2835,18 +2822,18 @@ def test_skill_rename_to_packaged_identity_preserves_immutable_response(org_engi
     alice = _scoped(org_engine, ALICE)
     service = SkillService(alice.scope)
     service.ensure_builtin_skills()
-    created = skills.create_skill(
-        SkillCreateRequest(label="builtin rename source", instructions="Original"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="builtin rename source", instructions="Original"),
+        principal=_principal(ALICE),
     )
 
     with pytest.raises(HTTPException) as immutable:
-        skills.update_skill(
-            created["id"],
-            SkillUpdateRequest(label="skill-creator"),
+        skills._update_skill(
             alice,
-            _principal(ALICE),
+            skill_id=created["id"],
+            body=SkillUpdateRequest(label="skill-creator"),
+            principal=_principal(ALICE),
         )
 
     assert immutable.value.status_code == 403
@@ -2856,10 +2843,10 @@ def test_skill_rename_to_packaged_identity_preserves_immutable_response(org_engi
 
 def test_skill_rename_recovers_expired_empty_destination_claim(org_engine):
     alice = _scoped(org_engine, ALICE)
-    created = skills.create_skill(
-        SkillCreateRequest(label="expired rename source", instructions="Original"),
+    created = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="expired rename source", instructions="Original"),
+        principal=_principal(ALICE),
     )
     source_slug = created["id"]
     destination_slug = "expired-rename-destination"
@@ -2873,11 +2860,11 @@ def test_skill_rename_recovers_expired_empty_destination_claim(org_engine):
     alice.add(claim)
     alice.commit()
 
-    renamed = skills.update_skill(
-        source_slug,
-        SkillUpdateRequest(label="expired rename destination"),
+    renamed = skills._update_skill(
         alice,
-        _principal(ALICE),
+        skill_id=source_slug,
+        body=SkillUpdateRequest(label="expired rename destination"),
+        principal=_principal(ALICE),
     )
 
     assert renamed["id"] == destination_slug
@@ -2901,13 +2888,13 @@ def test_skill_audit_failure_restores_noncanonical_bytes_and_metadata(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    created = skills.create_skill(
-        SkillCreateRequest(
+    created = skills._create_skill(
+        alice,
+        body=SkillCreateRequest(
             label="byte exact rollback",
             instructions="Initial canonical body",
         ),
-        alice,
-        _principal(ALICE),
+        principal=_principal(ALICE),
     )
     slug = created["id"]
     service = SkillService(alice.scope)
@@ -2944,11 +2931,11 @@ def test_skill_audit_failure_restores_noncanonical_bytes_and_metadata(
 
     monkeypatch.setattr(SharedResourceAccess, "record_updates", stage_then_fail)
     with pytest.raises(RuntimeError, match="skill audit failed"):
-        skills.update_skill(
-            slug,
-            SkillUpdateRequest(instructions="Uncommitted replacement"),
+        skills._update_skill(
             alice,
-            _principal(ALICE),
+            skill_id=slug,
+            body=SkillUpdateRequest(instructions="Uncommitted replacement"),
+            principal=_principal(ALICE),
         )
 
     assert skill_file.read_bytes() == original_bytes
@@ -2973,10 +2960,10 @@ def test_skill_audit_failure_restores_noncanonical_bytes_and_metadata(
 async def test_project_delete_audits_and_cleans_protected_children(org_engine):
     alice = _scoped(org_engine, ALICE)
     bob = _scoped(org_engine, BOB)
-    project = projects.create_project(
-        ProjectCreateRequest(name="cascade-delete"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="cascade-delete"),
+        principal=_principal(ALICE),
     )
     project_id = project["id"]
     project_name = project["name"]
@@ -3009,12 +2996,12 @@ async def test_project_delete_audits_and_cleans_protected_children(org_engine):
     assert not direct_owner_path.exists()
     assert direct_peer_path.exists()
 
-    project_files.write_project_file(
-        project_name,
-        project_files._validated_project_path(".anton/anton.md"),
-        project_files._FileWriteRequest(content="Protected instructions"),
+    project_files._write_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project_name,
+        path=project_files._validated_project_path(".anton/anton.md"),
+        req=project_files._FileWriteRequest(content="Protected instructions"),
+        principal=_principal(ALICE),
     )
     await MemoryService(alice, _principal(ALICE)).update_memory(
         scope="project",
@@ -3043,7 +3030,7 @@ async def test_project_delete_audits_and_cleans_protected_children(org_engine):
     foreign_attachment_path = Path(foreign_attachment.path)
     parent_owner_attachment_path = Path(parent_owner_attachment.path)
 
-    projects.delete_project(project_id, alice, _principal(ALICE))
+    projects._delete_project(alice, project_id=project_id, principal=_principal(ALICE))
 
     keys = {
         (PROJECT, project_resource_key(project_id)),
@@ -3088,10 +3075,10 @@ def test_project_delete_restores_row_directory_and_attribution_on_audit_failure(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="delete-rollback"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="delete-rollback"),
+        principal=_principal(ALICE),
     )
     project_id = project["id"]
     project_path = Path(project["path"])
@@ -3133,7 +3120,7 @@ def test_project_delete_restores_row_directory_and_attribution_on_audit_failure(
     )
 
     with pytest.raises(RuntimeError, match="delete audit failed"):
-        projects.delete_project(project_id, alice, _principal(ALICE))
+        projects._delete_project(alice, project_id=project_id, principal=_principal(ALICE))
 
     current = ProjectService(alice).get_project(project_id)
     assert Path(current.path) == project_path
@@ -3159,10 +3146,10 @@ def test_project_delete_cleans_a_legacy_memory_identity_cleared_before_lock(
     monkeypatch,
 ):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="legacy-memory-delete-race"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="legacy-memory-delete-race"),
+        principal=_principal(ALICE),
     )
     project_id = project["id"]
     store = ProjectMemoryStore(Path(project["path"]))
@@ -3185,7 +3172,7 @@ def test_project_delete_cleans_a_legacy_memory_identity_cleared_before_lock(
         clear_after_identity,
     )
     admin = _scoped(org_engine, ADMIN)
-    projects.delete_project(project_id, admin, _principal(ADMIN, admin=True))
+    projects._delete_project(admin, project_id=project_id, principal=_principal(ADMIN, admin=True))
 
     assert (
         SharedResourceAccess(admin, _principal(ADMIN, admin=True))._find(
@@ -3240,34 +3227,34 @@ def test_instructions_gate_does_not_gate_ordinary_project_files(org_engine):
     instructions_path = project_files._validated_project_path(".anton/anton.md")
     request = project_files._FileWriteRequest(content="Be concise")
 
-    result = project_files.write_project_file(
-        project.name,
-        instructions_path,
-        request,
+    result = project_files._write_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        path=instructions_path,
+        req=request,
+        principal=_principal(ALICE),
     )
     assert result["attribution"].created_by.user_id == ALICE
     assert result["capabilities"].can_edit is True
-    special = project_files.get_project_instructions(
-        project.name,
+    special = project_files._get_project_instructions(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        principal=_principal(ALICE),
     )["file"]
-    direct = project_files.read_project_file(
-        project.name,
-        ".anton/anton.md",
+    direct = project_files._read_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        path=".anton/anton.md",
+        principal=_principal(ALICE),
     )
     assert special["attribution"].created_by.user_id == ALICE
     assert direct["attribution"].created_by.user_id == ALICE
     assert direct["capabilities"].can_edit is True
-    normalized_alias = project_files.read_project_file(
-        project.name,
-        "notes/../.anton\\anton.md",
+    normalized_alias = project_files._read_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        path="notes/../.anton\\anton.md",
+        principal=_principal(ALICE),
     )
     assert normalized_alias["attribution"].created_by.user_id == ALICE
     assert normalized_alias["capabilities"].can_edit is True
@@ -3278,32 +3265,32 @@ def test_instructions_gate_does_not_gate_ordinary_project_files(org_engine):
 
     bob = _scoped(org_engine, BOB)
     with pytest.raises(HTTPException) as denied:
-        project_files.write_project_file(
-            project.name,
-            instructions_path,
-            project_files._FileWriteRequest(content="Take over"),
+        project_files._write_project_file(
             bob,
-            _principal(BOB),
+            project_name=project.name,
+            path=instructions_path,
+            req=project_files._FileWriteRequest(content="Take over"),
+            principal=_principal(BOB),
         )
     assert denied.value.status_code == 403
 
     admin = _scoped(org_engine, ADMIN)
-    admin_edit = project_files.write_project_file(
-        project.name,
-        instructions_path,
-        project_files._FileWriteRequest(content="Admin revision"),
+    admin_edit = project_files._write_project_file(
         admin,
-        _principal(ADMIN, admin=True),
+        project_name=project.name,
+        path=instructions_path,
+        req=project_files._FileWriteRequest(content="Admin revision"),
+        principal=_principal(ADMIN, admin=True),
     )
     assert admin_edit["attribution"].created_by.user_id == ALICE
     assert admin_edit["attribution"].last_modified_by.user_id == ADMIN
 
-    cleared = project_files.write_project_file(
-        project.name,
-        instructions_path,
-        project_files._FileWriteRequest(content=""),
+    cleared = project_files._write_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        path=instructions_path,
+        req=project_files._FileWriteRequest(content=""),
+        principal=_principal(ALICE),
     )
     assert cleared["attribution"].created_by.user_id == ALICE
     instruction_events = alice.exec(
@@ -3319,33 +3306,33 @@ def test_instructions_gate_does_not_gate_ordinary_project_files(org_engine):
     }
 
     with pytest.raises(HTTPException) as peer_delete_denied:
-        project_files.delete_project_file(
-            project.name,
-            instructions_path,
+        project_files._delete_project_file(
             bob,
-            _principal(BOB),
+            project_name=project.name,
+            path=instructions_path,
+            principal=_principal(BOB),
         )
     assert peer_delete_denied.value.status_code == 403
-    project_files.delete_project_file(
-        project.name,
-        instructions_path,
+    project_files._delete_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        path=instructions_path,
+        principal=_principal(ALICE),
     )
-    deleted = project_files.get_project_instructions(
-        project.name,
+    deleted = project_files._get_project_instructions(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        principal=_principal(ALICE),
     )["file"]
     assert deleted["synthetic"] is True
     assert deleted["attribution"].created_by is None
 
-    ordinary = project_files.write_project_file(
-        project.name,
-        project_files._validated_project_path("notes/member.txt"),
-        project_files._FileWriteRequest(content="Member-owned content"),
+    ordinary = project_files._write_project_file(
         bob,
-        _principal(BOB),
+        project_name=project.name,
+        path=project_files._validated_project_path("notes/member.txt"),
+        req=project_files._FileWriteRequest(content="Member-owned content"),
+        principal=_principal(BOB),
     )
     assert ordinary["path"] == "notes/member.txt"
 
@@ -3353,21 +3340,21 @@ def test_instructions_gate_does_not_gate_ordinary_project_files(org_engine):
     legacy_path = Path(legacy.path) / ".anton" / "anton.md"
     legacy_path.parent.mkdir(parents=True)
     legacy_path.write_text("Historical author unknown")
-    legacy_edit = project_files.write_project_file(
-        legacy.name,
-        instructions_path,
-        project_files._FileWriteRequest(content="Admin-maintained legacy"),
+    legacy_edit = project_files._write_project_file(
         admin,
-        _principal(ADMIN, admin=True),
+        project_name=legacy.name,
+        path=instructions_path,
+        req=project_files._FileWriteRequest(content="Admin-maintained legacy"),
+        principal=_principal(ADMIN, admin=True),
     )
     assert legacy_edit["attribution"].created_by is None
     assert legacy_edit["attribution"].last_modified_by.user_id == ADMIN
-    creator_edit = project_files.write_project_file(
-        legacy.name,
-        instructions_path,
-        project_files._FileWriteRequest(content="Creator-maintained legacy"),
+    creator_edit = project_files._write_project_file(
         alice,
-        _principal(ALICE),
+        project_name=legacy.name,
+        path=instructions_path,
+        req=project_files._FileWriteRequest(content="Creator-maintained legacy"),
+        principal=_principal(ALICE),
     )
     assert creator_edit["attribution"].created_by is None
     assert creator_edit["attribution"].last_modified_by.user_id == ALICE
@@ -3391,12 +3378,12 @@ def test_instruction_write_response_reuses_advisory_lock_owner(
 
     monkeypatch.setattr(project_files, "SharedResourceAccess", tracked_access)
 
-    result = project_files.write_project_file(
-        project.name,
-        instructions_path,
-        project_files._FileWriteRequest(content="Keep one lock owner"),
+    result = project_files._write_project_file(
         alice,
-        _principal(ALICE),
+        project_name=project.name,
+        path=instructions_path,
+        req=project_files._FileWriteRequest(content="Keep one lock owner"),
+        principal=_principal(ALICE),
     )
 
     assert result["attribution"].created_by.user_id == ALICE
@@ -3408,10 +3395,10 @@ async def test_generic_project_files_cannot_bypass_canonical_memory_contract(
     org_engine,
 ):
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="reserved-memory-files"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="reserved-memory-files"),
+        principal=_principal(ALICE),
     )
     service = MemoryService(alice, _principal(ALICE))
     await service.update_memory(
@@ -3443,21 +3430,21 @@ async def test_generic_project_files_cannot_bypass_canonical_memory_contract(
         for slot in ("rules", "lessons"):
             path = project_files._validated_project_path(f".anton/memory/{slot}.md")
             with pytest.raises(HTTPException) as put_denied:
-                project_files.write_project_file(
-                    project["name"],
-                    path,
-                    project_files._FileWriteRequest(content="bypass bytes"),
+                project_files._write_project_file(
                     scoped,
-                    principal,
+                    project_name=project["name"],
+                    path=path,
+                    req=project_files._FileWriteRequest(content="bypass bytes"),
+                    principal=principal,
                 )
             assert put_denied.value.status_code == 409
             assert "/api/v1/memory/" in put_denied.value.detail
             with pytest.raises(HTTPException) as delete_denied:
-                project_files.delete_project_file(
-                    project["name"],
-                    path,
+                project_files._delete_project_file(
                     scoped,
-                    principal,
+                    project_name=project["name"],
+                    path=path,
+                    principal=principal,
                 )
             assert delete_denied.value.status_code == 409
             assert "/api/v1/memory/" in delete_denied.value.detail
@@ -3486,20 +3473,20 @@ def test_generic_project_files_reject_protected_namespace_squatting_but_not_desk
     ):
         path = project_files._validated_project_path(raw)
         with pytest.raises(HTTPException) as put_denied:
-            project_files.write_project_file(
-                project.name,
-                path,
-                project_files._FileWriteRequest(content="squat"),
+            project_files._write_project_file(
                 alice,
-                _principal(ALICE),
+                project_name=project.name,
+                path=path,
+                req=project_files._FileWriteRequest(content="squat"),
+                principal=_principal(ALICE),
             )
         assert put_denied.value.status_code == 409
         with pytest.raises(HTTPException) as delete_denied:
-            project_files.delete_project_file(
-                project.name,
-                path,
+            project_files._delete_project_file(
                 alice,
-                _principal(ALICE),
+                project_name=project.name,
+                path=path,
+                principal=_principal(ALICE),
             )
         assert delete_denied.value.status_code == 409
     assert set(Path(project.path).rglob("*")) == before
@@ -3507,12 +3494,12 @@ def test_generic_project_files_reject_protected_namespace_squatting_but_not_desk
     local = ScopedSession(Session(org_engine), LOCAL_SCOPE)
     local_project = ProjectService(local).create_project("desktop-memory-file")
     local_path = project_files._validated_project_path(".anton/memory/rules.md")
-    written = project_files.write_project_file(
-        local_project.name,
-        local_path,
-        project_files._FileWriteRequest(content="desktop bytes"),
+    written = project_files._write_project_file(
         local,
-        None,
+        project_name=local_project.name,
+        path=local_path,
+        req=project_files._FileWriteRequest(content="desktop bytes"),
+        principal=None,
     )
     assert written["path"] == ".anton/memory/rules.md"
     assert (Path(local_project.path) / written["path"]).read_text() == "desktop bytes"
@@ -3530,11 +3517,10 @@ def test_compat_move_rejects_reserved_anton_without_consuming_attachment(org_eng
     source = Path(attachment.path)
 
     with pytest.raises(HTTPException) as denied:
-        compat_stubs.move_attachment_to_project(
-            project.name,
-            "session",
-            attachment.id,
+        compat_stubs._move_attachment_to_project(
             alice,
+            project_name=project.name,
+            attachment_id=attachment.id,
         )
 
     assert denied.value.status_code == 409
@@ -3555,19 +3541,19 @@ def test_project_rename_terminates_when_a_referencing_skill_never_resolves(
     mutation lock always 404s while holding the org-wide namespace lock.
     """
     alice = _scoped(org_engine, ALICE)
-    project = projects.create_project(
-        ProjectCreateRequest(name="rename-with-drifted-skill"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="rename-with-drifted-skill"),
+        principal=_principal(ALICE),
     )
-    created = skills.create_skill(
-        SkillCreateRequest(
+    created = skills._create_skill(
+        alice,
+        body=SkillCreateRequest(
             label="drifted skill",
             instructions="references the project",
             projects=[project["name"]],
         ),
-        alice,
-        _principal(ALICE),
+        principal=_principal(ALICE),
     )
     service = SkillService(alice.scope)
     slug = created["id"]
@@ -3590,11 +3576,11 @@ def test_project_rename_terminates_when_a_referencing_skill_never_resolves(
     assert slug in service.project_reference_slugs(project["name"])
     assert service.has_complete_skill(slug) is False
 
-    renamed = projects.update_project(
-        project["id"],
-        ProjectUpdateRequest(name="renamed-past-the-drift"),
+    renamed = projects._update_project(
         alice,
-        _principal(ALICE),
+        project_id=project["id"],
+        body=ProjectUpdateRequest(name="renamed-past-the-drift"),
+        principal=_principal(ALICE),
     )
     assert renamed["name"] == "renamed-past-the-drift"
 
@@ -3615,15 +3601,15 @@ async def test_a_peer_member_reads_every_shared_resource_with_no_capabilities(
     alice = _scoped(org_engine, ALICE)
     bob = _scoped(org_engine, BOB)
 
-    project = projects.create_project(
-        ProjectCreateRequest(name="alice-owns-this"),
+    project = projects._create_project(
         alice,
-        _principal(ALICE),
+        body=ProjectCreateRequest(name="alice-owns-this"),
+        principal=_principal(ALICE),
     )
-    skill = skills.create_skill(
-        SkillCreateRequest(label="alice skill", instructions="hers"),
+    skill = skills._create_skill(
         alice,
-        _principal(ALICE),
+        body=SkillCreateRequest(label="alice skill", instructions="hers"),
+        principal=_principal(ALICE),
     )
     await MemoryService(alice, _principal(ALICE)).update_memory(
         scope="project",
@@ -3632,13 +3618,13 @@ async def test_a_peer_member_reads_every_shared_resource_with_no_capabilities(
         project_id=project["id"],
     )
 
-    peer_projects = projects.list_projects(bob, _principal(BOB))
+    peer_projects = projects._list_projects(bob, principal=_principal(BOB))
     peer_project = next(p for p in peer_projects if p["id"] == project["id"])
     assert peer_project["capabilities"].can_rename is False
     assert peer_project["capabilities"].can_delete is False
     assert peer_project["capabilities"].can_edit_instructions is False
 
-    peer_skill = skills.get_skill(skill["id"], bob, _principal(BOB))
+    peer_skill = skills._get_skill(bob, skill_id=skill["id"], principal=_principal(BOB))
     assert jsonable_encoder(peer_skill)["capabilities"] == {
         "canEdit": False,
         "canDelete": False,
@@ -3656,7 +3642,7 @@ async def test_a_peer_member_reads_every_shared_resource_with_no_capabilities(
 
     # The creator still sees the allow side, or a gate that denied everyone
     # would satisfy the assertions above.
-    own_skill = skills.get_skill(skill["id"], alice, _principal(ALICE))
+    own_skill = skills._get_skill(alice, skill_id=skill["id"], principal=_principal(ALICE))
     assert jsonable_encoder(own_skill)["capabilities"]["canEdit"] is True
 
 
@@ -3727,10 +3713,10 @@ def test_a_packaged_skill_slug_cannot_be_squatted(org_engine):
     packaged = sorted(BUILTIN_SKILL_SLUGS)[0]
 
     with pytest.raises((HTTPException, PermissionError, ValueError)) as created:
-        skills.create_skill(
-            SkillCreateRequest(label=packaged, instructions="squatted"),
+        skills._create_skill(
             alice,
-            _principal(ALICE),
+            body=SkillCreateRequest(label=packaged, instructions="squatted"),
+            principal=_principal(ALICE),
         )
     if isinstance(created.value, HTTPException):
         assert created.value.status_code in (403, 409)
@@ -3739,14 +3725,14 @@ def test_a_packaged_skill_slug_cannot_be_squatted(org_engine):
     # every role, not merely for non-creators.
     admin = _scoped(org_engine, ADMIN)
     with pytest.raises((HTTPException, PermissionError, ValueError)):
-        skills.create_skill(
-            SkillCreateRequest(label=packaged, instructions="squatted by admin"),
+        skills._create_skill(
             admin,
-            _principal(ADMIN, admin=True),
+            body=SkillCreateRequest(label=packaged, instructions="squatted by admin"),
+            principal=_principal(ADMIN, admin=True),
         )
 
     # The packaged bytes are untouched and the identity still reports built-in.
-    still = skills.get_skill(packaged, alice, _principal(ALICE))
+    still = skills._get_skill(alice, skill_id=packaged, principal=_principal(ALICE))
     encoded = jsonable_encoder(still)
     assert encoded["isBuiltin"] is True
     assert encoded["capabilities"] == {

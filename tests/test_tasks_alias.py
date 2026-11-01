@@ -8,36 +8,34 @@ implementations, these fail.
 """
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.api.v1.endpoints import conversations
 from cowork.db.scoped import LOCAL_SCOPE, get_tenant_scope
-from cowork.db.session import get_session
+from cowork.db.units import unit_session
 from cowork.models.project import Project
+
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 
 @pytest.fixture
-def client():
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
-    SQLModel.metadata.create_all(engine)
-    with Session(engine) as seed:
-        project = Project(name="default", path="/tmp/default")
+def client(tmp_path):
+    # The suite's database: some routes run their work as units, which open
+    # sessions of their own on it rather than take the request's session.
+    with unit_session(scope=LOCAL_SCOPE) as seed:
+        project = Project(name=f"alias-{uuid4().hex[:8]}", path=str(tmp_path / "default"))
         seed.add(project)
         seed.commit()
-        seed.refresh(project)
         project_id = str(project.id)
 
     app = FastAPI()
     # Mirror api/v1/router.py: the same router mounted under both prefixes.
     app.include_router(conversations.router, prefix="/api/v1/conversations")
     app.include_router(conversations.router, prefix="/api/v1/tasks")
-    app.dependency_overrides[get_session] = lambda: Session(engine)
     app.dependency_overrides[get_tenant_scope] = lambda: LOCAL_SCOPE
     c = TestClient(app)
     c.project_id = project_id  # type: ignore[attr-defined]

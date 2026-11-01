@@ -21,7 +21,7 @@ from cowork.db.scoped import (
     scope_from_principal,
     unsafe_unscoped_session,
 )
-from cowork.db.units import run_db
+from cowork.db.units import FilesystemBusy, run_db
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
@@ -355,6 +355,27 @@ def _delete_unstarted_conversation(
     ConversationService(conv_session).delete_conversation(conversation_id)
 
 
+async def _discard_unstarted_conversation(
+    *, scheduled: _ScheduledTurn, conversation_id: UUID, schedule_id: UUID,
+) -> bool:
+    """Delete the conversation a run made for a turn that never started
+    (_delete_unstarted_conversation) in a unit of its own. True when it went;
+    a failed delete is logged, and the run keeps its link to the conversation."""
+    try:
+        await run_db(
+            partial(_delete_unstarted_conversation, scheduled=scheduled, conversation_id=conversation_id),
+            scope=SYSTEM_SCOPE,
+        )
+    except Exception:
+        logger.warning(
+            "Could not delete the empty conversation of a run that did not start",
+            exc_info=True,
+            extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+        )
+        return False
+    return True
+
+
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
 ) -> _RunOutcome:
@@ -529,14 +550,18 @@ async def execute_schedule(
             },
         )
         async def _drain_run() -> None:
+            nonlocal turn_started
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
             stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+            # handle() returns once it has started the turn's producer, which
+            # saves the question first. A refusal before that, such as the
+            # vault restore's or the turn start's read, leaves nothing done.
+            turn_started = True
             async for _ in stream:
                 pass
 
-        turn_started = True
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
@@ -554,22 +579,10 @@ async def execute_schedule(
                 "Schedule run did not start; the server is shutting down",
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
             )
-            if created_conversation:
-                try:
-                    await run_db(
-                        partial(
-                            _delete_unstarted_conversation,
-                            scheduled=scheduled, conversation_id=conversation_id,
-                        ),
-                        scope=SYSTEM_SCOPE,
-                    )
-                    conversation_id = None
-                except Exception:
-                    logger.warning(
-                        "Could not delete the empty conversation of a run that did not start",
-                        exc_info=True,
-                        extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
-                    )
+            if created_conversation and await _discard_unstarted_conversation(
+                scheduled=scheduled, conversation_id=conversation_id, schedule_id=schedule_id,
+            ):
+                conversation_id = None
             return
 
         # A cancel or a producer failure closes the stream normally from the
@@ -614,10 +627,19 @@ async def execute_schedule(
         # A run that raised consumes its cron slot like one that failed inside
         # its turn. Left due, the next poll starts it again, and a failure that
         # repeats (a timeout, a revoked permission) re-fires every poll. A busy
-        # pool or an auth outage before the turn starts is the exception: it
-        # clears on its own, the agent has done nothing yet, and skipping the
-        # slot would drop a daily or weekly occurrence over a short blip.
-        transient = not turn_started and isinstance(exc, (PoolTimeoutError, ProductPermissionUnavailable))
+        # pool, a busy file store or an auth outage before the turn starts is
+        # the exception: it clears on its own, the agent has done nothing yet,
+        # and skipping the slot would drop a daily or weekly occurrence over a
+        # short blip. As on a shutdown, the empty conversation this run made
+        # for its turn is deleted; the next poll makes its own.
+        transient = not turn_started and isinstance(
+            exc, (PoolTimeoutError, FilesystemBusy, ProductPermissionUnavailable)
+        )
+        if transient and created_conversation and conversation_id is not None:
+            if await _discard_unstarted_conversation(
+                scheduled=scheduled, conversation_id=conversation_id, schedule_id=schedule_id,
+            ):
+                conversation_id = None
         try:
             slot_consumed = await _until_it_lands(
                 partial(

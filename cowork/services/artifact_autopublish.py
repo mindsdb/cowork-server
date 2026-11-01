@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from cowork.db.units import run_efs, run_to_completion
+from cowork.db.units import run_efs, run_efs_cleanup, run_on_unit_threads
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -319,7 +319,7 @@ async def _release(artifacts_base: Path, slug: str, *, scope) -> None:
     failing, and a cancel that lands while it waits or runs waits for it: a
     lock left behind makes every later turn skip the slug as `lock_busy` until
     its TTL runs out."""
-    await run_to_completion(run_efs(partial(release, artifacts_base, slug), scope=scope, deadline=False))
+    await run_efs_cleanup(partial(release, artifacts_base, slug), scope=scope)
 
 
 async def _acquire(artifacts_base: Path, slug: str, *, ttl_s: float, scope) -> bool:
@@ -461,7 +461,7 @@ async def autopublish_project_artifacts(
     if not scope.org_id or not scope.user_id:
         _record("skipped", reason="no_scope_identity")
         return set()
-    if not _is_enabled(scope):
+    if not await run_on_unit_threads(partial(_is_enabled, scope)):
         return set()
     if not project_id:
         # Fail closed once, instead of raising in `_publish_one` for every slug.
@@ -480,9 +480,11 @@ async def autopublish_project_artifacts(
     phase_one = [s for s in all_slugs if s in touched]
     phase_two = [s for s in all_slugs if s not in touched]
 
-    publish_url = _publish_url(scope)
+    # Settings reads, each through a session of its own: off the loop.
+    publish_url = await run_on_unit_threads(partial(_publish_url, scope))
+    workspace_id = await run_on_unit_threads(partial(_active_workspace_id, scope))
     key = PublishKey(
-        scope.user_id, scope.org_id, min_ttl_s=timeout_s + 60.0, workspace_id=_active_workspace_id(scope)
+        scope.user_id, scope.org_id, min_ttl_s=timeout_s + 60.0, workspace_id=workspace_id
     )
     started = time.monotonic()
     published: set[str] = set()

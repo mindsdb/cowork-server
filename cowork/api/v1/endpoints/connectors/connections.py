@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.db.units import run_db, unit_session
+from cowork.db.units import run_db, run_efs, unit_session
 from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
@@ -348,17 +349,28 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     "/{engine}/{name}/picked-files/{file_id}",
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
-def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
+async def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
     """Untag one file from `project` — the "un-pick" counterpart to
     patch_picked_files, used by the Project files rail's delete action on
     a Drive reference row. Only removes the file from `project`'s rail;
     if the file is tagged to other projects too, it stays visible there
     (see remove_picked_file's docstring)."""
-    _refuse_unchangeable(scope, engine, name)
-    remaining = ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
+    # The caller's vault is files on disk, on the shared file store where
+    # hosted, so its read and write run on the file store's threads.
+    remaining = await run_efs(
+        partial(_remove_picked_file, scope=scope, engine=engine, name=name, file_id=file_id, project=project),
+        scope=scope,
+    )
     if remaining is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "files": remaining}
+
+
+def _remove_picked_file(
+    *, scope: TenantScope, engine: str, name: str, file_id: str, project: str
+) -> list[dict] | None:
+    _refuse_unchangeable(scope, engine, name)
+    return ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
 
 
 _ACCESS_MODES = {"read", "write", "none"}

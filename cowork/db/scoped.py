@@ -37,7 +37,7 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import MODEL_RESOURCE, STORE_RESOURCE, PersonalResource
 from cowork.db.session import get_session
-from cowork.principal import Principal, get_principal
+from cowork.principal import Principal
 
 
 class MissingTenantScopeError(RuntimeError):
@@ -143,9 +143,10 @@ def scope_for_org(org_id: str | None) -> TenantScope:
     return LOCAL_SCOPE if org_id is None else scope_for_identity(org_id=org_id, user_id=None)
 
 
-def get_tenant_scope(request: Request) -> TenantScope:
-    """FastAPI dependency: the request's tenant scope."""
-    return scope_from_principal(get_principal(request))
+async def get_tenant_scope(request: Request) -> TenantScope:
+    """FastAPI dependency: the request's tenant scope. A coroutine for the
+    reason get_principal is one."""
+    return scope_from_principal(getattr(request.state, "principal", None))
 
 
 def scope_for_background_context() -> TenantScope:
@@ -531,11 +532,12 @@ def adopt_scoped_session(session: Session) -> ScopedSession:
     return ScopedSession(session, scope)
 
 
-def get_scoped_session(
+async def get_scoped_session(
     session: Session = Depends(get_session),
     scope: TenantScope = Depends(get_tenant_scope),
 ) -> ScopedSession:
-    """FastAPI dependency: the request's tenant-scoped session."""
+    """FastAPI dependency: the request's tenant-scoped session. A coroutine
+    for the reason get_principal is one."""
     return ScopedSession(session, scope)
 
 

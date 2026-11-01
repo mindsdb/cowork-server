@@ -89,20 +89,20 @@ def _links(skills_dir: Path) -> dict[str, Path]:
 def test_a_person_lists_and_changes_only_their_own_skills(scoped):
     SkillService(ALICE).create_skill("probe-a-skill", "Alice's private procedure.")
 
-    bobs = {s["id"] for s in skills_ep.list_skills(scoped(BOB), None)["skills"]}
+    bobs = {s["id"] for s in skills_ep._list_skills(scoped(BOB), principal=None)["skills"]}
     assert "probe-a-skill" not in bobs
     with pytest.raises(HTTPException) as edit:
-        skills_ep.update_skill(
-            "probe-a-skill", SkillUpdateRequest(instructions="Bob's now"), scoped(BOB), None
+        skills_ep._update_skill(
+            scoped(BOB), skill_id="probe-a-skill", body=SkillUpdateRequest(instructions="Bob's now"), principal=None
         )
     assert edit.value.status_code == 404
     with pytest.raises(HTTPException) as removal:
-        skills_ep.delete_skill("probe-a-skill", scoped(BOB), None)
+        skills_ep._delete_skill(scoped(BOB), skill_id="probe-a-skill", principal=None)
     assert removal.value.status_code == 404
 
-    unchanged = skills_ep.get_skill("probe-a-skill", scoped(ALICE), None)
+    unchanged = skills_ep._get_skill(scoped(ALICE), skill_id="probe-a-skill", principal=None)
     assert unchanged["declarative"] == "Alice's private procedure."
-    alices = {s["id"] for s in skills_ep.list_skills(scoped(ALICE), None)["skills"]}
+    alices = {s["id"] for s in skills_ep._list_skills(scoped(ALICE), principal=None)["skills"]}
     assert "probe-a-skill" in alices
 
 
@@ -113,8 +113,8 @@ def test_shared_skills_stay_one_store(scoped, monkeypatch):
     shared_b = _person(partition=PARTITION_B, sub=SUB_B, resources=frozenset())
     SkillService(shared_a).create_skill("team-procedure", "Everyone's.")
 
-    assert "team-procedure" in {s["id"] for s in skills_ep.list_skills(scoped(shared_b), None)["skills"]}
-    assert "team-procedure" in {s["id"] for s in skills_ep.list_skills(scoped(LOCAL_SCOPE), None)["skills"]}
+    assert "team-procedure" in {s["id"] for s in skills_ep._list_skills(scoped(shared_b), principal=None)["skills"]}
+    assert "team-procedure" in {s["id"] for s in skills_ep._list_skills(scoped(LOCAL_SCOPE), principal=None)["skills"]}
 
 
 # ── links per turn ──────────────────────────────────────────────────────────

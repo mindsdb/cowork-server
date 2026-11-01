@@ -445,24 +445,24 @@ def _settings_env(monkeypatch):
     get_app_settings.cache_clear()
 
 
-def test_scope_is_local_in_local_mode(_settings_env):
+async def test_scope_is_local_in_local_mode(_settings_env):
     _settings_env.delenv("COWORK_TENANCY_MODE", raising=False)
     get_app_settings.cache_clear()
-    assert get_tenant_scope(_request()) == LOCAL_SCOPE
+    assert await get_tenant_scope(_request()) == LOCAL_SCOPE
 
 
-def test_scope_carries_principal_in_org_mode(_settings_env):
+async def test_scope_carries_principal_in_org_mode(_settings_env):
     _settings_env.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     principal = Principal(user_id="u-1", org_id=ORG_A)
-    scope = get_tenant_scope(_request(principal))
+    scope = await get_tenant_scope(_request(principal))
     assert scope == TenantScope(org_mode=True, org_id=ORG_A, user_id="u-1")
 
 
-def test_scope_without_principal_in_org_mode_has_no_org(_settings_env):
+async def test_scope_without_principal_in_org_mode_has_no_org(_settings_env):
     _settings_env.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
-    scope = get_tenant_scope(_request())
+    scope = await get_tenant_scope(_request())
     assert scope.org_mode is True
     assert scope.org_id is None
 
@@ -642,9 +642,9 @@ def test_trusted_identity_scope_carries_the_configured_resources(_settings_env, 
     assert scope.personal_resources == {PersonalResource.MEMORY, PersonalResource.SKILLS}
 
 
-def test_trusted_identity_without_a_person_is_the_operator_view(_settings_env, personal_deployment):
+async def test_trusted_identity_without_a_person_is_the_operator_view(_settings_env, personal_deployment):
     assert scope_from_principal(None) == LOCAL_SCOPE
-    assert get_tenant_scope(_request()) == LOCAL_SCOPE
+    assert await get_tenant_scope(_request()) == LOCAL_SCOPE
 
 
 def test_trusted_identity_org_id_alone_is_a_personless_partition(_settings_env, personal_deployment):

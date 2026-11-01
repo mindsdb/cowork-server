@@ -28,7 +28,9 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
     use_turn_settings,
 )
-from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_efs, run_to_completion
+from cowork.db.units import (
+    busy_retry_seconds, conversation_writes, run_db, run_efs, run_efs_unit, run_on_unit_threads, run_to_completion,
+)
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
 from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
@@ -642,6 +644,21 @@ def _start_first_take(
         reset_trace_context(token)
 
 
+def _carries_attachments(request: ResponsesRequest) -> bool:
+    """Whether the turn names an uploaded file, which its start reads from the
+    file store."""
+    if request.attachment_ids:
+        return True
+    if not isinstance(request.input, list):
+        return False
+    return any(
+        isinstance(item, Content) and item.type == ContentType.file and item.file_id
+        for message in request.input
+        if isinstance(message.content, list)
+        for item in message.content
+    )
+
+
 class ResponsesHandler:
     def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
         self.principal = principal
@@ -700,8 +717,11 @@ class ResponsesHandler:
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
-        # call, and a wait for one never stalls the event loop.
-        start = await run_db(
+        # call, and a wait for one never stalls the event loop. Attachments are
+        # read from the file store, so a turn that carries them waits for a
+        # file store slot.
+        read_unit = run_efs_unit if _carries_attachments(request) else run_db
+        start = await read_unit(
             partial(self._read_turn_start, request=request, has_disabled_connections=bool(disabled)),
             scope=self.scope,
         )
@@ -2469,7 +2489,9 @@ class ResponsesHandler:
             if isinstance(exc, PoolTimeoutError):
                 # No database connection freed in time. The frame says so with
                 # the wait, as a refused request's 503 does.
-                code, message = friendly_turn_error(exc)
+                # Off the loop: the classification reads settings, and the
+                # pool is full right now.
+                code, message = await run_on_unit_threads(partial(friendly_turn_error, exc))
                 retry_after = busy_retry_seconds()
                 extra: dict = {"retry_after": retry_after, "retry_at": retry_at_instant(retry_after)}
                 logger.warning(
@@ -2765,7 +2787,8 @@ class ResponsesHandler:
             # Resolve the model-403 info once and hand it to friendly_turn_error
             # so it isn't computed twice on this path (reused by the extras below).
             model_info = model_unavailable_info(exc)
-            friendly = friendly_turn_error(exc, model_info=model_info)
+            # Off the loop: the classification reads settings.
+            friendly = await run_on_unit_threads(partial(friendly_turn_error, exc, model_info=model_info))
             if friendly is not None:
                 code, message = friendly
                 logger.info(
@@ -2794,7 +2817,7 @@ class ResponsesHandler:
                 # (no reconnectable flag), so the stream still closes cleanly.
                 try:
                     provider = _auth_failure_provider(
-                        get_user_settings(), getattr(exc, "role", None)
+                        await run_on_unit_threads(get_user_settings), getattr(exc, "role", None)
                     )
                     # An unattributable failure keeps the generic auth copy with
                     # no provider fields, rather than naming a provider that may
@@ -2869,7 +2892,7 @@ class ResponsesHandler:
                 failed_model = overloaded_info[1] if overloaded_info else ""
                 extra = {"model": failed_model}
                 try:
-                    s = get_user_settings()
+                    s = await run_on_unit_threads(get_user_settings)
                     # The nudge keys on WHICH provider overloaded. anton passes the
                     # actual failing model (planning OR coding); map it back to its
                     # provider so a coding-model incident on a DIFFERENT provider
@@ -3075,7 +3098,8 @@ class ResponsesHandler:
             # Minted here rather than up front like the streaming twin: this
             # path has no seal to feed, so a successful turn needs no id.
             corr = str(uuid4())
-            friendly = friendly_turn_error(exc)
+            # Off the loop: the classification reads settings.
+            friendly = await run_on_unit_threads(partial(friendly_turn_error, exc))
             if friendly is not None:
                 code, message = friendly
                 logger.info(

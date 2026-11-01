@@ -633,10 +633,12 @@ def test_turn_terminal_reason_none_without_handle(monkeypatch):
     assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
 
 
-def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
+def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None, refusal=None):
     """Run execute_schedule with a no-op turn and a forced terminal reason;
     return the resulting run/schedule state as plain values. ``turn``, when
-    given, is awaited inside the turn's stream in place of the no-op."""
+    given, is awaited inside the turn's stream in place of the no-op.
+    ``refusal``, when given, is raised by the handler before it returns the
+    turn's stream, as ResponsesHandler.handle refuses a turn at its start."""
     import asyncio
 
     import cowork.handlers.responses as responses_mod
@@ -651,6 +653,9 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
             pass
 
         async def handle(self, request):
+            if refusal is not None:
+                raise refusal
+
             async def _gen():
                 if turn is not None:
                     await turn()
@@ -811,6 +816,41 @@ def test_pool_timeout_before_the_turn_keeps_the_slot_due(monkeypatch):
     state = _execute_with_terminal(monkeypatch, None)
     assert state["run_status"] == RunStatus.failed
     assert state["next_advanced"] is False
+
+
+@pytest.mark.parametrize("busy", ["file store", "database"])
+def test_a_busy_refusal_at_the_turns_start_keeps_the_slot_due_and_no_empty_conversation(monkeypatch, busy):
+    """The handler refuses before it starts the turn's producer: its vault
+    restore finds no file store slot, or its turn start's read finds the pool
+    full. The agent has done nothing, so the occurrence stays due for the next
+    poll, and the conversation the run made for the turn is deleted rather
+    than left empty in the owner's list, since the next poll makes its own."""
+    import cowork.scheduler as scheduler_mod
+    from cowork.db.session import get_open_session
+    from cowork.db.units import DatabaseBusy, FilesystemBusy
+    from cowork.services.conversations import ConversationService
+
+    linked: list = []
+    real_link = scheduler_mod._link_conversation
+
+    def recorded_link(*args, **kwargs):
+        linked.append(real_link(*args, **kwargs))
+        return linked[-1]
+
+    monkeypatch.setattr(scheduler_mod, "_link_conversation", recorded_link)
+    refusal = FilesystemBusy("no file store slot") if busy == "file store" else DatabaseBusy("no unit slot")
+    state = _execute_with_terminal(monkeypatch, None, refusal=refusal)
+
+    assert state["run_status"] == RunStatus.failed
+    assert state["next_advanced"] is False
+    assert state["run_conversation_id"] is None
+    assert len(linked) == 1
+    session = get_open_session()
+    try:
+        with pytest.raises(ValueError):
+            ConversationService(ScopedSession(session, SYSTEM_SCOPE)).get_conversation(linked[0])
+    finally:
+        session.close()
 
 
 def test_pool_timeout_inside_the_turn_consumes_the_slot(monkeypatch):

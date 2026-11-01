@@ -3,6 +3,7 @@
 import hashlib
 import re
 import time
+from collections.abc import Callable
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -33,6 +34,7 @@ def _is_expected_refusal(exc: BaseException) -> bool:
         return False
     status = exc.status_code
     return type(status) is int and 400 <= status < 500
+
 
 def postgres_session_options(database: DatabaseSettings) -> str:
     """The libpq ``options`` that set each app connection's session timeouts,
@@ -90,6 +92,31 @@ def log_slow_statements(engine, *, threshold_ms: int) -> None:
                     "statement_fingerprint": statement_fingerprint(statement),
                 },
             )
+
+
+def log_http_error(exc: HTTPException) -> None:
+    """Log an HTTPException that rolled a session back, unless it is an
+    expected refusal (``_is_expected_refusal``).
+
+    Starlette answers an HTTPException (FastAPI's subclasses it) itself and
+    logs nothing, so this line is the only record of what caused a 5xx, from
+    the request's session (get_session) or a unit's (cowork.db.units). The
+    cause's traceback goes through the handler filters, which replace a
+    database or provider chain; the exception's own detail is the client's
+    answer and stays out. The record names its caller as its site and
+    operation, the session whose work raised.
+    """
+    if _is_expected_refusal(exc):
+        return
+    cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    logger.error(
+        "Session error: error_type=%s status=%d cause=%s",
+        type(exc).__name__,
+        exc.status_code,
+        type(cause).__name__ if cause is not None else "none",
+        exc_info=cause,
+        stacklevel=2,
+    )
 
 
 def _create_engine(db_uri: str):
@@ -157,12 +184,18 @@ def get_session_factory(engine):
     return _session_factories[engine_id]
 
 
-def get_session():
+async def get_session():
     """
     FastAPI dependency that provides a database session with automatic cleanup.
 
     This is a generator-based dependency that ensures sessions are always closed
     after the request completes, preventing database connection leaks.
+
+    An async generator, so FastAPI runs it on the event loop rather than on one
+    of anyio's default threads, which sync routes and their file store work
+    share. Opening the session does no I/O. Rolling it back and closing it
+    return its connection to the pool, so they run on the threads database
+    units run on (run_on_unit_threads), unless the session never took one.
 
     It takes no parameters: FastAPI reads a dependency's parameters from the
     request, so the database URI comes from settings only.
@@ -199,30 +232,29 @@ def get_session():
                 getattr(e, "status_code", 503),
             )
         elif isinstance(e, HTTPException):
-            # Starlette answers an HTTPException (FastAPI's subclasses it)
-            # itself and logs nothing, so this line is the only record of what
-            # caused a 5xx. The cause's traceback goes through the handler
-            # filters, which replace a database or provider chain; the
-            # exception's own detail is the client's answer and stays out.
-            cause = e.__cause__ or (None if e.__suppress_context__ else e.__context__)
-            logger.error(
-                "Session error: error_type=%s status=%d cause=%s",
-                type(e).__name__,
-                e.status_code,
-                type(cause).__name__ if cause is not None else "none",
-                exc_info=cause,
-            )
+            log_http_error(e)
         else:
             # Any other exception goes on to Uvicorn, which logs its traceback
             # through the same filters, or to an app exception handler that
             # answers it. That includes an error that carries a status_code
             # without being an HTTPException, such as a provider SDK's.
             logger.error("Session error: error_type=%s", type(e).__name__)
-        db.rollback()
+        await _off_the_loop(db, release=db.rollback)
         raise
     finally:
         logger.debug("🔒 Closing database session")
-        db.close()
+        await _off_the_loop(db, release=db.close)
+
+
+async def _off_the_loop(db: SQLModelSession, *, release: Callable[[], None]) -> None:
+    """``release`` (the session's rollback or close) on the units' threads
+    when the session holds a connection; inline when it never took one."""
+    if not db.in_transaction():
+        release()
+        return
+    from cowork.db.units import run_on_unit_threads
+
+    await run_on_unit_threads(release)
 
 
 def get_open_session(db_uri: str = settings.database.uri):
