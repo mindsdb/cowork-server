@@ -1,0 +1,38 @@
+# Actions the published-pages command refuses, each changing nothing. Every
+# case starts from the same publisher, which serves four pages:
+#   ownerless: no owner record, named by one artifact in Alice's project
+#   owned:     Alice's, named by its artifact in Alice's project
+#   orphan:    no owner record, and no artifact names it
+#   twice:     no owner record, named by two artifacts in Alice's project
+# `argv` is the command after the action; PERSON stands for the person pair
+# of `person`. `says` must be in the error the command prints.
+
+unpublish:
+  - name: a page the publisher doesn't serve
+    argv: [--report-id, missing]
+    says: serves no page missing
+  - name: a page that has an owner, without --force
+    argv: [--report-id, owned]
+    says: Run with --force
+
+give:
+  - name: a page the publisher doesn't serve
+    argv: [--report-id, missing]
+    person: alice
+    says: serves no page missing
+  - name: a page that already has an owner
+    argv: [--report-id, owned]
+    person: alice
+    says: already belongs to user
+  - name: a page no artifact names
+    argv: [--report-id, orphan]
+    person: alice
+    says: Take it down with unpublish instead
+  - name: a page two artifacts name
+    argv: [--report-id, twice]
+    person: alice
+    says: 2 artifacts' publish records name page twice
+  - name: a person who can't open the project that holds the artifact
+    argv: [--report-id, ownerless]
+    person: bob
+    says: can't open the project
