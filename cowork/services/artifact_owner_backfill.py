@@ -68,7 +68,7 @@ class BackfillSummary:
 
 
 @contextmanager
-def _advisory_try_lock(engine):
+def _advisory_try_lock(engine, key: int = _LOCK_KEY):
     """One non-blocking cross-replica lock; SQLite (tests, desktop) has none."""
     if engine.dialect.name != "postgresql":
         yield True
@@ -78,7 +78,7 @@ def _advisory_try_lock(engine):
     try:
         acquired = bool(
             connection.execute(
-                sa.text("SELECT pg_try_advisory_lock(:key)"), {"key": _LOCK_KEY}
+                sa.text("SELECT pg_try_advisory_lock(:key)"), {"key": key}
             ).scalar()
         )
         yield acquired
@@ -86,21 +86,21 @@ def _advisory_try_lock(engine):
         try:
             if acquired:
                 connection.execute(
-                    sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _LOCK_KEY}
+                    sa.text("SELECT pg_advisory_unlock(:key)"), {"key": key}
                 )
         finally:
             connection.close()
 
 
-def _sentinel_present(engine) -> bool:
+def _sentinel_present(engine, key: str = SENTINEL_KEY) -> bool:
     with Session(engine) as raw:
         # No scope: the settings service then reads the global (NULL-scope) row.
-        return SettingService(raw)._fetch_row(SENTINEL_KEY) is not None
+        return SettingService(raw)._fetch_row(key) is not None
 
 
-def _write_sentinel(engine) -> None:
+def _write_sentinel(engine, key: str = SENTINEL_KEY) -> None:
     with Session(engine) as raw:
-        raw.add(Setting(key=SENTINEL_KEY, value="1"))
+        raw.add(Setting(key=key, value="1"))
         try:
             raw.commit()
         except sa.exc.IntegrityError:

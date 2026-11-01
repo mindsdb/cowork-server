@@ -297,6 +297,7 @@ async def _record_turn_artifacts(
                     project_id=UUID(artifacts.project_id) if artifacts.project_id else None,
                     slugs=changes.created,
                     creator=artifacts.creator,
+                    artifact_ids=changes.created_ids,
                 ),
                 scope=scope,
             )

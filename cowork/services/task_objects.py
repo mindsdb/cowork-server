@@ -4,7 +4,8 @@ import hashlib
 import json
 import logging
 import shutil
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from uuid import UUID
@@ -240,6 +241,20 @@ class TaskObjectService:
             self.session.add(row)
             moved += 1
         self.session.commit()
+        # Each moved folder's location row follows it (org mode). Plain values
+        # for the log line, as the owner rekeys below keep.
+        if rekeys:
+            from cowork.services.artifact_locations import move_locations
+
+            source_id, dest_id, conversation_id = source.id, dest.id, conversation.id
+            try:
+                move_locations(self.session, project_id=source_id, moved=dict(rekeys), to_project_id=dest_id)
+            except Exception:
+                self.session.rollback()
+                logger.warning(
+                    "Could not move the locations of artifacts to project %s", dest_id, exc_info=True,
+                    extra=log_context(project_id=dest_id, conversation_id=conversation_id),
+                )
         # A published page keeps its link: .published.json moved with the
         # folder, and its owner record follows. A failed rekey is logged; the
         # owner's next publish then gets a new link, as a copy would.
@@ -343,6 +358,7 @@ def record_new_artifacts(
     project_id,
     slugs: list[str],
     creator: str | None,
+    artifact_ids: Mapping[str, str] | None = None,
 ) -> None:
     """Attribute freshly appeared artifacts to this conversation, in the
     caller's session. Best-effort.
@@ -390,6 +406,26 @@ def record_new_artifacts(
                     exc_info=True,
                     extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
                 )
+    if org_mode and project_id and artifact_ids:
+        from cowork.services.artifact_locations import Location, record_made_folder
+
+        # A turn creates its folders in the project's shared root and sees
+        # only those, so it writes no location row; a folder whose id has a
+        # row naming another folder of the project marks the id conflicted.
+        for slug in slugs:
+            if slug not in artifact_ids:
+                continue
+            try:
+                record_made_folder(
+                    session, artifact_id=artifact_ids[slug], location=Location(UUID(str(project_id)), None, slug),
+                )
+            except Exception:
+                session.rollback()
+                logger.error(
+                    "Could not record the location of an artifact",
+                    exc_info=True,
+                    extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
+                )
 
 
 @dataclass(frozen=True)
@@ -403,6 +439,9 @@ class ArtifactChanges:
     # The created folders plus pre-existing ones the turn wrote to. The
     # autopublish reconciler publishes these first.
     touched: set[str]
+    # The id each created folder holds, read on the file store with the diff,
+    # so recording the folder's location row needs no file store call.
+    created_ids: dict[str, str] = field(default_factory=dict)
 
 
 def turn_artifact_changes(
@@ -491,7 +530,9 @@ def turn_artifact_changes(
     for slug in after - touched:
         if has_queued_agent_repair(base / slug, conversation_key):
             capture_agent_revision(base / slug, conversation_id=conversation_key)
-    return ArtifactChanges(created=new, touched=touched)
+    from cowork.services.artifact_identity import artifact_ids_below
+
+    return ArtifactChanges(created=new, touched=touched, created_ids=artifact_ids_below(base, new))
 
 
 def cards_for_slugs(

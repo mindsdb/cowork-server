@@ -984,3 +984,41 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
         assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
     engine.dispose()
+
+
+def test_artifact_locations_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact_locations.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert "conflicted" in _table_columns(db_path, "artifact_locations")
+    # Indexed for the conversations foreign key's ON DELETE CASCADE.
+    assert _has_index(db_path, "ix_artifact_locations_conversation_id")
+
+    _downgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert not _has_table(db_path, "artifact_locations")
+
+    _upgrade_to(engine, uri, "head")
+    assert _has_index(db_path, "ix_artifact_locations_conversation_id")
+
+
+def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch):
+    # Mirrors the upgrade guard, as task_objects' downgrade does.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact_locations_missing.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE artifact_locations"))
+
+    _downgrade_to(engine, uri, "a6e3c9f2b4d8")  # must not raise
+
+    assert _alembic_version(db_path) == "a6e3c9f2b4d8"

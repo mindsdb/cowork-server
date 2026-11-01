@@ -1008,6 +1008,7 @@ class AntonHarness:
                             project_id=conv_project_id,
                             slugs=new_slugs,
                             creator=getattr(conversation, "created_by", None),
+                            artifact_ids=changes.created_ids,
                         ),
                         scope=turn_scope,
                     )
