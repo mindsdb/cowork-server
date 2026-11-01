@@ -793,6 +793,8 @@ def _poll(session: ScopedSession) -> list[DueSlot]:
 
 
 async def _scheduler_loop() -> None:
+    from cowork.services.artifact_autopublish import start_due_self_heals
+
     logger.info("Scheduler loop started")
     # Replicas a rollout starts together would otherwise poll in step, and two
     # replicas polling together can both start one due schedule.
@@ -815,6 +817,9 @@ async def _scheduler_loop() -> None:
             run = asyncio.create_task(execute_schedule(slot.schedule_id, is_manual=False, slot_at=slot.slot_at))
             _scheduled_runs.add(run)
             run.add_done_callback(_scheduled_runs.discard)
+        # The artifact self-heals remote turn ends asked for, each project at
+        # its own slower cadence.
+        start_due_self_heals()
 
 
 def start_scheduler() -> None:

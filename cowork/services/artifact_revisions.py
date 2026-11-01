@@ -168,16 +168,33 @@ def _read_repair(folder: Path, repair_id: str) -> dict:
     return repair
 
 
-def _repair_records(folder: Path) -> list[dict]:
+def _repair_records(folder: Path, *, strict: bool = False) -> list[dict]:
+    """The repair records in ``folder``. A repairs folder that can't be
+    listed reads as holding none, and a record that can't be read is left
+    out, unless ``strict``: then the error raises, so the caller never takes a
+    folder it could not read for one holding no repair. A missing repairs
+    folder, a record gone after the listing and a record that doesn't parse
+    hold none either way."""
     try:
-        paths = sorted(_repairs_dir(folder).glob("*.json"))
-    except OSError:
+        # Path.glob skips a folder it can't list, so a strict read lists it
+        # with iterdir, which raises.
+        paths = sorted(
+            [path for path in _repairs_dir(folder).iterdir() if path.name.endswith(".json")]
+            if strict else _repairs_dir(folder).glob("*.json")
+        )
+    except OSError as exc:
+        if strict and not isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+            raise
         return []
     records: list[dict] = []
     for path in paths:
         try:
             repair = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except OSError as exc:
+            if strict and not isinstance(exc, FileNotFoundError):
+                raise
+            continue
+        except json.JSONDecodeError:
             continue
         if isinstance(repair, dict):
             records.append(repair)
@@ -254,14 +271,16 @@ def _partition_actionable_repairs(
     return blocking, dead
 
 
-def has_queued_agent_repair(folder: Path, conversation_id: str) -> bool:
-    """Return whether this exact agent turn has a pending repair handoff."""
+def has_queued_agent_repair(folder: Path, conversation_id: str, *, strict: bool = False) -> bool:
+    """Return whether this exact agent turn has a pending repair handoff.
+    With ``strict``, a repairs folder or record that can't be read raises
+    OSError instead of answering no (_repair_records)."""
     return any(
         (
             repair.get("status") == "queued"
             and repair.get("conversationId") == conversation_id
         )
-        for repair in _repair_records(folder)
+        for repair in _repair_records(folder, strict=strict)
     )
 
 

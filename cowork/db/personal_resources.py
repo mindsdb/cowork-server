@@ -78,6 +78,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "channel_installations": PersonalResource.CONVERSATIONS,
     "channel_bindings": PersonalResource.CONVERSATIONS,
     "channel_events": PersonalResource.CONVERSATIONS,
+    # Which artifact folders hold a repair queued to a conversation, so they
+    # follow conversations.
+    "queued_agent_repairs": PersonalResource.CONVERSATIONS,
     "projects": PersonalResource.PROJECTS,
     "artifact_identities": PersonalResource.PROJECTS,
     # Written and read only in org mode, where every resource is partitioned,

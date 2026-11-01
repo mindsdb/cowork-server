@@ -442,6 +442,36 @@ class ArtifactChanges:
     # The id each created folder holds, read on the file store with the diff,
     # so recording the folder's location row needs no file store call.
     created_ids: dict[str, str] = field(default_factory=dict)
+    # The folders among `repair_slugs` the diff ruled on: it found no
+    # artifact folder there, or it opened the folder and, after its captures,
+    # found no repair in it still queued to this conversation. A folder it
+    # could not read, or whose queued repair it could not finish, is left
+    # out, so its queued_agent_repairs row stays for the next turn end. Empty
+    # when the diff listed the whole folder.
+    checked_repairs: set[str] = field(default_factory=set)
+
+
+# More names than this is not one turn's own work: the diff then covers the
+# whole folder, as for a pod that sends no list.
+_MAX_TRACKED_ARTIFACTS = 1000
+
+
+def tracked_artifacts_from_reply(data: Mapping) -> set[str] | None:
+    """The folder names a remote turn's artifact tools touched, from its
+    ``turn_completed`` reply, or None when the pod sent no usable list (an
+    older pod). Untrusted. With the queued repairs read too, the diff opens
+    each name as one folder directly below the pinned artifacts base
+    (artifact_folders_named), so a name holding ``..``, a separator or NUL, a
+    link, or a folder whose ``metadata.json`` isn't a plain file is left out.
+    Otherwise the diff intersects the names with the folders it lists."""
+    touched = data.get("artifacts_touched")
+    if (
+        not isinstance(touched, list)
+        or len(touched) > _MAX_TRACKED_ARTIFACTS
+        or not all(isinstance(slug, str) for slug in touched)
+    ):
+        return None
+    return set(touched)
 
 
 def turn_artifact_changes(
@@ -454,6 +484,7 @@ def turn_artifact_changes(
     tracked_edits: set[str] | None = None,
     attribute_by_provenance: bool = False,
     completed_cleanly: bool = True,
+    repair_slugs: set[str] | None = None,
 ) -> ArtifactChanges:
     """What the turn created and touched, from the directory as it stands now
     against ``before``, with an agent revision captured for every touched
@@ -482,14 +513,25 @@ def turn_artifact_changes(
     deployment used to qualify (each conversation's pod had its own artifacts
     dir), but since ENG-2056 its pods share the project-level base, so the
     remote producer's pure diff carries the same concurrent-sibling caveat as
-    the desktop; the pod reports no tracked sets yet.
+    the desktop. A remote pod names the artifacts its tools touched on
+    `turn_completed`, and the remote producers pass that list as both tracked
+    sets; an older pod sends none, and every other exit has none.
 
     `attribute_by_provenance` is the remote producers' substitute for
-    `tracked_new` (ENG-2961): the pod reports no tracked sets, so a folder that
-    appeared is claimed only if its `metadata.json` provenance names this
+    `tracked_new` when the pod sent no list: a folder that appeared is
+    claimed only if its `metadata.json` provenance names this
     conversation (`artifact_ownership.turn_created_slugs`), and, when the turn
     did not complete cleanly, also if it has no provenance yet. Ignored when
     `tracked_new` is given.
+
+    `repair_slugs` are the folders recorded as holding an agent repair queued
+    to this conversation (queued_agent_repairs). With both tracked sets and
+    `repair_slugs` given, nothing else can be in the answer, so the diff opens
+    only those folders (artifact_folders_named) and lists nothing; the result's
+    `checked_repairs` names the repair folders it ruled on: one that holds no
+    artifact folder, or one it read that holds no repair still queued to this
+    conversation once the captures ran. Otherwise it lists the whole folder
+    and checks every artifact for a queued repair.
     """
     from cowork.services.artifacts import content_mtime_ns
     from cowork.services.artifact_revisions import (
@@ -498,7 +540,19 @@ def turn_artifact_changes(
     )
 
     base = Path(artifacts_base)
-    after = snapshot_artifact_slugs(base)
+    checked_repairs: set[str] = set()
+    # With both tracked sets and the repair folders, only those folders are
+    # opened, not every folder in the project's artifacts.
+    if tracked_new is not None and tracked_edits is not None and repair_slugs is not None:
+        from cowork.services.artifact_identity import artifact_folders_named
+
+        named = artifact_folders_named(
+            base=base, slugs=set(tracked_new) | set(tracked_edits) | set(repair_slugs),
+        )
+        after = named.found
+        checked_repairs = set(repair_slugs) - named.unreadable
+    else:
+        after = snapshot_artifact_slugs(base)
     if tracked_new is None and attribute_by_provenance:
         from cowork.services.artifact_ownership import turn_created_slugs
 
@@ -530,9 +584,22 @@ def turn_artifact_changes(
     for slug in after - touched:
         if has_queued_agent_repair(base / slug, conversation_key):
             capture_agent_revision(base / slug, conversation_id=conversation_key)
+    # A capture can leave a repair queued (the artifact's lock stayed held,
+    # or a read failed), so a repair folder the diff read counts as ruled on
+    # only once a strict read finds nothing in it still queued to this
+    # conversation. Otherwise its row stays for the next turn end.
+    for slug in checked_repairs & after:
+        try:
+            still_queued = has_queued_agent_repair(base / slug, conversation_key, strict=True)
+        except OSError:
+            still_queued = True
+        if still_queued:
+            checked_repairs.discard(slug)
     from cowork.services.artifact_identity import artifact_ids_below
 
-    return ArtifactChanges(created=new, touched=touched, created_ids=artifact_ids_below(base, new))
+    return ArtifactChanges(
+        created=new, touched=touched, created_ids=artifact_ids_below(base, new), checked_repairs=checked_repairs,
+    )
 
 
 def cards_for_slugs(
@@ -598,6 +665,7 @@ async def publish_and_card_turn_artifacts(
     project_id: str | None = None,
     project_name: str = "",
     project_label: str = "",
+    only_touched: bool = False,
 ) -> list[dict]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
@@ -625,11 +693,16 @@ async def publish_and_card_turn_artifacts(
     (non-new) slugs on it would mean a local edit never cards at all.
     `cards_for_slugs` builds a card straight from the local folder regardless of
     publish state, so every slug this turn touched is cardable there.
+
+    `only_touched` is for a remote turn whose pod named the artifacts its
+    tools touched: the reconciler then opens and publishes only the turn's
+    own folders, and leaves the rest of the project to its scheduled
+    self-heal (`artifact_autopublish.request_self_heal`).
     """
     from cowork.services.artifact_autopublish import autopublish_project_artifacts
 
     republished = await autopublish_project_artifacts(
-        artifacts_base, scope, touched=set(touched_slugs), project_id=project_id,
+        artifacts_base, scope, touched=set(touched_slugs), project_id=project_id, only_touched=only_touched,
     )
     if getattr(scope, "org_mode", False):
         carded = set(new_slugs) | (republished & set(touched_slugs))
