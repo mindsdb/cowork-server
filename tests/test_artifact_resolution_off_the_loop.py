@@ -51,7 +51,9 @@ from test_artifacts_api_tenancy import session  # noqa: F401  (fixture)
 
 ARTIFACT_ID = "0f9e8d7c6b5a49388271605f4e3d2c1b"
 SLOW_SECONDS = 3.0
-LIVE_BUDGET_SECONDS = 0.5
+# A blocked loop holds liveness for the whole SLOW_SECONDS, so half of it still
+# catches one and leaves a loaded CI runner room.
+LIVE_BUDGET_SECONDS = SLOW_SECONDS / 2
 LIVE = "/api/v1/health/live"
 WORKSPACE = f"/api/v1/artifacts/workspace/local/{ARTIFACT_ID}"
 REVIEW = f"{WORKSPACE}/review"
