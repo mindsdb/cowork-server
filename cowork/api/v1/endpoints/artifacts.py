@@ -919,7 +919,14 @@ async def artifact_status(
 ):
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
-    return _desktop_artifact_status_for_path(path, scope=scope)
+    status = _desktop_artifact_status_for_path(path, scope=scope)
+    if status.get("publishedUrl"):
+        from cowork.services.publish import published_link_owner_recorded
+
+        # False: no owner record ties the live page to this artifact, so
+        # Update makes a new link and Stop sharing leaves this one live.
+        status["linkOwnerRecorded"] = published_link_owner_recorded(path, scope=scope)
+    return status
 
 
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
