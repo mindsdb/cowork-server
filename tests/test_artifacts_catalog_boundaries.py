@@ -80,7 +80,7 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(
-        session,
+        session.scope,
         project_id=RequestProjectId(),
         project_path=None,
     )
@@ -117,7 +117,7 @@ async def test_desktop_route_selects_exact_source_from_complete_catalog(monkeypa
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(
-        SimpleNamespace(scope=LOCAL_SCOPE),
+        SimpleNamespace(scope=LOCAL_SCOPE).scope,
         project_id=None,
         project_path="/server-owned/project",
     )
@@ -155,7 +155,7 @@ async def test_desktop_route_distinguishes_duplicate_project_basenames(monkeypat
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(
-        SimpleNamespace(scope=LOCAL_SCOPE),
+        SimpleNamespace(scope=LOCAL_SCOPE).scope,
         project_id=None,
         project_path="/root-b/project",
     )
@@ -181,7 +181,7 @@ async def test_desktop_route_rejects_unregistered_path_with_same_basename(
     )
 
     cards = await artifacts.list_artifacts(
-        SimpleNamespace(scope=LOCAL_SCOPE),
+        SimpleNamespace(scope=LOCAL_SCOPE).scope,
         project_id=None,
         project_path="/attacker-controlled/project",
     )
@@ -252,7 +252,7 @@ async def test_legacy_delete_scans_only_roots_selected_by_the_server_catalog(
 
     with pytest.raises(ScanReached):
         await artifacts.delete_artifact_for_request(
-            SimpleNamespace(scope=LOCAL_SCOPE), "legacy-report", project_id=str(request_id)
+            SimpleNamespace(scope=LOCAL_SCOPE).scope, "legacy-report", project_id=str(request_id)
         )
 
     assert seen == {"sources": [source], "folder_name": "legacy-report"}
@@ -285,7 +285,7 @@ async def test_identity_delete_passes_catalog_project_and_canonical_artifact_ids
 
     with pytest.raises(ResolutionReached):
         await artifacts.delete_artifact_for_request(
-            SimpleNamespace(scope=LOCAL_SCOPE), str(artifact_id), project_id=str(request_project_id)
+            SimpleNamespace(scope=LOCAL_SCOPE).scope, str(artifact_id), project_id=str(request_project_id)
         )
 
     assert seen == {

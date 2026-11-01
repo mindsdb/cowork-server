@@ -26,7 +26,7 @@ from cowork.common.paths import (
     safe_join,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import ScopedSession, scoped_storage_root
+from cowork.db.scoped import ScopedSession, TenantScope, scoped_storage_root
 from cowork.db.units import run_db, run_efs
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
@@ -304,15 +304,77 @@ def _insert_file(session, *, file: File) -> File:
     return file
 
 
+def _files_root(scope: TenantScope) -> Path:
+    """Local base on desktop, ``<shared>/<org>/files`` in org mode."""
+    return scoped_storage_root(Path(get_app_settings().file.root_dir), scope, store="files")
+
+
+async def store_file(
+    *, scope: TenantScope, filename: str, content_type: str, data: bytes, purpose: str
+) -> File:
+    """Save ``data`` as a new file named ``filename``, which the caller has
+    already reduced to a safe basename, and return its loaded row.
+
+    The storage root refuses a scope with no organization where files are
+    partitioned (scoped_storage_root), so a missing principal fails before any
+    bytes hit disk. The bytes go to the file store, then the row to the
+    database, each in a worker thread of its own: no pooled connection waits on
+    the file server, and the event loop waits for neither.
+    """
+    file = File(
+        filename=filename,
+        content_type=content_type or "application/octet-stream",
+        size=len(data),
+        purpose=purpose,
+        path="",
+    )
+    file_dir = _files_root(scope) / str(file.id)
+    dest = await run_efs(partial(_write_upload, file_dir, filename, data), scope=scope)
+    file.path = str(dest)
+    try:
+        return await run_db(partial(_insert_file, file=file), scope=scope)
+    except Exception:
+        # Not on a cancel: run_db lets a unit that already holds its
+        # connection commit before the cancel propagates, so the row may name
+        # these bytes. A cancel before that leaves a folder no row names.
+        await run_efs(partial(shutil.rmtree, file_dir, ignore_errors=True), scope=scope)
+        raise
+
+
+async def save_upload(upload: UploadFile, *, purpose: str, scope: TenantScope) -> File:
+    """Save an uploaded file in ``scope`` (store_file) and return its row."""
+    contents = await upload.read()
+    # Untrusted filename: keep the basename only so `../` or an absolute
+    # path can't escape the per-file dir. `.name` also leaves bare "."/".." —
+    # reject those.
+    safe_name = Path(upload.filename or "upload").name.strip()
+    if safe_name in ("", ".", ".."):
+        safe_name = "upload"
+    return await store_file(
+        scope=scope,
+        filename=safe_name,
+        content_type=upload.content_type,
+        data=contents,
+        purpose=purpose,
+    )
+
+
+def file_response(file: File) -> FileResponse:
+    return FileResponse(
+        id=str(file.id),
+        bytes=file.size,
+        created_at=int(file.created_at.timestamp()) if file.created_at else 0,
+        filename=file.filename,
+        purpose=file.purpose,
+    )
+
+
 class FileService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
     def _root_dir(self) -> Path:
-        """Local base on desktop, ``<shared>/<org>/files`` in org mode."""
-        return scoped_storage_root(
-            Path(get_app_settings().file.root_dir), self.session.scope, store="files"
-        )
+        return _files_root(self.session.scope)
 
     def _owned_select(self):
         """Files are personal. The scoped session enforces the org, but user_id
@@ -329,13 +391,7 @@ class FileService:
         return self.session.exec(self._owned_select().where(File.id == file_id)).first()
 
     def _to_response(self, file: File) -> FileResponse:
-        return FileResponse(
-            id=str(file.id),
-            bytes=file.size,
-            created_at=int(file.created_at.timestamp()) if file.created_at else 0,
-            filename=file.filename,
-            purpose=file.purpose,
-        )
+        return file_response(file)
 
     def list_files(self, purpose: str | None = None) -> list[FileResponse]:
         stmt = self._owned_select()
@@ -373,39 +429,6 @@ class FileService:
         if file is None:
             raise ValueError("File not found")
         return self._to_response(file)
-
-    async def create_file(self, upload: UploadFile, purpose: str) -> FileResponse:
-        contents = await upload.read()
-        # Untrusted filename: keep the basename only so `../` or an absolute
-        # path can't escape the per-file dir. `.name` also leaves bare "."/".." —
-        # reject those.
-        safe_name = Path(upload.filename or "upload").name.strip()
-        if safe_name in ("", ".", ".."):
-            safe_name = "upload"
-
-        file = File(
-            filename=safe_name,
-            content_type=upload.content_type or "application/octet-stream",
-            size=len(contents),
-            purpose=purpose,
-            path="",
-        )
-        # The storage root refuses a scope with no organization where files
-        # are partitioned (scoped_storage_root), so a missing principal fails
-        # BEFORE any bytes hit disk.
-        scope = self.session.scope
-        file_dir = self._root_dir() / str(file.id)
-        # The bytes go to the file store, then the row to the database, each
-        # in a worker thread of its own: no pooled connection waits on the
-        # file server, and the event loop waits for neither.
-        dest = await run_efs(partial(_write_upload, file_dir, safe_name, contents), scope=scope)
-        file.path = str(dest)
-        try:
-            saved = await run_db(partial(_insert_file, file=file), scope=scope)
-        except BaseException:
-            await run_efs(partial(shutil.rmtree, file_dir, ignore_errors=True), scope=scope)
-            raise
-        return self._to_response(saved)
 
     def create_file_from_bytes(
         self, *, filename: str, content_type: str, data: bytes, purpose: str

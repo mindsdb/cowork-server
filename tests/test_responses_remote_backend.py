@@ -606,10 +606,9 @@ async def test_produce_remote_saves_the_pods_compaction(monkeypatch):
     handler = _remote_handler(monkeypatch, {})
     handler._remote_seed_history = lambda session, conv_id: ([], _SEED)
     persisted = {}
-    handler._persist_remote_compaction = (
-        lambda session, *, conv_id, data, seed_info: persisted.update(
-            data=data, seed_info=seed_info,
-        )
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction",
+        staticmethod(lambda session, *, conv_id, data, seed_info: persisted.update(data=data, seed_info=seed_info)),
     )
 
     async def fake_replies(**kwargs):
@@ -934,7 +933,9 @@ async def test_every_remote_unit_runs_in_the_turns_tenant_scope(monkeypatch, tmp
     monkeypatch.setattr(
         ResponsesHandler, "_persist_turn_memory", staticmethod(lambda session, conv_id, entries, principal: None),
     )
-    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction", staticmethod(lambda session, *, conv_id, data, seed_info: None),
+    )
     monkeypatch.setattr(task_objects, "record_new_artifacts", lambda session, **kwargs: None)
 
     async def no_publish(*args, **kwargs):
@@ -1988,7 +1989,9 @@ async def test_produce_remote_reads_a_compacted_turns_history_frame_and_saves_no
     sends both signals; a hard truncation sends only the step."""
     saved = {}
     handler = _figure_sources_handler(monkeypatch, saved)
-    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction", staticmethod(lambda session, *, conv_id, data, seed_info: None),
+    )
     rows = [
         *_web_fetch_rows("w1", "https://example.com/rates", "Overtime rate: $42 per hour."),
         *_web_fetch_rows("w4", "https://example.com/lines", "The plant runs 9 lines."),
@@ -2037,7 +2040,9 @@ async def test_produce_remote_leaves_a_figure_no_step_holds_unmarked_when_a_pod_
 
     saved = {}
     handler = _figure_sources_handler(monkeypatch, saved)
-    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction", staticmethod(lambda session, *, conv_id, data, seed_info: None),
+    )
     code = "print(open('/workspace/stock.csv').read())"
     cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
 

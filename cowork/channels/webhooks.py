@@ -4,14 +4,16 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Protocol
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
 
 from cowork.api.v1.permissions import PlatformSignature, require
 from cowork.channels.plugin import ChannelPlugin
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_org
-from cowork.db.session import get_open_session
+from cowork.db.units import run_db, run_to_completion
 from cowork.services.channel_events import ChannelEventService
 from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
 
@@ -231,7 +233,7 @@ def _add_webhook_route(
             return Response("could not parse webhook payload", status_code=400)
 
         log.info("channel %s: parsed %d inbound event(s)", channel_type, len(events))
-        intake_events(channel_type, bridge, events, sink=sink, scheduler=scheduler, org_id=org_id)
+        await intake_events(channel_type, bridge, events, sink=sink, scheduler=scheduler, org_id=org_id)
         return _success_ack(bridge, events)
 
     router.add_api_route(
@@ -263,7 +265,32 @@ def _success_ack(bridge: WebhookBridge, events: list[Any]) -> Response:
     return Response(status_code=200)
 
 
-def intake_events(
+@dataclass(frozen=True)
+class _Intake:
+    """One inbound event's dedupe outcome: its new event row, or why it was
+    dropped."""
+
+    event_id: UUID | None
+    duplicate: bool = False
+
+
+def _record_inbound(session: ScopedSession, *, channel_type: str, key: str | None) -> _Intake:
+    """Drop a duplicate, or record the event, as a unit."""
+    channel_log = ChannelEventService(session)
+    if channel_log.is_duplicate_inbound(channel_type, key):
+        return _Intake(event_id=None, duplicate=True)
+    return _Intake(
+        event_id=channel_log.record_inbound(channel_type, dedupe_key=key, external_message_id=key)
+    )
+
+
+def _set_event_status(
+    session: ScopedSession, *, event_id: UUID, status: str, error: str | None = None
+) -> None:
+    ChannelEventService(session).set_status(event_id, status, error=error)
+
+
+async def intake_events(
     channel_type: str,
     bridge: WebhookBridge,
     events: list[Any],
@@ -277,43 +304,49 @@ def intake_events(
     polling — so dedupe and event logging behave identically regardless of how
     the event arrived. For webhooks this runs in request scope, so the ACK is
     sent only after duplicates are filtered and recorded; the sink call itself
-    always happens in the background."""
+    always happens in the background.
+
+    Each event is recorded in a unit of its own and scheduled before the next
+    one is read. A cancel waits for the event in hand to be recorded and
+    scheduled, so it lands between events, never between an event's record
+    and its schedule: a recorded event left unscheduled would have its
+    redelivery dropped by dedupe. While the pool is full, that wait lasts up
+    to POOL_TIMEOUT."""
     sched = scheduler or _default_scheduler
-    session = get_open_session()
-    try:
-        # Dedupe is per installation: LOCAL_SCOPE when no org was resolved
-        # (local/desktop's one installation), the resolved org's scope otherwise.
-        scope = scope_for_org(org_id)
-        channel_log = ChannelEventService(ScopedSession(session, scope))
-        for event in events:
-            key = bridge.dedupe_key(event)
-            if channel_log.is_duplicate_inbound(channel_type, key):
-                log.info("channel %s dropping duplicate inbound key=%s", channel_type, key)
-                continue
-            event_id = channel_log.record_inbound(channel_type, dedupe_key=key, external_message_id=key)
-            if event_id is None:
-                log.info("channel %s dropping duplicate inbound (insert race) key=%s", channel_type, key)
-                continue
-            log.info("channel %s: accepted inbound key=%s; dispatching to runtime", channel_type, key)
-            sched(_process_event(channel_type, event, event_id, sink, org_id=org_id))
-    finally:
-        session.close()
+    # Dedupe is per installation: LOCAL_SCOPE when no org was resolved
+    # (local/desktop's one installation), the resolved org's scope otherwise.
+    scope = scope_for_org(org_id)
+
+    async def record_and_schedule(event: Any) -> None:
+        key = bridge.dedupe_key(event)
+        intake = await run_db(
+            partial(_record_inbound, channel_type=channel_type, key=key), scope=scope
+        )
+        if intake.duplicate:
+            log.info("channel %s dropping duplicate inbound key=%s", channel_type, key)
+            return
+        if intake.event_id is None:
+            log.info("channel %s dropping duplicate inbound (insert race) key=%s", channel_type, key)
+            return
+        log.info("channel %s: accepted inbound key=%s; dispatching to runtime", channel_type, key)
+        sched(_process_event(channel_type, event, intake.event_id, sink, org_id=org_id))
+
+    for event in events:
+        await run_to_completion(record_and_schedule(event))
 
 
 async def _process_event(
     channel_type: str, event: Any, event_id: Any, sink: InboundSink, *, org_id: str | None = None
 ) -> None:
-    """Route one event to the sink and record the outcome. Opens its own session
-    since it runs after the request's session is closed."""
-    session = get_open_session()
+    """Route one event to the sink and record the outcome, each write in a
+    unit of its own."""
+    scope = scope_for_org(org_id)
     try:
-        scope = scope_for_org(org_id)
-        channel_log = ChannelEventService(ScopedSession(session, scope))
-        try:
-            await sink(channel_type, event, org_id)
-            channel_log.set_status(event_id, "routed")
-        except Exception as exc:
-            channel_log.set_status(event_id, "failed", error=type(exc).__name__)
-            log.exception("channel %s inbound sink failed", channel_type)
-    finally:
-        session.close()
+        await sink(channel_type, event, org_id)
+        await run_db(partial(_set_event_status, event_id=event_id, status="routed"), scope=scope)
+    except Exception as exc:
+        await run_db(
+            partial(_set_event_status, event_id=event_id, status="failed", error=type(exc).__name__),
+            scope=scope,
+        )
+        log.exception("channel %s inbound sink failed", channel_type)

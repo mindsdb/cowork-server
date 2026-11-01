@@ -106,6 +106,8 @@ logger = logging.getLogger(__name__)
 # a bypass, so it needs nothing of its own here.)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
 
@@ -760,7 +762,7 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
 
 
 async def _authorize_artifact_file_mutation(
-    path: ProjectMutationPathDep, scoped: ScopedSessionDep,
+    path: ProjectMutationPathDep, scope: ScopeDep,
 ) -> None:
     """Protect artifact bytes reached through the generic file adapter.
 
@@ -771,19 +773,19 @@ async def _authorize_artifact_file_mutation(
     parts = tuple(part.casefold() for part in path.parts)
     if parts[0] == CONVERSATIONS_DIRNAME:
         if len(parts) == 1:
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         if len(parts) == 2:
             try:
                 UUID(parts[1])
             except ValueError:
                 return
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         parts = parts[2:]
     artifact_root = (".anton", "artifacts")
     if parts[:2] == artifact_root or parts == artifact_root[:1]:
-        await require_product_permission(scoped.scope, "artifact.manage")
+        await require_product_permission(scope, "artifact.manage")
 
 
 def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:

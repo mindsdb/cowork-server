@@ -35,7 +35,7 @@ from cowork.api.v1.artifact_scope import (
 )
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
-from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_scoped_session
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
 from cowork.services.product_permissions import has_product_permission, require_product_permission
@@ -79,12 +79,14 @@ from cowork.services.artifact_revisions import (
 
 logger = logging.getLogger(__name__)
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# AuthenticatedInOrgMode, declared explicitly: a ScopedSession already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
 # whenever org mode has no org in scope. Declaring it too makes the
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
@@ -461,7 +463,7 @@ async def _owner_workspace(scope: TenantScope, project_ref: str, artifact_id: st
 
 
 async def _sync_live_artifact(
-    session, folder: Path, *, project_id: str | None = None
+    scope: TenantScope, folder: Path, *, project_id: str | None = None
 ) -> bool | None:
     """Re-publish a live artifact after an editor write.
 
@@ -482,7 +484,7 @@ async def _sync_live_artifact(
     from cowork.services.artifact_locks import release
 
     artifacts_base = folder.parent
-    if not await _acquire_live_publish_lock(folder, session.scope):
+    if not await _acquire_live_publish_lock(folder, scope):
         logger.warning("Could not synchronize live artifact %s: publish lock busy", folder)
         return False
 
@@ -497,7 +499,7 @@ async def _sync_live_artifact(
                     folder,
                     artifacts_base=artifacts_base,
                 ),
-                scope=session.scope,
+                scope=scope,
             )
         except FileNotFoundError:
             return None
@@ -505,9 +507,8 @@ async def _sync_live_artifact(
             logger.warning("Could not read live publish state for %s", folder, exc_info=True)
             return False
 
-        scope = getattr(session, "scope", None)
-        if scope is not None and getattr(scope, "org_mode", False):
-            artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+        if scope.org_mode:
+            artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
             api_key = await key.get()
             if not api_key:
                 logger.warning("Could not synchronize live artifact %s: no publish key", folder)
@@ -555,7 +556,7 @@ async def _sync_live_artifact(
         if not publish_abandoned:
             # Waits for a slot: a lock left behind would block the next publish.
             await run_efs(
-                partial(release, folder.parent, folder.name), scope=session.scope, deadline=False
+                partial(release, folder.parent, folder.name), scope=scope, deadline=False
             )
         if key is not None and not publish_abandoned:
             await key.revoke()
@@ -580,11 +581,11 @@ async def _acquire_live_publish_lock(folder: Path, scope: TenantScope) -> bool:
         await asyncio.sleep(0.1)
 
 
-async def _current_capabilities(session, capabilities: dict) -> dict:
+async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     if not capabilities["canEdit"]:
         return capabilities
-    can_edit = await has_product_permission(session.scope, "artifact.manage")
-    can_execute = await has_product_permission(session.scope, "product.execute")
+    can_edit = await has_product_permission(scope, "artifact.manage")
+    can_execute = await has_product_permission(scope, "product.execute")
     current = {
         **capabilities,
         "canEdit": can_edit,
@@ -670,9 +671,9 @@ def _save_selected_source(
 async def artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
     path: str | None = Query(default=None, max_length=1000),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS.
@@ -682,20 +683,20 @@ async def artifact_source(
     is resolved, through the helper ``artifact_capabilities`` adds it with.
     """
     source, folder, metadata, owner_capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     # No format is offered whatever the folder holds while org export is off,
     # so the walk that finds the primary is skipped, and the source names none.
-    with_export = not org_export_refused(org_mode=bool(session.scope.org_mode))
+    with_export = not org_export_refused(org_mode=bool(scope.org_mode))
     try:
         result, repair, export_source = await run_efs(
             partial(
                 _workspace_state, source, folder, metadata, artifact_id, path, with_export=with_export
             ),
-            scope=session.scope,
+            scope=scope,
         )
         capabilities = await _current_capabilities(
-            session, with_export_formats(session, owner_capabilities, export_source)
+            scope, with_export_formats(scope, owner_capabilities, export_source)
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -709,14 +710,13 @@ async def update_artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _SourceUpdateBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     """Optimistic, atomic manual edit. A stale tab receives 409, never overwrite."""
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     source, folder, metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
-    scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
     try:
         saved = await run_efs(
@@ -732,10 +732,10 @@ async def update_artifact_source(
                 actor_id=actor_id,
                 summary=body.summary,
             ),
-            scope=session.scope,
+            scope=scope,
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder, project_id=source.project_id)
+            await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -769,7 +769,7 @@ async def export_workspace_artifact(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: ExportRequest,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ) -> ExportResult:
     """Export the artifact's primary file as a new HTML, Word or PDF file beside it.
 
@@ -782,18 +782,18 @@ async def export_workspace_artifact(
     that doesn't come back answers the render client's status, and only a
     200 leaves a file behind.
     """
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     source, folder, metadata, capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
-    if org_export_refused(org_mode=bool(session.scope.org_mode)):
+    if org_export_refused(org_mode=bool(scope.org_mode)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Export isn't available on this deployment.",
         )
     folder_name = _artifact_folder_component(source, folder)
     try:
-        async with export_slot(scope=session.scope, export_format=body.format):
+        async with export_slot(scope=scope, export_format=body.format):
             return await run_efs(
                 partial(
                     export_primary_file,
@@ -804,7 +804,7 @@ async def export_workspace_artifact(
                     export_format=body.format,
                     can_edit=bool(capabilities.get("canEdit")),
                 ),
-                scope=session.scope,
+                scope=scope,
             )
     except ExportRefused as exc:
         raise HTTPException(
@@ -831,13 +831,13 @@ async def export_workspace_artifact(
 async def artifact_revisions(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     path: str | None = Query(default=None, max_length=1000),
 ):
     _source, folder, _metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
-    return {"revisions": await run_efs(partial(list_revisions, folder, rel_path=path), scope=session.scope)}
+    return {"revisions": await run_efs(partial(list_revisions, folder, rel_path=path), scope=scope)}
 
 
 def _current_revision(folder: Path, metadata: dict, artifact_id: str) -> dict | None:
@@ -854,9 +854,9 @@ def _current_revision(folder: Path, metadata: dict, artifact_id: str) -> dict | 
 async def artifact_review_entry(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
 
@@ -871,16 +871,16 @@ async def artifact_review_entry(
     # The revision is what a reviewer may see, so it is read in the lookup's
     # own file store call.
     artifact, current_revision = await review_artifact_and_read(
-        session.scope,
+        scope,
         project_ref,
         artifact_id,
         read=lambda found: _current_revision(found.folder, found.metadata, artifact_id),
     )
     capabilities = await _current_capabilities(
-        session,
+        scope,
         await run_db(
             lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
-            scope=session.scope,
+            scope=scope,
         ),
     )
     return {
@@ -903,7 +903,7 @@ class _AccessBody(BaseModel):
     access: dict
 
 
-def _owner_publish_context(session, folder: Path):
+def _owner_publish_context(scope: TenantScope, folder: Path):
     """The (artifacts_base, publish_url, key) an org-mode publish needs.
 
     The same three `autopublish_project_artifacts` resolves, and deliberately
@@ -915,7 +915,6 @@ def _owner_publish_context(session, folder: Path):
     from cowork.services.artifact_autopublish import _active_workspace_id, _publish_url
     from cowork.services.artifact_publish_key import PublishKey
 
-    scope = session.scope
     return (
         folder.parent,
         _publish_url(scope),
@@ -951,7 +950,7 @@ def _access_state(folder: Path, metadata: dict) -> dict:
 async def artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     """The owner's full access state for the Share control.
 
@@ -962,9 +961,9 @@ async def artifact_access(
     need to pre-fill the dialog without widening what a card exposes.
     """
     _source, folder, metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
-    return await run_efs(partial(_access_state, folder, metadata), scope=session.scope)
+    return await run_efs(partial(_access_state, folder, metadata), scope=scope)
 
 
 @router.put("/workspace/{project_ref}/{artifact_id}/access")
@@ -972,7 +971,7 @@ async def set_artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _AccessBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     """Re-publish this artifact with a new audience. Owner-only.
 
@@ -981,20 +980,20 @@ async def set_artifact_access(
     shared URL survives the change. This is the same call autopublish makes on
     every turn, with the owner's selection in place of the first-publish default.
     """
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     from cowork.services.publish import PublishRejected, PublisherUnavailable
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
     source, folder, metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
-    if await run_efs(partial(_artifact_primary, folder, metadata), scope=session.scope) is None:
+    if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    if not await _acquire_live_publish_lock(folder, session.scope):
+    if not await _acquire_live_publish_lock(folder, scope):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Publishing is busy right now. Try again in a moment.",
@@ -1005,7 +1004,7 @@ async def set_artifact_access(
     publish_abandoned = False
     publish_started = False
     try:
-        artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+        artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
         api_key = await key.get()
         if not api_key:
             raise HTTPException(
@@ -1022,7 +1021,7 @@ async def set_artifact_access(
                     api_key=api_key,
                     publish_url=publish_url,
                     access=dict(body.access or {}),
-                    scope=session.scope,
+                    scope=scope,
                     project_id=source.project_id,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
@@ -1059,7 +1058,7 @@ async def set_artifact_access(
         if not publish_abandoned:
             # Waits for a slot: a lock left behind would block the next publish.
             await run_efs(
-                partial(release, folder.parent, folder.name), scope=session.scope, deadline=False
+                partial(release, folder.parent, folder.name), scope=scope, deadline=False
             )
         if key is not None and not publish_abandoned:
             await key.revoke()
@@ -1099,7 +1098,7 @@ def _open_comments(
 async def enable_artifact_comments(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ) -> CommentsAccessResponse:
     """Turn on draft comments for the artifact's owner.
 
@@ -1113,7 +1112,7 @@ async def enable_artifact_comments(
     only among the caller's artifacts roots, so the owner is the one person who
     reaches them.
     """
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     from cowork.services.artifact_access import (
         ArtifactAccessUnavailable,
         provision_draft_review_access,
@@ -1122,24 +1121,24 @@ async def enable_artifact_comments(
     from cowork.services.artifact_identity import artifact_key
 
     source, folder, metadata, capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
-    capabilities = await _current_capabilities(session, capabilities)
+    capabilities = await _current_capabilities(scope, capabilities)
     review_scope = None
-    if session.scope.org_mode:
+    if scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is
         # the caller; resolving it again would only repeat that query.
-        owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
+        owner_user_id = str(scope.user_id) if scope.user_id else None
         try:
             canonical_key = await run_in_threadpool(
                 ensure_authorization_key,
                 artifact_id,
-                session.scope,
+                scope,
                 owner_user_id=owner_user_id,
             )
             await provision_draft_review_access(
                 canonical_key.split("/", 1)[1],
-                session.scope,
+                scope,
                 owner_user_id=owner_user_id,
             )
         except ArtifactAccessUnavailable as exc:
@@ -1151,13 +1150,13 @@ async def enable_artifact_comments(
         # the marker is what reopens the folder to co-members on this server, and
         # a rule-less grant would show a draft the comments service then refuses
         # to talk about.
-        review_scope = session.scope
+        review_scope = scope
         comments_scope = "organization"
     else:
         comments_scope = "owner"
     current_revision = await run_efs(
         partial(_open_comments, folder, metadata, artifact_id, review_scope=review_scope),
-        scope=session.scope,
+        scope=scope,
     )
     return CommentsAccessResponse(
         # Workspace routes/cards keep the local id. The authenticated comments
@@ -1174,13 +1173,13 @@ async def artifact_revision(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     revision_id: str,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     _source, folder, _metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     try:
-        return await run_efs(partial(revision_with_content, folder, revision_id), scope=session.scope)
+        return await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except RevisionValidationError as exc:
@@ -1218,14 +1217,13 @@ async def restore_artifact_revision(
     artifact_id: ArtifactIdDep,
     revision_id: str,
     body: _RestoreBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     source, folder, metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     try:
-        scope = getattr(session, "scope", None)
         actor_id = str(scope.user_id) if scope and scope.user_id else None
         saved = await run_efs(
             partial(
@@ -1237,10 +1235,10 @@ async def restore_artifact_revision(
                 expected_revision_id=body.expectedRevisionId,
                 actor_id=actor_id,
             ),
-            scope=session.scope,
+            scope=scope,
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder, project_id=source.project_id)
+            await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -1258,12 +1256,12 @@ async def request_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _AgentRepairBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    await require_product_permission(session.scope, "artifact.manage")
-    await require_product_permission(session.scope, "product.execute")
+    await require_product_permission(scope, "artifact.manage")
+    await require_product_permission(scope, "product.execute")
     _source, folder, metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     try:
         return await run_efs(
@@ -1279,7 +1277,7 @@ async def request_agent_repair(
                 conversation_id=str(body.conversationId),
                 preview_errors=body.previewErrors,
             ),
-            scope=session.scope,
+            scope=scope,
         )
     except RevisionConflict as exc:
         raise HTTPException(
@@ -1304,13 +1302,13 @@ async def get_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     repair_id: str,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     _source, folder, _metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     try:
-        return await run_efs(partial(agent_repair_detail, folder, repair_id), scope=session.scope)
+        return await run_efs(partial(agent_repair_detail, folder, repair_id), scope=scope)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except RevisionValidationError as exc:
@@ -1322,7 +1320,7 @@ async def release_agent_repairs_for_comment(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _RepairReleaseBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     """Release the repairs waiting on a comment thread the owner resolved.
 
@@ -1330,16 +1328,16 @@ async def release_agent_repairs_for_comment(
     the comments route forwards to inference in org mode and carries no tenant
     scope, so only here can one call serve both desktop and cloud.
     """
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     _source, folder, _metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     try:
         released = await run_efs(
             partial(
                 release_repairs_for_comment, folder, body.commentThreadId,
             ),
-            scope=session.scope,
+            scope=scope,
         )
         return {"released": released}
     except FileNotFoundError as exc:
@@ -1353,13 +1351,13 @@ async def cancel_queued_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     repair_id: str,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     body: _RepairCancelBody | None = None,
 ):
     """Release a queued repair, or discard a ready one the owner is done with."""
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     _source, folder, _metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     try:
         return await run_efs(
@@ -1369,7 +1367,7 @@ async def cancel_queued_agent_repair(
                 repair_id,
                 discard_ready=bool(body and body.discardReady),
             ),
-            scope=session.scope,
+            scope=scope,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -1383,14 +1381,13 @@ async def decide_agent_repair(
     artifact_id: ArtifactIdDep,
     repair_id: str,
     body: _RepairDecisionBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     _source, folder, metadata, _capabilities = await _owner_workspace(
-        session.scope, project_ref, artifact_id
+        scope, project_ref, artifact_id
     )
     try:
-        scope = getattr(session, "scope", None)
         actor_id = str(scope.user_id) if scope and scope.user_id else None
         return await run_efs(
             partial(
@@ -1403,7 +1400,7 @@ async def decide_agent_repair(
                 actor_id=actor_id,
                 expected_head_revision_id=body.expectedHeadRevisionId,
             ),
-            scope=session.scope,
+            scope=scope,
         )
     except RevisionConflict as exc:
         raise HTTPException(
@@ -1452,9 +1449,9 @@ def _draft_link_file_parts(folder: Path, metadata: dict) -> tuple[str, ...]:
 async def create_draft_link(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
 ):
     """A 30-minute signed link to this draft on the draft host.
 
@@ -1470,7 +1467,6 @@ async def create_draft_link(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Draft links are not available",
         )
-    scope = session.scope
     if not scope.user_id or not scope.org_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
     project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
@@ -1509,9 +1505,9 @@ async def serve_private_draft(
     artifact_id: ArtifactIdDep,
     rel_path: str,
     request: Request,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
     download: Annotated[bool, Query()] = False,
 ):
     """Authenticated draft preview with project/org containment and relative assets.
@@ -1538,7 +1534,7 @@ async def serve_private_draft(
     # A reviewer may read every file of the draft, so the path checks and the
     # open run in the lookup's own file store call.
     _artifact, response = await review_artifact_and_read(
-        session.scope,
+        scope,
         project_selector,
         artifact_selector,
         read=partial(

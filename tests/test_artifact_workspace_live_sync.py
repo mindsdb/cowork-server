@@ -76,7 +76,7 @@ async def test_manual_save_synchronizes_an_existing_live_artifact(artifact, monk
         return True
 
     monkeypatch.setattr(workspace, "_sync_live_artifact", fake_sync)
-    session = _Session()
+    session = ORG_SCOPE
 
     saved = await workspace.update_artifact_source(
         "project-1",
@@ -116,7 +116,7 @@ async def test_noop_save_does_not_create_a_live_version(artifact, monkeypatch):
             expectedRevisionId=source["revision"]["id"],
             path="report.html",
         ),
-        _Session(),
+        ORG_SCOPE,
     )
 
     assert saved["revision"]["id"] == source["revision"]["id"]
@@ -146,7 +146,7 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
         return True
 
     monkeypatch.setattr(workspace, "_sync_live_artifact", fake_sync)
-    session = _Session()
+    session = ORG_SCOPE
 
     restored = await workspace.restore_artifact_revision(
         "project-1",
@@ -170,7 +170,7 @@ def test_owner_publish_context_threads_the_active_workspace(artifact, monkeypatc
     monkeypatch.setattr(autopublish, "_active_workspace_id", lambda scope: "ws-1")
     monkeypatch.setattr(autopublish, "_publish_url", lambda scope: "https://api.staging.example")
 
-    _base, publish_url, key = workspace._owner_publish_context(_Session(), folder)
+    _base, publish_url, key = workspace._owner_publish_context(ORG_SCOPE, folder)
 
     assert publish_url == "https://api.staging.example"
     assert key._workspace_id == "ws-1"
@@ -207,7 +207,7 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
 
-    result = await workspace._sync_live_artifact(_Session(), folder, project_id="project-1")
+    result = await workspace._sync_live_artifact(ORG_SCOPE, folder, project_id="project-1")
 
     assert result is True
     assert calls[0][0] == folder
@@ -234,7 +234,7 @@ async def test_unpublished_draft_does_not_resolve_publish_credentials(artifact, 
 
     monkeypatch.setattr(workspace, "_owner_publish_context", unexpected_context)
 
-    assert await workspace._sync_live_artifact(_Session(), folder) is None
+    assert await workspace._sync_live_artifact(ORG_SCOPE, folder) is None
 
 
 @pytest.mark.asyncio
@@ -254,7 +254,7 @@ async def test_desktop_save_uses_the_configured_publish_environment(artifact, mo
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
 
-    result = await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder)
+    result = await workspace._sync_live_artifact(LOCAL_SCOPE, folder)
 
     assert result is True
     assert calls[0][1]["api_key"] == "desktop-key"
@@ -293,7 +293,7 @@ async def test_timed_out_publish_keeps_its_lock_and_key(artifact, monkeypatch):
     monkeypatch.setattr("cowork.services.publish.publish_artifact", slow_publish)
 
     try:
-        assert await workspace._sync_live_artifact(_Session(), folder) is False
+        assert await workspace._sync_live_artifact(ORG_SCOPE, folder) is False
         assert publish_started.is_set()
         assert revoked == []
         assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is False
@@ -324,7 +324,7 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
             expectedRevisionId=source["revision"]["id"],
             path="report.html",
         ),
-        _Session(),
+        ORG_SCOPE,
     )
 
     assert saved["content"] == "<html>saved locally</html>"
@@ -353,7 +353,7 @@ async def test_source_save_survives_live_publish_authority_failure(artifact, mon
             content="<html>saved locally</html>",
             expectedRevisionId=original["revision"]["id"], path="report.html",
         ),
-        _Session(),
+        ORG_SCOPE,
     )
     assert saved["content"] == "<html>saved locally</html>"
     assert (folder / "report.html").read_text() == "<html>saved locally</html>"
@@ -384,7 +384,7 @@ async def test_another_owners_report_fails_the_sync_without_a_traceback(artifact
     monkeypatch.setattr("cowork.services.publish.publish_artifact", owned_elsewhere)
 
     with caplog.at_level(logging.WARNING, logger=workspace.logger.name):
-        assert await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder) is False
+        assert await workspace._sync_live_artifact(LOCAL_SCOPE, folder) is False
 
     record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
     assert "another account owns its report" in record.getMessage()
@@ -412,7 +412,7 @@ async def test_a_too_large_artifact_stops_live_sync_without_a_traceback(artifact
     monkeypatch.setattr("cowork.services.publish.publish_artifact", too_large)
 
     with caplog.at_level(logging.WARNING, logger=workspace.logger.name):
-        assert await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder) is False
+        assert await workspace._sync_live_artifact(LOCAL_SCOPE, folder) is False
 
     record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
     assert "too large to publish" in record.getMessage()

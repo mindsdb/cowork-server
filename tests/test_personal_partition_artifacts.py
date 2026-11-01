@@ -1100,6 +1100,6 @@ def test_hosted_search_lists_no_artifacts(org_deployment, monkeypatch, tmp_path)
     import asyncio
 
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        found = asyncio.run(search_cowork(ScopedSession(raw, org_scope), q="Quarterly", limit=25))
+        found = asyncio.run(search_cowork(org_scope, q="Quarterly", limit=25))
 
     assert [r for r in found["results"] if r["type"] == "artifact"] == []

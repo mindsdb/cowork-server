@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import cowork.handlers.responses as responses_mod
 import cowork.turnqueue.remote_turn as remote_turn_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
@@ -17,10 +18,12 @@ from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import RemoteWorkspace
 from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
+from tests._fakes import inline_run_db
 from tests._logging_assertions import assert_log_fields
 
 
 class _FakeScope:
+    org_mode = True
     org_id = "org-123"
     # An organization's scope, which cowork.db.units.run_efs reads for the share.
     partitioned = True
@@ -29,6 +32,11 @@ class _FakeScope:
 
 class _FakeSession:
     scope = _FakeScope()
+
+
+def _no_memory(session, conv_id, entries, principal):
+    """ResponsesHandler._persist_turn_memory's own signature, so a call that
+    leaves an argument out fails as the real one does."""
 
 
 def _fake_handler(
@@ -44,17 +52,28 @@ def _fake_handler(
         return ()
 
     monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
+    # Each unit runs inline, on a session that reaches no database.
+    monkeypatch.setattr(remote_turn_mod, "run_db", inline_run_db(_FakeSession()))
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
             "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
-            "_persist_remote_compaction": staticmethod(lambda s, *, conv_id, data, seed_info: None),
             "_remote_workspace": staticmethod(remote_workspace or (lambda s, c: None)),
             "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c, *, workspace: None)),
             "_remote_started_at": staticmethod(lambda s, c: None),
-            "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
         },
     ))
+    # The pod's memory and compaction go through the helpers the browser
+    # producer shares (save_turn_memory, save_turn_compaction), which run
+    # their units with cowork.handlers.responses's own run_db.
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeSession()))
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_persist_turn_memory", staticmethod(persist_turn_memory or _no_memory),
+    )
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_persist_remote_compaction",
+        staticmethod(lambda s, *, conv_id, data, seed_info: None),
+    )
 
 
 async def _drain(gen):
@@ -94,7 +113,7 @@ async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events = [event async for event in remote_turn_events(
-        session=session, conv_id=conv_id, org_id="org-123", user_id=None,
+        scope=session.scope, conv_id=conv_id, org_id="org-123", user_id=None,
         input_text="How many at S1?", model="anton", turn_rows=[],
     )]
 
@@ -129,7 +148,7 @@ async def test_the_turn_looks_up_its_workspace_once(monkeypatch):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -151,7 +170,7 @@ async def test_turn_delta_becomes_a_stream_text_delta(monkeypatch):
 
     turn_rows = []
     events, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=turn_rows,
     ))
 
@@ -171,7 +190,7 @@ async def test_turn_failed_raises_with_the_workers_code_and_message(monkeypatch)
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -193,7 +212,7 @@ async def test_turn_failed_falls_back_to_the_generic_message_and_code(monkeypatc
     from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
     _, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -221,7 +240,7 @@ async def test_turn_history_mutates_the_callers_turn_rows_list(monkeypatch):
 
     turn_rows = []
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=turn_rows,
     ))
 
@@ -249,7 +268,7 @@ async def test_turn_history_reaches_the_formatter_as_the_pod_sent_it(monkeypatch
 
     turn_rows = []
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
     ))
 
@@ -291,7 +310,7 @@ async def test_a_compacted_turns_history_reaches_the_formatter_and_none_is_kept(
 
     turn_rows = []
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
     ))
 
@@ -317,7 +336,7 @@ async def test_a_compacted_turns_history_frame_without_a_list_of_rows_reaches_th
 
     turn_rows = []
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
     ))
 
@@ -339,7 +358,7 @@ async def test_the_turns_context_carries_the_history_the_pod_is_seeded_with(monk
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events = [event async for event in remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="And at S2?", model="anton", turn_rows=[],
     )]
 
@@ -349,8 +368,17 @@ async def test_the_turns_context_carries_the_history_the_pod_is_seeded_with(monk
 
 @pytest.mark.asyncio
 async def test_turn_memory_calls_persist_turn_memory(monkeypatch):
+    """Outside org tenancy a channel turn writes memory with no principal.
+    The fake keeps the real signature, so a call that drops the principal
+    fails."""
+    from cowork.db.scoped import LOCAL_SCOPE
+
     calls = []
-    _fake_handler(monkeypatch, persist_turn_memory=lambda s, c, e: calls.append(e))
+
+    def persist(session, conv_id, entries, principal):
+        calls.append((entries, principal))
+
+    _fake_handler(monkeypatch, persist_turn_memory=persist)
 
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
@@ -360,11 +388,103 @@ async def test_turn_memory_calls_persist_turn_memory(monkeypatch):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=LOCAL_SCOPE, conv_id=uuid4(), org_id=None, user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
-    assert calls == [[{"key": "likes", "value": "pizza"}]]
+    assert calls == [([{"key": "likes", "value": "pizza"}], None)]
+
+
+async def test_an_org_channel_turn_saves_no_memory_and_says_so_at_info(monkeypatch, caplog):
+    """In org tenancy a channel turn has no member, and neither memory tier
+    takes an entry without one. The turn skips the write and logs one INFO
+    line naming the conversation, rather than an ERROR with a stack for a
+    refusal that is by design."""
+    import logging
+
+    from cowork.db.scoped import TenantScope
+
+    calls = []
+
+    def persist(session, conv_id, entries, principal):
+        calls.append(entries)
+
+    _fake_handler(monkeypatch, persist_turn_memory=persist)
+
+    async def fake_replies(**kwargs):
+        yield "turn_memory", {"entries": [{"key": "likes", "value": "pizza"}]}
+        yield "turn_delta", {"text": "noted"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+    conv_id = uuid4()
+
+    with caplog.at_level(logging.INFO):
+        events, failure = await _drain(remote_turn_events(
+            scope=TenantScope(org_mode=True, org_id="org-123"), conv_id=conv_id, org_id="org-123",
+            user_id=None, input_text="hi", model="anton", turn_rows=[], correlation_id="corr-1",
+        ))
+
+    assert failure is None
+    assert [event.text for event in events] == ["noted"]
+    assert calls == []
+    logged = [
+        r for r in caplog.records
+        if r.name in (remote_turn_mod.logger.name, responses_mod.logger.name) and r.levelno >= logging.INFO
+    ]
+    assert [(r.name, r.levelname, r.getMessage()) for r in logged] == [(
+        remote_turn_mod.logger.name, "INFO",
+        "channel turn memory not saved: an organization's channel turn has no member",
+    )]
+    assert (logged[0].conversation_id, logged[0].request_id) == (str(conv_id), "corr-1")
+
+
+@pytest.mark.parametrize(
+    ("kind", "data"),
+    [
+        ("turn_memory", {"entries": [{"key": "likes", "value": "pizza"}]}),
+        ("turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}),
+    ],
+    ids=["memory", "compaction"],
+)
+async def test_a_busy_pool_on_a_memory_or_compaction_frame_keeps_the_channel_turn(
+    monkeypatch, controller_flags, one_connection_pool, caplog, kind, data,
+):
+    """The pod sends a memory or a compaction frame while the pool frees no
+    connection within POOL_TIMEOUT. The write is dropped with one WARNING,
+    and the turn goes on to its reply: it does not fail, and the controller
+    is not told to stop the pod's turn."""
+    import logging
+
+    from cowork.db import units
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    _fake_handler(monkeypatch)
+    # The write's unit waits for the app's pool, which the test holds.
+    monkeypatch.setattr(responses_mod, "run_db", units.run_db)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "before "}
+        yield kind, data
+        yield "turn_delta", {"text": "after"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+    conv_id = uuid4()
+
+    with caplog.at_level(logging.WARNING), one_connection_pool.connect():
+        events, failure = await _drain(remote_turn_events(
+            scope=LOCAL_SCOPE, conv_id=conv_id, org_id=None, user_id=None,
+            input_text="hi", model="anton", turn_rows=[],
+        ))
+
+    assert failure is None
+    assert [event.text for event in events] == ["before ", "after"]
+    assert await controller_flags.keys("*") == []
+    warned = [r for r in caplog.records if r.name == responses_mod.logger.name and r.levelno >= logging.WARNING]
+    assert [r.levelname for r in warned] == ["WARNING"]
+    assert warned[0].getMessage().startswith("[responses] no database connection freed in time")
+    assert warned[0].conversation_id == str(conv_id)
 
 
 @pytest.mark.asyncio
@@ -378,7 +498,7 @@ async def test_no_artifacts_context_skips_indexing_without_error(monkeypatch):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events, failure = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -409,7 +529,7 @@ async def test_vault_secrets_are_registered_before_the_seed_history_is_built(mon
 
     session = _FakeSession()
     _, failure = await _drain(remote_turn_events(
-        session=session, conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=session.scope, conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -439,7 +559,7 @@ async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatc
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
     events, _ = await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
         input_text="run", model="m", turn_rows=[],
     ))
     assert events[0].text == "model still runs"
@@ -469,7 +589,7 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
         input_text="run", model="m", turn_rows=[],
     ))
     assert diff.call_args.kwargs["attribute_by_provenance"] is True
@@ -513,7 +633,7 @@ async def test_a_cancelled_channel_turn_stops_its_controller_turn(monkeypatch, c
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     turn = asyncio.create_task(_drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[], correlation_id=correlation_id,
     )))
     await asyncio.wait_for(started.wait(), timeout=2)
@@ -535,7 +655,7 @@ async def test_a_channel_turn_its_reader_abandons_stops_its_controller_turn(monk
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     events = remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     )
     async for event in events:
@@ -560,7 +680,7 @@ async def test_a_channel_turn_that_reached_its_terminal_writes_no_cancel_flag(
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     await _drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
 
@@ -590,7 +710,7 @@ async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
     turn = asyncio.create_task(_drain(remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     )))
     await asyncio.wait_for(started.wait(), timeout=2)
@@ -628,12 +748,28 @@ class _Recorded(NamedTuple):
 _PROJECT_ID = str(uuid4())
 
 
-def _turn_with_a_new_artifact(monkeypatch, *, scope, diff=None, snapshot=None):
+def _real_units_after_the_inputs_read(monkeypatch):
+    """The turn's opening read of its inputs runs inline on a fake session, as
+    _fake_handler sets up; every later unit runs as a real unit on the test
+    database."""
+    from cowork.db import units
+
+    inline = inline_run_db(_FakeSession())
+
+    async def run_db(fn, *, scope):
+        if fn.func is remote_turn_mod._read_channel_turn_inputs:
+            return await inline(fn, scope=scope)
+        return await units.run_db(fn, scope=scope)
+
+    monkeypatch.setattr(remote_turn_mod, "run_db", run_db)
+
+
+def _turn_with_a_new_artifact(monkeypatch, *, diff=None, snapshot=None):
     """A channel turn in a project where the turn's end finds one new
-    artifact, "report". ``scope`` stands for the one the channel's session
-    carries (_recover_turn_scope). The record runs as a real unit on the
-    test database, with a spy in place of record_new_artifacts; ``diff`` and
-    ``snapshot`` replace the file store halves. Returns the spy's calls."""
+    artifact, "report". The record runs as a real unit on the test database,
+    in the scope the turn is given, with a spy in place of
+    record_new_artifacts; ``diff`` and ``snapshot`` replace the file store
+    halves. Returns the spy's calls."""
     from unittest.mock import AsyncMock
 
     from cowork.db.units import on_efs_thread
@@ -643,12 +779,12 @@ def _turn_with_a_new_artifact(monkeypatch, *, scope, diff=None, snapshot=None):
     _fake_handler(
         monkeypatch, remote_artifacts_context=lambda *_: (conversation, "/project/artifacts", _PROJECT_ID, "Project"),
     )
+    _real_units_after_the_inputs_read(monkeypatch)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", snapshot or (lambda *_: (set(), {})))
     monkeypatch.setattr(
         task_objects, "turn_artifact_changes",
         diff or (lambda **_: task_objects.ArtifactChanges(created=["report"], touched={"report"})),
     )
-    monkeypatch.setattr(task_objects, "_recover_turn_scope", lambda _conversation: scope)
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
     recorded: list[_Recorded] = []
 
@@ -672,9 +808,9 @@ def _completed_persistent_turn(monkeypatch, *, before_completed=None):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
 
-def _channel_turn(*, conv_id=None):
+def _channel_turn(*, scope, conv_id=None):
     return remote_turn_events(
-        session=_FakeSession(), conv_id=conv_id or uuid4(), org_id="org-123", user_id=None,
+        scope=scope, conv_id=conv_id or uuid4(), org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     )
 
@@ -682,8 +818,8 @@ def _channel_turn(*, conv_id=None):
 async def test_a_channel_turn_diffs_on_a_file_store_thread_and_records_in_a_unit(monkeypatch):
     """The diff reads the shared file store, so it runs on a file store
     thread. The record writes rows, so it runs as a database unit off that
-    thread, in the scope the channel's session carries: a stalled pool then
-    holds no file store slot."""
+    thread, in the scope the turn is given: a stalled pool then holds no file
+    store slot."""
     from cowork.db.scoped import TenantScope
     from cowork.db.units import on_efs_thread
     from cowork.services import task_objects
@@ -695,32 +831,14 @@ async def test_a_channel_turn_diffs_on_a_file_store_thread_and_records_in_a_unit
         diffs.append(on_efs_thread())
         return task_objects.ArtifactChanges(created=["report"], touched={"report"})
 
-    recorded = _turn_with_a_new_artifact(monkeypatch, scope=org, diff=diff)
+    recorded = _turn_with_a_new_artifact(monkeypatch, diff=diff)
     _completed_persistent_turn(monkeypatch)
 
-    _, failure = await _drain(_channel_turn())
+    _, failure = await _drain(_channel_turn(scope=org))
 
     assert failure is None
     assert diffs == [True]
     assert recorded == [_Recorded(["report"], UUID(_PROJECT_ID), "user-1", org, False)]
-
-
-@pytest.mark.parametrize("partitioned", [True, False], ids=["partitioned", "desktop"])
-async def test_a_channel_turn_without_a_scope_records_its_artifacts_only_on_a_desktop(monkeypatch, partitioned):
-    """No scope found on the conversation's session: a desktop records under
-    its local scope, and a partitioned deployment skips the record rather
-    than invent a tenant."""
-    from cowork.db.scoped import LOCAL_SCOPE
-    from cowork.services import task_objects
-
-    recorded = _turn_with_a_new_artifact(monkeypatch, scope=None)
-    monkeypatch.setattr(task_objects, "tenant_scope_required", lambda: partitioned)
-    _completed_persistent_turn(monkeypatch)
-
-    _, failure = await _drain(_channel_turn())
-
-    assert failure is None
-    assert [call.scope for call in recorded] == ([] if partitioned else [LOCAL_SCOPE])
 
 
 def _artifact_record_log(caplog):
@@ -742,12 +860,12 @@ async def test_a_channel_turn_whose_artifact_diff_fails_still_finishes(monkeypat
     def failing_diff(**kwargs):
         raise RuntimeError("the artifacts folder could not be read")
 
-    recorded = _turn_with_a_new_artifact(monkeypatch, scope=LOCAL_SCOPE, diff=failing_diff)
+    recorded = _turn_with_a_new_artifact(monkeypatch, diff=failing_diff)
     _completed_persistent_turn(monkeypatch)
     logged = owned_logger(remote_turn_mod.logger.name, level=logging.WARNING)
     conv_id = uuid4()
 
-    _, failure = await _drain(_channel_turn(conv_id=conv_id))
+    _, failure = await _drain(_channel_turn(scope=LOCAL_SCOPE, conv_id=conv_id))
 
     assert failure is None
     assert recorded == []
@@ -772,7 +890,7 @@ async def test_a_channel_turn_whose_artifact_record_fails_still_finishes_and_car
     from cowork.db.scoped import LOCAL_SCOPE
     from cowork.services import task_objects
 
-    _turn_with_a_new_artifact(monkeypatch, scope=LOCAL_SCOPE)
+    _turn_with_a_new_artifact(monkeypatch)
 
     def failing_record(session, **kwargs):
         raise RuntimeError("the index row could not be written")
@@ -782,7 +900,7 @@ async def test_a_channel_turn_whose_artifact_record_fails_still_finishes_and_car
     logged = owned_logger(remote_turn_mod.logger.name, level=logging.WARNING)
     conv_id = uuid4()
 
-    _, failure = await _drain(_channel_turn(conv_id=conv_id))
+    _, failure = await _drain(_channel_turn(scope=LOCAL_SCOPE, conv_id=conv_id))
 
     assert failure is None
     assert task_objects.publish_and_card_turn_artifacts.await_args.kwargs["new_slugs"] == ["report"]
@@ -814,7 +932,7 @@ async def test_a_refused_artifact_record_names_the_conversation_project_and_slug
 
     slugs = ["chart", "sales-report"]
     recorded = _turn_with_a_new_artifact(
-        monkeypatch, scope=LOCAL_SCOPE,
+        monkeypatch,
         diff=lambda **_: task_objects.ArtifactChanges(created=slugs, touched=set(slugs)),
     )
 
@@ -826,7 +944,7 @@ async def test_a_refused_artifact_record_names_the_conversation_project_and_slug
     logged = owned_logger(remote_turn_mod.logger.name, level=logging.WARNING)
     conv_id = uuid4()
 
-    _, failure = await _drain(_channel_turn(conv_id=conv_id))
+    _, failure = await _drain(_channel_turn(scope=LOCAL_SCOPE, conv_id=conv_id))
 
     assert failure is None
     assert recorded == []
@@ -834,7 +952,7 @@ async def test_a_refused_artifact_record_names_the_conversation_project_and_slug
     assert record.levelname == "ERROR"
     assert record.getMessage() == (
         "Database operation failed: error_type=DatabaseBusy sqlstate=unknown "
-        f"site=remote_turn.record_artifacts:{record.lineno}"
+        f"site=remote_turn._record_turn_artifacts:{record.lineno}"
     )
     assert (record.conversation_id, record.project_id, record.artifact_slugs) == (
         str(conv_id), _PROJECT_ID, tuple(slugs),
@@ -847,10 +965,10 @@ async def test_a_refused_artifact_record_names_the_conversation_project_and_slug
 
 @pytest.mark.usefixtures("cleanup_tmp_projects")
 async def test_a_channel_turn_writes_the_index_row_and_the_creators_owner_row(monkeypatch, tmp_path):
-    """No spy: the channel's session carries an organization's scope, the
-    conversation comes back attached to it, and the turn's end writes the
-    new folder's task_objects row and its creator's owner row on the test
-    database. Without the owner row its creator could no longer edit it."""
+    """No spy: the turn runs in an organization's scope, its inputs are read
+    in a real unit, and the turn's end writes the new folder's task_objects
+    row and its creator's owner row on the test database. Without the owner
+    row its creator could no longer edit it."""
     from unittest.mock import AsyncMock
 
     from cowork.db import units
@@ -859,7 +977,7 @@ async def test_a_channel_turn_writes_the_index_row_and_the_creators_owner_row(mo
     from cowork.models.task_object import TaskObject
     from cowork.services import artifact_ownership as ownership
     from cowork.services import task_objects
-    from test_artifact_ownership import make_conversation, make_project, project_root, scoped, write_artifact
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
 
     org_id, creator = str(uuid4()), str(uuid4())
     project = make_project(tmp_path, org_id)
@@ -867,6 +985,7 @@ async def test_a_channel_turn_writes_the_index_row_and_the_creators_owner_row(mo
     source = project_root(project)
     slug = "sales-report"
     _fake_handler(monkeypatch, remote_artifacts_context=ResponsesHandler._remote_artifacts_context)
+    monkeypatch.setattr(remote_turn_mod, "run_db", units.run_db)
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
 
     async def replies(**kwargs):
@@ -875,14 +994,14 @@ async def test_a_channel_turn_writes_the_index_row_and_the_creators_owner_row(mo
         yield "turn_completed", {}
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
-    with scoped(org_id, creator) as session:
-        _, failure = await _drain(remote_turn_events(
-            session=session, conv_id=conversation_id, org_id=org_id, user_id=creator,
-            input_text="hi", model="anton", turn_rows=[],
-        ))
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    _, failure = await _drain(remote_turn_events(
+        scope=scope, conv_id=conversation_id, org_id=org_id, user_id=creator,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
 
     assert failure is None
-    with units.unit_session(scope=TenantScope(org_mode=True, org_id=org_id, user_id=creator)) as session:
+    with units.unit_session(scope=scope) as session:
         indexed = session.exec(
             session.select(TaskObject).where(TaskObject.conversation_id == conversation_id, TaskObject.ref == slug)
         ).all()
@@ -898,7 +1017,7 @@ async def test_a_cancel_while_the_turn_end_waits_for_a_file_store_slot_still_rec
     from cowork.db import units
     from cowork.db.scoped import LOCAL_SCOPE
 
-    recorded = _turn_with_a_new_artifact(monkeypatch, scope=LOCAL_SCOPE)
+    recorded = _turn_with_a_new_artifact(monkeypatch)
     slots = units._efs_slots()
     holders = [object() for _ in range(units.EFS_SLOTS)]
 
@@ -907,7 +1026,7 @@ async def test_a_cancel_while_the_turn_end_waits_for_a_file_store_slot_still_rec
             await slots.acquire_on_behalf_of(holder)
 
     _completed_persistent_turn(monkeypatch, before_completed=take_every_slot)
-    turn = asyncio.create_task(_drain(_channel_turn()))
+    turn = asyncio.create_task(_drain(_channel_turn(scope=LOCAL_SCOPE)))
     try:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 5
@@ -941,10 +1060,10 @@ async def test_a_channel_turns_artifact_diff_waits_past_pool_timeout_for_a_file_
 
     monkeypatch.setattr(units.db_session.settings.database, "pool_timeout", 1)
     slots = _FileStoreSlots()
-    recorded = _turn_with_a_new_artifact(monkeypatch, scope=LOCAL_SCOPE)
+    recorded = _turn_with_a_new_artifact(monkeypatch)
     _completed_persistent_turn(monkeypatch, before_completed=slots.take)
     with caplog.at_level(logging.WARNING, logger=remote_turn_mod.logger.name):
-        turn = asyncio.create_task(_drain(_channel_turn()))
+        turn = asyncio.create_task(_drain(_channel_turn(scope=LOCAL_SCOPE)))
         try:
             await slots.until_someone_waits()
             await asyncio.sleep(1.5)
@@ -984,7 +1103,7 @@ async def test_a_channel_turns_artifact_bookkeeping_leaves_the_event_loop_free(m
         time.sleep(slow)
         return task_objects.ArtifactChanges(created=["report"], touched={"report"})
 
-    recorded = _turn_with_a_new_artifact(monkeypatch, scope=LOCAL_SCOPE, diff=slow_diff, snapshot=slow_snapshot)
+    recorded = _turn_with_a_new_artifact(monkeypatch, diff=slow_diff, snapshot=slow_snapshot)
     _completed_persistent_turn(monkeypatch)
     ticks = 0
 
@@ -998,7 +1117,7 @@ async def test_a_channel_turns_artifact_bookkeeping_leaves_the_event_loop_free(m
     beat = asyncio.create_task(heartbeat())
     started = loop.time()
     try:
-        _, failure = await _drain(_channel_turn())
+        _, failure = await _drain(_channel_turn(scope=LOCAL_SCOPE))
     finally:
         beat.cancel()
     elapsed = loop.time() - started

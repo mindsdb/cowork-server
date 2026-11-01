@@ -265,7 +265,7 @@ async def test_org_source_read_and_manual_edit_are_project_scoped(
     card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
 
     source = await workspace_ep.artifact_source(
-        str(row.id), card["id"], _scoped(session, ORG_A), path="index.html"
+        str(row.id), card["id"], _scoped(session, ORG_A).scope, path="index.html"
     )
     saved = await workspace_ep.update_artifact_source(
         str(row.id),
@@ -276,7 +276,7 @@ async def test_org_source_read_and_manual_edit_are_project_scoped(
             path="index.html",
             summary="Edit heading",
         ),
-        _scoped(session, ORG_A),
+        _scoped(session, ORG_A).scope,
     )
 
     assert saved["revision"]["actor"] == {"kind": "manual", "id": USER_A}
@@ -294,7 +294,7 @@ async def test_org_source_read_cannot_cross_org(session, tmp_path, org_mode):
     with Session(session.get_bind()) as foreign_session:
         with pytest.raises(HTTPException) as err:
             await workspace_ep.artifact_source(
-                str(row.id), card["id"], _scoped(foreign_session, ORG_A), path="index.html"
+                str(row.id), card["id"], _scoped(foreign_session, ORG_A).scope, path="index.html"
             )
 
         assert err.value.status_code == 404
@@ -324,7 +324,7 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
         lambda *_args: card["artifactKey"],
     )
     enabled = await workspace_ep.enable_artifact_comments(
-        str(row.id), card["id"], _scoped(session, org_id)
+        str(row.id), card["id"], _scoped(session, org_id).scope
     )
     assert enabled.enabled is True
     return row, folder, card
@@ -336,18 +336,18 @@ async def test_same_org_reviewer_can_preview_but_cannot_edit_source(
     row, _folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
-        entry = await workspace_ep.artifact_review_entry(str(row.id), card["id"], reviewer)
+        entry = await workspace_ep.artifact_review_entry(str(row.id), card["id"], reviewer.scope)
         assert entry["capabilities"]["role"] == "reviewer"
         assert entry["capabilities"]["canEdit"] is False
 
         draft = await workspace_ep.serve_private_draft(
-            str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
+            str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer.scope
         )
         assert draft.status_code == 200
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.artifact_source(
-                str(row.id), card["id"], reviewer, path="index.html"
+                str(row.id), card["id"], reviewer.scope, path="index.html"
             )
         assert err.value.status_code == 403
 
@@ -363,9 +363,9 @@ async def test_ungranted_draft_stays_invisible_to_a_co_member(session, tmp_path,
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
 
         for call in (
-            workspace_ep.artifact_review_entry(str(row.id), artifact_id, reviewer),
+            workspace_ep.artifact_review_entry(str(row.id), artifact_id, reviewer.scope),
             workspace_ep.serve_private_draft(
-                str(row.id), artifact_id, "index.html", MagicMock(query_params={}), reviewer
+                str(row.id), artifact_id, "index.html", MagicMock(query_params={}), reviewer.scope
             ),
         ):
             with pytest.raises(HTTPException) as err:
@@ -380,7 +380,7 @@ async def test_reviewer_cannot_provision_draft_review(session, tmp_path, org_mod
     with Session(session.get_bind()) as reviewer_session:
         with pytest.raises(HTTPException) as err:
             await workspace_ep.enable_artifact_comments(
-                str(row.id), card["id"], _scoped(reviewer_session, ORG_A, user_id=USER_A2)
+                str(row.id), card["id"], _scoped(reviewer_session, ORG_A, user_id=USER_A2).scope
             )
 
     assert err.value.status_code == 403
@@ -394,7 +394,7 @@ async def test_same_org_reviewer_receives_the_current_revision_for_comments(
         result = await workspace_ep.artifact_review_entry(
             str(row.id),
             card["id"],
-            _scoped(reviewer_session, ORG_A, user_id=USER_A2),
+            _scoped(reviewer_session, ORG_A, user_id=USER_A2).scope,
         )
 
     assert result["capabilities"]["role"] == "reviewer"
@@ -421,13 +421,13 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         asset = await workspace_ep.serve_private_draft(
-            str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer
+            str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer.scope
         )
         assert asset.status_code == 200
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
-                str(row.id), card["id"], "backend.py", MagicMock(query_params={}), reviewer
+                str(row.id), card["id"], "backend.py", MagicMock(query_params={}), reviewer.scope
             )
         assert err.value.status_code == 404
 
@@ -450,7 +450,7 @@ async def test_fullstack_draft_preview_refuses_a_root_level_primary(
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
-                str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
+                str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer.scope
             )
         assert err.value.status_code == 404
 
@@ -460,7 +460,7 @@ async def test_fullstack_draft_preview_refuses_a_root_level_primary(
 async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, publish_key):
     row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
-    await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+    await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
 
     assert not folder.exists()
 
@@ -494,7 +494,7 @@ async def test_delete_threads_the_active_workspace_into_the_publish_key(
     monkeypatch.setattr(PublishKey, "get", fake_get)
     monkeypatch.setattr(PublishKey, "revoke", fake_revoke)
 
-    await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+    await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
 
     assert captured["workspace_id"] == "ws-1"
 
@@ -536,7 +536,7 @@ async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
     monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
     monkeypatch.setattr("anton.publisher.unpublish", unpublish)
     with pytest.raises(error_type) as error:
-        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
     assert error.value.status_code == status
     assert (folder / "index.html").read_text() == "<html></html>"
     assert json.loads((folder / ".published.json").read_text()) == record
@@ -569,7 +569,7 @@ async def test_delete_keeps_artifact_files_when_the_upload_service_is_unavailabl
     monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
     monkeypatch.setattr("anton.publisher.unpublish", unpublish)
     with pytest.raises(UploadServiceUnavailable):
-        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
     assert (folder / "index.html").read_text() == "<html></html>"
     assert json.loads((folder / ".published.json").read_text()) == record
 
@@ -592,7 +592,7 @@ async def test_delete_revokes_with_the_verified_owner_and_tenant_before_removing
     monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
 
     await ep.delete_artifact_for_request(
-        _scoped(session, ORG_A), artifact_id if by_id else "dash", project_id=row.id
+        _scoped(session, ORG_A).scope, artifact_id if by_id else "dash", project_id=row.id
     )
 
     assert [(UUID(identifier).hex, owner, org) for identifier, owner, org in calls] == [
@@ -618,7 +618,7 @@ async def test_delete_keeps_files_when_draft_authorization_is_unavailable(
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A), artifact_id, project_id=row.id
+            _scoped(session, ORG_A).scope, artifact_id, project_id=row.id
         )
 
     assert err.value.status_code == 503
@@ -667,7 +667,7 @@ async def test_delete_by_artifact_id_selects_the_exact_duplicate_slug(
     second_artifact_id, _metadata = ensure_full_id(second_folder)
 
     await ep.delete_artifact_for_request(
-        _scoped(session, ORG_A), second_artifact_id, project_id=row.id
+        _scoped(session, ORG_A).scope, second_artifact_id, project_id=row.id
     )
 
     assert first_folder.exists()
@@ -690,7 +690,7 @@ async def test_reviewer_cannot_delete_an_owners_artifact(
     with Session(session.get_bind()) as reviewer_session:
         with pytest.raises(HTTPException) as err:
             await ep.delete_artifact_for_request(
-                _scoped(reviewer_session, ORG_A, user_id=USER_A2),
+                _scoped(reviewer_session, ORG_A, user_id=USER_A2).scope,
                 card["id"],
                 project_id=row.id,
             )
@@ -709,7 +709,7 @@ async def test_ungranted_delete_by_a_co_member_is_404(
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A, user_id=USER_A2), artifact_id, project_id=row.id
+            _scoped(session, ORG_A, user_id=USER_A2).scope, artifact_id, project_id=row.id
         )
 
     assert err.value.status_code == 404
@@ -728,7 +728,7 @@ async def test_delete_cannot_reach_another_members_artifact(
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A, USER_A2), "theirs", project_id=row.id
+            _scoped(session, ORG_A, USER_A2).scope, "theirs", project_id=row.id
         )
 
     assert err.value.status_code == 404
@@ -743,7 +743,7 @@ async def test_delete_in_foreign_project_is_404_and_keeps_files(
     )
 
     with pytest.raises(HTTPException) as err:
-        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "secret", project_id=row.id)
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "secret", project_id=row.id)
 
     assert err.value.status_code == 404
     assert folder.exists()
@@ -763,7 +763,7 @@ async def test_delete_in_desktop_hits_the_named_project_not_the_first_one(
     )
 
     await ep.delete_artifact_for_request(
-        ScopedSession(session, LOCAL_SCOPE), "dash", project_id=second.id
+        ScopedSession(session, LOCAL_SCOPE).scope, "dash", project_id=second.id
     )
 
     assert not second_folder.exists()

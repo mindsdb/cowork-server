@@ -15,7 +15,7 @@ from sqlmodel import Session, select
 
 from cowork.api.v1.endpoints import artifact_workspace, artifacts, comments
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
-from cowork.db.scoped import ScopedSession, TenantScope, get_scoped_session
+from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -253,7 +253,7 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
 ):
     session, project, conversation, folder = owned_artifact
     granted = await artifact_workspace.enable_artifact_comments(
-        str(project.id), local_id, session
+        str(project.id), local_id, session.scope
     )
     canonical = identities.existing_authorization_key(local_id, scope)
     assert granted.artifact_key == artifact_key(local_id)
@@ -281,7 +281,7 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
     )
     assert seen["artifact_key"] == canonical
     assert comments.resolve_comments_route(
-        "artifact", local_id, session=session
+        "artifact", local_id, tenant_scope=session.scope
     ) == tuple(canonical.split("/", 1))
 
     async def mint(_self):
@@ -290,7 +290,7 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
     monkeypatch.setattr("cowork.services.artifact_publish_key.PublishKey.get", mint)
     monkeypatch.setattr("anton.publisher.unpublish", lambda *_a, **_kw: None)
     await artifacts.delete_artifact_for_request(
-        session, local_id, project_id=project.id
+        session.scope, local_id, project_id=project.id
     )
     assert issuer.calls[-1][0].endswith("/delete/")
     assert issuer.calls[-1][1] == {
@@ -310,7 +310,7 @@ async def test_an_authorization_outage_still_answers_503(issuer, local_id, owned
     issuer.failure = True
 
     with pytest.raises(HTTPException) as err:
-        await artifact_workspace.enable_artifact_comments(str(project.id), local_id, session)
+        await artifact_workspace.enable_artifact_comments(str(project.id), local_id, session.scope)
 
     assert err.value.status_code == 503
     assert not (folder / ".revisions" / "draft-review.json").exists()
@@ -335,7 +335,7 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
 
     session, project, _conversation, folder = owned_artifact
     await artifact_workspace.enable_artifact_comments(
-        str(project.id), local_id, session
+        str(project.id), local_id, session.scope
     )
     canonical = identities.existing_authorization_key(local_id, scope)
     uploads = []
@@ -380,14 +380,14 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
         peer_session = ScopedSession(raw, peer)
         with pytest.raises(HTTPException) as excinfo:
             await artifact_workspace.update_artifact_source(
-                str(project.id), local_id, body, peer_session
+                str(project.id), local_id, body, peer_session.scope
             )
         assert excinfo.value.status_code == 403
     assert len(uploads) == 1
     authority_calls = len(issuer.calls)
 
     saved = await artifact_workspace.update_artifact_source(
-        str(project.id), local_id, body, session
+        str(project.id), local_id, body, session.scope
     )
     assert saved["content"] == body.content
     assert len(uploads) == 2
@@ -439,7 +439,7 @@ def test_pending_allocation_cannot_fall_back_to_an_untrusted_global_id(
     before = list(issuer.calls)
     app = FastAPI()
     app.include_router(comments.router, prefix="/comments")
-    app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=scope)
+    app.dependency_overrides[get_tenant_scope] = lambda: scope
     monkeypatch.setattr(comments, "_org_mode", lambda: True)
 
     async def forwarded(*_args):
@@ -460,7 +460,7 @@ def test_rest_and_stream_translate_sql_aliases_without_issuing_identity(
     before = list(issuer.calls)
     app = FastAPI()
     app.include_router(comments.router, prefix="/comments")
-    app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=scope)
+    app.dependency_overrides[get_tenant_scope] = lambda: scope
     monkeypatch.setattr(comments, "_org_mode", lambda: True)
     seen = []
 
@@ -489,7 +489,7 @@ def test_foreign_org_proxy_cannot_select_another_tenants_sql_alias(
     foreign = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=str(uuid4()))
     monkeypatch.setattr(comments, "_org_mode", lambda: True)
     assert comments.resolve_comments_route(
-        "artifact", local_id, session=SimpleNamespace(scope=foreign)
+        "artifact", local_id, tenant_scope=foreign
     ) == ("artifact", local_id)
     assert canonical != artifact_key(local_id)
     assert len(issuer.calls) == 2
@@ -501,7 +501,7 @@ def test_unknown_external_canonical_key_remains_subject_to_upstream_authorizatio
     external = str(uuid4())
     monkeypatch.setattr(comments, "_org_mode", lambda: True)
     assert comments.resolve_comments_route(
-        "artifact", external, session=SimpleNamespace(scope=scope)
+        "artifact", external, tenant_scope=scope
     ) == ("artifact", external)
     assert issuer.calls == []
 

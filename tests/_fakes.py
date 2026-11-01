@@ -84,6 +84,15 @@ def opens(buffer):
     return open_buffer
 
 
+def units_on_engine(monkeypatch, engine):
+    """Point the real ``run_db`` units at a test's own engine, for a test that
+    seeds and reads through a session on an engine of its own. The units still
+    run in worker threads, each in a session of its own."""
+    from cowork.db import units
+
+    monkeypatch.setattr(units, "_engine", lambda: engine)
+
+
 def inline_run_db(session):
     """A run_db stand-in for producer tests whose services are fakes: it runs
     each unit on the event loop with ``session``, so nothing reaches a

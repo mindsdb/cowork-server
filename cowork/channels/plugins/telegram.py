@@ -457,7 +457,7 @@ async def _setup(ctx: LifecycleContext) -> LifecycleResult:
     secret_token = (ctx.credentials.get("secret_token") or "").strip()
     if not secret_token:
         secret_token = secrets.token_urlsafe(32)
-        ctx.persist_credentials({"secret_token": secret_token})
+        await ctx.persist_credentials({"secret_token": secret_token})
 
     if not ctx.webhook_url:
         active = await ctx.refresh_adapter()

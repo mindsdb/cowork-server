@@ -79,6 +79,57 @@ def test_ingress_manager_poll_lifecycle():
     asyncio.run(scenario())
 
 
+def test_a_poll_whose_intake_fails_polls_the_batch_again_and_keeps_polling(monkeypatch):
+    """A batch's intake is refused, as by a pool that frees no connection
+    within POOL_TIMEOUT. The poll loop goes on (in local mode nothing would
+    restart it), and the next poll sends the offset from before the batch,
+    so the platform delivers the same events again rather than counting them
+    confirmed."""
+    from cowork.channels import ingress
+    from cowork.db.units import DatabaseBusy
+
+    batch = [{"key": "evt-1"}]
+
+    class _OneBatchBridge:
+        def __init__(self):
+            self.offsets: list[int | None] = []
+            self.third_poll = asyncio.Event()
+
+        async def poll(self, *, offset):
+            self.offsets.append(offset)
+            if len(self.offsets) == 3:
+                self.third_poll.set()
+            await asyncio.sleep(0)
+            return list(batch), 11
+
+        def dedupe_key(self, event):
+            return event["key"]
+
+    intakes: list[list] = []
+
+    async def intake_events(channel_type, bridge, events, *, sink, org_id):
+        intakes.append(events)
+        if len(intakes) == 1:
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(ingress, "intake_events", intake_events)
+    monkeypatch.setattr(ingress, "_ERROR_BACKOFF_S", 0.01)
+
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        bridge = _OneBatchBridge()
+        await mgr.start("telegram", bridge)
+        try:
+            await asyncio.wait_for(bridge.third_poll.wait(), 2.0)
+            assert mgr.is_running("telegram")
+        finally:
+            await mgr.stop("telegram")
+        return bridge.offsets[:3]
+
+    assert asyncio.run(scenario()) == [None, None, 11]
+    assert intakes[:2] == [batch, batch]
+
+
 def test_ingress_manager_stream_lifecycle():
     async def scenario():
         mgr = IngressManager(sink=_noop_sink)
