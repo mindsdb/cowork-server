@@ -1,7 +1,8 @@
 """Wire shapes of an artifact's sharing: the access a publish takes, one save
-of the Share dialog included (ArtifactAccessRequest), and the access state
-the owner reads back (ArtifactAccessView) or a publish answers
-(ArtifactPublishResult).
+of the Share dialog included (ArtifactAccessRequest), the access state the
+owner reads back (ArtifactAccessView) or a publish answers
+(ArtifactPublishResult), and the part of an artifact's card the desktop's
+GET /api/v1/artifacts/status answers (ArtifactStatusView).
 
 Who a restricted artifact is shared with goes by MindsHub's artifact rule
 names (cowork.services.sharing_contract.AudienceField). The access state is
@@ -165,18 +166,46 @@ class ArtifactAudienceView(CamelResponse):
         )
 
 
-class ArtifactAccessView(ArtifactAudienceView):
+class ArtifactAccessView(CamelResponse):
     """An artifact's access state for its owner: the Share dialog's GET
     .../access and the artifact card's access fields. The plaintext password
     and the email list are the owner's only, so only the owner is answered
-    with them."""
+    with them.
 
+    Who a restricted artifact is shared with goes under ArtifactAudienceView's
+    names, and all five are None when this server doesn't know it
+    (audience_unknown): never an empty audience, which would say the
+    artifact is shared with nobody. That is a restricted artifact's state as
+    its .published.json says it in MindsHub mode, which keeps no copy of the
+    audience (cowork.services.artifacts.published_access_view), so its card
+    answers null for each of them it carries. GET .../access reads
+    MindsHub's rule for a restricted artifact (restricted_to), so it never
+    answers None."""
+
+    access_emails: list[str] | None = Field(default_factory=list)
+    org_allowed: bool | None = False
+    owner_only: bool | None = False
+    allowed_team_ids: list[str] | None = Field(default_factory=list)
+    allowed_user_ids: list[str] | None = Field(default_factory=list)
     access_mode: AccessMode = AccessMode.PUBLIC
     access_protected: bool = False
     access_password: str = ""
     # The key the renderer addresses comment requests by; "" when
     # unpublished or published before the key was kept.
     artifact_key: str = ""
+
+    @classmethod
+    def audience_unknown(cls, *, artifact_key: str) -> ArtifactAccessView:
+        """A restricted artifact whose audience this server doesn't know."""
+        return cls(
+            access_mode=AccessMode.RESTRICTED,
+            artifact_key=artifact_key,
+            access_emails=None,
+            org_allowed=None,
+            owner_only=None,
+            allowed_team_ids=None,
+            allowed_user_ids=None,
+        )
 
     def restricted_to(self, rule: ArtifactRule) -> ArtifactAccessView:
         """This state restricted to ``rule``'s audience: what an artifact
@@ -185,6 +214,47 @@ class ArtifactAccessView(ArtifactAudienceView):
             access_mode=AccessMode.RESTRICTED,
             artifact_key=self.artifact_key,
             **ArtifactAudienceView.of(rule).model_dump(),
+        )
+
+
+class ArtifactStatusView(CamelResponse):
+    """The published, modified, and access part of an artifact's card that
+    the desktop's GET /api/v1/artifacts/status answers, the read the preview
+    viewer repeats on every open and window focus. It never carries the
+    plaintext password the card holds for its owner: of_card reads none of
+    the card's other keys. The defaults answer an artifact that can't be
+    found or read.
+
+    The audience fields are the card's. One the card answers null for (a
+    restricted artifact whose audience this server doesn't know,
+    ArtifactAccessView.audience_unknown) stays null, never an empty
+    audience."""
+
+    published_url: str = ""
+    modified: bool = False
+    access_mode: AccessMode = AccessMode.PUBLIC
+    access_protected: bool = False
+    access_emails: list[str] | None = Field(default_factory=list)
+    org_allowed: bool | None = False
+    owner_only: bool | None = False
+    # The key the renderer addresses comment requests by; "" when
+    # unpublished or published before the key was kept.
+    artifact_key: str = ""
+
+    @classmethod
+    def of_card(cls, card: Mapping[str, Any]) -> ArtifactStatusView:
+        """The status part of ``card``, an artifact card under the app's
+        names (cowork.services.artifacts.card_for_folder). A field the card
+        doesn't carry takes its default."""
+        return cls(
+            published_url=card.get("publishedUrl") or "",
+            modified=bool(card.get("modified")),
+            access_mode=card.get("accessMode") or AccessMode.PUBLIC,
+            access_protected=bool(card.get("accessProtected")),
+            access_emails=card.get("accessEmails", []),
+            org_allowed=card.get("orgAllowed", False),
+            owner_only=card.get("ownerOnly", False),
+            artifact_key=card.get("artifactKey") or "",
         )
 
 

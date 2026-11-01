@@ -31,6 +31,7 @@ from cowork.db.scoped import TenantScope, get_scoped_session
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.services import artifact_locks
+from cowork.services.publish import ARTIFACT_ORG_REFUSAL
 from tests._org_sharing import (
     BOB,
     CAROL,
@@ -55,6 +56,11 @@ ARTIFACT_ID = "11111111-1111-1111-1111-111111111111"
 
 class _Session:
     scope = ORG_SCOPE
+
+
+def _answer(response) -> tuple[int, dict]:
+    """The status and JSON body of a route's own response."""
+    return response.status_code, json.loads(response.body)
 
 
 # The route's request: the caller's credential, read only to check teams.
@@ -300,9 +306,10 @@ async def test_sharing_with_everyone_takes_share_org_before_anything_is_publishe
     asked: list = []
     mindshub_sharing_answers(monkeypatch, asked=asked)
     everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": []}
-    with pytest.raises(HTTPException) as caught:
-        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
-    assert (caught.value.status_code, caught.value.detail) == (403, aw.ARTIFACT_ORG_REFUSAL)
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST
+    )
+    assert _answer(refused) == (403, {"detail": ARTIFACT_ORG_REFUSAL, "code": "share_org_required"})
     assert publish_calls == []
     assert {bearer for _path, bearer in asked} == {MEMBER_BEARER}
     # Read for the owner's own artifact, in the publish's artifacts root.
@@ -310,14 +317,43 @@ async def test_sharing_with_everyone_takes_share_org_before_anything_is_publishe
     assert _lock_is_free(as_owner)
 
     mindshub_sharing_answers(monkeypatch, permissions=("skills.share_org",))
-    with pytest.raises(HTTPException) as caught:
-        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
-    assert (caught.value.status_code, caught.value.detail) == (403, aw.ARTIFACT_ORG_REFUSAL)
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST
+    )
+    assert _answer(refused) == (403, {"detail": ARTIFACT_ORG_REFUSAL, "code": "share_org_required"})
     assert publish_calls == []
 
     mindshub_sharing_answers(monkeypatch, permissions=("artifacts.share_org",))
     await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
     assert publish_calls[-1]["access"]["org_allowed"] is True
+
+
+# MindsHub's reason for refusing a share with everyone, as the upload service
+# passes it on. Written here because neither of them can be imported.
+SHARE_ORG_REASON = "Sharing an artifact with everyone in the organization needs the artifacts.share_org permission."
+
+
+async def test_mindshubs_refusal_of_a_share_with_everyone_is_a_403_with_its_reason(
+    as_owner, publish_context, stored_rule, monkeypatch,
+):
+    """This server's read of the caller's permissions let the save through,
+    but MindsHub refused the rule's write, say because the capability was
+    taken away since, and the upload service passed its 403 on. The route
+    answers that 403 with MindsHub's reason as it gave it and the code the
+    app branches on, never the 502 of a failed publish, and nothing is
+    published."""
+    mindshub_sharing_answers(monkeypatch, permissions=("artifacts.share_org",))
+    _upload_service_answers(
+        monkeypatch, 403, "Forbidden",
+        json.dumps({"error": SHARE_ORG_REASON, "code": "share_org_required"}).encode(),
+    )
+    everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": []}
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST
+    )
+    assert _answer(refused) == (403, {"detail": SHARE_ORG_REASON, "code": "share_org_required"})
+    assert not (as_owner / ".published.json").exists()
+    assert _lock_is_free(as_owner)
 
 
 def _planted(folder, **entry) -> None:
@@ -339,9 +375,10 @@ async def test_an_entry_an_agent_planted_never_lets_a_member_share_with_everyone
     _planted(as_owner, org_allowed=True)
     mindshub_sharing_answers(monkeypatch)
     everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": []}
-    with pytest.raises(HTTPException) as caught:
-        await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST)
-    assert (caught.value.status_code, caught.value.detail) == (403, aw.ARTIFACT_ORG_REFUSAL)
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST
+    )
+    assert _answer(refused) == (403, {"detail": ARTIFACT_ORG_REFUSAL, "code": "share_org_required"})
     assert publish_calls == []
 
 

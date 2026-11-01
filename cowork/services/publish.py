@@ -35,6 +35,7 @@ from cowork.schemas.artifact_access import (
     ArtifactAudienceView,
     ArtifactPublishResult,
 )
+from cowork.schemas.refusals import Refusal
 from cowork.services.artifact_audience import (
     ENTRY_AUDIENCE_FIELDS,
     ORG_AUDIENCE_FIELDS,
@@ -47,7 +48,7 @@ from cowork.services.artifact_audience import (
     sync_team_audience,
 )
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.sharing_contract import AudienceField
+from cowork.services.sharing_contract import ARTIFACTS_SHARE_ORG, SHARE_ORG_REQUIRED_CODE, AudienceField
 from cowork.services.providers import (
     is_mindshub_publish_url,
     normalize_publish_url,
@@ -151,6 +152,39 @@ class PublishRejected(RuntimeError):
     """
 
 
+# Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
+# which MindsHub also checks when the rule is written.
+ARTIFACT_ORG_REFUSAL = (
+    f"Sharing an artifact with everyone in the organization requires the {ARTIFACTS_SHARE_ORG} "
+    "permission or an organization admin."
+)
+
+
+class ShareOrgRequired(PublishRejected):
+    """Sharing an artifact with everyone in its organization was refused to
+    someone without MindsHub's artifacts.share_org. MindsHub refuses a
+    publish whose rule newly shares with everyone, and the upload service
+    passes on its reason, which is this error's text, clipped as any upload
+    service text is (classify_upload_error, _clip); the access route's own
+    check refuses the same before anything publishes, with
+    ARTIFACT_ORG_REFUSAL. Nothing was published either way.
+
+    ``status_code`` and ``code`` are what a route answers: 403 with
+    refusal(), never the 502 of a failed publish. The agent's publish tool
+    tells the model not to publish wider instead
+    (cowork.services.sharing_contract.SHARE_ORG_REQUIRED_INSTRUCTION)."""
+
+    status_code: int = 403
+    code: str = SHARE_ORG_REQUIRED_CODE
+
+    def __init__(self, reason: str = ARTIFACT_ORG_REFUSAL) -> None:
+        super().__init__(reason)
+
+    def refusal(self) -> Refusal:
+        """The body a route answers: the reason as ``detail``, and ``code``."""
+        return Refusal(detail=str(self), code=self.code)
+
+
 class AccessModeChanged(PublishRejected):
     """A re-publish in MindsHub mode that isn't a person's save (live
     sync, autopublish) found a .published.json entry that isn't restricted
@@ -218,31 +252,46 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
 
     413 is too large. A 503 is an auth outage only when the service says so
     (`auth_unavailable`); any other 503 is the upload service itself. A 403 is
-    a denial only with `permission_denied`. Every other HTTP answer comes back
-    as an UploadError; a failure that got no HTTP answer returns None.
+    a denial with `permission_denied`, and MindsHub's refusal of a share with
+    everyone with SHARE_ORG_REQUIRED_CODE (ShareOrgRequired, its reason,
+    clipped, as the text). Every other HTTP answer comes back as an
+    UploadError; a failure that got no HTTP answer returns None.
     """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
     if isinstance(
         exc,
-        (ProductPermissionDenied, ProductPermissionUnavailable, PublishTooLarge, UploadServiceUnavailable),
+        (
+            ProductPermissionDenied,
+            ProductPermissionUnavailable,
+            PublishTooLarge,
+            UploadServiceUnavailable,
+            ShareOrgRequired,
+        ),
     ):
         raise exc
     if not isinstance(exc, urllib.error.HTTPError):
         return None
     status = exc.code
     body, code, error = _read_http_error_body(exc)
-    typed: HTTPException | None = None
+    typed: HTTPException | ShareOrgRequired | None = None
     if status == 413:
         typed = PublishTooLarge()
     elif status == 503:
         typed = ProductPermissionUnavailable() if code == "auth_unavailable" else UploadServiceUnavailable()
     elif status == 403 and code == "permission_denied":
         typed = ProductPermissionDenied()
+    elif status == 403 and code == SHARE_ORG_REQUIRED_CODE:
+        typed = ShareOrgRequired(_clip(error)) if error else ShareOrgRequired()
     if typed is None:
         return UploadError(status, code, error)
-    # A typed refusal leaves publish_artifact before its own failure log.
-    logger.warning("Publish service answered HTTP %s code=%s body=%r", status, code, body[:200])
+    # A typed refusal leaves publish_artifact before its own failure log. The
+    # deployments' log keeps only this template, so the status and code go in
+    # fields it keeps too.
+    logger.warning(
+        "Publish service answered HTTP %s code=%s body=%r", status, code, body[:200],
+        extra={"status_code": status, "reason": code},
+    )
     raise typed from exc
 
 

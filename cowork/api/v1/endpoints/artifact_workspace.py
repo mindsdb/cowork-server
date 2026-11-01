@@ -51,7 +51,7 @@ from cowork.schemas.artifact_access import (
     access_refusal,
 )
 from cowork.schemas.base import CamelResponse
-from cowork.services.sharing_contract import ARTIFACTS_SHARE_ORG, AudienceField
+from cowork.services.sharing_contract import AudienceField
 from cowork.services.artifact_export import (
     ExportRefusal,
     ExportRefused,
@@ -477,6 +477,7 @@ async def _sync_live_artifact(
         AccessModeChanged,
         PublishOwnedByOtherUser,
         PublishTooLarge,
+        ShareOrgRequired,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -552,9 +553,11 @@ async def _sync_live_artifact(
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
-    except AccessModeChanged:
-        # publish_artifact logged the refusal. It repeats on every save until
-        # the owner saves the artifact's sharing again.
+    except (AccessModeChanged, ShareOrgRequired):
+        # publish_artifact logged the refusal: a mode changed after the
+        # owner's last save, or MindsHub refusing a share with everyone that
+        # an entry from before the rule changed still asks for. It repeats on
+        # every save until the owner saves the artifact's sharing again.
         return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
@@ -875,14 +878,6 @@ class _AccessSaveRoute(APIRoute):
         return route_handler
 
 
-# Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
-# which MindsHub also checks when the rule is written.
-ARTIFACT_ORG_REFUSAL = (
-    f"Sharing an artifact with everyone in the organization requires the {ARTIFACTS_SHARE_ORG} "
-    "permission or an organization admin."
-)
-
-
 OWN_EMAIL_REFUSAL = "Your own email address can't be added: you can always open your own artifact."
 
 
@@ -917,7 +912,8 @@ async def _checked_team_audience(
       read the default team can't be told apart, so a save that adds a team
       is a 503 ``mindshub_unreachable``, an admin's included.
     - ``org_allowed`` the stored rule doesn't have takes
-      ``artifacts.share_org`` (403). An owner without it can still save an
+      ``artifacts.share_org``: without it the save is refused with
+      ShareOrgRequired (403). An owner without it can still save an
       artifact already shared with everyone.
     - A team the stored rule doesn't have must be one the caller belongs to
       (400), by the caller's teams read now, past the cache
@@ -951,6 +947,7 @@ async def _checked_team_audience(
         MindsHubUnreachable,
     )
     from cowork.services.mindshub_teams import org_team_ids, read_mindshub_teams_now
+    from cowork.services.publish import ShareOrgRequired
     from cowork.services.skill_sharing import (
         default_team_as_org,
         get_org_member_lookup,
@@ -993,7 +990,7 @@ async def _checked_team_audience(
             if org_allowed and not rule.org_allowed and not viewer.can_share_artifacts_org:
                 if not viewer.permissions_known:
                     raise MindsHubUnreachable(PERMISSIONS_UNREACHABLE)
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ARTIFACT_ORG_REFUSAL)
+                raise ShareOrgRequired()
             outside: list[str] = []
             if added:
                 # The caller's teams read now: one deleted since the cached
@@ -1149,7 +1146,7 @@ async def set_artifact_access(
     every turn, with the owner's selection in place of the first-publish default.
     """
     await require_product_permission(session.scope, "artifact.manage")
-    from cowork.services.publish import PublishRejected, PublisherUnavailable
+    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
 
@@ -1242,6 +1239,10 @@ async def set_artifact_access(
     # PublisherUnavailable and PublishRejected are RuntimeErrors, so they come first.
     except PublisherUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ShareOrgRequired as exc:
+        # This server's check or MindsHub refused the share with everyone, so
+        # nothing was published: a 403 the app can tell apart by its code.
+        return JSONResponse(exc.refusal().model_dump(), status_code=exc.status_code)
     except PublishRejected as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     except (RuntimeError, OSError) as exc:

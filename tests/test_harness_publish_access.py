@@ -1,7 +1,9 @@
 """Harness publish tool forwards access + preserves previous (ENG-322 follow-up)."""
 
 import hashlib
+import io
 import json
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -379,3 +381,33 @@ async def test_harness_reports_a_rejected_publish_without_a_second_traceback(tmp
     assert out.reason == "PublishRejected"
     assert json.loads(out.content)["message"] == "PUBLISH FAILED: Publishing failed: This organization is archived."
     assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_harness_tells_the_model_not_to_publish_wider_when_sharing_with_everyone_is_refused(tmp_path):
+    """MindsHub refused a share with everyone. The model picks the access
+    mode itself, so the tool names the refusal by its code and tells the
+    model, after MindsHub's reason, not to get past it by publishing wider.
+    anton's own publish tool says the same sentence, word for word."""
+    from cowork.services.publish import classify_upload_error
+
+    reason = "Sharing an artifact with everyone in the organization needs the artifacts.share_org permission."
+    refusal = urllib.error.HTTPError(
+        "https://publish.example/upload", 403, "Forbidden", {},
+        io.BytesIO(json.dumps({"error": reason, "code": "share_org_required"}).encode()),
+    )
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=lambda *args, **kwargs: classify_upload_error(refusal))
+    with mock.patch.object(htools, "_publish_artifact", fake):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path),
+            {"file_path": str(f), "action": "publish", "access_mode": "restricted", "org_allowed": True},
+        )
+
+    assert out.ok is False
+    assert out.reason == "share_org_required"
+    assert json.loads(out.content)["message"] == (
+        f"PUBLISH FAILED: {reason} Do not publish it publicly or to a wider audience instead. Tell the "
+        "user that an organization admin can share it with everyone, or offer to share it with specific "
+        "people by email."
+    )

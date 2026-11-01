@@ -55,6 +55,8 @@ from cowork.services.mindshub_people import (
     org_members_by_ids,
 )
 from cowork.services.sharing_contract import (
+    INVALID_EMAIL_CODE,
+    INVALID_ID_CODE,
     MAX_EMAILS_PER_REQUEST,
     MAX_EMAILS_QUERY_CHARS,
     MAX_IDS_PER_REQUEST,
@@ -66,10 +68,6 @@ from cowork.services.sharing_contract import (
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
-
-INVALID_ID = "invalid_id"
-INVALID_EMAIL = "invalid_email"
-
 
 def _listed(*, raw: str) -> list[str]:
     return [part for part in (p.strip() for p in raw.split(",")) if part]
@@ -118,7 +116,10 @@ async def get_mindshub_people(
         malformed = [value for value, parsed in canonical.items() if parsed is None]
         if malformed:
             return _refused(
-                code=INVALID_ID, detail="Each id must be a UUID.", field="ids", values=malformed
+                code=INVALID_ID_CODE,
+                detail="Each id must be a UUID.",
+                field="ids",
+                values=malformed,
             )
         wanted_ids = list(dict.fromkeys(parsed for parsed in canonical.values() if parsed))
         if len(wanted_ids) > MAX_IDS_PER_REQUEST:
@@ -131,7 +132,7 @@ async def get_mindshub_people(
         malformed = [email for email in wanted_emails if not is_email_address(email)]
         if malformed:
             return _refused(
-                code=INVALID_EMAIL,
+                code=INVALID_EMAIL_CODE,
                 detail="Each entry must be an email address.",
                 field="emails",
                 values=malformed,

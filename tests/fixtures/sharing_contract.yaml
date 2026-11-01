@@ -1,11 +1,21 @@
-# The audience names and bounds cowork/services/sharing_contract.py holds,
-# written down apart from it (tests/test_sharing_contract.py). Each bound's
-# comment there says whether MindsHub owns it or this server does.
+# The audience names, refusal codes, instructions to the agent, and bounds
+# cowork/services/sharing_contract.py holds, written down apart from it
+# (tests/test_sharing_contract.py). Each bound's comment there says whether
+# MindsHub owns it or this server does.
 audience_fields:
   - org_allowed
   - allowed_team_ids
   - allowed_user_ids
   - allowed_emails
+codes:
+  SHARE_ORG_REQUIRED_CODE: share_org_required
+  INVALID_ID_CODE: invalid_id
+  INVALID_EMAIL_CODE: invalid_email
+instructions:
+  SHARE_ORG_REQUIRED_INSTRUCTION: >-
+    Do not publish it publicly or to a wider audience instead. Tell the user
+    that an organization admin can share it with everyone, or offer to share it
+    with specific people by email.
 bounds:
   MAX_PEOPLE_PER_RULE: 100
   MAX_TEAMS_PER_RULE: 100

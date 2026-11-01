@@ -1,11 +1,15 @@
 """What sharing a skill or an artifact agrees on with MindsHub and the app.
 
 The names of who a rule is shared with, the MindsHub reads and capabilities
-sharing uses, and every bound this server owns or mirrors. A bound MindsHub
-enforces is mirrored here so a share it would refuse is refused before
-anything is published; each comment says which side owns it. The app
-mirrors two of them, MAX_IDS_PER_LOOKUP and MAX_EMAILS_PER_LOOKUP, in its
-sharing contract module (src/renderer/cowork/lib/sharingContract.js).
+sharing uses, the code of a refused share and what the agent is told after
+one, and every bound this server owns or mirrors. A bound MindsHub enforces
+is mirrored here so a share it would refuse is refused before anything is
+published; each comment says which side owns it. The app mirrors five of
+them, MAX_IDS_PER_LOOKUP, MAX_EMAILS_PER_LOOKUP, INVALID_ID_CODE,
+INVALID_EMAIL_CODE, and SHARE_ORG_REQUIRED_CODE, in its sharing contract
+module (src/renderer/cowork/lib/sharingContract.js).
+anton's publisher holds SHARE_ORG_REQUIRED_CODE and
+SHARE_ORG_REQUIRED_INSTRUCTION under the same names.
 """
 
 from __future__ import annotations
@@ -36,6 +40,32 @@ SKILLS_SHARE_ORG = "skills.share_org"
 SKILLS_WRITE_ORG = "skills.write_org"
 # Share an artifact with everyone in the organization.
 ARTIFACTS_SHARE_ORG = "artifacts.share_org"
+
+# The ``code`` of a refused share with everyone in the organization by
+# someone without ARTIFACTS_SHARE_ORG. MindsHub answers it when a publish's
+# rule newly sets org_allowed, and the upload service passes it on; this
+# server answers it, with HTTP 403 and the reason as ``detail``, for that
+# refusal and for its own check of the same before anything publishes. The
+# app's sharing contract module and anton's publisher (anton.publisher)
+# hold it under the same name.
+SHARE_ORG_REQUIRED_CODE = "share_org_required"
+# The ``code`` of the people lookup's 400 when an id in ``?ids=`` isn't a
+# UUID, and when an address in ``?emails=`` is one MindsHub wouldn't take;
+# the body's ``ids`` or ``emails`` lists them. Owned by this server. The
+# app's sharing contract module holds both under the same names.
+INVALID_ID_CODE = "invalid_id"
+INVALID_EMAIL_CODE = "invalid_email"
+# What the agent's publish tool tells the model after the reason a share
+# with everyone was refused. The model picks the access mode itself, so
+# without it a model can get past the refusal by publishing wider. The
+# tool takes anton's publish schema, which names people by email and has no
+# teams, so the sentence offers only that. anton's publisher tells its own
+# agent the same sentence under the same name.
+SHARE_ORG_REQUIRED_INSTRUCTION = (
+    "Do not publish it publicly or to a wider audience instead. Tell the user that an "
+    "organization admin can share it with everyone, or offer to share it with specific "
+    "people by email."
+)
 
 # MindsHub reads sharing makes with the caller's bearer.
 # The teams the caller belongs to.

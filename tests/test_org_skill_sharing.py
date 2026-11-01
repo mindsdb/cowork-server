@@ -42,7 +42,6 @@ from cowork.api.v1.endpoints import mindshub_people as mindshub_people_ep
 from cowork.api.v1.endpoints import mindshub_teams as mindshub_teams_ep
 from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
-from cowork.api.v1.endpoints.artifact_workspace import ARTIFACT_ORG_REFUSAL
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import (
     LOCAL_SCOPE,
@@ -63,6 +62,7 @@ from cowork.schemas.skills import (
 )
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.services import mindshub_people, mindshub_teams
+from cowork.services.publish import ARTIFACT_ORG_REFUSAL, ShareOrgRequired
 from cowork.services.shared_resources import SKILL, SharedResourceAccess
 from cowork.services.skill_access import (
     access_row,
@@ -2554,8 +2554,9 @@ def test_the_post_publish_write_sends_the_changes_and_returns_mindshubs_answer(m
 def test_an_org_entry_says_nothing_of_who_an_artifact_is_shared_with(tmp_path, monkeypatch):
     """In MindsHub mode the card and the access route read no audience from
     .published.json, even from an entry stored before it stopped keeping
-    one, and a re-publish keeps the mode alone (GET /access reads the rule).
-    On the desktop the entry is still the record."""
+    one: the audience reads as unknown (None), never as an empty one, and a
+    re-publish keeps the mode alone (GET /access reads the rule). On the
+    desktop the entry is still the record."""
     from cowork.services import artifacts
     from cowork.services.artifacts import _published_access_for
     from cowork.services.publish import published_artifact_access
@@ -2572,7 +2573,7 @@ def test_an_org_entry_says_nothing_of_who_an_artifact_is_shared_with(tmp_path, m
     read = _published_access_for(folder, folder / "index.html")
     assert read["accessMode"] == "restricted"
     assert (read["accessEmails"], read["orgAllowed"], read["ownerOnly"], read["allowedTeamIds"],
-            read["allowedUserIds"]) == ([], False, False, [], [])
+            read["allowedUserIds"]) == (None, None, None, None, None)
     assert published_artifact_access(folder, artifacts_base=folder.parent, org_mode=True).publisher_access() == {
         "mode": "restricted", "owner_only": True,
     }
@@ -2773,17 +2774,19 @@ def test_sharing_an_artifact_with_everyone_takes_share_org_only_to_turn_it_on(mo
         {"mode": "restricted", "org_allowed": True},
         {"mode": "restricted", "allowed_team_ids": [TEAM_ALL, TEAM_ENG]},
     ):
-        with pytest.raises(HTTPException) as caught:
+        with pytest.raises(ShareOrgRequired) as caught:
             _check(access)
-        assert (caught.value.status_code, caught.value.detail) == (403, ARTIFACT_ORG_REFUSAL)
+        assert (caught.value.status_code, caught.value.refusal().model_dump()) == (
+            403, {"detail": ARTIFACT_ORG_REFUSAL, "code": "share_org_required"},
+        )
     already = _check({"mode": "restricted", "org_allowed": True, "allowed_emails": ["e@else.com"]}, stored=artifact_rule(org=True))
     assert already == {"mode": "restricted", "org_allowed": True, "emails": ["e@else.com"]}
 
     # The skill capability alone shares no artifact with everyone.
     mindshub_sharing_answers(monkeypatch, default=TEAM_ALL, permissions=("skills.share_org",))
-    with pytest.raises(HTTPException) as caught:
+    with pytest.raises(ShareOrgRequired) as caught:
         _check({"mode": "restricted", "org_allowed": True})
-    assert (caught.value.status_code, caught.value.detail) == (403, ARTIFACT_ORG_REFUSAL)
+    assert (caught.value.status_code, str(caught.value)) == (403, ARTIFACT_ORG_REFUSAL)
     mindshub_sharing_answers(monkeypatch, default=TEAM_ALL, permissions=("artifacts.share_org",))
     assert _check({"mode": "restricted", "allowed_team_ids": [TEAM_ALL, TEAM_ENG]}) == {
         "mode": "restricted", "allowed_team_ids": [TEAM_ENG], "org_allowed": True,

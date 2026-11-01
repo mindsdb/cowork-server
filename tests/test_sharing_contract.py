@@ -2,8 +2,8 @@
 uses: MindsHub's artifact rule, a skill's skill_access row and its rule, and
 the saves the app sends. A model that renamed one of them would stop matching
 what the app sends and MindsHub stores, so each is pinned to AudienceField.
-The names and bounds themselves are the ones tests/fixtures/sharing_contract.yaml
-records."""
+The names, refusal codes, instructions to the agent, and bounds themselves
+are the ones tests/fixtures/sharing_contract.yaml records."""
 
 from __future__ import annotations
 
@@ -43,3 +43,27 @@ def test_the_bounds_are_the_recorded_ones():
     }
     assert bounds == set(CONTRACT["bounds"])
     assert {name: getattr(sharing_contract, name) for name in CONTRACT["bounds"]} == CONTRACT["bounds"]
+
+
+def test_the_refusal_codes_are_the_recorded_ones():
+    """Each refusal code under the name the fixture records, and no code it
+    doesn't. The app's contract module holds each under the same name."""
+    codes = {
+        name for name, value in vars(sharing_contract).items()
+        if name.endswith("_CODE") and isinstance(value, str)
+    }
+    assert codes == set(CONTRACT["codes"])
+    assert {name: getattr(sharing_contract, name) for name in CONTRACT["codes"]} == CONTRACT["codes"]
+
+
+def test_the_instructions_to_the_agent_are_the_recorded_ones():
+    """Each sentence the agent is told under the name the fixture records,
+    word for word, and no sentence it doesn't. anton's publisher tells its
+    own agent the same sentence under the same name."""
+    instructions = {
+        name for name, value in vars(sharing_contract).items()
+        if name.endswith("_INSTRUCTION") and isinstance(value, str)
+    }
+    assert instructions == set(CONTRACT["instructions"])
+    recorded = {name: getattr(sharing_contract, name) for name in CONTRACT["instructions"]}
+    assert recorded == CONTRACT["instructions"]

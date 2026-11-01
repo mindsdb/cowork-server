@@ -371,7 +371,9 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         PublishOwnedByOtherUser,
         PublishRejected,
         PublishTooLarge,
+        ShareOrgRequired,
     )
+    from cowork.services.sharing_contract import SHARE_ORG_REQUIRED_INSTRUCTION
 
     try:
         result = _publish_artifact(abs_path, access=access)
@@ -397,6 +399,11 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "(PDFs, images) and publish again.",
             reason="too_large",
         )
+    except ShareOrgRequired as exc:
+        # The reason is MindsHub's, and classify_upload_error already logged
+        # the refusal. A PublishRejected, so kept before that branch, which
+        # would drop the code.
+        return _fail(f"PUBLISH FAILED: {exc} {SHARE_ORG_REQUIRED_INSTRUCTION}", reason=exc.code)
     except HTTPException as exc:
         # Typed refusals carry their text in `detail`; str(exc) would hand the
         # model "503: {'code': ...}".

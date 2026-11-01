@@ -43,7 +43,7 @@ from cowork.common.paths import (
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
-from cowork.schemas.artifact_access import ArtifactAccessView
+from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
 from anton.core.artifacts.store import iter_content_files
 
@@ -676,8 +676,9 @@ def published_access_view(
     In MindsHub mode the entry doesn't say who a restricted artifact is
     shared with: MindsHub's rule is the one record of it, which GET /access
     reads (cowork.services.publish.stored_artifact_rule). So the audience
-    fields stay empty here, even for an entry written before that, and a
-    card never shows a copy that could have gone stale or been planted. An
+    reads as unknown here (ArtifactAccessView.audience_unknown), even for an
+    entry written before that: a card never shows a copy that could have
+    gone stale or been planted, nor an empty audience it doesn't know. An
     entry whose mode is none of the three reads as public, the mode anton's
     publisher republishes it in.
     """
@@ -703,7 +704,9 @@ def published_access_view(
                 access_protected=True,
                 access_password=entry.get("access_password", "") or "",
             )
-        if mode is AccessMode.RESTRICTED and not _org_mode():
+        if mode is AccessMode.RESTRICTED and _org_mode():
+            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key)
+        if mode is AccessMode.RESTRICTED:
             return ArtifactAccessView(
                 access_mode=mode,
                 artifact_key=artifact_key,
@@ -1419,9 +1422,9 @@ def _prepare_artifact_card(
         # Dropped at the single card builder so inline chat cards are covered
         # too: they call this function as well, and a filter applied only at the
         # list endpoint would still hand the plaintext password to the chat.
-        # Access in org mode is always restricted-to-org, so neither field has a
-        # consumer there. `accessMode` stays — ArtifactStatus draws its badge
-        # from it.
+        # In org mode the owner reads the password and the emails from GET
+        # .../access, which can tell owner from co-member, so the card carries
+        # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
         card.pop("accessPassword", None)
         card.pop("accessEmails", None)
     return _PreparedArtifactCard(
@@ -1569,16 +1572,7 @@ def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
         return None
 
 
-def _blank_artifact_status() -> dict:
-    """The stable response for an unknown or no-longer-readable artifact."""
-    return {
-        "publishedUrl": "", "modified": False, "accessMode": "public",
-        "accessProtected": False, "accessEmails": [], "orgAllowed": False,
-        "ownerOnly": False,
-    }
-
-
-def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> dict:
+def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Fresh owner-side status for an already resolved artifact path.
 
     The HTTP boundary resolves an untrusted request through
@@ -1591,9 +1585,8 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     subset only — the cheap read the viewer polls on window focus to light up
     the "Update" button when the artifact changes underneath an open preview.
     """
-    blank = _blank_artifact_status()
     if not isinstance(artifact, Path) or not artifact.is_absolute():
-        return dict(blank)
+        return ArtifactStatusView()
     # Fullstack artifacts keep their primary file in a `static/` subdir, so a
     # naive `artifact.parent` would land there instead of the artifact root
     # (where metadata.json + .published.json actually live) — climb via
@@ -1611,27 +1604,18 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     # One response shape for BOTH branches: explicitly the published /
     # modified / access subset, and NEVER `accessPassword` — that owner-only
     # plaintext (which `_published_access_for` and the card both carry) must
-    # not leave this endpoint.
-    return {
-        "publishedUrl": card.get("publishedUrl", ""),
-        "modified": bool(card.get("modified")),
-        "accessMode": card.get("accessMode", "public"),
-        "accessProtected": bool(card.get("accessProtected")),
-        "accessEmails": card.get("accessEmails", []),
-        "orgAllowed": bool(card.get("orgAllowed")),
-        "ownerOnly": bool(card.get("ownerOnly")),
-        "artifactKey": card.get("artifactKey", ""),
-    }
+    # not leave this endpoint. ArtifactStatusView has no field for it.
+    return ArtifactStatusView.of_card(card)
 
 
-def artifact_status(raw_path: str, *, scope: TenantScope | None) -> dict:
+def artifact_status(raw_path: str, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Compatibility wrapper accepting the historical raw path string."""
     try:
         artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     except Exception:
-        return _blank_artifact_status()
+        return ArtifactStatusView()
     if artifact is None:
-        return _blank_artifact_status()
+        return ArtifactStatusView()
     return artifact_status_for_resolved(artifact, scope=scope)
 
 
