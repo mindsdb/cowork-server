@@ -3,9 +3,13 @@ but built separately, since sharing it would move ~20 tests' patch targets."""
 from __future__ import annotations
 
 import asyncio
+import logging
+from functools import partial
 from uuid import UUID
 
+from cowork.common.logger import log_context
 from cowork.db.scoped import ScopedSession
+from cowork.db.units import run_db, run_efs, run_to_completion
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
@@ -13,6 +17,8 @@ from cowork.services.conversations import read_earlier_answers
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.turnqueue import producer
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+
+logger = logging.getLogger(__name__)
 
 
 class RemoteTurnFailed(Exception):
@@ -48,10 +54,13 @@ async def remote_turn_events(
     from cowork.handlers._turn_history import remote_turn_history
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
     from cowork.services.task_objects import (
-        index_turn_artifacts,
+        _recover_turn_scope,
         publish_and_card_turn_artifacts,
+        record_new_artifacts,
         remote_skill_draft_result,
         snapshot_artifact_state,
+        turn_artifact_changes,
+        turn_record_scope,
     )
 
     # Minted here rather than inside stream_remote_replies, so a cancel below
@@ -73,7 +82,10 @@ async def remote_turn_events(
     )
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
-        snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
+        await run_efs(
+            partial(snapshot_artifact_state, artifacts[1]), scope=session.scope, deadline=False
+        )
+        if artifacts else (set(), {})
     )
     new_slugs: list[str] = []
     touched_slugs: set[str] = set()
@@ -85,6 +97,69 @@ async def remote_turn_events(
     # compacted step comes for both, its compaction reply for a summary. Both
     # arrive before the history frame.
     compacted = False
+
+    async def record_artifacts() -> None:
+        """Diff the project's artifacts against the snapshot on the file
+        store, then index the folders this turn created, and in org mode
+        record their creator as owner, in a unit. Never raises: it runs in
+        the turn's `finally`, where an exception would replace the turn's
+        real outcome. Outside org mode the next turn in the project
+        reconciles what a failure leaves; in org mode nothing does."""
+        nonlocal new_slugs, touched_slugs, turn_scope
+        conversation, artifacts_base, project_id, _ = artifacts
+        try:
+            # Waits for a file store slot rather than failing: in org mode
+            # nothing reconciles a turn whose diff was refused.
+            changes = await run_efs(
+                partial(
+                    turn_artifact_changes,
+                    conversation_id=conv_id,
+                    artifacts_base=artifacts_base,
+                    before=before_slugs,
+                    before_mtimes=before_mtimes,
+                    attribute_by_provenance=True,
+                    completed_cleanly=completed_cleanly,
+                ),
+                scope=session.scope,
+                deadline=False,
+            )
+        except Exception:
+            logger.warning(
+                "Could not index artifacts created this turn",
+                exc_info=True,
+                extra=log_context(conversation_id=conv_id, project_id=project_id),
+            )
+            return
+        new_slugs, touched_slugs = changes.created, changes.touched
+        try:
+            turn_scope = _recover_turn_scope(conversation)
+            if not new_slugs:
+                return
+            record_scope = turn_record_scope(turn_scope, conversation_id=conv_id)
+            if record_scope is None:
+                return
+            await run_db(
+                partial(
+                    record_new_artifacts,
+                    conversation_id=conv_id,
+                    # The context carries the id as text; the index row's
+                    # column takes a UUID.
+                    project_id=UUID(project_id) if project_id else None,
+                    slugs=new_slugs,
+                    creator=getattr(conversation, "created_by", None),
+                ),
+                scope=record_scope,
+            )
+        except Exception:
+            # record_new_artifacts logs each slug whose index or owner write
+            # fails itself; this covers the unit's own refusal (a busy pool)
+            # or a failed commit. In org mode nothing records these folders
+            # later, so they keep no index row and their owner stays unknown.
+            logger.error(
+                "Could not record the artifacts a channel turn created",
+                exc_info=True,
+                extra=log_context(conversation_id=conv_id, project_id=project_id, artifact_slugs=new_slugs),
+            )
 
     try:
         async for kind, data in stream_remote_replies(
@@ -142,12 +217,17 @@ async def remote_turn_events(
         raise
     finally:
         if artifacts is not None and artifact_writes_allowed:
-            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
-                artifacts[0], conv_id, artifacts[2], artifacts[1],
-                before_slugs, before_mtimes,
-                attribute_by_provenance=True,
-                completed_cleanly=completed_cleanly,
-            )
+            # A cancel that lands while the diff or the record waits for a
+            # slot, or while either runs, waits for both, so the rows are
+            # written once. While the file store stalls, that wait has no
+            # bound. At shutdown, the drain of channel tasks waits up to its
+            # timeout plus its cancel_timeout. Then the event loop's close at
+            # the end of the teardown cancels a diff not yet returned, or a
+            # record still waiting for a slot, so this turn's rows are lost.
+            # Only a file store call already running on a stuck mount keeps
+            # the process alive, until the kubelet's SIGKILL: its worker
+            # thread is not a daemon thread.
+            await run_to_completion(record_artifacts())
 
     if artifacts is not None and artifact_writes_allowed:
         for card in await publish_and_card_turn_artifacts(

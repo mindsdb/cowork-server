@@ -156,3 +156,20 @@ async def live() -> dict:
     `live()` would queue behind a saturated pool instead of answering directly.
     """
     return {"status": "ok"}
+
+
+# OpenByDesign, standalone reason: the kubelet's readiness probe sends no
+# identity headers either, like the liveness probe above.
+@router.get("/ready", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
+async def ready() -> dict:
+    """Readiness for the kubelet: the event loop answers, so this pod can take
+    requests. No database, no file store, no settings, for the reason `live`
+    has none: a full pool or a slow file store would fail readiness on every
+    replica at once, and nginx would then answer 503 for the whole service.
+    A request that needs the database or the file store is refused on its own
+    (DatabaseBusy, FilesystemBusy) instead.
+
+    `/api/v1/health/` stays what the desktop and the web client poll for the
+    server's configuration.
+    """
+    return {"status": "ok"}

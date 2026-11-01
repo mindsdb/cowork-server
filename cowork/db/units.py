@@ -12,6 +12,14 @@ which the app answers with 503 (cowork.server). A worker thread still waiting
 in the pool after that keeps its slot until the pool's own timeout passes or
 a connection frees. When a connection frees first, the thread hands it
 straight back without running the unit.
+
+``run_efs`` does the same for work on the shared file store (``COWORK_HOME``,
+an NFS hard mount on hosted deployments). A stuck call there blocks its
+thread with no time limit, so EFS work gets its own EFS_SLOTS threads, apart
+from anyio's default limiter, which sync routes and sync dependencies share.
+Only the wait for a slot has a deadline: a started call keeps its slot until
+it returns. One person holds at most EFS_SHARE of the slots, so one heavy
+client is refused with ``FilesystemBusy`` before anyone else waits.
 """
 from __future__ import annotations
 
@@ -44,6 +52,16 @@ class DatabaseBusy(PoolTimeoutError):
     A subclass of SQLAlchemy's pool timeout, so one ``except`` clause and one
     exception handler cover both a unit that waited for its slot and any other
     checkout that waited for a connection.
+    """
+
+    status_code = 503
+
+
+class FilesystemBusy(Exception):
+    """No shared-file-store slot freed within POOL_TIMEOUT.
+
+    The app answers it with 503 and Retry-After (cowork.server), as it does
+    DatabaseBusy.
     """
 
     status_code = 503
@@ -91,11 +109,12 @@ def _slots(engine: Engine) -> anyio.CapacityLimiter:
 
 
 def _threads() -> anyio.CapacityLimiter:
-    """The worker threads units run on, kept apart from anyio's default limiter.
+    """The worker threads units and EFS work run on, kept apart from anyio's
+    default limiter.
 
     Sync routes share that limiter's 40 threads, so a unit waiting on the pool
-    must not take one of them. The slots already cap how many units run, so
-    this limiter never makes a unit wait.
+    or a call stuck on the file store must not take one of them. The slots
+    already cap how many run, so this limiter never makes anyone wait.
     """
     try:
         return _THREADS.get()
@@ -280,6 +299,133 @@ async def _drain(task: asyncio.Future[Any]) -> None:
             "work its caller waited for failed after the caller was cancelled",
             exc_info=task.exception(),
         )
+
+
+#: Threads EFS work may hold at once, per event loop. A call stuck on the hard
+#: mount keeps its thread until the file server answers, so this is also the
+#: most threads a stalled mount can take.
+EFS_SLOTS = 16
+#: Slots one person, or one organization's work with no person, may hold at
+#: once.
+EFS_SHARE = 4
+
+_EFS_SLOTS: RunVar[anyio.CapacityLimiter] = RunVar("cowork_efs_slots")
+_EFS_SHARES: RunVar[WeakValueDictionary[str, anyio.CapacityLimiter]] = RunVar("cowork_efs_shares")
+_efs_thread = threading.local()
+
+
+def _efs_slots() -> anyio.CapacityLimiter:
+    """This event loop's EFS slots."""
+    try:
+        return _EFS_SLOTS.get()
+    except LookupError:
+        pass
+    limiter = anyio.CapacityLimiter(EFS_SLOTS)
+    _EFS_SLOTS.set(limiter)
+    return limiter
+
+
+def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
+    """The caller's share of the EFS slots, or None where one person owns the
+    deployment (the desktop, the operator view) and there is nobody to keep
+    apart. A share lives while someone waits for it or holds it.
+
+    Work in a partitioned scope with no person, such as a channel turn
+    (scope_for_org), shares as one person keyed ``org:<org_id>``, so one
+    organization's channel bookkeeping cannot take every slot. That key
+    never matches a person's, which is their identity provider's subject id.
+    """
+    if not scope.partitioned:
+        return None
+    key = scope.user_id or f"org:{scope.org_id}"
+    try:
+        shares = _EFS_SHARES.get()
+    except LookupError:
+        shares = WeakValueDictionary()
+        _EFS_SHARES.set(shares)
+    share = shares.get(key)
+    if share is None:
+        share = anyio.CapacityLimiter(EFS_SHARE)
+        shares[key] = share
+    return share
+
+
+def on_efs_thread() -> bool:
+    """True while the current thread runs work ``run_efs`` started."""
+    return getattr(_efs_thread, "active", False)
+
+
+def _run_marked(fn: Callable[[], T]) -> T:
+    # Worker threads are pooled across limiters, so the mark is per call.
+    _efs_thread.active = True
+    try:
+        return fn()
+    finally:
+        _efs_thread.active = False
+
+
+class _EfsStart:
+    """Whether an EFS task has handed its work to a thread. Read and set on
+    the event loop only."""
+
+    started = False
+
+
+async def _efs_task(
+    fn: Callable[[], T], share: anyio.CapacityLimiter | None, deadline: float, start: _EfsStart,
+) -> T:
+    """Take the caller's share, then a slot, by ``deadline``; then run ``fn`` in
+    a worker thread, holding both until the thread ends."""
+    held: list[anyio.CapacityLimiter] = []
+    try:
+        with anyio.CancelScope(deadline=deadline) as slot_wait:
+            for limiter in (share, _efs_slots()):
+                if limiter is not None:
+                    await limiter.acquire()
+                    held.append(limiter)
+        if slot_wait.cancelled_caught:
+            raise FilesystemBusy("no shared file store slot freed within POOL_TIMEOUT")
+        start.started = True
+        return await anyio.to_thread.run_sync(_run_marked, fn, limiter=_threads())
+    finally:
+        for limiter in reversed(held):
+            limiter.release()
+
+
+async def run_efs(fn: Callable[[], T], *, scope: TenantScope, deadline: bool = True) -> T:
+    """Run ``fn``, which works on the shared file store, in a worker thread and
+    return its result.
+
+    The wait for a slot gives up POOL_TIMEOUT after the call with
+    ``FilesystemBusy``. ``deadline=False`` waits for a slot as long as it
+    takes, for bookkeeping nothing would redo if it were refused, such as a
+    turn's artifact diff. A caller cancelled before ``fn`` starts leaves at
+    once and ``fn`` never runs. Once ``fn`` runs, a cancel of the caller waits
+    for it to return before it propagates, as ``run_db`` does, so a lock it
+    holds is released before the caller unwinds.
+    """
+    loop = asyncio.get_running_loop()
+    until = loop.time() + db_session.settings.database.pool_timeout if deadline else math.inf
+    start = _EfsStart()
+    work = asyncio.ensure_future(_efs_task(fn, _efs_share(scope), until, start))
+    work.add_done_callback(_retrieve_outcome)
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        if not start.started:
+            work.cancel()
+        await _drain(work)
+        raise
+
+
+def loop_limiters() -> dict[str, anyio.CapacityLimiter]:
+    """The limiters a request can queue on, by name, for this event loop.
+    Call it on the loop: each one is per loop."""
+    return {
+        "anyio_default": anyio.to_thread.current_default_thread_limiter(),
+        "run_db": _slots(_engine()),
+        "run_efs": _efs_slots(),
+    }
 
 
 _writes_by_conversation: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()

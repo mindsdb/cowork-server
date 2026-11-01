@@ -68,6 +68,7 @@ HEADER_ORG_RELOAD = "X-Cowork-Organization-Reload"
 _EXEMPT_PATHS = frozenset({
     "/api/v1/health", "/api/v1/health/",
     "/api/v1/health/live",
+    "/api/v1/health/ready",
 })
 
 

@@ -37,6 +37,7 @@ from cowork.services.artifact_export import (
 from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.services.artifacts import ProjectArtifacts
 from test_artifact_ownership import make_project, project_root
+from _async_stub import awaitable
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
 FORMAT_CASES = yaml.safe_load((FIXTURES / "formats.yaml").read_text(encoding="utf-8"))["cases"]
@@ -193,7 +194,7 @@ def test_the_local_workspace_response_carries_export_formats(tmp_path, local_mod
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True)),
     )
     from cowork.server import create_app
 
@@ -216,7 +217,7 @@ def test_the_workspace_response_decides_export_formats_where_artifact_capabiliti
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True)),
     )
     monkeypatch.setattr(artifact_permissions, "offered_export_formats", lambda **_kwargs: ["docx"])
     from cowork.server import create_app
@@ -250,7 +251,7 @@ def test_a_hard_linked_primary_offers_nothing_anywhere_and_the_route_answers_422
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True)),
     )
     from cowork.server import create_app
 
@@ -428,7 +429,7 @@ def test_the_route_accepts_exactly_the_formats_the_card_lists(tmp_path, local_mo
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True)),
     )
     from cowork.server import create_app
 

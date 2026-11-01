@@ -13,10 +13,11 @@ import re
 import secrets
 import stat as stat_module
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -46,6 +47,7 @@ from cowork.api.v1.artifact_scope import (
     artifact_sources_for_request,
     scoped_project_id_for_request,
 )
+from cowork.db.units import FilesystemBusy, run_db, run_efs
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
@@ -57,12 +59,17 @@ from cowork.schemas.live_apps import (
     SharedLiveAppResponse,
 )
 from cowork.services.artifact_roots import (
+    RootsPlan,
     artifacts_sources_for_project,
     artifacts_sources_for_scan,
+    plan_project_roots,
+    plan_scope_roots,
+    readable_sources,
 )
 from cowork.services.artifacts import (
     BackendPreviewRefused,
     ExecutionRefused,
+    ProjectArtifacts,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
@@ -164,6 +171,13 @@ def _legacy_artifact_for_sources(sources, folder_name: str):
     return None, None
 
 
+def _legacy_artifact_in_plan(plan: RootsPlan, folder_name: str):
+    """``_legacy_artifact_for_sources`` over the roots ``plan`` names that the
+    caller may read, found on the same thread, so a legacy delete's lookup is
+    one file store call."""
+    return _legacy_artifact_for_sources(readable_sources(plan), folder_name)
+
+
 # ``no-cache`` mirrors the FileResponse headers used elsewhere so a rebuilt
 # artifact is always re-fetched.
 # The two functions below hold the logic; the routes under them are thin adapters.
@@ -172,10 +186,45 @@ def _legacy_artifact_for_sources(sources, folder_name: str):
 
 
 def _artifact_cards(session, sources) -> list[dict]:
+    """The cards of ``sources``, with the file store and the database read in
+    turn on the calling thread. The routes read the two halves in their own
+    worker threads instead (``_cards_for``)."""
     # Owner-side fields are stripped inside `card_for_folder`, not here: inline chat
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
-    cards = _list_artifacts(sources)
+    return _card_capabilities(session, sources=sources, cards=_list_artifacts(sources))
+
+
+class _SourcesAndCards(NamedTuple):
+    """The file store half of a card list: the roots, and the cards of the
+    artifacts in them before the owner reads."""
+
+    sources: list[ProjectArtifacts]
+    cards: list[dict]
+
+
+def _sources_and_cards(find_sources: Callable[[], list[ProjectArtifacts]]) -> _SourcesAndCards:
+    """The roots ``find_sources`` finds and their cards, on the calling thread."""
+    sources = find_sources()
+    return _SourcesAndCards(sources=sources, cards=_list_artifacts(sources))
+
+
+async def _cards_for(
+    scope: TenantScope, find_sources: Callable[[], list[ProjectArtifacts]]
+) -> list[dict]:
+    """``_artifact_cards`` with the roots found and their folders walked in one
+    file store call, then the owner reads in a database unit, so no pooled
+    connection waits on the file server. ``find_sources`` runs in that file
+    store call."""
+    found = await run_efs(partial(_sources_and_cards, find_sources), scope=scope)
+    return await run_db(
+        partial(_card_capabilities, sources=found.sources, cards=found.cards), scope=scope
+    )
+
+
+def _card_capabilities(session, *, sources, cards: list[dict]) -> list[dict]:
+    """The database half of the cards: each card's owner, its capabilities and,
+    with live apps, who shared it. Reads no artifact folder."""
     from cowork.services.artifact_export import card_export_source
     from cowork.services.artifact_ownership import resolve_artifact_owners
     from cowork.services.artifact_permissions import artifact_capabilities
@@ -261,6 +310,33 @@ def _scoped_project_sources(session, project_id: UUID | str):
             detail="Unknown project",
         ) from exc
     return server_project_id, sources
+
+
+def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
+    """The database half of ``_scoped_project_sources``, run as a unit: the
+    server's own id for the selector, then the plan of that project's roots."""
+    server_project_id = scoped_project_id_for_request(session, project_ref)
+    try:
+        return plan_project_roots(session, server_project_id)
+    except ValueError as exc:
+        # The project can disappear between catalog recovery and root discovery.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Unknown project",
+        ) from exc
+
+
+async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> RootsPlan:
+    """The plan ``_scoped_project_sources`` reads, for async callers: the same
+    selector boundary, read in a database unit."""
+    raw_project_ref = str(project_id)
+    project_ref = os.path.basename(raw_project_ref)
+    if project_ref != raw_project_ref:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid project",
+        )
+    return await run_db(partial(_plan_scoped_project, project_ref=project_ref), scope=scope)
 
 
 def _scoped_project_cards(session, project_ref: str) -> list[dict]:
@@ -684,8 +760,8 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
-            catalog = await run_in_threadpool(
-                _desktop_registered_path_catalog, scope=session.scope
+            catalog = await run_efs(
+                partial(_desktop_registered_path_catalog, scope=session.scope), scope=session.scope
             )
             if not project_path or "\x00" in project_path:
                 return []
@@ -700,7 +776,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return await run_in_threadpool(_artifact_cards, session, [source])
+            return await _cards_for(session.scope, lambda: [source])
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -711,8 +787,10 @@ async def list_artifacts(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid project",
             )
-        return await run_in_threadpool(_scoped_project_cards, session, project_ref)
-    return await run_in_threadpool(_all_artifact_cards, session)
+        plan = await _scoped_project_plan(session.scope, project_ref)
+        return await _cards_for(session.scope, partial(readable_sources, plan))
+    plan = await run_db(plan_scope_roots, scope=session.scope)
+    return await _cards_for(session.scope, partial(readable_sources, plan))
 
 
 
@@ -757,10 +835,14 @@ async def delete_artifact_for_request(
     # older desktop clients, but never use it when the caller supplied a UUID:
     # two conversations in one project can legitimately produce the same slug.
     ref = slug if isinstance(slug, _ArtifactDeleteRef) else _artifact_delete_ref(slug)
-    server_project_id, sources = _scoped_project_sources(session, project_id)
     source = None
     folder = None
     if ref.artifact_id is not None:
+        # Only the server's own project id: the review lookup below finds
+        # the project's roots itself.
+        server_project_id = await run_db(
+            lambda unit: scoped_project_id_for_request(unit, str(project_id)), scope=session.scope
+        )
         # Keep UUID validation and pass the basename output to the resolver:
         # SAST does not recognize UUID parsing or dataclass fields as a path
         # sanitizer. Parsing first rejects traversal instead of truncating it.
@@ -772,15 +854,18 @@ async def delete_artifact_for_request(
         # below is what refuses, the resolver only decides visibility.
         from cowork.api.v1.artifact_scope import review_artifact_for_request
 
-        source, folder, _metadata, _is_own = review_artifact_for_request(
-            session, project_ref, artifact_id
+        source, folder, _metadata, _is_own = await review_artifact_for_request(
+            session.scope, project_ref, artifact_id
         )
     else:
         # The legacy name is compared with entries discovered under each
         # authorized root. It is never joined onto the root, and symlinked
         # artifact folders are not eligible for mutation.
         assert ref.legacy_slug is not None
-        source, folder = _legacy_artifact_for_sources(sources, ref.legacy_slug)
+        plan = await _scoped_project_plan(session.scope, project_id)
+        source, folder = await run_efs(
+            partial(_legacy_artifact_in_plan, plan, ref.legacy_slug), scope=session.scope
+        )
     if source is None or folder is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
     folder_name = _artifact_folder_name(source, folder)
@@ -791,14 +876,18 @@ async def delete_artifact_for_request(
         require_artifact_owner,
     )
 
-    # One resolution for both decisions, so they cannot disagree.
-    resolution = resolve_artifact_owner(session, source, folder_name)
-    # D7: the only thing an unknown owner grants anyone is an org admin's delete.
-    admin_delete = may_delete_ownerless_artifact(
-        session, source, folder_name, principal, resolution=resolution
-    )
-    if not admin_delete:
-        require_artifact_owner(session, source, folder_name, resolution=resolution)
+    def owner_decision(unit) -> bool:
+        # One resolution for both decisions, so they cannot disagree.
+        resolution = resolve_artifact_owner(unit, source, folder_name)
+        # D7: the only thing an unknown owner grants anyone is an org admin's delete.
+        admin_delete = may_delete_ownerless_artifact(
+            unit, source, folder_name, principal, resolution=resolution
+        )
+        if not admin_delete:
+            require_artifact_owner(unit, source, folder_name, resolution=resolution)
+        return admin_delete
+
+    admin_delete = await run_db(owner_decision, scope=session.scope)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():
@@ -827,8 +916,8 @@ async def delete_artifact_for_request(
         from cowork.services.artifact_authorization_identity import existing_authorization_key
         try:
             if expected_artifact_id is None:
-                expected_artifact_id = await run_in_threadpool(
-                    _artifact_id_for_folder, source, folder_name
+                expected_artifact_id = await run_efs(
+                    partial(_artifact_id_for_folder, source, folder_name), scope=session.scope
                 )
             canonical_key = await run_in_threadpool(
                 existing_authorization_key,
@@ -862,13 +951,16 @@ async def delete_artifact_for_request(
                 detail=str(exc),
             ) from exc
     try:
-        await run_in_threadpool(
-            _delete_artifact_from_source,
-            source,
-            folder_name,
-            expected_artifact_id=expected_artifact_id,
-            api_key=api_key,
-            publish_url=publish_url,
+        await run_efs(
+            partial(
+                _delete_artifact_from_source,
+                source,
+                folder_name,
+                expected_artifact_id=expected_artifact_id,
+                api_key=api_key,
+                publish_url=publish_url,
+                scope=session.scope,
+            ),
             scope=session.scope,
         )
     except FileNotFoundError as e:
@@ -879,7 +971,7 @@ async def delete_artifact_for_request(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found") from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except HTTPException:
+    except (HTTPException, FilesystemBusy):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
@@ -1452,7 +1544,8 @@ async def duplicate_live_app(
                 },
             )
         raise
-    cards = await run_in_threadpool(_scoped_project_cards, session, str(body.project_id))
+    plan = await _scoped_project_plan(session.scope, str(body.project_id))
+    cards = await _cards_for(session.scope, partial(readable_sources, plan))
     card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)
     if card is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The copy has no card")

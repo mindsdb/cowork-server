@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 
 import pytest
@@ -64,9 +65,16 @@ def test_org_discovery_drops_a_symlinked_conversation_root(tmp_path, monkeypatch
     # ENG-2056: the project-level base is always a candidate root regardless of
     # any conversation's safety — only the symlinked conversation entry itself
     # is dropped.
-    assert artifact_roots._project_artifact_bases(
-        str(project), object(), include_other_members=True
-    ) == [artifact_roots._artifacts_base(str(project))]
+    row = artifact_roots.ProjectRow(
+        id=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+        name="project",
+        path=str(project),
+        external=False,
+    )
+    found = artifact_roots.discover_roots(artifact_roots.RootsPlan(projects=(row,)))
+    assert [source.base for source in found.unfiltered()] == [
+        artifact_roots._artifacts_base(str(project))
+    ]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
