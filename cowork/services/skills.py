@@ -422,6 +422,39 @@ def reads_shared_skills(scope: TenantScope | None) -> bool:
     return reads_shared_registry(scope, resource=PersonalResource.SKILLS)
 
 
+def _turn_skill_service(
+    scope: TenantScope | None, *, viewer: SkillViewer | None, session: ScopedSession | None
+) -> SkillService:
+    """The store as a turn of ``viewer`` selects from it: in MindsHub mode
+    a missing viewer is the fail-closed one, and an admin's role grants no
+    other member's private skills (SkillViewer.for_turns)."""
+    if sharing_applies(scope):
+        viewer = (viewer or fail_closed_viewer(scope)).for_turns()
+    return SkillService(scope, viewer=viewer, session=session)
+
+
+def has_always_on_skills(
+    scope: TenantScope | None,
+    *,
+    project_name: str | None,
+    viewer: SkillViewer | None,
+    session: ScopedSession,
+) -> bool:
+    """Whether a turn in ``project_name`` puts an always-on skill in its
+    prompt: the skills build_turn_skills would flag ``always_on``. The
+    routing gate's own answer would not follow one, so such a turn goes to
+    the agent (cowork.handlers.responses). Never outside MindsHub mode.
+
+    Reads the org's skill_access rows first, which the turn's selection
+    reads anyway, and parses no SKILL.md when none of them is always on.
+    """
+    svc = _turn_skill_service(scope, viewer=viewer, session=session)
+    # No rows outside MindsHub mode (SkillService._access_rows).
+    if not any(row.always_on for row in svc._access_rows().values()):
+        return False
+    return bool(_split_always_on(svc, _selected_turn_skills(svc, project_name)).always_on)
+
+
 def build_turn_skills(
     scope: TenantScope | None,
     project_path: str | None = None,
@@ -448,9 +481,7 @@ def build_turn_skills(
     Every cloud turn sends it, empty when the caller sees nothing
     (cowork.handlers.responses.remote_turn_skills).
     """
-    if sharing_applies(scope):
-        viewer = (viewer or fail_closed_viewer(scope)).for_turns()
-    svc = SkillService(scope, viewer=viewer, session=session)
+    svc = _turn_skill_service(scope, viewer=viewer, session=session)
     # A fresh org's store starts empty and there is no org-creation hook, so the
     # builtins are seeded on first read: here, behind ``GET /skills``, and in
     # `_stage_remote_workspace_files`. No-op after the first run, and in local

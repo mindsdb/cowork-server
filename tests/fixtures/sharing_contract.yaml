@@ -1,7 +1,7 @@
-# The audience names, refusal codes, instructions to the agent, and bounds
-# cowork/services/sharing_contract.py holds, written down apart from it
-# (tests/test_sharing_contract.py). Each bound's comment there says whether
-# MindsHub owns it or this server does.
+# The audience names, refusal codes, instructions to the agent, patterns, and
+# bounds cowork/services/sharing_contract.py holds, written down apart from it
+# (tests/test_sharing_contract.py). Each pattern's and bound's comment there
+# says which side owns it: MindsHub, the upload service, or this server.
 audience_fields:
   - org_allowed
   - allowed_team_ids
@@ -16,9 +16,12 @@ instructions:
     Do not publish it publicly or to a wider audience instead. Tell the user
     that an organization admin can share it with everyone, or offer to share it
     with specific people by email.
+patterns:
+  REPORT_ID_PATTERN: '[A-Za-z0-9_-]+'
 bounds:
   MAX_PEOPLE_PER_RULE: 100
   MAX_TEAMS_PER_RULE: 100
+  MAX_ARTIFACT_ID_CHARS: 512
   MAX_NOTIFY_EMAILS: 100
   MAX_NOTIFY_TITLE_CHARS: 200
   MAX_NOTIFY_URL_CHARS: 2048
@@ -30,3 +33,4 @@ bounds:
   MAX_IDS_QUERY_CHARS: 8000
   MAX_EMAILS_QUERY_CHARS: 64800
   MAX_DIRECTORY_ROWS: 500
+  LEGACY_RULE_USER_DIR_CHARS: 9

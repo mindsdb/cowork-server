@@ -2,13 +2,15 @@
 uses: MindsHub's artifact rule, a skill's skill_access row and its rule, and
 the saves the app sends. A model that renamed one of them would stop matching
 what the app sends and MindsHub stores, so each is pinned to AudienceField.
-The names, refusal codes, instructions to the agent, and bounds themselves
-are the ones tests/fixtures/sharing_contract.yaml records."""
+The names, refusal codes, instructions to the agent, patterns, and bounds
+themselves are the ones tests/fixtures/sharing_contract.yaml records."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from cowork.models.skill_access import SkillAccess
@@ -67,3 +69,42 @@ def test_the_instructions_to_the_agent_are_the_recorded_ones():
     assert instructions == set(CONTRACT["instructions"])
     recorded = {name: getattr(sharing_contract, name) for name in CONTRACT["instructions"]}
     assert recorded == CONTRACT["instructions"]
+
+
+def test_the_patterns_are_the_recorded_ones():
+    """Each pattern under the name the fixture records, character for
+    character, compiled with no flags, and no pattern it doesn't. The upload
+    service checks a report's id against the same report-id pattern, also
+    compiled with no flags: ignoring case would let [A-Za-z] match the
+    Kelvin sign."""
+    compiled = {
+        name: value for name, value in vars(sharing_contract).items()
+        if name.isupper() and isinstance(value, re.Pattern)
+    }
+    assert {name: value.pattern for name, value in compiled.items()} == CONTRACT["patterns"]
+    assert {name: value.flags for name, value in compiled.items()} == {
+        name: re.compile(value).flags for name, value in CONTRACT["patterns"].items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "read"),
+    [
+        ("artifact/1", "artifact/1"),
+        ("  artifact/1\t", "artifact/1"),
+        ("k" * 512, "k" * 512),
+        (" " * 10 + "k" * 512 + " " * 10, "k" * 512),
+        ("k" * 513, ""),
+        ("", ""),
+        ("   ", ""),
+        ("\t\n\u3000", ""),
+        ("a\x00b", ""),
+        ("a\ud800", ""),
+        ("a\udfff", ""),
+    ],
+)
+def test_an_artifact_id_is_read_as_mindshub_reads_it(key, read):
+    """MindsHub's artifact-access serializers strip an artifact id, and
+    refuse a blank one, one longer than MAX_ARTIFACT_ID_CHARS, and one
+    holding a NUL or a lone surrogate."""
+    assert sharing_contract.mindshub_artifact_id(key) == read

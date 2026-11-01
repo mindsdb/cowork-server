@@ -35,6 +35,7 @@ from anton.core.tools.skill_format import dump_skill
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -81,10 +82,12 @@ from cowork.services.skill_sharing import (
     normalize_user_ids,
     resolve_skill_viewer,
 )
+from cowork.services import skills as skills_module
 from cowork.services.skills import (
     BUILTIN_SKILL_SLUGS,
     SkillService,
     build_turn_skills,
+    has_always_on_skills,
     link_turn_skills,
 )
 from cowork.services.skill_user_settings import off_for_me as user_off_for_me
@@ -1345,6 +1348,249 @@ def test_a_turn_without_a_viewer_gets_only_skills_shared_with_everyone_always_on
     assert [slug for slug, entry in block.items() if entry.always_on] == ["alpha-org"]
     assert not {"beta-team", "eta-team", "dave-private"} & set(block)
     assert {"alpha-org", "delta-org", "gamma-person", "bob-own"} <= set(block)
+
+
+def test_a_turn_has_always_on_skills_exactly_when_its_block_flags_one(org, monkeypatch):
+    """has_always_on_skills answers what build_turn_skills's block would
+    say, for the same caller and project, and reads no SKILL.md while no row
+    is always on."""
+    _create(org, ALICE, "beta-team")
+    _share(org, ALICE, "beta-team", allowed_team_ids=[TEAM_ENG])
+    _create(org, ALICE, "gamma-person")
+    _share(org, ALICE, "gamma-person", allowed_user_ids=[CAROL])
+
+    def has_them(user: str, viewer: SkillViewer | None, project: str = "general") -> bool:
+        return has_always_on_skills(org.as_(user).scope, project_name=project, viewer=viewer, session=org.as_(user))
+
+    def answers(user: str, viewer: SkillViewer | None, project: str = "general") -> tuple[bool, bool]:
+        block = build_turn_skills(org.as_(user).scope, project_name=project, viewer=viewer, session=org.as_(user))
+        return has_them(user, viewer, project), any(entry.always_on for entry in block.values())
+
+    # On demand everywhere: nothing is always on, and no SKILL.md is read.
+    with monkeypatch.context() as patched:
+        patched.setattr(skills_module, "_skill_from_dir", _refuse_to_parse)
+        assert has_them(BOB, _viewer(BOB, teams=(TEAM_ENG,))) is False
+    assert answers(BOB, _viewer(BOB, teams=(TEAM_ENG,))) == (False, False)
+
+    _share(org, ALICE, "beta-team", always_on=True)
+    assert answers(BOB, _viewer(BOB, teams=(TEAM_ENG,))) == (True, True)
+    # Outside the team, or with the teams unknown, the team skill is not there.
+    assert answers(CAROL, _viewer(CAROL)) == (False, False)
+    assert answers(BOB, None) == (False, False)
+    # A skill scoped to another project applies only there.
+    SkillService(org.as_(ALICE).scope).update_skill("beta-team", projects=["other"])
+    assert answers(BOB, _viewer(BOB, teams=(TEAM_ENG,))) == (False, False)
+    assert answers(BOB, _viewer(BOB, teams=(TEAM_ENG,)), "other") == (True, True)
+
+
+def _refuse_to_parse(*_args, **_kwargs):
+    raise AssertionError("must not parse a SKILL.md")
+
+
+def _turn_start(org, user: str, viewer: SkillViewer, question: str, *, session: ScopedSession | None = None):
+    """The request's first unit, as handle() runs it for ``user``, with the
+    viewer handle() resolved before it."""
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = ResponsesHandler(principal=_principal(user))
+    handler.harness_name = "anton"
+    handler._skill_viewer = viewer
+    start = handler._read_turn_start(
+        session or org.as_(user), request=ResponsesRequest(input=question), has_disabled_connections=False,
+    )
+    return handler, start
+
+
+def test_a_plain_question_goes_to_the_agent_when_an_always_on_skill_reaches_the_caller(org, monkeypatch):
+    """The routing gate answers some plain questions itself, without the
+    agent, and its answer would not follow an always-on skill. So a turn an
+    always-on skill reaches goes to the agent with no gate call, and skips
+    the gate's history read; a caller it does not reach still meets the gate."""
+    import cowork.handlers.responses as responses
+    from cowork.handlers.response_routing import DELEGATED_AGENTIC, RouteDecision
+
+    _create(org, ALICE, "house-style")
+    _share(org, ALICE, "house-style", _viewer(ALICE, share_org=True), org_allowed=True, always_on=True)
+    _create(org, ALICE, "team-rules")
+    _share(org, ALICE, "team-rules", allowed_team_ids=[TEAM_ENG], always_on=True)
+    gate_calls: list[dict] = []
+
+    async def gate(**kwargs):
+        gate_calls.append(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="router_declined_direct_response")
+
+    monkeypatch.setattr(responses, "decide_route", gate)
+
+    async def no_binding():
+        return None, None
+
+    async def route(handler, start):
+        handler._router_binding = no_binding
+        return await handler._route_request(
+            conversation_id=start.conversation_id,
+            harness_input=start.harness_input,
+            gate_rows=start.gate_rows,
+            has_attachments=False,
+            has_disabled_connections=False,
+            has_always_on_skills=start.always_on_skills,
+        )
+
+    handler, start = _turn_start(org, BOB, _viewer(BOB, teams=(TEAM_ENG,)), "What is 12 times 7?")
+    decision, turn_llm = asyncio.run(route(handler, start))
+    assert (start.always_on_skills, start.gate_rows) == (True, [])
+    assert (decision.route, decision.reason, turn_llm) == (DELEGATED_AGENTIC, "always_on_skills", None)
+    assert gate_calls == []
+
+    # Only the team skill is always on now; Carol is in no team, so it doesn't reach her.
+    _share(org, ALICE, "house-style", _viewer(ALICE, share_org=True), always_on=False)
+    handler, start = _turn_start(org, CAROL, _viewer(CAROL), "What is 12 times 7?")
+    decision, _turn_llm = asyncio.run(route(handler, start))
+    assert start.always_on_skills is False
+    assert decision.reason == "router_declined_direct_response"
+    assert len(gate_calls) == 1
+
+
+def test_handle_sends_a_plain_question_to_the_agent_without_the_gate_or_a_first_take(org, monkeypatch):
+    """The request's own path: handle() reads the caller's teams from
+    MindsHub, its first unit finds the team's always-on skill in the
+    conversation's project, and the plain question goes to the agent with no
+    gate call, no gate key minted and no first take. Scoped to another
+    project, the skill doesn't reach the turn, and the gate answers it."""
+    import cowork.handlers.responses as responses
+    from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.schemas.responses import ResponsesRequest
+
+    _create(org, ALICE, "team-rules")
+    _share(org, ALICE, "team-rules", allowed_team_ids=[TEAM_ENG], always_on=True)
+    SkillService(org.as_(ALICE).scope).update_skill("team-rules", projects=["general"])
+    mindshub_sharing_answers(monkeypatch, teams=(TEAM_ENG,))
+    calls: list[str] = []
+    routes: list[tuple[str, str]] = []
+
+    class _StopHere(Exception):
+        pass
+
+    async def allowed(_scope, _permission):
+        return None
+
+    async def no_secrets(_scope):
+        return None
+
+    async def unit(work, *, scope):
+        return work(org.as_(BOB))
+
+    async def gate(**_kwargs):
+        calls.append("gate")
+        return RouteDecision(route=DIRECT_CONTEXT, reason="direct", text="12 times 7 is 84.")
+
+    def first_take(*_args, **_kwargs):
+        calls.append("first_take")
+
+    monkeypatch.setattr(responses, "require_product_permission", allowed)
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+    monkeypatch.setattr(responses, "run_db", unit)
+    monkeypatch.setattr(responses, "decide_route", gate)
+    monkeypatch.setattr(responses, "_start_first_take", first_take)
+    monkeypatch.setattr(responses, "_spawn_jev_shadow_probe", lambda **_kwargs: None)
+
+    def ask() -> None:
+        handler = ResponsesHandler(principal=_principal(BOB), mindshub_bearer=MEMBER_BEARER)
+        routed = handler._route_request
+
+        async def mint():
+            calls.append("mint")
+            return None, None
+
+        async def route(**kwargs):
+            decision, turn_llm = await routed(**kwargs)
+            routes.append((decision.route, decision.reason))
+            return decision, turn_llm
+
+        def to_the_agent():
+            raise _StopHere
+
+        async def answered(**_kwargs):
+            raise _StopHere
+
+        handler._router_binding = mint
+        handler._route_request = route
+        handler._get_harness = to_the_agent
+        handler._handle_direct_response = answered
+        with pytest.raises(_StopHere):
+            asyncio.run(handler.handle(ResponsesRequest(input="What is 12 times 7?", stream=True)))
+
+    ask()
+    assert routes == [(DELEGATED_AGENTIC, "always_on_skills")]
+    assert calls == []
+
+    SkillService(org.as_(ALICE).scope).update_skill("team-rules", projects=["other"])
+    ask()
+    assert routes[-1] == (DIRECT_CONTEXT, "direct")
+    assert calls == ["mint", "first_take", "gate"]
+
+
+def test_a_failed_always_on_read_sends_the_turn_to_the_agent(org, monkeypatch, caplog):
+    """Like a failed history read, a failed always-on read rolls back and
+    sends the turn to the agent as a fallback (router_unavailable): the gate
+    never answers past a skill it could not check, and the route names no
+    always-on skill the read never found."""
+    import cowork.handlers.responses as responses
+    from cowork.handlers.response_routing import DELEGATED_AGENTIC
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("store unreadable")
+
+    monkeypatch.setattr(responses, "has_always_on_skills", broken)
+    session = org.as_(BOB)
+    rollbacks: list[bool] = []
+    rollback = session.rollback
+
+    def counted_rollback() -> None:
+        rollbacks.append(True)
+        rollback()
+
+    monkeypatch.setattr(session, "rollback", counted_rollback)
+    with caplog.at_level(logging.ERROR, logger=responses.logger.name):
+        handler, start = _turn_start(
+            org, BOB, _viewer(BOB, teams=(TEAM_ENG,)), "What is 12 times 7?", session=session,
+        )
+    decision, turn_llm = asyncio.run(handler._route_request(
+        conversation_id=start.conversation_id,
+        harness_input=start.harness_input,
+        gate_rows=start.gate_rows,
+        has_attachments=False,
+        has_disabled_connections=False,
+        has_always_on_skills=start.always_on_skills,
+    ))
+
+    assert (start.always_on_skills, start.gate_rows) == (False, None)
+    assert rollbacks == [True]
+    assert (decision.route, decision.reason, decision.fallback, turn_llm) == (
+        DELEGATED_AGENTIC, "router_unavailable", True, None,
+    )
+    failures = [
+        record for record in caplog.records
+        if record.name == responses.logger.name and record.levelno == logging.ERROR
+    ]
+    assert [record.getMessage() for record in failures] == [
+        "[responses] could not read the turn's always-on skills; delegating"
+    ]
+
+
+def test_a_full_pool_during_the_always_on_read_refuses_the_request(org, monkeypatch):
+    """No connection freeing in time is the request's 503 (server_busy), as
+    for the history read, not a delegation: the agent would meet the same
+    full pool."""
+    import cowork.handlers.responses as responses
+
+    def pool_full(*_args, **_kwargs):
+        raise PoolTimeoutError("pool full")
+
+    monkeypatch.setattr(responses, "has_always_on_skills", pool_full)
+    with pytest.raises(PoolTimeoutError):
+        _turn_start(org, BOB, _viewer(BOB, teams=(TEAM_ENG,)), "What is 12 times 7?")
 
 
 def test_the_request_sheds_on_demand_skills_before_always_on_ones(monkeypatch):

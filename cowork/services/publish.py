@@ -48,7 +48,15 @@ from cowork.services.artifact_audience import (
     sync_team_audience,
 )
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.sharing_contract import ARTIFACTS_SHARE_ORG, SHARE_ORG_REQUIRED_CODE, AudienceField
+from cowork.services.sharing_contract import (
+    ARTIFACTS_SHARE_ORG,
+    LEGACY_RULE_USER_DIR_CHARS,
+    MAX_ARTIFACT_ID_CHARS,
+    REPORT_ID_PATTERN,
+    SHARE_ORG_REQUIRED_CODE,
+    AudienceField,
+    mindshub_artifact_id,
+)
 from cowork.services.providers import (
     is_mindshub_publish_url,
     normalize_publish_url,
@@ -790,8 +798,10 @@ def _plan_access(
 def _rule_key(canonical_key: str | None, entry: Any) -> str:
     """The key an artifact's rule is stored under: its identity, else, for a
     legacy loose file with none, the key the upload service gave the publish
-    ``entry`` records. The one source of that key, for the read before a
-    publish and for every write after it."""
+    ``entry`` records. The one source of that key, for the first key a
+    re-publish checks (_prior_rule_keys) and for every write after it. A
+    read of who a loose file is shared with never asks the entry's key
+    (_audience_rule_keys), since the pod can write the entry."""
     if canonical_key:
         return canonical_key
     return str(entry.get("artifact_key") or "") if isinstance(entry, dict) else ""
@@ -811,26 +821,81 @@ def _prior_rule_keys(canonical_key: str | None, entry: Any) -> list[str]:
     return [key for key in dict.fromkeys([_rule_key(canonical_key, entry), *recorded]) if key]
 
 
+def _report_rule_key(entry: Any, *, owner_user_id: str | None) -> str:
+    """The id the rule of the report ``entry`` records was stored under
+    before the report had a stable id: ``<user_dir>/<report_id>``, with
+    ``user_dir`` the upload service's folder for the owner
+    (LEGACY_RULE_USER_DIR_CHARS). A report published restricted then, and
+    not published since, still has its rule there, and an entry written
+    then records no key for it. "" when the owner's id isn't a UUID, or the
+    entry names no report in the upload service's form
+    (REPORT_ID_PATTERN), or the id is longer than MindsHub takes
+    (MAX_ARTIFACT_ID_CHARS). The upload service refuses to publish a report
+    of another form, MindsHub holds no rule under an id that long, and the
+    pod can write the report_id, so asking about one gains nothing and can
+    fail the read."""
+    from cowork.services.mindshub_client import canonical_uuid
+
+    report_id = entry.get("report_id") if isinstance(entry, dict) else None
+    owner = canonical_uuid(owner_user_id) if owner_user_id else None
+    if not isinstance(report_id, str) or not REPORT_ID_PATTERN.fullmatch(report_id) or owner is None:
+        return ""
+    key = f"{hashlib.md5(owner.encode()).hexdigest()[:LEGACY_RULE_USER_DIR_CHARS]}/{report_id}"
+    return key if len(key) <= MAX_ARTIFACT_ID_CHARS else ""
+
+
+def _audience_rule_keys(canonical_key: str | None, entry: Any, *, owner_user_id: str | None) -> list[str]:
+    """The keys a read of who the artifact is shared with asks MindsHub
+    about, in order: the artifact's identity, then the report's id from
+    before stable ids (_report_rule_key). The first rule held under them is
+    the one the artifact is shared with, so a report whose rule hasn't moved
+    off its old id yet is read as shared with that rule's audience. A loose
+    file has no identity, and this server sends the upload service no key
+    for it, so the upload service keeps its rule under the report's id. The
+    old id names the report this publish uploads to, and MindsHub moves that
+    rule's audience only to the stable id first published as that report.
+    Never a key the entry recorded, a loose file's ``artifact_key``
+    included: the pod can write those, and a rule under one may be another
+    artifact's, whose audience would then be sent as this one's."""
+    keys = [canonical_key or "", _report_rule_key(entry, owner_user_id=owner_user_id)]
+    return [key for key in dict.fromkeys(keys) if key]
+
+
+def _held_rule_keys(canonical_key: str | None, entry: Any, *, owner_user_id: str | None) -> list[str]:
+    """Every key a rule could sit under that a re-publish checks before it
+    goes ahead, in order: _prior_rule_keys, then the report's id from before
+    stable ids (_report_rule_key). Any rule held under them refuses a
+    re-publish that isn't restricted (_access_mode_refusal), and the access
+    route shows it for such an entry (rule_held_over_entry), so a key an
+    agent writes here adds a refusal, never an audience a publish sends.
+    The old id never makes a page the entry names no key for checkable,
+    because an agent can write the entry's report_id."""
+    keys = [*_prior_rule_keys(canonical_key, entry), _report_rule_key(entry, owner_user_id=owner_user_id)]
+    return [key for key in dict.fromkeys(keys) if key]
+
+
 def _access_mode_refusal(
     canonical_key: str | None, entry: Any, *, reuses_report: bool, scope: TenantScope
 ) -> Literal["rule_held", "no_rule_key"] | None:
     """Why a re-publish in MindsHub mode that isn't a person's save and
     isn't restricted must not go ahead (AccessModeChanged), or None. The
-    MindsHub holds a rule under one of the keys the last publish could
-    have left it under (_prior_rule_keys): ``rule_held``. Or the publish
-    reuses a page the entry names no key for, so no rule can be read:
-    ``no_rule_key``. A failed read raises."""
-    keys = _prior_rule_keys(canonical_key, entry)
-    if not keys:
+    MindsHub holds a rule under one of the keys it checks
+    (_held_rule_keys), the keys the last publish could have left it under
+    and the report's id from before stable ids: ``rule_held``. Or the
+    publish reuses a page the entry names no key for (_prior_rule_keys), so
+    no rule can be read: ``no_rule_key``. A failed read raises."""
+    if not _prior_rule_keys(canonical_key, entry):
         return "no_rule_key" if reuses_report else None
-    if _held_rule(keys, scope) is not None:
+    if _held_rule(_held_rule_keys(canonical_key, entry, owner_user_id=scope.user_id), scope) is not None:
         return "rule_held"
     return None
 
 
 def _held_rule(keys: list[str], scope: TenantScope) -> ArtifactRule | None:
     """The first rule MindsHub holds under ``keys``, in order, or
-    None when it holds none. A failed read raises."""
+    None when it holds none. A failed read raises, a 409 for a key
+    MindsHub binds to another owner or holds for repair included: the
+    rule there may be this artifact's."""
     for key in keys:
         rule = _read_rule(key, scope)
         if rule is not None:
@@ -861,23 +926,27 @@ def _authorization_key(
 def _read_rule(rule_key: str, scope: TenantScope) -> ArtifactRule | None:
     """The artifact's rule as MindsHub stores it under ``rule_key``
     (read_artifact_access), or None when it holds none, as for an artifact
-    with no key yet. A failed read raises, so a publish never guesses who it
-    shares with."""
+    with no key yet or a key MindsHub refuses as an artifact id
+    (mindshub_artifact_id): the pod can write the keys an entry records,
+    and MindsHub holds no rule under such a key but answers its read with a
+    400. A failed read raises, so a publish never guesses who it shares
+    with."""
     from cowork.services.artifact_access import read_artifact_access
 
-    if not rule_key:
+    artifact_id = mindshub_artifact_id(rule_key)
+    if not artifact_id:
         return None
     return read_artifact_access(
-        artifact_id=rule_key, scope=scope, owner_user_id=str(scope.user_id or "")
+        artifact_id=artifact_id, scope=scope, owner_user_id=str(scope.user_id or "")
     )
 
 
-def _stored_rule(rule_key: str, scope: TenantScope) -> ArtifactRule:
-    """Who the artifact is shared with (_read_rule): nobody but the owner
-    when MindsHub holds no rule for it."""
+def _stored_rule(keys: list[str], scope: TenantScope) -> ArtifactRule:
+    """Who the artifact is shared with: the first rule MindsHub holds under
+    ``keys`` (_held_rule), else nobody but the owner."""
     from cowork.services.artifact_access import ArtifactRule
 
-    rule = _read_rule(rule_key, scope)
+    rule = _held_rule(keys, scope)
     return ArtifactRule.nobody() if rule is None else rule
 
 
@@ -885,24 +954,29 @@ def stored_artifact_rule(
     artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
 ) -> ArtifactRule:
     """Who ``artifact`` is shared with, as MindsHub's rule stores it, read
-    under the key publish_artifact publishes it with. What
-    the access route checks a save against and shows; .published.json never
-    says it in MindsHub mode."""
+    under the artifact's identity and then its report's id from before
+    stable ids (_audience_rule_keys), the keys the publish plans against.
+    So a report whose rule still sits under its old id is checked and shown
+    with that rule's audience, and a member re-saving their own artifact
+    already shared with everyone keeps it so. What the access route checks
+    a save against and shows; .published.json never says it in MindsHub
+    mode."""
     _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
     previous = _load_published_map(published_dir).get(published_key)
     canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
-    return _stored_rule(_rule_key(canonical_key, previous), scope)
+    return _stored_rule(_audience_rule_keys(canonical_key, previous, owner_user_id=scope.user_id), scope)
 
 
 def rule_held_over_entry(
     artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
 ) -> ArtifactRule | None:
     """The rule MindsHub holds for ``artifact`` under a key its live
-    .published.json entry's last publish could have left it under
-    (_prior_rule_keys, the keys _access_mode_refusal reads before a
-    re-publish), or None: for no live entry, or no rule. The access route
+    .published.json entry's last publish could have left it under, or the
+    report's id from before stable ids (_held_rule_keys, the keys
+    _access_mode_refusal reads before a re-publish), or None: for no live
+    entry, or no rule. The access route
     reads it for an entry that isn't restricted. Only a restricted publish
     leaves a rule in MindsHub mode, so a rule held there means the pod
     rewrote the entry's mode after the owner's last save, and the rule, not
@@ -914,7 +988,7 @@ def rule_held_over_entry(
     if not isinstance(entry, dict) or not entry.get("published", True):
         return None
     canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
-    return _held_rule(_prior_rule_keys(canonical_key, entry), scope)
+    return _held_rule(_held_rule_keys(canonical_key, entry, owner_user_id=scope.user_id), scope)
 
 
 def publish_artifact(
@@ -1072,7 +1146,9 @@ def publish_artifact(
         if org_scope is None or not restricted:
             stored = None
         elif stored is None:
-            stored = _stored_rule(_rule_key(canonical_artifact_key, previous), org_scope)
+            stored = _stored_rule(
+                _audience_rule_keys(canonical_artifact_key, previous, owner_user_id=org_scope.user_id), org_scope
+            )
         plan = _plan_access(password, access, previous, stored=stored)
         owner_side = plan.owner_side
         # Who the rule shares with: the plan's, then MindsHub's answer

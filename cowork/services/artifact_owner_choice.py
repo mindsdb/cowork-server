@@ -79,7 +79,13 @@ def widening(*, mode: AccessMode, choice: OwnerChoice) -> Widening | None:
 
 
 def _keyable(key: str) -> bool:
-    return 0 < len(key) <= ARTIFACT_KEY_MAX_CHARS
+    """Whether ``key`` can be a record's key: no longer than the column, and
+    an artifact id as MindsHub reads it (mindshub_artifact_id), so a key the
+    pod writes into an entry with a NUL or a lone surrogate is never asked
+    about."""
+    from cowork.services.sharing_contract import mindshub_artifact_id
+
+    return 0 < len(key) <= ARTIFACT_KEY_MAX_CHARS and mindshub_artifact_id(key) == key
 
 
 def read_owner_choice(*, keys: Iterable[str], scope: TenantScope) -> OwnerChoice | None:

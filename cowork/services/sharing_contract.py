@@ -2,18 +2,23 @@
 
 The names of who a rule is shared with, the MindsHub reads and capabilities
 sharing uses, the code of a refused share and what the agent is told after
-one, and every bound this server owns or mirrors. A bound MindsHub enforces
-is mirrored here so a share it would refuse is refused before anything is
-published; each comment says which side owns it. The app mirrors five of
-them, MAX_IDS_PER_LOOKUP, MAX_EMAILS_PER_LOOKUP, INVALID_ID_CODE,
+one, how an artifact's rule was keyed before it had a stable id, and every
+bound this server owns or mirrors. A bound MindsHub enforces is mirrored
+here so a share it would refuse is refused before anything is published;
+each comment says which side owns it. The app mirrors five of them,
+MAX_IDS_PER_LOOKUP, MAX_EMAILS_PER_LOOKUP, INVALID_ID_CODE,
 INVALID_EMAIL_CODE, and SHARE_ORG_REQUIRED_CODE, in its sharing contract
 module (src/renderer/cowork/lib/sharingContract.js).
-anton's publisher holds SHARE_ORG_REQUIRED_CODE and
-SHARE_ORG_REQUIRED_INSTRUCTION under the same names.
+MindsHub, in its sharing contract module, and the upload service hold
+SHARE_ORG_REQUIRED_CODE under the same name, and anton's publisher holds
+SHARE_ORG_REQUIRED_CODE and SHARE_ORG_REQUIRED_INSTRUCTION under the same
+names. The upload service holds LEGACY_RULE_USER_DIR_CHARS and
+REPORT_ID_PATTERN under the same names.
 """
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 
 
@@ -45,9 +50,10 @@ ARTIFACTS_SHARE_ORG = "artifacts.share_org"
 # someone without ARTIFACTS_SHARE_ORG. MindsHub answers it when a publish's
 # rule newly sets org_allowed, and the upload service passes it on; this
 # server answers it, with HTTP 403 and the reason as ``detail``, for that
-# refusal and for its own check of the same before anything publishes. The
-# app's sharing contract module and anton's publisher (anton.publisher)
-# hold it under the same name.
+# refusal and for its own check of the same before anything publishes.
+# MindsHub's sharing contract module, the upload service, the app's
+# sharing contract module, and anton's publisher (anton.publisher) hold it
+# under the same name.
 SHARE_ORG_REQUIRED_CODE = "share_org_required"
 # The ``code`` of the people lookup's 400 when an id in ``?ids=`` isn't a
 # UUID, and when an address in ``?emails=`` is one MindsHub wouldn't take;
@@ -67,6 +73,19 @@ SHARE_ORG_REQUIRED_INSTRUCTION = (
     "people by email."
 )
 
+# A report published restricted before it had a stable ``artifact/<uuid>``
+# id has its rule under ``<user_dir>/<report_id>`` until its next publish
+# moves the rule. ``user_dir`` is the first this many hex digits of md5 of the
+# owner's id in its canonical lowercase form. Owned by the upload service,
+# which holds it under the same name for the folder its ``_user_prefix``
+# names each owner.
+LEGACY_RULE_USER_DIR_CHARS = 9
+# The form of ``report_id`` in that old id. Owned by the upload service,
+# which holds it under the same name for its report-id check and refuses a
+# publish naming a report of another form, so no publish reaches a rule
+# under one.
+REPORT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+
 # MindsHub reads sharing makes with the caller's bearer.
 # The teams the caller belongs to.
 TEAMS_PATH = "/me/teams/"
@@ -83,6 +102,23 @@ MAX_PEOPLE_PER_RULE = 100
 # The most teams one skill or artifact is shared with. Mirrors MindsHub's
 # bound on an artifact's rule; this server applies it to skills too.
 MAX_TEAMS_PER_RULE = 100
+# The longest id an artifact's rule is stored under. Mirrors MindsHub's
+# bound of the same name on the ``artifact_id`` its artifact-access routes
+# take: they answer 400 for a longer one.
+MAX_ARTIFACT_ID_CHARS = 512
+
+
+def mindshub_artifact_id(key: str) -> str:
+    """``key`` as MindsHub's artifact-access routes read an artifact id:
+    stripped of surrounding whitespace. "" for one they refuse with a 400:
+    blank once stripped, longer than MAX_ARTIFACT_ID_CHARS, or holding a NUL
+    or a lone surrogate, which no request body or database column can carry
+    either."""
+    key = key.strip()
+    if len(key) > MAX_ARTIFACT_ID_CHARS or "\x00" in key or any("\ud800" <= ch <= "\udfff" for ch in key):
+        return ""
+    return key
+
 # The most addresses one save of an artifact's share asks MindsHub to email.
 # Mirrors MindsHub's bound on the share email; the ids it emails are bound
 # by MAX_PEOPLE_PER_RULE.

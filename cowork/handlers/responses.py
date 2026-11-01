@@ -128,8 +128,8 @@ from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
 from cowork.schemas.turn_skills import TurnSkills
-from cowork.services.skill_sharing import SkillViewer
-from cowork.services.skills import SkillService
+from cowork.services.skill_sharing import SkillViewer, sharing_applies
+from cowork.services.skills import SkillService, has_always_on_skills
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
 
 
@@ -390,9 +390,13 @@ class _TurnStart:
     conversation_id: UUID
     turn_id: int
     # The gate's history: user and assistant rows, oldest first, at most
-    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape skips the gate, and
-    # None when the read failed, which sends the turn to the agent.
+    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape or an always-on
+    # skill skips the gate, and None when the history or always-on read
+    # failed, which sends the turn to the agent.
     gate_rows: list[Message] | None
+    # Whether an always-on skill reaches the turn (has_always_on_skills),
+    # which sends it to the agent: the gate's answer would not follow it.
+    always_on_skills: bool = False
 
 
 @dataclass(frozen=True)
@@ -747,6 +751,9 @@ class ResponsesHandler:
         # in this request's context, so the vault's secrets are registered
         # first. It needs only the scope.
         await register_vault_secrets(self.scope)
+        # The unit reads which always-on skills reach the caller, so their
+        # teams are read first (cached per caller). A no-op outside MindsHub mode.
+        await self._resolve_skill_viewer(self.scope)
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
@@ -776,6 +783,7 @@ class ResponsesHandler:
                     gate_rows=start.gate_rows,
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
+                    has_always_on_skills=start.always_on_skills,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -1022,16 +1030,25 @@ class ResponsesHandler:
         # this is a stable per-conversation index for the buffer file.
         turn_id = conversation_service.message_count(conversation)
 
-        # Shape checks first: a turn the gate cannot route skips the history
-        # read, as _route_request skips the gate.
+        # Shape checks first, then the always-on skills: a turn the gate
+        # cannot route skips the history read, as _route_request skips the gate.
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
+        always_on_skills = False
         if ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
         ) is None:
-            gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
+            reaches = self._reads_always_on_skills(session, conversation=conversation)
+            if reaches is None:
+                # The read failed: the turn goes to the agent as when the
+                # history read fails.
+                gate_rows = None
+            elif reaches:
+                always_on_skills = True
+            else:
+                gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
 
         return _TurnStart(
             settings=settings,
@@ -1040,7 +1057,34 @@ class ResponsesHandler:
             conversation_id=conversation_id,
             turn_id=turn_id,
             gate_rows=gate_rows,
+            always_on_skills=always_on_skills,
         )
+
+    def _reads_always_on_skills(self, session: ScopedSession, *, conversation: Conversation) -> bool | None:
+        """Whether an always-on skill reaches this turn in MindsHub mode, for
+        the viewer handle() resolved (has_always_on_skills). None when the
+        read fails: like a failed history read, that sends the turn to the
+        agent as a fallback, so the gate never answers past a skill it could
+        not check, and the route names no skill that may not exist."""
+        if not sharing_applies(session.scope):
+            return False
+        try:
+            return has_always_on_skills(
+                session.scope,
+                project_name=conversation.project.name,
+                viewer=self._skill_viewer,
+                session=session,
+            )
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.exception(
+                "[responses] could not read the turn's always-on skills; delegating",
+                extra=log_context(conversation_id=conversation.id),
+            )
+            # Rolling back loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return None
 
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
@@ -1069,6 +1113,7 @@ class ResponsesHandler:
         gate_rows: list[Message] | None,
         has_attachments: bool,
         has_disabled_connections: bool,
+        has_always_on_skills: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -1079,7 +1124,9 @@ class ResponsesHandler:
         or cancel once the route is known.
 
         `gate_rows` is the history handle()'s first unit read for the gate
-        (see _TurnStart).
+        (see _TurnStart). `has_always_on_skills` delegates the turn without a
+        gate call: an always-on skill applies to every answer, and only the
+        agent's prompt carries it.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1096,6 +1143,8 @@ class ResponsesHandler:
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
+        if has_always_on_skills:
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="always_on_skills"), None
         if gate_rows is None:
             # The history read failed. Like any other gate failure, the turn
             # goes to the agent rather than failing.

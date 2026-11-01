@@ -1,10 +1,13 @@
 """Real SQL aliases keep mutable metadata out of the global authorization key."""
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from threading import Barrier, Lock
+import time
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -28,7 +31,7 @@ from cowork.services import (
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_identity import artifact_key
 from cowork.services.publish import publish_artifact
-from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA
+from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA, member_request, mindshub_sharing_answers
 
 
 class AuthIssuer:
@@ -37,7 +40,9 @@ class AuthIssuer:
     It keeps each artifact's rule the way MindsHub does. Its upsert
     replaces a sharing field the caller sends and keeps one it leaves out,
     and echoes the org flag, teams and people; its read answers the rule as
-    stored, or 404 ``no_rule``; its delete removes it. ``lambda_publish`` is
+    stored, or 404 ``no_rule``; its delete removes it. Every route reads an
+    artifact id as MindsHub does, stripped, and answers 400 for a blank one,
+    one holding a NUL, and one longer than MindsHub takes. ``lambda_publish`` is
     the publish lambda's own write of the emails and the org flag, and its
     delete of the rule for a public or password publish. A deleted
     team is dropped from every rule and refused from then on
@@ -128,8 +133,18 @@ class AuthIssuer:
                 self.drop_allocation_reply = False
                 raise httpx.ReadTimeout("Allocation reply lost", request=request)
             return httpx.Response(200, json={"artifact_id": key})
+        stripped = body["artifact_id"].strip()
+        if not stripped or "\x00" in stripped or len(stripped) > 512:
+            # MindsHub's serializers strip an artifact id, and refuse a blank
+            # one, one holding a NUL, and one over 512 characters.
+            return httpx.Response(400, json={"artifact_id": ["Not a valid artifact id."]})
+        body = {**body, "artifact_id": stripped}
         key = body["artifact_id"].replace("artifact-draft/", "artifact/")
         expected = self.bindings.get(key)
+        if expected is None and path.endswith("/read/") and body["artifact_id"] not in self.rules:
+            # MindsHub's read answers an id nobody reserved and no rule sits
+            # under as having no rule, like any other.
+            return httpx.Response(404, json={"code": "no_rule", "detail": "x"})
         if expected is None:
             return httpx.Response(409, json={"code": "artifact_ownership_unclaimed"})
         if expected != owner:
@@ -1110,6 +1125,454 @@ async def test_the_access_route_reads_the_rule_under_the_key_the_entry_recorded(
     assert (state["accessMode"], state["accessEmails"]) == ("restricted", ["a@else.com"])
 
 
+def _published_before_stable_ids(issuer, folder, scope, key, *, emails, org_allowed):
+    """Leave the artifact as a report published restricted before stable ids
+    and not since: its rule under the report's ``<user_dir>/<report_id>`` id,
+    bound to the owner, none under ``key``, and an entry that records no key.
+    ``user_dir`` is the upload service's folder for the owner, the first nine
+    hex digits of md5 of their id (the upload service's code, which can't be
+    imported here).
+    Answers the legacy id."""
+    legacy = f"{hashlib.md5(scope.user_id.encode()).hexdigest()[:9]}/report-1"
+    issuer.rules.pop(key, None)
+    issuer.rules[legacy] = {
+        "org_allowed": org_allowed, "allowed_team_ids": [], "allowed_user_ids": [], "allowed_emails": list(emails),
+    }
+    issuer.bindings[legacy] = (scope.user_id, scope.org_id)
+    _plant_entry(folder, artifact_key="", lambda_artifact_key="")
+    return legacy
+
+
+@pytest.mark.asyncio
+async def test_a_member_re_saving_their_legacy_artifact_shared_with_everyone_keeps_it(
+    issuer, scope, local_id, owned_artifact, monkeypatch, granted_product_permissions
+):
+    """A report an admin shared with everyone before stable ids still has its
+    rule under its old id. The check reads that rule when the stable id has
+    none, so a member without artifacts.share_org who saves it with everyone
+    again is not refused, and the publish plans against that rule."""
+    session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=True)
+    mindshub_sharing_answers(monkeypatch)
+
+    class _Key:
+        async def get(self):
+            return "turn-key"
+
+        async def revoke(self):
+            pass
+
+    monkeypatch.setattr(
+        artifact_workspace, "_owner_publish_context",
+        lambda _session, _folder: (folder.parent, "https://view.test", _Key()),
+    )
+    everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": ["a@else.com"]}
+
+    saved = await artifact_workspace.set_artifact_access(
+        str(project.id), local_id, artifact_workspace._AccessBody(access=everyone), session, member_request(),
+    )
+
+    # A refusal answers its 403 as a response of its own; a publish, its result.
+    assert isinstance(saved, dict), (saved.status_code, saved.body)
+    assert saved["orgAllowed"] is True
+    assert uploads[-1]["access"] == {"mode": "restricted", "emails": ["a@else.com"], "org_allowed": True}
+    assert uploads[-1]["artifact_key"] == key
+
+
+@pytest.mark.asyncio
+async def test_the_access_route_answers_a_legacy_rule_when_the_stable_id_holds_none(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=True)
+
+    state = (await artifact_workspace.artifact_access(str(project.id), local_id, session)).model_dump(
+        by_alias=True, mode="json"
+    )
+
+    assert (state["accessMode"], state["accessEmails"], state["orgAllowed"]) == ("restricted", ["a@else.com"], True)
+
+
+@pytest.mark.asyncio
+async def test_a_live_sync_of_a_legacy_artifact_sends_the_legacy_rules_audience(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """A content save that isn't the owner's choice takes who the artifact is
+    shared with from the rule. Read under the stable id alone, a legacy
+    artifact's would be nobody, and the publish would quietly take everyone
+    else off it."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=True)
+
+    saved = await _live_sync(folder, scope, project, monkeypatch)
+
+    assert saved is True
+    assert uploads[-1]["access"] == {"mode": "restricted", "emails": ["a@else.com"], "org_allowed": True}
+
+
+def _another_artifact_shared_with_everyone(issuer, scope):
+    """Another of the owner's artifacts, its rule shared with everyone. Answers its key."""
+    other = artifact_key(uuid4().hex)
+    issuer.rules[other] = {"org_allowed": True, "allowed_team_ids": [], "allowed_user_ids": [], "allowed_emails": []}
+    issuer.bindings[other] = (scope.user_id, scope.org_id)
+    return other
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["artifact_key", "lambda_artifact_key"])
+async def test_a_live_sync_never_takes_its_audience_from_a_key_an_agent_writes_in_the_entry(
+    issuer, scope, local_id, owned_artifact, monkeypatch, field
+):
+    """The pod can write the keys the entry recorded. A re-publish that took
+    who it shares with from a rule under one of them would send another
+    artifact's audience, everyone in the organization here, as this one's.
+    So it reads the artifact's identity, then its report's old id."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=False)
+    _plant_entry(folder, **{field: _another_artifact_shared_with_everyone(issuer, scope)})
+
+    saved = await _live_sync(folder, scope, project, monkeypatch)
+
+    assert saved is True
+    assert uploads[-1]["access"] == {"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}
+
+
+@pytest.mark.asyncio
+async def test_a_loose_files_live_sync_never_takes_its_audience_from_an_artifact_key_an_agent_writes(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """A loose file has no metadata.json, so it has no identity, as this
+    folder has none once its metadata.json is gone. This server sends the
+    upload service no key for it, so its rule sits under the report's old
+    id. The pod can write the entry's ``artifact_key``. A re-publish that
+    took who it shares with from a rule under it would send another
+    artifact's audience, everyone in the organization here, as this one's.
+    So it reads the report's old id alone."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=False)
+    (folder / "metadata.json").unlink()
+    _plant_entry(folder, artifact_key=_another_artifact_shared_with_everyone(issuer, scope))
+
+    saved = await _live_sync(folder, scope, project, monkeypatch)
+
+    assert saved is True
+    assert uploads[-1]["artifact_key"] is None
+    assert uploads[-1]["access"] == {"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}
+
+
+def test_a_loose_files_owner_save_writes_its_rule_under_the_key_the_upload_service_answers(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """Only the read of a loose file's audience skips the entry's key. The
+    team and people write, and the owner's choice, take the key the upload
+    service answers for the publish (publish._rule_key), which for a loose
+    file is the report's old id, so they land on the rule the next read
+    finds."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice, read_owner_choice
+
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    legacy = _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=False)
+    (folder / "metadata.json").unlink()
+    # The upload service answers a key-less publish with the report's old id.
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, echoed_key=legacy)
+
+    run(
+        {"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False, "allowed_team_ids": [TEAM_ENG]},
+        owner_save=True,
+    )
+
+    assert uploads[-1]["artifact_key"] is None
+    assert _upserts(issuer)[-1]["artifact_id"] == legacy
+    assert issuer.rules[legacy]["allowed_team_ids"] == [TEAM_ENG]
+    assert read_owner_choice(keys=[legacy], scope=scope) == OwnerChoice(AccessMode.RESTRICTED, True)
+
+
+@pytest.mark.asyncio
+async def test_a_live_sync_reads_the_identitys_rule_before_a_legacy_rule_left_behind(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """The upload service deletes the legacy rule once it moves, on a best
+    effort, so one can be left behind. The identity's rule is the one the
+    owner saved since, and a legacy rule left behind never widens it again."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)
+    legacy = f"{hashlib.md5(scope.user_id.encode()).hexdigest()[:9]}/{_entry(folder)['report_id']}"
+    issuer.rules[legacy] = {"org_allowed": True, "allowed_team_ids": [], "allowed_user_ids": [], "allowed_emails": []}
+    issuer.bindings[legacy] = (scope.user_id, scope.org_id)
+
+    saved = await _live_sync(folder, scope, project, monkeypatch)
+
+    assert saved is True
+    assert uploads[-1]["access"] == {"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}
+
+
+@pytest.mark.asyncio
+async def test_the_access_route_never_answers_the_rule_under_a_key_an_agent_writes_in_a_restricted_entry(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """The Share dialog, and the check a save makes, read who a restricted
+    artifact is shared with the way its re-publish does, so an agent can't
+    make it look shared with everyone."""
+    session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=False)
+    _plant_entry(folder, lambda_artifact_key=_another_artifact_shared_with_everyone(issuer, scope))
+
+    state = (await artifact_workspace.artifact_access(str(project.id), local_id, session)).model_dump(
+        by_alias=True, mode="json"
+    )
+
+    assert (state["accessMode"], state["accessEmails"], state["orgAllowed"]) == ("restricted", ["a@else.com"], False)
+
+
+@pytest.mark.asyncio
+async def test_the_access_route_answers_when_an_agent_writes_a_report_id_too_long_for_mindshub(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """The pod can write the entry's report_id. An old id longer than
+    MindsHub takes holds no rule, so it is never asked about, and the Share
+    dialog answers rather than failing on MindsHub's 400."""
+    session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=False)
+    _plant_entry(folder, report_id="r" * 600)
+
+    state = (await artifact_workspace.artifact_access(str(project.id), local_id, session)).model_dump(
+        by_alias=True, mode="json"
+    )
+
+    assert (state["accessMode"], state["accessEmails"], state["orgAllowed"]) == ("restricted", [], False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["artifact_key", "lambda_artifact_key"])
+@pytest.mark.parametrize(
+    "planted",
+    ["k" * 600, "   ", "\t\n\u3000", "a\x00b", "a\ud800", "a\udfff"],
+    ids=["too_long", "blank", "other_whitespace", "nul", "lone_high_surrogate", "lone_low_surrogate"],
+)
+async def test_the_access_route_answers_when_an_agent_writes_an_entry_key_mindshub_refuses(
+    issuer, scope, local_id, owned_artifact, monkeypatch, field, planted
+):
+    """The pod can write the keys a public entry records. One MindsHub
+    refuses as an artifact id holds no rule, so the check for a rule held
+    over the entry skips it, and the Share dialog answers rather than
+    failing on MindsHub's 400, or before it on a body that can't be
+    encoded."""
+    session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "public"}, owner_save=True)
+    _plant_entry(folder, **{field: planted})
+
+    state = (await artifact_workspace.artifact_access(str(project.id), local_id, session)).model_dump(
+        by_alias=True, mode="json"
+    )
+
+    assert state["accessMode"] == "public"
+    asked = [body["artifact_id"] for path, body in issuer.calls if path.endswith("/read/")]
+    assert planted not in asked and planted.strip() not in asked
+
+
+@pytest.mark.asyncio
+async def test_the_access_route_refuses_when_an_agent_writes_a_key_mindshub_binds_to_another_owner(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """MindsHub's 409 for a key in the entry bound to another owner also
+    answers a key it holds for repair, whose rule may be this artifact's, so
+    the read fails closed and the Share dialog reports the refusal."""
+    session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "public"}, owner_save=True)
+    colleague = artifact_key(uuid4().hex)
+    issuer.bindings[colleague] = (str(uuid4()), scope.org_id)
+    _plant_entry(folder, artifact_key=colleague)
+
+    with pytest.raises(HTTPException) as refused:
+        await artifact_workspace.artifact_access(str(project.id), local_id, session)
+
+    assert refused.value.status_code == 409
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("planted", ["a\ud800", "a\x00b"], ids=["lone_surrogate", "nul"])
+async def test_a_live_sync_of_a_public_entry_with_a_key_mindshub_refuses_still_publishes(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog, planted
+):
+    """A key the pod writes into a public entry that no request body or
+    column can carry is asked about neither in MindsHub nor in the owner's
+    record, so the content save still publishes the page as it was."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "public"}, owner_save=True)
+    uploaded = len(uploads)
+    _plant_entry(folder, artifact_key=planted)
+
+    with caplog.at_level(logging.WARNING):
+        saved = await _live_sync(folder, scope, project, monkeypatch)
+
+    assert saved is True
+    assert len(uploads) == uploaded + 1
+    assert uploads[-1]["access"] == {"mode": "public"}
+    assert not [record for record in caplog.records if record.exc_info]
+
+
+def _nest(folder, local_id, how):
+    """Put the artifact's page in a subfolder, as an agent-built site does:
+    a ``primary`` the metadata names, or a newer nested index.html."""
+    sub = folder / ("site" if how == "hint" else "docs")
+    sub.mkdir()
+    (sub / "index.html").write_text("<html>nested</html>")
+    if how == "hint":
+        (folder / "metadata.json").write_text(
+            json.dumps({"id": local_id, "slug": "demo", "type": "html-app", "primary": "site/index.html"})
+        )
+    else:
+        old = time.time() - 600
+        os.utime(folder / "index.html", (old, old))
+    return sub
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["hint", "newer_nested_index"])
+@pytest.mark.parametrize("republish", ["live_sync", "autopublish"])
+async def test_a_page_in_a_subfolder_its_owner_made_public_keeps_syncing(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog, how, republish
+):
+    """A page in a subfolder of the artifact has no metadata beside it, so
+    it publishes with no identity, under the key the upload service gives
+    its report. A page its owner made public is still re-published by live
+    sync and autopublish, never refused for having no identity."""
+    from cowork.services import artifact_autopublish as ap
+
+    _session, project, _conversation, folder = owned_artifact
+    sub = _nest(folder, local_id, how)
+    legacy = f"{hashlib.md5(scope.user_id.encode()).hexdigest()[:9]}/report-1"
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, echoed_key=legacy)
+    run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)
+    assert uploads[-1]["artifact_key"] is None
+    run({"mode": "public"}, owner_save=True)
+    uploaded = len(uploads)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        if republish == "live_sync":
+            saved = await _live_sync(folder, scope, project, monkeypatch)
+        else:
+            entry = json.loads((sub / ".published.json").read_text())["index.html"]
+            decision = ap.PublishDecision("changed", published_entry=entry)
+            saved = await ap._publish_one(
+                folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
+                ap._access_for(decision), project_id=str(project.id),
+            )
+
+    assert saved is True, [record.reason for record in _mode_changed_records(caplog)]
+    assert len(uploads) == uploaded + 1
+    assert uploads[-1]["access"] == {"mode": "public"}
+
+
+
+@pytest.mark.asyncio
+async def test_a_live_sync_reads_the_rule_under_a_recorded_key_after_one_too_long_for_mindshub(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog
+):
+    """An agent that moves the metadata id and writes a key longer than
+    MindsHub takes into the entry's artifact_key gets nothing published: the
+    long key is skipped, and the rule the owner saved is still read under the
+    lambda's key the entry records."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False}, owner_save=True)["artifactKey"]
+    uploaded = len(uploads)
+    (folder / "metadata.json").write_text(json.dumps({"id": uuid4().hex, "slug": "demo", "type": "html-app"}))
+    _plant_entry(folder, mode="public", artifact_key="k" * 600)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        saved = await _live_sync(folder, scope, project, monkeypatch)
+
+    assert saved is False
+    assert len(uploads) == uploaded
+    assert issuer.rules[key]["allowed_emails"] == ["a@else.com"]
+    [record] = _mode_changed_records(caplog)
+    assert record.reason == "rule_held"
+
+
+@pytest.mark.asyncio
+async def test_a_live_sync_never_publishes_a_legacy_artifact_publicly_after_an_agent_changes_the_mode(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog
+):
+    """The legacy rule is a rule MindsHub holds, so an entry an agent turned
+    public publishes nothing while it stands."""
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "restricted", "emails": ["a@else.com"], "org_allowed": False})["artifactKey"]
+    legacy = _published_before_stable_ids(issuer, folder, scope, key, emails=["a@else.com"], org_allowed=False)
+    uploaded = len(uploads)
+    _plant_entry(folder, mode="public")
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        saved = await _live_sync(folder, scope, project, monkeypatch)
+
+    assert saved is False
+    assert len(uploads) == uploaded
+    assert issuer.rules[legacy]["allowed_emails"] == ["a@else.com"]
+    [record] = _mode_changed_records(caplog)
+    assert record.reason == "rule_held"
+
+
+@pytest.mark.parametrize(
+    ("entry", "owner", "expected"),
+    [
+        # The upload service's folder for this owner, as its own code names it.
+        ({"report_id": "r1"}, "0b0b0b0b-0000-4000-8000-000000000001", "d002e645a/r1"),
+        ({"report_id": "r1"}, "0B0B0B0B-0000-4000-8000-000000000001", "d002e645a/r1"),
+        ({"report_id": "r1/x"}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": ""}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": "r1"}, "not-a-uuid", ""),
+        ({"report_id": "r1"}, None, ""),
+        # Only the upload service's report-id form, in an id no longer than MindsHub takes.
+        ({"report_id": "Report-1_x"}, "0b0b0b0b-0000-4000-8000-000000000001", "d002e645a/Report-1_x"),
+        ({"report_id": "a" * 502}, "0b0b0b0b-0000-4000-8000-000000000001", "d002e645a/" + "a" * 502),
+        ({"report_id": "a" * 503}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": "r1\n"}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": "r 1"}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": "r1.html"}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": "r1\x00"}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": "r\u00e9"}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        # The Kelvin sign, which [A-Za-z] matches only when case is ignored.
+        ({"report_id": "r\u212a"}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+        ({"report_id": 7}, "0b0b0b0b-0000-4000-8000-000000000001", ""),
+    ],
+    ids=[
+        "owner", "owner_upper_case", "report_id_with_a_slash", "empty_report_id", "no_report_id",
+        "owner_not_a_uuid", "no_owner", "report_id_with_a_dash_an_underscore_and_capitals",
+        "longest_id_mindshub_takes", "id_longer_than_mindshub_takes", "report_id_with_a_trailing_newline",
+        "report_id_with_a_space", "report_id_with_a_dot", "report_id_with_a_nul", "report_id_not_ascii",
+        "report_id_with_a_kelvin_sign", "report_id_not_a_string",
+    ],
+)
+def test_a_reports_id_from_before_stable_ids_is_the_upload_services_folder_and_report(entry, owner, expected):
+    from cowork.services.publish import _report_rule_key
+
+    assert _report_rule_key(entry, owner_user_id=owner) == expected
+
+
 @pytest.mark.asyncio
 async def test_an_artifact_the_owner_made_public_keeps_syncing_publicly(
     issuer, scope, local_id, owned_artifact, monkeypatch, caplog
@@ -1326,9 +1789,10 @@ def test_two_saves_racing_to_record_an_artifacts_first_choice_both_succeed(scope
 def test_the_rule_is_read_and_written_under_one_key_whatever_the_lambda_echoes(
     issuer, scope, local_id, owned_artifact, monkeypatch
 ):
-    """The read before a publish and the team and people write after it both
-    take the rule's key from publish._rule_key, the artifact's identity
-    first. A lambda that echoes another key moves neither."""
+    """The read before a publish asks the artifact's identity first
+    (publish._audience_rule_keys), and the team and people write after it
+    takes the rule's key from publish._rule_key, the identity first too. A
+    lambda that echoes another key moves neither."""
     _session, project, _conversation, folder = owned_artifact
     run, _uploads = _org_publisher(
         issuer, folder, scope, project, monkeypatch, echoed_key=f"artifact/{uuid4()}",
