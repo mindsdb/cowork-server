@@ -9,6 +9,7 @@ import httpx
 import openai
 import pytest
 from anton.core.llm.provider import LLMResponse, StreamComplete, StreamTextDelta, ToolCall
+from anton.core.llm.tracing import get_call_role, get_trace_context
 
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.handlers import response_routing as routing
@@ -25,9 +26,13 @@ class _Provider:
         self.delay = 0
         self.closed = False
         self.error = None
+        self.labels = []
 
     async def stream(self, **kwargs):
         self.calls.append(kwargs)
+        # Read where anton's adapter builds the request's trace headers: in the task that streams.
+        context = get_trace_context()
+        self.labels.append((context.session_id if context else None, get_call_role()))
         try:
             if self.error is not None:
                 raise self.error
@@ -101,6 +106,18 @@ async def test_probe_uses_the_gate_contract_without_gate_latency_budget(probe, m
     assert probe.provider.closed
     probe.client.aclose.assert_awaited_once()
     _outcome(caplog, "passed")
+
+
+async def test_the_probes_call_carries_its_own_conversation_and_role_and_leaves_no_context_behind(probe):
+    """model-route records a call's conversation and role from these, so the
+    probe's line names itself instead of showing as unattributed."""
+    assert get_trace_context() is None
+    await router_probe.run_router_startup_probe()
+
+    assert probe.provider.labels == [("router-startup-probe", "router_probe")]
+    assert (router_probe.ROUTER_PROBE_CONVERSATION, router_probe.ROUTER_PROBE_ROLE) == ("router-startup-probe", "router_probe")
+    assert get_trace_context() is None
+    assert get_call_role() != "router_probe"
 
 
 @pytest.mark.parametrize("stop", ["completed", "tool_calls", "tool_use"])
