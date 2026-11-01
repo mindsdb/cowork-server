@@ -3,15 +3,17 @@ read the database in worker threads.
 
 With the pool's only connection held elsewhere, each one waits for it without
 stopping the event loop: a heartbeat on the test's loop keeps ticking and
-/api/v1/health/live keeps answering within 0.5 s. Each one is still refused
-once POOL_TIMEOUT has passed, a request with the 503 the app answers a full
-pool with. The heartbeat runs through httpx.ASGITransport, so a query that ran
-on the loop shows up as missing ticks rather than as a slow request.
+/api/v1/health/live keeps answering within half of POOL_TIMEOUT. Each one is
+still refused once POOL_TIMEOUT has passed, a request with the 503 the app
+answers a full pool with. The heartbeat runs through httpx.ASGITransport, so a
+query that ran on the loop shows up as missing ticks rather than as a slow
+request.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -26,7 +28,9 @@ from cowork.services.hub_workspaces import HubWorkspaceListing
 
 # POOL_TIMEOUT in these tests, in seconds; one_connection_pool sets it.
 WAIT = 2
-LIVE_BUDGET = 0.5
+# A blocked loop holds liveness for the whole WAIT, so half of it still
+# catches one and leaves a loaded CI runner room.
+LIVE_BUDGET = WAIT / 2
 
 
 @dataclass
@@ -42,7 +46,7 @@ async def _while_others_are_served(
     client: httpx.AsyncClient, work: Callable[[], Awaitable[object]]
 ) -> _Measured:
     """Run ``work`` while a heartbeat ticks every 10 ms and
-    /api/v1/health/live is asked every 50 ms."""
+    /api/v1/health/live is asked every 200 ms."""
     ticks = 0
     live_answers = 0
     slowest_live = 0.0
@@ -55,14 +59,20 @@ async def _while_others_are_served(
             ticks += 1
 
     async def probe_liveness():
+        # Each answer is timed from when its ask was due, so a stalled loop
+        # counts against it even when the ask itself starts late.
         nonlocal live_answers, slowest_live
-        while True:
-            asked = loop.time()
+        first = loop.time()
+        asks = 0
+        while not work_done.is_set():
+            due = first + 0.2 * asks
+            await asyncio.sleep(max(0.0, due - loop.time()))
             if (await client.get("/api/v1/health/live")).status_code == 200:
                 live_answers += 1
-            slowest_live = max(slowest_live, loop.time() - asked)
-            await asyncio.sleep(0.05)
+            slowest_live = max(slowest_live, loop.time() - due)
+            asks += 1
 
+    work_done = asyncio.Event()
     beat = asyncio.create_task(heartbeat())
     prober = asyncio.create_task(probe_liveness())
     started = loop.time()
@@ -73,10 +83,13 @@ async def _while_others_are_served(
             outcome = refused
         elapsed = loop.time() - started
     finally:
-        for task in (beat, prober):
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        # The prober finishes the ask it is on, so a stall that ends with the
+        # work still counts against liveness.
+        work_done.set()
+        await prober
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
     return _Measured(outcome, elapsed, ticks, live_answers, slowest_live)
 
 
@@ -150,3 +163,17 @@ async def test_the_ingress_reconcile_waits_off_the_loop(held_pool, client):
 
     assert isinstance(measured.outcome, DatabaseBusy)
     _assert_the_loop_kept_serving(measured)
+
+
+async def test_a_loop_blocked_for_the_pool_wait_misses_the_liveness_budget(client):
+    """The measurement itself catches the failure it guards against: a read
+    that held the loop for the whole POOL_TIMEOUT leaves liveness waiting past
+    LIVE_BUDGET, even though each ask answers at once when it finally runs."""
+
+    async def held_the_loop():
+        await asyncio.sleep(0.3)
+        time.sleep(WAIT)
+
+    measured = await _while_others_are_served(client, held_the_loop)
+
+    assert measured.slowest_live >= LIVE_BUDGET, f"liveness waited {measured.slowest_live:.2f}s"
