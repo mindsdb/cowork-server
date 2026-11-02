@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
-from cowork.build_info import surface
+from cowork.build_info import supported_kwargs, surface
 from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
@@ -1530,25 +1530,6 @@ _WEB_TOOL_ENV = {
     "internet_research_enabled": "ANTON_INTERNET_RESEARCH_ENABLED",
 }
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
-_warned_config_fields: set[str] = set()
-
-
-def _anton_config_takes(field: str) -> bool:
-    """Whether the installed anton's ChatSessionConfig has ``field``.
-
-    An older anton refuses an unknown keyword, which would fail every turn, so
-    a switch it cannot take is dropped with one warning instead.
-    """
-    import dataclasses
-
-    from anton.core.session import ChatSessionConfig
-
-    if field in {f.name for f in dataclasses.fields(ChatSessionConfig)}:
-        return True
-    if field not in _warned_config_fields:
-        _warned_config_fields.add(field)
-        logger.warning("Installed anton has no ChatSessionConfig.%s; its switch is ignored", field)
-    return False
 
 
 def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
@@ -1563,10 +1544,14 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     what its flavor provides.
 
     ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
-    value in the server's env turn that tool off for every session, and
-    ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off; they never
-    turn anything on.
+    value in the server's env turn that tool off for every session this server
+    runs, and ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off;
+    they never turn anything on. Org turns run in a pod through
+    ``anton.cloud_turn``, which doesn't read this env. A field the installed
+    anton's ChatSessionConfig lacks is dropped (``supported_kwargs``): passing
+    it would fail every turn.
     """
+    from anton.core.session import ChatSessionConfig
     from cowork.common.settings.user_settings import Provider
 
     if (
@@ -1577,9 +1562,9 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     else:
         kwargs = WebToolKwargs()
     for field, env_name in _WEB_TOOL_ENV.items():
-        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES and _anton_config_takes(field):
+        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
             kwargs[field] = False
-    return kwargs
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **kwargs))
 
 
 def build_llm_client(

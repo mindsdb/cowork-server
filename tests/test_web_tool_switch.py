@@ -42,7 +42,7 @@ def test_true_never_turns_on_what_the_provider_turned_off(monkeypatch):
 
 def test_switch_turns_internet_research_off(monkeypatch):
     # Independent of the anton version the lock pins.
-    monkeypatch.setattr(providers, "_anton_config_takes", lambda field: True)
+    monkeypatch.setattr(providers, "supported_kwargs", lambda cls, **kwargs: kwargs)
     monkeypatch.setenv("ANTON_INTERNET_RESEARCH_ENABLED", "false")
     assert providers.web_tool_kwargs_for(Provider.MINDS_CLOUD) == {"internet_research_enabled": False}
 
@@ -55,11 +55,6 @@ def test_a_switch_the_installed_anton_cannot_take_is_dropped(monkeypatch):
 
     known = [f for f in dataclasses.fields(ChatSessionConfig) if f.name != "internet_research_enabled"]
     monkeypatch.setattr(dataclasses, "fields", lambda cls: known if cls is ChatSessionConfig else ())
-    monkeypatch.setattr(providers, "_warned_config_fields", set())
     monkeypatch.setenv("ANTON_INTERNET_RESEARCH_ENABLED", "false")
     monkeypatch.setenv("ANTON_WEB_SEARCH_ENABLED", "false")
-    # Recorded at the call, not through caplog: the suite's logging setup can stop propagation.
-    warnings: list[str] = []
-    monkeypatch.setattr(providers.logger, "warning", lambda msg, *args: warnings.append(msg % args))
     assert providers.web_tool_kwargs_for(Provider.MINDS_CLOUD) == {"web_search_enabled": False}
-    assert len(warnings) == 1 and "internet_research_enabled" in warnings[0]
