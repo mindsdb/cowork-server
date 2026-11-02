@@ -12,6 +12,7 @@ import sqlalchemy as sa
 
 from cowork.db import session as db_session
 from cowork.services import live_app_admission as admission
+from tests.integration.prereq import missing_prerequisite
 
 
 async def test_sqlite_workers_share_the_database_file_lock(tmp_path, monkeypatch):
@@ -216,10 +217,14 @@ def test_memory_database_has_process_lock():
         second.close()
 
 
+@pytest.mark.postgres_service
 async def test_postgres_workers_use_a_separate_session_and_cancel_releases_it(monkeypatch):
     uri = os.environ.get("COWORK_TEST_POSTGRES_URI")
     if not uri:
-        pytest.skip("set COWORK_TEST_POSTGRES_URI to an isolated PostgreSQL test database")
+        missing_prerequisite(
+            "set COWORK_TEST_POSTGRES_URI to an isolated PostgreSQL test database",
+            required_by="COWORK_REQUIRE_SERVICES",
+        )
     engine = sa.create_engine(uri, pool_size=1, max_overflow=0, pool_timeout=0.1)
     monkeypatch.setattr(db_session, "get_engine", lambda _uri: engine)
     child = subprocess.Popen(

@@ -229,4 +229,6 @@ markers = [
     "integration: needs a real Redis; skips itself when none is reachable",
     "postdeploy: runs against a deployed cowork-server; skips unless COWORK_BASE_URL is set",
     "production_read_only: GET-only smoke selected by the production nightly",
+    "redis_service: needs a Redis at COWORK_TEST_REDIS_URL; runs in make test/services",
+    "postgres_service: needs a disposable PostgreSQL at COWORK_TEST_POSTGRES_URI; runs in make test/services",
 ]
