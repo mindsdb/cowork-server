@@ -30,6 +30,7 @@ from cowork.common.paths import (
     read_bounded,
 )
 from cowork.services.artifact_journal import (
+    COMMENTS_JOURNAL_NAME,
     JOURNAL_DIRNAME,
     MAX_JOURNAL_RECORD_BYTES,
     JournalFileRefused,
@@ -71,8 +72,6 @@ _MAX_MANIFEST_BYTES = 1024 * 1024
 # dead. Without it a turn killed between minting the handoff and starting the
 # agent gates that source path forever.
 QUEUED_REPAIR_TTL_SECONDS = 3600
-# Desktop comment threads share the journal directory (local_artifact_comments).
-COMMENTS_FILENAME = "comments.json"
 
 
 class RevisionConflict(RuntimeError):
@@ -539,7 +538,7 @@ def _has_comment_on(folder: Path, revision_id: str | None) -> bool:
     cheaper than overwriting the content someone commented on.
     """
     try:
-        threads = read_journal_json(folder, COMMENTS_FILENAME)
+        threads = read_journal_json(folder, COMMENTS_JOURNAL_NAME)
     except (OSError, ValueError):
         return True
     if threads is None:
