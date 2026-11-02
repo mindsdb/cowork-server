@@ -26,7 +26,9 @@ A task has:
 
 - `title` and `prompt`. Each run starts a new conversation from `prompt` alone,
   with no other context, so write it as complete instructions.
-- `cadence`: `once`, `hourly`, `daily`, `weekdays` or `weekly`.
+- `cadence`: `once`, `every_15_minutes`, `every_30_minutes`, `hourly`,
+  `daily`, `weekdays` or `weekly`. A server older than the 15 and 30 minute
+  cadences answers 422 for them.
 - `next_run_at`: the first run, ISO 8601 with a UTC offset. Recurring tasks
   repeat at that time of day, minute or weekday.
 - `timezone`: the IANA zone the cadence follows, such as `Europe/London`.
@@ -70,13 +72,13 @@ a file.
 BASE=https://cowork.mindshub.ai/api/v1
 AUTH="Authorization: Bearer $(cat ~/.config/cowork/api-key)"
 
-# Create a daily task that starts tomorrow at 09:00 UTC.
+# Create a daily task. Set next_run_at to the first run you want, in the future.
 curl -sS -X POST "$BASE/schedules/" -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "title": "Daily pipeline summary",
   "prompt": "Summarize yesterday'\''s closed deals from the sales-db connection: count, total value and the three largest.",
   "cadence": "daily",
   "timezone": "UTC",
-  "next_run_at": "2026-11-01T09:00:00+00:00"
+  "next_run_at": "2030-01-15T09:00:00+00:00"
 }'
 # → 201 {"id": "<task id>", ...}
 
