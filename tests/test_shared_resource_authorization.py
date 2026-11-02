@@ -2555,7 +2555,7 @@ async def test_skill_upload_endpoint_offloads_the_owned_session_worker(monkeypat
     assert result == {"worker": True}
     assert captured["function"] is skills._upload_skill_in_new_session
     assert captured["args"] == (b"skill bytes", "worker.md", scope, principal)
-    assert captured["kwargs"] == {"shared": False}
+    assert captured["kwargs"] == {"shared": False, "viewer": None}
 
 
 @pytest.mark.asyncio

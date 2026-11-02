@@ -50,6 +50,15 @@ deployment:
             serviceName: cowork-server
             servicePort: 80
 
+  # Draft-preview host. values.yaml builds the draft Ingress and the
+  # COWORK_DRAFT_* variables from these two; ingress_secondary.enabled is not
+  # templated, so it is switched on here too. webOrigin is the primary host
+  # above, where the web app runs.
+  draftHost: draft-staging.mindshub.co
+  webOrigin: https://cowork.staging.mindshub.ai
+  ingress_secondary:
+    enabled: true
+
   extraEnvs:
 
     - name: ENV

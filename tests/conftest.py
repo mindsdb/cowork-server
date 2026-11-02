@@ -41,6 +41,10 @@ os.environ["COWORK_REQUIRE_AUTH"] = "false"
 import pytest
 from sqlmodel import Session, SQLModel
 
+# Lists every skipped test in CI and fails a run that requires every
+# prerequisite when one is left out without a reason (tests/skip_guard.py).
+from tests.skip_guard import pytest_addoption, pytest_configure  # noqa: E402,F401
+
 
 @pytest.fixture(scope="session", autouse=True)
 def db_schema():
@@ -267,6 +271,27 @@ def managed_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("COWORK_MANAGED_DIR", str(folder.root))
     get_app_settings.cache_clear()
     yield folder
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def sharepoint_stores(monkeypatch, tmp_path):
+    """Fresh home, shared, vault, skills and memory folders and an empty SharePoint token cache, for one test.
+
+    Yields ``tmp_path``, the folders' root.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services.connectors import sharepoint as sharepoint_service
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
+    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
+    get_app_settings.cache_clear()
+    sharepoint_service._TOKENS.clear()
+    yield tmp_path
+    sharepoint_service._TOKENS.clear()
     get_app_settings.cache_clear()
 
 

@@ -45,10 +45,15 @@ EVENT_FIELDS = frozenset(
         "attempt",
         "attempts",
         "count",
+        # A turn request's size and the cap it was shed to fit
+        # (cowork.turnqueue.producer._fit_request).
+        "request_bytes",
+        "cap_bytes",
         "slot",
         "model_alias",
         "managed_connection_file",
         "retryable",
+        "statement_fingerprint",
     ]
 )
 HEALTH_PATHS = frozenset(

@@ -291,3 +291,74 @@ def test_a_missing_gateway_route_keeps_the_wrong_endpoint_advice(tmp_path, monke
         run()
     assert "Missing Authentication Token" not in str(error.value)
     assert "wrong server/endpoint" in str(error.value)
+
+
+# MindsHub's reason for refusing a share with everyone, as the upload service
+# passes it on. Written here because neither of them can be imported.
+SHARE_ORG_REASON = "Sharing an artifact with everyone in the organization needs the artifacts.share_org permission."
+SHARE_ORG_REFUSAL = {"detail": SHARE_ORG_REASON, "code": "share_org_required"}
+
+
+def _upload_refusing_the_share(monkeypatch, tmp_path) -> Path:
+    """A desktop publish through anton's own publisher, whose upload the
+    upload service answers with MindsHub's 403 share_org_required."""
+    import anton.publisher
+
+    page = tmp_path / "report.html"
+    page.write_text("<html><body>report</body></html>")
+    real_publish = anton.publisher.publish
+    _wire_publish(monkeypatch, tmp_path, page, "report.html", publish_side_effect=None)
+    monkeypatch.setattr("anton.publisher.publish", real_publish)
+
+    def refuse(*args, **kwargs):
+        raise _upstream(403, {"error": SHARE_ORG_REASON, "code": "share_org_required"}, "Forbidden")
+
+    monkeypatch.setattr("anton.publisher.minds_request", refuse)
+    return page
+
+
+EVERYONE = {"mode": "restricted", "emails": [], "org_allowed": True}
+
+
+def test_a_refused_share_with_everyone_is_mindshubs_reason_not_a_failed_publish(tmp_path, monkeypatch, caplog):
+    """anton's publisher passes the upload service's 403 on, and the publish
+    raises ShareOrgRequired with MindsHub's reason, with no "Publishing
+    failed:" in front. It is a refusal, so the failure log's traceback never
+    records it."""
+    import logging
+
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+
+    page = _upload_refusing_the_share(monkeypatch, tmp_path)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        with pytest.raises(publish.ShareOrgRequired) as error:
+            publish.publish_artifact(
+                page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai",
+                access=ArtifactAccessRequest.of_publisher(EVERYONE),
+            )
+    assert str(error.value) == SHARE_ORG_REASON
+    records = [r for r in caplog.records if r.name == "cowork.services.publish"]
+    assert [(r.levelno, r.exc_info is None) for r in records] == [(logging.WARNING, True)]
+    assert not (tmp_path / ".published.json").exists()
+
+
+def test_the_desktop_publish_answers_a_refused_share_with_everyone_403_with_its_code(tmp_path, monkeypatch):
+    """POST /publish answers MindsHub's refusal as it gave it, with the code
+    the app branches on: never the 502 that reads as a retryable failure."""
+    page = _upload_refusing_the_share(monkeypatch, tmp_path)
+    with _patch_context():
+        res = _client().post("/api/v1/publish/", json={"path": str(page), "access": EVERYONE})
+    assert (res.status_code, res.json()) == (403, SHARE_ORG_REFUSAL)
+
+
+@pytest.mark.parametrize("route, target", [
+    ("/api/v1/publish/", "_publish"),
+    ("/api/v1/publish/update", "_update"),
+])
+def test_both_desktop_publish_routes_answer_a_refused_share_403_with_its_code(route, target):
+    """An update republishes with the access the artifact keeps, so it can
+    meet the same refusal."""
+    refused = publish.ShareOrgRequired(SHARE_ORG_REASON)
+    with _patch_context(), patch.object(publish_ep, target, side_effect=refused):
+        res = _client().post(route, json={"path": "/some/art"})
+    assert (res.status_code, res.json()) == (403, SHARE_ORG_REFUSAL)
