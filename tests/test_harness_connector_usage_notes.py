@@ -26,7 +26,8 @@ def test_google_drive_spec_explains_the_picker_instead_of_broader_access():
     notes = registry.usage_notes_for(["google_drive"])["google_drive"]
 
     assert "Add files from Google Drive" in notes
-    assert "files.get(fileId=...)" in notes
+    assert "files.export" in notes
+    assert "alt=media" in notes
     assert "never suggest reconnecting with broader permissions" in notes
 
 
