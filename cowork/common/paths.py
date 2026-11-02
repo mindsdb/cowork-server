@@ -12,7 +12,7 @@ the settings classes or directly) — a path that hardcodes ``~/.cowork`` would
 silently leak across builds and defeat the isolation.
 
 When ``COWORK_HOME`` is unset, the resolved home depends on whether we run from
-an installed wheel or a source checkout (ENG-1541). The desktop app sets
+an installed wheel or a source checkout. The desktop app sets
 ``COWORK_HOME`` before spawning the server, so a *source* run that reaches this
 module with it unset bypassed the app — a bare ``uv run cowork-server``, the
 ``cowork-dev-setup`` entrypoint, ``npm run dev:web``, a pyenv-shim binary.
@@ -107,7 +107,7 @@ def cowork_home() -> Path:
 
     With ``COWORK_HOME`` unset, a source checkout defaults to an isolated
     ``~/.cowork-dev`` (with a warning) rather than the production ``~/.cowork``
-    — see the module docstring (ENG-1541). An installed wheel keeps ``~/.cowork``.
+    — see the module docstring. An installed wheel keeps ``~/.cowork``.
     """
     raw = os.environ.get("COWORK_HOME")
     if raw:
@@ -115,6 +115,17 @@ def cowork_home() -> Path:
     if _running_from_source():
         return _dev_home_fallback()
     return _DEFAULT_HOME
+
+
+def uses_production_home() -> bool:
+    """Whether this process resolves to the production ``~/.cowork``.
+
+    True only for an installed build with ``COWORK_HOME`` unset. A source
+    checkout with it unset resolves to the dev home instead, so anything
+    reserved for production (such as the legacy ``~/.anton/.env``) must key
+    on this rather than on the variable alone.
+    """
+    return not os.environ.get("COWORK_HOME") and not _running_from_source()
 
 
 def pod_local_only(local_path: Path, name: str) -> Path:

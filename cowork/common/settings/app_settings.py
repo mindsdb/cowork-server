@@ -21,7 +21,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from cowork.common.paths import cowork_home
+from cowork.common.paths import cowork_home, uses_production_home
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.schemas.artifact_export import ExportPdfSettings
 
@@ -316,9 +316,11 @@ def _env_file_chain() -> list[str]:
     process starts, so an isolated build reads its own .env.
     """
     files = [str(cowork_home() / ".env"), ".env"]
-    if not os.environ.get("COWORK_HOME"):
+    if uses_production_home():
         # Prod (default home) still consults the legacy file, ordered BEFORE
-        # <COWORK_HOME>/.env so the migrated file wins (fresh over stale).
+        # <COWORK_HOME>/.env so the migrated file wins (fresh over stale). A
+        # source checkout with COWORK_HOME unset runs on the dev home, so it
+        # must not read it either.
         files.insert(0, str(Path.home() / ".anton" / ".env"))
     return files
 

@@ -35,7 +35,7 @@ def test_cowork_home_defaults_to_dot_cowork_for_installed_build(monkeypatch):
 def test_cowork_home_source_checkout_defaults_to_dev_home(monkeypatch, caplog):
     # A source/dev run with COWORK_HOME unset bypassed the desktop app; it must
     # steer to the isolated ~/.cowork-dev rather than silently migrate the
-    # production ~/.cowork (ENG-1541), and say so once.
+    # production ~/.cowork, and say so once.
     monkeypatch.delenv("COWORK_HOME", raising=False)
     monkeypatch.setattr(paths, "_running_from_source", lambda: True)
     paths._dev_home_fallback.cache_clear()
@@ -75,13 +75,26 @@ def test_prod_build_still_reads_legacy_anton_env(monkeypatch):
     # The default (prod) home keeps the legacy fallback for un-migrated
     # installs, ordered BEFORE <COWORK_HOME>/.env so the migrated file wins.
     # Simulate an installed build so the unset COWORK_HOME resolves to ~/.cowork
-    # rather than the source-checkout dev home (ENG-1541).
+    # rather than the source-checkout dev home.
     monkeypatch.delenv("COWORK_HOME", raising=False)
     monkeypatch.setattr(paths, "_running_from_source", lambda: False)
     chain = _env_file_chain()
     legacy = str(Path.home() / ".anton" / ".env")
     assert legacy in chain
     assert chain.index(legacy) < chain.index(str(cowork_home() / ".env"))
+
+
+def test_source_checkout_does_not_read_legacy_anton_env(monkeypatch):
+    # A source run with COWORK_HOME unset lands on the dev home. The legacy
+    # file belongs to production: a DATABASE_URI there would point the dev
+    # server back at the production database.
+    monkeypatch.delenv("COWORK_HOME", raising=False)
+    monkeypatch.setattr(paths, "_running_from_source", lambda: True)
+    paths._dev_home_fallback.cache_clear()
+    chain = _env_file_chain()
+    paths._dev_home_fallback.cache_clear()
+    assert str(Path.home() / ".anton" / ".env") not in chain
+    assert chain[0] == str(Path.home() / ".cowork-dev" / ".env")
 
 
 # Per-resource env vars that, when set, intentionally win over the
