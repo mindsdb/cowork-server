@@ -321,6 +321,30 @@ _CHANGE_LABELS = {
 }
 
 
+def _show_resume_catch_up(preview: dict) -> None:
+    """Make a resume card show what the scheduler will really do.
+
+    Resuming only re-enables the task, and its next run time may have passed
+    while it was paused. The scheduler then runs one missed slot right away,
+    or skips several and waits for the next one (scheduler._handle_missed_runs),
+    so the card shows that next slot and says which of the two happens.
+    """
+    from cowork.schedule_timing import count_missed_occurrences
+
+    missed, future = count_missed_occurrences(
+        preview["cadence"], datetime.fromisoformat(preview["next_run_at"]), preview["timezone"],
+        now=datetime.now(timezone.utc),
+    )
+    if missed == 0:
+        return
+    preview["next_run_at"] = ensure_utc(future).isoformat()
+    preview["catch_up"] = (
+        "It runs once right away for the run it missed while paused."
+        if missed == 1
+        else f"The {missed} runs it missed while paused are skipped."
+    )
+
+
 def card_prompt(action: str, task: dict, *, before: dict | None = None) -> str:
     """The card's markdown: the task as it will be once the user confirms."""
     title = task["title"]
@@ -340,7 +364,10 @@ def card_prompt(action: str, task: dict, *, before: dict | None = None) -> str:
             f"- **How often:** {describe_cadence(task['cadence'], datetime.fromisoformat(task['next_run_at']), task['timezone'])}",
         ]
     elif action == "resume":
-        lines = [f"**Resume “{title}”?**", "", *_task_lines(task, starts_label="Next run")]
+        lines = [f"**Resume “{title}”?**", ""]
+        if task.get("catch_up"):
+            lines += [task["catch_up"], ""]
+        lines += _task_lines(task, starts_label="Next run")
     else:
         lines = [
             f"**Delete “{title}”?**", "",
@@ -468,6 +495,7 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
                         "This one-off task's run time has passed. Update `next_run_at` to a future "
                         "time first, then resume it.", before,
                     )
+                _show_resume_catch_up(preview)
                 apply = partial(_resume_unit, schedule_id=schedule_id)
             else:
                 apply = partial(_delete_unit, schedule_id=schedule_id)

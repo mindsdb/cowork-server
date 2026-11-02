@@ -126,8 +126,8 @@ async def _page_schedules() -> list[dict]:
     return response.json()["schedules"]
 
 
-async def _create_confirmed() -> dict:
-    result = await _call(MANAGE_TOOL_NAME, _Session(_Card(CONFIRM)), _create_input())
+async def _create_confirmed(**overrides) -> dict:
+    result = await _call(MANAGE_TOOL_NAME, _Session(_Card(CONFIRM)), _create_input(**overrides))
     return result["task"]
 
 
@@ -273,6 +273,33 @@ async def test_pause_resume_and_delete_each_take_a_confirmation():
     assert [r.prompt.splitlines()[0] for r in card.shown] == [
         "**Pause “Daily sales”?**", "**Resume “Daily sales”?**", "**Delete “Daily sales”?**",
     ]
+
+
+@pytest.mark.parametrize(("hours_overdue", "catch_up"), [
+    (1, "It runs once right away for the run it missed while paused."),
+    (3 * 24 + 1, "The 4 runs it missed while paused are skipped."),
+])
+async def test_a_resume_card_shows_the_run_that_will_really_happen(hours_overdue, catch_up):
+    task = await _create_confirmed(cadence="daily")
+    card = _Card(CONFIRM)
+    await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "pause", "schedule_id": task["schedule_id"]})
+    overdue = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=hours_overdue)
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        schedule.next_run_at = overdue
+        session.add(schedule)
+
+    shown = _Card(CANCEL)
+    await _call(MANAGE_TOOL_NAME, _Session(shown), {"action": "resume", "schedule_id": task["schedule_id"]})
+
+    (request,) = shown.shown
+    assert catch_up in request.prompt
+    # The next run shown is in the future, never the time that passed.
+    next_slot = overdue
+    while next_slot <= datetime.now(timezone.utc):
+        next_slot += timedelta(days=1)
+    assert schedule_tools.describe_start(next_slot, "UTC") in request.prompt
+    assert schedule_tools.describe_start(overdue, "UTC") not in request.prompt
 
 
 async def test_an_unknown_task_is_reported_without_a_card():
