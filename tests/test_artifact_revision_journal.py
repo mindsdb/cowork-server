@@ -27,6 +27,7 @@ from uuid import uuid4
 import pytest
 import yaml
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from cowork.api.v1.endpoints.artifact_workspace import _not_found_detail
 from cowork.services import artifact_journal, artifact_revisions, local_artifact_comments
@@ -41,7 +42,7 @@ from cowork.services.artifact_journal import (
     remove_journal_file,
     write_journal_file,
 )
-from cowork.services.artifact_revision_records import is_repair_id
+from cowork.services.artifact_revision_records import AgentRepair, is_repair_id
 from cowork.services.artifact_revisions import (
     MAX_SOURCE_BYTES,
     RevisionConflict,
@@ -888,6 +889,14 @@ def test_recovery_abandons_a_pending_write_the_server_never_writes(layout, case)
 )
 def test_only_a_canonical_uuid_names_a_repair(repair_id, canonical):
     assert is_repair_id(repair_id) is canonical
+
+
+@pytest.mark.parametrize("repair_id", JOURNAL["repair_ids"]["refused"])
+def test_a_repair_record_refuses_an_id_the_server_never_mints(repair_id):
+    """The file-name filter, the read and the write each check the id too; this
+    pins the model's own check, which every repair the server holds passes."""
+    with pytest.raises(ValidationError):
+        AgentRepair.model_validate({"id": repair_id, "path": "brief.md", "status": "queued"})
 
 
 @pytest.mark.parametrize("repair_id", JOURNAL["repair_ids"]["refused"])
