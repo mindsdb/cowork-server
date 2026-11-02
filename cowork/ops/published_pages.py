@@ -15,9 +15,12 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
@@ -173,6 +176,25 @@ def _read_record(published_dir: Path) -> dict[str, Any]:
     return record if isinstance(record, dict) else {}
 
 
+@contextmanager
+def _record_locks(session: Session, *, publisher: _Publisher, artifact_paths: tuple[str, ...]) -> Iterator[None]:
+    """Hold the lock Cowork's publish holds on each folder whose record names
+    the page (publication_owner), in one order, so the record and the owner
+    row can't change under the command."""
+    locks = _DatabaseResourceLocks(ScopedSession(session, LOCAL_SCOPE))
+    keys = sorted({publish_record_lock_key(_record_entry(artifact_path)[0]) for artifact_path in artifact_paths})
+    with ExitStack() as held:
+        try:
+            for key in keys:
+                held.enter_context(locks.lock(publisher.key, "published_page", key))
+        except HTTPException:
+            # A lock still held when its wait runs out answers 503.
+            raise OperatorCommandError(
+                "A publish from a folder that names this page is still running; nothing changed. Run the command again."
+            ) from None
+        yield
+
+
 def _drop_entry(artifact_path: str, report_id: str) -> bool:
     """Removes the artifact's entry when it still names report_id."""
     published_dir, name = _record_entry(artifact_path)
@@ -191,28 +213,25 @@ def unpublish_page(*, report_id: str, force: bool) -> str:
     publisher = _publisher()
     with _session() as session:
         page = _page(_pages(session, publisher), report_id)
-        if page.owner_user_id is not None and not force:
-            raise OperatorCommandError(
-                f"Page {report_id} belongs to user {page.owner_user_id}, who can stop sharing it in Cowork. "
-                "Run with --force to take it down anyway. Nothing changed."
-            )
-        try:
-            unpublish(report_id, api_key=publisher.api_key, publish_url=publisher.url, ssl_verify=_ssl_verify())
-        except Exception:
-            raise OperatorCommandError(f"The publisher could not take down page {report_id}; nothing changed.") from None
-        locks = _DatabaseResourceLocks(ScopedSession(session, LOCAL_SCOPE))
-        dropped = 0
-        for artifact_path in page.artifact_paths:
-            published_dir, _name = _record_entry(artifact_path)
-            with locks.lock(publisher.key, "published_page", publish_record_lock_key(published_dir)):
-                dropped += _drop_entry(artifact_path, report_id)
-        owner = find_owner(session, publisher.key, report_id)
-        if owner is not None:
-            session.delete(owner)
-        session.commit()
+        with _record_locks(session, publisher=publisher, artifact_paths=page.artifact_paths):
+            owner = find_owner(session, publisher.key, report_id)
+            owner_user_id = owner.owner_user_id if owner is not None else None
+            if owner_user_id is not None and not force:
+                raise OperatorCommandError(
+                    f"Page {report_id} belongs to user {owner_user_id}, who can stop sharing it in Cowork. "
+                    "Run with --force to take it down anyway. Nothing changed."
+                )
+            try:
+                unpublish(report_id, api_key=publisher.api_key, publish_url=publisher.url, ssl_verify=_ssl_verify())
+            except Exception:
+                raise OperatorCommandError(f"The publisher could not take down page {report_id}; nothing changed.") from None
+            dropped = sum(_drop_entry(artifact_path, report_id) for artifact_path in page.artifact_paths)
+            if owner is not None:
+                session.delete(owner)
+            session.commit()
     removed = [f"{dropped} artifact publish record entr{'y' if dropped == 1 else 'ies'} that named it"]
-    if page.owner_user_id:
-        removed.insert(0, f"its owner record (user {page.owner_user_id})")
+    if owner_user_id:
+        removed.insert(0, f"its owner record (user {owner_user_id})")
     return (
         f"Took down page {report_id} ({page.view_url}): its link answers 404 from now on. "
         f"Removed {' and '.join(removed)}."
@@ -252,8 +271,7 @@ def give_page(*, report_id: str, person: Person) -> str:
                 f"User {person.user_id} can't open the project that holds {artifact_path}; nothing changed."
             )
         published_dir, name = _record_entry(artifact_path)
-        locks = _DatabaseResourceLocks(ScopedSession(session, LOCAL_SCOPE))
-        with locks.lock(publisher.key, "published_page", publish_record_lock_key(published_dir)):
+        with _record_locks(session, publisher=publisher, artifact_paths=(artifact_path,)):
             entry = _read_record(published_dir).get(name)
             if not isinstance(entry, dict) or entry.get("report_id") != report_id:
                 raise OperatorCommandError(f"{artifact_path}'s publish record no longer names page {report_id}; nothing changed.")

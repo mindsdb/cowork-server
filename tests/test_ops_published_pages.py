@@ -18,6 +18,7 @@ from cowork.models.published_page import PublishedPageOwner
 from cowork.ops.published_pages import main
 from cowork.services.publish import PublishOwnedByOtherUser
 from cowork.services.published_page_ownership import PublicationOwner, publisher_key
+from cowork.services.shared_resources import _DatabaseResourceLocks, _resource_busy
 from tests.test_ops_commands import ALICE, BOB, SUB_A, _arguments, _general, _run, stack  # noqa: F401
 
 REFUSALS = yaml.safe_load((Path(__file__).parent / "fixtures" / "ops_published_pages" / "refusals.yaml").read_text(encoding="utf-8"))
@@ -85,6 +86,12 @@ def pages(stack, monkeypatch, tmp_path):  # noqa: F811
         session.commit()
 
 
+def _busy_lock(*_args, **_kwargs):
+    """A publish record's lock that a publish still holds when the wait runs out. The tests'
+    SQLite takes no lock, so this answers as PostgreSQL's would."""
+    raise _resource_busy()
+
+
 def _records(artifacts: Path) -> dict[str, str]:
     return {str(path): path.read_text() for path in sorted(artifacts.rglob(".published.json"))}
 
@@ -112,8 +119,10 @@ def test_the_plain_list_says_which_pages_have_no_owner(pages, capsys):
 @pytest.mark.parametrize("action, case", [
     (action, case) for action, cases in REFUSALS.items() for case in cases
 ], ids=lambda value: value["name"] if isinstance(value, dict) else value)
-def test_a_refused_action_changes_nothing(pages, capsys, action, case):
+def test_a_refused_action_changes_nothing(pages, capsys, monkeypatch, action, case):
     argv = [action, *case["argv"], *(_arguments(PEOPLE[case["person"]]) if "person" in case else [])]
+    if case.get("busy"):
+        monkeypatch.setattr(_DatabaseResourceLocks, "lock", _busy_lock)
     records, owners, served = _records(pages.artifacts), _owners(pages.key), dict(pages.served)
     status, out, err = _run(main, argv, capsys)
     assert status == 1 and out == ""

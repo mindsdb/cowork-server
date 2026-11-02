@@ -5,7 +5,9 @@
 #   orphan:    no owner record, and no artifact names it
 #   twice:     no owner record, named by two artifacts in Alice's project
 # `argv` is the command after the action; PERSON stands for the person pair
-# of `person`. `says` must be in the error the command prints.
+# of `person`. `says` must be in the error the command prints. `busy` makes
+# every publish record's lock answer busy, as while a tester's publish from
+# that folder holds it.
 
 unpublish:
   - name: a page the publisher doesn't serve
@@ -14,6 +16,14 @@ unpublish:
   - name: a page that has an owner, without --force
     argv: [--report-id, owned]
     says: Run with --force
+  - name: a page whose publish record a publish holds
+    argv: [--report-id, ownerless]
+    busy: true
+    says: is still running
+  - name: an owned page whose publish record a publish holds, with --force
+    argv: [--report-id, owned, --force]
+    busy: true
+    says: is still running
 
 give:
   - name: a page the publisher doesn't serve
@@ -36,3 +46,8 @@ give:
     argv: [--report-id, ownerless]
     person: bob
     says: can't open the project
+  - name: a page whose publish record a publish holds
+    argv: [--report-id, ownerless]
+    person: alice
+    busy: true
+    says: is still running
