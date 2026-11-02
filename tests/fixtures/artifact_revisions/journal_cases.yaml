@@ -70,6 +70,37 @@ malformed_pending_writes:
   - id: blank-path
     record: {path: "  ", revision_path: "  ", base_revision_id: null}
 
+# Pending source writes whose source already holds the revision's bytes, as
+# after a crash between the source write and the manifest's. Each fails
+# PendingSourceWrite on a field recovery would otherwise accept, so recovery
+# abandons it rather than add its revision to the history. `record` fields
+# replace those of a server-shaped record.
+pending_writes_failing_their_model:
+  - id: before-hash-not-hex
+    record: {beforeContentHash: ../../.env}
+  - id: before-hash-in-capitals
+    record: {beforeContentHash: "{real_upper}"}
+  - id: before-hash-null
+    record: {beforeContentHash: null}
+  - id: version-as-text
+    record: {version: "1"}
+
+# Repair records the agent's code wrote for the running turn, each failing
+# AgentRepair on one field. `record` fields replace those of a server-shaped
+# queued record. The turn-end capture leaves each file as it is, and the
+# repair routes answer as for a missing repair.
+repairs_failing_their_model:
+  - id: blank-path
+    record: {path: "  "}
+  - id: empty-path
+    record: {path: ""}
+  - id: path-not-text
+    record: {path: [brief.md]}
+  - id: status-the-server-never-writes
+    record: {status: approved}
+  - id: status-null
+    record: {status: null}
+
 # A pile of large repair records the agent's code planted. Records are read one
 # at a time, so a second pile on top of the first may not raise the peak memory
 # of a scan past the bound.
