@@ -109,15 +109,15 @@ async def test_probe_uses_the_gate_contract_without_gate_latency_budget(probe, m
 
 
 async def test_the_probes_call_carries_its_own_conversation_and_role_and_leaves_no_context_behind(probe):
-    """model-route records a call's conversation and role from these, so the
-    probe's line names itself instead of showing as unattributed."""
+    """A deployment that records model calls reads a call's conversation and role
+    from these, so the probe's line names itself instead of showing as unattributed."""
     assert get_trace_context() is None
     await router_probe.run_router_startup_probe()
 
     assert probe.provider.labels == [("router-startup-probe", "router_probe")]
     assert (router_probe.ROUTER_PROBE_CONVERSATION, router_probe.ROUTER_PROBE_ROLE) == ("router-startup-probe", "router_probe")
     assert get_trace_context() is None
-    assert get_call_role() != "router_probe"
+    assert get_call_role() is None
 
 
 @pytest.mark.parametrize("stop", ["completed", "tool_calls", "tool_use"])
