@@ -1,5 +1,6 @@
-"""The router hands a change, an approval or a yes-or-no reply to the agent, and
-never ships an answer that reads as an approval card or as finished work.
+"""The router hands a change, an approval, a yes-or-no reply or any reply to its
+own answer to the agent, and never ships an answer that reads as an approval
+card or as finished work.
 
 Only the agent can act, and only its write check shows the card a person has to
 press. A router answer to such a turn can only imitate it, and a "yes" typed
@@ -90,20 +91,14 @@ async def test_a_plain_router_answer_is_shipped(answer):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", CASES["follow_ups"], ids=lambda case: case["reply"])
-async def test_a_reply_to_a_router_answer(monkeypatch, case):
-    history = [
+async def test_a_reply_to_a_router_answer_goes_to_the_agent(monkeypatch, case):
+    _no_gate(monkeypatch)
+    decision = await _route([
         {"role": "user", "content": "hello there"},
         {"role": "assistant", "content": case["router_answer"]},
         {"role": "user", "content": case["reply"]},
-    ]
-    if case["delegates"]:
-        _no_gate(monkeypatch)
-        decision = await _route(history, after_router_answer=True)
-        assert decision == RouteDecision(route=DELEGATED_AGENTIC, reason="follow_up_to_router_answer")
-    else:
-        seen = _gate_spy(monkeypatch)
-        decision = await _route(history, after_router_answer=True)
-        assert decision.route == DIRECT_CONTEXT and seen
+    ], after_router_answer=True)
+    assert decision == RouteDecision(route=DELEGATED_AGENTIC, reason="follow_up_to_router_answer")
 
 
 @pytest.mark.asyncio
@@ -119,9 +114,15 @@ async def test_a_reply_to_the_agents_imitation_is_not_a_router_follow_up(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness, expected", [(DIRECT_HARNESS, True), ("anton", False)])
-async def test_route_request_says_whether_the_last_answer_was_the_routers(monkeypatch, harness, expected):
-    """Rows as `_read_gate_rows` returns them: the harness is on the row, not in the history sent."""
+@pytest.mark.parametrize("harnesses, expected", [
+    ((DIRECT_HARNESS,), True),
+    (("anton",), False),
+    ((DIRECT_HARNESS, "anton"), False),
+    (("anton", DIRECT_HARNESS), True),
+])
+async def test_route_request_says_whether_the_last_answer_was_the_routers(monkeypatch, harnesses, expected):
+    """Rows as `_read_gate_rows` returns them, oldest first: the harness is on the
+    row, not in the history sent, and only the newest answer's counts."""
     import cowork.handlers.responses as responses
     from cowork.models.message import Message
     from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
@@ -135,10 +136,12 @@ async def test_route_request_says_whether_the_last_answer_was_the_routers(monkey
 
     monkeypatch.setattr(responses, "decide_route", fake_decide_route)
     conversation_id = uuid4()
-    rows = [
-        Message(conversation_id=conversation_id, role=Role.user, content="hello there"),
-        Message(conversation_id=conversation_id, role=Role.assistant, content="Hello!", harness=harness),
-    ]
+    rows = []
+    for harness in harnesses:
+        rows += [
+            Message(conversation_id=conversation_id, role=Role.user, content="hello there"),
+            Message(conversation_id=conversation_id, role=Role.assistant, content="Hello!", harness=harness),
+        ]
     handler = responses.ResponsesHandler()
     handler.harness_name = "anton"
     await handler._route_request(
@@ -153,7 +156,7 @@ async def test_route_request_says_whether_the_last_answer_was_the_routers(monkey
 
 @pytest.mark.asyncio
 async def test_a_typed_yes_under_a_saved_router_answer_reaches_the_agent_end_to_end(monkeypatch):
-    """The customer-shaped sequence: a change request answered by the router before
+    """The reported sequence: a change request answered by the router before
     this fix, then a typed "yes". The decision and its reason come from the real
     `decide_route`, fed by `_route_request`."""
     import cowork.handlers.responses as responses

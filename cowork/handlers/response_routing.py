@@ -320,15 +320,18 @@ def _whole_words(words: tuple[str, ...]) -> re.Pattern[str]:
 # approval card a person has to press. A router answer to a request that
 # changes something, or asks for a confirmation, can only imitate that card or
 # claim work that never ran, and a "yes" typed under it reaches the router
-# again. Whole words, English only: a false positive costs one hop, and the
-# follow-up and answer checks below still catch the next turn in any language.
+# again. Whole words, English only: a false positive costs one hop. After a
+# router answer every reply goes to the agent in any language (`decide_route`'s
+# `after_router_answer`); the answer check below reads English only.
 _CHANGE_WORDS = (
-    "add", "added", "adding", "apply", "applied", "build", "built", "cancel",
-    "change", "changed", "copy", "create", "created", "creating", "delete",
-    "deleted", "drop", "duplicate", "edit", "edited", "import", "insert", "load",
-    "make", "modify", "modified", "move", "moved", "post", "publish", "published",
-    "remove", "removed", "rename", "run", "save", "saved", "schedule", "send",
-    "sent", "set up", "submit", "update", "updated", "upload", "write",
+    "add", "added", "adding", "apply", "applied", "assign", "build", "built",
+    "cancel", "change", "changed", "copy", "create", "created", "creating",
+    "decrease", "delete", "deleted", "drop", "duplicate", "edit", "edited",
+    "email", "erase", "export", "generate", "import", "increase", "insert",
+    "load", "make", "modify", "modified", "move", "moved", "post", "publish",
+    "published", "remove", "removed", "rename", "run", "save", "saved",
+    "schedule", "send", "sent", "set up", "share", "submit", "update", "updated",
+    "upload", "write",
 )
 _APPROVAL_WORDS = (
     "approve", "approved", "approval", "confirm", "confirmed", "confirmation",
@@ -348,14 +351,16 @@ _BARE_REPLIES = frozenset({
 _IMITATION_RE = _whole_words((
     "card", "confirm", "confirmed", "confirmation", "approve", "approved",
     "approval", "permission", "proceed", "proceeding", "go ahead", "yes or no",
-    "yes/no", "reply yes", "answer yes", "say yes", "created", "creating",
-    "updated", "updating", "deleted", "deleting", "saved", "sent", "published",
-    "submitted", "scheduled",
+    "yes/no", "y/n", "reply yes", "answer yes", "say yes", "shall i", "should i",
+    "created", "creating", "updated", "updating", "deleted", "deleting", "saved",
+    "sent", "published", "submitted", "scheduled", "added", "removed", "changed",
+    "renamed", "moved", "applied", "uploaded", "imported", "edited", "modified",
+    "done", "completed", "finished", "all set",
 ))
 
 
 def _bare_reply(text: str) -> str | None:
-    reply = " ".join(text.lower().split()).strip(" .!,")
+    reply = " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
     return reply if reply in _BARE_REPLIES else None
 
 
@@ -384,22 +389,6 @@ def imitates_approval(text: str) -> str | None:
 def _latest_text(history: list[dict], role: str) -> str:
     latest = next((m for m in reversed(history) if m.get("role") == role), None)
     return "" if latest is None else _condense_content(latest.get("content")) or ""
-
-
-def reply_to_router_answer(history: list[dict]) -> str | None:
-    """Why the latest prompt, which follows a router answer, must reach the agent; or None.
-
-    A bare yes or no answers whatever that answer asked, and the router acting
-    it out is how a typed "yes" looks like an approval. A saved router answer
-    that imitates an approval, which `_gate` no longer ships but a conversation
-    can still hold, makes any reply to it the agent's. The caller says whether
-    the answer before the prompt was the router's: the history carries no
-    harness.
-    """
-    bare = _bare_reply(_latest_text(history, "user"))
-    if bare is not None:
-        return bare
-    return imitates_approval(_latest_text(history, "assistant"))
 
 
 @dataclass(frozen=True)
@@ -745,7 +734,9 @@ async def decide_route(
 
     `after_router_answer` says the assistant message before the latest prompt
     is a direct answer (saved under ``DIRECT_HARNESS``), which the history's
-    rows don't carry.
+    rows don't carry. Such a turn always goes to the agent: whatever the reply
+    says, in any language, the router could only act out what its own answer
+    asked, and a typed "yes" would then read as an approval.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -770,7 +761,7 @@ async def decide_route(
     if prior_turn_ran_tools(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
 
-    if after_router_answer and reply_to_router_answer(history) is not None:
+    if after_router_answer:
         return RouteDecision(route=DELEGATED_AGENTIC, reason="follow_up_to_router_answer")
 
     if names_change_or_approval(_latest_text(history, "user")) is not None:

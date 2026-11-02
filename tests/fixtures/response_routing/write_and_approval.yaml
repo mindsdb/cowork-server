@@ -13,8 +13,11 @@ delegates_without_router_call:
   - Rename the scenario to Q4 baseline
   - Check with me before you change anything
   - Do I have permission to edit this?
+  - Generate the Q4 forecast
+  - Email the summary to the planning team
   - "yes"
   - "Yes!"
+  - "Yes, please."
   - ok
   - go ahead
   - "No."
@@ -43,6 +46,9 @@ rejected_answers:
   - Reply yes to approve the change.
   - "Proceed? (yes/no)"
   - I'm creating the two scenarios now.
+  - Done!
+  - I've added both rows.
+  - Shall I continue?
 
 kept_answers:
   - Paris is the capital of France.
@@ -50,18 +56,20 @@ kept_answers:
   - You're welcome.
   - A 95% interval is a range that holds the true value 95% of the time.
 
-# The router's previous answer, the user's reply, and whether the reply goes
-# to the agent without a router call.
+# The router's previous answer and the user's reply. Every reply to a router
+# answer goes to the agent without a router call, in any language: the router
+# could only act out what its own answer asked. The last two are the cost, a
+# plain question that takes one hop.
 follow_ups:
   - router_answer: "**Question card:** Proceed? Please answer yes or no"
     reply: both of them please
-    delegates: true
   - router_answer: Hello! How can I help you today?
     reply: "yes"
-    delegates: true
+  - router_answer: Would you like me to generate the forecast now?
+    reply: "Yes, please."
+  - router_answer: "¿Procedo? Responde sí o no"
+    reply: sí
   - router_answer: Hello! How can I help you today?
     reply: What is the capital of Spain?
-    delegates: false
   - router_answer: Paris is the capital of France.
     reply: and of Spain?
-    delegates: false
