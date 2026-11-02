@@ -108,13 +108,13 @@ def test_peer_probe_returns_the_last_response_at_timeout(monkeypatch):
     assert peer.calls == 1
 
 
-def _created_frame() -> str:
+def _created_frame(user_message_id: str = _USER_MESSAGE_ID) -> str:
     """The `response.created` frame as the streaming handler injects it."""
     return sse_frame("response.created", {
         "type": "response.created",
         "sequence_number": 1,
         "conversation_id": _CONVERSATION_ID,
-        "user_message_id": _USER_MESSAGE_ID,
+        "user_message_id": user_message_id,
         "response": Response(status=ResponseStatus.created, model="test-model").model_dump(),
     })
 
@@ -129,7 +129,12 @@ def _delta_frame(text: str, sequence_number: int = 2) -> str:
     })
 
 
-def _completed_frame(text: str = _ANSWER, *, ended_by: str | None = None) -> str:
+def _completed_frame(
+    text: str = _ANSWER,
+    *,
+    ended_by: str | None = None,
+    assistant_message_id: str = _ASSISTANT_MESSAGE_ID,
+) -> str:
     """The terminal frame, with the saved assistant id injected at its root."""
     response = Response(
         model="test-model",
@@ -145,7 +150,7 @@ def _completed_frame(text: str = _ANSWER, *, ended_by: str | None = None) -> str
         "type": "response.completed",
         "sequence_number": 9,
         "response": response.model_dump(),
-        "assistant_message_id": _ASSISTANT_MESSAGE_ID,
+        "assistant_message_id": assistant_message_id,
     })
 
 
@@ -180,22 +185,27 @@ def _saved_turn(answer: str = _ANSWER) -> list[dict]:
 
 
 def _deployment(
-    turn_body: str,
+    turn_body: str | list[str],
     tail_body: str,
     *,
     in_flight: bool = True,
     saved: list[dict] | None = None,
     seen: list[httpx.Request] | None = None,
 ) -> httpx.MockTransport:
-    """A fake deployment answering the routes the turn smoke tests call."""
+    """A fake deployment answering the routes the turn smoke tests call.
+
+    A list for `turn_body` answers successive turn POSTs in order.
+    """
     items = _saved_turn() if saved is None else saved
+    turn_bodies = [turn_body] if isinstance(turn_body, str) else list(turn_body)
 
     def handle(request: httpx.Request) -> httpx.Response:
         if seen is not None:
             seen.append(request)
         route = (request.method, request.url.path)
         if route == ("POST", "/api/v1/responses/"):
-            return _sse(turn_body)
+            body = turn_bodies.pop(0) if len(turn_bodies) > 1 else turn_bodies[0]
+            return _sse(body)
         if route == ("GET", "/api/v1/responses/in-flight"):
             return httpx.Response(200, json={"in_flight": in_flight, "has_buffer": True})
         if route == ("GET", "/api/v1/responses/tail"):
@@ -345,3 +355,88 @@ def test_replica_reconnect_starts_on_a_and_replays_from_b_with_direct_identity()
         assert "authorization" not in request.headers
         assert request.headers["x-user-id"] == _DIRECT_IDENTITY["user_id"]
         assert request.headers["x-organization-id"] == _DIRECT_IDENTITY["organization_id"]
+
+
+_TURNS = [
+    (test_post_deploy.FIRST_TURN_PROMPT, "alpha",
+     "6f0f1b8e-0000-4000-8000-000000000011", "6f0f1b8e-0000-4000-8000-000000000012"),
+    (test_post_deploy.SECOND_TURN_PROMPT, "bravo",
+     "6f0f1b8e-0000-4000-8000-000000000021", "6f0f1b8e-0000-4000-8000-000000000022"),
+]
+
+
+def _successive_turn_bodies() -> list[str]:
+    """Each turn's stream, carrying its own saved message ids."""
+    return [
+        _created_frame(user_id) + _delta_frame(answer)
+        + _completed_frame(answer, assistant_message_id=assistant_id)
+        for _prompt, answer, user_id, assistant_id in _TURNS
+    ]
+
+
+def _saved_successive_turns() -> list[dict]:
+    """Both turns saved in order, with an unrelated pending row between them."""
+    items: list[dict] = []
+    for prompt, answer, user_id, assistant_id in _TURNS:
+        items.append({"id": user_id, "role": "user", "content": prompt,
+                      "created_at": "2026-11-02T10:00:00", "events": []})
+        items.append({"id": assistant_id, "role": "assistant", "content": answer,
+                      "created_at": "2026-11-02T10:00:01", "events": []})
+    items.insert(2, {"id": "6f0f1b8e-0000-4000-8000-0000000000ff", "role": "assistant",
+                     "content": "", "created_at": "2026-11-02T10:00:01", "events": []})
+    return items
+
+
+def _run_successive_turns(saved: list[dict]) -> None:
+    """Run the successive turn smoke test against `saved` as the stored history."""
+    transport = _deployment(
+        turn_body=_successive_turn_bodies(), tail_body="", saved=saved,
+    )
+    with httpx.Client(base_url="https://cowork.example", transport=transport) as api:
+        test_post_deploy.test_two_successive_turns_complete_and_persist(api, _CONVERSATION_ID)
+
+
+def test_successive_turns_accept_both_turns_saved_in_order():
+    _run_successive_turns(_saved_successive_turns())
+
+
+def _without_second_answer(items: list[dict]) -> list[dict]:
+    """The history with the second turn's answer missing."""
+    return [item for item in items if item["id"] != _TURNS[1][3]]
+
+
+def _with_first_question_twice(items: list[dict]) -> list[dict]:
+    """The history with the first question listed twice under its own id."""
+    return [items[0], *items]
+
+
+def _with_turns_reversed(items: list[dict]) -> list[dict]:
+    """The history with the second turn saved before the first."""
+    return items[3:] + items[:3]
+
+
+def _with_question_saved_twice_under_new_id(items: list[dict]) -> list[dict]:
+    """The history with the first question saved again as a separate row."""
+    copy = {**items[0], "id": "6f0f1b8e-0000-4000-8000-0000000000ee"}
+    return [*items, copy]
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    (_without_second_answer, "saved turn missing"),
+    (_with_first_question_twice, r"user message \S+ saved more than once"),
+    (_with_question_saved_twice_under_new_id, "question saved more than once"),
+    (_with_turns_reversed, "saved turns out of order"),
+])
+def test_successive_turns_reject_a_wrong_saved_history(change, reason):
+    with pytest.raises(AssertionError, match=reason):
+        _run_successive_turns(change(_saved_successive_turns()))
+
+
+def test_successive_turns_reject_a_failed_second_turn():
+    bodies = _successive_turn_bodies()
+    bodies[1] = _created_frame(_TURNS[1][2]) + _FAILED_FRAME
+    transport = _deployment(turn_body=bodies, tail_body="", saved=_saved_successive_turns())
+
+    with httpx.Client(base_url="https://cowork.example", transport=transport) as api:
+        with pytest.raises(AssertionError, match="stream reported response.failed"):
+            test_post_deploy.test_two_successive_turns_complete_and_persist(api, _CONVERSATION_ID)

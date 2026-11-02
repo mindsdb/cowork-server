@@ -73,6 +73,8 @@ CANCEL_PROMPT = (
     "pausing to think between each one."
 )
 QUICK_PROMPT = "Reply with exactly the word: pong"
+FIRST_TURN_PROMPT = "Reply with exactly the word: alpha"
+SECOND_TURN_PROMPT = "Reply with exactly the word: bravo"
 
 TURN_TIMEOUT_S = 180.0
 CANCEL_VISIBLE_S = 45.0
@@ -743,22 +745,41 @@ def test_cancel_ends_the_turn(api, conversation_id):
         )
 
 
-def test_a_second_message_queues_behind_the_first(api, conversation_id):
-    """The controller serialises per conversation, so two messages sent back to
-    back must both finish rather than fight over one pod."""
-    first = _stream_turn(api, conversation_id, QUICK_PROMPT)
-    assert "response.completed" in first, first
+def test_two_successive_turns_complete_and_persist(api, conversation_id):
+    """Two turns sent one after the other both finish and are saved in order.
 
-    second = _stream_turn(api, conversation_id, QUICK_PROMPT)
-    assert "response.completed" in second, second
+    The second is sent only once the first has ended, which is what the UI
+    queue does; a second turn sent while one runs is refused with 409, and
+    tests/test_turn_already_running.py covers that.
+    """
+    expected: list[tuple[str, str, str]] = []
+    for prompt in (FIRST_TURN_PROMPT, SECOND_TURN_PROMPT):
+        frames: list[SseFrame] = []
+        _stream_turn(api, conversation_id, prompt, frames=frames)
+        completed = _assert_successful_turn(frames)
+        created = next(payload for event, payload in frames if event == "response.created")
+        assert created.get("user_message_id"), "created frame carried no user_message_id"
+        assert completed.get("assistant_message_id"), "completed frame carried no assistant_message_id"
+        expected.append((created["user_message_id"], "user", prompt))
+        expected.append((completed["assistant_message_id"], "assistant", _answer_text(completed)))
 
-    items = api.get(f"/api/v1/conversations/{conversation_id}/items")
-    assert items.status_code == 200, items.text
-    body = items.json()
-    payload = body if isinstance(body, list) else body.get("items", [])
-    assert (
-        len(payload) >= 4
-    ), f"expected both turns persisted, got {json.dumps(body)[:400]}"
+    items = _conversation_items(api, conversation_id)
+    ids = [str(item.get("id")) for item in items]
+    positions = []
+    for message_id, role, content in expected:
+        assert message_id in ids, f"saved turn missing: {role} message {message_id}"
+        assert ids.count(message_id) == 1, f"{role} message {message_id} saved more than once"
+        item = items[ids.index(message_id)]
+        assert item.get("role") == role, f"{message_id}: role {item.get('role')!r}"
+        assert item.get("content") == content, f"{message_id}: content differs"
+        positions.append(ids.index(message_id))
+    for prompt in (FIRST_TURN_PROMPT, SECOND_TURN_PROMPT):
+        questions = [
+            item for item in items
+            if item.get("role") == "user" and item.get("content") == prompt
+        ]
+        assert len(questions) == 1, f"question saved more than once: {prompt!r}"
+    assert positions == sorted(positions), f"saved turns out of order: {positions}"
 
 
 def test_deleting_a_conversation_leaves_no_replayable_buffer(api, conversation_id):
