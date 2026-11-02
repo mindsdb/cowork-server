@@ -13,15 +13,19 @@ import os
 import re
 import stat
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, open_fd, read_bounded
 from cowork.services.artifact_journal import (
     JOURNAL_DIRNAME,
-    journal_file_names,
+    MAX_JOURNAL_RECORD_BYTES,
+    JournalFileRefused,
+    iter_journal_json,
     prune_journal_folder,
     read_journal_file,
+    read_journal_json,
     remove_journal_file,
     write_journal_file,
 )
@@ -37,6 +41,10 @@ _MANIFEST = "manifest.json"
 _PENDING = "pending-source-write.json"
 _REPAIRS = "repairs"
 _BLOBS = "blobs"
+# The manifest holds at most MAX_REVISIONS entries, each a few kilobytes at
+# most (a 1,000-character path, a 240-character summary), so a larger one is
+# not the server's.
+_MAX_MANIFEST_BYTES = 1024 * 1024
 # A blob's name is the sha256 of its bytes. Matched with fullmatch: `$` would
 # also accept a trailing newline.
 _CONTENT_HASH = re.compile(r"[0-9a-f]{64}")
@@ -111,12 +119,11 @@ def _is_repair_id(value: object) -> bool:
 
 def _read_manifest(folder: Path) -> dict:
     try:
-        raw = read_journal_file(folder, _MANIFEST)
-        if raw is None:
-            return {"version": 1, "revisions": []}
-        data = json.loads(raw)
+        data = read_journal_json(folder, _MANIFEST, max_bytes=_MAX_MANIFEST_BYTES)
     except (OSError, ValueError) as exc:
         raise RevisionValidationError("Artifact revision history is unreadable") from exc
+    if data is None:
+        return {"version": 1, "revisions": []}
     if not isinstance(data, dict) or not isinstance(data.get("revisions"), list):
         raise RevisionValidationError("Artifact revision history is invalid")
     return data
@@ -180,20 +187,25 @@ def _write_repair(folder: Path, repair: dict) -> None:
     write_journal_file(folder, _REPAIRS, f"{repair_id}.json", content=encoded)
 
 
-def _load_repair(folder: Path, repair_id: str) -> dict | None:
-    """The record saved as ``repairs/<repair_id>.json``, or None.
+def _own_record(repair_id: str, repair: object) -> dict | None:
+    """``repair`` when it is the record saved as ``repairs/<repair_id>.json``.
 
     A record whose own id isn't its file name's is refused, so a copied or
     planted record can't be written back under another name.
     """
-    try:
-        raw = read_journal_file(folder, _REPAIRS, f"{repair_id}.json")
-        repair = json.loads(raw) if raw is not None else None
-    except (OSError, ValueError):
-        return None
     if not isinstance(repair, dict) or repair.get("id") != repair_id:
         return None
     return repair
+
+
+def _load_repair(folder: Path, repair_id: str) -> dict | None:
+    """The record saved as ``repairs/<repair_id>.json``, or None. A read that
+    couldn't be made raises."""
+    try:
+        repair = read_journal_json(folder, _REPAIRS, f"{repair_id}.json")
+    except (JournalFileRefused, ValueError):
+        return None
+    return _own_record(repair_id, repair)
 
 
 def _read_repair(folder: Path, repair_id: str) -> dict:
@@ -203,20 +215,15 @@ def _read_repair(folder: Path, repair_id: str) -> dict:
     return repair
 
 
-def _repair_records(folder: Path) -> list[dict]:
-    try:
-        names = journal_file_names(folder, _REPAIRS)
-    except OSError:
-        return []
-    records: list[dict] = []
-    for name in names:
-        repair_id = name.removesuffix(".json")
-        if repair_id == name or not _is_repair_id(repair_id):
-            continue
-        repair = _load_repair(folder, repair_id)
-        if repair is not None:
-            records.append(repair)
-    return records
+def _repair_records(folder: Path) -> Iterator[dict]:
+    """The repair records, one at a time, so a caller that stops early or
+    keeps only some holds no more than one parsed record."""
+    for repair_id, repair in iter_journal_json(
+        folder, _REPAIRS, suffix=".json", accept=_is_repair_id
+    ):
+        record = _own_record(repair_id, repair)
+        if record is not None:
+            yield record
 
 
 def _actionable_repairs_for_path(folder: Path, rel_path: str) -> list[dict]:
@@ -385,15 +392,15 @@ def _blob_bytes(folder: Path, content_hash: object) -> bytes | None:
     artifact's own journal, and a name that isn't 64 lowercase hex characters
     is never opened. The blob must be a regular file with one name, no larger
     than an editable source, and its bytes must match its name. Anything else
-    answers None, as a missing blob does.
+    answers None, as a missing blob does. A read that couldn't be made raises.
     """
     if not _is_content_hash(content_hash):
         _refused_blob("invalid_name")
         return None
     try:
         content = read_journal_file(folder, _BLOBS, content_hash, max_bytes=MAX_SOURCE_BYTES)
-    except OSError:
-        _refused_blob("refused_file")
+    except JournalFileRefused:
+        # read_journal_file logged why.
         return None
     if content is not None and _sha(content) != content_hash:
         _refused_blob("hash_mismatch")
@@ -527,15 +534,15 @@ def _recover_pending_source_write(folder: Path) -> None:
     anything it names is opened. One the server couldn't have written is
     abandoned: a damaged record, a source path outside the artifact's editable
     files, or a blob the server doesn't trust. The server saves the blob before
-    the record, so a real crash never leaves one of those behind.
+    the record, so a real crash never leaves one of those behind. A read that
+    couldn't be made raises and keeps the record for the next request.
     """
     try:
-        raw = read_journal_file(folder, _PENDING)
-        if raw is None:
-            return
-        pending = json.loads(raw)
-    except (OSError, ValueError):
+        pending = read_journal_json(folder, _PENDING, max_bytes=MAX_JOURNAL_RECORD_BYTES)
+    except (JournalFileRefused, ValueError):
         _abandon_pending(folder, "unreadable")
+        return
+    if pending is None:
         return
     if not isinstance(pending, dict):
         _abandon_pending(folder, "invalid")
@@ -547,6 +554,7 @@ def _recover_pending_source_write(folder: Path) -> None:
         pending.get("version") != 1
         or not isinstance(entry, dict)
         or not isinstance(rel_path, str)
+        or not rel_path.strip()
         or entry.get("path") != rel_path
     ):
         _abandon_pending(folder, "invalid")
@@ -558,7 +566,7 @@ def _recover_pending_source_write(folder: Path) -> None:
     try:
         target, _ = resolve_source(folder, {}, rel_path)
         current = _read_source(target)
-    except (OSError, ValueError):
+    except (FileNotFoundError, ValueError):
         _abandon_pending(folder, "source_unavailable")
         return
 

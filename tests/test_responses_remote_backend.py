@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed, and its database
 units run inline on fakes (inline_run_db) unless a test needs the real ones.
 """
 from __future__ import annotations
+from tests._event_loop import on_the_event_loop
 from tests._logging_assertions import assert_log_fields
 
 import asyncio
@@ -2631,6 +2632,7 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
 
     def spy_diff(**kwargs):
         indexed["completed_cleanly"] = kwargs["completed_cleanly"]
+        indexed["on_the_event_loop"] = on_the_event_loop()
         return diff(**kwargs)
 
     def spy_index(session, **kwargs):
@@ -2659,7 +2661,8 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
-    assert indexed == {"completed_cleanly": False, "slugs": ["half-written"]}
+    # The diff waits on artifact locks and parses journals: off the loop.
+    assert indexed == {"completed_cleanly": False, "on_the_event_loop": False, "slugs": ["half-written"]}
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
 
 

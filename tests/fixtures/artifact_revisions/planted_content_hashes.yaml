@@ -30,6 +30,7 @@
   content_hash: "{home_file}"
 
 # The server's own environment: its auth token, database URI and model keys.
+# Only Linux has /proc; elsewhere this case still pins the name check.
 - id: server-environment
   content_hash: /proc/self/environ
 
@@ -40,9 +41,14 @@
 - id: endless-device-relative
   content_hash: ../../../../../../../../../../../../../../../../dev/zero
 
-# A disk that ignores case opens the real blob under this name.
+# A disk that ignores case, such as macOS's default, opens the real blob under
+# this name; a case-sensitive one only pins the name check.
 - id: real-hash-in-capitals
   content_hash: "{real_upper}"
+
+# Starts with 64 hex characters, so only a match of the whole name refuses it.
+- id: real-hash-then-a-path
+  content_hash: "{real}/../../../../.env"
 
 - id: real-hash-with-a-trailing-newline
   content_hash: "{real}\n"

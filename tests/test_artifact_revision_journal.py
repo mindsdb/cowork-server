@@ -8,31 +8,42 @@ write or serve a file outside the journal. A planted blob name answers as a
 missing revision does, a hard-linked blob is refused, a repair id names no file
 outside `repairs/`, and a journal folder that is a link reads as no journal and
 is replaced by a real folder on the first write, with its target untouched.
+An open that fails for any other reason is an error, never an empty journal.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import logging
 import os
 import shutil
+import tracemalloc
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 import yaml
+from fastapi import HTTPException
 
-from cowork.services import artifact_journal, artifact_revisions
+from cowork.api.v1.endpoints.artifact_workspace import _not_found_detail
+from cowork.services import artifact_journal, artifact_revisions, local_artifact_comments
 from cowork.services.artifact_draft_review import draft_review_grant, enable_draft_review
 from cowork.services.artifact_identity import ensure_full_id
 from cowork.services.artifact_journal import (
     MAX_JOURNAL_FILE_BYTES,
+    MAX_JOURNAL_RECORD_BYTES,
     JournalFileRefused,
+    journal_file_mtime_ns,
     read_journal_file,
+    remove_journal_file,
     write_journal_file,
 )
 from cowork.services.artifact_revisions import (
     MAX_SOURCE_BYTES,
+    RevisionConflict,
     RevisionValidationError,
     active_agent_repair,
     agent_repair_detail,
@@ -40,6 +51,7 @@ from cowork.services.artifact_revisions import (
     create_agent_repair,
     current_source,
     finalize_agent_repair,
+    has_queued_agent_repair,
     list_revisions,
     revision_with_content,
     save_source,
@@ -62,6 +74,7 @@ from test_personal_partition_artifacts import (  # noqa: F401 (stack, two_people
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_revisions"
 CASES = yaml.safe_load((FIXTURES / "planted_content_hashes.yaml").read_text(encoding="utf-8"))
 CASE_IDS = [case["id"] for case in CASES]
+JOURNAL = yaml.safe_load((FIXTURES / "journal_cases.yaml").read_text(encoding="utf-8"))
 
 SECRET = "OPENAI_API_KEY=sk-own-7f3a"
 OTHER_SECRET = "OPENAI_API_KEY=sk-other-91c2"
@@ -244,12 +257,23 @@ def _victim(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
-def test_a_planted_blob_name_reads_no_file(layout, case):
+def test_a_planted_blob_name_reads_no_file(layout, case, monkeypatch):
+    """A name that isn't 64 lowercase hex characters is never opened, not
+    only refused by a later check."""
     head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
     planted = _plant_revision(layout.folder, content_hash=_case_hash(case, layout, real=head["contentHash"]))
+    opened: list[tuple[str, ...]] = []
+    real_read = artifact_revisions.read_journal_file
+
+    def spy(folder, *parts, **kwargs):
+        opened.append(parts)
+        return real_read(folder, *parts, **kwargs)
+
+    monkeypatch.setattr(artifact_revisions, "read_journal_file", spy)
 
     with pytest.raises(FileNotFoundError, match="^Revision not found$"):
         revision_with_content(layout.folder, planted)
+    assert not [parts for parts in opened if parts[0] == "blobs"]
 
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
@@ -269,8 +293,9 @@ def test_the_repair_compare_and_reject_read_no_planted_blob(layout, case):
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_recovery_abandons_a_pending_write_naming_a_planted_blob(layout, case):
-    """Before, recovery opened the name first and then answered one of two
-    errors, which told the caller whether any server path exists."""
+    """Recovery checks the name before it opens anything, so every planted
+    name answers alike and none tells the caller whether a server path
+    exists."""
     head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
     pending = _plant_pending(
         layout.folder,
@@ -317,8 +342,9 @@ def test_recovery_copies_no_hard_linked_blob_into_the_source(layout):
 
 
 def test_a_save_replaces_a_planted_blob_at_its_name(layout):
-    """Before, a planted blob made the save fail after it wrote the source,
-    which left the pending record behind for every later request to trip on."""
+    """A save over a planted blob replaces the name with the server's own
+    bytes and finishes, so no pending record is left for later requests to
+    trip on."""
     head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
     edited = "# Edited\n"
     planted = layout.journal / "blobs" / _sha(edited.encode())
@@ -344,9 +370,9 @@ def test_a_save_replaces_a_planted_blob_at_its_name(layout):
 @pytest.mark.parametrize("planted_id", ["../../../../escaped", "{outside}"], ids=["relative", "absolute"])
 def test_a_planted_repair_id_writes_no_file_outside_the_journal(layout, tmp_path, planted_id):
     """At turn end, the capture finishes this turn's queued repairs and writes
-    each back by its id. A record the agent's code wrote must not pick that
-    file name: before, these ids made the server write `escaped.json` in
-    `.anton` and in a folder it created outside the project."""
+    each back by its id. A record the agent's code wrote can't pick that file
+    name, so no `escaped.json` lands in `.anton` or in a folder outside the
+    project."""
     head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
     outside = tmp_path / "outside" / "escaped"
     record = {
@@ -383,6 +409,8 @@ def test_a_linked_journal_reads_as_no_journal(layout, tmp_path):
     assert read_journal_file(layout.folder, "comments.json") is None
     assert draft_review_grant(layout.folder) is None
     assert active_agent_repair(layout.folder) is None
+    # Read before any lock: the lock replaces the link with a real folder.
+    assert artifact_revisions._read_manifest(layout.folder)["revisions"] == []
     assert list_revisions(layout.folder) == []
     assert _files_below(victim / ".revisions") == before
     assert layout.journal.is_dir() and not layout.journal.is_symlink()
@@ -457,17 +485,51 @@ def test_the_turn_end_capture_writes_nothing_through_a_linked_journal(layout, tm
 
 def test_a_sparse_journal_file_is_refused_before_it_is_read(layout, monkeypatch):
     """A cell can `truncate` a journal file to any size without writing it."""
-    current_source(layout.folder, layout.metadata, layout.artifact_id)
-    with (layout.journal / "manifest.json").open("r+b") as stream:
+    write_journal_file(layout.folder, "comments.json", content=b"[]")
+    with (layout.journal / "comments.json").open("r+b") as stream:
         stream.truncate(MAX_JOURNAL_FILE_BYTES + 1)
     reads: list[int] = []
     monkeypatch.setattr(artifact_journal, "read_bounded", lambda fd, size: reads.append(size) or [])
 
     with pytest.raises(JournalFileRefused):
-        read_journal_file(layout.folder, "manifest.json")
+        read_journal_file(layout.folder, "comments.json")
+    assert reads == []
+
+
+def test_a_manifest_past_its_cap_is_refused_before_it_is_read(layout, monkeypatch):
+    """Valid JSON padded with spaces past the manifest's cap: a whole-file read
+    would parse it, so only the cap refuses it."""
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    manifest = layout.journal / "manifest.json"
+    manifest.write_bytes(manifest.read_bytes().ljust(artifact_revisions._MAX_MANIFEST_BYTES + 1))
+    assert json.loads(manifest.read_bytes())["revisions"]
+    reads: list[int] = []
+    monkeypatch.setattr(artifact_journal, "read_bounded", lambda fd, size: reads.append(size) or [])
+
     with pytest.raises(RevisionValidationError, match="unreadable"):
         list_revisions(layout.folder)
     assert reads == []
+
+
+def test_a_pending_write_past_its_cap_is_abandoned_unread(layout):
+    """The record names a real blob and is valid JSON padded with spaces, so a
+    read would finish it and write the blob into the source."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    recovered = b"# Recovered\n"
+    write_journal_file(layout.folder, "blobs", _sha(recovered), content=recovered)
+    pending = _plant_pending(
+        layout.folder,
+        content_hash=_sha(recovered),
+        path=head["path"],
+        base_revision_id=head["id"],
+        before=FIRST.encode(),
+    )
+    pending.write_bytes(pending.read_bytes().ljust(MAX_JOURNAL_RECORD_BYTES + 1))
+
+    reread = current_source(layout.folder, layout.metadata, layout.artifact_id)
+
+    assert reread["content"] == FIRST
+    assert not pending.exists()
 
 
 def test_a_sparse_source_is_refused_before_it_is_read(layout, monkeypatch):
@@ -479,6 +541,450 @@ def test_a_sparse_source_is_refused_before_it_is_read(layout, monkeypatch):
     with pytest.raises(RevisionValidationError, match="too large"):
         current_source(layout.folder, layout.metadata, layout.artifact_id)
     assert reads == []
+
+
+# ── an open that couldn't be made ────────────────────────────────────────────
+
+
+def _open_fails(monkeypatch, failure: dict) -> dict:
+    """Make opening the folder ``failure["at"]`` fail with its errno while the
+    returned switch is on. The switch starts off."""
+    code = getattr(errno, failure["errno"])
+    switch = {"on": False}
+    if failure["at"] == "journal_folder":
+        real_open = artifact_journal.open_pinned_child
+
+        def open_child(parent, name, **kwargs):
+            if switch["on"] and name == ".revisions":
+                raise OSError(code, os.strerror(code))
+            return real_open(parent, name, **kwargs)
+
+        monkeypatch.setattr(artifact_journal, "open_pinned_child", open_child)
+    else:
+        real_pin = artifact_journal.pinned_dir
+
+        @contextmanager
+        def pin(base, **kwargs):
+            if switch["on"]:
+                raise OSError(code, os.strerror(code))
+            with real_pin(base, **kwargs) as pinned:
+                yield pinned
+
+        monkeypatch.setattr(artifact_journal, "pinned_dir", pin)
+    return switch
+
+
+def _failing_inside(monkeypatch, switch: dict, module, name: str) -> None:
+    """Turn the switch on only while ``module.name`` runs, so the open fails
+    in that read and nowhere else, the lock's own open included."""
+    real = getattr(module, name)
+
+    def failing(*args, **kwargs):
+        switch["on"] = True
+        try:
+            return real(*args, **kwargs)
+        finally:
+            switch["on"] = False
+
+    monkeypatch.setattr(module, name, failing)
+
+
+def _comments(layout: Layout, monkeypatch) -> local_artifact_comments.LocalArtifactComments:
+    """The local comment service for ``layout``'s artifact, found without a
+    scan of the server's artifacts roots."""
+    monkeypatch.setattr(local_artifact_comments, "artifacts_sources_for_scan", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        local_artifact_comments, "resolve_artifact_folder", lambda _sources, _id: (None, layout.folder, None)
+    )
+    return local_artifact_comments.LocalArtifactComments(layout.artifact_id, scope=None)
+
+
+def _history(layout: Layout) -> dict:
+    """Four revisions and two comments: the journal an empty read would lose.
+    Returns the head revision."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    for number in range(2, 5):
+        head = save_source(
+            layout.folder,
+            layout.metadata,
+            layout.artifact_id,
+            content=f"# Version {number}\n",
+            expected_revision_id=head["id"],
+        )["revision"]
+    threads = [{"id": "t1", "status": "open"}, {"id": "t2", "status": "open"}]
+    write_journal_file(layout.folder, "comments.json", content=json.dumps(threads).encode())
+    return head
+
+
+def _write_after_a_read(operation: str, layout: Layout, head: dict, monkeypatch) -> None:
+    if operation == "open_editor":
+        current_source(layout.folder, layout.metadata, layout.artifact_id)
+    elif operation == "save":
+        (layout.folder / "brief.md").write_text("# Outside edit\n", encoding="utf-8")
+        save_source(
+            layout.folder,
+            layout.metadata,
+            layout.artifact_id,
+            content="# Mine\n",
+            expected_revision_id=head["id"],
+        )
+    elif operation == "turn_end_capture":
+        # The capture answers None for any failure, so the turn still ends.
+        (layout.folder / "brief.md").write_text("# Agent edit\n", encoding="utf-8")
+        assert capture_agent_revision(layout.folder, conversation_id=str(uuid4())) is None
+    elif operation == "comment_create":
+        _comments(layout, monkeypatch).create({"text": "New note"})
+    else:
+        raise AssertionError(f"unknown operation {operation}")
+
+
+@pytest.mark.parametrize("operation", JOURNAL["writers_after_a_read"])
+@pytest.mark.parametrize(
+    "failure", JOURNAL["transient_open_failures"], ids=[case["id"] for case in JOURNAL["transient_open_failures"]]
+)
+def test_an_open_that_fails_never_reads_as_an_empty_journal(layout, monkeypatch, operation, failure):
+    """Read as empty, the next write would replace the whole history or every
+    comment with one entry."""
+    head = _history(layout)
+    before = _files_below(layout.journal)
+    switch = _open_fails(monkeypatch, failure)
+    _failing_inside(monkeypatch, switch, artifact_revisions, "read_journal_json")
+    _failing_inside(monkeypatch, switch, local_artifact_comments, "read_journal_json")
+
+    if operation == "turn_end_capture":
+        _write_after_a_read(operation, layout, head, monkeypatch)
+    else:
+        with pytest.raises((OSError, RevisionValidationError, HTTPException)):
+            _write_after_a_read(operation, layout, head, monkeypatch)
+
+    assert _files_below(layout.journal) == before
+
+
+@pytest.mark.parametrize(
+    "failure", JOURNAL["transient_open_failures"], ids=[case["id"] for case in JOURNAL["transient_open_failures"]]
+)
+def test_recovery_keeps_a_pending_write_whose_blob_it_could_not_read(layout, monkeypatch, failure):
+    """A real crash leaves the blob and the record; a failed read is no reason
+    to drop the record, and the next request finishes it."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    recovered = b"# Recovered\n"
+    write_journal_file(layout.folder, "blobs", _sha(recovered), content=recovered)
+    pending = _plant_pending(
+        layout.folder,
+        content_hash=_sha(recovered),
+        path=head["path"],
+        base_revision_id=head["id"],
+        before=FIRST.encode(),
+    )
+    switch = _open_fails(monkeypatch, failure)
+    _failing_inside(monkeypatch, switch, artifact_revisions, "read_journal_file")
+
+    with pytest.raises(OSError):
+        current_source(layout.folder, layout.metadata, layout.artifact_id)
+    assert pending.exists()
+
+    monkeypatch.undo()
+    assert current_source(layout.folder, layout.metadata, layout.artifact_id)["content"] == recovered.decode()
+    assert not pending.exists()
+
+
+# ── a journal file that is a link ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "case", JOURNAL["linked_journal_files"], ids=[case["id"] for case in JOURNAL["linked_journal_files"]]
+)
+def test_a_journal_file_that_is_a_link_is_refused_and_replaced(layout, tmp_path, monkeypatch, caplog, case):
+    """Left from before the sandbox, or made by a remote worker: no read goes
+    through it, the lockless readers included, and the next write replaces the
+    link, never its target."""
+    victim = _victim(tmp_path)
+    write_journal_file(victim, "pending-source-write.json", content=b'{"version": 1}')
+    victims_repair = next((victim / ".revisions" / "repairs").glob("*.json")).stem
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    parts = tuple(case["name"].replace("{repair}", victims_repair).split("/"))
+    link = layout.journal.joinpath(*parts)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.unlink(missing_ok=True)
+    link.symlink_to(victim / ".revisions" / Path(*parts))
+    before = _files_below(victim / ".revisions")
+
+    with pytest.raises(JournalFileRefused):
+        read_journal_file(layout.folder, *parts)
+    if case["id"] == "manifest":
+        with pytest.raises(RevisionValidationError, match="unreadable"):
+            artifact_revisions._read_manifest(layout.folder)
+    elif case["id"] == "comments":
+        with pytest.raises(HTTPException) as refused:
+            _comments(layout, monkeypatch).list_payload("all")
+        assert refused.value.status_code == 500
+    elif case["id"] == "draft-review-grant":
+        assert draft_review_grant(layout.folder) is None
+    elif case["id"] == "repair":
+        assert active_agent_repair(layout.folder) is None
+    elif case["id"] == "pending-source-write":
+        with caplog.at_level(logging.WARNING, logger=artifact_revisions.logger.name):
+            current_source(layout.folder, layout.metadata, layout.artifact_id)
+        reasons = [
+            record.reason for record in caplog.records
+            if record.name == artifact_revisions.logger.name
+            and getattr(record, "event", None) == "artifact_pending_write_abandoned"
+        ]
+        assert reasons == ["unreadable"]
+    write_journal_file(layout.folder, *parts, content=b"{}")
+
+    assert link.is_file() and not link.is_symlink()
+    assert _files_below(victim / ".revisions") == before
+
+
+@pytest.mark.parametrize("writer", JOURNAL["first_writers_on_a_linked_journal"])
+def test_the_first_writer_on_a_linked_journal_replaces_the_link(layout, tmp_path, monkeypatch, writer):
+    """Each writer runs before anything else has replaced the link, so none
+    relies on another's lock having done it."""
+    victim = _victim(tmp_path)
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    shutil.rmtree(layout.journal)
+    layout.journal.symlink_to(victim / ".revisions", target_is_directory=True)
+    before = _files_below(victim / ".revisions")
+
+    if writer == "draft_review_grant":
+        enable_draft_review(layout.folder, org_id="org-2", enabled_by="alice")
+    elif writer == "comment":
+        _comments(layout, monkeypatch).create({"text": "Alice's note"})
+    elif writer == "agent_repair":
+        with pytest.raises(RevisionConflict):
+            create_agent_repair(
+                layout.folder,
+                layout.metadata,
+                layout.artifact_id,
+                expected_revision_id=head["id"],
+                comment_thread_id="thread-2",
+                selector=None,
+                thread=[{"text": "Fix the title"}],
+                conversation_id=str(uuid4()),
+            )
+    elif writer == "save":
+        with pytest.raises(RevisionConflict):
+            save_source(
+                layout.folder,
+                layout.metadata,
+                layout.artifact_id,
+                content="# Edited\n",
+                expected_revision_id=head["id"],
+            )
+    else:
+        raise AssertionError(f"unknown writer {writer}")
+
+    assert _files_below(victim / ".revisions") == before
+    assert layout.journal.is_dir() and not layout.journal.is_symlink()
+
+
+def test_an_artifact_folder_that_is_a_link_has_no_journal(layout, tmp_path):
+    victim = _victim(tmp_path)
+    before = _files_below(victim / ".revisions")
+    linked = layout.folder.parent / "linked"
+    linked.symlink_to(victim, target_is_directory=True)
+
+    assert read_journal_file(linked, "comments.json") is None
+    assert draft_review_grant(linked) is None
+    assert active_agent_repair(linked) is None
+    with pytest.raises(OSError):
+        write_journal_file(linked, "comments.json", content=b"[]")
+    assert _files_below(victim / ".revisions") == before
+
+
+# ── journal files the server never wrote ─────────────────────────────────────
+
+
+def test_a_blob_whose_bytes_do_not_match_its_name_is_refused(layout):
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    (layout.journal / "blobs" / head["contentHash"]).write_text("# Rewritten by the agent\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="^Revision not found$"):
+        revision_with_content(layout.folder, head["id"])
+
+
+def test_a_blob_past_the_source_cap_answers_as_missing(layout):
+    """Its bytes match its name, so only the cap refuses it."""
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    large = b"x" * (MAX_SOURCE_BYTES + 1)
+    (layout.journal / "blobs" / _sha(large)).write_bytes(large)
+    planted = _plant_revision(layout.folder, content_hash=_sha(large))
+
+    with pytest.raises(FileNotFoundError, match="^Revision not found$"):
+        revision_with_content(layout.folder, planted)
+
+
+def test_a_save_over_a_source_past_the_cap_is_refused(layout):
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    (layout.folder / "brief.md").write_bytes(b"x" * (MAX_SOURCE_BYTES + 1))
+
+    with pytest.raises(RevisionValidationError, match="too large"):
+        save_source(layout.folder, layout.metadata, layout.artifact_id, content=FIRST, expected_revision_id=head["id"])
+
+
+def test_a_journal_file_with_a_second_name_is_refused_and_logged(layout, tmp_path, caplog):
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    os.link(layout.journal / "manifest.json", tmp_path / "manifest-backup.json")
+
+    with caplog.at_level(logging.WARNING, logger=artifact_journal.logger.name):
+        with pytest.raises(RevisionValidationError, match="unreadable"):
+            list_revisions(layout.folder)
+
+    [record] = [record for record in caplog.records if record.name == artifact_journal.logger.name]
+    assert (record.event, record.reason, record.artifact_slug) == (
+        "artifact_journal_file_refused",
+        "second_name",
+        "report",
+    )
+
+
+@pytest.mark.parametrize(
+    "case", JOURNAL["malformed_pending_writes"], ids=[case["id"] for case in JOURNAL["malformed_pending_writes"]]
+)
+def test_recovery_abandons_a_pending_write_the_server_never_writes(layout, case):
+    """Each record names a real blob, so a recovery that trusted it would write
+    the blob into the source."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    recovered = b"# Recovered\n"
+    write_journal_file(layout.folder, "blobs", _sha(recovered), content=recovered)
+    pending = _plant_pending(
+        layout.folder,
+        content_hash=_sha(recovered),
+        path=head["path"],
+        base_revision_id=head["id"],
+        before=FIRST.encode(),
+    )
+    if "raw" in case:
+        pending.write_text(case["raw"], encoding="utf-8")
+    elif "nested" in case:
+        pending.write_text("[" * case["nested"], encoding="utf-8")
+    else:
+        record = json.loads(pending.read_text(encoding="utf-8"))
+        overrides = case["record"]
+        record["version"] = overrides.get("version", record["version"])
+        record["path"] = overrides.get("path", record["path"])
+        record["revision"]["path"] = overrides.get("revision_path", record["revision"]["path"])
+        record["revision"]["baseRevisionId"] = overrides.get(
+            "base_revision_id", record["revision"]["baseRevisionId"]
+        )
+        pending.write_text(json.dumps(record), encoding="utf-8")
+
+    reread = current_source(layout.folder, layout.metadata, layout.artifact_id)
+
+    assert reread["content"] == FIRST
+    assert (layout.folder / "brief.md").read_text(encoding="utf-8") == FIRST
+    assert not pending.exists()
+
+
+# ── repair records ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("repair_id", "canonical"),
+    [(repair_id, True) for repair_id in JOURNAL["repair_ids"]["canonical"]]
+    + [(repair_id, False) for repair_id in JOURNAL["repair_ids"]["refused"]],
+)
+def test_only_a_canonical_uuid_names_a_repair(repair_id, canonical):
+    assert artifact_revisions._is_repair_id(repair_id) is canonical
+
+
+@pytest.mark.parametrize("repair_id", JOURNAL["repair_ids"]["refused"])
+def test_a_record_named_by_a_non_canonical_id_is_left_alone_at_turn_end(layout, repair_id):
+    """Its id matches its file name, so only the UUID check skips it. Loaded,
+    its write-back would be refused and the turn's edit would get no
+    revision."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    repairs = layout.journal / "repairs"
+    repairs.mkdir()
+    record = {
+        "id": repair_id,
+        "status": "queued",
+        "conversationId": "turn-1",
+        "path": "other.md",
+        "baseRevisionId": head["id"],
+        "createdAt": "2026-11-02T10:00:00+00:00",
+    }
+    planted = repairs / f"{repair_id}.json"
+    planted.write_text(json.dumps(record), encoding="utf-8")
+    (layout.folder / "brief.md").write_text("# Agent edit\n", encoding="utf-8")
+
+    captured = capture_agent_revision(layout.folder, conversation_id="turn-1")
+
+    assert captured is not None and captured["actor"]["kind"] == "agent"
+    assert json.loads(planted.read_text(encoding="utf-8")) == record
+
+
+def test_a_deeply_nested_repair_record_is_skipped(layout):
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    depth = next(case["nested"] for case in JOURNAL["malformed_pending_writes"] if "nested" in case)
+    repairs = layout.journal / "repairs"
+    repairs.mkdir()
+    (repairs / f"{uuid4()}.json").write_text("[" * depth, encoding="utf-8")
+    (layout.folder / "brief.md").write_text("# Agent edit\n", encoding="utf-8")
+
+    assert has_queued_agent_repair(layout.folder, "turn-1") is False
+    captured = capture_agent_revision(layout.folder, conversation_id="turn-1")
+    assert captured is not None and captured["actor"]["kind"] == "agent"
+
+
+def test_repair_records_are_read_one_at_a_time(layout):
+    """A scan holds one parsed record at a time, so a pile of large records the
+    agent's code planted costs the server one record's memory, not the pile's."""
+    pile = JOURNAL["repair_pile"]
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    repairs = layout.journal / "repairs"
+    repairs.mkdir()
+    padding = ",".join(["{}"] * pile["objects_per_record"])
+
+    def plant() -> None:
+        for _ in range(pile["records_per_pile"]):
+            repair_id = str(uuid4())
+            (repairs / f"{repair_id}.json").write_text(
+                f'{{"id": "{repair_id}", "status": "done", "pad": [{padding}]}}', encoding="utf-8"
+            )
+
+    def peak() -> int:
+        tracemalloc.start()
+        try:
+            assert has_queued_agent_repair(layout.folder, "turn-1") is False
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    plant()
+    one_pile = peak()
+    plant()
+    two_piles = peak()
+
+    assert two_piles < one_pile * pile["peak_growth_bound"]
+
+
+# ── names ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name", JOURNAL["names_with_more_than_one_part"])
+def test_the_journal_refuses_a_name_with_more_than_one_part(layout, name):
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    calls = [
+        lambda: read_journal_file(layout.folder, name),
+        lambda: read_journal_file(layout.folder, name, "manifest.json"),
+        lambda: write_journal_file(layout.folder, name, content=b"{}"),
+        lambda: remove_journal_file(layout.folder, name),
+        lambda: journal_file_mtime_ns(layout.folder, name),
+    ]
+    for call in calls:
+        with pytest.raises(ValueError, match="direct-child"):
+            call()
+
+
+def test_a_404_carries_no_server_path():
+    """An OS error names the path it failed on; the service's own messages
+    don't."""
+    gone = FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), "/srv/cowork/alice/.anton/artifacts/report")
+
+    assert _not_found_detail(gone) == "Artifact not found"
+    assert _not_found_detail(FileNotFoundError("Revision not found")) == "Revision not found"
 
 
 # ── the routes, on a stack where several people sign in ──────────────────────

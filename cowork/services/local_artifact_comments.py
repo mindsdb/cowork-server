@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from cowork.services.artifact_identity import (
@@ -18,7 +19,7 @@ from cowork.services.artifact_identity import (
 from cowork.db.scoped import TenantScope
 from cowork.services.artifact_journal import (
     journal_file_mtime_ns,
-    read_journal_file,
+    read_journal_json,
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
@@ -62,8 +63,7 @@ class LocalArtifactComments:
         # The journal is opened without following links: a `.revisions` that
         # is a link reads as no comments, and the next write replaces it.
         try:
-            data = read_journal_file(self.folder, _JOURNAL_NAME)
-            raw = json.loads(data) if data is not None else []
+            raw = read_journal_json(self.folder, _JOURNAL_NAME)
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail="Comment journal is unreadable") from exc
         return raw if isinstance(raw, list) else []
@@ -227,7 +227,10 @@ class LocalArtifactComments:
 async def handle_local_comments(
     request: Request, artifact_id: str, subpath: str, *, scope: TenantScope | None
 ):
-    service = LocalArtifactComments(artifact_id, scope=scope)
+    # The service scans the artifacts roots and reads and writes the journal
+    # under the artifact's lock, which can wait seconds, so it runs off the
+    # event loop every request on the server shares.
+    service = await run_in_threadpool(LocalArtifactComments, artifact_id, scope=scope)
     parts = [part for part in subpath.split("/") if part]
     method = request.method.upper()
     try:
@@ -236,9 +239,26 @@ async def handle_local_comments(
         raise HTTPException(status_code=422, detail="Request body must be valid JSON") from exc
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="Request body must be an object")
+    return await run_in_threadpool(
+        _dispatch,
+        service,
+        parts=parts,
+        method=method,
+        body=body,
+        status_filter=request.query_params.get("status", "open"),
+    )
 
+
+def _dispatch(
+    service: LocalArtifactComments,
+    *,
+    parts: list[str],
+    method: str,
+    body: dict,
+    status_filter: str,
+) -> JSONResponse:
     if parts == ["threads"] and method == "GET":
-        return JSONResponse(service.list_payload(request.query_params.get("status", "open")))
+        return JSONResponse(service.list_payload(status_filter))
     if parts == ["threads"] and method == "POST":
         return JSONResponse(service.create(body))
     if parts == ["read"] and method == "POST":
@@ -259,32 +279,31 @@ async def handle_local_comments(
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown comment operation")
 
 
-def local_comments_stream(artifact_id: str, *, scope: TenantScope | None) -> StreamingResponse:
-    service = LocalArtifactComments(artifact_id, scope=scope)
+async def local_comments_stream(artifact_id: str, *, scope: TenantScope | None) -> StreamingResponse:
+    # As in handle_local_comments, every journal read runs off the event loop.
+    service = await run_in_threadpool(LocalArtifactComments, artifact_id, scope=scope)
+
+    async def threads() -> dict[str, dict]:
+        payload = await run_in_threadpool(service.list_payload, "all")
+        return {thread["id"]: thread for thread in payload["threads"]}
+
+    async def mtime() -> int:
+        try:
+            return await run_in_threadpool(service.mtime_ns)
+        except OSError:
+            return 0
 
     async def events():
-        previous = {
-            thread["id"]: thread
-            for thread in service.list_payload("all")["threads"]
-        }
-        try:
-            previous_mtime = service.mtime_ns()
-        except OSError:
-            previous_mtime = 0
+        previous = await threads()
+        previous_mtime = await mtime()
         while True:
             await asyncio.sleep(1)
-            try:
-                current_mtime = service.mtime_ns()
-            except OSError:
-                current_mtime = 0
+            current_mtime = await mtime()
             if current_mtime == previous_mtime:
                 yield ": keepalive\n\n"
                 continue
             previous_mtime = current_mtime
-            current = {
-                thread["id"]: thread
-                for thread in service.list_payload("all")["threads"]
-            }
+            current = await threads()
             for deleted_id in previous.keys() - current.keys():
                 yield f"event: thread.deleted\ndata: {json.dumps({'id': deleted_id})}\n\n"
             for thread_id, thread in current.items():

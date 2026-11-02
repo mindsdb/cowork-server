@@ -23,8 +23,10 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cowork.common.logger import log_context
 from cowork.services.artifact_journal import (
-    read_journal_file,
+    MAX_JOURNAL_RECORD_BYTES,
+    read_journal_json,
     remove_journal_file,
     write_journal_file,
 )
@@ -69,12 +71,16 @@ def draft_review_grant(folder: Path) -> dict | None:
     access, so a damaged record must fail closed.
     """
     try:
-        raw = read_journal_file(folder, _MARKER_NAME)
-        if raw is None:
-            return None
-        payload = json.loads(raw)
+        payload = read_journal_json(folder, _MARKER_NAME, max_bytes=MAX_JOURNAL_RECORD_BYTES)
     except (OSError, ValueError):
-        logger.warning("Ignoring unreadable draft review grant: %s", folder, exc_info=True)
+        logger.warning(
+            "Ignoring unreadable draft review grant",
+            extra={
+                "event": "artifact_draft_review_grant_unreadable",
+                **log_context(artifact_slug=folder.name),
+            },
+            exc_info=True,
+        )
         return None
     if not isinstance(payload, dict) or payload.get("scope") != SCOPE_ORGANIZATION:
         return None
@@ -99,5 +105,12 @@ def disable_draft_review(folder: Path) -> bool:
     try:
         return remove_journal_file(folder, _MARKER_NAME)
     except OSError:
-        logger.warning("Could not remove draft review grant in %s", folder, exc_info=True)
+        logger.warning(
+            "Could not remove draft review grant",
+            extra={
+                "event": "artifact_draft_review_grant_not_removed",
+                **log_context(artifact_slug=folder.name),
+            },
+            exc_info=True,
+        )
         return False
