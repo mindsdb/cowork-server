@@ -1,23 +1,32 @@
 """Stop sharing, Update and the artifact status say when a page's old link stays
 live, because no owner record ties the page to the artifact. The Stop sharing
-cases are in fixtures/published_link_left_live/stop_sharing.yaml."""
+and status cases are in fixtures/published_link_left_live/."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 
+import cowork.server as cowork_server
 from cowork.api.v1.endpoints import artifacts as artifact_routes
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.schemas.artifact_access import ArtifactStatusView
 from cowork.services import publish
 from cowork.services.published_page_ownership import link_owner_recorded
 from tests.test_local_publish_ownership import ALICE, BOB, publisher  # noqa: F401
 
-STOP_SHARING = yaml.safe_load(
-    (Path(__file__).parent / "fixtures" / "published_link_left_live" / "stop_sharing.yaml").read_text(encoding="utf-8")
-)
+CASES = Path(__file__).parent / "fixtures" / "published_link_left_live"
+STOP_SHARING = yaml.safe_load((CASES / "stop_sharing.yaml").read_text(encoding="utf-8"))
+STATUS = yaml.safe_load((CASES / "status.yaml").read_text(encoding="utf-8"))
 OLD_LINK = "https://old-viewer.example/view/legacy-page/"
+# A person on the personal deployment the `publisher` fixture sets up.
+ALICE_HEADERS = {
+    "Authorization": "Bearer personal-deployment-test-token",
+    "X-User-Id": ALICE.user_id,
+    "X-Organization-Id": "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a",
+}
 
 
 def _planted(publisher, kind: str):  # noqa: F811
@@ -83,14 +92,48 @@ def test_the_link_is_owned_only_when_an_owner_record_ties_it_to_this_artifact(pu
     assert link_owner_recorded(legacy, "legacy-page", publish_url="https://llm.mdb.ai") is True
 
 
-@pytest.mark.parametrize("published_url, recorded, expected", [
-    ("https://viewer.example/view/a/", False, {"linkOwnerRecorded": False}),
-    ("https://viewer.example/view/a/", True, {"linkOwnerRecorded": True}),
-    ("", None, {}),
-])
-async def test_the_status_carries_the_owner_record_only_for_a_live_link(monkeypatch, published_url, recorded, expected):
-    base = {"publishedUrl": published_url, "modified": False}
-    monkeypatch.setattr(artifact_routes, "_desktop_artifact_status_for_path", lambda path, *, scope: dict(base))
-    monkeypatch.setattr(publish, "published_link_owner_recorded", lambda path, *, scope: recorded)
-    status = await artifact_routes.artifact_status(scope=ALICE, path="artifact/index.html")
-    assert status == {**base, **expected}
+def test_the_stop_sharing_route_answers_the_link_it_left_live(publisher):  # noqa: F811
+    page, link = _planted(publisher, "no_owner_record")
+    # No `with`: skipping the lifespan skips boot migrations and workers.
+    res = TestClient(cowork_server.create_app()).delete(
+        "/api/v1/publish/", params={"path": str(page)}, headers=ALICE_HEADERS,
+    )
+    assert res.status_code == 200, res.text
+    assert res.json() == {"status": "ok", "takenDown": False, "liveLink": link, "reason": "no_owner_record"}
+    assert publisher.deletes == []
+
+
+def test_a_record_with_no_page_id_is_dropped_and_its_link_named_on_publish(publisher):  # noqa: F811
+    page = publisher.page("artifact")
+    publisher.plant(page, {
+        "url": OLD_LINK, "published": True, "mode": "password", "requires_password": True,
+        "access_password": "shared-secret", "pwd_version": 9, "password_hash": "planted-hash",
+    })
+    result = publisher.send(page, access={"mode": "password", "password": "shared-secret"})
+    upload = publisher.uploads[-1]
+    # Nothing from a record no owner ties to this person reaches the upload.
+    assert upload["previous_access"] is None
+    assert upload["pwd_version"] == 1
+    assert result["replacedLink"] == OLD_LINK
+
+
+def test_a_live_link_with_no_page_id_is_not_on_record(publisher):  # noqa: F811
+    page = publisher.page("artifact")
+    assert link_owner_recorded(page, "", publish_url=publisher.endpoint) is False
+    assert link_owner_recorded(page, "", publish_url="https://llm.mdb.ai") is True
+
+
+@pytest.mark.parametrize("case", STATUS, ids=lambda case: case["name"])
+def test_the_status_route_carries_the_owner_record_only_for_a_live_link(monkeypatch, request, case):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    get_app_settings.cache_clear()
+    request.addfinalizer(get_app_settings.cache_clear)
+    monkeypatch.setattr(
+        artifact_routes, "_desktop_artifact_status_for_path",
+        lambda path, *, scope: ArtifactStatusView(published_url=case["published_url"]),
+    )
+    monkeypatch.setattr(publish, "published_link_owner_recorded", lambda path, *, scope: case["recorded"])
+    res = TestClient(cowork_server.create_app()).get("/api/v1/artifacts/status", params={"path": "/p/artifact/index.html"})
+    assert res.status_code == 200, res.text
+    assert res.json()["linkOwnerRecorded"] is case["link_owner_recorded"]

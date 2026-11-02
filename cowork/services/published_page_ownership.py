@@ -7,7 +7,6 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 from uuid import UUID
 
@@ -19,7 +18,7 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
-from cowork.models.published_page import PublishedPageOwner
+from cowork.models.published_page import PageClaim, PublishedPageOwner
 from cowork.models.setting import Setting
 from cowork.services.providers import is_mindshub_publish_url, normalize_publish_url
 from cowork.services.shared_resources import (
@@ -56,17 +55,6 @@ def find_owner(session: Session, publisher: str, report_id: str) -> PublishedPag
         PublishedPageOwner.publisher_key == publisher,
         PublishedPageOwner.report_id == report_id,
     )).first()
-
-
-class PageClaim(StrEnum):
-    """What an artifact's recorded page id is to the person acting on it."""
-
-    OWNED = "owned"
-    # No owner record names the page, as for one published before Cowork
-    # recorded owners on a stack whose projects were shared.
-    NO_OWNER_RECORD = "no_owner_record"
-    # The owner record names another artifact.
-    OTHER_ARTIFACT = "other_artifact"
 
 
 @dataclass
@@ -193,8 +181,11 @@ def link_owner_recorded(artifact: Path, report_id: str, *, publish_url: str) -> 
     always on a publisher Cowork doesn't protect, and on one it does, only when
     an owner record names the page for this artifact. None when the database
     can't be asked. Reads without a lock."""
-    if not protects_publisher(publish_url) or not report_id:
+    if not protects_publisher(publish_url):
         return True
+    if not report_id:
+        # Stop sharing can't send a page id it doesn't have, so the page stays.
+        return False
     try:
         with Session(get_engine(get_app_settings().database.uri)) as session:
             row = find_owner(session, publisher_key(publish_url), report_id)
