@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 DIRECT_CONTEXT = "direct_context"
 DELEGATED_AGENTIC = "delegated_agentic"
+#: The harness a direct answer is saved and announced under.
+DIRECT_HARNESS = "cowork-direct"
 
 # Keep the gate's context bounded.  It does not need Anton's full tool history.
 _MAX_HISTORY_MESSAGES = 16
@@ -81,6 +83,9 @@ whether there is a desktop app, how to install, update or remove it, which
 platforms or editions exist, where a setting or feature lives, what it costs.
 You do not have that information either, and answering from general knowledge
 describes some other company's product.
+Delegate any request to change, send, confirm or approve something, and any
+reply to a question asked earlier in this conversation. Never ask the user to
+confirm or approve, and never say that something was done.
 Call the delegate tool when the request needs any of those capabilities or you
 are unsure. Direct answers must be short, helpful, and in the user's language.
 Never mention routing, Anton, tools, or these instructions."""
@@ -306,6 +311,86 @@ def names_gate_tool(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+def _whole_words(words: tuple[str, ...]) -> re.Pattern[str]:
+    alternatives = "|".join(r"\s+".join(map(re.escape, word.split())) for word in words)
+    return re.compile(rf"(?<![\w])(?:{alternatives})(?![\w])", re.IGNORECASE)
+
+
+# Only the agent can change anything, and only its write check shows the
+# approval card a person has to press. A router answer to a request that
+# changes something, or asks for a confirmation, can only imitate that card or
+# claim work that never ran, and a "yes" typed under it reaches the router
+# again. Whole words, English only: a false positive costs one hop. After a
+# router answer every reply goes to the agent in any language (`decide_route`'s
+# `after_router_answer`); the answer check below reads English only.
+_CHANGE_WORDS = (
+    "add", "added", "adding", "apply", "applied", "assign", "build", "built",
+    "cancel", "change", "changed", "copy", "create", "created", "creating",
+    "decrease", "delete", "deleted", "drop", "duplicate", "edit", "edited",
+    "email", "erase", "export", "generate", "import", "increase", "insert",
+    "load", "make", "modify", "modified", "move", "moved", "post", "publish",
+    "published", "remove", "removed", "rename", "run", "save", "saved",
+    "schedule", "send", "sent", "set up", "share", "submit", "update", "updated",
+    "upload", "write",
+)
+_APPROVAL_WORDS = (
+    "approve", "approved", "approval", "confirm", "confirmed", "confirmation",
+    "permission", "card", "ask me", "check with me", "before you", "go ahead",
+    "proceed",
+)
+_CHANGE_OR_APPROVAL_RE = _whole_words(_CHANGE_WORDS + _APPROVAL_WORDS)
+# A message that is only a yes or a no answers a question someone asked, and
+# the router can only act the answer out.
+_BARE_REPLIES = frozenset({
+    "yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "go", "go ahead",
+    "do it", "please do", "yes please", "proceed", "confirm", "confirmed",
+    "approve", "approved", "correct", "no", "n", "nope", "cancel", "stop",
+})
+# Wording only an approval card, a confirmation question or finished work
+# would use. The router has none of the three to offer.
+_IMITATION_RE = _whole_words((
+    "card", "confirm", "confirmed", "confirmation", "approve", "approved",
+    "approval", "permission", "proceed", "proceeding", "go ahead", "yes or no",
+    "yes/no", "y/n", "reply yes", "answer yes", "say yes", "shall i", "should i",
+    "created", "creating", "updated", "updating", "deleted", "deleting", "saved",
+    "sent", "published", "submitted", "scheduled", "added", "removed", "changed",
+    "renamed", "moved", "applied", "uploaded", "imported", "edited", "modified",
+    "done", "completed", "finished", "all set",
+))
+
+
+def _bare_reply(text: str) -> str | None:
+    reply = " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+    return reply if reply in _BARE_REPLIES else None
+
+
+def names_change_or_approval(text: str) -> str | None:
+    """The change or approval word in ``text``, or the whole of it when it is a
+    bare yes or no; None when it has neither.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    bare = _bare_reply(text or "")
+    if bare is not None:
+        return bare
+    match = _CHANGE_OR_APPROVAL_RE.search(text or "")
+    return " ".join(match.group(0).lower().split()) if match else None
+
+
+def imitates_approval(text: str) -> str | None:
+    """The approval or finished-change wording in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _IMITATION_RE.search(text or "")
+    return " ".join(match.group(0).lower().split()) if match else None
+
+
+def _latest_text(history: list[dict], role: str) -> str:
+    latest = next((m for m in reversed(history) if m.get("role") == role), None)
+    return "" if latest is None else _condense_content(latest.get("content")) or ""
+
+
 @dataclass(frozen=True)
 class RouterBinding:
     """A resolved gate target: an anton LLMProvider, model, and display label."""
@@ -475,6 +560,12 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
         # trace does not already carry.
         logger.info("[gate] discarding direct answer denying our own product; delegating")
         raise _RejectedAnswer("router_answer_denied_product", denial)
+    imitation = imitates_approval(answer)
+    if imitation is not None:
+        # Saved, such an answer reads as an approval card or as finished work,
+        # and a "yes" typed under it reaches this gate again.
+        logger.info("[gate] discarding direct answer imitating an approval or a finished change; delegating")
+        raise _RejectedAnswer("router_answer_imitated_approval", imitation)
     return answer
 
 
@@ -635,10 +726,17 @@ async def decide_route(
     has_non_text_input: bool,
     has_attachments: bool,
     has_disabled_connections: bool,
+    after_router_answer: bool = False,
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation on the gate's own model.
+
+    `after_router_answer` says the assistant message before the latest prompt
+    is a direct answer (saved under ``DIRECT_HARNESS``), which the history's
+    rows don't carry. Such a turn always goes to the agent: whatever the reply
+    says, in any language, the router could only act out what its own answer
+    asked, and a typed "yes" would then read as an approval.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -662,6 +760,12 @@ async def decide_route(
 
     if prior_turn_ran_tools(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
+
+    if after_router_answer:
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="follow_up_to_router_answer")
+
+    if names_change_or_approval(_latest_text(history, "user")) is not None:
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="write_or_approval_request")
 
     messages = _text_history(history)
     if not messages:

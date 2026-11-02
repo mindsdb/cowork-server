@@ -35,6 +35,7 @@ from cowork.handlers.first_take import FirstTake, clears_take as first_take_clea
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    DIRECT_HARNESS,
     _MAX_HISTORY_MESSAGES,
     _settings_binding,
     _text_history,
@@ -622,6 +623,12 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
             retry_after=retry_after, retry_at=retry_at_instant(retry_after), request_id=request_id,
         )
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
+
+
+def _last_answer_harness(rows: list[Message]) -> str | None:
+    """The harness of the newest assistant row in `rows`, oldest first; None without one."""
+    answer = next((row for row in reversed(rows) if row.role == Role.assistant), None)
+    return None if answer is None else answer.harness
 
 
 def _first_take_binding(
@@ -1225,6 +1232,7 @@ class ResponsesHandler:
                         has_non_text_input=has_non_text_input,
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
+                        after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
                         binding=binding,
                         binding_factory=binding_for_turn,
                     )
@@ -1363,7 +1371,7 @@ class ResponsesHandler:
                 service = ConversationService(session)
                 user_message = service.save_user_message(conversation_id, original_content)
                 assistant_message = service.save_assistant_turn(
-                    conversation_id, text, events, harness="cowork-direct",
+                    conversation_id, text, events, harness=DIRECT_HARNESS,
                 )
                 return _turn_anchor_id(user_message, assistant_message)
 
@@ -1480,7 +1488,7 @@ class ResponsesHandler:
             service = ConversationService(session)
             user_message = service.save_user_message(conv_id, original_content)
             assistant_message = service.save_assistant_turn(
-                conv_id, route.text, events, harness="cowork-direct",
+                conv_id, route.text, events, harness=DIRECT_HARNESS,
             )
             return _DirectTurn(
                 user_message_id=user_message.id,
@@ -1518,7 +1526,7 @@ class ResponsesHandler:
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "run_id": lifecycle.identity.run_id,
-                "harness": "cowork-direct",
+                "harness": DIRECT_HARNESS,
                 "user_message_id": str(saved.user_message_id),
                 "response": response.model_dump(),
             })})
