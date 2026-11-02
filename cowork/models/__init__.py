@@ -1,3 +1,4 @@
+from cowork.models.artifact_owner_choice import ArtifactOwnerChoice  # noqa: F401
 from cowork.models.channel import (  # noqa: F401
     ChannelBinding,
     ChannelEvent,

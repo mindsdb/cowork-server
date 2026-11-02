@@ -98,7 +98,8 @@ async def remote_turn_events(
             workspace=workspace,
             started_at=ResponsesHandler._remote_started_at(session, conv_id),
             # A channel turn has no member behind it: the fail-closed set,
-            # the org-wide skills, and never the whole skills volume.
+            # the skills shared with everyone, and never a fallback to a
+            # mounted skills tree.
             skills=remote_turn_skills(session, conv_id),
             correlation_id=correlation_id,
             llm=llm,

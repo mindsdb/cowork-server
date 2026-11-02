@@ -366,10 +366,18 @@ def test_shared_resource_audit_upgrade_and_downgrade(tmp_path, monkeypatch):
     assert _has_table(db_path, "shared_resource_mutations")
 
 
+# Org and person ids as SQLite holds a UUID column: 32 hex digits.
+_ORG = uuid.UUID(int=1).hex
+_OTHER_ORG = uuid.UUID(int=2).hex
+_ALICE = uuid.UUID(int=3).hex
+_LOCAL_PERSON = uuid.UUID(int=0).hex
+
+
 def test_skill_sharing_tables_upgrade_and_downgrade(tmp_path, monkeypatch):
-    """ENG-3787, one revision: skill_access, one row per skill per org, and
+    """One revision: skill_access, one row per skill per org, and
     skill_user_setting, one person's own off per skill, one row per (org,
-    person, skill), including the desktop's rows, which carry no org."""
+    person, skill), including the desktop's rows, which carry no org and the
+    nil UUID for its one person."""
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
 
@@ -382,29 +390,29 @@ def test_skill_sharing_tables_upgrade_and_downgrade(tmp_path, monkeypatch):
     with engine.begin() as connection:
         insert = text(
             "INSERT INTO skill_access (id, org_id, skill_slug, org_allowed, always_on) "
-            "VALUES (:id, 'org', 'notes', 0, 0)"
+            "VALUES (:id, :org, 'notes', 0, 0)"
         )
-        connection.execute(insert, {"id": "a" * 32})
+        connection.execute(insert, {"id": "a" * 32, "org": _ORG})
         row = connection.execute(text("SELECT allowed_team_ids, allowed_user_ids FROM skill_access")).one()
         assert tuple(row) == ("[]", "[]")
         with pytest.raises(IntegrityError):
             with connection.begin_nested():
-                connection.execute(insert, {"id": "b" * 32})
+                connection.execute(insert, {"id": "b" * 32, "org": _ORG})
 
         setting = text(
             "INSERT INTO skill_user_setting (id, org_id, user_id, skill_slug, enabled) "
             "VALUES (:id, :org, :user, :slug, 0)"
         )
-        connection.execute(setting, {"id": "c" * 32, "org": "org", "user": "alice", "slug": "notes"})
-        connection.execute(setting, {"id": "d" * 32, "org": None, "user": "local", "slug": "pdf"})
+        connection.execute(setting, {"id": "c" * 32, "org": _ORG, "user": _ALICE, "slug": "notes"})
+        connection.execute(setting, {"id": "d" * 32, "org": None, "user": _LOCAL_PERSON, "slug": "pdf"})
         # Another org's row, and the same person's no-org row, are distinct.
-        connection.execute(setting, {"id": "e" * 32, "org": "other", "user": "alice", "slug": "notes"})
-        connection.execute(setting, {"id": "f" * 32, "org": None, "user": "alice", "slug": "notes"})
+        connection.execute(setting, {"id": "e" * 32, "org": _OTHER_ORG, "user": _ALICE, "slug": "notes"})
+        connection.execute(setting, {"id": "f" * 32, "org": None, "user": _ALICE, "slug": "notes"})
         for duplicate in (
-            {"id": "1" * 32, "org": "org", "user": "alice", "slug": "notes"},
+            {"id": "1" * 32, "org": _ORG, "user": _ALICE, "slug": "notes"},
             # NULLs are distinct in the org-keyed constraint; the partial
             # index still refuses a second no-org row.
-            {"id": "2" * 32, "org": None, "user": "local", "slug": "pdf"},
+            {"id": "2" * 32, "org": None, "user": _LOCAL_PERSON, "slug": "pdf"},
         ):
             with pytest.raises(IntegrityError):
                 with connection.begin_nested():
@@ -416,6 +424,106 @@ def test_skill_sharing_tables_upgrade_and_downgrade(tmp_path, monkeypatch):
     _upgrade_to(engine, uri, "head")
     assert _has_table(db_path, "skill_access")
     assert _has_table(db_path, "skill_user_setting")
+
+
+def test_the_sharing_tables_key_every_org_and_person_by_uuid(tmp_path, monkeypatch):
+    """The migrations type each org and person id of the sharing tables as a
+    UUID column, as their models do, so a value that isn't a UUID can't be
+    stored under them; the audience lists stay JSON."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sharing-uuid-columns.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    columns = {
+        (table, column["name"]): column
+        for table in ("skill_access", "skill_user_setting", "artifact_owner_choices")
+        for column in inspect(engine).get_columns(table)
+    }
+    uuid_columns = [
+        ("skill_access", "org_id"),
+        ("skill_access", "owner_user_id"),
+        ("skill_user_setting", "org_id"),
+        ("skill_user_setting", "user_id"),
+        ("artifact_owner_choices", "org_id"),
+        ("artifact_owner_choices", "owner_user_id"),
+    ]
+    # SQLite holds sa.Uuid as CHAR(32), the 32 hex digits.
+    assert {key: str(columns[key]["type"]) for key in uuid_columns} == dict.fromkeys(uuid_columns, "CHAR(32)")
+    assert (
+        columns[("skill_access", "org_id")]["nullable"],
+        columns[("skill_access", "owner_user_id")]["nullable"],
+        columns[("skill_user_setting", "org_id")]["nullable"],
+        columns[("skill_user_setting", "user_id")]["nullable"],
+    ) == (False, True, True, False)
+    assert {str(columns[("skill_access", name)]["type"]) for name in ("allowed_team_ids", "allowed_user_ids")} == {
+        "JSON"
+    }
+
+
+def test_a_skill_sharing_downgrade_takes_the_backfill_marker_with_the_rows(tmp_path, monkeypatch):
+    """The marker that says an org's skills from before sharing got their
+    rows lives in settings, not beside the rows. Left behind by a downgrade,
+    it would tell a re-upgrade's first read the empty table was backfilled,
+    and every legacy skill would read as its creator's alone. The downgrade
+    deletes it and leaves other settings as they are."""
+    from cowork.services.skill_access import BACKFILL_SETTING_KEY
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "skill-backfill-marker.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    with engine.begin() as connection:
+        _insert_setting(connection, key=BACKFILL_SETTING_KEY, value="1", scope="org", org_id=_ORG)
+        _insert_setting(connection, key="tone", value="balanced", scope="org", org_id=_ORG)
+
+    _downgrade_to(engine, uri, "a3734c9e5210")
+    with engine.connect() as connection:
+        keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
+    assert BACKFILL_SETTING_KEY not in keys
+    assert "tone" in keys
+    _upgrade_to(engine, uri, "head")
+    with engine.connect() as connection:
+        marker = connection.execute(
+            text("SELECT count(*) FROM settings WHERE key = :key"), {"key": BACKFILL_SETTING_KEY}
+        ).scalar_one()
+    assert marker == 0
+
+
+def test_artifact_owner_choices_upgrade_and_downgrade(tmp_path, monkeypatch):
+    """One row per artifact per organization, keyed by its authorization key;
+    the downgrade drops the table, so a re-upgrade never judges a re-publish
+    against a choice the owner changed on the older version."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact-owner-choices.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "artifact_owner_choices")
+    insert = text(
+        "INSERT INTO artifact_owner_choices (id, org_id, artifact_key, access_mode, published, owner_user_id) "
+        "VALUES (:id, :org, 'artifact/1', 'password', 1, :owner)"
+    )
+    with engine.begin() as connection:
+        connection.execute(insert, {"id": "a" * 32, "org": _ORG, "owner": _ALICE})
+        connection.execute(insert, {"id": "b" * 32, "org": _OTHER_ORG, "owner": _ALICE})
+        with pytest.raises(IntegrityError):
+            with connection.begin_nested():
+                connection.execute(insert, {"id": "c" * 32, "org": _ORG, "owner": _ALICE})
+
+    _downgrade_to(engine, uri, "c5a8e2f1d7b3")
+    assert not _has_table(db_path, "artifact_owner_choices")
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "artifact_owner_choices")
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM artifact_owner_choices")).scalar_one() == 0
 
 
 # ── ENG-338: attachment purpose re-keying (f7d2b9e4a1c6) ─────────────────

@@ -5,17 +5,18 @@ from pydantic import Field
 from cowork.schemas.base import CamelResponse
 
 
-class HubPersonRow(CamelResponse):
+class MindsHubPersonRow(CamelResponse):
     id: str
     name: str = ""
     email: str = ""
 
 
-class HubPeopleView(CamelResponse):
+class MindsHubPeopleView(CamelResponse):
     """The org directory, or the members among some ids. ``reachable`` false
-    means auth could not be asked, which a client must not read as "nobody"."""
+    means MindsHub could not be asked, which a client must not read as
+    "nobody"."""
 
     reachable: bool = False
-    people: list[HubPersonRow] = Field(default_factory=list)
+    people: list[MindsHubPersonRow] = Field(default_factory=list)
     # The directory only: the org has more members than it returns.
     truncated: bool = False

@@ -1,10 +1,24 @@
 from datetime import datetime
-from typing import Literal
+from enum import StrEnum
 
 from pydantic import AliasChoices, Field
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 from cowork.schemas.shared_resources import ResourceAttribution, SkillCapabilities
+
+
+class SkillSection(StrEnum):
+    """The skills page's bucket a skill is listed under for the caller, by
+    who it is shared with (cowork.services.skill_sharing.SkillViewer.section)."""
+
+    # Their own, shared with nobody or only with people.
+    MINE = "mine"
+    # Someone else's, shared with the caller personally.
+    SHARED_WITH_ME = "shared_with_me"
+    # Shared with a team the caller is in, or their own shared with a team.
+    TEAM = "team"
+    # Shared with everyone at the org (or its default team).
+    ORG = "org"
 
 
 class SkillCreateRequest(CamelRequest):
@@ -22,12 +36,13 @@ class SkillCreateRequest(CamelRequest):
 class SkillSharingRequest(CamelRequest):
     """Who one skill is shared with.
 
-    Hosted org mode (ENG-3787) reads the skill's access, named as auth's
-    ArtifactAccess names it: ``org_allowed`` (everyone in the org),
-    ``allowed_team_ids``, ``allowed_user_ids`` (Keycloak ids of people in the
-    org) and ``always_on`` (put an org-wide or team skill in every turn's
-    prompt instead of recalling it on demand). Each is accepted in camelCase
-    too; a field left out keeps what the skill has. Elsewhere, where a person
+    MindsHub mode reads the skill's audience, under MindsHub's artifact rule
+    names (cowork.services.sharing_contract.AudienceField): ``org_allowed``
+    (everyone at the org), ``allowed_team_ids``, ``allowed_user_ids`` (user
+    ids of people in the org) and ``always_on`` (put a skill shared with
+    everyone or a team in every turn's prompt of the org or the team instead
+    of recalling it on demand). Each is accepted in camelCase too; a field
+    left out keeps what the skill has. In single-tenant mode, where a person
     shares their own skills one at a time, ``shared`` shares one with
     everyone, read-only, or stops sharing it.
     """
@@ -40,11 +55,12 @@ class SkillSharingRequest(CamelRequest):
 
 
 class SkillAccessView(CamelResponse):
-    """Who a skill is shared with in hosted org mode (its skill_access row).
+    """Who a skill is shared with in MindsHub mode (its skill_access row).
     All empty elsewhere. ``allowed_user_ids`` is listed only to whoever may
-    change it (owner or admin). ``always_on``: an org-wide or team skill in
-    every turn's prompt; false for one recalled on demand, a built-in, a
-    managed skill, and outside hosted org mode."""
+    change it (owner or admin). ``always_on``: a skill shared with everyone
+    or a team, in every turn's prompt of the org or the team; false for one
+    recalled on demand, a built-in, a managed skill, and outside MindsHub
+    mode."""
 
     org_allowed: bool = False
     allowed_team_ids: list[str] = Field(default_factory=list)
@@ -53,8 +69,8 @@ class SkillAccessView(CamelResponse):
 
 
 class SkillOwner(CamelResponse):
-    """The skill's owner, by Keycloak id. ``email`` only when the owner is
-    the caller; anyone else is named through GET /hub/people/?ids=."""
+    """The skill's owner, by user id. ``email`` only when the owner is the
+    caller; anyone else is named through GET /hub/people/?ids=."""
 
     id: str | None = None
     email: str | None = None
@@ -110,13 +126,11 @@ class SkillResponse(CamelResponse):
     # left shared, also one someone else created, read-only for the caller.
     shared: bool = False
     capabilities: SkillCapabilities
-    # Hosted org sharing (ENG-3787). Outside it: section "mine" (managed
-    # skills "org"), can_edit as capabilities.can_edit, access all empty.
+    # Sharing in MindsHub mode. Outside it: section "mine" (managed skills
+    # "org"), can_edit as capabilities.can_edit, access all empty.
     access: SkillAccessView = Field(default_factory=SkillAccessView)
-    # The skills page's bucket for the caller, by audience (the owner's
-    # too): "org" (org-wide), else "team" (shared with a team), else "mine"
-    # (their own, shared with nobody or only people), else "shared_with_me".
-    section: Literal["mine", "shared_with_me", "team", "org"] = "mine"
+    # The skills page's bucket for the caller, by audience (the owner's too).
+    section: SkillSection = SkillSection.MINE
     can_edit: bool = False
     owner: SkillOwner = Field(default_factory=SkillOwner)
 
@@ -129,10 +143,18 @@ class SkillListResponse(CamelResponse):
 
 
 class SkillSharingCapabilities(CamelResponse):
-    """What the caller may do with skill sharing. ``enabled`` is hosted org
-    mode; an admin holds both capabilities."""
+    """What the caller may do with sharing (GET /skills/sharing-capabilities).
+    ``enabled`` is MindsHub mode. The three capabilities are MindsHub's
+    ``skills.share_org``, ``skills.write_org`` and ``artifacts.share_org``;
+    an admin holds all three. ``permissions_known`` false means MindsHub
+    couldn't be asked for the caller's permissions, so a false capability
+    is "couldn't ask", not "may not"; ``teams_known`` false means the same
+    for the caller's teams. Both are true outside MindsHub mode, where there
+    is nothing to ask."""
 
     enabled: bool = False
-    can_share_org: bool = False
-    can_write_org: bool = False
-    org_name: str | None = None
+    can_share_skills_org: bool = False
+    can_write_skills_org: bool = False
+    can_share_artifacts_org: bool = False
+    permissions_known: bool = False
+    teams_known: bool = False
