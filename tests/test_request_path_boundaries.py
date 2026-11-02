@@ -190,10 +190,10 @@ async def test_status_path_only_selects_a_server_built_card(tmp_path, monkeypatc
         scope=LOCAL_SCOPE, path=str(folder / "does-not-exist")
     )
 
-    assert result["publishedUrl"] == "https://example.test/artifact"
-    assert result["modified"] is False
-    assert outside["publishedUrl"] == ""
-    assert missing_child["publishedUrl"] == ""
+    assert result.published_url == "https://example.test/artifact"
+    assert result.modified is False
+    assert outside.published_url == ""
+    assert missing_child.published_url == ""
 
 
 @pytest.mark.asyncio
@@ -226,7 +226,9 @@ async def test_status_lookup_preserves_published_loose_files(tmp_path, monkeypat
     )
     monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda *, scope: [source])
 
-    result = await artifacts.artifact_status(scope=LOCAL_SCOPE, path=str(loose))
+    result = (await artifacts.artifact_status(scope=LOCAL_SCOPE, path=str(loose))).model_dump(
+        by_alias=True, mode="json"
+    )
 
     assert result["publishedUrl"] == "https://example.test/legacy"
     assert result["accessMode"] == "password"

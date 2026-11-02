@@ -213,12 +213,10 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
     assert calls[0][1]["artifacts_base"] == folder.parent
     assert calls[0][1]["api_key"] == "turn-key"
     assert calls[0][1]["publish_url"] == "https://api.staging.example"
-    assert calls[0][1]["access"] == {
-        "mode": "restricted",
-        "emails": ["viewer@example.com"],
-        "org_allowed": False,
-        "owner_only": False,
-    }
+    # The restricted mode, naming nobody: the publish reads who the artifact
+    # is shared with from MindsHub's rule, never from the entry an
+    # agent can write (cowork.services.publish._plan_access).
+    assert calls[0][1]["access"].publisher_access() == {"mode": "restricted", "owner_only": True}
     assert calls[0][1]["scope"] is ORG_SCOPE
     assert revoked == [True]
     assert calls[0][1]["project_id"] == "project-1"
@@ -258,7 +256,7 @@ async def test_desktop_save_uses_the_configured_publish_environment(artifact, mo
     assert result is True
     assert calls[0][1]["api_key"] == "desktop-key"
     assert calls[0][1]["publish_url"] == "https://api.desktop.example"
-    assert calls[0][1]["access"] == {"mode": "public"}
+    assert calls[0][1]["access"].publisher_access() == {"mode": "public"}
     assert calls[0][1]["scope"] is LOCAL_SCOPE
 
 
@@ -416,4 +414,44 @@ async def test_a_too_large_artifact_stops_live_sync_without_a_traceback(artifact
     record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
     assert "too large to publish" in record.getMessage()
     assert record.exc_info is None
+    assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True
+
+
+@pytest.mark.asyncio
+async def test_a_refused_share_with_everyone_stops_live_sync_with_one_warning(artifact, monkeypatch, caplog):
+    """A desktop entry still asks for everyone after the rule stopped sharing
+    with everyone, and MindsHub refuses the re-publish. The edit stays saved,
+    and the refusal, which repeats on every save, is the upload classifier's
+    one warning: the sync adds no second record and no stack."""
+    import io
+    import logging
+    import urllib.error
+
+    from cowork.services.publish import ShareOrgRequired, classify_upload_error
+
+    folder, _metadata = artifact
+    _publish(folder, {"mode": "restricted", "emails": [], "org_allowed": True})
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("desktop-key", "https://api.desktop.example"),
+    )
+    body = json.dumps({
+        "error": "Sharing an artifact with everyone in the organization needs the artifacts.share_org permission.",
+        "code": "share_org_required",
+    }).encode()
+
+    def refused(*_args, **_kwargs):
+        classify_upload_error(urllib.error.HTTPError(
+            "https://publish.example/upload", 403, "Forbidden", {}, io.BytesIO(body),
+        ))
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", refused)
+
+    with caplog.at_level(logging.WARNING):
+        assert await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder) is False
+
+    assert [(r.name, r.levelno, r.exc_info) for r in caplog.records] == [
+        ("cowork.services.publish", logging.WARNING, None),
+    ]
+    assert ShareOrgRequired.code == caplog.records[0].reason
     assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True
