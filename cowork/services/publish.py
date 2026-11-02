@@ -304,25 +304,28 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     raise typed from exc
 
 
-# The upload service's answers that come before it writes the artifact's
-# rule, its access gate or its files. 401, 402 and 403 come from its first
-# step, which authorizes the caller, or from API Gateway. A 403
-# share_org_required and a 409 with no code can also be MindsHub refusing the
-# rule's write, which rolls that write back. Every other 409 is a check of the
-# report, its key or its owner, made before the rule's write. 410 says the
-# publish host moved, which it checks first. 413 and 429 are API Gateway's
-# size limit and throttling, answered before the upload service runs. A 400
-# is not here: a full-stack bundle can be refused with one after its files
-# are uploaded.
+# The answers of MindsHub's upload service that come before it writes the
+# artifact's rule, its access gate or its files. 401, 402 and 403 come from
+# its first step, which authorizes the caller, or from the edge (Cloudflare
+# or API Gateway) before the upload service runs. A 403 share_org_required
+# and a 409 with no code can also be MindsHub refusing the rule's write,
+# which rolls that write back. Every other 409 is a check of the report, its
+# key or its owner, made before the rule's write. 410 says the publish host
+# moved, which it checks first. 413 and 429 are the edge's size limit and
+# throttling, answered before the upload service runs. A 400 is not here: a
+# full-stack bundle can be refused with one after its files are uploaded.
+# Another publisher can answer any of these after it writes, so only
+# MindsHub's own service is judged by them (_restore_after_refused_save).
 _REFUSED_BEFORE_WRITING = frozenset({401, 402, 403, 409, 410, 413, 429})
 
 
 def _refused_before_writing(exc: Exception) -> bool:
-    """Whether a publish that raised ``exc`` ended before the upload service
-    changed who can open the artifact or what it serves. By status alone:
-    anton reads a 409's body before it re-raises the error
-    (anton.publisher._raise_if_owned_by_other_user). anton's own refusal of a
-    state schema change comes before the request."""
+    """Whether a publish that raised ``exc`` ended before MindsHub's upload
+    service changed who can open the artifact or what it serves. By status
+    alone, never the code in the answer's body: anton raises the service's
+    409 for another owner's artifact as ArtifactOwnedByOtherUserError, and
+    every other answer as an HTTPError with the service's status. anton's
+    own refusal of a state schema change comes before the request."""
     from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked
 
     if isinstance(exc, (ArtifactOwnedByOtherUserError, StatePublishBlocked)):
@@ -331,26 +334,34 @@ def _refused_before_writing(exc: Exception) -> bool:
 
 
 def _restore_after_refused_save(
+    *,
     narrowing: Narrowing | None,
     exc: Exception,
-    *,
+    publish_url: str,
     scope: TenantScope | None,
     project_id: str | None,
     artifact_slug: str,
 ) -> None:
-    """After the owner's save narrowed the record (``narrowing``) and its
-    upload ended with ``exc`` before writing anything, put the record back
-    (artifact_owner_choice.restore_after_refused_save). Any other ending
-    leaves it narrowed. A restore that fails leaves it narrowed too, which
-    only refuses wider re-publishes, and is logged: the save answers with
-    the upload's refusal either way."""
-    if narrowing is None or scope is None or not _refused_before_writing(exc):
+    """After the owner's save narrowed the record (``narrowing``) and
+    MindsHub's upload service refused it before writing anything (``exc``),
+    put the record back (artifact_owner_choice.restore_after_refused_save).
+    Any other ending leaves it narrowed, and so does any refusal from a
+    publisher that isn't MindsHub's (is_mindshub_publish_url), whose order
+    of writes this can't know. A restore that fails leaves it narrowed too,
+    which only refuses wider re-publishes, and is logged: the save answers
+    with the upload's refusal either way."""
+    if (
+        narrowing is None
+        or scope is None
+        or not is_mindshub_publish_url(publish_url)
+        or not _refused_before_writing(exc)
+    ):
         return
     from cowork.services.artifact_access import ArtifactAccessUnavailable
     from cowork.services.artifact_owner_choice import restore_after_refused_save
 
     try:
-        restore_after_refused_save(narrowing, scope=scope)
+        restore_after_refused_save(narrowing=narrowing, scope=scope)
     except ArtifactAccessUnavailable:
         logger.warning(
             "Could not restore the sharing an artifact's owner chose after the upload service refused their save",
@@ -1124,8 +1135,8 @@ def publish_artifact(
     every other publish is checked against that record before anything
     uploads: one wider than the owner's choice is refused the same way. The
     save narrows the record before its upload, and puts back what it
-    narrowed when the upload service refuses it before writing anything
-    (_refused_before_writing).
+    narrowed when MindsHub's upload service refuses it before writing
+    anything (_refused_before_writing).
     """
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
@@ -1223,7 +1234,7 @@ def publish_artifact(
         # anything is uploaded when it would open the artifact wider. The
         # owner's own save narrows the record before the upload, records its
         # choice once the upload is live, and puts back what it narrowed when
-        # the upload service refuses it before writing anything.
+        # MindsHub's upload service refuses it before writing anything.
         chosen = (
             OwnerChoice(
                 access_mode=AccessMode(owner_side.get("mode", AccessMode.PUBLIC)), published=True
@@ -1253,19 +1264,25 @@ def publish_artifact(
         # and unpublish all key off the file the user actually sees.
         publish_source = publish_target
         md_tmp_dir: tempfile.TemporaryDirectory | None = None
-        if not is_fullstack and publish_target.suffix.lower() == ".md":
-            md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
-            publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+        try:
+            if not is_fullstack and publish_target.suffix.lower() == ".md":
+                md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
+                publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
 
-        # Narrowed after the render, so a render that fails leaves the
-        # record as it was.
-        narrowing = (
-            narrow_before_save(
-                key=_rule_key(canonical_artifact_key, previous), chosen=chosen, scope=org_scope
+            # Narrowed after the render, so a render that fails leaves the
+            # record as it was.
+            narrowing = (
+                narrow_before_save(
+                    key=_rule_key(canonical_artifact_key, previous), chosen=chosen, scope=org_scope
+                )
+                if chosen is not None and owner_save
+                else None
             )
-            if chosen is not None and owner_save
-            else None
-        )
+        except BaseException:
+            # From the upload on, the finally below removes the rendered page.
+            if md_tmp_dir is not None:
+                md_tmp_dir.cleanup()
+            raise
 
         ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
         try:
@@ -1294,13 +1311,15 @@ def publish_artifact(
             # Not a failure to log or wrap: the upload service holds this
             # report_id for another account.
             _restore_after_refused_save(
-                narrowing, exc, scope=org_scope, project_id=project_id, artifact_slug=published_dir.name
+                narrowing=narrowing, exc=exc, publish_url=publish_url, scope=org_scope,
+                project_id=project_id, artifact_slug=published_dir.name,
             )
             raise PublishOwnedByOtherUser() from exc
         except Exception as exc:
             # Before classify_upload_error, which raises the typed refusal.
             _restore_after_refused_save(
-                narrowing, exc, scope=org_scope, project_id=project_id, artifact_slug=published_dir.name
+                narrowing=narrowing, exc=exc, publish_url=publish_url, scope=org_scope,
+                project_id=project_id, artifact_slug=published_dir.name,
             )
             upload_error = classify_upload_error(exc)
             logger.exception("Publishing failed")

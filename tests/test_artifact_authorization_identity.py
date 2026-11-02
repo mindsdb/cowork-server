@@ -808,12 +808,13 @@ def test_org_publish_reports_the_lambda_echo_when_it_differs(
 
 def _org_publisher(
     issuer, folder, scope, project, monkeypatch, *, view_url="https://view.test/1", echoed_key=None,
+    publish_url="https://view.test",
 ):
     """``(run, uploads)``: run(access, **kwargs) publishes ``folder`` in org
-    mode through anton's publisher, faked as the publish lambda (which writes
-    the rule's emails and org flag), and ``uploads`` lists what it was given.
-    The lambda answers ``view_url``, and ``echoed_key`` in place of the key
-    it was given when set."""
+    mode to ``publish_url`` through anton's publisher, faked as the publish
+    lambda (which writes the rule's emails and org flag), and ``uploads``
+    lists what it was given. The lambda answers ``view_url``, and
+    ``echoed_key`` in place of the key it was given when set."""
     uploads = []
 
     def publish(_source, **kwargs):
@@ -830,7 +831,7 @@ def _org_publisher(
             # MindsHub's names.
             access = ArtifactAccessRequest.of_publisher(access)
         return publish_artifact(
-            folder, artifacts_base=folder.parent, api_key="key", publish_url="https://view.test",
+            folder, artifacts_base=folder.parent, api_key="key", publish_url=publish_url,
             scope=scope, project_id=str(project.id), access=access, **kwargs,
         )
 
@@ -1718,12 +1719,14 @@ async def test_an_owners_save_narrows_the_record_before_anything_uploads(
 class UploadEnding(BaseModel):
     """One way an owner's save can end once its upload is under way
     (tests/fixtures/upload_endings.yaml): the upload service's answer, or an
-    error with no answer."""
+    error with no answer, and the error the save raises for it."""
 
     name: str
     status: int | None = None
     body: dict[str, str] = Field(default_factory=dict)
+    raw_body: str | None = None
     raises: Literal["timeout", "connection_error", "state_publish_blocked", "os_error"] | None = None
+    save_raises: str
 
 
 class UploadEndings(BaseModel):
@@ -1737,6 +1740,9 @@ UPLOAD_ENDINGS = UploadEndings.model_validate(
 _SHARE_ORG_REQUIRED = next(e for e in UPLOAD_ENDINGS.restored if e.name == "share_org_required")
 # anton's publisher as it ships, taken before any test replaces it.
 _ANTON_PUBLISH = anton.publisher.publish
+# MindsHub's own publishing service, the one publisher whose refusals put the
+# owner's choice back (cowork.services.providers.is_mindshub_publish_url).
+_MINDSHUB_PUBLISH_URL = "https://view.mindshub.ai"
 
 
 def _upload_ends(monkeypatch, ending: UploadEnding, *, meanwhile=None) -> None:
@@ -1751,6 +1757,8 @@ def _upload_ends(monkeypatch, ending: UploadEnding, *, meanwhile=None) -> None:
             raise TimeoutError("The read operation timed out")
         if ending.raises == "connection_error":
             raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+        if ending.status == 200:
+            return (ending.raw_body or "").encode()
         body = io.BytesIO(json.dumps(ending.body).encode())
         raise urllib.error.HTTPError(url, ending.status, "Refused", {}, body)
 
@@ -1787,7 +1795,7 @@ async def test_a_save_mindshub_refuses_to_share_with_everyone_keeps_the_owners_p
     from cowork.services.publish import ShareOrgRequired
 
     _session, project, _conversation, folder = owned_artifact
-    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, publish_url=_MINDSHUB_PUBLISH_URL)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
 
     _upload_ends(monkeypatch, _SHARE_ORG_REQUIRED)
@@ -1809,19 +1817,20 @@ async def test_an_upload_refused_before_writing_puts_the_owners_choice_back(
     issuer, scope, local_id, owned_artifact, monkeypatch, caplog, ending
 ):
     """The owner of a public artifact saves a password, and the upload ends
-    before the upload service changed who can open the artifact or what it
-    serves. The record goes back to public, and a live sync still publishes
-    publicly."""
+    before MindsHub's upload service changed who can open the artifact or
+    what it serves. The save raises the refusal it always did, the record
+    goes back to public, and a live sync still publishes publicly."""
     from cowork.models.artifact_owner_choice import AccessMode
     from cowork.services.artifact_owner_choice import OwnerChoice
 
     _session, project, _conversation, folder = owned_artifact
-    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, publish_url=_MINDSHUB_PUBLISH_URL)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
 
     _upload_ends(monkeypatch, ending)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as raised:
         run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    assert type(raised.value).__name__ == ending.save_raises
     assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PUBLIC, published=True)
 
     run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
@@ -1829,6 +1838,28 @@ async def test_an_upload_refused_before_writing_puts_the_owners_choice_back(
         assert await _live_sync(folder, scope, project, monkeypatch) is True
     assert uploads[-1]["access"] == {"mode": "public"}
     assert _mode_changed_records(caplog) == []
+
+
+@pytest.mark.parametrize("ending", UPLOAD_ENDINGS.restored, ids=lambda ending: ending.name)
+def test_a_refusal_from_a_publisher_that_isnt_mindshubs_keeps_the_owners_choice_narrowed(
+    issuer, scope, local_id, owned_artifact, monkeypatch, ending
+):
+    """The organization publishes through a service other than MindsHub's,
+    whose order of writes nothing here knows, and that service refuses the
+    owner's save of a password. It may have written first, so the record
+    keeps the password, whatever the refusal."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice
+
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, publish_url="https://publish.example")
+    key = run({"mode": "public"}, owner_save=True)["artifactKey"]
+
+    _upload_ends(monkeypatch, ending)
+    with pytest.raises(Exception) as raised:
+        run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    assert type(raised.value).__name__ == ending.save_raises
+    assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PASSWORD, published=True)
 
 
 @pytest.mark.asyncio
@@ -1844,12 +1875,13 @@ async def test_an_upload_that_may_have_written_keeps_the_owners_choice_narrowed(
     from cowork.services.artifact_owner_choice import OwnerChoice
 
     _session, project, _conversation, folder = owned_artifact
-    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, publish_url=_MINDSHUB_PUBLISH_URL)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
 
     _upload_ends(monkeypatch, ending)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as raised:
         run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    assert type(raised.value).__name__ == ending.save_raises
     assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PASSWORD, published=True)
 
     run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
@@ -1858,6 +1890,14 @@ async def test_an_upload_that_may_have_written_keeps_the_owners_choice_narrowed(
     assert uploads == []
     [record] = _mode_changed_records(caplog)
     assert record.reason == "wider_than_owner_choice"
+
+
+def _markdown_artifact(folder) -> None:
+    """Make ``folder`` a Markdown artifact: its page is notes.md."""
+    (folder / "index.html").unlink()
+    (folder / "notes.md").write_text("# Notes\n")
+    metadata = json.loads((folder / "metadata.json").read_text())
+    (folder / "metadata.json").write_text(json.dumps({**metadata, "primary": "notes.md"}))
 
 
 def test_a_markdown_render_that_fails_leaves_the_owners_choice_as_it_was(
@@ -1869,10 +1909,7 @@ def test_a_markdown_render_that_fails_leaves_the_owners_choice_as_it_was(
     from cowork.services.artifact_owner_choice import OwnerChoice
 
     _session, project, _conversation, folder = owned_artifact
-    (folder / "index.html").unlink()
-    (folder / "notes.md").write_text("# Notes\n")
-    metadata = json.loads((folder / "metadata.json").read_text())
-    (folder / "metadata.json").write_text(json.dumps({**metadata, "primary": "notes.md"}))
+    _markdown_artifact(folder)
     run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
 
@@ -1883,6 +1920,44 @@ def test_a_markdown_render_that_fails_leaves_the_owners_choice_as_it_was(
     with pytest.raises(OSError):
         run({"mode": "password", "password": "owner-pw"}, owner_save=True)
     assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PUBLIC, published=True)
+
+
+def test_a_markdown_save_whose_narrowing_fails_removes_its_rendered_page(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """A Markdown artifact's save renders its page into a folder of its own,
+    then can't narrow the record because the database is down. The save
+    fails with that outage, and the folder is already gone while the
+    failure's traceback still holds the save, not left for garbage
+    collection."""
+    from cowork.services import artifact_owner_choice as choices
+    from cowork.services import publish as publish_module
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
+
+    _session, project, _conversation, folder = owned_artifact
+    _markdown_artifact(folder)
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run({"mode": "public"}, owner_save=True)
+
+    rendered = []
+    render = publish_module._render_markdown_to_html
+
+    def render_and_note(md_path, out_dir):
+        rendered.append(out_dir)
+        return render(md_path, out_dir)
+
+    def narrowing_fails(**_kwargs):
+        raise ArtifactAccessUnavailable("Could not record the sharing the artifact's owner chose")
+
+    monkeypatch.setattr("cowork.services.publish._render_markdown_to_html", render_and_note)
+    monkeypatch.setattr(choices, "narrow_before_save", narrowing_fails)
+    with pytest.raises(ArtifactAccessUnavailable) as raised:
+        run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    # The traceback keeps the save's frame, and with it the folder's
+    # TemporaryDirectory, alive: only the save itself can have removed it.
+    assert raised.value.__traceback__ is not None
+    [out_dir] = rendered
+    assert not out_dir.exists()
 
 
 @pytest.mark.parametrize("other_save", ("records_the_same_mode", "narrows_nothing"))
@@ -1901,7 +1976,7 @@ def test_a_save_that_started_since_keeps_its_write_over_a_refused_saves_restore(
     from cowork.services.artifact_owner_choice import OwnerChoice, narrow_before_save, record_owner_choice
 
     _session, project, _conversation, folder = owned_artifact
-    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, publish_url=_MINDSHUB_PUBLISH_URL)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
     password = OwnerChoice(AccessMode.PASSWORD, published=True)
 
@@ -1932,7 +2007,7 @@ def test_a_restore_that_cannot_reach_the_database_leaves_the_choice_narrowed_and
     from cowork.services.publish import ShareOrgRequired
 
     _session, project, _conversation, folder = owned_artifact
-    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch, publish_url=_MINDSHUB_PUBLISH_URL)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
     reachable = choices.authorization_session
 
