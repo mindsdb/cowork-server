@@ -396,6 +396,13 @@ def _artifact_id_from_path(artifact_id: UUID) -> str:
 ArtifactIdDep = Annotated[str, Depends(_artifact_id_from_path)]
 
 
+def _not_found_detail(exc: FileNotFoundError) -> str:
+    """A 404's detail. The service's own messages ("Revision not found") pass
+    through; an OS error carries the server's path, so it answers as a missing
+    artifact instead."""
+    return "Artifact not found" if exc.filename is not None else str(exc)
+
+
 class _SourceUpdateBody(BaseModel):
     content: str
     expectedRevisionId: str = Field(min_length=1, max_length=80)
@@ -644,7 +651,7 @@ async def artifact_source(
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -690,7 +697,7 @@ async def update_artifact_source(
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1233,7 +1240,7 @@ async def set_artifact_access(
         # Asking again gets the same answer, so never the retryable 503.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     # PublisherUnavailable and PublishRejected are RuntimeErrors, so they come first.
@@ -1371,7 +1378,7 @@ async def artifact_revision(
     try:
         return await run_in_threadpool(revision_with_content, folder, revision_id)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1413,7 +1420,7 @@ async def restore_artifact_revision(
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1474,7 +1481,7 @@ async def get_agent_repair(
     try:
         return await run_in_threadpool(agent_repair_detail, folder, repair_id)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1502,7 +1509,7 @@ async def release_agent_repairs_for_comment(
         )
         return {"released": released}
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1528,7 +1535,7 @@ async def cancel_queued_agent_repair(
             discard_ready=bool(body and body.discardReady),
         )
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1564,7 +1571,7 @@ async def decide_agent_repair(
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

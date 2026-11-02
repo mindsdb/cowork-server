@@ -1,0 +1,102 @@
+# Journal cases for tests/test_artifact_revision_journal.py, beside the planted
+# blob names in planted_content_hashes.yaml.
+
+# An open that fails for one of these reasons says nothing about what is on
+# disk. `at` is the folder whose open fails: the artifact folder, or its
+# `.revisions`.
+transient_open_failures:
+  - id: journal-folder-out-of-descriptors
+    at: journal_folder
+    errno: EMFILE
+  - id: journal-folder-io-error
+    at: journal_folder
+    errno: EIO
+  - id: artifact-folder-system-out-of-descriptors
+    at: artifact_folder
+    errno: ENFILE
+
+# Each reads the journal under the artifact's lock and then writes it, so an
+# empty read would replace the whole history or comment journal.
+writers_after_a_read:
+  - open_editor
+  - save
+  - turn_end_capture
+  - comment_create
+
+# A journal file left as a symbolic link to another artifact's. `{repair}` is
+# the id of a repair record both artifacts hold.
+linked_journal_files:
+  - id: manifest
+    name: manifest.json
+  - id: comments
+    name: comments.json
+  - id: draft-review-grant
+    name: draft-review.json
+  - id: repair
+    name: "repairs/{repair}.json"
+  - id: pending-source-write
+    name: pending-source-write.json
+
+# Writers that take no lock of their own, or take it after their first write,
+# each run first on a `.revisions` that is a link.
+first_writers_on_a_linked_journal:
+  - draft_review_grant
+  - comment
+  - agent_repair
+  - save
+
+# Pending source writes the server never writes. `record` fields replace those
+# of a server-shaped record that names a real blob, `raw` is written as is, and
+# `nested` is that many `[` characters.
+malformed_pending_writes:
+  - id: not-json
+    raw: "{not json"
+  - id: a-list
+    raw: "[1]"
+  - id: nested-too-deeply
+    nested: 100000
+  - id: another-version
+    record: {version: 2}
+  - id: paths-differ
+    record: {path: other.md}
+  - id: path-out-of-the-artifact
+    record: {path: ../../.env, revision_path: ../../.env}
+  - id: path-in-the-journal
+    record: {path: .revisions/x.md, revision_path: .revisions/x.md}
+  # No revision has a blank path, so a planted record names no base revision,
+  # the one base recovery would accept for it.
+  - id: empty-path
+    record: {path: "", revision_path: "", base_revision_id: null}
+  - id: blank-path
+    record: {path: "  ", revision_path: "  ", base_revision_id: null}
+
+# A pile of large repair records the agent's code planted. Records are read one
+# at a time, so a second pile on top of the first may not raise the peak memory
+# of a scan past the bound.
+repair_pile:
+  objects_per_record: 50000
+  records_per_pile: 3
+  peak_growth_bound: 1.4
+
+# Only the canonical spelling of a UUID names a repair record.
+repair_ids:
+  canonical:
+    - 0b4a3c1e-8f1d-4c6b-9a3e-2f5d7c8b9e10
+  refused:
+    - 0B4A3C1E-8F1D-4C6B-9A3E-2F5D7C8B9E10
+    - "{0b4a3c1e-8f1d-4c6b-9a3e-2f5d7c8b9e10}"
+    - 0b4a3c1e8f1d4c6b9a3e2f5d7c8b9e10
+    - urn:uuid:0b4a3c1e-8f1d-4c6b-9a3e-2f5d7c8b9e10
+    - escaped
+    - ".."
+    - ""
+
+# Names the journal helpers refuse before any open: each must name one child.
+names_with_more_than_one_part:
+  - ".."
+  - "."
+  - ""
+  - ../escaped.json
+  - blobs/../../escaped.json
+  - "a\\b"
+  - "a\0b"

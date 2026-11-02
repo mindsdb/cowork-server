@@ -1007,7 +1007,10 @@ class AntonHarness:
                         extra=log_context(conversation_id=conv_id),
                     )
             try:
-                changes = turn_artifact_changes(
+                # It waits on each touched artifact's lock and parses its
+                # journal, so it runs off the event loop the server shares.
+                changes = await asyncio.to_thread(
+                    turn_artifact_changes,
                     conversation_id=conv_id,
                     artifacts_base=artifacts_base,
                     before=before_slugs,
