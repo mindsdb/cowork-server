@@ -7,13 +7,16 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 
 from cowork.services.publish import (
     PublisherUnavailable,
+    ShareOrgRequired,
     activate_version as _activate_version,
     desktop_publish_context as _desktop_context,
     list_publishable,
@@ -86,7 +89,7 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep):
             api_key=api_key,
             publish_url=publish_url,
             password=req.password,
-            access=req.access.model_dump() if req.access else None,
+            access=ArtifactAccessRequest.of_publisher(req.access.model_dump()) if req.access else None,
             scope=scope,
         )
     except FileNotFoundError as e:
@@ -95,6 +98,9 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except PublisherUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ShareOrgRequired as e:
+        # MindsHub refused the share with everyone and nothing was published.
+        return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -109,6 +115,9 @@ async def update_artifact(req: _UpdateBody, scope: ScopeDep):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except PublisherUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ShareOrgRequired as e:
+        # MindsHub refused the share with everyone and nothing was published.
+        return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

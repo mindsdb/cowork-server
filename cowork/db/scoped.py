@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
+import sqlalchemy as sa
 from fastapi import Depends, Request
 from sqlalchemy import event, inspect
 from sqlalchemy.sql import Select
@@ -341,6 +344,16 @@ def _is_org_scoped(model: type) -> bool:
     return hasattr(model, "org_id")
 
 
+@cache
+def _org_id_is_uuid(model: type) -> bool:
+    """Whether ``model``'s org_id column is typed as a UUID (the skill
+    sharing tables and artifact_owner_choices), rather than the string the
+    older tables keep."""
+    table = getattr(model, "__table__", None)
+    column = table.c.get("org_id") if table is not None else None
+    return column is not None and isinstance(column.type, sa.Uuid)
+
+
 class ScopedSelect:
     """Statement built by ScopedSession.select — the only kind exec() runs.
 
@@ -401,9 +414,10 @@ class ScopedSession:
         # rows being cleaned up by their own tenant (e.g. cascades).
         for row in [*session.new, *session.dirty]:
             if self._partitions(type(row)):
+                org_id = self._org_id_for(type(row))
                 if row.org_id is None:
-                    row.org_id = self.scope.org_id
-                elif row.org_id != self.scope.org_id:
+                    row.org_id = org_id
+                elif row.org_id != org_id:
                     raise TenantMismatchError(
                         f"pending write on {type(row).__name__} with "
                         f"org_id={row.org_id!r} conflicts with scope "
@@ -418,7 +432,7 @@ class ScopedSession:
                 row.created_by = self.scope.user_id
         for row in session.deleted:
             if self._partitions(type(row)):
-                if row.org_id is not None and row.org_id != self.scope.org_id:
+                if row.org_id is not None and row.org_id != self._org_id_for(type(row)):
                     raise TenantMismatchError(
                         f"cannot delete {type(row).__name__} belonging to another org"
                     )
@@ -434,10 +448,27 @@ class ScopedSession:
             )
         return True
 
+    def _org_id_for(self, model: type) -> str | UUID:
+        """The scope's org id as ``model``'s org_id column holds it: a UUID
+        where the column is typed as one, else the string. Called only where
+        _partitions said yes, so the scope has an org. One that isn't a UUID
+        can't name a row of a UUID-keyed table, so it fails closed
+        (TenantMismatchError) rather than matching nothing or everything."""
+        org_id = self.scope.org_id
+        if not _org_id_is_uuid(model):
+            return org_id
+        try:
+            return UUID(org_id)
+        except ValueError:
+            raise TenantMismatchError(
+                f"{model.__name__} is keyed by an org UUID, and the scope's "
+                f"org_id={org_id!r} is not one"
+            ) from None
+
     def select(self, model: type) -> ScopedSelect:
         stmt = select(model)
         if self._partitions(model):
-            stmt = stmt.where(model.org_id == self.scope.org_id)
+            stmt = stmt.where(model.org_id == self._org_id_for(model))
         return ScopedSelect(stmt)
 
     def exec(self, stmt: ScopedSelect) -> Any:
@@ -450,16 +481,17 @@ class ScopedSession:
     def get(self, model: type, ident: Any) -> Any:
         if self._partitions(model):
             row = self._session.get(model, ident)
-            if row is not None and row.org_id != self.scope.org_id:
+            if row is not None and row.org_id != self._org_id_for(model):
                 return None
             return row
         return self._session.get(model, ident)
 
     def add(self, row: Any) -> Any:
         if self._partitions(type(row)):
+            org_id = self._org_id_for(type(row))
             if row.org_id is None:
-                row.org_id = self.scope.org_id
-            elif row.org_id != self.scope.org_id:
+                row.org_id = org_id
+            elif row.org_id != org_id:
                 raise TenantMismatchError(
                     f"{type(row).__name__}.org_id={row.org_id!r} conflicts with scope "
                     f"org_id={self.scope.org_id!r}"
@@ -479,7 +511,7 @@ class ScopedSession:
 
     def delete(self, row: Any) -> None:
         if self._partitions(type(row)):
-            if row.org_id != self.scope.org_id:
+            if row.org_id != self._org_id_for(type(row)):
                 raise TenantMismatchError(
                     f"cannot delete {type(row).__name__} belonging to another org"
                 )

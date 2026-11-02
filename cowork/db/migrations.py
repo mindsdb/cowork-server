@@ -177,9 +177,18 @@ def _rekey_stray_legacy_attachment_rows(connection: sa.Connection) -> int:
 
 
 def run_schema_migrations(engine: Engine, db_uri: str) -> None:
-    """Run schema migrations, baselining pre-Alembic local databases."""
+    """Run schema migrations, baselining pre-Alembic local databases.
+
+    On PostgreSQL the app's engine can carry statement and idle-in-transaction
+    timeouts (cowork.db.session.postgres_session_options). The migration turns
+    both off for its own transaction: it waits on the migration lock for as
+    long as another process migrates, and runs as one long transaction.
+    """
     config = _alembic_config(db_uri)
     with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            connection.exec_driver_sql("SET LOCAL statement_timeout = 0")
+            connection.exec_driver_sql("SET LOCAL idle_in_transaction_session_timeout = 0")
         config.attributes["connection"] = connection
         _stamp_existing_schema(config, connection)
         _assert_db_not_ahead(config, connection)
