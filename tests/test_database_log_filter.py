@@ -568,3 +568,15 @@ def test_app_logging_disables_sqlalchemy_query_and_connection_diagnostics(tmp_pa
     report = json.loads(result.stdout.splitlines()[-1])
     assert report == {"engine_level": logging.WARNING, "pool_level": logging.WARNING, "diagnostics": []}
     assert not any(secret in result.stdout + result.stderr for secret in SECRETS)
+
+
+def test_the_server_imports_no_psycopg2_of_its_own():
+    """psycopg2-binary bundles its own libpq, libssl and libcrypto, so a server that loads it beside
+    psycopg holds several OpenSSL builds at once. A server that connects with psycopg never needs
+    it; a bare ``postgresql://`` URI still imports it, through SQLAlchemy's dialect."""
+    found = subprocess.run(
+        [sys.executable, "-c", "import sys, cowork.server; print(sorted(m for m in sys.modules if m.startswith('psycopg2')))"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.splitlines()[-1] == "[]"
