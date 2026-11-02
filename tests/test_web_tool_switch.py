@@ -47,7 +47,7 @@ def test_switch_turns_internet_research_off(monkeypatch):
     assert providers.web_tool_kwargs_for(Provider.MINDS_CLOUD) == {"internet_research_enabled": False}
 
 
-def test_a_switch_the_installed_anton_cannot_take_is_dropped(monkeypatch, caplog):
+def test_a_switch_the_installed_anton_cannot_take_is_dropped(monkeypatch):
     """An older anton refuses an unknown ChatSessionConfig keyword, which would fail every turn."""
     import dataclasses
 
@@ -58,6 +58,8 @@ def test_a_switch_the_installed_anton_cannot_take_is_dropped(monkeypatch, caplog
     monkeypatch.setattr(providers, "_warned_config_fields", set())
     monkeypatch.setenv("ANTON_INTERNET_RESEARCH_ENABLED", "false")
     monkeypatch.setenv("ANTON_WEB_SEARCH_ENABLED", "false")
-    with caplog.at_level("WARNING", logger=providers.logger.name):
-        assert providers.web_tool_kwargs_for(Provider.MINDS_CLOUD) == {"web_search_enabled": False}
-    assert "internet_research_enabled" in caplog.text
+    # Recorded at the call, not through caplog: the suite's logging setup can stop propagation.
+    warnings: list[str] = []
+    monkeypatch.setattr(providers.logger, "warning", lambda msg, *args: warnings.append(msg % args))
+    assert providers.web_tool_kwargs_for(Provider.MINDS_CLOUD) == {"web_search_enabled": False}
+    assert len(warnings) == 1 and "internet_research_enabled" in warnings[0]
