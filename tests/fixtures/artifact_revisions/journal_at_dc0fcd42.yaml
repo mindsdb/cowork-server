@@ -329,3 +329,15 @@ expected:
     orgId: org-1
     enabledBy: alice
     enabledAt: '2026-11-02T17:39:21+00:00'
+
+# Values dc0fcd42 also wrote that the journal above doesn't hold. Rejecting a
+# repair the agent's code planted saved its commentThreadId as is in the
+# rejection's revision, in the pending write and then the manifest, even when
+# it was null or not text.
+planted_thread_rejections:
+  - id: no-thread
+    commentThreadIds: [null]
+  - id: thread-as-a-number
+    commentThreadIds: [5]
+  - id: thread-as-true
+    commentThreadIds: [true]

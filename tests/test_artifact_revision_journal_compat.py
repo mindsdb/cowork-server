@@ -103,3 +103,36 @@ def test_a_restore_and_a_decision_keep_every_record_they_do_not_change(folder):
     assert list(accepted) == list(ready)
     assert {**accepted, "updatedAt": ready["updatedAt"]} == {**ready, "status": "accepted"}
     assert draft_review_grant(folder) == EXPECTED["grant"]
+
+
+@pytest.mark.parametrize(
+    "rejection",
+    FIXTURE["planted_thread_rejections"],
+    ids=[rejection["id"] for rejection in FIXTURE["planted_thread_rejections"]],
+)
+def test_a_rejection_of_a_planted_repair_reads_and_is_kept(folder, rejection):
+    """dc0fcd42 saved a rejected repair's commentThreadId as is, even null or
+    not text. The manifest's head and the pending write's revision carry it
+    here: the history keeps both, and a save writes both back as they are."""
+    threads = rejection["commentThreadIds"]
+    manifest = json.loads(_journal(folder, "manifest.json"))
+    manifest["revisions"][-1]["commentThreadIds"] = threads
+    pending = json.loads(_journal(folder, "pending-source-write.json"))
+    pending["revision"]["commentThreadIds"] = threads
+    for name, record in (("manifest.json", manifest), ("pending-source-write.json", pending)):
+        (folder / ".revisions" / name).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    marked = {manifest["revisions"][-1]["id"], pending["revision"]["id"]}
+
+    revisions = list_revisions(folder)
+    metadata = _metadata(folder)
+    save_source(folder, metadata, metadata["id"], content="# Later\n", expected_revision_id=revisions[0]["id"])
+
+    assert [revision["id"] for revision in revisions] == [revision["id"] for revision in EXPECTED["revisions"]]
+    # As JSON text, since True and 1 compare equal.
+    listed = {revision["id"]: json.dumps(revision["commentThreadIds"]) for revision in revisions if revision["id"] in marked}
+    assert listed == {revision_id: json.dumps(threads) for revision_id in marked}
+    kept = json.loads(_journal(folder, "manifest.json"))["revisions"]
+    assert {entry["id"]: json.dumps(entry["commentThreadIds"]) for entry in kept if entry["id"] in marked} == listed
+    assert {revision_id: revision_with_content(folder, revision_id)["content"] for revision_id in marked} == {
+        revision_id: EXPECTED["contents"][revision_id] for revision_id in marked
+    }

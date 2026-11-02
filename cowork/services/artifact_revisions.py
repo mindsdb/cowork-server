@@ -275,9 +275,26 @@ def _is_superseded(manifest: Manifest, repair: AgentRepair) -> bool:
     return head is not None and head != repair.revision_id
 
 
+@dataclass(frozen=True)
+class _FinishedRepair:
+    """An actionable repair that can no longer gate, and the status that ends it."""
+
+    repair: AgentRepair
+    status: RepairStatus
+
+
+@dataclass(frozen=True)
+class _RepairPartition:
+    """One path's actionable repairs: those that still gate a new repair, and
+    those that cannot."""
+
+    blocking: list[AgentRepair]
+    finished: list[_FinishedRepair]
+
+
 def _partition_actionable_repairs(
     folder: Path, manifest: Manifest, rel_path: str
-) -> tuple[list[AgentRepair], list[tuple[AgentRepair, RepairStatus]]]:
+) -> _RepairPartition:
     """Split one path's actionable repairs into those that still gate a new
     repair, and those that cannot, each with the status that finishes it.
 
@@ -288,7 +305,7 @@ def _partition_actionable_repairs(
     now = datetime.now(timezone.utc)
     head = _head_revision_id(manifest, rel_path)
     blocking: list[AgentRepair] = []
-    dead: list[tuple[AgentRepair, RepairStatus]] = []
+    finished: list[_FinishedRepair] = []
     for repair in _actionable_repairs_for_path(folder, rel_path):
         if _is_superseded(manifest, repair):
             continue
@@ -296,15 +313,15 @@ def _partition_actionable_repairs(
             if head is not None and repair.base_revision_id != head:
                 # The turn is still running, but it can only land on conflict
                 # now, so it should not hold the path until it gets there.
-                dead.append((repair, "conflict"))
+                finished.append(_FinishedRepair(repair=repair, status="conflict"))
                 continue
             created = _parse_timestamp(repair.created_at)
             # An unreadable timestamp must not mean "blocks forever".
             if created is None or (now - created).total_seconds() > QUEUED_REPAIR_TTL_SECONDS:
-                dead.append((repair, "no_change"))
+                finished.append(_FinishedRepair(repair=repair, status="no_change"))
                 continue
         blocking.append(repair)
-    return blocking, dead
+    return _RepairPartition(blocking=blocking, finished=finished)
 
 
 def has_queued_agent_repair(folder: Path, conversation_id: str) -> bool:
@@ -604,7 +621,7 @@ def _recover_pending_source_write(folder: Path) -> None:
 
 def _commit_source_revision(
     folder: Path,
-    manifest: dict,
+    manifest: Manifest,
     target: Path,
     *,
     artifact_id: str,
@@ -968,13 +985,13 @@ def create_agent_repair(
         if current.id != expected_revision_id:
             raise RevisionConflict(current.to_json())
         manifest = _read_manifest(folder)
-        blocking, dead = _partition_actionable_repairs(folder, manifest, source.path)
-        if blocking:
-            raise RepairAlreadyPending(blocking[0].to_json())
-        for repair, finished_status in dead:
-            repair.status = finished_status
-            repair.updated_at = _now()
-            _write_repair(folder, repair)
+        partition = _partition_actionable_repairs(folder, manifest, source.path)
+        if partition.blocking:
+            raise RepairAlreadyPending(partition.blocking[0].to_json())
+        for finished in partition.finished:
+            finished.repair.status = finished.status
+            finished.repair.updated_at = _now()
+            _write_repair(folder, finished.repair)
         repair_id = str(uuid.uuid4())
         repair = AgentRepair(
             id=repair_id,

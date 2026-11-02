@@ -9,8 +9,9 @@ damaged.
 
 The keys on disk are the ones the server has written since revisions began. A
 record keeps any key it doesn't declare, and writes back only the keys it was
-read or made with plus those the code set, in the order the server writes
-them, so a journal reads and writes the same across builds.
+read or made with plus those the code set: the keys it declares in the order
+the server writes them, then any others. So a journal reads and writes the
+same across builds.
 """
 from __future__ import annotations
 
@@ -96,6 +97,14 @@ class JournalRecord(BaseModel):
         validate_assignment=True,
     )
 
+    @model_validator(mode="after")
+    def _writes_back(self) -> JournalRecord:
+        # A value JSON can't encode, such as one nested too deeply or a lone
+        # surrogate, can't be answered or written back, so the record reads as
+        # damaged. Encoding to text builds no second copy of the record.
+        self.model_dump_json(by_alias=True, exclude_unset=True)
+        return self
+
     def to_json(self) -> dict[str, Any]:
         """The record as the journal and the API hold it: the keys it was read
         or made with, and those the code set since."""
@@ -129,7 +138,9 @@ class RevisionEntry(JournalRecord):
     content_hash: ContentHash
     size: int | None = Field(default=None, alias="bytes")
     conversation_id: str | None = None
-    comment_thread_ids: list[str] = []
+    # An older build saved a rejected or captured repair's commentThreadId as
+    # is, even when it was null or not text.
+    comment_thread_ids: list[str | int | float | bool | None] = []
 
 
 def _entry_or_none(raw: object) -> RevisionEntry | None:

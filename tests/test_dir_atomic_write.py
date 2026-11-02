@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import uuid
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,26 @@ def test_a_second_name_at_the_name_is_replaced_and_the_first_keeps_its_bytes(tmp
     assert (tmp_path / "record.json").read_bytes() == b"after"
     assert first.read_text(encoding="utf-8") == "before"
     assert first.stat().st_nlink == 1
+
+
+@POSIX
+@pytest.mark.parametrize("plant", [os.symlink, os.link], ids=["symbolic-link", "hard-link"])
+def test_a_link_planted_at_the_temporary_name_is_never_written_through(tmp_path, monkeypatch, plant):
+    target = tmp_path / "outside" / "secret.txt"
+    target.parent.mkdir()
+    target.write_text("someone else's", encoding="utf-8")
+    folder_path = tmp_path / "folder"
+    folder_path.mkdir()
+    (folder_path / "record.json").write_bytes(b"old")
+    fixed = uuid.UUID(int=0)
+    monkeypatch.setattr(paths.uuid, "uuid4", lambda: fixed)
+    plant(target, folder_path / f".record.json.{fixed.hex}.tmp")
+
+    with pinned_dir(folder_path) as folder, pytest.raises(OSError):
+        dir_atomic_write(folder, "record.json", content=b"new")
+
+    assert target.read_text(encoding="utf-8") == "someone else's"
+    assert (folder_path / "record.json").read_bytes() == b"old"
 
 
 @POSIX
