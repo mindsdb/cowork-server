@@ -50,6 +50,11 @@ def publisher_key(publish_url: str) -> str:
     return hashlib.sha256(normalized.rstrip("/").encode()).hexdigest()
 
 
+def publish_record_lock_key(published_dir: Path) -> str:
+    """The lock that guards one folder's .published.json and the owner rows its pages have."""
+    return hashlib.sha256(str(published_dir.resolve()).encode()).hexdigest()
+
+
 def find_owner(session: Session, publisher: str, report_id: str) -> PublishedPageOwner | None:
     return session.exec(select(PublishedPageOwner).where(
         PublishedPageOwner.publisher_key == publisher,
@@ -161,7 +166,7 @@ def publication_owner(
     # A folder can hold several loose pages in the same .published.json map.
     # Lock the map while reading it, uploading, recording ownership and saving
     # it. Use the existing PostgreSQL cross-process lock where available.
-    lock_key = hashlib.sha256(str(published_dir.resolve()).encode()).hexdigest()
+    lock_key = publish_record_lock_key(published_dir)
     try:
         engine = get_engine(get_app_settings().database.uri)
         with _process_lock(publisher, "published_page", lock_key, timeout=RESOURCE_LOCK_TIMEOUT_SECONDS):
