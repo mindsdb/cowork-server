@@ -402,3 +402,22 @@ def test_usage_log_reads_its_variable_as_anton_does(monkeypatch, value, expected
     monkeypatch.setenv("ANTON_USAGE_LOG", value)
 
     assert AppSettings(_env_file=None).usage_log is expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, None), ("", None), ("  ", None), ("2.5", 2.5)])
+def test_gate_decision_budget_reads_its_variable(monkeypatch, value, expected):
+    # The gate reads this field by name; a rename here must fail a test, not every turn.
+    if value is None:
+        monkeypatch.delenv("COWORK_GATE_FIRST_EVENT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("COWORK_GATE_FIRST_EVENT_SECONDS", value)
+
+    assert AppSettings(_env_file=None).gate_first_event_seconds == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan", "abc"])
+def test_an_invalid_gate_decision_budget_fails_at_startup(monkeypatch, value):
+    monkeypatch.setenv("COWORK_GATE_FIRST_EVENT_SECONDS", value)
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
