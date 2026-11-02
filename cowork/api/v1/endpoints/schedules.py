@@ -25,9 +25,13 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live `running` flag (any in-flight run)."""
+    """ScheduleResponse plus the live `running` flag (any in-flight run) and
+    when a waiting retry of the due slot may start (`retryAt`)."""
+    from cowork.scheduler import pending_retry_at
+
     data = ScheduleResponse.serialize(schedule)
     data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
+    data["retryAt"] = pending_retry_at(scoped, schedule)
     return data
 
 
@@ -108,19 +112,43 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    from cowork.scheduler import execute_schedule, schedule_conversation_topic
+    from cowork.scheduler import (
+        pending_retry_at,
+        release_run_place,
+        reserve_run_place,
+        run_admitted,
+        schedule_conversation_topic,
+    )
     from cowork.services.conversations import ConversationService
 
-    conversation = ConversationService(scoped).create_conversation(
-        topic=schedule_conversation_topic(schedule.title),
-        project_id=schedule.project_id,
-    )
+    # Refused with a reason rather than queued: the user is watching and can
+    # press Run again.
+    if ScheduleRunService(scoped).has_active_run(schedule_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This task is already running.")
+    if pending_retry_at(scoped, schedule) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This task's last run failed before it started and is waiting to be tried again.",
+        )
+    if not reserve_run_place():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Too many scheduled tasks are running right now. Try again in a few minutes.",
+        )
+    try:
+        conversation = ConversationService(scoped).create_conversation(
+            topic=schedule_conversation_topic(schedule.title),
+            project_id=schedule.project_id,
+        )
+    except BaseException:
+        release_run_place()
+        raise
     # FastAPI closes this session only after the background run ends, which
     # can take minutes. Give the request's connection back before it starts.
     scoped.close()
 
     background_tasks.add_task(
-        execute_schedule, schedule_id, is_manual=True,
+        run_admitted, schedule_id, is_manual=True,
         conversation_id=conversation.id,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}

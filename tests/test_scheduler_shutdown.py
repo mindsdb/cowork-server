@@ -49,7 +49,7 @@ async def one_due_schedule(monkeypatch):
         polls.append(len(polls))
         return [slot] if len(polls) == 1 else []
 
-    async def execute_schedule(due_id, is_manual=False, conversation_id=None, *, slot_at=None):
+    async def execute_schedule(due_id, is_manual=False, conversation_id=None, *, slot_at=None, **_attempt):
         assert slot_at == slot.slot_at
         await release.wait()
         finished.append(due_id)
