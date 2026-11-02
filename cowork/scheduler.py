@@ -26,6 +26,8 @@ from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.streaming.backend import get_backend
+from cowork.streaming.cancellation import request_cancel
 from cowork.streaming.registry import ServerShuttingDown, registry
 
 if TYPE_CHECKING:
@@ -552,7 +554,7 @@ async def execute_schedule(
         except asyncio.TimeoutError as exc:
             # The timeout cancels only this drain. The turn runs detached in
             # the registry and would go on writing and publishing, so stop it.
-            await registry.cancel(str(conversation_id))
+            await _stop_timed_out_turn(str(conversation_id))
             raise RuntimeError(
                 f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
             ) from exc
@@ -664,6 +666,32 @@ async def execute_schedule(
                 "Failed to finish the run record",
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
             )
+
+
+async def _stop_timed_out_turn(conversation_id: str) -> None:
+    """Stop a turn its run gave up on, the way the Stop button does.
+
+    A turn in a sandbox pod only stops when the controller sees its cancel
+    flag; cancelling the local producer alone ends just our tail of it. The
+    turn is marked timed out first, so it saves as interrupted, not as the
+    user's own Stop.
+    """
+    handle = registry.get(conversation_id)
+    if handle is None or not handle.is_running:
+        return
+    handle.lifecycle.timed_out = True
+    if get_backend() == "redis" or handle.lifecycle.identity.remote:
+        try:
+            await request_cancel(handle.lifecycle.identity.correlation_id)
+        except Exception:
+            # The local cancel below still runs; a pod turn then ends at the
+            # controller's own turn limit.
+            logger.warning(
+                "Could not flag a timed-out scheduled turn for cancellation",
+                exc_info=True,
+                extra=log_context(conversation_id=conversation_id),
+            )
+    await handle.cancel()
 
 
 async def _turn_terminal_reason(conversation_id: str) -> str | None:

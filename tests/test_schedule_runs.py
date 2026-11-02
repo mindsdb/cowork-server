@@ -764,11 +764,10 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
 
     cancelled = []
 
-    async def _cancel(conversation_id):
+    async def _stop(conversation_id):
         cancelled.append(conversation_id)
-        return True
 
-    monkeypatch.setattr(scheduler_mod.registry, "cancel", _cancel)
+    monkeypatch.setattr(scheduler_mod, "_stop_timed_out_turn", _stop)
 
     state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
     assert state["run_status"] == RunStatus.failed
@@ -777,6 +776,86 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
     # The turn runs detached from the drain the timeout cancels, so it is
     # stopped explicitly or it goes on writing after the run is failed.
     assert cancelled == [str(state["run_conversation_id"])]
+
+
+class _FakeRunHandle:
+    def __init__(self, *, remote: bool):
+        from cowork.streaming.registry import RunIdentity, TurnLifecycle
+
+        self.lifecycle = TurnLifecycle(identity=RunIdentity(remote=remote))
+        self.is_running = True
+        self.cancelled_after_timed_out = None
+
+    async def cancel(self):
+        self.cancelled_after_timed_out = self.lifecycle.timed_out
+        return True
+
+
+@pytest.mark.parametrize(("remote", "backend", "flags"), [
+    (False, "memory", False),
+    (True, "memory", True),
+    (False, "redis", True),
+])
+def test_a_timed_out_turn_is_stopped_like_a_stop_press(monkeypatch, remote, backend, flags):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    handle = _FakeRunHandle(remote=remote)
+    monkeypatch.setattr(scheduler_mod.registry, "get", lambda cid: handle if cid == "c1" else None)
+    monkeypatch.setattr(scheduler_mod, "get_backend", lambda: backend)
+    requested = []
+
+    async def _request_cancel(correlation_id, **_):
+        requested.append(correlation_id)
+
+    monkeypatch.setattr(scheduler_mod, "request_cancel", _request_cancel)
+
+    asyncio.run(scheduler_mod._stop_timed_out_turn("c1"))
+
+    # A pod's turn stops only on the controller's flag; a local cancel alone
+    # would end just our tail of it.
+    assert requested == ([handle.lifecycle.identity.correlation_id] if flags else [])
+    # Marked before the cancel, so the turn saves as interrupted, not a Stop.
+    assert handle.cancelled_after_timed_out is True
+
+
+def test_a_failed_cancel_flag_still_stops_the_local_turn(monkeypatch):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    handle = _FakeRunHandle(remote=True)
+    monkeypatch.setattr(scheduler_mod.registry, "get", lambda cid: handle)
+
+    async def _request_cancel(correlation_id, **_):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(scheduler_mod, "request_cancel", _request_cancel)
+
+    asyncio.run(scheduler_mod._stop_timed_out_turn("c1"))
+
+    assert handle.cancelled_after_timed_out is True
+
+
+def test_a_turn_that_already_ended_is_left_alone(monkeypatch):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    handle = _FakeRunHandle(remote=True)
+    handle.is_running = False
+    monkeypatch.setattr(scheduler_mod.registry, "get", lambda cid: handle)
+
+    async def _request_cancel(correlation_id, **_):
+        raise AssertionError("no flag for a finished turn")
+
+    monkeypatch.setattr(scheduler_mod, "request_cancel", _request_cancel)
+
+    asyncio.run(scheduler_mod._stop_timed_out_turn("c1"))
+
+    assert handle.cancelled_after_timed_out is None
+    assert handle.lifecycle.timed_out is False
 
 
 def test_execute_schedule_with_a_title_longer_than_a_topic_runs(monkeypatch):
