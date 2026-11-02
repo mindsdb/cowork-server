@@ -1518,14 +1518,37 @@ class WebToolKwargs(TypedDict, total=False):
 
     web_search_enabled: bool
     web_fetch_enabled: bool
+    # False: the agent answers from the connected data only (no web tools, no
+    # scratchpad web_search(), no internet guidance in its prompt).
+    internet_research_enabled: bool
 
 
 # anton's own setting names, so the CLI and a cowork-server read the same variables.
 _WEB_TOOL_ENV = {
     "web_search_enabled": "ANTON_WEB_SEARCH_ENABLED",
     "web_fetch_enabled": "ANTON_WEB_FETCH_ENABLED",
+    "internet_research_enabled": "ANTON_INTERNET_RESEARCH_ENABLED",
 }
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
+_warned_config_fields: set[str] = set()
+
+
+def _anton_config_takes(field: str) -> bool:
+    """Whether the installed anton's ChatSessionConfig has ``field``.
+
+    An older anton refuses an unknown keyword, which would fail every turn, so
+    a switch it cannot take is dropped with one warning instead.
+    """
+    import dataclasses
+
+    from anton.core.session import ChatSessionConfig
+
+    if field in {f.name for f in dataclasses.fields(ChatSessionConfig)}:
+        return True
+    if field not in _warned_config_fields:
+        _warned_config_fields.add(field)
+        logger.warning("Installed anton has no ChatSessionConfig.%s; its switch is ignored", field)
+    return False
 
 
 def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
@@ -1540,8 +1563,9 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     what its flavor provides.
 
     ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
-    value in the server's env turn that tool off for every session; they never
-    turn one on.
+    value in the server's env turn that tool off for every session, and
+    ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off; they never
+    turn anything on.
     """
     from cowork.common.settings.user_settings import Provider
 
@@ -1553,7 +1577,7 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     else:
         kwargs = WebToolKwargs()
     for field, env_name in _WEB_TOOL_ENV.items():
-        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
+        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES and _anton_config_takes(field):
             kwargs[field] = False
     return kwargs
 
