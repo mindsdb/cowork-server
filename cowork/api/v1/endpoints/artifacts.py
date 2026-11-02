@@ -49,6 +49,7 @@ from cowork.api.v1.artifact_scope import (
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
+from cowork.schemas.artifact_access import ArtifactStatusView
 from cowork.schemas.live_apps import (
     LiveAppCopyRef,
     LiveAppDuplicateRequest,
@@ -63,6 +64,7 @@ from cowork.services.artifact_roots import (
 from cowork.services.artifacts import (
     BackendPreviewRefused,
     ExecutionRefused,
+    _is_single_named_file,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
@@ -383,29 +385,6 @@ def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict
     return _artifact_cards(session, [source])
 
 
-_BLANK_ARTIFACT_STATUS = {
-    "publishedUrl": "",
-    "modified": False,
-    "accessMode": "public",
-    "accessProtected": False,
-    "accessEmails": [],
-    "orgAllowed": False,
-}
-
-
-def _status_from_card(card: dict) -> dict:
-    """The non-secret status subset exposed by the focus-refresh endpoint."""
-    return {
-        "publishedUrl": card.get("publishedUrl", ""),
-        "modified": bool(card.get("modified")),
-        "accessMode": card.get("accessMode", "public"),
-        "accessProtected": bool(card.get("accessProtected")),
-        "accessEmails": card.get("accessEmails", []),
-        "orgAllowed": bool(card.get("orgAllowed")),
-        "artifactKey": card.get("artifactKey", ""),
-    }
-
-
 def _normalized_lookup_key(value: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.expanduser(value)))
 
@@ -494,7 +473,7 @@ def _pinned_artifact_match(
     return None
 
 
-def _pinned_loose_status(directory, logical_file: Path) -> dict:
+def _pinned_loose_status(directory, logical_file: Path) -> ArtifactStatusView:
     """Status for a metadata-less legacy file using its pinned parent record."""
     from cowork.services.artifacts import (
         _load_published_map_pinned,
@@ -503,7 +482,7 @@ def _pinned_loose_status(directory, logical_file: Path) -> dict:
     )
 
     published_map = _load_published_map_pinned(directory)
-    return _status_from_card(
+    return ArtifactStatusView.of_card(
         {
             "publishedUrl": _published_url_for(
                 directory.path,
@@ -526,7 +505,7 @@ def _pinned_loose_match(
     source_base: Path,
     requested: str,
     relative_requested: str,
-) -> dict | None:
+) -> ArtifactStatusView | None:
     """Find an exact real file below a metadata-less legacy directory."""
     try:
         with dir_scandir(directory) as entries:
@@ -566,7 +545,7 @@ def _pinned_loose_match(
     return None
 
 
-def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -> dict:
+def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Match a legacy path only against entries scanned from ``scope``'s roots.
 
     The request is reduced to a string lookup key. Every card and folder key is
@@ -577,7 +556,7 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
     hashing every artifact on each window-focus poll.
     """
     if not path or "\x00" in path:
-        return dict(_BLANK_ARTIFACT_STATUS)
+        return ArtifactStatusView()
     requested = _normalized_lookup_key(path)
     relative_requested = requested
     artifacts_prefix = f"artifacts{os.sep}"
@@ -655,15 +634,15 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
                                 _pinned_root=root,
                             )
                             if card is not None:
-                                return _status_from_card(card)
+                                return ArtifactStatusView.of_card(card)
                             if matched != logical:
                                 return _pinned_loose_status(folder, matched)
-                            return dict(_BLANK_ARTIFACT_STATUS)
+                            return ArtifactStatusView()
                     except (OSError, ValueError):
                         continue
         except (OSError, ValueError):
             continue
-    return dict(_BLANK_ARTIFACT_STATUS)
+    return ArtifactStatusView()
 
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -913,13 +892,34 @@ async def delete_artifact_for_request(
 # of routes only holds while the range does; each route carries the
 # declaration itself, so inserting one here cannot inherit this paragraph by
 # accident.
-@router.get("/status", dependencies=[Depends(require(DesktopOnly))])
+@router.get(
+    "/status",
+    response_model=ArtifactStatusView,
+    dependencies=[Depends(require(DesktopOnly))],
+)
 async def artifact_status(
     scope: ScopeDep, path: str = Query(..., min_length=1, max_length=4096)
-):
+) -> ArtifactStatusView:
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
-    return _desktop_artifact_status_for_path(path, scope=scope)
+    status = _desktop_artifact_status_for_path(path, scope=scope)
+    if status.published_url:
+        from cowork.services.publish import published_link_owner_recorded
+
+        # Resolved as Stop sharing and Update resolve the path, so False is
+        # what they will do: Update shares a new link and Stop sharing leaves
+        # this one live.
+        status.link_owner_recorded = published_link_owner_recorded(path, scope=scope)
+    # Never the plaintext password either: ArtifactStatusView has no field
+    # for it.
+    return status
+
+
+def _refuse_a_second_name(artifact: Path) -> None:
+    """404 for a file with a second name: resolve_artifact_path still finds
+    it, so its owner can delete or unpublish it, but no route reads it."""
+    if artifact.is_file() and not _is_single_named_file(artifact):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
 
 
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
@@ -930,6 +930,7 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    _refuse_a_second_name(artifact)
     try:
         return _preview_artifact(artifact)
     except ValueError as e:
@@ -946,6 +947,7 @@ async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeD
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    _refuse_a_second_name(artifact)
     try:
         payload = await mount_preview(artifact, scope=scope)
     except BackendPreviewRefused as e:
@@ -979,7 +981,7 @@ async def preview_asset(token: str, rel_path: str, request: Request, scope: Scop
         target.relative_to(parent)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset is outside the artifact directory")
-    if not target.is_file():
+    if not _is_single_named_file(target):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     if wants_html_preview(media_type, request):
@@ -1014,7 +1016,7 @@ def serve_artifact_file(
         target.relative_to(base.resolve())
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
-    if not target.is_file():
+    if not _is_single_named_file(target):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool

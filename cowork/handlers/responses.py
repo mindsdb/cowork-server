@@ -35,6 +35,7 @@ from cowork.handlers.first_take import FirstTake, clears_take as first_take_clea
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    DIRECT_HARNESS,
     _MAX_HISTORY_MESSAGES,
     _settings_binding,
     _text_history,
@@ -129,7 +130,9 @@ from cowork.services.product_permissions import (
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
-from cowork.services.skills import SkillService
+from cowork.schemas.turn_skills import TurnSkills
+from cowork.services.skill_sharing import SkillViewer, sharing_applies
+from cowork.services.skills import SkillService, has_always_on_skills
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
 
 
@@ -390,9 +393,13 @@ class _TurnStart:
     conversation_id: UUID
     turn_id: int
     # The gate's history: user and assistant rows, oldest first, at most
-    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape skips the gate, and
-    # None when the read failed, which sends the turn to the agent.
+    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape or an always-on
+    # skill skips the gate, and None when the history or always-on read
+    # failed, which sends the turn to the agent.
     gate_rows: list[Message] | None
+    # Whether an always-on skill reaches the turn (has_always_on_skills),
+    # which sends it to the agent: the gate's answer would not follow it.
+    always_on_skills: bool = False
 
 
 @dataclass(frozen=True)
@@ -538,6 +545,42 @@ class _RemoteTurnInputs:
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
     files: AgentFiles | None
+    # The skills the caller sees, the pod's whole recallable set
+    # (remote_turn_skills); empty when they see none.
+    skills: TurnSkills
+
+
+def remote_turn_skills(
+    session: ScopedSession, conv_id: UUID, *, viewer: SkillViewer | None = None
+) -> TurnSkills:
+    """The skills block for a cloud turn's request: every skill the pod's
+    agent may recall in it, and the always-on ones flagged and first
+    (cowork.services.skills.build_turn_skills). In MindsHub mode only the
+    skills ``viewer`` sees; without one (a scheduled or channel turn, or one
+    whose teams couldn't be read) the fail-closed viewer's.
+
+    Never None: the pod's anton recalls only what a block names, and falls
+    back to whatever org skills tree its pod mounts for a request without
+    one, which can hold every member's skills, so every turn path sends one.
+    A failure sends an empty block, a turn with no skills, rather than
+    failing the turn or leaving the pod to fall back.
+    """
+    from cowork.services.skills import build_turn_skills
+
+    try:
+        conversation = ConversationService(session).get_conversation(conv_id)
+        return build_turn_skills(
+            session.scope,
+            project_name=conversation.project.name,
+            viewer=viewer,
+            session=session,
+        )
+    except Exception:
+        logger.exception(
+            "[responses] failed to build the turn's skills; sending none",
+            extra=log_context(conversation_id=conv_id),
+        )
+        return {}
 
 
 @dataclass
@@ -580,6 +623,12 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
             retry_after=retry_after, retry_at=retry_at_instant(retry_after), request_id=request_id,
         )
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
+
+
+def _last_answer_harness(rows: list[Message]) -> str | None:
+    """The harness of the newest assistant row in `rows`, oldest first; None without one."""
+    answer = next((row for row in reversed(rows) if row.role == Role.assistant), None)
+    return None if answer is None else answer.harness
 
 
 def _first_take_binding(
@@ -642,9 +691,24 @@ def _start_first_take(
 
 
 class ResponsesHandler:
-    def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        principal: Principal | None = None,
+        interactive: bool = True,
+        mindshub_bearer: str = "",
+    ) -> None:
         self.principal = principal
         self.scope = scope_from_principal(principal)
+        # The Authorization the gateway validated (cowork.principal.caller_bearer),
+        # used only to read the caller's teams and permissions for skill
+        # sharing. Empty for a turn with no caller present, such as a
+        # scheduled one: that turn gets the fail-closed set, without skills
+        # shared only with a team.
+        self.mindshub_bearer = mindshub_bearer
+        # Skill sharing's view of the caller in MindsHub mode, resolved once
+        # per remote turn before its inputs are read (remote_turn_skills).
+        self._skill_viewer: SkillViewer | None = None
         # The harness this turn runs: the request's own pick or the stored
         # setting, resolved by handle() from the settings its first unit reads.
         # Anton itself is built lazily, only after Cowork delegates a turn:
@@ -696,6 +760,9 @@ class ResponsesHandler:
         # in this request's context, so the vault's secrets are registered
         # first. It needs only the scope.
         await register_vault_secrets(self.scope)
+        # The unit reads which always-on skills reach the caller, so their
+        # teams are read first (cached per caller). A no-op outside MindsHub mode.
+        await self._resolve_skill_viewer(self.scope)
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
@@ -725,6 +792,7 @@ class ResponsesHandler:
                     gate_rows=start.gate_rows,
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
+                    has_always_on_skills=start.always_on_skills,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -971,16 +1039,25 @@ class ResponsesHandler:
         # this is a stable per-conversation index for the buffer file.
         turn_id = conversation_service.message_count(conversation)
 
-        # Shape checks first: a turn the gate cannot route skips the history
-        # read, as _route_request skips the gate.
+        # Shape checks first, then the always-on skills: a turn the gate
+        # cannot route skips the history read, as _route_request skips the gate.
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
+        always_on_skills = False
         if ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
         ) is None:
-            gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
+            reaches = self._reads_always_on_skills(session, conversation=conversation)
+            if reaches is None:
+                # The read failed: the turn goes to the agent as when the
+                # history read fails.
+                gate_rows = None
+            elif reaches:
+                always_on_skills = True
+            else:
+                gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
 
         return _TurnStart(
             settings=settings,
@@ -989,7 +1066,34 @@ class ResponsesHandler:
             conversation_id=conversation_id,
             turn_id=turn_id,
             gate_rows=gate_rows,
+            always_on_skills=always_on_skills,
         )
+
+    def _reads_always_on_skills(self, session: ScopedSession, *, conversation: Conversation) -> bool | None:
+        """Whether an always-on skill reaches this turn in MindsHub mode, for
+        the viewer handle() resolved (has_always_on_skills). None when the
+        read fails: like a failed history read, that sends the turn to the
+        agent as a fallback, so the gate never answers past a skill it could
+        not check, and the route names no skill that may not exist."""
+        if not sharing_applies(session.scope):
+            return False
+        try:
+            return has_always_on_skills(
+                session.scope,
+                project_name=conversation.project.name,
+                viewer=self._skill_viewer,
+                session=session,
+            )
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.exception(
+                "[responses] could not read the turn's always-on skills; delegating",
+                extra=log_context(conversation_id=conversation.id),
+            )
+            # Rolling back loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return None
 
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
@@ -1018,6 +1122,7 @@ class ResponsesHandler:
         gate_rows: list[Message] | None,
         has_attachments: bool,
         has_disabled_connections: bool,
+        has_always_on_skills: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -1028,7 +1133,9 @@ class ResponsesHandler:
         or cancel once the route is known.
 
         `gate_rows` is the history handle()'s first unit read for the gate
-        (see _TurnStart).
+        (see _TurnStart). `has_always_on_skills` delegates the turn without a
+        gate call: an always-on skill applies to every answer, and only the
+        agent's prompt carries it.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1045,6 +1152,8 @@ class ResponsesHandler:
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
+        if has_always_on_skills:
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="always_on_skills"), None
         if gate_rows is None:
             # The history read failed. Like any other gate failure, the turn
             # goes to the agent rather than failing.
@@ -1123,6 +1232,7 @@ class ResponsesHandler:
                         has_non_text_input=has_non_text_input,
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
+                        after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
                         binding=binding,
                         binding_factory=binding_for_turn,
                     )
@@ -1261,7 +1371,7 @@ class ResponsesHandler:
                 service = ConversationService(session)
                 user_message = service.save_user_message(conversation_id, original_content)
                 assistant_message = service.save_assistant_turn(
-                    conversation_id, text, events, harness="cowork-direct",
+                    conversation_id, text, events, harness=DIRECT_HARNESS,
                 )
                 return _turn_anchor_id(user_message, assistant_message)
 
@@ -1378,7 +1488,7 @@ class ResponsesHandler:
             service = ConversationService(session)
             user_message = service.save_user_message(conv_id, original_content)
             assistant_message = service.save_assistant_turn(
-                conv_id, route.text, events, harness="cowork-direct",
+                conv_id, route.text, events, harness=DIRECT_HARNESS,
             )
             return _DirectTurn(
                 user_message_id=user_message.id,
@@ -1416,7 +1526,7 @@ class ResponsesHandler:
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "run_id": lifecycle.identity.run_id,
-                "harness": "cowork-direct",
+                "harness": DIRECT_HARNESS,
                 "user_message_id": str(saved.user_message_id),
                 "response": response.model_dump(),
             })})
@@ -1539,17 +1649,31 @@ class ResponsesHandler:
             first_take=first_take,
         )
 
+    async def _resolve_skill_viewer(self, scope) -> None:
+        """Skill sharing's view of the caller in MindsHub mode, for this
+        turn's skills. Never fails the turn: a failure leaves the fail-closed
+        view (build_turn_skills)."""
+        from cowork.services.skill_sharing import resolve_skill_viewer
+
+        try:
+            self._skill_viewer = await resolve_skill_viewer(
+                scope=scope, principal=self.principal, bearer_token=self.mindshub_bearer
+            )
+        except Exception:
+            logger.warning("[responses] could not resolve the caller's teams for skills", exc_info=True)
+            self._skill_viewer = None
+
     @staticmethod
     def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
-        """Stage the project-level files the pod can't otherwise see — the
-        conversation's attachments and the project's anton.md instructions —
+        """Stage the project-level files the pod can't otherwise see (the
+        conversation's attachments and the project's anton.md instructions)
         into the conversation workspace on the shared mount, and seed this
         org's skill store with the packaged builtins if it hasn't been yet.
 
-        The seeding call belongs here, not just behind ``GET /skills``: the pod
-        reads skills straight off the shared mount (no payload), so this is the
-        only place that runs on every remote turn and can catch an org that
-        chats before it ever opens the skills menu. Never fails the turn: a
+        The seeding call belongs here, not just behind ``GET /skills``: this
+        runs before every remote turn, web or channel, and catches an org that
+        chats before it ever opens the skills menu, as the turn's skills block
+        (remote_turn_skills) seeds again. Never fails the turn: a
         staging error degrades to a turn without the missing piece."""
         try:
             from cowork.services.artifact_roots import project_artifacts_base
@@ -1788,6 +1912,7 @@ class ResponsesHandler:
             workspace=workspace,
             started_at=self._remote_started_at(session, conv_id),
             files=self._remote_agent_files(session, conv_id, workspace=workspace),
+            skills=remote_turn_skills(session, conv_id, viewer=self._skill_viewer),
         )
 
     @staticmethod
@@ -2229,6 +2354,9 @@ class ResponsesHandler:
             # compaction against exactly the history seeded here, so
             # re-reading it when the reply arrives could map the count onto a
             # different list.
+            # The caller's teams and permissions, read from MindsHub (cached
+            # per caller) before the seed, which selects the skills they see.
+            await self._resolve_skill_viewer(scope)
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
@@ -2261,10 +2389,12 @@ class ResponsesHandler:
                 model=model,
                 turn_id=turn_id,
                 history=seed.history,
-                # Global memory and skills use read-only mounts. Project
-                # memory is outside the conversation workspace and therefore
-                # travels as a bounded, sheddable wire block.
+                # Global memory uses a read-only mount. Project memory is
+                # outside the conversation workspace and therefore travels as
+                # a bounded, sheddable wire block. Skills travel as the
+                # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
+                skills=seed.skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
