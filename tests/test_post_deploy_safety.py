@@ -163,44 +163,105 @@ def _chunks(body: str, size: int = 7) -> Iterator[bytes]:
 
 
 def _sse(body: str) -> httpx.Response:
+    """A streaming SSE response that delivers `body` in small chunks."""
     return httpx.Response(
         200, content=_chunks(body), headers={"Content-Type": "text/event-stream"},
     )
 
 
-def _deployment(turn_body: str, tail_body: str) -> httpx.MockTransport:
+def _saved_turn(answer: str = _ANSWER) -> list[dict]:
+    """Conversation items in the shape `_hydrate_message_items` serves."""
+    return [
+        {"id": _USER_MESSAGE_ID, "role": "user", "content": "question",
+         "created_at": "2026-11-02T10:00:00", "events": []},
+        {"id": _ASSISTANT_MESSAGE_ID, "role": "assistant", "content": answer,
+         "created_at": "2026-11-02T10:00:01", "events": [], "harness": "anton"},
+    ]
+
+
+def _deployment(
+    turn_body: str,
+    tail_body: str,
+    *,
+    in_flight: bool = True,
+    saved: list[dict] | None = None,
+    seen: list[httpx.Request] | None = None,
+) -> httpx.MockTransport:
     """A fake deployment answering the routes the turn smoke tests call."""
+    items = _saved_turn() if saved is None else saved
 
     def handle(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
         route = (request.method, request.url.path)
         if route == ("POST", "/api/v1/responses/"):
             return _sse(turn_body)
         if route == ("GET", "/api/v1/responses/in-flight"):
-            return httpx.Response(200, json={"in_flight": True, "has_buffer": True})
+            return httpx.Response(200, json={"in_flight": in_flight, "has_buffer": True})
         if route == ("GET", "/api/v1/responses/tail"):
             assert request.url.params["from_seq"] == "0"
             return _sse(tail_body)
+        if route == ("GET", f"/api/v1/conversations/{_CONVERSATION_ID}/items"):
+            return httpx.Response(200, json=items)
         return httpx.Response(404, json={"unexpected_route": list(route)})
 
     return httpx.MockTransport(handle)
 
 
-def _run_end_to_end(body: str) -> None:
-    transport = _deployment(turn_body=body, tail_body=body)
+def _run_end_to_end(body: str, **deployment) -> None:
+    """Run the end-to-end smoke test against a deployment streaming `body`."""
+    transport = _deployment(turn_body=body, tail_body=body, **deployment)
     with httpx.Client(base_url="https://cowork.example", transport=transport) as api:
         test_post_deploy.test_a_turn_runs_end_to_end(api, _CONVERSATION_ID)
 
 
-def _run_ingress_reconnect(body: str) -> None:
-    transport = _deployment(turn_body=_STARTED, tail_body=body)
+def _run_ingress_reconnect(body: str, **deployment) -> None:
+    """Run the ingress reconnect smoke test with `body` as the replayed turn."""
+    transport = _deployment(turn_body=_STARTED, tail_body=body, **deployment)
     with httpx.Client(base_url="https://cowork.example", transport=transport) as api:
         test_post_deploy.test_reconnect_replays_a_turn_in_progress(api, _CONVERSATION_ID)
 
 
-_SMOKE_RUNNERS: dict[str, Callable[[str], None]] = {
+_DIRECT_IDENTITY = test_post_deploy._Identity({
+    "api_key": "mdb_never-sent-to-a-pod",
+    "user_id": "6f0f1b8e-0000-4000-8000-0000000000aa",
+    "organization_id": "6f0f1b8e-0000-4000-8000-0000000000bb",
+    "email": "postdeploy@example.com",
+})
+
+
+def _run_replica_reconnect(
+    body: str, *, seen: list[httpx.Request] | None = None, **deployment,
+) -> None:
+    """Run the A to B reconnect smoke test with `body` as replica B's replay.
+
+    Both replica clients share one fake; `seen` collects every request so a
+    caller can check which host and headers each one used.
+    """
+    requests: list[httpx.Request] = [] if seen is None else seen
+    transport = _deployment(turn_body=_STARTED, tail_body=body, seen=requests, **deployment)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("COWORK_BASE_URL_A", "http://replica-a:9010")
+        patch.setenv("COWORK_BASE_URL_B", "http://replica-b:9010/")
+        patch.setattr(
+            test_post_deploy,
+            "_replica_client",
+            lambda base_url, headers: httpx.Client(
+                base_url=base_url, headers=headers, transport=transport,
+            ),
+        )
+        test_post_deploy.test_reconnect_works_on_the_other_replica(
+            _CONVERSATION_ID, _DIRECT_IDENTITY,
+        )
+
+
+_SMOKE_RUNNERS: dict[str, Callable[..., None]] = {
     "end_to_end": _run_end_to_end,
     "ingress_reconnect": _run_ingress_reconnect,
+    "replica_reconnect": _run_replica_reconnect,
 }
+
+_RECONNECT_RUNNERS = ["ingress_reconnect", "replica_reconnect"]
 
 _UNSUCCESSFUL_TURNS = {
     "failed": (
@@ -240,3 +301,47 @@ def test_smoke_turn_rejects_an_unsuccessful_stream(runner, case):
 
     with pytest.raises(AssertionError, match=reason):
         _SMOKE_RUNNERS[runner](body)
+
+
+@pytest.mark.parametrize("runner", _RECONNECT_RUNNERS)
+def test_reconnect_rejects_a_replay_that_differs_from_the_saved_answer(runner):
+    with pytest.raises(AssertionError, match="replayed answer differs from the saved one"):
+        _SMOKE_RUNNERS[runner](_SUCCESSFUL_TURN, saved=_saved_turn("pon"))
+
+
+@pytest.mark.parametrize("runner", _RECONNECT_RUNNERS)
+def test_reconnect_rejects_a_replay_whose_answer_was_not_saved(runner):
+    with pytest.raises(AssertionError, match="replayed answer was not saved"):
+        _SMOKE_RUNNERS[runner](_SUCCESSFUL_TURN, saved=_saved_turn()[:1])
+
+
+@pytest.mark.parametrize("runner", _RECONNECT_RUNNERS)
+def test_reconnect_skips_only_after_a_good_replay_when_the_turn_already_ended(runner):
+    with pytest.raises(pytest.skip.Exception, match="ended before the connection dropped"):
+        _SMOKE_RUNNERS[runner](_SUCCESSFUL_TURN, in_flight=False)
+
+
+@pytest.mark.parametrize("runner", _RECONNECT_RUNNERS)
+def test_reconnect_rejects_a_broken_replay_even_when_the_turn_already_ended(runner):
+    # A skip is not an AssertionError, so pytest.raises alone would let it
+    # through and report this test as skipped rather than failed.
+    try:
+        with pytest.raises(AssertionError, match="stream reported response.failed"):
+            _SMOKE_RUNNERS[runner](_STARTED + _FAILED_FRAME, in_flight=False)
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f"a broken replay was skipped instead of rejected: {skipped}")
+
+
+def test_replica_reconnect_starts_on_a_and_replays_from_b_with_direct_identity():
+    seen: list[httpx.Request] = []
+
+    _run_replica_reconnect(_SUCCESSFUL_TURN, seen=seen)
+
+    hosts = {(request.method, request.url.path): request.url.host for request in seen}
+    assert hosts[("POST", "/api/v1/responses/")] == "replica-a"
+    assert hosts[("GET", "/api/v1/responses/tail")] == "replica-b"
+    assert hosts[("GET", f"/api/v1/conversations/{_CONVERSATION_ID}/items")] == "replica-b"
+    for request in seen:
+        assert "authorization" not in request.headers
+        assert request.headers["x-user-id"] == _DIRECT_IDENTITY["user_id"]
+        assert request.headers["x-organization-id"] == _DIRECT_IDENTITY["organization_id"]

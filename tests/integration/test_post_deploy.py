@@ -476,25 +476,66 @@ def test_a_turn_runs_end_to_end(api, conversation_id):
     _assert_successful_turn(frames)
 
 
-def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
-    """Close the stream mid-turn and tail it back, the page-reload path."""
-    with api.stream(
-        "POST",
-        "/api/v1/responses/",
-        json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
-        timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
-    ) as resp:
-        assert resp.status_code == 200
-        for line in resp.iter_lines():  # drop the connection early
-            if line.startswith("event:"):
-                break
+_ANSWER_DELTA = "response.output_text.delta"
+_RECONNECT_PREMISE_SKIP = (
+    "the turn ended before the connection dropped, so its replay was checked "
+    "but no mid-turn reconnect happened on this run; the prompt needs to "
+    "outlast the first answer delta on this deployment"
+)
 
-    probe = api.get(
-        "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
-    ).json()
-    assert probe["has_buffer"] is True, probe
 
-    with api.stream(
+def _drop_after_first_answer_delta(resp: httpx.Response) -> None:
+    """Read a turn's stream until the model has produced answer text, then stop.
+
+    ``response.created`` is written before the model streams anything, so
+    leaving on it would reconnect to a turn that has not started answering.
+    """
+    for line in resp.iter_lines():
+        if line.startswith("event:") and line.removeprefix("event:").strip() == _ANSWER_DELTA:
+            return
+
+
+def _replica_client(base_url: str, headers: dict[str, str]) -> httpx.Client:
+    """A client that talks to one pod directly, bypassing the ingress."""
+    return httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=30.0)
+
+
+def _conversation_items(client: httpx.Client, conversation_id: str) -> list[dict]:
+    """The conversation's saved items, as the renderer loads them on reload."""
+    items = client.get(f"/api/v1/conversations/{conversation_id}/items")
+    assert items.status_code == 200, items.text[:500]
+    body = items.json()
+    return body if isinstance(body, list) else body.get("items", [])
+
+
+def _assert_answer_saved(client: httpx.Client, conversation_id: str, completed: dict) -> None:
+    """Fail unless the completed frame's answer is the saved assistant message.
+
+    The server saves the answer before it writes the completed frame, so one
+    read is enough.
+    """
+    message_id = completed.get("assistant_message_id")
+    assert message_id, "completed frame carried no assistant_message_id"
+    saved = [
+        item
+        for item in _conversation_items(client, conversation_id)
+        if str(item.get("id")) == message_id
+    ]
+    assert len(saved) == 1, f"replayed answer was not saved: assistant_message_id={message_id}"
+    assert saved[0].get("role") == "assistant", saved[0].get("role")
+    assert saved[0].get("content") == _answer_text(completed), (
+        "replayed answer differs from the saved one: "
+        f"replayed={_answer_text(completed)[:200]!r} saved={str(saved[0].get('content'))[:200]!r}"
+    )
+
+
+def _replay_turn(client: httpx.Client, conversation_id: str) -> dict:
+    """Tail the whole turn from the start and require a successful answer.
+
+    Returns:
+        The replayed ``response.completed`` payload.
+    """
+    with client.stream(
         "GET",
         "/api/v1/responses/tail",
         params={"conversation_id": conversation_id, "from_seq": 0},
@@ -504,7 +545,32 @@ def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
         replayed = _read_sse_frames(resp.iter_lines())
 
     assert replayed and replayed[0][0] == "response.created", replayed[:1]
-    _assert_successful_turn(replayed)
+    return _assert_successful_turn(replayed)
+
+
+def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
+    """Close the stream mid-answer and tail it back, the page-reload path."""
+    with api.stream(
+        "POST",
+        "/api/v1/responses/",
+        json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
+        timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
+    ) as resp:
+        assert resp.status_code == 200
+        _drop_after_first_answer_delta(resp)
+
+    probe = api.get(
+        "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
+    ).json()
+    assert probe["has_buffer"] is True, probe
+    running = _await_running_turn(api, conversation_id)
+
+    completed = _replay_turn(api, conversation_id)
+    _assert_answer_saved(api, conversation_id, completed)
+
+    # Only after the replay passed: a skip must never hide a broken one.
+    if running is None:
+        pytest.skip(_RECONNECT_PREMISE_SKIP)
 
 
 def test_reconnect_works_on_the_other_replica(conversation_id, identity):
@@ -523,9 +589,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
         )
 
     headers = _direct_headers(identity)
-    with httpx.Client(
-        base_url=url_a.rstrip("/"), headers=headers, timeout=30.0
-    ) as replica_a:
+    with _replica_client(url_a, headers) as replica_a:
         with replica_a.stream(
             "POST",
             "/api/v1/responses/",
@@ -537,29 +601,21 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
             timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
         ) as resp:
             assert resp.status_code == 200
-            for line in resp.iter_lines():
-                if line.startswith("event:"):
-                    break
+            _drop_after_first_answer_delta(resp)
 
-    with httpx.Client(
-        base_url=url_b.rstrip("/"), headers=headers, timeout=30.0
-    ) as replica_b:
+    with _replica_client(url_b, headers) as replica_b:
         probe = _await_shared_buffer(replica_b, conversation_id)
         # Before the Redis backend this replica had no handle and no buffer,
         # and answered has_buffer=False.
         assert probe["has_buffer"] is True, probe
+        running = _await_running_turn(replica_b, conversation_id)
 
-        with replica_b.stream(
-            "GET",
-            "/api/v1/responses/tail",
-            params={"conversation_id": conversation_id, "from_seq": 0},
-            timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
-        ) as resp:
-            assert resp.status_code == 200
-            replayed = _read_sse_frames(resp.iter_lines())
+        completed = _replay_turn(replica_b, conversation_id)
+        _assert_answer_saved(replica_b, conversation_id, completed)
 
-    assert replayed and replayed[0][0] == "response.created", replayed[:1]
-    _assert_successful_turn(replayed)
+    # Only after the replay passed: a skip must never hide a broken one.
+    if running is None:
+        pytest.skip(_RECONNECT_PREMISE_SKIP)
 
 
 def _await_shared_buffer(
