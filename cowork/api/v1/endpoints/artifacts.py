@@ -901,9 +901,17 @@ async def artifact_status(
 ) -> ArtifactStatusView:
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
+    status = _desktop_artifact_status_for_path(path, scope=scope)
+    if status.published_url:
+        from cowork.services.publish import published_link_owner_recorded
+
+        # Resolved as Stop sharing and Update resolve the path, so False is
+        # what they will do: Update shares a new link and Stop sharing leaves
+        # this one live.
+        status.link_owner_recorded = published_link_owner_recorded(path, scope=scope)
     # Never the plaintext password either: ArtifactStatusView has no field
     # for it.
-    return _desktop_artifact_status_for_path(path, scope=scope)
+    return status
 
 
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])

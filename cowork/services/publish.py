@@ -34,6 +34,7 @@ from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
     ArtifactAudienceView,
     ArtifactPublishResult,
+    UnpublishResult,
 )
 from cowork.schemas.refusals import Refusal
 from cowork.services.artifact_audience import (
@@ -1093,7 +1094,7 @@ def publish_artifact(
         record_owner_choice,
         republish_widening,
     )
-    from cowork.services.published_page_ownership import publication_owner
+    from cowork.services.published_page_ownership import PageClaim, publication_owner
 
     with publication_owner(
         publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
@@ -1107,11 +1108,16 @@ def publish_artifact(
                 published_map = {}
         previous = published_map.get(published_key)
         report_id = previous.get("report_id") if isinstance(previous, dict) else None
+        # The link this publish replaces with a new one, when no owner record
+        # names its page: that page stays live with the old content.
+        replaced_link: str | None = None
         if ownership is not None:
-            report_id = ownership.checked_report_id(
-                report_id, url=previous.get("url") if isinstance(previous, dict) else "",
-            )
-            if report_id is None:
+            previous_url = previous.get("url", "") if isinstance(previous, dict) else ""
+            claim = ownership.claim(report_id, url=previous_url)
+            if claim is not PageClaim.OWNED:
+                if claim is PageClaim.NO_OWNER_RECORD and previous_url and previous.get("published", True):
+                    replaced_link = previous_url
+                report_id = None
                 previous = None
 
         canonical_artifact_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
@@ -1366,6 +1372,7 @@ def publish_artifact(
             access_mode=AccessMode(owner_side.get("mode", AccessMode.PUBLIC)),
             access_protected=bool(owner_side.get("requires_password")),
             artifact_key=response_key or "",
+            replaced_link=replaced_link,
             result={k: v for k, v in result.items() if k != "file_payload"},
             **ArtifactAudienceView.of(audience).model_dump(),
         ).model_dump(by_alias=True, mode="json")
@@ -1440,7 +1447,7 @@ def unpublish_artifact(
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    from cowork.services.published_page_ownership import publication_owner
+    from cowork.services.published_page_ownership import PageClaim, publication_owner
 
     with publication_owner(
         _publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
@@ -1459,14 +1466,18 @@ def unpublish_artifact(
         if isinstance(entry, dict):
             identifier = entry.get("report_id") or entry.get("last_md5") or None
         if ownership is not None:
-            identifier = ownership.checked_report_id(
-                entry.get("report_id") if isinstance(entry, dict) else None,
-                url=entry.get("url", "") if isinstance(entry, dict) else "",
-            )
-            if identifier is None:
+            url = entry.get("url", "") if isinstance(entry, dict) else ""
+            claim = ownership.claim(entry.get("report_id") if isinstance(entry, dict) else None, url=url)
+            if claim is not PageClaim.OWNED:
+                # Cowork never sends a page id no owner record ties to this
+                # artifact, so the page, if any, stays live; say so.
                 published_map.pop(published_key, None)
                 _write_published_map(published_json, published_map)
-                return {"status": "ok"}
+                live = isinstance(entry, dict) and entry.get("published", True) is not False and bool(url)
+                return UnpublishResult(
+                    taken_down=False, live_link=url if live else None, reason=claim if live else None,
+                ).model_dump(by_alias=True, mode="json")
+            identifier = entry.get("report_id")
         if not identifier:
             raise FileNotFoundError("No published version on file")
 
@@ -1508,7 +1519,7 @@ def unpublish_artifact(
             entry["published"] = False
             published_map[published_key] = entry
             _write_published_map(published_json, published_map)
-        return {"status": "ok"}
+        return UnpublishResult(taken_down=True).model_dump(by_alias=True, mode="json")
 
 
 def published_artifact_access(
@@ -1734,6 +1745,25 @@ def published_state(raw_path: str, *, scope: TenantScope | None) -> dict:
         "url": str(entry.get("url") or "") if live else "",
         "published": live,
     }
+
+
+def published_link_owner_recorded(raw_path: str, *, scope: TenantScope | None) -> bool | None:
+    """Whether Cowork can still update or take down the artifact's live page,
+    resolved exactly like `published_state`. True with no live page; False
+    when no owner record ties the page to this artifact; None when that can't
+    be read."""
+    from cowork.services.published_page_ownership import link_owner_recorded
+
+    state = published_state(raw_path, scope=scope)
+    if not state["published"]:
+        return True
+    try:
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+        publish_target, *_rest = _resolve_publish_target(artifact, container_dirs=_scan_artifact_dirs(scope=scope))
+        publish_url, _api_key = _resolve_publish_endpoint(get_user_settings())
+    except Exception:
+        return None
+    return link_owner_recorded(publish_target, state["report_id"], publish_url=publish_url)
 
 
 def published_owner_state(raw_path: str, *, scope: TenantScope | None) -> dict:

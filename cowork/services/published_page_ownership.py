@@ -18,7 +18,7 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
-from cowork.models.published_page import PublishedPageOwner
+from cowork.models.published_page import PageClaim, PublishedPageOwner
 from cowork.models.setting import Setting
 from cowork.services.providers import is_mindshub_publish_url, normalize_publish_url
 from cowork.services.shared_resources import (
@@ -64,11 +64,12 @@ class PublicationOwner:
     artifact_path: str
     user_id: str
 
-    def checked_report_id(self, report_id: object, *, url: object = "") -> str | None:
-        """Only the recorded tester may send this artifact's recorded page id."""
+    def claim(self, report_id: object, *, url: object = "") -> PageClaim:
+        """What this artifact's recorded page id is to this tester. Raises
+        PublishOwnedByOtherUser when another tester owns it."""
         try:
             if not isinstance(report_id, str) or not report_id:
-                return None
+                return PageClaim.NO_OWNER_RECORD
             row = find_owner(self.session, self.publisher, report_id)
             if row is None:
                 # The caller drops this folder's pointer, and the page stays
@@ -78,18 +79,22 @@ class PublicationOwner:
                     "orphaned_publish identifier=%s url=%s reason=unrecorded_owner",
                     report_id, url if isinstance(url, str) else "",
                 )
-                return None
+                return PageClaim.NO_OWNER_RECORD
             if row.artifact_path != self.artifact_path:
-                return None
+                return PageClaim.OTHER_ARTIFACT
             if row.owner_user_id != self.user_id:
                 from cowork.services.publish import PublishOwnedByOtherUser
 
                 raise PublishOwnedByOtherUser()
-            return report_id
+            return PageClaim.OWNED
         finally:
             # End the read transaction before the caller's upload or delete.
             # The advisory lock is on its own connection and stays held.
             self.session.rollback()
+
+    def checked_report_id(self, report_id: object, *, url: object = "") -> str | None:
+        """Only the recorded tester may send this artifact's recorded page id."""
+        return report_id if self.claim(report_id, url=url) is PageClaim.OWNED else None
 
     def record(self, report_id: str) -> None:
         """Commit before exposing the successful upload in editable local state."""
@@ -169,6 +174,25 @@ def publication_owner(
                     yield PublicationOwner(session, publisher, path, user_id)
     except SQLAlchemyError as exc:
         raise HTTPException(503, OWNERSHIP_UNAVAILABLE) from exc
+
+
+def link_owner_recorded(artifact: Path, report_id: str, *, publish_url: str) -> bool | None:
+    """Whether Cowork can still update or take down this artifact's live page:
+    always on a publisher Cowork doesn't protect, and on one it does, only when
+    an owner record names the page for this artifact. None when the database
+    can't be asked. Reads without a lock."""
+    if not protects_publisher(publish_url):
+        return True
+    if not report_id:
+        # Stop sharing can't send a page id it doesn't have, so the page stays.
+        return False
+    try:
+        with Session(get_engine(get_app_settings().database.uri)) as session:
+            row = find_owner(session, publisher_key(publish_url), report_id)
+    except SQLAlchemyError:
+        logger.warning("Could not read a published page's owner record for its status", exc_info=True)
+        return None
+    return row is not None and row.artifact_path == str(artifact.resolve())
 
 
 def rekey_published_page_paths(old_dir: Path, new_dir: Path) -> None:

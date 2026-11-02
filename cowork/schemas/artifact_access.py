@@ -1,8 +1,9 @@
 """Wire shapes of an artifact's sharing: the access a publish takes, one save
 of the Share dialog included (ArtifactAccessRequest), the access state the
 owner reads back (ArtifactAccessView) or a publish answers
-(ArtifactPublishResult), and the part of an artifact's card the desktop's
-GET /api/v1/artifacts/status answers (ArtifactStatusView).
+(ArtifactPublishResult), what Stop sharing answers (UnpublishResult), and the
+part of an artifact's card the desktop's GET /api/v1/artifacts/status answers
+(ArtifactStatusView).
 
 Who a restricted artifact is shared with goes by MindsHub's artifact rule
 names (cowork.services.sharing_contract.AudienceField). The access state is
@@ -18,6 +19,7 @@ from pydantic import Field, model_validator
 from pydantic_core import ErrorDetails
 
 from cowork.models.artifact_owner_choice import AccessMode
+from cowork.models.published_page import PageClaim
 from cowork.schemas.base import CamelRequest, CamelResponse
 from cowork.services.sharing_contract import AudienceField
 
@@ -240,6 +242,10 @@ class ArtifactStatusView(CamelResponse):
     # The key the renderer addresses comment requests by; "" when
     # unpublished or published before the key was kept.
     artifact_key: str = ""
+    # False when no owner record ties the live page to this artifact, so
+    # Update shares a new link and Stop sharing leaves this one live. None
+    # with no live link, or when that can't be read. Not on the card.
+    link_owner_recorded: bool | None = None
 
     @classmethod
     def of_card(cls, card: Mapping[str, Any]) -> ArtifactStatusView:
@@ -268,4 +274,18 @@ class ArtifactPublishResult(ArtifactAudienceView):
     access_protected: bool = False
     # The key the renderer addresses comment requests by.
     artifact_key: str = ""
+    # The old link, when this publish shared a new one because no owner
+    # record names the old page, which stays live with the earlier version.
+    replaced_link: str | None = None
     result: dict[str, Any] = Field(default_factory=dict)
+
+
+class UnpublishResult(CamelResponse):
+    """What Stop sharing answers: whether it took the artifact's page down,
+    and, when it left a link live that Cowork can't take down, that link and
+    why."""
+
+    status: Literal["ok"] = "ok"
+    taken_down: bool
+    live_link: str | None = None
+    reason: PageClaim | None = None
