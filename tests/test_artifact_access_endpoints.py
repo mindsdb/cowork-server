@@ -356,6 +356,95 @@ async def test_mindshubs_refusal_of_a_share_with_everyone_is_a_403_with_its_reas
     assert _lock_is_free(as_owner)
 
 
+def _public_owner_choice(monkeypatch) -> str:
+    """The artifact's key, made new for the test, under which its owner's
+    last save chose public (cowork.services.artifact_owner_choice)."""
+    from uuid import uuid4
+
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_identity import artifact_key
+    from cowork.services.artifact_owner_choice import OwnerChoice, record_owner_choice
+
+    key = artifact_key(uuid4().hex)
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity.publish_authorization_key", lambda *args: key,
+    )
+    record_owner_choice(key=key, choice=OwnerChoice(AccessMode.PUBLIC, published=True), scope=ORG_SCOPE)
+    return key
+
+
+async def test_mindshubs_refusal_of_a_share_with_everyone_keeps_the_owners_public_choice(
+    as_owner, publish_context, stored_rule, monkeypatch,
+):
+    """The owner's save of Everyone narrowed the record of their public
+    choice before its upload. MindsHub's refusal comes before anything is
+    written, so the route still answers it as a 403 with its reason, and
+    the record is public again."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice, read_owner_choice
+
+    mindshub_sharing_answers(monkeypatch, permissions=("artifacts.share_org",))
+    _upload_service_answers(
+        monkeypatch, 403, "Forbidden",
+        json.dumps({"error": SHARE_ORG_REASON, "code": "share_org_required"}).encode(),
+    )
+    key = _public_owner_choice(monkeypatch)
+    everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": []}
+    refused = await aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST
+    )
+    assert _answer(refused) == (403, {"detail": SHARE_ORG_REASON, "code": "share_org_required"})
+    assert read_owner_choice(keys=[key], scope=ORG_SCOPE) == OwnerChoice(AccessMode.PUBLIC, published=True)
+    assert _lock_is_free(as_owner)
+
+
+async def test_a_restore_that_cannot_reach_the_database_still_answers_mindshubs_refusal(
+    as_owner, publish_context, stored_rule, monkeypatch, caplog,
+):
+    """The database goes down while the save's upload is out, so the save
+    can't put the owner's record back. The owner still gets MindsHub's 403
+    and its reason, not the 503 of an outage, and the record stays
+    restricted, which only refuses wider re-publishes."""
+    import anton.publisher
+    from sqlalchemy.exc import OperationalError
+
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services import artifact_owner_choice as choices
+
+    mindshub_sharing_answers(monkeypatch, permissions=("artifacts.share_org",))
+    _upload_service_answers(
+        monkeypatch, 403, "Forbidden",
+        json.dumps({"error": SHARE_ORG_REASON, "code": "share_org_required"}).encode(),
+    )
+    key = _public_owner_choice(monkeypatch)
+    reachable = choices.authorization_session
+    refuse = anton.publisher.publish
+
+    def database_down(_scope):
+        raise OperationalError("SELECT", {}, Exception("database is down"))
+
+    def database_goes_down_then_refuse(*args, **kwargs):
+        monkeypatch.setattr(choices, "authorization_session", database_down)
+        return refuse(*args, **kwargs)
+
+    monkeypatch.setattr("anton.publisher.publish", database_goes_down_then_refuse)
+    everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": []}
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        refused = await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access=everyone), _Session(), _MEMBER_REQUEST
+        )
+    assert _answer(refused) == (403, {"detail": SHARE_ORG_REASON, "code": "share_org_required"})
+    monkeypatch.setattr(choices, "authorization_session", reachable)
+    assert choices.read_owner_choice(keys=[key], scope=ORG_SCOPE) == choices.OwnerChoice(
+        AccessMode.RESTRICTED, published=True
+    )
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.publish" and getattr(r, "event", None) == "artifact_owner_choice_restore_failed"
+    ]
+    assert record.levelno == logging.WARNING
+
+
 def _planted(folder, **entry) -> None:
     """What an agent in the pod can write: the artifact folder is mounted
     writable, .published.json included."""

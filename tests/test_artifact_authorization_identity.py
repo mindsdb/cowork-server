@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import io
 import json
 import logging
 import os
@@ -9,13 +10,18 @@ from pathlib import Path
 from threading import Barrier, Lock
 import time
 from types import SimpleNamespace
+from typing import Literal
+import urllib.error
 from uuid import UUID, uuid4
 
+import anton.publisher
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import httpx
+from pydantic import BaseModel, Field
 import pytest
 from sqlmodel import Session, select
+import yaml
 
 from cowork.api.v1.endpoints import artifact_workspace, artifacts, comments
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
@@ -1707,6 +1713,247 @@ async def test_an_owners_save_narrows_the_record_before_anything_uploads(
     assert uploads == []
     [record] = _mode_changed_records(caplog)
     assert record.reason == "wider_than_owner_choice"
+
+
+class UploadEnding(BaseModel):
+    """One way an owner's save can end once its upload is under way
+    (tests/fixtures/upload_endings.yaml): the upload service's answer, or an
+    error with no answer."""
+
+    name: str
+    status: int | None = None
+    body: dict[str, str] = Field(default_factory=dict)
+    raises: Literal["timeout", "connection_error", "state_publish_blocked", "os_error"] | None = None
+
+
+class UploadEndings(BaseModel):
+    restored: list[UploadEnding]
+    narrowed: list[UploadEnding]
+
+
+UPLOAD_ENDINGS = UploadEndings.model_validate(
+    yaml.safe_load((Path(__file__).parent / "fixtures" / "upload_endings.yaml").read_text())
+)
+_SHARE_ORG_REQUIRED = next(e for e in UPLOAD_ENDINGS.restored if e.name == "share_org_required")
+# anton's publisher as it ships, taken before any test replaces it.
+_ANTON_PUBLISH = anton.publisher.publish
+
+
+def _upload_ends(monkeypatch, ending: UploadEnding, *, meanwhile=None) -> None:
+    """The next publish runs anton's publisher, and its upload ends as
+    ``ending`` says. ``meanwhile`` runs while the request is out, as another
+    save of the artifact on another replica would."""
+
+    def request(url, api_key, **_kwargs):
+        if meanwhile is not None:
+            meanwhile()
+        if ending.raises == "timeout":
+            raise TimeoutError("The read operation timed out")
+        if ending.raises == "connection_error":
+            raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+        body = io.BytesIO(json.dumps(ending.body).encode())
+        raise urllib.error.HTTPError(url, ending.status, "Refused", {}, body)
+
+    def publish_fails_before_sending(_source, **_kwargs):
+        if ending.raises == "state_publish_blocked":
+            raise anton.publisher.StatePublishBlocked("Collections ['notes'] are missing from the new schema")
+        raise OSError("Could not read the artifact's files to zip them")
+
+    local = ending.raises in ("state_publish_blocked", "os_error")
+    monkeypatch.setattr("anton.publisher.publish", publish_fails_before_sending if local else _ANTON_PUBLISH)
+    monkeypatch.setattr("anton.publisher.minds_request", request)
+
+
+def _owner_choice(key, scope):
+    from cowork.services.artifact_owner_choice import read_owner_choice
+
+    return read_owner_choice(keys=[key], scope=scope)
+
+
+_EVERYONE = {"mode": "restricted", "emails": [], "org_allowed": True}
+
+
+@pytest.mark.asyncio
+async def test_a_save_mindshub_refuses_to_share_with_everyone_keeps_the_owners_public_choice(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog
+):
+    """An owner of a public artifact picks Everyone while MindsHub no longer
+    lets them share with everyone, and MindsHub refuses the rule's write.
+    Nothing was published, and the public link still works. The record goes
+    back to public, so the owner's next edit still reaches that link: a live
+    sync publishes it publicly, with no refusal logged."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice
+    from cowork.services.publish import ShareOrgRequired
+
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "public"}, owner_save=True)["artifactKey"]
+
+    _upload_ends(monkeypatch, _SHARE_ORG_REQUIRED)
+    with pytest.raises(ShareOrgRequired):
+        run(_EVERYONE, owner_save=True)
+    assert _entry(folder)["mode"] == "public"
+    assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PUBLIC, published=True)
+
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        assert await _live_sync(folder, scope, project, monkeypatch) is True
+    assert uploads[-1]["access"] == {"mode": "public"}
+    assert _mode_changed_records(caplog) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", UPLOAD_ENDINGS.restored, ids=lambda ending: ending.name)
+async def test_an_upload_refused_before_writing_puts_the_owners_choice_back(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog, ending
+):
+    """The owner of a public artifact saves a password, and the upload ends
+    before the upload service changed who can open the artifact or what it
+    serves. The record goes back to public, and a live sync still publishes
+    publicly."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice
+
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "public"}, owner_save=True)["artifactKey"]
+
+    _upload_ends(monkeypatch, ending)
+    with pytest.raises(Exception):
+        run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PUBLIC, published=True)
+
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        assert await _live_sync(folder, scope, project, monkeypatch) is True
+    assert uploads[-1]["access"] == {"mode": "public"}
+    assert _mode_changed_records(caplog) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", UPLOAD_ENDINGS.narrowed, ids=lambda ending: ending.name)
+async def test_an_upload_that_may_have_written_keeps_the_owners_choice_narrowed(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog, ending
+):
+    """The owner of a public artifact saves a password, and the upload ends
+    in a way that can follow the upload service's writes: the password may
+    be live. The record keeps the password, so a live sync of the public
+    entry left behind is refused before anything is uploaded."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice
+
+    _session, project, _conversation, folder = owned_artifact
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "public"}, owner_save=True)["artifactKey"]
+
+    _upload_ends(monkeypatch, ending)
+    with pytest.raises(Exception):
+        run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PASSWORD, published=True)
+
+    run, uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        assert await _live_sync(folder, scope, project, monkeypatch) is False
+    assert uploads == []
+    [record] = _mode_changed_records(caplog)
+    assert record.reason == "wider_than_owner_choice"
+
+
+def test_a_markdown_render_that_fails_leaves_the_owners_choice_as_it_was(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    """A Markdown artifact's save renders its page before it narrows the
+    record, so a render that fails leaves the record as it was."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice
+
+    _session, project, _conversation, folder = owned_artifact
+    (folder / "index.html").unlink()
+    (folder / "notes.md").write_text("# Notes\n")
+    metadata = json.loads((folder / "metadata.json").read_text())
+    (folder / "metadata.json").write_text(json.dumps({**metadata, "primary": "notes.md"}))
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "public"}, owner_save=True)["artifactKey"]
+
+    def render_fails(_md_path, _out_dir):
+        raise OSError("Could not read notes.md")
+
+    monkeypatch.setattr("cowork.services.publish._render_markdown_to_html", render_fails)
+    with pytest.raises(OSError):
+        run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    assert _owner_choice(key, scope) == OwnerChoice(AccessMode.PUBLIC, published=True)
+
+
+@pytest.mark.parametrize("other_save", ("records_the_same_mode", "narrows_nothing"))
+def test_a_save_that_started_since_keeps_its_write_over_a_refused_saves_restore(
+    issuer, scope, local_id, owned_artifact, monkeypatch, other_save
+):
+    """The owner's save of a password narrows a public record, and while
+    its upload is out another save of the artifact starts on another
+    replica: one that records the password too once its upload is live, or
+    one that narrows nothing because the record is already a password, but
+    whose upload may change what is live. When MindsHub then refuses the
+    first save, its restore leaves the record as the other save left it. A
+    restore that compared the mode alone, or a narrowing that stamped the row
+    only when it changed the mode, would put public back."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_owner_choice import OwnerChoice, narrow_before_save, record_owner_choice
+
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "public"}, owner_save=True)["artifactKey"]
+    password = OwnerChoice(AccessMode.PASSWORD, published=True)
+
+    def another_save():
+        if other_save == "records_the_same_mode":
+            record_owner_choice(key=key, choice=password, scope=scope)
+        else:
+            assert narrow_before_save(key=key, chosen=OwnerChoice(AccessMode.PUBLIC, True), scope=scope) is None
+
+    _upload_ends(monkeypatch, _SHARE_ORG_REQUIRED, meanwhile=another_save)
+    with pytest.raises(Exception):
+        run({"mode": "password", "password": "owner-pw"}, owner_save=True)
+    assert _owner_choice(key, scope) == password
+
+
+def test_a_restore_that_cannot_reach_the_database_leaves_the_choice_narrowed_and_logs_it(
+    issuer, scope, local_id, owned_artifact, monkeypatch, caplog
+):
+    """MindsHub refuses the owner's save of Everyone, and the database goes
+    down before the save can put the record back. The record stays
+    restricted, which only refuses wider re-publishes, a warning names the
+    artifact, and the save still raises MindsHub's refusal rather than the
+    database's outage."""
+    from sqlalchemy.exc import OperationalError
+
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services import artifact_owner_choice as choices
+    from cowork.services.publish import ShareOrgRequired
+
+    _session, project, _conversation, folder = owned_artifact
+    run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
+    key = run({"mode": "public"}, owner_save=True)["artifactKey"]
+    reachable = choices.authorization_session
+
+    def database_down(_scope):
+        raise OperationalError("SELECT", {}, Exception("database is down"))
+
+    _upload_ends(
+        monkeypatch, _SHARE_ORG_REQUIRED,
+        meanwhile=lambda: monkeypatch.setattr(choices, "authorization_session", database_down),
+    )
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        with pytest.raises(ShareOrgRequired):
+            run(_EVERYONE, owner_save=True)
+
+    monkeypatch.setattr(choices, "authorization_session", reachable)
+    assert _owner_choice(key, scope) == choices.OwnerChoice(AccessMode.RESTRICTED, published=True)
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.publish" and getattr(r, "event", None) == "artifact_owner_choice_restore_failed"
+    ]
+    assert (record.levelno, record.artifact_slug) == (logging.WARNING, folder.name)
 
 
 def test_the_owner_choice_record_judges_by_the_narrowest_key_and_fails_closed(scope, monkeypatch):

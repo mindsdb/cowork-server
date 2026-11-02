@@ -6,10 +6,10 @@ relies on the unique keys of ``skill_access`` and ``settings`` when two
 replicas backfill one org at once. The SQLite suite
 (tests/test_org_skill_sharing.py) shares one connection between every
 session, so there the backfill's commit also commits the request's work, and
-nothing runs at once: it can show none of this. The last three check the
+nothing runs at once: it can show none of this. The last four check the
 skill sharing and artifact owner choices revisions' downgrades, the owner
-choice store, and two saves racing to record an artifact's first choice, on
-PostgreSQL. These run when COWORK_TEST_POSTGRES_URI
+choice store, two saves racing to record an artifact's first choice, and a
+refused save's restore under the row's lock and stamp, on PostgreSQL. These run when COWORK_TEST_POSTGRES_URI
 points at a disposable database, on the schema the migrations build.
 """
 from __future__ import annotations
@@ -275,3 +275,47 @@ def test_two_saves_racing_to_record_an_artifacts_first_choice_both_succeed_on_po
     assert choices.read_owner_choice(keys=[key], scope=scope) == choices.OwnerChoice(AccessMode.RESTRICTED, True)
     with engine.connect() as connection:
         assert connection.execute(text("SELECT count(*) FROM artifact_owner_choices")).scalar_one() == 1
+
+
+def test_a_refused_saves_restore_checks_the_stamp_its_narrowing_wrote_on_postgresql(engine, monkeypatch):
+    """The owner's save narrows the record under the row's lock: another
+    session can't lock the row until the narrowing commits. A restore puts
+    the replaced choice back while the row holds the narrowing's stamp, and
+    leaves a later write of the same mode alone."""
+    from sqlalchemy.exc import OperationalError
+
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services import artifact_owner_choice as choices
+
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE)
+    key = "artifact/restored"
+    public = choices.OwnerChoice(AccessMode.PUBLIC, True)
+    password = choices.OwnerChoice(AccessMode.PASSWORD, True)
+    choices.record_owner_choice(key=key, choice=public, scope=scope)
+
+    stage = choices._stage_choice
+    locked: list = []
+
+    def stage_while_another_session_tries_the_lock(session, *, key, choice):
+        with engine.connect() as other:
+            with pytest.raises(OperationalError):
+                other.execute(
+                    text("SELECT id FROM artifact_owner_choices WHERE artifact_key = :key FOR UPDATE NOWAIT"),
+                    {"key": key},
+                )
+            locked.append(key)
+        return stage(session, key=key, choice=choice)
+
+    monkeypatch.setattr(choices, "_stage_choice", stage_while_another_session_tries_the_lock)
+    narrowing = choices.narrow_before_save(key=key, chosen=password, scope=scope)
+    monkeypatch.setattr(choices, "_stage_choice", stage)
+    assert locked == [key]
+    assert narrowing is not None
+    choices.restore_after_refused_save(narrowing, scope=scope)
+    assert choices.read_owner_choice(keys=[key], scope=scope) == public
+
+    narrowing = choices.narrow_before_save(key=key, chosen=password, scope=scope)
+    assert narrowing is not None
+    choices.record_owner_choice(key=key, choice=password, scope=scope)
+    choices.restore_after_refused_save(narrowing, scope=scope)
+    assert choices.read_owner_choice(keys=[key], scope=scope) == password

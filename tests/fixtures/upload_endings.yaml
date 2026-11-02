@@ -1,0 +1,76 @@
+# How an owner's save of an artifact's sharing can end once its upload is
+# under way, and what each ending does to the sharing the owner last chose
+# (cowork/services/artifact_owner_choice.py). The save narrowed that record
+# before its upload (tests/test_artifact_authorization_identity.py).
+#
+# restored: the upload service refused the save before it changed who can
+# open the artifact or what it serves, so the record goes back to what it held
+# before the save.
+# narrowed: the ending can follow such a change, so the record keeps the
+# narrower mode.
+#
+# An HTTP ending is the upload service's answer: its status and JSON body. A
+# `raises` ending is an error with no answer: `timeout` and `connection_error`
+# while the request is out, `state_publish_blocked` and `os_error` inside
+# anton's publish before it sends anything.
+restored:
+  - name: share_org_required
+    status: 403
+    body: {error: Sharing an artifact with everyone in the organization needs the artifacts.share_org permission., code: share_org_required}
+  - name: permission_denied
+    status: 403
+    body: {error: Permission denied, code: permission_denied}
+  - name: organization_inactive
+    status: 403
+    body: {error: Organization is inactive, code: organization_inactive}
+  - name: forbidden_with_no_code
+    status: 403
+    body: {message: Forbidden}
+  - name: invalid_token
+    status: 401
+    body: {error: Invalid token}
+  - name: upgrade_required
+    status: 402
+    body: {error: Upgrade required, code: upgrade_required}
+  - name: artifact_key_required
+    status: 409
+    body: {error: This report has a stable key; publish it with that key, code: artifact_key_required}
+  - name: conflict_with_no_code
+    status: 409
+    body: {error: The report belongs to another kind of artifact}
+  - name: artifact_owned_by_other_user
+    status: 409
+    body: {error: This artifact was published by another owner., code: artifact_owned_by_other_user}
+  - name: publish_host_moved
+    status: 410
+    body: {error: publish_host_moved}
+  - name: too_large
+    status: 413
+    body: {message: Request Too Long}
+  - name: throttled
+    status: 429
+    body: {message: Too Many Requests}
+  - name: state_schema_change
+    raises: state_publish_blocked
+narrowed:
+  - name: bad_request
+    status: 400
+    body: {error: Fullstack bundle missing static/index.html}
+  - name: internal_error
+    status: 500
+    body: {error: Internal Server Error}
+  - name: bad_gateway
+    status: 502
+    body: {message: Internal server error}
+  - name: service_unavailable
+    status: 503
+    body: {error: Service Unavailable}
+  - name: gateway_timeout
+    status: 504
+    body: {message: Endpoint request timed out}
+  - name: timeout
+    raises: timeout
+  - name: connection_error
+    raises: connection_error
+  - name: local_error
+    raises: os_error
