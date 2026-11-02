@@ -14,6 +14,7 @@ silently leak across builds and defeat the isolation.
 
 import os
 import shutil
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -267,6 +268,46 @@ def dir_fsync(d: PinnedDir) -> None:
     directory descriptor to sync, and keeps the atomic rename without it."""
     if d.fd is not None:
         os.fsync(d.fd)
+
+
+def dir_atomic_write(d: PinnedDir, name: str, *, content: bytes, mode: int | None = None) -> None:
+    """Replace the child *name* of *d* with *content* in one durable step.
+
+    The bytes go to a new file beside *name*, created with ``O_EXCL |
+    O_NOFOLLOW`` so nothing planted at that name is written through, synced,
+    and renamed over *name*. The rename acts on the name itself, so a link or a
+    second name already there is replaced, never written through. The new file
+    takes *mode* as its permission bits, and is private (0o600) without it.
+    """
+    if not is_child_name(name):
+        raise ValueError("Write path must be a direct-child name")
+    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        fd = dir_open(d, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            # Windows keeps no permission bits beyond read-only.
+            if mode is not None and d.fd is not None:
+                try:
+                    os.fchmod(stream.fileno(), mode)
+                except OSError:
+                    # A volume that keeps no modes, such as vfat, refuses the
+                    # change; the file is written all the same.
+                    pass
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        dir_replace(d, tmp, name)
+        try:
+            dir_fsync(d)
+        except OSError:
+            # The file is durable and the rename atomic; a filesystem that
+            # can't sync a folder only loses the rename's durability.
+            pass
+    finally:
+        try:
+            dir_unlink(d, tmp)
+        except OSError:
+            pass
 
 
 def open_pinned_child(d: PinnedDir, name: str, *, nofollow: bool = True) -> PinnedDir:

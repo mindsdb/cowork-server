@@ -17,7 +17,14 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, open_fd, read_bounded
+from cowork.common.paths import (
+    O_NOFOLLOW,
+    O_NONBLOCK,
+    dir_fsync,
+    open_fd,
+    pinned_dir,
+    read_bounded,
+)
 from cowork.services.artifact_journal import (
     JOURNAL_DIRNAME,
     MAX_JOURNAL_RECORD_BYTES,
@@ -141,17 +148,13 @@ def _atomic_bytes(path: Path, content: bytes, *, mode: int | None = None) -> Non
             os.chmod(tmp, mode)
         os.replace(tmp, path)
         # `fsync` above durably writes the file bytes; syncing the containing
-        # directory makes the rename itself durable across a host crash on
-        # filesystems that support directory descriptors. Windows does not,
-        # so it safely keeps the atomic-replace guarantee without this extra
-        # durability step.
+        # directory makes the rename itself durable across a host crash.
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            with pinned_dir(path.parent) as parent:
+                dir_fsync(parent)
         except OSError:
+            # The file is durable and the rename atomic; a filesystem that
+            # can't sync a folder only loses the rename's durability.
             pass
     finally:
         try:
