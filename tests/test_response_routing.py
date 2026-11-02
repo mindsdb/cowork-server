@@ -1816,7 +1816,7 @@ def _router_on_an_endpoint_answering(monkeypatch, status: int, error: dict):
 
 async def _route_on(provider):
     return await decide_route(
-        history=[{"role": "user", "content": "Make an HTML artifact with a bar chart."}],
+        history=[{"role": "user", "content": "What is a bar chart good for?"}],
         has_non_text_input=False,
         has_attachments=False,
         has_disabled_connections=False,

@@ -636,11 +636,11 @@ def test_an_unrecorded_page_is_logged_and_the_upload_runs_outside_a_transaction(
     old_url = "https://old-viewer.example/view/legacy-page/"
     publisher.plant(page, {"report_id": "legacy-page", "url": old_url, "published": True})
     sessions, in_transaction = [], []
-    checked = ownership.PublicationOwner.checked_report_id
+    claim = ownership.PublicationOwner.claim
 
     def capture(self, *args, **kwargs):
         sessions.append(self.session)
-        return checked(self, *args, **kwargs)
+        return claim(self, *args, **kwargs)
 
     upload = anton.publisher.publish
 
@@ -648,7 +648,7 @@ def test_an_unrecorded_page_is_logged_and_the_upload_runs_outside_a_transaction(
         in_transaction.append(sessions[-1].in_transaction())
         return upload(*args, **kwargs)
 
-    monkeypatch.setattr(ownership.PublicationOwner, "checked_report_id", capture)
+    monkeypatch.setattr(ownership.PublicationOwner, "claim", capture)
     monkeypatch.setattr(anton.publisher, "publish", watched_upload)
     with caplog.at_level(logging.WARNING, logger=ownership.logger.name):
         publisher.send(page)
