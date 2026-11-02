@@ -35,7 +35,7 @@ from cowork.db.session import get_engine
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.services.projects import ProjectService
-from _linked_folders import SECRET, replace_with_link
+from _linked_folders import SECRET, LoggedRefusal, linked_folder_refusals, replace_with_link
 from test_artifact_export_route import padded_png
 
 TOKEN = "partition-artifacts-test-token"
@@ -153,7 +153,6 @@ def _artifact_id(folder: Path) -> str:
 def _client() -> TestClient:
     # No `with`: skipping the lifespan skips boot migrations and workers.
     return TestClient(cowork_server.create_app())
-
 
 
 @pytest.fixture
@@ -405,8 +404,8 @@ def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people, le
 
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
     served = client.get(serve, headers=B)
+    assert "Quarterly forecast" not in served.text, (served.status_code, served.text[:200])
     assert served.status_code == 404
-    assert "Quarterly forecast" not in served.text
     assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
     assert client.get(serve, headers=A).status_code == 200
 
@@ -452,12 +451,12 @@ def test_serve_refuses_an_artifacts_folder_linked_to_the_projects_own_anton(two_
     # Body first: before the fix, the failure output shows the leaked secret.
     assert SECRET not in served.text, (served.status_code, served.text[:200])
     assert served.status_code == 404
-    assert [getattr(r, "project", None) for r in caplog.records if r.getMessage() == "Refused a linked artifacts folder"] == [
-        "general"
+    assert linked_folder_refusals(caplog.records) == [
+        LoggedRefusal(event="artifact_folder_refused", reason="linked_folder", project_id=_general_id(ALICE))
     ]
 
 
-def test_serve_refuses_an_anton_folder_linked_elsewhere(two_people, tmp_path):
+def test_serve_refuses_an_anton_folder_linked_elsewhere(two_people, tmp_path, caplog):
     general = _general(ALICE)
     elsewhere = tmp_path / "elsewhere"
     page = elsewhere / "artifacts" / "dash" / "index.html"
@@ -466,10 +465,14 @@ def test_serve_refuses_an_anton_folder_linked_elsewhere(two_people, tmp_path):
     replace_with_link(general / ".anton", elsewhere)
     client = _client()
 
-    served = client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A)
+    with caplog.at_level("WARNING", logger="cowork.services.artifacts"):
+        served = client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A)
 
+    assert "outside the project" not in served.text, (served.status_code, served.text[:200])
     assert served.status_code == 404
-    assert "outside the project" not in served.text
+    assert linked_folder_refusals(caplog.records) == [
+        LoggedRefusal(event="artifact_folder_refused", reason="linked_folder", project_id=_general_id(ALICE))
+    ]
 
 
 def test_serve_refuses_an_artifacts_folder_linked_to_another_persons_anton(two_people):
@@ -486,7 +489,6 @@ def test_serve_refuses_an_artifacts_folder_linked_to_another_persons_anton(two_p
     assert SECRET not in served.text, (served.status_code, served.text[:200])
     assert served.status_code == 404
     assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A).status_code == 200
-    assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A).status_code == 200
 
 
 def test_serve_refuses_a_link_inside_an_artifact_folder_that_leads_out(two_people):
@@ -502,6 +504,130 @@ def test_serve_refuses_a_link_inside_an_artifact_folder_that_leads_out(two_peopl
 
     assert served.status_code == 400
     assert SECRET not in served.text
+
+
+def test_serve_and_preview_refuse_a_hard_link_to_the_projects_secrets(two_people):
+    """A hard link to `.anton/.env` inside an artifact folder resolves inside
+    it, so only its second name tells it apart, and the code sandbox lets a
+    cell make one. It would also show every secret saved to `.env` later."""
+    dash, _notes = two_people
+    general = _general(ALICE)
+    (general / ".anton" / ".env").write_text(SECRET, encoding="utf-8")
+    os.link(general / ".anton" / ".env", dash / "env.txt")
+    client = _client()
+
+    mount = client.post("/api/v1/artifacts/preview-mount", json={"path": str(dash / "index.html")}, headers=A)
+    assert mount.status_code == 200, mount.text
+
+    answers = [
+        client.get("/api/v1/artifacts/serve/general/dash/env.txt", headers=A),
+        client.get("/api/v1/artifacts/preview", params={"path": str(dash / "env.txt")}, headers=A),
+        client.get("/api/v1/artifacts/preview", params={"path": "dash/env.txt"}, headers=A),
+        client.post("/api/v1/artifacts/preview-mount", json={"path": str(dash / "env.txt")}, headers=A),
+        client.get(f"/api/v1/artifacts/preview-asset/{mount.json()['token']}/env.txt", headers=A),
+    ]
+
+    for answer in answers:
+        assert SECRET not in answer.text, (answer.status_code, answer.text[:200])
+        assert answer.status_code == 404
+    assert client.get("/api/v1/artifacts/serve/general/dash/index.html", headers=A).status_code == 200
+
+
+def test_the_source_route_refuses_a_hard_link_to_the_projects_secrets(two_people):
+    """The source route reads and writes an artifact's file in place, so a hard
+    link there to `.anton/.env` would hand out the project's secrets, and take
+    a write into them."""
+    general = _general(ALICE)
+    report = _report(general, "report", "# Quarterly forecast\n")
+    (general / ".anton" / ".env").write_text(SECRET, encoding="utf-8")
+    os.link(general / ".anton" / ".env", report / "env.md")
+    client = _client()
+
+    source = client.get(
+        f"/api/v1/artifacts/workspace/{_general_id(ALICE)}/{_artifact_id(report)}",
+        params={"path": "env.md"},
+        headers=A,
+    )
+
+    assert SECRET not in source.text, (source.status_code, source.text[:200])
+    assert source.status_code == 404
+
+
+def test_project_file_routes_refuse_a_hard_link_to_the_projects_secrets(two_people):
+    """The proxy refuses every path in `.anton/`, so a cell that wants the
+    project's secrets in a browser hard-links `.anton/.env` elsewhere in the
+    project. The file routes refuse that one file under any name."""
+    general = _general(ALICE)
+    (general / ".anton" / ".env").write_text(SECRET, encoding="utf-8")
+    docs = general / "docs"
+    docs.mkdir()
+    (docs / "page.html").write_text("<html>docs</html>", encoding="utf-8")
+    os.link(general / ".anton" / ".env", docs / "env.txt")
+    client = _client()
+    mount = client.post(
+        "/api/v1/projects/preview-mount-file", json={"name": "general", "path": "docs/page.html"}, headers=A
+    )
+    assert mount.status_code == 200, mount.text
+
+    answers = [
+        client.get("/api/v1/projects/general/files-raw/docs/env.txt", headers=A),
+        client.get("/api/v1/projects/general/files/docs/env.txt", headers=A),
+        client.get(f"/api/v1/projects/preview-asset/{mount.json()['token']}/env.txt", headers=A),
+    ]
+
+    for answer in answers:
+        assert SECRET not in answer.text, (answer.status_code, answer.text[:200])
+        assert answer.status_code == 404
+
+
+def test_project_file_routes_serve_other_hard_linked_files(two_people):
+    """A package manager such as pnpm installs files as hard links into its
+    store. Only the project's `.anton/.env` is refused under a second name, so
+    those still open, download and preview."""
+    general = _general(ALICE)
+    stored = general / "store" / "lib.js"
+    stored.parent.mkdir()
+    stored.write_text("export const answer = 42;", encoding="utf-8")
+    app = general / "app"
+    (app / "node_modules").mkdir(parents=True)
+    (app / "index.html").write_text('<script src="node_modules/lib.js"></script>', encoding="utf-8")
+    os.link(stored, app / "node_modules" / "lib.js")
+    client = _client()
+    mount = client.post(
+        "/api/v1/projects/preview-mount-file", json={"name": "general", "path": "app/index.html"}, headers=A
+    )
+    assert mount.status_code == 200, mount.text
+
+    answers = [
+        client.get("/api/v1/projects/general/files-raw/app/node_modules/lib.js", headers=A),
+        client.get("/api/v1/projects/general/files/app/node_modules/lib.js", headers=A),
+        client.get(f"/api/v1/projects/preview-asset/{mount.json()['token']}/node_modules/lib.js", headers=A),
+    ]
+
+    for answer in answers:
+        assert answer.status_code == 200, answer.text
+        assert "answer = 42" in answer.text
+
+
+def test_an_artifact_holding_a_hard_link_can_still_be_deleted(two_people, monkeypatch):
+    """Only the routes that read a file refuse a second name. The path lookup
+    still finds the file, so its owner can delete what a cell planted, and the
+    project's own `.env` stays."""
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("publish-key", "https://publish.example"),
+    )
+    _dash, notes = two_people
+    general = _general(ALICE)
+    (general / ".anton" / ".env").write_text(SECRET, encoding="utf-8")
+    os.link(general / ".anton" / ".env", notes / "env.txt")
+    client = _client()
+
+    deleted = client.delete("/api/v1/artifacts/", params={"path": str(notes / "env.txt")}, headers=A)
+
+    assert deleted.status_code == 204, deleted.text
+    assert not (notes / "env.txt").exists()
+    assert (general / ".anton" / ".env").read_text(encoding="utf-8") == SECRET
 
 
 def _files_below(folder: Path) -> dict[str, bytes]:

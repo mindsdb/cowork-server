@@ -771,17 +771,63 @@ def _real_artifacts_dir(project_dir: Path) -> Path | None:
     return project_dir / ".anton" / "artifacts"
 
 
-def _served_artifacts_dir(project_dir: Path, project_name: str) -> Path | None:
+def _served_artifacts_dir(
+    project_dir: Path, *, project_name: str, session: ScopedSession
+) -> Path | None:
     """_real_artifacts_dir for /serve, with one warning when a link in
     `.anton` or `.anton/artifacts` is why it refuses: the route answers 404
     then, as for a missing folder, and only this line tells the two apart."""
+    from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH
+    from cowork.services.projects import ProjectService
+
     base = _real_artifacts_dir(project_dir)
-    anton = project_dir / ".anton"
     # os.path.islink, not Path.is_symlink: it answers False when lstat
     # fails, where is_symlink raises on EACCES.
-    if base is None and (os.path.islink(anton) or os.path.islink(anton / "artifacts")):
-        logger.warning("Refused a linked artifacts folder", extra={"project": project_name})
+    if base is None and (
+        os.path.islink(project_dir / _ARTIFACTS_SUBPATH[0])
+        or os.path.islink(project_dir.joinpath(*_ARTIFACTS_SUBPATH))
+    ):
+        # The JSON log keeps only its listed fields, so the project goes in
+        # by id; a name in `extra` would never reach it.
+        project = ProjectService(session).get_project_by_name_or_none(project_name)
+        logger.warning(
+            "Refused a linked artifacts folder",
+            extra={
+                "event": "artifact_folder_refused",
+                "reason": "linked_folder",
+                "project_id": str(project.id) if project is not None else None,
+            },
+        )
     return base
+
+
+def _is_single_named_file(path: Path) -> bool:
+    """A regular file, not a link, with no second name. A hard link in an
+    artifacts folder to a file outside it, such as the project's
+    `.anton/.env`, resolves inside the folder and passes every path check,
+    and the code sandbox lets a cell make one. A route that hands out a
+    file's content checks this; the drafts route refuses such a file the same
+    way (artifact_files._open_regular_file)."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def _is_the_projects_secrets(found: os.stat_result, *, anton_dir: Path) -> bool:
+    """Whether ``found`` is the project's `.anton/.env` under a second name: a
+    hard link a cell can make anywhere in its project, past the proxy's
+    refusal of `.anton/`. Matched by device and inode, so the project's other
+    hard-linked files, such as a package store's or a backup tool's, still
+    open."""
+    if found.st_nlink == 1:
+        return False
+    try:
+        saved = (anton_dir / ".env").lstat()
+    except OSError:
+        return False
+    return (found.st_dev, found.st_ino) == (saved.st_dev, saved.st_ino)
 
 
 def _project_artifacts_base(
@@ -805,7 +851,7 @@ def _project_artifacts_base(
     if external is not None:
         # Final: the scan lists every folder in the projects root, so falling
         # through would serve a same-named folder there instead.
-        return _served_artifacts_dir(external, project_name)
+        return _served_artifacts_dir(external, project_name=project_name, session=session)
     # Compare canonical paths on both sides. On macOS, temporary and user
     # paths commonly cross aliases such as /var -> /private/var; comparing a
     # resolved candidate with raw registry entries incorrectly rejects a
@@ -823,7 +869,7 @@ def _project_artifacts_base(
         return None
     if candidate not in registered:
         return None
-    return _served_artifacts_dir(candidate, project_name)
+    return _served_artifacts_dir(candidate, project_name=project_name, session=session)
 
 
 def serve_url_for(

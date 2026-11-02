@@ -313,7 +313,16 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
             target.relative_to(canonical_folder)
         except ValueError as exc:
             raise RevisionValidationError("Invalid artifact source path") from exc
-    if not target.is_file() or target.is_symlink():
+    from cowork.services.artifacts import _is_the_projects_secrets
+
+    # The source route reads and writes the file in place, so the project's
+    # `.anton/.env` under a second name is refused too. Other hard-linked
+    # sources, such as one a backup tool made, still open.
+    if (
+        not target.is_file()
+        or target.is_symlink()
+        or _is_the_projects_secrets(target.lstat(), anton_dir=canonical_folder.parent.parent)
+    ):
         raise FileNotFoundError("Artifact source not found")
     if target.suffix.lower() not in EDITABLE_EXTENSIONS:
         raise RevisionValidationError("This artifact type is not source-editable")
