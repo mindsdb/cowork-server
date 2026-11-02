@@ -64,6 +64,7 @@ from cowork.services.artifact_roots import (
 from cowork.services.artifacts import (
     BackendPreviewRefused,
     ExecutionRefused,
+    _is_single_named_file,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
@@ -914,6 +915,13 @@ async def artifact_status(
     return status
 
 
+def _refuse_a_second_name(artifact: Path) -> None:
+    """404 for a file with a second name: resolve_artifact_path still finds
+    it, so its owner can delete or unpublish it, but no route reads it."""
+    if artifact.is_file() and not _is_single_named_file(artifact):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
+
+
 @router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
 async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
     try:
@@ -922,6 +930,7 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    _refuse_a_second_name(artifact)
     try:
         return _preview_artifact(artifact)
     except ValueError as e:
@@ -938,6 +947,7 @@ async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeD
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    _refuse_a_second_name(artifact)
     try:
         payload = await mount_preview(artifact, scope=scope)
     except BackendPreviewRefused as e:
@@ -971,7 +981,7 @@ async def preview_asset(token: str, rel_path: str, request: Request, scope: Scop
         target.relative_to(parent)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset is outside the artifact directory")
-    if not target.is_file():
+    if not _is_single_named_file(target):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     if wants_html_preview(media_type, request):
@@ -1006,7 +1016,7 @@ def serve_artifact_file(
         target.relative_to(base.resolve())
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path") from exc
-    if not target.is_file():
+    if not _is_single_named_file(target):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool

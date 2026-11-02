@@ -10,6 +10,7 @@ import html as _html
 import json
 import logging
 import os
+import stat
 import tempfile
 import urllib.error
 from datetime import datetime, timezone
@@ -64,6 +65,7 @@ from cowork.services.providers import (
     publish_url_for_endpoint,
 )
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
 from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
@@ -494,6 +496,23 @@ def desktop_publish_context(
         api_key=api_key,
         publish_url=publish_url,
     )
+
+
+def _a_hard_linked_file(folder: Path) -> Path | None:
+    """The first regular file below ``folder`` with more than one name, or
+    None. Links are not followed, and the revision journal, which anton never
+    bundles, is left out."""
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = [name for name in dirs if name.casefold() != REVISIONS_DIRNAME.casefold()]
+        for name in names:
+            path = Path(root) / name
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                return path
+    return None
 
 
 def _resolve_publish_target(
@@ -1076,6 +1095,15 @@ def publish_artifact(
     )
     if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
         raise ValueError("Only HTML and Markdown artifact content can be published")
+    # anton bundles files from this folder by path. A file there with a second
+    # name, such as a hard link a cell made to the project's `.anton/.env`,
+    # would publish that file's current content on every publish.
+    hard_linked = _a_hard_linked_file(published_dir)
+    if hard_linked is not None:
+        raise ValueError(
+            "Can't publish an artifact holding a file with a second name (a hard link): "
+            f"{hard_linked.relative_to(published_dir)}"
+        )
     # Refuse before anything is built: `anton.publisher.publish` puts the
     # artifact's datasource credentials, in plaintext, in the body of a
     # full-stack upload, and a service that can't run the app would receive

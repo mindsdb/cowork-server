@@ -300,12 +300,10 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
     against these dirs, so a link to another person's folder would make it
     the caller's.
     """
-    from cowork.services.artifact_roots import _storage_components_are_safe
-
     dirs: dict[str, Path] = {}
     for project_dir in _registered_project_dirs(scope=scope):
-        if _storage_components_are_safe(project_dir, may_be_absent=False):
-            candidate = project_dir / ".anton" / "artifacts"
+        candidate = _real_artifacts_dir(project_dir)
+        if candidate is not None:
             dirs[str(candidate.resolve())] = candidate
     return list(dirs.values())
 
@@ -732,14 +730,15 @@ def _published_access_for(
     )
 
 
-def _external_project_artifacts_base(
+def _external_project_dir(
     project_name: str, session: ScopedSession
 ) -> Path | None:
-    """The artifacts dir of an adopted-folder project, addressed by row name.
+    """The folder of an adopted-folder project, addressed by row name.
 
     Scoped read, so it cannot reach another tenant's project. Returns None for
-    every project the filesystem scan already resolves, leaving that path
-    untouched.
+    every project the filesystem scan resolves, and for a row whose folder is
+    gone: a row created before the projects root moved still looks adopted,
+    and its folder now lives under the new root, where the scan finds it.
     """
     from cowork.services.projects import ProjectService
 
@@ -747,7 +746,17 @@ def _external_project_artifacts_base(
     project = service.get_project_by_name_or_none(project_name)
     if project is None or not service.directory_is_external(project):
         return None
-    return _real_artifacts_dir(Path(project.path))
+    folder = Path(project.path)
+    # lstat, not is_dir: a dangling link at the folder's path is not a stale
+    # row, and neither is a folder lstat can't reach. Only a missing path
+    # hands the name to a folder in the projects root.
+    try:
+        folder.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    return folder
 
 
 def _real_artifacts_dir(project_dir: Path) -> Path | None:
@@ -762,24 +771,87 @@ def _real_artifacts_dir(project_dir: Path) -> Path | None:
     return project_dir / ".anton" / "artifacts"
 
 
+def _served_artifacts_dir(
+    project_dir: Path, *, project_name: str, session: ScopedSession
+) -> Path | None:
+    """_real_artifacts_dir for /serve, with one warning when a link in
+    `.anton` or `.anton/artifacts` is why it refuses: the route answers 404
+    then, as for a missing folder, and only this line tells the two apart."""
+    from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH
+    from cowork.services.projects import ProjectService
+
+    base = _real_artifacts_dir(project_dir)
+    # os.path.islink, not Path.is_symlink: it answers False when lstat
+    # fails, where is_symlink raises on EACCES.
+    if base is None and (
+        os.path.islink(project_dir / _ARTIFACTS_SUBPATH[0])
+        or os.path.islink(project_dir.joinpath(*_ARTIFACTS_SUBPATH))
+    ):
+        # The JSON log keeps only its listed fields, so the project goes in
+        # by id; a name in `extra` would never reach it.
+        project = ProjectService(session).get_project_by_name_or_none(project_name)
+        logger.warning(
+            "Refused a linked artifacts folder",
+            extra={
+                "event": "artifact_folder_refused",
+                "reason": "linked_folder",
+                "project_id": str(project.id) if project is not None else None,
+            },
+        )
+    return base
+
+
+def _is_single_named_file(path: Path) -> bool:
+    """A regular file, not a link, with no second name. A hard link in an
+    artifacts folder to a file outside it, such as the project's
+    `.anton/.env`, resolves inside the folder and passes every path check,
+    and the code sandbox lets a cell make one. A route that hands out a
+    file's content checks this; the drafts route refuses such a file the same
+    way (artifact_files._open_regular_file)."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def _is_the_projects_secrets(found: os.stat_result, *, anton_dir: Path) -> bool:
+    """Whether ``found`` is the project's `.anton/.env` under a second name: a
+    hard link a cell can make anywhere in its project, past the proxy's
+    refusal of `.anton/`. Matched by device and inode, so the project's other
+    hard-linked files, such as a package store's or a backup tool's, still
+    open."""
+    if found.st_nlink == 1:
+        return False
+    try:
+        saved = (anton_dir / ".env").lstat()
+    except OSError:
+        return False
+    return (found.st_dev, found.st_ino) == (saved.st_dev, saved.st_ino)
+
+
 def _project_artifacts_base(
     project_name: str, session: ScopedSession
 ) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
-    maps to a registered project of the session's scope. Returns None for
-    unknown projects or path-traversal attempts.
+    maps to a registered project of the session's scope and neither `.anton`
+    nor `.anton/artifacts` is a link. Returns None for unknown projects,
+    path-traversal attempts and linked folders.
 
     The scan below derives the directory as `<root>/<name>`, which is only true
     for a project the scan can see. A project pointed at a folder the user
-    chose is resolved from its row instead.
+    chose is resolved from its row instead. A row whose folder is gone, such
+    as one created before the projects root moved, is resolved by the scan.
     """
     if (not project_name or "\x00" in project_name
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
         return None
-    base = _external_project_artifacts_base(project_name, session)
-    if base is not None:
-        return base
+    external = _external_project_dir(project_name, session)
+    if external is not None:
+        # Final: the scan lists every folder in the projects root, so falling
+        # through would serve a same-named folder there instead.
+        return _served_artifacts_dir(external, project_name=project_name, session=session)
     # Compare canonical paths on both sides. On macOS, temporary and user
     # paths commonly cross aliases such as /var -> /private/var; comparing a
     # resolved candidate with raw registry entries incorrectly rejects a
@@ -797,7 +869,7 @@ def _project_artifacts_base(
         return None
     if candidate not in registered:
         return None
-    return _real_artifacts_dir(candidate)
+    return _served_artifacts_dir(candidate, project_name=project_name, session=session)
 
 
 def serve_url_for(
@@ -836,7 +908,11 @@ def serve_url_for(
         rel_str = "/".join(quote(part) for part in rel.parts)
         return f"/api/v1/artifacts/serve/{quote(project_name)}/{rel_str}"
     for project_dir in _registered_project_dirs(scope=scope):
-        base = project_dir / ".anton" / "artifacts"
+        # The route's own rule (_project_artifacts_base): a URL for a linked
+        # folder would get only a 404.
+        base = _real_artifacts_dir(project_dir)
+        if base is None:
+            continue
         try:
             rel = p.relative_to(base.resolve())
         except (ValueError, OSError):

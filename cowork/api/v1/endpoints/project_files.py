@@ -79,6 +79,7 @@ from cowork.schemas.sharepoint import (
     SharePointSkippedItem,
 )
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+from cowork.services.artifacts import _is_the_projects_secrets
 from cowork.services.connectors.sharepoint import (
     DownloadBudget,
     SharePointClient,
@@ -835,7 +836,7 @@ def _pinned_regular_file(target: Path, base: Path, flags: int = os.O_RDONLY):
     except OSError:
         cm.__exit__(None, None, None)
         raise HTTPException(status_code=404, detail="File not found")
-    if not stat.S_ISREG(st.st_mode):
+    if not stat.S_ISREG(st.st_mode) or _is_the_projects_secrets(st, anton_dir=base / ".anton"):
         cm.__exit__(None, None, None)
         raise HTTPException(status_code=404, detail="File not found")
     return cm, fd, st
