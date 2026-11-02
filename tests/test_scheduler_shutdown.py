@@ -43,11 +43,14 @@ async def one_due_schedule(monkeypatch):
     release = asyncio.Event()
     finished: list[object] = []
 
+    slot = scheduler.DueSlot(schedule_id=schedule_id, slot_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc))
+
     async def poll(fn, *, scope):
         polls.append(len(polls))
-        return [schedule_id] if len(polls) == 1 else []
+        return [slot] if len(polls) == 1 else []
 
-    async def execute_schedule(due_id, is_manual=False, conversation_id=None):
+    async def execute_schedule(due_id, is_manual=False, conversation_id=None, *, slot_at=None):
+        assert slot_at == slot.slot_at
         await release.wait()
         finished.append(due_id)
 

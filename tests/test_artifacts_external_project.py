@@ -6,9 +6,11 @@ folder and they then disappear from the artifact list and do not serve.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -19,6 +21,9 @@ from cowork.services.projects import (
     GENERAL_PROJECT_ID,
     ProjectService,
 )
+from _linked_folders import SECRET, LoggedRefusal, linked_folder_refusals, replace_with_link
+
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 
 @pytest.fixture()
@@ -279,8 +284,6 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
 
 # -- serving through links and stale rows ------------------------------------
 
-_SECRET = "SECRET_TOKEN=do-not-serve-7f3a"
-
 
 def _local_client():
     from fastapi.testclient import TestClient
@@ -293,36 +296,33 @@ def _local_client():
     )
 
 
-def _adopt(client, folder: Path, name: str) -> str:
+class _Adopted(BaseModel):
+    id: str
+    name: str
+
+
+def _adopt(client, folder: Path, name: str) -> _Adopted:
     created = client.post("/api/v1/projects/", json={"name": name, "path": str(folder)})
     assert created.status_code == 201, created.text
-    return created.json()["name"]
+    return _Adopted.model_validate(created.json())
 
 
-def _replace_with_link(path: Path, target: Path) -> None:
-    """Replace a folder with a symlink, as a pre-sandbox cell could."""
-    import shutil
-
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.exists():
-        shutil.rmtree(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.symlink_to(target, target_is_directory=True)
-
-
-def test_serve_refuses_an_adopted_folders_artifacts_linked_to_its_anton(projects_root, tmp_path):
+def test_serve_refuses_an_adopted_folders_artifacts_linked_to_its_anton(projects_root, tmp_path, caplog):
     folder = tmp_path / "Documents" / "notes"
     (folder / ".anton").mkdir(parents=True)
-    (folder / ".anton" / ".env").write_text(_SECRET)
+    (folder / ".anton" / ".env").write_text(SECRET)
     client = _local_client()
-    name = _adopt(client, folder, "linked-artifacts")
-    _replace_with_link(folder / ".anton" / "artifacts", folder / ".anton")
+    adopted = _adopt(client, folder, "linked-artifacts")
+    replace_with_link(folder / ".anton" / "artifacts", folder / ".anton")
 
-    served = client.get(f"/api/v1/artifacts/serve/{name}/.env")
+    with caplog.at_level("WARNING", logger="cowork.services.artifacts"):
+        served = client.get(f"/api/v1/artifacts/serve/{adopted.name}/.env")
 
-    assert _SECRET not in served.text, (served.status_code, served.text[:200])
+    assert SECRET not in served.text, (served.status_code, served.text[:200])
     assert served.status_code == 404
+    assert linked_folder_refusals(caplog.records) == [
+        LoggedRefusal(event="artifact_folder_refused", reason="linked_folder", project_id=adopted.id)
+    ]
 
 
 def test_serve_refuses_an_adopted_folders_anton_linked_elsewhere(projects_root, tmp_path):
@@ -333,30 +333,43 @@ def test_serve_refuses_an_adopted_folders_anton_linked_elsewhere(projects_root, 
     page.parent.mkdir(parents=True)
     page.write_text("<html>outside the project</html>")
     client = _local_client()
-    name = _adopt(client, folder, "linked-anton")
-    _replace_with_link(folder / ".anton", elsewhere)
+    name = _adopt(client, folder, "linked-anton").name
+    replace_with_link(folder / ".anton", elsewhere)
 
     served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
 
+    assert "outside the project" not in served.text, (served.status_code, served.text[:200])
     assert served.status_code == 404
-    assert "outside the project" not in served.text
 
 
-@pytest.mark.parametrize("dangling", [False, True], ids=["no-artifacts", "dangling-link"])
+@pytest.mark.parametrize(
+    "folder_state",
+    [
+        "no-artifacts",
+        "dangling-link",
+        pytest.param(
+            "unreadable-parent",
+            marks=pytest.mark.skipif(
+                os.name == "nt" or os.geteuid() == 0, reason="POSIX modes, enforced for non-root"
+            ),
+        ),
+    ],
+)
 def test_serve_does_not_take_a_root_folder_of_the_same_name_for_an_adopted_project(
-    projects_root, tmp_path, dangling
+    projects_root, tmp_path, folder_state, caplog
 ):
     """The scan lists every directory in the projects root, so falling through
     to it would serve a leftover folder under the adopted project's name. A
-    dangling link at the adopted folder's path is not a stale row either."""
+    dangling link at the adopted folder's path is not a stale row either, nor
+    is a folder whose parent lstat can't read. None of these is a linked
+    `.anton`, so none logs the linked-folder warning."""
     import shutil
 
     folder = tmp_path / "Documents" / "notes"
     folder.mkdir(parents=True)
     client = _local_client()
-    # Rows outlive the test in the app's database, so each case needs its own name.
-    name = _adopt(client, folder, "dangling" if dangling else "same-name")
-    if dangling:
+    name = _adopt(client, folder, "same-name").name
+    if folder_state == "dangling-link":
         shutil.rmtree(folder)
         folder.symlink_to(tmp_path / "nowhere", target_is_directory=True)
     else:
@@ -364,25 +377,35 @@ def test_serve_does_not_take_a_root_folder_of_the_same_name_for_an_adopted_proje
     page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
     page.parent.mkdir(parents=True)
     page.write_text("<html>leftover in the root</html>")
+    if folder_state == "unreadable-parent":
+        folder.parent.chmod(0)
+    try:
+        with caplog.at_level("WARNING", logger="cowork.services.artifacts"):
+            served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
+    finally:
+        folder.parent.chmod(0o755)
 
-    served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
-
+    assert "leftover in the root" not in served.text, (served.status_code, served.text[:200])
     assert served.status_code == 404
-    assert "leftover in the root" not in served.text
+    assert linked_folder_refusals(caplog.records) == []
 
 
 def test_serve_reads_an_adopted_folder_reached_through_a_link(projects_root, tmp_path):
     """Only `.anton` and `.anton/artifacts` must be real directories; the
-    adopted folder itself may be an alias."""
-    real = tmp_path / "real" / "notes"
-    page = real / ".anton" / "artifacts" / "dash" / "index.html"
+    adopted folder itself may be an alias. Adoption stores the resolved
+    path, so the folder moves after it and a link takes its stored place."""
+    import shutil
+
+    stored = tmp_path / "Documents" / "notes"
+    page = stored / ".anton" / "artifacts" / "dash" / "index.html"
     page.parent.mkdir(parents=True)
     page.write_text("<html>through the alias</html>")
-    alias = tmp_path / "Documents" / "notes"
-    alias.parent.mkdir(parents=True)
-    alias.symlink_to(real, target_is_directory=True)
     client = _local_client()
-    name = _adopt(client, alias, "aliased")
+    name = _adopt(client, stored, "aliased").name
+    real = tmp_path / "real" / "notes"
+    real.parent.mkdir(parents=True)
+    shutil.move(stored, real)
+    stored.symlink_to(real, target_is_directory=True)
 
     served = client.get(f"/api/v1/artifacts/serve/{name}/dash/index.html")
 
@@ -399,7 +422,7 @@ def test_serve_finds_a_stale_rows_project_in_the_projects_root(projects_root, tm
     folder = tmp_path / "old-root" / "moved"
     folder.mkdir(parents=True)
     client = _local_client()
-    name = _adopt(client, folder, "moved")
+    name = _adopt(client, folder, "moved").name
     shutil.rmtree(folder)
     page = projects_root / name / ".anton" / "artifacts" / "dash" / "index.html"
     page.parent.mkdir(parents=True)

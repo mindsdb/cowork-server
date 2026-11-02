@@ -80,6 +80,17 @@ class LiveAppStateResponse(CamelResponse):
     stop_reason_text: str | None
 
 
+class LiveAppAvailabilityNotice(CamelResponse):
+    id: UUID
+    message: str
+
+
+class LiveAppAvailabilityResponse(CamelResponse):
+    waiting: bool
+    notice: LiveAppAvailabilityNotice | None = None
+    scope: str
+
+
 class LiveAppPreviewRequest(CamelRequest):
     launch_id: UUID
 

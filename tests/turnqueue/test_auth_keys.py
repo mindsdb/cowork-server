@@ -103,7 +103,7 @@ def _sequenced_client(monkeypatch, responses):
 def forgotten(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        "cowork.turnqueue.auth_keys.forget_stale_hub_workspace",
+        "cowork.turnqueue.auth_keys.forget_stale_mindshub_workspace",
         lambda **kw: calls.append(kw),
     )
     return calls

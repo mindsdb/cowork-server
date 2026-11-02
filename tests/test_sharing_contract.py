@@ -1,0 +1,110 @@
+"""The sharing contract's names are the ones every model of an audience
+uses: MindsHub's artifact rule, a skill's skill_access row and its rule, and
+the saves the app sends. A model that renamed one of them would stop matching
+what the app sends and MindsHub stores, so each is pinned to AudienceField.
+The names, refusal codes, instructions to the agent, patterns, and bounds
+themselves are the ones tests/fixtures/sharing_contract.yaml records."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+import yaml
+
+from cowork.models.skill_access import SkillAccess
+from cowork.schemas.artifact_access import ArtifactAccessRequest
+from cowork.schemas.skills import SkillSharingRequest
+from cowork.services import sharing_contract
+from cowork.services.artifact_access import ArtifactAudience, ArtifactRule
+from cowork.services.sharing_contract import AudienceField
+from cowork.services.skill_sharing import SkillAccessRule
+
+CONTRACT = yaml.safe_load((Path(__file__).parent / "fixtures" / "sharing_contract.yaml").read_text())
+ORG_AUDIENCE = {AudienceField.ORG_ALLOWED, AudienceField.ALLOWED_TEAM_IDS, AudienceField.ALLOWED_USER_IDS}
+
+
+def test_every_audience_model_uses_the_contract_names():
+    assert [field.value for field in AudienceField] == CONTRACT["audience_fields"]
+    assert set(ArtifactRule.model_fields) == set(AudienceField)
+    assert set(ArtifactAudience.model_fields) == ORG_AUDIENCE
+    assert set(AudienceField) <= set(ArtifactAccessRequest.model_fields)
+    assert ORG_AUDIENCE <= set(SkillSharingRequest.model_fields)
+    assert ORG_AUDIENCE <= set(SkillAccessRule.__dataclass_fields__)
+    assert ORG_AUDIENCE <= set(SkillAccess.model_fields)
+
+
+def test_the_bounds_are_the_recorded_ones():
+    """Each bound under the name the fixture records, and no bound it
+    doesn't: one renamed or added here without the fixture fails. The names
+    MindsHub's and the app's contract modules share are the same there."""
+    bounds = {
+        name for name, value in vars(sharing_contract).items()
+        if name.isupper() and isinstance(value, int) and not isinstance(value, bool)
+    }
+    assert bounds == set(CONTRACT["bounds"])
+    assert {name: getattr(sharing_contract, name) for name in CONTRACT["bounds"]} == CONTRACT["bounds"]
+
+
+def test_the_refusal_codes_are_the_recorded_ones():
+    """Each refusal code under the name the fixture records, and no code it
+    doesn't. The app's contract module holds each under the same name."""
+    codes = {
+        name for name, value in vars(sharing_contract).items()
+        if name.endswith("_CODE") and isinstance(value, str)
+    }
+    assert codes == set(CONTRACT["codes"])
+    assert {name: getattr(sharing_contract, name) for name in CONTRACT["codes"]} == CONTRACT["codes"]
+
+
+def test_the_instructions_to_the_agent_are_the_recorded_ones():
+    """Each sentence the agent is told under the name the fixture records,
+    word for word, and no sentence it doesn't. anton's publisher tells its
+    own agent the same sentence under the same name."""
+    instructions = {
+        name for name, value in vars(sharing_contract).items()
+        if name.endswith("_INSTRUCTION") and isinstance(value, str)
+    }
+    assert instructions == set(CONTRACT["instructions"])
+    recorded = {name: getattr(sharing_contract, name) for name in CONTRACT["instructions"]}
+    assert recorded == CONTRACT["instructions"]
+
+
+def test_the_patterns_are_the_recorded_ones():
+    """Each pattern under the name the fixture records, character for
+    character, compiled with no flags, and no pattern it doesn't. The upload
+    service checks a report's id against the same report-id pattern, also
+    compiled with no flags: ignoring case would let [A-Za-z] match the
+    Kelvin sign."""
+    compiled = {
+        name: value for name, value in vars(sharing_contract).items()
+        if name.isupper() and isinstance(value, re.Pattern)
+    }
+    assert {name: value.pattern for name, value in compiled.items()} == CONTRACT["patterns"]
+    assert {name: value.flags for name, value in compiled.items()} == {
+        name: re.compile(value).flags for name, value in CONTRACT["patterns"].items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "read"),
+    [
+        ("artifact/1", "artifact/1"),
+        ("  artifact/1\t", "artifact/1"),
+        ("k" * 512, "k" * 512),
+        (" " * 10 + "k" * 512 + " " * 10, "k" * 512),
+        ("k" * 513, ""),
+        ("", ""),
+        ("   ", ""),
+        ("\t\n\u3000", ""),
+        ("a\x00b", ""),
+        ("a\ud800", ""),
+        ("a\udfff", ""),
+    ],
+)
+def test_an_artifact_id_is_read_as_mindshub_reads_it(key, read):
+    """MindsHub's artifact-access serializers strip an artifact id, and
+    refuse a blank one, one longer than MAX_ARTIFACT_ID_CHARS, and one
+    holding a NUL or a lone surrogate."""
+    assert sharing_contract.mindshub_artifact_id(key) == read
