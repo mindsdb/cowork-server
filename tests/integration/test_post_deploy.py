@@ -42,10 +42,12 @@ therefore no injected identity: those two clients send the headers themselves.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import time
 import uuid
+from collections.abc import Iterable
 
 import httpx
 import pytest
@@ -346,24 +348,112 @@ def _sse_events(text: str) -> list[str]:
     ]
 
 
+SseFrame = tuple[str, dict]
+
+_UNSUCCESSFUL_EVENTS = ("response.failed", "response.cancelled", "error")
+
+
+def _read_sse_frames(lines: Iterable[str]) -> list[SseFrame]:
+    """Group SSE lines into (event name, JSON payload) frames, in order.
+
+    Heartbeat comments are skipped. A payload that is not a JSON object is
+    kept as ``{"raw": ...}`` so a malformed frame still shows up in a failure.
+    A frame cut off by the end of the stream is still returned.
+
+    Args:
+        lines: Decoded lines without their line endings, as ``iter_lines`` yields.
+
+    Returns:
+        One tuple per frame that carried an ``event:`` line.
+    """
+    frames: list[SseFrame] = []
+    event: str | None = None
+    data: list[str] = []
+    # The trailing "" flushes a final frame the stream did not terminate.
+    for line in itertools.chain(lines, [""]):
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event = line.removeprefix("event:").strip()
+        elif line.startswith("data:"):
+            data.append(line.removeprefix("data:").strip())
+        elif not line:
+            if event is not None:
+                raw = "\n".join(data)
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    payload = None
+                if not isinstance(payload, dict):
+                    payload = {"raw": raw[:300]}
+                frames.append((event, payload))
+            event, data = None, []
+    return frames
+
+
+def _assert_successful_turn(frames: list[SseFrame]) -> dict:
+    """Fail unless the frames are one turn that finished with an answer.
+
+    Success is exactly one ``response.completed`` whose status is
+    ``completed``, no failure, error or cancel frame, and nonempty answer
+    text. The text comes from the completed payload, not from joined
+    deltas, because answer reset and restore frames rewrite what streamed.
+
+    Args:
+        frames: The turn's frames from ``_read_sse_frames``.
+
+    Returns:
+        The ``response.completed`` frame's payload.
+
+    Raises:
+        AssertionError: naming the first rule the stream broke, with the
+            server's code and message when it reported a failure.
+    """
+    events = [event for event, _ in frames]
+    for event, payload in frames:
+        if event in _UNSUCCESSFUL_EVENTS:
+            message = payload.get("error") or payload.get("message")
+            raise AssertionError(
+                f"turn did not complete: stream reported {event} "
+                f"code={payload.get('code')!r} message={message!r} events={events}"
+            )
+    completed = [payload for event, payload in frames if event == "response.completed"]
+    assert completed, f"turn did not complete: no response.completed frame, events={events}"
+    assert len(completed) == 1, f"turn completed more than once: events={events}"
+
+    response = completed[0].get("response") or {}
+    status = response.get("status")
+    assert status == "completed", (
+        f"turn ended with status {status!r}: {response.get('incomplete_details')}"
+    )
+    assert _answer_text(completed[0]).strip(), (
+        f"turn completed with no answer text: events={events}"
+    )
+    return completed[0]
+
+
+def _answer_text(completed: dict) -> str:
+    """The final answer text carried by a ``response.completed`` payload."""
+    return "".join(
+        part.get("text", "")
+        for output in completed.get("response", {}).get("output", [])
+        for part in output.get("content", [])
+    )
+
+
 def _stream_turn(
     client: httpx.Client,
     conversation_id: str,
     prompt: str,
     *,
     read_timeout: float = TURN_TIMEOUT_S,
-    failures: list[str] | None = None,
+    frames: list[SseFrame] | None = None,
 ) -> list[str]:
     """POST a turn and drain its SSE response, returning the event names.
 
-    Pass ``failures`` to also collect the reason from any ``response.failed`` /
-    ``error`` event (its ``data:`` line carries ``code`` + ``error`` or
-    ``message``) — a bare "did not complete" is unactionable in CI, and the
-    reason says whether the pod never mounted, the worker timed out, or the
-    model was unavailable.
+    Pass ``frames`` to also receive every frame with its payload, which
+    ``_assert_successful_turn`` needs to say why a turn did not succeed.
     """
-    events: list[str] = []
-    current: str | None = None
     with client.stream(
         "POST",
         "/api/v1/responses/",
@@ -371,36 +461,19 @@ def _stream_turn(
         timeout=httpx.Timeout(read_timeout, connect=10.0),
     ) as resp:
         assert resp.status_code == 200, resp.read()[:500]
-        for line in resp.iter_lines():
-            if line.startswith("event:"):
-                current = line.removeprefix("event:").strip()
-                events.append(current)
-            elif (
-                line.startswith("data:")
-                and failures is not None
-                and current in ("response.failed", "error")
-            ):
-                raw = line.removeprefix("data:").strip()
-                try:
-                    payload = json.loads(raw)
-                    message = payload.get("error") or payload.get("message")
-                    failures.append(
-                        f"code={payload.get('code')!r} message={message!r}"
-                    )
-                except (ValueError, AttributeError):
-                    failures.append(raw[:300])
-    return events
+        received = _read_sse_frames(resp.iter_lines())
+    if frames is not None:
+        frames.extend(received)
+    return [event for event, _ in received]
 
 
 def test_a_turn_runs_end_to_end(api, conversation_id):
-    """A turn posted over HTTP reaches a pod and its replies reach the client."""
-    failures: list[str] = []
-    events = _stream_turn(api, conversation_id, QUICK_PROMPT, failures=failures)
+    """A turn posted over HTTP reaches a pod and its answer reaches the client."""
+    frames: list[SseFrame] = []
+    events = _stream_turn(api, conversation_id, QUICK_PROMPT, frames=frames)
 
     assert "response.created" in events
-    assert (
-        "response.completed" in events
-    ), f"turn did not complete: events={events} failure={failures}"
+    _assert_successful_turn(frames)
 
 
 def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
@@ -428,9 +501,10 @@ def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
         assert resp.status_code == 200
-        replayed = _sse_events(resp.read().decode())
+        replayed = _read_sse_frames(resp.iter_lines())
 
-    assert "response.created" in replayed, replayed
+    assert replayed and replayed[0][0] == "response.created", replayed[:1]
+    _assert_successful_turn(replayed)
 
 
 def test_reconnect_works_on_the_other_replica(conversation_id, identity):
@@ -482,9 +556,10 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
             timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
         ) as resp:
             assert resp.status_code == 200
-            replayed = _sse_events(resp.read().decode())
+            replayed = _read_sse_frames(resp.iter_lines())
 
-    assert "response.created" in replayed, replayed
+    assert replayed and replayed[0][0] == "response.created", replayed[:1]
+    _assert_successful_turn(replayed)
 
 
 def _await_shared_buffer(
