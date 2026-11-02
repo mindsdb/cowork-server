@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -18,9 +16,15 @@ from cowork.services.artifact_identity import (
     resolve_artifact_folder,
 )
 from cowork.db.scoped import TenantScope
+from cowork.services.artifact_journal import (
+    journal_file_mtime_ns,
+    read_journal_file,
+    write_journal_file,
+)
 from cowork.services.artifact_lock import artifact_lock
 from cowork.services.artifact_roots import artifacts_sources_for_scan
 
+_JOURNAL_NAME = "comments.json"
 _VIEWER = {"user_id": "desktop-owner", "email": "You", "role": "owner"}
 _CAPABILITIES = {
     "canComment": True,
@@ -49,36 +53,28 @@ class LocalArtifactComments:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="Artifact not found") from exc
-        revisions_dir = Path(folder) / ".revisions"
-        revisions_dir.mkdir(parents=True, exist_ok=True)
-        self.path = revisions_dir / "comments.json"
         self.folder = Path(folder)
         # Threads carry the same `artifact/<uuid>` key the cloud comments service
         # uses, so a desktop journal stays readable if it ever moves to the cloud.
         self.artifact_key = artifact_key(artifact_id)
 
     def _read(self) -> list[dict]:
+        # The journal is opened without following links: a `.revisions` that
+        # is a link reads as no comments, and the next write replaces it.
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return []
-        except (OSError, json.JSONDecodeError) as exc:
+            data = read_journal_file(self.folder, _JOURNAL_NAME)
+            raw = json.loads(data) if data is not None else []
+        except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail="Comment journal is unreadable") from exc
         return raw if isinstance(raw, list) else []
 
     def _write(self, threads: list[dict]) -> None:
-        fd, name = tempfile.mkstemp(prefix="comments-", suffix=".tmp", dir=self.path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(threads, handle, ensure_ascii=False, separators=(",", ":"))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(name, self.path)
-        finally:
-            try:
-                os.unlink(name)
-            except FileNotFoundError:
-                pass
+        encoded = json.dumps(threads, ensure_ascii=False, separators=(",", ":"))
+        write_journal_file(self.folder, _JOURNAL_NAME, content=encoded.encode("utf-8"))
+
+    def mtime_ns(self) -> int:
+        """When the comment journal last changed, or 0 when there is none."""
+        return journal_file_mtime_ns(self.folder, _JOURNAL_NAME)
 
     def _mutate(self, mutation):
         with artifact_lock(self.folder):
@@ -272,13 +268,13 @@ def local_comments_stream(artifact_id: str, *, scope: TenantScope | None) -> Str
             for thread in service.list_payload("all")["threads"]
         }
         try:
-            previous_mtime = service.path.stat().st_mtime_ns
+            previous_mtime = service.mtime_ns()
         except OSError:
             previous_mtime = 0
         while True:
             await asyncio.sleep(1)
             try:
-                current_mtime = service.path.stat().st_mtime_ns
+                current_mtime = service.mtime_ns()
             except OSError:
                 current_mtime = 0
             if current_mtime == previous_mtime:

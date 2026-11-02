@@ -20,43 +20,23 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cowork.services.artifact_journal import (
+    read_journal_file,
+    remove_journal_file,
+    write_journal_file,
+)
+
 logger = logging.getLogger(__name__)
 
-#: Inside `.revisions/`, which every artifact listing, publish bundle and draft
-#: preview already refuses to serve.
-_MARKER_RELPATH = (".revisions", "draft-review.json")
+#: Inside the journal, `.revisions/`, which every artifact listing, publish
+#: bundle and draft preview already refuses to serve. It's read and written
+#: through artifact_journal, which follows no link on the way.
+_MARKER_NAME = "draft-review.json"
 
 SCOPE_ORGANIZATION = "organization"
-
-
-def _marker_path(folder: Path) -> Path:
-    return folder.joinpath(*_MARKER_RELPATH)
-
-
-def _write_atomically(path: Path, payload: dict) -> None:
-    """Replace `path` in one step, like the sibling comments journal does.
-
-    A half-written grant would read as absent (`draft_review_grant` fails
-    closed), so the risk is a draft that silently stays private rather than one
-    that leaks — but a reader must never see a truncated file either way.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=".draft-review-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(name, 0o600)
-        os.replace(name, path)
-    except BaseException:
-        os.unlink(name)
-        raise
 
 
 def enable_draft_review(folder: Path, *, org_id: str, enabled_by: str) -> dict:
@@ -75,7 +55,10 @@ def enable_draft_review(folder: Path, *, org_id: str, enabled_by: str) -> dict:
         "enabledBy": str(enabled_by),
         "enabledAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    _write_atomically(_marker_path(folder), grant)
+    # Replaced in one step: a half-written grant would read as absent, so the
+    # risk is a draft that silently stays private, but a reader must never see
+    # a truncated file either way.
+    write_journal_file(folder, _MARKER_NAME, content=json.dumps(grant, indent=2).encode("utf-8"))
     return grant
 
 
@@ -85,13 +68,13 @@ def draft_review_grant(folder: Path) -> dict | None:
     Unreadable or malformed content reads as absent: the grant only ever widens
     access, so a damaged record must fail closed.
     """
-    path = _marker_path(folder)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
+        raw = read_journal_file(folder, _MARKER_NAME)
+        if raw is None:
+            return None
+        payload = json.loads(raw)
     except (OSError, ValueError):
-        logger.warning("Ignoring unreadable draft review grant: %s", path, exc_info=True)
+        logger.warning("Ignoring unreadable draft review grant: %s", folder, exc_info=True)
         return None
     if not isinstance(payload, dict) or payload.get("scope") != SCOPE_ORGANIZATION:
         return None
@@ -114,10 +97,7 @@ def draft_review_allows(folder: Path, org_id: str | None) -> bool:
 def disable_draft_review(folder: Path) -> bool:
     """Drop the grant. True when one was there."""
     try:
-        _marker_path(folder).unlink()
-        return True
-    except FileNotFoundError:
-        return False
+        return remove_journal_file(folder, _MARKER_NAME)
     except OSError:
         logger.warning("Could not remove draft review grant in %s", folder, exc_info=True)
         return False

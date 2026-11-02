@@ -291,6 +291,13 @@ def dir_scandir(d: PinnedDir) -> "Iterator[os.DirEntry[str]]":
     return os.scandir(d.path)
 
 
+def dir_fsync(d: PinnedDir) -> None:
+    """Make a rename inside *d* durable across a host crash. Windows has no
+    directory descriptor to sync, and keeps the atomic rename without it."""
+    if d.fd is not None:
+        os.fsync(d.fd)
+
+
 def open_pinned_child(d: PinnedDir, name: str, *, nofollow: bool = True) -> PinnedDir:
     """Descend into direct child directory *name* of *d*, returning a new
     ``PinnedDir`` the caller must ``close()``.
