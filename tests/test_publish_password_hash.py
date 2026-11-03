@@ -14,6 +14,7 @@ import pytest
 
 import cowork.services.publish as publish_mod
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 
 HASH = "pbkdf2_sha256$200000$c2FsdHNhbHRzYWx0c2FsdA==$ZGVyaXZlZGtleQ=="
 PUBLISH_URL = "https://view.example"
@@ -51,8 +52,10 @@ def _entry(page: Path) -> dict:
 
 
 def _publish(page: Path, access: dict) -> dict:
+    """Publish ``page`` with ``access`` as anton's publisher names it."""
     return publish_mod.publish_artifact(
-        page, artifacts_base=page.parent, api_key="k", publish_url=PUBLISH_URL, access=access,
+        page, artifacts_base=page.parent, api_key="k", publish_url=PUBLISH_URL,
+        access=ArtifactAccessRequest.of_publisher(access),
     )
 
 

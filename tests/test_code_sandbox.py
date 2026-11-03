@@ -40,7 +40,7 @@ from cowork.code_sandbox import NO_CODE_MODE_DETAIL, PlantedLinkError, build_cel
 from cowork.common.paths import makedirs_below_nofollow
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, STORE_RESOURCE, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, TenantScope
 from cowork.harnesses.anton_harness import harness
 from cowork.principal import personal_partition_id
@@ -339,6 +339,47 @@ def test_a_link_at_one_of_cowork_homes_own_entries_is_refused(stack, tmp_path, n
     assert message.startswith(f"COWORK_CODE_SANDBOX=landlock: {home / name} is a link")
     assert "remove the link and put the real file or folder back" in message
     assert list(where_it_leads.iterdir()) == []
+
+
+@pytest.mark.parametrize("store", [None, *STORE_RESOURCE], ids=["partition", *STORE_RESOURCE])
+def test_a_link_at_a_persons_partition_or_store_is_refused(stack, tmp_path, store):
+    """Agent code before the sandbox could swap B's partition folder, or one
+    of its stores, for a link to A's, and the server would read and write A's
+    projects, memory and connections as B's."""
+    home = tmp_path / "home"
+    if store is None:
+        alices, bobs = _project(home, PARTITION_A), home / PARTITION_B
+    else:
+        alices, bobs = _project(home, PARTITION_A, store), _project(home, PARTITION_B) / store
+    _plant_link(bobs, alices)
+    message = _refusal()
+    assert message.startswith(f"COWORK_CODE_SANDBOX=landlock: {bobs} is a link")
+    assert "remove the link and put the real folder back" in message
+    assert list(alices.iterdir()) == []
+
+
+def test_real_partitions_and_stores_start(stack, tmp_path):
+    home = tmp_path / "home"
+    for partition in (PARTITION_A, PARTITION_B):
+        for store in STORE_RESOURCE:
+            _project(home, partition, store)
+    # A link that names no partition is left to the other checks.
+    _plant_link(home / "not-a-partition", _project(tmp_path, "elsewhere"))
+    cowork_server.create_app()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="root reads any folder")
+def test_a_partition_the_server_cant_read_is_refused_by_name(stack, tmp_path):
+    """The server can't tell whether a store in an unreadable partition is a
+    link, so it refuses to start and names the folder."""
+    bobs = _project(tmp_path / "home", PARTITION_B, "projects").parent
+    bobs.chmod(0)
+    try:
+        message = _refusal()
+    finally:
+        bobs.chmod(0o755)
+    assert message.startswith(f"COWORK_CODE_SANDBOX=landlock: the server can't check whether {bobs / 'projects'}")
+    assert "Give the server's user access to it" in message
 
 
 def test_cowork_homes_own_entries_start_as_real_files_and_folders(stack, tmp_path):

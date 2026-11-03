@@ -29,6 +29,7 @@ one, so both modes address artifacts the same way.
 """
 from __future__ import annotations
 
+import logging
 import stat
 from pathlib import Path
 from uuid import UUID
@@ -40,6 +41,8 @@ from cowork.services.artifacts import (
     _org_mode,
     _scan_artifact_dirs,
 )
+
+logger = logging.getLogger(__name__)
 
 _ARTIFACTS_SUBPATH = (".anton", "artifacts")
 
@@ -207,11 +210,23 @@ def _sources_for(
     addresses artifacts by, so cards stay project-addressed in both modes."""
     from cowork.services.projects import ProjectService
 
+    service = ProjectService(session)
+    if service.sits_in_another_partition(project):
+        logger.warning(
+            "artifacts: a project names a folder in another person's partition, so its "
+            "artifacts are left out",
+            extra={
+                "event": "artifact_folder_refused",
+                "reason": "other_partition",
+                "project_id": str(project.id),
+            },
+        )
+        return []
     project_path = Path(project.path)
     # The same truth as the scope resolver's: a serve URL for an adopted
     # folder cannot be rediscovered by scanning, and this is the resolver the
     # desktop rail reaches (it addresses artifacts by project id).
-    external = ProjectService(session).directory_is_external(project)
+    external = service.directory_is_external(project)
     sources: list[ProjectArtifacts] = []
     for base in _project_artifact_bases(
         project.path, session, include_other_members=include_other_members

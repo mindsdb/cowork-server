@@ -42,6 +42,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 import cowork.server as cowork_server
 from cowork import managed, shared_skills
+from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -196,7 +197,7 @@ def _listed(scoped, scope: TenantScope) -> dict[str, dict]:
 
 
 def _set_sharing(scoped, scope: TenantScope, principal: Principal, slug: str, *, shared: bool) -> dict:
-    return skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), scoped(scope), principal)
+    return sharing_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), scoped(scope), principal)
 
 
 def _answers(call, status: int, detail: str) -> None:
@@ -1006,7 +1007,7 @@ def test_where_skills_are_shared_nobody_shares_one_at_a_time(all_shared, scoped)
     for slug in ("team-notes", "never-made"):
         for shared in (True, False):
             _answers(
-                lambda: skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), alice, ALICE_PRINCIPAL),
+                lambda: sharing_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), alice, ALICE_PRINCIPAL),
                 409,
                 SKILL_SHARING_UNAVAILABLE,
             )
@@ -1214,7 +1215,9 @@ def test_where_all_are_shared_a_skill_with_no_creator_is_the_operators(all_share
 def _every_route_works(session, principal, *, upload_creator: str | None) -> None:
     """Create, upload, list, read, edit, disable, rename and delete one skill
     each, as the caller who made them. None is ``shared``, and nothing stamps
-    a creator: an upload keeps what its file says (``upload_creator``)."""
+    a creator. On the desktop an upload keeps what its file says
+    (``upload_creator``); MindsHub mode drops it, since a skill's owner
+    there is its skill_access row's (cowork.services.skill_sharing)."""
     created = skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), session, principal)
     assert (created["shared"], created["capabilities"]) == (False, CHANGE_CAPABILITY)
     uploaded = skills_ep._upload_skill_bytes(
@@ -1277,7 +1280,7 @@ def hosted(org_deployment, monkeypatch, tmp_path):
 def test_hosted_org_tenancy_keeps_every_skills_route(hosted):
     principal = Principal(user_id=ORG_USER, org_id=ORG_ID, email="member@example.com")
 
-    _every_route_works(hosted, principal, upload_creator=SUB_B)
+    _every_route_works(hosted, principal, upload_creator=None)
 
     assert SkillService(hosted.scope).root.parent.name == ORG_ID
 
@@ -1287,7 +1290,7 @@ def test_hosted_org_tenancy_shares_no_skill(hosted):
     skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), hosted, principal)
 
     _answers(
-        lambda: skills_ep.set_skill_sharing("my-notes", SkillSharingRequest(shared=True), hosted, principal),
+        lambda: sharing_ep.set_skill_sharing("my-notes", SkillSharingRequest(shared=True), hosted, principal),
         409,
         SKILL_SHARING_UNAVAILABLE,
     )

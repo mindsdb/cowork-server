@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
-from starlette.requests import Request
 
 from cowork.api.v1.endpoints.connectors.submissions import submit_form
 from cowork.db.scoped import LOCAL_SCOPE
@@ -106,7 +105,7 @@ class TestSubmitEndpoint:
             form_spec={"form_id": "fm_ec163d25cf", "engine": "../etc", "fields": []},
         )
         with pytest.raises(HTTPException) as exc:
-            await submit_form(req, Request({"type": "http", "headers": []}), LOCAL_SCOPE)
+            await submit_form(req, LOCAL_SCOPE)
         assert exc.value.status_code == 422
         assert staged == []
 
