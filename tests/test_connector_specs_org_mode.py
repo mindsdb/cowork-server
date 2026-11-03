@@ -112,7 +112,7 @@ async def test_an_enabled_datasource_is_listed_even_though_oauth_never_heard_of_
     result = await specs_endpoints.list_connector_specs(ORG_SCOPE, FakeRequest())
 
     # postgres and the managed services that run as it.
-    assert {c.id for c in result} == {"postgres", "aws_aurora_postgres", "aws_rds_postgres", "azure_postgres", "gcp_cloudsql_postgres", "heroku_postgres", "neon"}
+    assert {c.id for c in result} == {"postgres", "aws_aurora_postgres", "aws_rds_postgres", "azure_postgres", "gcp_cloudsql_postgres", "heroku_postgres", "neon", "supabase"}
 
 
 @pytest.mark.asyncio

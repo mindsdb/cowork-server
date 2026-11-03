@@ -57,7 +57,7 @@ def test_enabling_one_pair_marks_only_that_pair(adapter_verified_datasources):
     assert caps.is_available("postgres", "host-port") is True
     assert caps.is_available("mysql", "host-password") is False
     # postgres and the managed services that run as it; nothing MySQL.
-    assert caps.available_connector_ids() == {"postgres", "aws_aurora_postgres", "aws_rds_postgres", "azure_postgres", "gcp_cloudsql_postgres", "heroku_postgres", "neon"}
+    assert caps.available_connector_ids() == {"postgres", "aws_aurora_postgres", "aws_rds_postgres", "azure_postgres", "gcp_cloudsql_postgres", "heroku_postgres", "neon", "supabase"}
 
 
 def test_configuration_cannot_enable_a_method_the_spec_calls_unverified(

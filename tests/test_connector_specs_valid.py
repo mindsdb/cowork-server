@@ -375,6 +375,7 @@ CLOUD_SERVICE_METHODS = {
     "aws_rds_mysql": ("direct-connection", "mysql:host-password"),
     "azure_mysql": ("connection-string", "mysql:host-password"),
     "gcp_cloudsql_mysql": ("direct-connection", "mysql:host-password"),
+    "supabase": ("individual-credentials", "postgres:host-port"),
 }
 
 # Their desktop fields, pinned before the cloud blocks existed.
@@ -481,6 +482,18 @@ SERVICE_DESKTOP_FIELDS = {"aws_aurora_postgres": {"direct-connection": [("host",
                                                   False,
                                                   True,
                                                   None)]}}
+
+
+SERVICE_DESKTOP_FIELDS["supabase"] = {"browser_oauth_builtin": [],
+ "connection-string": [("connection_string", "password", True, True, None)],
+ "individual-credentials": [("host", "text", True, False, None),
+                            ("port", "text", True, False, "5432"),
+                            ("database", "text", True, False, "postgres"),
+                            ("user", "text", True, False, "postgres"),
+                            ("password", "password", True, True, None),
+                            ("ssl_mode", "select", False, False, "require")],
+ "service-role-api-key": [("project_url", "url", True, False, None),
+                          ("service_role_key", "password", True, True, None)]}
 
 
 @pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
@@ -650,6 +663,15 @@ class TestCloudServiceSpecs:
             for m in spec.form.methods
         }
         assert actual == SERVICE_DESKTOP_FIELDS[service_id]
+
+    def test_supabase_points_at_the_session_pooler(self, registry):
+        """Supabase's direct host is IPv6-only without its add-on; the session
+        pooler answers on 5432 with a project-qualified user. The postgres
+        text's 6432 pooler line is not Supabase's."""
+        cloud = self._cloud(registry, "supabase", "individual-credentials")
+        assert "session pooler" in cloud.how_to.lower()
+        assert "postgres.<project-ref>" in cloud.how_to
+        assert "6432" not in cloud.how_to
 
     @staticmethod
     def _cloud(registry, connector_id, method_id):
