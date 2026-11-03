@@ -644,17 +644,22 @@ def test_a_desktop_managed_service_submission_still_stages_and_probes(local_clie
     from cowork.services.connectors.submissions import store
 
     staged: dict = {}
+    probed: dict = {}
     real_stage = store.stage
 
     def record_stage(**kwargs):
         staged.update(kwargs)
-        return real_stage(**kwargs)
+        staged["submission_id"] = real_stage(**kwargs)
+        return staged["submission_id"]
 
     class FakeProbeHandler:
         def __init__(self, *, scope):
             pass
 
-        async def run(self, *args):
+        async def run(self, submission_id, connector_id, method, name, conversation_id):
+            probed["submission_id"] = submission_id
+            probed["connector_id"] = connector_id
+            probed["method"] = method
             yield "event: response.completed\ndata: {}\n\n"
 
     monkeypatch.setattr(store, "stage", record_stage)
@@ -666,6 +671,9 @@ def test_a_desktop_managed_service_submission_still_stages_and_probes(local_clie
     assert res.status_code == 200
     assert staged["connector_id"] == "aws_rds_postgres"
     assert staged["values"]["password"] == PASSWORD
+    assert probed["submission_id"] == staged["submission_id"]
+    assert probed["connector_id"] == "aws_rds_postgres"
+    assert probed["method"] == "connection-string"
 
 
 def test_a_desktop_handcrafted_submission_still_stages_its_own_form(local_client, monkeypatch):
