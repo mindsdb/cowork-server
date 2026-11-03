@@ -101,7 +101,8 @@ def test_delete_project_removes_schedule_runs_too(tmp_path, monkeypatch):
     schedule = _schedule(session, project.id)
     run_service = ScheduleRunService(scoped)
     for _ in range(3):
-        run_service.create_run(schedule.id, is_manual=False)
+        # One running run per schedule: finish each before the next.
+        run_service.finish_run(run_service.create_run(schedule.id, is_manual=False).id, error="ended")
 
     assert ProjectService(scoped).delete_project(project.id) is True
 
