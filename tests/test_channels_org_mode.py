@@ -10,9 +10,11 @@ test_channels_tenancy.py / test_channel_webhooks.py for those).
 from __future__ import annotations
 
 import os
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import event
 from sqlmodel import select
 
 from cowork.channels.plugins.discord import DiscordBridge
@@ -351,9 +353,30 @@ def test_test_connection_does_not_require_org_admin(client):
     assert res.status_code == 200
 
 
-# --- removing a route that has served a message ------------------------------
+@pytest.fixture()
+def enforced_foreign_keys():
+    """Enforce SQLite foreign keys on the app database for one test, as
+    Postgres always does. The pool is disposed after so no connection keeps
+    the setting into later tests."""
+    session = get_open_session()
+    engine = session.get_bind()
+    session.close()
+    engine.dispose()
 
-def test_owner_removes_a_members_route_after_its_first_message(client, tmp_path):
+    def _fk_on(dbapi_conn: Any, _record: Any, _proxy: Any) -> None:
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    event.listen(engine, "checkout", _fk_on)
+    try:
+        yield
+    finally:
+        event.remove(engine, "checkout", _fk_on)
+        engine.dispose()
+
+
+def test_owner_removes_a_members_route_after_its_first_message(client, tmp_path, enforced_foreign_keys):
     owner = {"X-User-Id": OWNER_A, "X-Organization-Id": ORG_A, "X-User-Roles": "manage-organization"}
     project_id = _org_project(tmp_path)
     created = client.post(

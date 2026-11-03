@@ -14,9 +14,9 @@ from uuid import UUID
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.channels.plugins.discord import DiscordBridge
@@ -179,9 +179,23 @@ def test_unused_route_still_removes(engine, registry, project_id):
     assert _rows(engine, binding_id) == (None, [])
 
 
+def _empty_public_schema(uri: str) -> None:
+    """Drop everything the migrations built. A downgrade to base leaves tables
+    behind on PostgreSQL (see test_skill_access_backfill_postgres.py); the lock
+    timeout turns a session left open into an error, not a hung teardown."""
+    engine = create_engine(uri, poolclass=NullPool)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("SET LOCAL lock_timeout = '15s'"))
+            connection.execute(text("DROP SCHEMA public CASCADE"))
+            connection.execute(text("CREATE SCHEMA public"))
+    finally:
+        engine.dispose()
+
+
 @pytest.fixture()
 def postgres_engine(monkeypatch: pytest.MonkeyPatch):
-    """A disposable PostgreSQL migrated to head, downgraded to base after."""
+    """A disposable PostgreSQL migrated to head from an empty schema, emptied again after."""
     uri = os.environ.get("COWORK_TEST_POSTGRES_URI")
     if not uri:
         missing_prerequisite(
@@ -189,14 +203,14 @@ def postgres_engine(monkeypatch: pytest.MonkeyPatch):
         )
     monkeypatch.setenv("DATABASE_URI", uri)
     get_app_settings.cache_clear()
-    cfg = Config("alembic.ini")
+    _empty_public_schema(uri)
+    command.upgrade(Config("alembic.ini"), "head")
     engine = create_engine(uri)
     try:
-        command.upgrade(cfg, "head")
         yield engine
     finally:
         engine.dispose()
-        command.downgrade(cfg, "base")
+        _empty_public_schema(uri)
         get_app_settings.cache_clear()
 
 
