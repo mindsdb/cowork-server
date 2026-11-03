@@ -337,7 +337,7 @@ def granted_product_permissions(monkeypatch):
 
 
 def _set_datasource_adapter_flag(available: bool):
-    """Set `cloud.available` on the database specs, restoring it afterwards.
+    """Set `cloud.available` on the database and managed service specs, restoring it afterwards.
 
     Mutates the registry's cached spec data, because that is what a release
     flipping the flag looks like from the policy's side.
@@ -346,10 +346,13 @@ def _set_datasource_adapter_flag(available: bool):
 
     raw = registry.get_connectors()
     restore: list[tuple[dict, bool]] = []
-    for connector_id in ("postgres", "mysql"):
-        for method in raw[connector_id]["form"].get("methods", []):
+    for connector_id, spec in raw.items():
+        for method in spec.get("form", {}).get("methods", []):
             cloud = method.get("cloud")
-            if cloud is not None:
+            if cloud is None:
+                continue
+            # The engines, and every managed service that runs as one of them.
+            if connector_id in ("postgres", "mysql") or cloud.get("engine"):
                 restore.append((cloud, cloud.get("available", False)))
                 cloud["available"] = available
     yield

@@ -335,7 +335,7 @@ def test_a_datasource_submission_that_is_not_an_enabled_cloud_method_is_refused(
 
 @pytest.mark.parametrize(
     ("connector_id", "method"),
-    [("aws_rds_postgres", "connection-string"), ("snowflake", "user-password"), ("bigquery", None)],
+    [("aws_rds_postgres", "iam-auth"), ("snowflake", "user-password"), ("bigquery", None)],
 )
 def test_a_built_in_database_without_a_cloud_form_is_refused_not_saved(org_client, relay, connector_id, method):
     recorded, _ = relay

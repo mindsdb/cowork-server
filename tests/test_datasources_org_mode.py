@@ -524,3 +524,15 @@ def test_a_managed_service_stays_off_while_its_engine_is(managed_postgres_servic
     assert res.status_code == 409
     assert res.json()["detail"]["code"] == "unsupported_capability"
     assert recorded == []
+
+
+def test_the_real_rds_spec_is_created_in_auth_as_postgres(org_client, relay):
+    recorded, scripted = relay
+    scripted["status"] = 201
+    body = {**SERVICE_UI_BODY, "connector_id": "aws_rds_postgres", "method": "connection-string"}
+
+    res = org_client.post("/api/v1/connectors/datasources/", json=body, headers=AUTH_HEADERS)
+
+    assert res.status_code == 201
+    sent = json.loads(recorded[0].content)
+    assert (sent["connector_id"], sent["method"]) == ("postgres", "host-port")
