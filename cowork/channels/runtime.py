@@ -437,6 +437,7 @@ class AntonChannelRuntime:
         conversation = ConversationService(scoped).create_conversation(
             topic=topic,
             project_id=binding.anton_project_id or self._resolve_default_project_id(scoped),
+            channel_type=binding.channel_type,
         )
         binding.anton_conversation_id = conversation.id
         scoped.add(binding)
