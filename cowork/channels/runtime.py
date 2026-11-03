@@ -59,6 +59,30 @@ def _fits(conversation: Conversation, shared: bool | None) -> bool:
     return shared is None or (conversation.channel_type is not None) == shared
 
 
+def _served_on_route(scoped: ScopedSession, binding: ChannelBinding, conversation_id) -> bool:
+    """Whether the runtime itself last served `conversation_id` on `binding`
+    (its session row names it), as opposed to the route having been pointed
+    at it."""
+    return scoped.exec(
+        scoped.select(ChannelSession).where(
+            ChannelSession.binding_id == binding.id,
+            ChannelSession.anton_session_id == str(conversation_id),
+        )
+    ).first() is not None
+
+
+def _reusable_in_org(scoped: ScopedSession, binding: ChannelBinding, conversation: Conversation, shared: bool | None) -> bool:
+    """Org mode's reuse rule: the runtime's own conversation, marked to match,
+    on this route only. An unknown message joins a marked conversation only
+    when this route was the one served into it, so a group DM route pointed at
+    a marked conversation (by an older server mid-rollout) starts afresh."""
+    if not _fits(conversation, shared) or _shared_by_another_route(scoped, binding, conversation.id):
+        return False
+    if shared is None and conversation.channel_type is not None:
+        return _served_on_route(scoped, binding, conversation.id)
+    return True
+
+
 def _shared_by_another_route(scoped: ScopedSession, binding: ChannelBinding, conversation_id) -> bool:
     """Whether a route other than `binding` points at `conversation_id`; such a
     conversation (a legacy pin) would mix two chats' messages."""
@@ -468,8 +492,7 @@ class AntonChannelRuntime:
         if binding.anton_conversation_id is not None:
             existing = scoped.get(Conversation, binding.anton_conversation_id)
             if existing is not None and (
-                not scoped.scope.org_mode
-                or (_fits(existing, shared) and not _shared_by_another_route(scoped, binding, existing.id))
+                not scoped.scope.org_mode or _reusable_in_org(scoped, binding, existing, shared)
             ):
                 return existing
         topic = f"{binding.channel_type}: {binding.display_name or binding.external_group_id}"[:80]
@@ -504,6 +527,9 @@ class AntonChannelRuntime:
                 last_message_at=now,
             )
         else:
+            # Always the conversation just served: _ensure_conversation may have
+            # replaced the route's, and its reuse rule reads this row.
+            row.anton_session_id = str(conversation.id)
             row.last_message_at = now
         scoped.add(row)
         scoped.commit()
