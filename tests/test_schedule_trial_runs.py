@@ -16,7 +16,7 @@ from cowork.common.datetime_utils import ensure_utc
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import run_schema_migrations
 from cowork.schemas.schedules import RunStatus
-from cowork.services.schedules import ScheduleService
+from cowork.services.schedules import ScheduleRunService, ScheduleService
 from tests.test_schedule_run_failures import (  # noqa: F401  (fixtures)
     SLOT,
     _client,
@@ -128,15 +128,24 @@ async def test_run_now_passes_trial_through_and_the_run_reports_it(schedule_id, 
         scheduler.release_run_place()
 
     monkeypatch.setattr(scheduler, "run_admitted", capture)
+
+    def end_claimed_run() -> None:
+        # The press claimed its run row before answering; end it so the next
+        # press can claim the schedule.
+        session, scoped = _scoped()
+        try:
+            ScheduleRunService(scoped).finish_run(started[-1]["run_id"])
+        finally:
+            session.close()
+
     async with _client() as client:
         assert (await client.post(f"/api/v1/schedules/{schedule_id}/run-now?trial=true")).status_code == 202
+        end_claimed_run()
         assert (await client.post(f"/api/v1/schedules/{schedule_id}/run-now")).status_code == 202
+        end_claimed_run()
+        runs = (await client.get(f"/api/v1/schedules/{schedule_id}/runs")).json()["runs"]
     assert [kwargs["trial"] for kwargs in started] == [True, False]
-
-    await scheduler.execute_schedule(schedule_id, is_manual=True, trial=True)
-    async with _client() as client:
-        (run,) = (await client.get(f"/api/v1/schedules/{schedule_id}/runs")).json()["runs"]
-    assert run["trial"] is True
+    assert sorted(run["trial"] for run in runs) == [False, True], "the claimed run row carries the flag"
 
 
 async def test_a_cron_run_is_never_a_trial(schedule_id, turns):

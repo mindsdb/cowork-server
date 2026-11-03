@@ -425,6 +425,26 @@ async def test_run_now_is_refused_when_the_organization_is_at_its_limit(schedule
     assert scheduler._admission.held == 0
 
 
+async def test_run_now_taking_the_organizations_last_place_is_counted_in_its_claim(schedules, monkeypatch):
+    """The early check can pass for two presses at once; the claim counts the
+    organization's runs again in its own transaction, so a press over the
+    limit is refused and nothing is left running for it."""
+    from cowork.server import create_app
+
+    for _ in range(scheduler._org_run_limit()):
+        _running(schedules(org_id="org-a"))
+    schedule_id = schedules(org_id="org-a")
+    monkeypatch.setattr(scheduler, "org_runs_full", lambda _session, _schedule: False)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="http://test") as client:
+        answer = await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
+
+    assert answer.status_code == 409
+    assert "organization" in answer.json()["detail"]
+    assert _runs(schedule_id) == []
+    assert scheduler._admission.held == 0
+
+
 # --- The run's time limit -------------------------------------------------------
 
 
