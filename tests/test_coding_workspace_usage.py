@@ -195,6 +195,55 @@ def test_preparing_a_task_invalidates_the_last_measurement(tmp_path: Path) -> No
     assert usage._measured_generation != usage._generation
 
 
+def test_a_request_once_the_path_is_visible_measures_again_while_setup_runs(tmp_path: Path) -> None:
+    (tmp_path / "one").mkdir()
+    repo = repository(tmp_path / "one")
+    write(repo / "data.bin", 200_000)
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "data")
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="One",
+        folders=[ProjectFolder(id="one", name="One", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+    factory = service.session_factory
+    preparing, prepare_released = threading.Event(), threading.Event()
+    in_setup, setup_released = threading.Event(), threading.Event()
+    prepare, run_setup = factory._prepare_local_session, factory._run_setup
+
+    def paused_prepare(*args, **kwargs):
+        preparing.set()
+        assert prepare_released.wait(timeout=10)
+        return prepare(*args, **kwargs)
+
+    def paused_setup(*args, **kwargs):
+        in_setup.set()
+        assert setup_released.wait(timeout=10)
+        return run_setup(*args, **kwargs)
+
+    factory._prepare_local_session = paused_prepare
+    factory._run_setup = paused_setup
+    session_id = service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id
+    try:
+        assert preparing.wait(timeout=10)
+        usage = service.workspace_usage
+        # Measured before the workspace exists.
+        assert {item.session_id: item.bytes for item in usage.measure().items}[session_id] == 0
+        prepare_released.set()
+        assert in_setup.wait(timeout=10)
+        assert service.get_session(session_id).workspace_path  # the client has seen the path
+
+        assert usage.snapshot(session_id).measuring
+        join_measurement(usage)
+        assert {item.session_id: item.bytes for item in usage.snapshot(session_id).items}[session_id] >= 200_000
+    finally:
+        prepare_released.set()
+        setup_released.set()
+    wait_for_status(service, session_id, SessionStatus.completed)
+
+
 def test_the_service_reports_a_worktree_task_and_the_total(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     write(repo / "data.bin", 200_000)

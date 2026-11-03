@@ -170,6 +170,7 @@ class CodingService(
             self.project_workspaces,
             self._emit,
             self.control,
+            on_workspace_ready=self.workspace_usage.invalidate,
         )
         self.commands = CodingCommandHandler(
             self.registry,

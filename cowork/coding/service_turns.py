@@ -105,8 +105,8 @@ class CodingTurnOperations:
                 lambda current: fail_turn(current, False, message),
             )
             return
-        # A measurement taken while the workspace was preparing saw it empty
-        # or partly written.
+        # Setup commands may have written into the workspace since it was
+        # first published.
         self.workspace_usage.invalidate()
         with self._lock:
             preparing = self._running.pop(session_id, None)
