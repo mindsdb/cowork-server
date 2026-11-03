@@ -22,6 +22,15 @@ def test_google_drive_spec_carries_the_drive_api_rules():
     assert "corpora='allDrives'" in notes
 
 
+def test_google_drive_spec_explains_the_picker_instead_of_broader_access():
+    notes = registry.usage_notes_for(["google_drive"])["google_drive"]
+
+    assert "Add files from Google Drive" in notes
+    assert "files.export" in notes
+    assert "alt=media" in notes
+    assert "never suggest reconnecting with broader permissions" in notes
+
+
 def test_roam_research_spec_carries_the_redirect_rule():
     notes = registry.usage_notes_for(["roam_research"])["roam_research"]
 
@@ -143,8 +152,12 @@ async def test_a_custom_connectors_notes_reach_the_session_config(monkeypatch, t
 
 async def test_drive_notes_reach_the_session_config_without_picked_files(monkeypatch, tmp_path):
     async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
-        assert "corpora='allDrives'" in config.connector_usage_notes["google_drive"]
+        notes = config.connector_usage_notes["google_drive"]
+        assert "corpora='allDrives'" in notes
+        # A fresh connection has no picked files, so the Picker block is empty;
+        # the usage notes alone must tell the agent how to reach an existing file.
         assert "Google Picker" not in config.system_prompt_context.suffix
+        assert "Add files from Google Drive" in notes
 
 
 @pytest.mark.parametrize(
