@@ -1808,13 +1808,12 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     return cards
 
 
-def _line_breaks(text: str, start: int, end: int) -> int:
+def _line_breaks(text: str, start: int, end: int, has_cr: bool) -> int:
     # `\r\n` is one break; a bare `\n` or `\r` is one each.
-    return (
-        text.count("\n", start, end)
-        + text.count("\r", start, end)
-        - text.count("\r\n", start, end)
-    )
+    breaks = text.count("\n", start, end)
+    if has_cr:
+        breaks += text.count("\r", start, end) - text.count("\r\n", start, end)
+    return breaks
 
 
 def count_csv_rows(text: str) -> int:
@@ -1829,14 +1828,17 @@ def count_csv_rows(text: str) -> int:
     if text.startswith("\ufeff"):
         text = text[1:]
     end = len(text)
+    # read_text already turns `\r\n` and `\r` into `\n`, so this usually saves
+    # two counts per segment.
+    has_cr = "\r" in text
     rows = 0
     pos = 0
     while pos < end:
         quote = text.find('"', pos)
         if quote < 0:
-            rows += _line_breaks(text, pos, end)
+            rows += _line_breaks(text, pos, end, has_cr)
             break
-        rows += _line_breaks(text, pos, quote)
+        rows += _line_breaks(text, pos, quote, has_cr)
         if quote and text[quote - 1] not in ",\n\r":
             # A quote inside a field is literal.
             pos = quote + 1
