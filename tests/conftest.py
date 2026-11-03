@@ -4,6 +4,7 @@ Isolates the app onto a throwaway SQLite DB + master key BEFORE any cowork
 module is imported (settings/engine are read at import time), then builds the
 schema directly and seeds the ``general`` project the runtime depends on.
 """
+import copy
 import importlib
 import io
 import logging
@@ -374,6 +375,42 @@ def adapter_unverified_datasources():
     branch that ships the flag the other way round.
     """
     yield from _set_datasource_adapter_flag(False)
+
+
+@pytest.fixture
+def managed_postgres_service():
+    """A managed service spec, ``managed_pg``, that runs as postgres:host-port.
+
+    Its one cloud method copies postgres's cloud fields and is adapter-verified.
+    Added to the registry's cached spec data and removed afterwards.
+    """
+    from cowork.services.connectors.specs._registry import registry
+
+    raw = registry.get_connectors()
+    postgres_cloud = next(
+        m["cloud"] for m in raw["postgres"]["form"]["methods"] if m.get("cloud") is not None
+    )
+    raw["managed_pg"] = {
+        "id": "managed_pg",
+        "label": "Managed PostgreSQL",
+        "category": "database",
+        "form": {
+            "form_id": "managed-pg-connector",
+            "title": "Connect Managed PostgreSQL",
+            "methods": [{
+                "id": "direct",
+                "label": "Direct",
+                "fields": [{"name": "host", "label": "Host", "type": "text"}],
+                "cloud": {
+                    **copy.deepcopy(postgres_cloud),
+                    "available": True,
+                    "engine": "postgres:host-port",
+                },
+            }],
+        },
+    }
+    yield "managed_pg", "direct"
+    raw.pop("managed_pg", None)
 
 
 @pytest.fixture

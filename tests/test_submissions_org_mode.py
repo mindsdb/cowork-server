@@ -349,6 +349,39 @@ def test_a_built_in_database_without_a_cloud_form_is_refused_not_saved(org_clien
     assert recorded == []
 
 
+def test_a_managed_service_submission_is_relayed_as_its_engine(managed_postgres_service, org_client, relay):
+    recorded, _ = relay
+    connector_id, method = managed_postgres_service
+
+    res = org_client.post(PATH, json=submission(connector_id=connector_id, method=method), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    body = json.loads(recorded[0].content)
+    assert (body["connector_id"], body["method"]) == ("postgres", "host-port")
+    assert PASSWORD not in res.text
+    assert "managed_pg" in res.text
+
+
+@pytest.mark.parametrize(
+    ("top_level", "form_spec"),
+    [
+        ({}, {"engine": "postgres"}),
+        ({}, {"_connector_id": "postgres"}),
+        ({"form_id": "postgres-connector"}, {}),
+    ],
+    ids=["engine", "connector-id", "form-id"],
+)
+def test_a_handcrafted_form_naming_postgres_still_goes_to_auth(org_client, relay, top_level, form_spec):
+    recorded, _ = relay
+    body = {**submission(), **top_level, "form_spec": {"form_id": "x", **form_spec}}
+    body.pop("connector_id")
+
+    res = org_client.post(PATH, json=body, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert json.loads(recorded[0].content)["connector_id"] == "postgres"
+
+
 @pytest.fixture()
 def org_client_with_local_flow(monkeypatch, adapter_verified_datasources) -> TestClient:
     """Org mode with PostgreSQL enabled and the ordinary submission flow left intact."""
