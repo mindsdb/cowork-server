@@ -1863,14 +1863,18 @@ def preview_artifact(path: Path) -> dict:
     if suffix not in TEXT_EXTENSIONS:
         raise ValueError("Preview is available for text, Markdown, code, JSON, CSV, and HTML files")
     text = path.read_text(encoding="utf-8", errors="replace")
-    return {
+    preview = {
         "path": str(path),
         "title": path.name,
         "kind": KIND_BY_EXT.get(suffix, "File"),
         "mime": mimetypes.guess_type(str(path))[0] or "text/plain",
-        "content": text[:200_000],
-        "truncated": len(text) > 200_000,
+        "content": text[:PREVIEW_TEXT_MAX],
+        "truncated": len(text) > PREVIEW_TEXT_MAX,
     }
+    if suffix == ".csv" and preview["truncated"]:
+        # The client only sees the cut content, so the total has to come from here.
+        preview["total_rows"] = max(0, count_csv_rows(text) - 1)
+    return preview
 
 
 async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:

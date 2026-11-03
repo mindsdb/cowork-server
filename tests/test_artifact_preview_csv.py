@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from cowork.services.artifacts import count_csv_rows
+from cowork.services.artifacts import PREVIEW_TEXT_MAX, count_csv_rows, preview_artifact
 
 
 def _reference_count(text: str) -> int:
@@ -73,3 +73,37 @@ def test_count_csv_rows_agrees_with_the_character_loop():
         if rng.random() < 0.1:
             text = "\ufeff" + text
         assert count_csv_rows(text) == _reference_count(text), repr(text)
+
+
+def test_preview_reports_the_full_row_count_of_a_cut_csv(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text(
+        "id,value\n" + "".join(f"{i},{i * 7}\n" for i in range(20_000)), encoding="utf-8"
+    )
+    assert path.stat().st_size > PREVIEW_TEXT_MAX
+
+    preview = preview_artifact(path)
+
+    assert preview["truncated"] is True
+    assert len(preview["content"]) == PREVIEW_TEXT_MAX
+    assert preview["total_rows"] == 20_000
+
+
+def test_preview_of_an_uncut_csv_carries_no_total(tmp_path):
+    path = tmp_path / "small.csv"
+    path.write_text("id,value\n1,7\n", encoding="utf-8")
+
+    preview = preview_artifact(path)
+
+    assert preview["truncated"] is False
+    assert "total_rows" not in preview
+
+
+def test_preview_of_a_cut_text_file_carries_no_total(tmp_path):
+    path = tmp_path / "big.txt"
+    path.write_text("line\n" * 50_000, encoding="utf-8")
+
+    preview = preview_artifact(path)
+
+    assert preview["truncated"] is True
+    assert "total_rows" not in preview
