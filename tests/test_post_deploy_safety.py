@@ -440,3 +440,71 @@ def test_successive_turns_reject_a_failed_second_turn():
     with httpx.Client(base_url="https://cowork.example", transport=transport) as api:
         with pytest.raises(AssertionError, match="stream reported response.failed"):
             test_post_deploy.test_two_successive_turns_complete_and_persist(api, _CONVERSATION_ID)
+
+
+def test_read_sse_frames_keeps_a_final_frame_the_stream_did_not_terminate():
+    frames = test_post_deploy._read_sse_frames(
+        ["event: response.completed", 'data: {"type": "response.completed"}'],
+    )
+
+    assert frames == [("response.completed", {"type": "response.completed"})]
+
+
+def test_reconnect_drops_the_first_connection_only_after_an_answer_delta():
+    read: list[str] = []
+    frames = [_created_frame(), _delta_frame("po"), _delta_frame("ng", 3), _completed_frame()]
+
+    def turn_stream() -> Iterator[bytes]:
+        for frame in frames:
+            read.append(frame)
+            yield frame.encode()
+
+    rest = _deployment(turn_body=_STARTED, tail_body=_SUCCESSFUL_TURN)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if (request.method, request.url.path) == ("POST", "/api/v1/responses/"):
+            return httpx.Response(
+                200, content=turn_stream(), headers={"Content-Type": "text/event-stream"},
+            )
+        return rest.handle_request(request)
+
+    transport = httpx.MockTransport(handle)
+    with httpx.Client(base_url="https://cowork.example", transport=transport) as api:
+        test_post_deploy.test_reconnect_replays_a_turn_in_progress(api, _CONVERSATION_ID)
+
+    assert read == frames[:2], "the client must read up to the first answer delta and stop"
+
+
+def test_reconnect_rejects_a_replay_that_does_not_start_with_created():
+    with pytest.raises(AssertionError, match="replay did not start with response.created"):
+        _run_ingress_reconnect(_delta_frame(_ANSWER) + _completed_frame())
+
+
+def test_reconnect_rejects_an_answer_saved_under_the_wrong_role():
+    saved = _saved_turn()
+    saved[1] = {**saved[1], "role": "user"}
+
+    with pytest.raises(AssertionError, match="saved answer has role 'user'"):
+        _run_ingress_reconnect(_SUCCESSFUL_TURN, saved=saved)
+
+
+def _with_second_answer_changed(items: list[dict]) -> list[dict]:
+    """The history with the second answer saved as different text."""
+    return [
+        {**item, "content": "charlie"} if item["id"] == _TURNS[1][3] else item
+        for item in items
+    ]
+
+
+def _with_first_answer_saved_as_user(items: list[dict]) -> list[dict]:
+    """The history with the first answer stored under the user role."""
+    return [{**item, "role": "user"} if item["id"] == _TURNS[0][3] else item for item in items]
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    (_with_second_answer_changed, "content differs"),
+    (_with_first_answer_saved_as_user, "role 'user'"),
+])
+def test_successive_turns_reject_a_saved_message_with_the_wrong_role_or_content(change, reason):
+    with pytest.raises(AssertionError, match=reason):
+        _run_successive_turns(change(_saved_successive_turns()))

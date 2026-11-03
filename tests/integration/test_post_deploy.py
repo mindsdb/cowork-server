@@ -524,7 +524,7 @@ def _assert_answer_saved(client: httpx.Client, conversation_id: str, completed: 
         if str(item.get("id")) == message_id
     ]
     assert len(saved) == 1, f"replayed answer was not saved: assistant_message_id={message_id}"
-    assert saved[0].get("role") == "assistant", saved[0].get("role")
+    assert saved[0].get("role") == "assistant", f"saved answer has role {saved[0].get('role')!r}"
     assert saved[0].get("content") == _answer_text(completed), (
         "replayed answer differs from the saved one: "
         f"replayed={_answer_text(completed)[:200]!r} saved={str(saved[0].get('content'))[:200]!r}"
@@ -546,7 +546,9 @@ def _replay_turn(client: httpx.Client, conversation_id: str) -> dict:
         assert resp.status_code == 200
         replayed = _read_sse_frames(resp.iter_lines())
 
-    assert replayed and replayed[0][0] == "response.created", replayed[:1]
+    assert replayed and replayed[0][0] == "response.created", (
+        f"replay did not start with response.created: {replayed[:1]}"
+    )
     return _assert_successful_turn(replayed)
 
 
@@ -759,7 +761,9 @@ def test_two_successive_turns_complete_and_persist(api, conversation_id):
         completed = _assert_successful_turn(frames)
         created = next(payload for event, payload in frames if event == "response.created")
         assert created.get("user_message_id"), "created frame carried no user_message_id"
-        assert completed.get("assistant_message_id"), "completed frame carried no assistant_message_id"
+        assert completed.get("assistant_message_id"), (
+            "completed frame carried no assistant_message_id"
+        )
         expected.append((created["user_message_id"], "user", prompt))
         expected.append((completed["assistant_message_id"], "assistant", _answer_text(completed)))
 
