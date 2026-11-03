@@ -2168,7 +2168,10 @@ class ResponsesHandler:
             turn_artifacts.recorded = True
             directory = turn_artifacts.directory
             try:
-                changes = turn_artifact_changes(
+                # It waits on each touched artifact's lock and parses its
+                # journal, so it runs off the event loop the server shares.
+                changes = await asyncio.to_thread(
+                    turn_artifact_changes,
                     conversation_id=conv_id,
                     artifacts_base=directory.base,
                     before=turn_artifacts.before_slugs,

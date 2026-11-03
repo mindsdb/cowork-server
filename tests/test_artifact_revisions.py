@@ -1034,7 +1034,7 @@ def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monke
 
     def fail_once(folder_arg, repair):
         nonlocal failed
-        if not failed and repair.get("status") == "rejected":
+        if not failed and repair.status == "rejected":
             failed = True
             raise OSError("simulated repair status interruption")
         return write_repair(folder_arg, repair)

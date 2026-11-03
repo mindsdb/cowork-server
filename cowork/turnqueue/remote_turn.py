@@ -146,7 +146,10 @@ async def remote_turn_events(
         raise
     finally:
         if artifacts is not None and artifact_writes_allowed:
-            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
+            # It waits on each touched artifact's lock and parses its
+            # journal, so it runs off the event loop the server shares.
+            new_slugs, touched_slugs, turn_scope = await asyncio.to_thread(
+                index_turn_artifacts,
                 artifacts[0], conv_id, artifacts[2], artifacts[1],
                 before_slugs, before_mtimes,
                 attribute_by_provenance=True,
