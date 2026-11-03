@@ -17,7 +17,6 @@ import logging
 import os
 import secrets
 import stat
-import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -39,10 +38,10 @@ from cowork.code_sandbox import anchored_below_a_trusted_root
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_atomic_write,
     dir_open,
     dir_scandir,
     dir_stat,
-    dir_unlink,
     open_pinned_child,
     pinned_dir,
 )
@@ -264,42 +263,16 @@ def _replaced_mode(folder: PinnedDir, name: str) -> int | None:
 
 
 def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:
+    """Replace the document *name* with *payload*. A symlinked
+    `metadata.json` is replaced by the real document, never written through
+    (dir_atomic_write)."""
     name = _component(name)
-    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
-    try:
-        # `O_EXCL | O_NOFOLLOW`: the name carries a uuid4 so a collision is not
-        # realistic, but creating rather than opening is what makes "write to a
-        # file somebody planted here" impossible rather than improbable.
-        fd = dir_open(
-            folder,
-            tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
-            0o600,
-        )
-        mode = _replaced_mode(folder, name)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            if mode is not None:
-                try:
-                    os.fchmod(stream.fileno(), mode)
-                except OSError:
-                    # A volume that keeps no modes, such as vfat, refuses the
-                    # change; the document is written all the same.
-                    pass
-            stream.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-        # `os.replace` acts on the link itself, never its target, so a symlinked
-        # `metadata.json` is replaced by the real document instead of writing
-        # through it.
-        if folder.fd is not None:
-            os.replace(tmp, name, src_dir_fd=folder.fd, dst_dir_fd=folder.fd)
-        else:
-            os.replace(folder.path / tmp, folder.path / name)
-    finally:
-        try:
-            dir_unlink(folder, tmp)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+    dir_atomic_write(
+        folder,
+        name,
+        content=(json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+        mode=_replaced_mode(folder, name),
+    )
 
 
 def _ensure_full_id(

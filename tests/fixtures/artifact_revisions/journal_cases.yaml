@@ -59,6 +59,10 @@ malformed_pending_writes:
     record: {version: 2}
   - id: paths-differ
     record: {path: other.md}
+  # The record names the source and its base revision, so only the check that
+  # its revision names the same path refuses it.
+  - id: revision-names-another-path
+    record: {revision_path: other.md}
   - id: path-out-of-the-artifact
     record: {path: ../../.env, revision_path: ../../.env}
   - id: path-in-the-journal
@@ -69,6 +73,93 @@ malformed_pending_writes:
     record: {path: "", revision_path: "", base_revision_id: null}
   - id: blank-path
     record: {path: "  ", revision_path: "  ", base_revision_id: null}
+
+# Pending source writes whose source already holds the revision's bytes, as
+# after a crash between the source write and the manifest's. Each fails
+# PendingSourceWrite on a field recovery would otherwise accept, so recovery
+# abandons it rather than add its revision to the history. `record` fields
+# replace those of a server-shaped record.
+pending_writes_failing_their_model:
+  - id: before-hash-not-hex
+    record: {beforeContentHash: ../../.env}
+  - id: before-hash-in-capitals
+    record: {beforeContentHash: "{real_upper}"}
+  - id: before-hash-null
+    record: {beforeContentHash: null}
+  - id: version-as-text
+    record: {version: "1"}
+
+# Repair records the agent's code wrote for the running turn, each failing
+# AgentRepair on one field. `record` fields replace those of a server-shaped
+# queued record. The turn-end capture leaves each file as it is, and the
+# repair routes answer as for a missing repair.
+repairs_failing_their_model:
+  - id: blank-path
+    record: {path: "  "}
+  - id: empty-path
+    record: {path: ""}
+  - id: path-not-text
+    record: {path: [brief.md]}
+  - id: status-the-server-never-writes
+    record: {status: approved}
+  - id: status-null
+    record: {status: null}
+
+# Manifest entries the agent's code wrote, each failing RevisionEntry on a
+# field other than contentHash. `record` fields replace those of the server's
+# head entry, so each names a real blob. Each is left out of the history and
+# dropped on the next write. A number written as numeric text, such as "3",
+# reads as that number, so it is not here.
+revisions_failing_their_model:
+  - id: blank-path
+    record: {path: "  "}
+  - id: empty-path
+    record: {path: ""}
+  - id: path-not-text
+    record: {path: [brief.md]}
+  - id: id-as-a-number
+    record: {id: 7}
+  - id: number-not-a-number
+    record: {number: x}
+  - id: number-as-a-list
+    record: {number: [1]}
+  - id: actor-as-text
+    record: {actor: agent}
+  - id: actor-without-a-kind
+    record: {actor: {id: alice}}
+  - id: comment-threads-as-text
+    record: {commentThreadIds: thread-1}
+
+# Values the agent's code can put in a record that JSON can't encode, so no
+# record holding one can be answered or written back, and each reads as
+# damaged. `depth` nests empty lists that deep: past the 255 levels a record's
+# encoding takes, and past the roughly 1,000 at which staging's own writes gave
+# up. `text` is a lone surrogate, which the file holds as an escape.
+values_json_cannot_encode:
+  - id: nested-300-deep
+    depth: 300
+  - id: nested-1200-deep
+    depth: 1200
+  - id: lone-high-surrogate
+    text: "\ud800"
+  - id: lone-low-surrogate
+    text: "\udcff"
+
+# One large repair the agent's code planted that passes its model. Checking
+# that it can be written back builds no second copy of it, so a scan's peak
+# memory stays near what parsing it takes.
+large_repair:
+  objects_per_record: 50000
+  peak_over_parse_bound: 1.6
+
+# Records another build wrote: each holds a key this build doesn't declare,
+# after the keys it declares, and lacks fields this build writes but never
+# reads back. A write keeps the key, adds none of the fields, and answers the
+# record as it is on disk.
+records_from_another_build:
+  undeclared: {writtenBy: a later build}
+  revision_without: [bytes, conversationId]
+  repair_without: [artifactId, baseContentHash, selector, thread]
 
 # A pile of large repair records the agent's code planted. Records are read one
 # at a time, so a second pile on top of the first may not raise the peak memory

@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import stat
-import uuid
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -31,11 +30,10 @@ from cowork.common.paths import (
     O_NOFOLLOW,
     O_NONBLOCK,
     PinnedDir,
-    dir_fsync,
+    dir_atomic_write,
     dir_lstat,
     dir_mkdir,
     dir_open,
-    dir_replace,
     dir_scandir,
     dir_unlink,
     is_child_name,
@@ -274,27 +272,7 @@ def write_journal_file(folder: Path, *parts: str, content: bytes) -> None:
     *folders, name = parts
     _check_names((name,))
     with opened_journal(folder, *folders, create=True) as journal:
-        tmp = f".{name}.{uuid.uuid4().hex}.tmp"
-        try:
-            fd = dir_open(
-                journal, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o600
-            )
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            dir_replace(journal, tmp, name)
-            try:
-                dir_fsync(journal)
-            except OSError:
-                # The file is durable and the rename atomic; a filesystem that
-                # can't sync a folder only loses the rename's durability.
-                pass
-        finally:
-            try:
-                dir_unlink(journal, tmp)
-            except OSError:
-                pass
+        dir_atomic_write(journal, name, content=content)
 
 
 def remove_journal_file(folder: Path, *parts: str) -> bool:
