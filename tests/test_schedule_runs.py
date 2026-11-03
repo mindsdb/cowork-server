@@ -69,6 +69,8 @@ def _run_with_conversation(session, run_service, schedule):
     conv = _conversation(session)
     run = run_service.create_run(schedule.id, is_manual=False)
     run_service.set_run_conversation(run.id, conv.id)
+    # A schedule holds one running run at a time.
+    run_service.finish_run(run.id, conversation_id=conv.id)
     return conv
 
 
