@@ -138,6 +138,10 @@ class CloudMethod(BaseModel):
     # Two independent lists is what keeps the desktop form fixed while this
     # one changes.
     fields: list[ConnectorField] = []
+    # "connector:method" of the engine a managed service is underneath, such
+    # as "postgres:host-port". Its availability and the pair auth stores both
+    # come from that engine; None means the method is an engine itself.
+    engine: str | None = None
 
 
 class ConnectorMethod(BaseModel):
