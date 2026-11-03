@@ -1823,8 +1823,8 @@ def count_csv_rows(text: str) -> int:
     The preview footer sits under a table the renderer parses, so both sides must
     agree on every input, including a quote that opens a field only at its start
     and a last record counted by the final character alone. The scan jumps from
-    quote to quote and counts line breaks with str.count, so a large file never
-    runs a per-character Python loop.
+    quote to quote and counts line breaks with str.count, so the Python loop runs
+    once per quote rather than once per character.
     """
     if text.startswith("\ufeff"):
         text = text[1:]
