@@ -1205,14 +1205,14 @@ def test_missed_runs_disables_stale_once_overdue_beyond_window():
 
 def test_missed_runs_once_near_catchup_boundary():
     from cowork.scheduler import (
-        _ONCE_CATCHUP_WINDOW_SECONDS,
+        _ONCE_LATE_LIMIT,
         _due_schedules,
         _handle_missed_runs,
     )
 
     session = _session()
     now = datetime.now(timezone.utc)
-    window = _ONCE_CATCHUP_WINDOW_SECONDS
+    window = _ONCE_LATE_LIMIT.total_seconds()
     # Straddle the catch-up boundary: just inside stays enabled and runs, just
     # outside is disabled. `_handle_missed_runs` reads its own wall clock, so a
     # small margin keeps each case on its intended side without flaking.

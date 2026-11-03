@@ -1,17 +1,30 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from datetime import timezone as timezone_
 from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import set_attribute
 
+from cowork.common.logger import get_logger, log_context
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
-from cowork.models.schedule import Schedule, ScheduleRun
-from cowork.schemas.schedules import AttemptOutcome, RunStatus
+from cowork.models.schedule import Schedule, ScheduleRun, ScheduleSkippedPeriod
+from cowork.schedule_timing import normalize_next_run
+from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus
+
+logger = get_logger(__name__)
+
+# Cron slots in a row that may settle failed before the schedule pauses
+# itself.
+MAX_FAILED_SLOTS = 3
+
+
+class ScheduleConflict(Exception):
+    """An action the schedule's state does not allow; the message says why."""
 
 
 class ScheduleService:
@@ -102,6 +115,8 @@ class ScheduleService:
             timezone=timezone,
             project_id=target_project_id,
             enabled=enabled,
+            # `timezone` is this method's zone-name argument here.
+            paused_at=None if enabled else datetime.now(timezone_.utc),
         )
         self.session.add(schedule)
         self.session.commit()
@@ -109,6 +124,9 @@ class ScheduleService:
         return schedule
 
     def update_schedule(self, schedule_id: UUID, **kwargs) -> Schedule:
+        """Apply an edit. ``enabled`` pauses or resumes, as those actions do;
+        the editor sends the current value with every save, which changes
+        nothing."""
         schedule = self.get_schedule(schedule_id)
         if "project_id" in kwargs and kwargs["project_id"] is None:
             # No project: the caller's default, as at create.
@@ -116,10 +134,25 @@ class ScheduleService:
         new_project_id = kwargs.get("project_id")
         if new_project_id is not None and self.session.get(Project, new_project_id) is None:
             raise ValueError("Project not found")
+        enabled = kwargs.pop("enabled", None)
+        # Compared with the state before the edit: a new time below can turn a
+        # missed one-off back on, and the `enabled` the editor sent with the
+        # old state must not pause it again.
+        was_on = _runs_on_its_own(schedule)
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
+        if (
+            schedule.cadence == Cadence.once
+            and schedule.missed_at is not None
+            and _utc(schedule.next_run_at) > datetime.now(timezone.utc)
+        ):
+            # A missed one-off given a new time is scheduled again.
+            schedule.missed_at = None
+            schedule.enabled = schedule.paused_at is None and schedule.auto_paused_at is None
         self.session.add(schedule)
+        if enabled is not None and enabled != was_on:
+            return self._pause(schedule) if not enabled else self._resume(schedule)
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
@@ -175,20 +208,89 @@ class ScheduleService:
         )
 
     def pause_schedule(self, schedule_id: UUID) -> Schedule:
-        schedule = self.get_schedule(schedule_id)
+        return self._pause(self.get_schedule(schedule_id))
+
+    def _pause(self, schedule: Schedule) -> Schedule:
+        """Stop future slots: nothing is due on a disabled schedule. A run
+        already going finishes; nothing follows it."""
         schedule.enabled = False
+        if schedule.paused_at is None:
+            schedule.paused_at = datetime.now(timezone.utc)
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
 
     def resume_schedule(self, schedule_id: UUID) -> Schedule:
-        schedule = self.get_schedule(schedule_id)
+        return self._resume(self.get_schedule(schedule_id))
+
+    def _resume(self, schedule: Schedule) -> Schedule:
+        """Turn the schedule back on, clearing a pause, an auto-pause and its
+        failure streak. The run history stays. Nothing runs at once: a
+        recurring schedule waits for its next slot. A one-off whose time has
+        passed cannot wait for anything; run it now or give it a new time."""
+        now = datetime.now(timezone.utc)
+        if schedule.cadence == Cadence.once and _utc(schedule.next_run_at) <= now:
+            raise ScheduleConflict(
+                "This one-time task's time has passed. Run it now, or edit it to give it a new time."
+            )
         schedule.enabled = True
+        schedule.paused_at = None
+        schedule.auto_paused_at = None
+        schedule.missed_at = None
+        schedule.consecutive_failures = 0
+        schedule.next_run_at = normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone, now=now)
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
+
+    def last_skipped(self, schedule_id: UUID) -> ScheduleSkippedPeriod | None:
+        return self.session.exec(
+            self.session.select(ScheduleSkippedPeriod)
+            .where(ScheduleSkippedPeriod.schedule_id == schedule_id)
+            .order_by(ScheduleSkippedPeriod.created_at.desc())  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+
+
+def _runs_on_its_own(schedule: Schedule) -> bool:
+    return schedule.paused_at is None and schedule.auto_paused_at is None and schedule.enabled
+
+
+def count_settled_slot(session: ScopedSession, schedule_id: UUID, *, failed: bool) -> None:
+    """Stage the failure streak for a cron slot that just settled, and pause
+    the schedule when the streak reaches MAX_FAILED_SLOTS.
+
+    Called by the write that settles the slot: a failure extends the streak,
+    and a success ends it. Atomic updates, so two replicas settling different slots never
+    lose a count. The caller commits.
+    """
+    raw = unsafe_unscoped_session(session)
+    if not failed:
+        raw.execute(
+            sa.update(Schedule).where(Schedule.id == schedule_id).values(consecutive_failures=0)
+            .execution_options(synchronize_session=False)
+        )
+        return
+    raw.execute(
+        sa.update(Schedule).where(Schedule.id == schedule_id)
+        .values(consecutive_failures=Schedule.consecutive_failures + 1)
+        .execution_options(synchronize_session=False)
+    )
+    paused = raw.execute(
+        sa.update(Schedule)
+        .where(Schedule.id == schedule_id)
+        .where(Schedule.consecutive_failures >= MAX_FAILED_SLOTS)
+        .where(Schedule.auto_paused_at.is_(None))  # type: ignore[union-attr]
+        .values(enabled=False, auto_paused_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if paused:
+        logger.warning(
+            "Schedule paused after %s failed runs in a row", MAX_FAILED_SLOTS,
+            extra=log_context(schedule_id=schedule_id),
+        )
 
 
 class ScheduleBusy(Exception):

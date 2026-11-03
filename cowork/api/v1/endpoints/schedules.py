@@ -13,8 +13,10 @@ from cowork.schemas.schedules import (
     ScheduleResponse,
     ScheduleRunResponse,
     ScheduleUpdateRequest,
+    SkippedPeriodResponse,
+    schedule_state,
 )
-from cowork.services.schedules import ScheduleRunService, ScheduleService
+from cowork.services.schedules import ScheduleConflict, ScheduleRunService, ScheduleService
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +30,14 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live `running` flag (any in-flight run)."""
+    """ScheduleResponse plus the live state: `running` (any in-flight run),
+    `state` (what the schedule will do next) and `lastSkipped` (the latest
+    slots it passed over)."""
     data = ScheduleResponse.serialize(schedule)
     data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
+    data["state"] = schedule_state(schedule).value
+    skipped = ScheduleService(scoped).last_skipped(schedule.id)
+    data["lastSkipped"] = SkippedPeriodResponse.serialize(skipped) if skipped else None
     return data
 
 
@@ -76,6 +83,8 @@ def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scoped: Scop
         changes["project_id"] = None
     try:
         schedule = ScheduleService(scoped).update_schedule(schedule_id, **changes)
+    except ScheduleConflict as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return _serialize(schedule, scoped)
@@ -100,6 +109,8 @@ def pause_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).resume_schedule(schedule_id), scoped)
+    except ScheduleConflict as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
