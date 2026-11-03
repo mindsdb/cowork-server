@@ -56,22 +56,19 @@ from tests.integration.prereq import missing_prerequisite
 
 pytestmark = pytest.mark.postdeploy
 
-# A turn that runs for a while, so there is something to cancel and something
-# to reconnect to. Short enough that a failing test does not hang CI.
-SLOW_PROMPT = (
-    "Count slowly from 1 to 40, one number per line, "
-    "pausing to think between each one."
-)
-# The cancel test needs a turn that is still running one HTTP call later, which
-# SLOW_PROMPT does not guarantee: a fast deployment answered all 40 lines before
-# the next call landed, and the test skipped rather than cancelling anything.
-# Ten times the output buys that margin without making a failure hang CI — the
-# turn is cancelled or abandoned either way, so the extra tokens are never
-# actually generated.
+# The cancel test needs a turn that is still running one HTTP call later. A
+# fast deployment answered a 40-line count before the next call landed, and the
+# test skipped rather than cancelling anything. Ten times the output buys that
+# margin without making a failure hang CI — the turn is cancelled or abandoned
+# either way, so the extra tokens are never actually generated.
 CANCEL_PROMPT = (
     "Count slowly from 1 to 400, one number per line, "
     "pausing to think between each one."
 )
+# The reconnect tests need a turn still running after its first answer delta.
+# A 40-line count ended within the same few seconds on a PR environment, so
+# they take the cancel test's length. Unlike cancel, this turn runs to the end.
+RECONNECT_PROMPT = CANCEL_PROMPT
 QUICK_PROMPT = "Reply with exactly the word: pong"
 FIRST_TURN_PROMPT = "Reply with exactly the word: alpha"
 SECOND_TURN_PROMPT = "Reply with exactly the word: bravo"
@@ -557,7 +554,7 @@ def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
     with api.stream(
         "POST",
         "/api/v1/responses/",
-        json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
+        json={"input": RECONNECT_PROMPT, "conversation": conversation_id, "stream": True},
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
         assert resp.status_code == 200
@@ -598,7 +595,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
             "POST",
             "/api/v1/responses/",
             json={
-                "input": SLOW_PROMPT,
+                "input": RECONNECT_PROMPT,
                 "conversation": conversation_id,
                 "stream": True,
             },
