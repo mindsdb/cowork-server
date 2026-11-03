@@ -362,6 +362,19 @@ def test_a_managed_service_submission_is_relayed_as_its_engine(managed_postgres_
     assert "managed_pg" in res.text
 
 
+def test_the_real_rds_spec_is_relayed_as_postgres(org_client, relay):
+    recorded, _ = relay
+
+    res = org_client.post(
+        PATH, json=submission(connector_id="aws_rds_postgres", method="connection-string"), headers=AUTH_HEADERS
+    )
+
+    assert res.status_code == 200
+    body = json.loads(recorded[0].content)
+    assert (body["connector_id"], body["method"]) == ("postgres", "host-port")
+    assert PASSWORD not in res.text
+
+
 @pytest.mark.parametrize(
     ("top_level", "form_spec"),
     [
@@ -622,6 +635,37 @@ def test_a_desktop_submission_still_stages_and_probes(local_client, monkeypatch)
     assert staged["values"]["password"] == PASSWORD
     assert probed["submission_id"] == staged["submission_id"]
     assert probed["connector_id"] == "postgres"
+
+
+def test_a_desktop_managed_service_submission_still_stages_and_probes(local_client, monkeypatch):
+    """A cloud block changes nothing on the desktop: the service's own desktop
+    form is staged and probed under its own id."""
+    from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
+    from cowork.services.connectors.submissions import store
+
+    staged: dict = {}
+    real_stage = store.stage
+
+    def record_stage(**kwargs):
+        staged.update(kwargs)
+        return real_stage(**kwargs)
+
+    class FakeProbeHandler:
+        def __init__(self, *, scope):
+            pass
+
+        async def run(self, *args):
+            yield "event: response.completed\ndata: {}\n\n"
+
+    monkeypatch.setattr(store, "stage", record_stage)
+    monkeypatch.setattr(submissions_endpoint, "ProbeHandler", FakeProbeHandler)
+    values = {"host": "db.example.com", "port": "5432", "database": "appdb", "username": "dbuser", "password": PASSWORD}
+
+    res = local_client.post(PATH, json=submission(connector_id="aws_rds_postgres", method="connection-string", values=values))
+
+    assert res.status_code == 200
+    assert staged["connector_id"] == "aws_rds_postgres"
+    assert staged["values"]["password"] == PASSWORD
 
 
 def test_a_desktop_handcrafted_submission_still_stages_its_own_form(local_client, monkeypatch):
