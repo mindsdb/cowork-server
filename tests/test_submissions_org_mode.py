@@ -333,6 +333,22 @@ def test_a_datasource_submission_that_is_not_an_enabled_cloud_method_is_refused(
     assert recorded == []
 
 
+@pytest.mark.parametrize(
+    ("connector_id", "method"),
+    [("aws_rds_postgres", "connection-string"), ("snowflake", "user-password"), ("bigquery", None)],
+)
+def test_a_built_in_database_without_a_cloud_form_is_refused_not_saved(org_client, relay, connector_id, method):
+    recorded, _ = relay
+    body = submission(connector_id=connector_id, method=method)
+
+    res = org_client.post(PATH, json=body, headers=AUTH_HEADERS)
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "unsupported_capability"
+    assert PASSWORD not in res.text
+    assert recorded == []
+
+
 @pytest.fixture()
 def org_client_with_local_flow(monkeypatch, adapter_verified_datasources) -> TestClient:
     """Org mode with PostgreSQL enabled and the ordinary submission flow left intact."""
@@ -375,6 +391,42 @@ def test_an_org_handcrafted_form_takes_the_submission_flow_not_the_relay(org_cli
 
     assert res.status_code == 200
     assert staged["form_spec"]["form_id"] == HANDCRAFTED_FORM["form_id"]
+    assert recorded == []
+
+
+def test_an_org_built_in_outside_the_database_category_takes_the_submission_flow(
+    org_client_with_local_flow, relay, monkeypatch
+):
+    from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
+    from cowork.services.connectors.submissions import store
+
+    recorded, _ = relay
+    staged: dict = {}
+    real_stage = store.stage
+
+    def record_stage(**kwargs):
+        staged.update(kwargs)
+        return real_stage(**kwargs)
+
+    class FakeProbeHandler:
+        def __init__(self, *, scope):
+            pass
+
+        async def run(self, *args):
+            yield "event: response.completed\ndata: {}\n\n"
+
+    monkeypatch.setattr(store, "stage", record_stage)
+    monkeypatch.setattr(submissions_endpoint, "ProbeHandler", FakeProbeHandler)
+    values = {"api_key": PASSWORD, "application_key": "app-key", "region": "us1"}
+
+    res = org_client_with_local_flow.post(
+        PATH,
+        json=submission(connector_id="datadog", method="api-key", values=values),
+        headers=AUTH_HEADERS,
+    )
+
+    assert res.status_code == 200
+    assert staged["connector_id"] == "datadog"
     assert recorded == []
 
 

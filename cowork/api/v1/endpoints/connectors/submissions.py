@@ -37,6 +37,7 @@ from cowork.services.connectors.submissions import missing_required_fields, stor
 # the probe waits on the model or the relay waits on auth.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+_DATABASE_CATEGORY = "database"
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -86,18 +87,31 @@ def _connector_id(req: SubmitFormRequest) -> str:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
 
+def _relayed_in_org_mode(connector_id: str) -> bool:
+    """True when an org's credential for this connector may go only to auth's store.
+
+    That is a connector with a cloud datasource form, or any built-in
+    database connector; the relay refuses those it has no enabled method for.
+    """
+    if load_datasource_capabilities().is_cloud_datasource(connector_id):
+        return True
+    spec = registry.get_connector(connector_id)
+    return spec is not None and spec.category == _DATABASE_CATEGORY
+
+
 @router.post("/", name="submit_form")
 async def submit_form_route(req: SubmitFormRequest, request: Request, scope: TenantScopeDep) -> StreamingResponse:
     """Answer one form submission.
 
-    In org mode a connector with a cloud datasource form goes to auth's
-    encrypted store through the relay, which refuses any method this
-    deployment has not enabled. Every other submission takes submit_form.
-    The relay needs ``request`` to forward the caller's bearer to auth.
+    In org mode a cloud datasource or built-in database submission goes to
+    the relay, which stores an enabled method in auth's encrypted store and
+    refuses the rest, so no database password is saved locally. Every other
+    submission takes submit_form. The relay needs ``request`` to forward the
+    caller's bearer to auth.
     """
     if scope.org_mode:
         connector_id = _connector_id(req)
-        if load_datasource_capabilities().is_cloud_datasource(connector_id):
+        if _relayed_in_org_mode(connector_id):
             return await relay_cloud_submission(req, connector_id, req.resolve_method(), scope, request)
     return await submit_form(req, scope)
 
