@@ -33,7 +33,13 @@ from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.schedules import ScheduleBusy, ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.services.schedules import (
+    OrgRunsAtLimit,
+    ScheduleBusy,
+    ScheduleRunService,
+    ScheduleService,
+    SlotAlreadyClaimed,
+)
 from tests.integration.prereq import missing_prerequisite
 
 # A slot that came due a minute ago: one missed occurrence stays due, where
@@ -706,3 +712,58 @@ def test_a_link_on_postgres_that_waits_on_a_reap_refuses_the_run(postgres):
     assert row.status == RunStatus.failed
     assert row.conversation_id is None
     assert row.slot_at is None
+
+
+@pytest.mark.postgres_service
+def test_replicas_claiming_one_organizations_slots_at_once_stay_within_its_limit(postgres):
+    """The per-organization cap on the database hosted Cowork runs: eight
+    connections claim slots for eight schedules of one organization at the
+    same moment, and only the limit's worth start. Without the organization's
+    advisory lock each would count the others' runs as not there yet."""
+    org_id = f"org-{uuid4().hex[:8]}"
+    count, limit = 8, 3
+    with Session(postgres.engine) as session:
+        scoped = ScopedSession(session, SYSTEM_SCOPE)
+        schedule_ids = [
+            ScheduleService(scoped).create_schedule(
+                title=f"org {i}", prompt="p", cadence="daily", next_run_at=SLOT,
+                model="default", timezone="UTC", project_id=postgres.project_id, enabled=True,
+            ).id
+            for i in range(count)
+        ]
+        for schedule_id in schedule_ids:
+            schedule = session.get(Schedule, schedule_id)
+            schedule.org_id = org_id
+            session.add(schedule)
+        session.commit()
+
+    barrier = threading.Barrier(count)
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def claim(schedule_id: UUID) -> None:
+        with Session(postgres.engine) as session:
+            runs = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+            barrier.wait()
+            try:
+                runs.create_run(schedule_id, slot_at=SLOT, lease_seconds=60, org_limit=limit)
+                session.commit()
+                outcome = "claimed"
+            except OrgRunsAtLimit:
+                outcome = "refused"
+            with outcomes_lock:
+                outcomes.append(outcome)
+
+    threads = [threading.Thread(target=claim, args=(schedule_id,)) for schedule_id in schedule_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert sorted(outcomes) == ["claimed"] * limit + ["refused"] * (count - limit)
+    with Session(postgres.engine) as session:
+        running = session.exec(
+            select(ScheduleRun).join(Schedule, Schedule.id == ScheduleRun.schedule_id)
+            .where(Schedule.org_id == org_id, ScheduleRun.status == RunStatus.running)
+        ).all()
+    assert len(running) == limit
