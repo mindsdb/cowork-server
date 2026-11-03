@@ -1,10 +1,11 @@
-"""Connector form submissions in org mode are relayed, never stored locally.
+"""Cloud datasource submissions in org mode are relayed, never stored locally.
 
 A cloud submission carries a database password. It must reach auth's
 encrypted store and nothing else: no staging store, no probe, no local vault,
 on the success path and on every refusal. Each org case runs with those paths
 booby-trapped, so a fallback that quietly saves the credential fails the test
-rather than passing it.
+rather than passing it. A connector with no cloud datasource form takes the
+ordinary submission flow in org mode too, and never reaches the relay.
 
 The desktop cases at the bottom pin the other half: local mode still stages
 and probes exactly as before.
@@ -36,6 +37,14 @@ MEMBER_HEADERS = {
     "X-Organization-Id": "22222222-2222-4222-8222-222222222222",
 }
 AUTH_HEADERS = {**MEMBER_HEADERS, "Authorization": BEARER}
+
+#: A model-written form that passes check_handcrafted_form.
+HANDCRAFTED_FORM = {
+    "form_id": "fm_bbbbbbbbbb",
+    "engine": "handcrafted",
+    "title": "Connect handcrafted",
+    "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True, "required": True}],
+}
 
 #: Shaped like auth's DatasourceConnectionResponseSerializer.
 CONNECTION = {
@@ -310,27 +319,71 @@ def test_a_method_the_specs_call_unverified_is_refused_however_it_is_configured(
     "body",
     [
         pytest.param(submission(method="connection-string"), id="connection-string"),
-        pytest.param(submission(connector_id="not_a_connector"), id="unknown-connector"),
         pytest.param(submission(method=None), id="no-method"),
-        pytest.param(
-            {
-                "form_id": "handcrafted-connector",
-                "name": "handcrafted",
-                "form_spec": {"form_id": "handcrafted-connector", "fields": [{"name": "token"}]},
-                "values": {"token": PASSWORD},
-                "skipped": [],
-            },
-            id="handcrafted-form",
-        ),
     ],
 )
-def test_everything_that_is_not_an_enabled_cloud_method_is_refused(org_client, relay, body):
+def test_a_datasource_submission_that_is_not_an_enabled_cloud_method_is_refused(org_client, relay, body):
     recorded, _ = relay
 
     res = org_client.post(PATH, json=body, headers=AUTH_HEADERS)
 
     assert res.status_code == 409
     assert res.json()["detail"]["code"] == "unsupported_capability"
+    assert PASSWORD not in res.text
+    assert recorded == []
+
+
+@pytest.fixture()
+def org_client_with_local_flow(monkeypatch, adapter_verified_datasources) -> TestClient:
+    """Org mode with PostgreSQL enabled and the ordinary submission flow left intact."""
+    return _org_client(monkeypatch, ENABLED)
+
+
+def test_an_org_handcrafted_form_takes_the_submission_flow_not_the_relay(org_client_with_local_flow, relay, monkeypatch):
+    from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
+    from cowork.services.connectors.submissions import store
+
+    recorded, _ = relay
+    staged: dict = {}
+    real_stage = store.stage
+
+    def record_stage(**kwargs):
+        staged.update(kwargs)
+        return real_stage(**kwargs)
+
+    class FakeProbeHandler:
+        def __init__(self, *, scope):
+            pass
+
+        async def run(self, *args):
+            yield "event: response.completed\ndata: {}\n\n"
+
+    monkeypatch.setattr(store, "stage", record_stage)
+    monkeypatch.setattr(submissions_endpoint, "ProbeHandler", FakeProbeHandler)
+
+    res = org_client_with_local_flow.post(
+        PATH,
+        json={
+            "form_id": HANDCRAFTED_FORM["form_id"],
+            "name": "handcrafted",
+            "form_spec": HANDCRAFTED_FORM,
+            "values": {"token": PASSWORD},
+            "skipped": [],
+        },
+        headers=AUTH_HEADERS,
+    )
+
+    assert res.status_code == 200
+    assert staged["form_spec"]["form_id"] == HANDCRAFTED_FORM["form_id"]
+    assert recorded == []
+
+
+def test_an_org_connector_unknown_to_the_registry_is_not_relayed(org_client_with_local_flow, relay):
+    recorded, _ = relay
+
+    res = org_client_with_local_flow.post(PATH, json=submission(connector_id="not_a_connector"), headers=AUTH_HEADERS)
+
+    assert res.status_code == 404
     assert PASSWORD not in res.text
     assert recorded == []
 
@@ -510,16 +563,16 @@ def test_a_desktop_handcrafted_submission_still_stages_its_own_form(local_client
     res = local_client.post(
         PATH,
         json={
-            "form_id": "handcrafted-connector",
+            "form_id": HANDCRAFTED_FORM["form_id"],
             "name": "handcrafted",
-            "form_spec": {"form_id": "handcrafted-connector", "fields": [{"name": "token", "required": True}]},
+            "form_spec": HANDCRAFTED_FORM,
             "values": {"token": PASSWORD},
             "skipped": [],
         },
     )
 
     assert res.status_code == 200
-    assert staged["form_spec"]["form_id"] == "handcrafted-connector"
+    assert staged["form_spec"]["form_id"] == HANDCRAFTED_FORM["form_id"]
     assert staged["values"]["token"] == PASSWORD
 
 

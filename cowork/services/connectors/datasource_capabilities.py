@@ -59,6 +59,10 @@ class DatasourceCapabilities:
     def is_available(self, connector_id: str, method: str) -> bool:
         return bool(self.methods.get(connector_id, {}).get(method, False))
 
+    def is_cloud_datasource(self, connector_id: str) -> bool:
+        """True when the connector declares a cloud datasource form, enabled or not."""
+        return connector_id in self.methods
+
     def available_connector_ids(self) -> set[str]:
         return {
             connector_id

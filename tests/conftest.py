@@ -41,6 +41,10 @@ os.environ["COWORK_REQUIRE_AUTH"] = "false"
 import pytest
 from sqlmodel import Session, SQLModel
 
+# Lists every skipped test in CI and fails a run that requires every
+# prerequisite when one is left out without a reason (tests/skip_guard.py).
+from tests.skip_guard import pytest_addoption, pytest_configure  # noqa: E402,F401
+
 
 @pytest.fixture(scope="session", autouse=True)
 def db_schema():

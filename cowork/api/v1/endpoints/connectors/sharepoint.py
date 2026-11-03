@@ -36,6 +36,7 @@ from cowork.services.connectors.identity import VAULT_KEEP_SENTINEL
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, LayeredDataVault
 from cowork.services.connectors.persist import ConnectionExistsError, persist_connection, vault_for_scope
 from cowork.services.connectors.sharepoint import (
+    ENGINE,
     AppKey,
     SharePointClient,
     SharePointError,
@@ -48,7 +49,6 @@ from cowork.services.connectors.sharepoint import (
 router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
-ENGINE = "sharepoint"
 _KEY_FIELDS = ("tenant_id", "client_id", "client_secret", "site_urls")
 _CREATE_FIELDS = frozenset({"name", "user_label", *_KEY_FIELDS})
 _EDIT_FIELDS = frozenset({"user_label", *_KEY_FIELDS})
@@ -70,6 +70,12 @@ _BROWSE_STATUS = {
     SharePointErrorKind.ITEM_NOT_FOUND: status.HTTP_404_NOT_FOUND,
     SharePointErrorKind.THROTTLED: status.HTTP_429_TOO_MANY_REQUESTS,
     SharePointErrorKind.UNREACHABLE: status.HTTP_502_BAD_GATEWAY,
+    # Raised only by imports; listed so every kind maps.
+    SharePointErrorKind.TOO_MANY_FILES: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.TOO_LARGE: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.BAD_NAME: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.PLAN_TOO_SLOW: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.IMPORT_TOO_SLOW: status.HTTP_400_BAD_REQUEST,
 }
 
 

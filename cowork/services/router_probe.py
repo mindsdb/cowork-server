@@ -2,14 +2,20 @@
 
 The adapter's SDK retries and provider retention policy still apply. This does
 not measure the gate's latency budget, create a conversation, or execute a tool.
+Its call carries the conversation id ``ROUTER_PROBE_CONVERSATION`` and the role
+``ROUTER_PROBE_ROLE`` in anton's trace headers, so a deployment that records
+model calls can tell the probe's call from an unattributed one.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from anton.core.llm.provider import LLMResponse, RequestRefusedError, StreamComplete
+from anton.core.llm.tracing import TraceContext, call_role, reset_trace_context, set_trace_context
 
 from cowork.common.logger import exception_http_status
 from cowork.common.settings.user_settings import UserSettings
@@ -24,6 +30,20 @@ logger = logging.getLogger(__name__)
 _PROBE_TIMEOUT_SECONDS = 30.0
 _CLOSE_TIMEOUT_SECONDS = 2.0
 _read_tasks: set[asyncio.Task] = set()
+#: The conversation id and role the probe's call carries. No conversation has this id.
+ROUTER_PROBE_CONVERSATION = "router-startup-probe"
+ROUTER_PROBE_ROLE = "router_probe"
+
+
+@contextmanager
+def _labeled_as_probe() -> Iterator[None]:
+    # A task created inside copies the context, so the reader's request carries it too.
+    token = set_trace_context(TraceContext(session_id=ROUTER_PROBE_CONVERSATION))
+    try:
+        with call_role(ROUTER_PROBE_ROLE):
+            yield
+    finally:
+        reset_trace_context(token)
 
 
 def _load_settings(session: ScopedSession) -> UserSettings:
@@ -153,14 +173,15 @@ async def run_router_startup_probe() -> None:
                 _unverified(failure_reason, provider=provider)
                 return
             failure_reason = "provider_unavailable"
-            events = client.router_provider.stream(
-                model=model,
-                system=routing.with_deployment_identity(routing._SYSTEM_PROMPT),
-                messages=[{"role": "user", "content": "Hello"}],
-                tools=[routing._DELEGATE_TOOL],
-                max_tokens=routing._DIRECT_MAX_TOKENS,
-            )
-            reader = asyncio.create_task(_read_response(events), name="router-startup-probe-read")
+            with _labeled_as_probe():
+                events = client.router_provider.stream(
+                    model=model,
+                    system=routing.with_deployment_identity(routing._SYSTEM_PROMPT),
+                    messages=[{"role": "user", "content": "Hello"}],
+                    tools=[routing._DELEGATE_TOOL],
+                    max_tokens=routing._DIRECT_MAX_TOKENS,
+                )
+                reader = asyncio.create_task(_read_response(events), name="router-startup-probe-read")
             _read_tasks.add(reader)
             reader.add_done_callback(_read_finished)
             # Awaiting the reader directly would make our deadline wait for
