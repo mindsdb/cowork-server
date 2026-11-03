@@ -189,7 +189,8 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
             assert row.status == "routed", row.status
             assert row.org_id == ORG_A
             conversation = s.get(Conversation, conversation_id)
-            assert (conversation.channel_type, conversation.created_by) == ("discord", None)
+            # A DM to the bot (no guild_id): never marked, so no admin can read it.
+            assert (conversation.channel_type, conversation.created_by) == (None, None)
         finally:
             s.close()
     finally:

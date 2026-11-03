@@ -419,17 +419,19 @@ def _org_project(tmp_path) -> UUID:
         session.close()
 
 
-def _serve_first_discord_message(binding_id: UUID, project_id: UUID) -> UUID:
-    """The runtime's first-message bookkeeping, under its org scope with no user."""
+def _serve_first_discord_message(binding_id: UUID, project_id: UUID, guild_id: str | None = "guild-1") -> UUID:
+    """The runtime's first-message bookkeeping, under its org scope with no user.
+    A `guild_id` makes it a message in a server channel; None makes it a DM."""
     runtime = AntonChannelRuntime(LiveAdapterRegistry(), default_project_id=project_id)
-    message = DiscordBridge({})._normalize_message(
-        {"id": "m-route-1", "channel_id": "route-1", "content": "hello", "author": {"id": "42"}}
-    )
+    payload = {"id": "m-route-1", "channel_id": "route-1", "content": "hello", "author": {"id": "42"}}
+    if guild_id is not None:
+        payload["guild_id"] = guild_id
+    message = DiscordBridge({})._normalize_message(payload)
     session = get_open_session()
     try:
         scoped = ScopedSession(session, scope_for_org(ORG_A))
         binding = scoped.get(ChannelBinding, binding_id)
-        conversation = runtime._ensure_conversation(scoped, binding)
+        conversation = runtime._ensure_conversation(scoped, binding, shared=bool(message.message.is_group))
         runtime._touch_channel_session(scoped, binding, conversation, message)
         return conversation.id
     finally:
@@ -612,6 +614,25 @@ def test_only_marked_ownerless_conversations_are_channel_conversations(client, t
             session.commit()
         finally:
             session.close()
+
+
+def test_a_direct_message_to_the_bot_is_not_a_channel_conversation(client, tmp_path):
+    project_id = _org_project(tmp_path)
+    created = client.post(
+        "/api/v1/channels/bindings", headers=A,
+        json={"channel_type": "discord", "external_group_id": "route-dm", "anton_project_id": str(project_id)},
+    )
+    binding_id = UUID(created.json()["id"])
+    conversation_id = _serve_first_discord_message(binding_id, project_id, guild_id=None)
+    try:
+        cid = str(conversation_id)
+        listed = {i["id"] for i in client.get("/api/v1/channel-conversations/", headers=OWNER_A_ADMIN).json()["conversations"]}
+        assert cid not in listed
+        for path in (f"/{cid}", f"/{cid}/items", f"/{cid}/items?limit=1"):
+            assert client.get(f"/api/v1/channel-conversations{path}", headers=OWNER_A_ADMIN).status_code == 404
+        assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
+    finally:
+        _drop_rows(binding_id, conversation_id, project_id)
 
 
 def test_org_admin_still_cannot_write_to_a_channel_conversation(client, channel_conversation, granted_product_permissions):

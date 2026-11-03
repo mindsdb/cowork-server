@@ -11,6 +11,7 @@ import time
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from sqlmodel import select
 
 import cowork.channels.plugins.telegram as telegram_plugin
@@ -82,13 +83,13 @@ class FakeAdapter:
         ...
 
 
-def telegram_update(update_id: int, chat_id: int, message_id: int, text: str) -> bytes:
+def telegram_update(update_id: int, chat_id: int, message_id: int, text: str, chat_type: str = "private") -> bytes:
     return json.dumps({
         "update_id": update_id,
         "message": {
             "message_id": message_id,
             "from": {"id": 42, "is_bot": False},
-            "chat": {"id": chat_id, "type": "private"},
+            "chat": {"id": chat_id, "type": chat_type},
             "date": 1700000000,
             "text": text,
         },
@@ -216,14 +217,23 @@ def test_rich_turn_appends_conversation_link(monkeypatch):
     s.close()
 
 
-def test_runtime_marks_its_conversation_with_the_routes_channel(monkeypatch):
+@pytest.mark.parametrize(
+    ("chat_type", "chat_id", "text", "expected"),
+    [
+        # A shared group: marked with the route's own channel.
+        ("group", -98, "@b hello", "telegram"),
+        # A one-to-one chat with the bot: never marked, so no admin can read it.
+        ("private", 97, "hello", None),
+    ],
+)
+def test_runtime_marks_only_shared_channel_conversations(monkeypatch, chat_type, chat_id, text, expected):
     monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness())
 
     registry = PluginRegistry()
     load_first_party_plugins(registry)
     bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s", "bot_username": "b"})
     event = asyncio.run(bridge.parse_inbound(
-        body=telegram_update(51, 98, 1, "hello"), headers={}, route_name=None,
+        body=telegram_update(51, chat_id, 1, text, chat_type=chat_type), headers={}, route_name=None,
     ))[0]
 
     adapters = LiveAdapterRegistry(registry)
@@ -232,8 +242,10 @@ def test_runtime_marks_its_conversation_with_the_routes_channel(monkeypatch):
 
     s = get_open_session()
     try:
-        binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "98")).one()
-        assert s.get(Conversation, binding.anton_conversation_id).channel_type == "telegram"
+        binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == str(chat_id))).one()
+        conversation = s.get(Conversation, binding.anton_conversation_id)
+        assert conversation is not None, "the message must have started a conversation"
+        assert conversation.channel_type == expected
     finally:
         s.close()
 
