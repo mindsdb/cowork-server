@@ -453,6 +453,7 @@ class ProbeHandler:
             final_outcome: ProbeOutcome | None = None
             pending_cell: dict = {}
 
+            usage_notes, notes_define_pass = await self._usage_notes(connector_id)
             probe = CredentialProbe(
                 engine=connector_id,
                 credentials=probe_credentials,
@@ -460,7 +461,8 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
-                usage_notes=await self._usage_notes(connector_id),
+                usage_notes=usage_notes,
+                notes_define_pass=notes_define_pass,
                 web_tool_kwargs=web_tools,
                 saved_fields=sorted(saved_only_fields),
                 cell_sandbox=cell_sandbox,
@@ -668,17 +670,20 @@ class ProbeHandler:
             return "\nThe connection is saved, but it could not be added to your connectors list.\n"
         return None
 
-    async def _usage_notes(self, connector_id: str) -> str | None:
+    async def _usage_notes(self, connector_id: str) -> tuple[str | None, bool]:
         """The connector's agent-facing notes, or None when it has none or they
-        could not be read; the probe runs without them then."""
+        could not be read; the probe runs without them then. The flag is True
+        only for a built-in spec's notes, the ones reviewed like code, which
+        may tell the probe what counts as a pass."""
         try:
             notes = await run_db(
                 lambda session: ConnectorCatalog(session).usage_notes_for([connector_id]), scope=self.scope,
             )
         except Exception:
             logger.exception("Could not read the usage notes for %s; probing without them", connector_id)
-            return None
-        return notes.get(connector_id)
+            return None, False
+        text = notes.get(connector_id)
+        return text, text is not None and text == registry.usage_notes_for([connector_id]).get(connector_id)
 
     @staticmethod
     def _build_llm_client(settings=None):

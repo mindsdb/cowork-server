@@ -151,6 +151,9 @@ class ConnectorMethod(BaseModel):
     help_url: str | None = None
     fields: list[ConnectorField] = []
     cloud: CloudMethod | None = None
+    # Field(s) a saved connection is named after; read from the raw spec by
+    # cowork/services/connectors/identity.py.
+    name_from: str | list[str] | None = None
 
     @field_validator("id")
     @classmethod
