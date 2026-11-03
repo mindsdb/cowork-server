@@ -7,6 +7,7 @@ it the admin check admits everyone, so every route here answers 404.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -28,7 +29,7 @@ def _org_mode_only() -> None:
 router = APIRouter(dependencies=[Depends(_org_mode_only), Depends(require(AuthenticatedOrgAdmin))])
 
 
-def _serialize(conversation: Conversation, updated_at=None) -> dict:
+def _serialize(conversation: Conversation, updated_at: datetime | None = None) -> dict:
     """One list item; `updated_at` is the last-activity time, as the conversation list uses it."""
     return ChannelConversationItem.serialize({
         "id": conversation.id,

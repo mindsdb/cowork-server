@@ -26,9 +26,11 @@ from cowork.db.scoped import ScopedSession, scope_for_org
 from cowork.db.session import get_open_session
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
+from cowork.models.file import File
 from cowork.models.message import Message
 from cowork.models.project import Project
 from cowork.services.conversations import ConversationService
+from cowork.services.files import attachment_purpose
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -508,6 +510,8 @@ def test_org_admin_lists_and_reads_a_channel_conversation(client, channel_conver
     item = next(i for i in listed.json()["conversations"] if i["id"] == cid)
     assert set(item) == CHANNEL_ITEM_FIELDS
     assert (item["title"], item["channelType"]) == ("discord: route-2", "discord")
+    last_message_at = _runtime_view_of_messages(channel_conversation)[-1]["created_at"].replace(tzinfo=timezone.utc)
+    assert datetime.fromisoformat(item["updatedAt"]) == last_message_at, "updatedAt is the last message's time"
 
     one = client.get(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN)
     assert one.status_code == 200, one.text
@@ -553,13 +557,13 @@ def test_channel_conversations_list_newest_activity_first(client, channel_conver
 
 def test_members_and_other_orgs_cannot_reach_channel_conversations(client, channel_conversation):
     cid = str(channel_conversation)
-    for path in ("/", f"/{cid}", f"/{cid}/items"):
+    for path in ("/", f"/{cid}", f"/{cid}/items", f"/{cid}/items?limit=1"):
         refused = client.get(f"/api/v1/channel-conversations{path}", headers=A)
         assert refused.status_code == 403, refused.text
 
     other_list = client.get("/api/v1/channel-conversations/", headers=B_ADMIN)
     assert cid not in {i["id"] for i in other_list.json()["conversations"]}
-    for path in (f"/{cid}", f"/{cid}/items"):
+    for path in (f"/{cid}", f"/{cid}/items", f"/{cid}/items?limit=1"):
         assert client.get(f"/api/v1/channel-conversations{path}", headers=B_ADMIN).status_code == 404
 
 
@@ -569,30 +573,37 @@ def test_only_marked_ownerless_conversations_are_channel_conversations(client, t
         "/api/v1/conversations/", headers=A, json={"topic": "discord: plans", "projectId": str(project_id)},
     )
     assert own.status_code == 201, own.text
+    # The schema allows a marked row with an owner even though the runtime
+    # never writes one; it must stay as private as any owned conversation.
     session = get_open_session()
     try:
         unmarked = Conversation(topic="discord: old", project_id=project_id, org_id=ORG_A, created_by=None)
+        marked_owned = Conversation(
+            topic="discord: mine", project_id=project_id, org_id=ORG_A, created_by=OWNER_A, channel_type="discord",
+        )
         session.add(unmarked)
+        session.add(marked_owned)
         session.commit()
-        unmarked_id = unmarked.id
+        unreachable = [UUID(own.json()["id"]), unmarked.id, marked_owned.id]
     finally:
         session.close()
     try:
         listed = {i["id"] for i in client.get("/api/v1/channel-conversations/", headers=OWNER_A_ADMIN).json()["conversations"]}
-        for cid in (own.json()["id"], str(unmarked_id)):
+        for conversation_id in unreachable:
+            cid = str(conversation_id)
             assert cid not in listed
-            assert client.get(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
+            for path in (f"/{cid}", f"/{cid}/items", f"/{cid}/items?limit=1"):
+                assert client.get(f"/api/v1/channel-conversations{path}", headers=OWNER_A_ADMIN).status_code == 404
             assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
         session = get_open_session()
         try:
-            assert session.get(Conversation, UUID(own.json()["id"])) is not None
-            assert session.get(Conversation, unmarked_id) is not None
+            assert all(session.get(Conversation, conversation_id) is not None for conversation_id in unreachable)
         finally:
             session.close()
     finally:
         session = get_open_session()
         try:
-            for cid in (UUID(own.json()["id"]), unmarked_id):
+            for cid in unreachable:
                 row = session.get(Conversation, cid)
                 if row is not None:
                     session.delete(row)
@@ -639,8 +650,14 @@ def test_org_admin_deletes_a_channel_conversation(client, channel_conversation, 
         binding_id = session.exec(
             select(ChannelBinding.id).where(ChannelBinding.anton_conversation_id == channel_conversation)
         ).one()
+        project_name = session.get(Conversation, channel_conversation).project.name
     finally:
         session.close()
+    uploaded = client.post(
+        f"/api/v1/attachments/{project_name}/{cid}/upload", headers=A,
+        files=[("files", ("note.txt", b"a member's note", "text/plain"))],
+    )
+    assert uploaded.status_code == 200, uploaded.text
 
     assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=A).status_code == 403
     assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=B_ADMIN).status_code == 404
@@ -655,6 +672,12 @@ def test_org_admin_deletes_a_channel_conversation(client, channel_conversation, 
         binding = session.get(ChannelBinding, binding_id)
         assert binding is not None and binding.anton_conversation_id is None
         assert not session.exec(select(ChannelSession).where(ChannelSession.binding_id == binding_id)).all()
+        # The delete stays inside the actor's own files, as a member's own delete does.
+        kept = session.exec(select(File).where(File.purpose == attachment_purpose(cid))).all()
+        assert [f.created_by for f in kept] == [USER_A]
+        for row in kept:
+            session.delete(row)
+        session.commit()
     finally:
         session.close()
     assert client.get(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
