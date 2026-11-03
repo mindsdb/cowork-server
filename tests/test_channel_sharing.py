@@ -206,13 +206,14 @@ def test_a_dm_never_lands_in_a_members_own_conversation(db):
 
 
 def test_a_dm_never_joins_its_own_routes_marked_conversation(db):
-    # One route, no second route involved: only the mark check stands between
-    # a DM and the conversation admins read.
+    # One route that already served its marked conversation, session row and
+    # all: only the mark check stands between a DM and what admins read.
     engine, runtime, _ = db
     route = _route(engine)
-    marked = _serve(engine, runtime, route, guild_id="g1")
+    bridge = DiscordBridge({"bot_token": "t"})
+    marked = _serve_event(engine, runtime, route, bridge._normalize_message(_discord_message(guild_id="g1")))
 
-    served = _serve(engine, runtime, route, guild_id=None)
+    served = _serve_event(engine, runtime, route, bridge._normalize_message(_discord_message(id="2")))
 
     assert served != marked
     assert _conversation(engine, served).channel_type is None
