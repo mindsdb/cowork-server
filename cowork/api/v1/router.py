@@ -11,6 +11,7 @@ from cowork.api.v1.endpoints import (
     artifacts,
     artifact_workspace,
     capabilities,
+    channel_conversations,
     channels,
     comments,
     coding,
@@ -89,6 +90,9 @@ api_router.include_router(skill_sharing.router, prefix="/skills", tags=["skills"
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
+api_router.include_router(
+    channel_conversations.router, prefix="/channel-conversations", tags=["channels"]
+)
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
 api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])

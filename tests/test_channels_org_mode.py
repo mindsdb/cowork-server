@@ -10,10 +10,12 @@ test_channels_tenancy.py / test_channel_webhooks.py for those).
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import event
 from sqlmodel import select
 
@@ -24,7 +26,9 @@ from cowork.db.scoped import ScopedSession, scope_for_org
 from cowork.db.session import get_open_session
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
+from cowork.models.message import Message
 from cowork.models.project import Project
+from cowork.services.conversations import ConversationService
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -445,3 +449,175 @@ def _drop_rows(binding_id: UUID, conversation_id: UUID, project_id: UUID) -> Non
         session.commit()
     finally:
         session.close()
+
+
+OWNER_A_ADMIN = {"X-User-Id": OWNER_A, "X-Organization-Id": ORG_A, "X-User-Roles": "manage-organization"}
+B_ADMIN = {**B, "X-User-Roles": "manage-organization"}
+CHANNEL_ITEM_FIELDS = {"id", "title", "channelType", "createdAt", "updatedAt"}
+
+
+@pytest.fixture()
+def channel_conversation(client, tmp_path):
+    """A route a member added, the conversation the runtime created on its
+    first message, and that message saved the way the runtime saves it."""
+    project_id = _org_project(tmp_path)
+    created = client.post(
+        "/api/v1/channels/bindings", headers=A,
+        json={"channel_type": "discord", "external_group_id": "route-2", "anton_project_id": str(project_id)},
+    )
+    assert created.status_code == 201, created.text
+    binding_id = UUID(created.json()["id"])
+    conversation_id = _serve_first_discord_message(binding_id, project_id)
+    session = get_open_session()
+    try:
+        ConversationService(ScopedSession(session, scope_for_org(ORG_A))).save_user_message(
+            conversation_id, "hello", created_at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+    finally:
+        session.close()
+    yield conversation_id
+    _drop_messages(conversation_id)
+    _drop_rows(binding_id, conversation_id, project_id)
+
+
+def _drop_messages(conversation_id: UUID) -> None:
+    """Remove the conversation's messages, on the raw session: nobody owns it."""
+    session = get_open_session()
+    try:
+        for row in session.exec(select(Message).where(Message.conversation_id == conversation_id)).all():
+            session.delete(row)
+        session.commit()
+    finally:
+        session.close()
+
+
+def _runtime_view_of_messages(conversation_id: UUID) -> list[dict]:
+    """The history as the runtime's own scope reads it back."""
+    session = get_open_session()
+    try:
+        return ConversationService(ScopedSession(session, scope_for_org(ORG_A))).get_messages(conversation_id)
+    finally:
+        session.close()
+
+
+def test_org_admin_lists_and_reads_a_channel_conversation(client, channel_conversation):
+    cid = str(channel_conversation)
+
+    listed = client.get("/api/v1/channel-conversations/", headers=OWNER_A_ADMIN)
+    assert listed.status_code == 200, listed.text
+    item = next(i for i in listed.json()["conversations"] if i["id"] == cid)
+    assert set(item) == CHANNEL_ITEM_FIELDS
+    assert (item["title"], item["channelType"]) == ("discord: route-2", "discord")
+
+    one = client.get(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN)
+    assert one.status_code == 200, one.text
+    assert one.json() == item
+
+    items = client.get(f"/api/v1/channel-conversations/{cid}/items", headers=OWNER_A_ADMIN)
+    assert items.status_code == 200, items.text
+    assert items.json() == jsonable_encoder(_runtime_view_of_messages(channel_conversation))
+    assert [m["content"] for m in items.json()] == ["hello"]
+
+    page = client.get(f"/api/v1/channel-conversations/{cid}/items?limit=1", headers=OWNER_A_ADMIN)
+    assert page.status_code == 200, page.text
+    assert set(page.json()) == {"items", "hasMore", "nextBefore"}
+
+
+def test_channel_conversations_list_newest_activity_first(client, channel_conversation, tmp_path):
+    older = str(channel_conversation)
+    project_id = _org_project(tmp_path)
+    created = client.post(
+        "/api/v1/channels/bindings", headers=A,
+        json={"channel_type": "discord", "external_group_id": "route-3", "anton_project_id": str(project_id)},
+    )
+    binding_id = UUID(created.json()["id"])
+    newer_id = _serve_first_discord_message(binding_id, project_id)
+    session = get_open_session()
+    try:
+        ConversationService(ScopedSession(session, scope_for_org(ORG_A))).save_user_message(
+            newer_id, "later", created_at=datetime.now(timezone.utc)
+        )
+    finally:
+        session.close()
+    try:
+        listed = client.get("/api/v1/channel-conversations/", headers=OWNER_A_ADMIN).json()["conversations"]
+        assert [i["id"] for i in listed if i["id"] in {older, str(newer_id)}] == [str(newer_id), older]
+        first = client.get("/api/v1/channel-conversations/?limit=1", headers=OWNER_A_ADMIN).json()["conversations"]
+        assert [i["id"] for i in first] == [str(newer_id)]
+        for bad in (0, 201):
+            assert client.get(f"/api/v1/channel-conversations/?limit={bad}", headers=OWNER_A_ADMIN).status_code == 422
+    finally:
+        _drop_messages(newer_id)
+        _drop_rows(binding_id, newer_id, project_id)
+
+
+def test_members_and_other_orgs_cannot_reach_channel_conversations(client, channel_conversation):
+    cid = str(channel_conversation)
+    for path in ("/", f"/{cid}", f"/{cid}/items"):
+        refused = client.get(f"/api/v1/channel-conversations{path}", headers=A)
+        assert refused.status_code == 403, refused.text
+
+    other_list = client.get("/api/v1/channel-conversations/", headers=B_ADMIN)
+    assert cid not in {i["id"] for i in other_list.json()["conversations"]}
+    for path in (f"/{cid}", f"/{cid}/items"):
+        assert client.get(f"/api/v1/channel-conversations{path}", headers=B_ADMIN).status_code == 404
+
+
+def test_only_marked_ownerless_conversations_are_channel_conversations(client, tmp_path):
+    project_id = _org_project(tmp_path)
+    own = client.post(
+        "/api/v1/conversations/", headers=A, json={"topic": "discord: plans", "projectId": str(project_id)},
+    )
+    assert own.status_code == 201, own.text
+    session = get_open_session()
+    try:
+        unmarked = Conversation(topic="discord: old", project_id=project_id, org_id=ORG_A, created_by=None)
+        session.add(unmarked)
+        session.commit()
+        unmarked_id = unmarked.id
+    finally:
+        session.close()
+    try:
+        listed = {i["id"] for i in client.get("/api/v1/channel-conversations/", headers=OWNER_A_ADMIN).json()["conversations"]}
+        for cid in (own.json()["id"], str(unmarked_id)):
+            assert cid not in listed
+            assert client.get(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
+    finally:
+        session = get_open_session()
+        try:
+            for cid in (UUID(own.json()["id"]), unmarked_id):
+                row = session.get(Conversation, cid)
+                if row is not None:
+                    session.delete(row)
+            session.flush()
+            session.delete(session.get(Project, project_id))
+            session.commit()
+        finally:
+            session.close()
+
+
+def test_org_admin_still_cannot_write_to_a_channel_conversation(client, channel_conversation, granted_product_permissions):
+    cid = str(channel_conversation)
+    assert client.get(f"/api/v1/conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
+    assert client.patch(f"/api/v1/conversations/{cid}", headers=OWNER_A_ADMIN, json={"topic": "x"}).status_code == 404
+    moved = client.post(f"/api/v1/conversations/{cid}/move", headers=OWNER_A_ADMIN, json={"projectId": str(uuid4())})
+    assert moved.status_code == 404
+    first = _runtime_view_of_messages(channel_conversation)[0]["id"]
+    assert client.delete(f"/api/v1/conversations/{cid}/turns/{first}", headers=OWNER_A_ADMIN).status_code == 404
+    turn = client.post(
+        "/api/v1/responses/", headers=OWNER_A_ADMIN, json={"input": "hi", "stream": True, "conversation": cid},
+    )
+    assert turn.status_code == 404, turn.text
+    assert [m["content"] for m in _runtime_view_of_messages(channel_conversation)] == ["hello"]
+
+
+def test_channel_conversation_routes_do_not_exist_outside_org_mode(client, channel_conversation, monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    try:
+        cid = str(channel_conversation)
+        for path in ("/", f"/{cid}", f"/{cid}/items"):
+            assert client.get(f"/api/v1/channel-conversations{path}", headers=OWNER_A_ADMIN).status_code == 404
+    finally:
+        monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+        get_app_settings.cache_clear()

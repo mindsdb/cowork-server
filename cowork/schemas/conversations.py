@@ -46,6 +46,16 @@ class ConversationListItem(CamelResponse):
     reasoning_effort: str | None = None
 
 
+class ChannelConversationItem(CamelResponse):
+    """A channel conversation as the org admin's Channels section lists it."""
+
+    id: UUID
+    title: str
+    channel_type: str
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
 class ConversationItemsPage(CamelResponse):
     """Cursor-paginated envelope for GET /conversations/{id}/items. `items`
     is a plain list[dict] passthrough (NOT nested CamelResponse models) —
