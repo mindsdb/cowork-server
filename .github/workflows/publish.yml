@@ -115,23 +115,38 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
+          version: "0.11.30"
           python-version: "3.12"
 
       - name: Build package
-        run: uv build
+        run: |
+          python scripts/release_contract.py --check
+          uv build
+          python scripts/release_contract.py --check --dist-dir dist
 
-      # This pipeline has no anton-agent pin (unlike publish-staging.yml): the
-      # wheel ships whatever satisfies the loose floor in pyproject.toml, which
-      # can be a stable anton release that predates a symbol this commit's code
-      # already imports at module scope (ENG-2065). Import the wheel we are
-      # about to ship, from outside the checkout so a local cowork/ package
-      # can't shadow it (see the identical check in publish-staging.yml and its
-      # review discussion for why that matters).
+      # Check the artifact with the same reviewed contract installers consume.
+      - name: Check the built wheel resolves to wheels on every shipped platform
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          # Exactly one, or the check would silently inspect an arbitrary
+          # artifact. `uv build` produces one wheel plus an sdist, so anything
+          # else means the build changed and this check needs rethinking.
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly 1 wheel in dist/, found ${#wheels[@]}: ${wheels[*]:-<none>}" >&2
+            exit 1
+          fi
+          bash scripts/check_wheels_available.sh "${wheels[0]}"
+
+      # Import the installed artifact outside the checkout with its locked dependencies.
       - name: Verify anton-agent satisfies this build
         run: |
           set -euo pipefail
           uv venv .smoke-venv
-          uv pip install --python .smoke-venv "$(ls dist/*.whl)"
+          uv pip install --python .smoke-venv --require-hashes --no-deps --only-binary :all: -r cowork/release-requirements.txt
+          uv pip install --python .smoke-venv --no-deps "$(ls dist/*.whl)"
+          uv pip check --python .smoke-venv
           VENV_PY="$(pwd)/.smoke-venv/bin/python"
           cd /tmp && "$VENV_PY" -c "import cowork.server"
 

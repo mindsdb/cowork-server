@@ -28,6 +28,26 @@
   var MAX_REPORTS = 20;
   var seen = Object.create(null);
   var sent = 0;
+  /* A report names what the agent can open, and never a draft link's token.
+     On the draft host the document's address starts with /_t/v1.<token>/, so
+     that segment goes, with or without its origin (a page's own message can
+     carry location.pathname). Anywhere else the document's own folder goes (a
+     desktop draft's loopback path), and a /_t/ folder inside an artifact is
+     just a folder. about:srcdoc has no folder, and nothing is cut there. */
+  var HREF = String(window.location.href);
+  /* The folder comes from the path alone: a query or hash such as
+     ?next=/a or #/route would otherwise move it. */
+  var PATH_ONLY = HREF.split(/[?#]/)[0];
+  var BASE = PATH_ONLY.slice(0, PATH_ONLY.lastIndexOf('/') + 1);
+  var TOKEN_PATH = /^[a-z][a-z0-9+.-]*:\/\/[^\/?#]+\/_t\/v1\.[^\/?#]+\//.test(HREF) ?
+    /(?:https?:\/\/[^\/\s]+)?\/_t\/v1\.[^\/?#\s]+\//g : null;
+
+  function local(value) {
+    var text = String(value || '');
+    if (TOKEN_PATH) return text.replace(TOKEN_PATH, '');
+    if (!BASE) return text;
+    return text.split(BASE).join('');
+  }
 
   function post(payload) {
     try {
@@ -57,43 +77,40 @@
         if (ev instanceof ErrorEvent) {
           var file = ev.filename || '';
           var line = typeof ev.lineno === 'number' ? ev.lineno : 0;
-          var href = String(window.location.href);
-          if (file === href) {
+          if (file === HREF) {
             /* Only this document's own inline scripts shifted; an external
                file carries its own coordinates. lineno is 0 for "Script
                error." and for some parse failures, hence the guard. */
             if (line > LINE_OFFSET) line -= LINE_OFFSET;
             /* The document's own address names nothing the agent can open —
                about:srcdoc on web, a signed draft URL with a query on
-               desktop. An empty file tells the server to print the artifact's
-               source path instead. */
+               desktop and on the draft host. An empty file tells the server
+               to print the artifact's source path instead. */
             file = '';
           } else if (file) {
             /* An external <script src> under the same document (e.g. a
-               desktop draft's "static/app.js") still carries the loopback
-               origin and full server path, which names nothing the agent can
-               open either. Strip the document's own directory so what is left
-               is the path the agent actually edits. */
-            var dir = href.slice(0, href.lastIndexOf('/') + 1);
-            if (dir && file.indexOf(dir) === 0) file = file.slice(dir.length);
+               desktop draft's "static/app.js") still carries the full
+               address, which names nothing the agent can open either. What
+               is left after the cut is the path the agent actually edits. */
+            file = local(file);
           }
           report('e|' + ev.message + '|' + file + '|' + line, {
             type: 'error',
-            message: String(ev.message || ''),
+            message: local(ev.message),
             file: file,
             line: line,
             col: typeof ev.colno === 'number' ? ev.colno : 0,
-            stack: ev.error && ev.error.stack ? String(ev.error.stack) : ''
+            stack: ev.error && ev.error.stack ? local(ev.error.stack) : ''
           });
           return;
         }
         var node = ev.target || {};
         var tagName = node.tagName || '';
-        var url = node.src || node.href || '';
+        var url = local(node.src || node.href || '');
         report('r|' + tagName + '|' + url, {
           type: 'resource',
           tagName: String(tagName),
-          url: String(url)
+          url: url
         });
       } catch (inner) { /* a reporter must never break the page */ }
     }, true);
@@ -104,11 +121,11 @@
         var message = reason && reason.message ? reason.message : String(reason);
         report('p|' + message, {
           type: 'error',
-          message: 'Unhandled promise rejection: ' + message,
+          message: 'Unhandled promise rejection: ' + local(message),
           file: '',
           line: 0,
           col: 0,
-          stack: reason && reason.stack ? String(reason.stack) : ''
+          stack: reason && reason.stack ? local(reason.stack) : ''
         });
       } catch (inner) { /* a reporter must never break the page */ }
     });
@@ -120,7 +137,7 @@
         report('c|' + ev.violatedDirective + '|' + ev.blockedURI, {
           type: 'csp',
           violatedDirective: String(ev.violatedDirective || ''),
-          blockedURI: String(ev.blockedURI || '')
+          blockedURI: local(ev.blockedURI)
         });
       } catch (inner) { /* a reporter must never break the page */ }
     });

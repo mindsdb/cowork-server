@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
-from cowork.harnesses.anton_harness.harness import AntonHarness, _turn_style_context
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession, _turn_style_context
 from cowork.harnesses.base import ChannelContext
 
 UI_LEAD = (
@@ -113,7 +113,7 @@ def test_stream_response_forwards_channel_context(monkeypatch):
         tool_messages=False,
     ):
         received["channel_context"] = channel_context
-        return _FakeSession(), None, None
+        return BuiltChatSession(session=_FakeSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

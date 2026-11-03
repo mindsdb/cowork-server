@@ -5,6 +5,7 @@
 conversation's own history, so a reload shows it too.
 """
 from __future__ import annotations
+from tests._logging_assertions import assert_log_fields
 
 import asyncio
 import json
@@ -17,6 +18,7 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
 from cowork.db.session import get_engine
+from cowork.handlers.turn_errors import TURN_LOST_MESSAGE
 from cowork.models.message_event import MessageEvent
 from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT_ID
@@ -76,10 +78,10 @@ def test_seals_a_crashed_turn_into_history(svc, conv, session, tmp_path):
     events = _events_for(session, messages[1].id)
     assert len(events) == 1
     assert events[0].event_data["type"] == "response.failed"
-    # Generic code, not a dedicated one — same as the remote path's own
-    # TurnInterrupted handling; the message text is what distinguishes it.
-    assert events[0].event_data["code"] == "anton_error"
-    assert events[0].event_data["error"] == "The response was interrupted before it finished. Please try again."
+    # The crash lost the turn: nothing about the request failed, and a proxy
+    # that outlived the server sends the same code to the client it cut off.
+    assert events[0].event_data["code"] == "turn_lost"
+    assert events[0].event_data["error"] == TURN_LOST_MESSAGE
 
 
 def test_is_idempotent_once_sealed(svc, conv, session, tmp_path):
@@ -220,7 +222,7 @@ def test_a_database_error_while_sealing_names_the_conversation(
     )
     assert record.conversation_id == str(conv.id)
     emitted = logged.output()
-    assert f"[Conversation:{conv.id}]: Database operation failed" in emitted
+    assert_log_fields(emitted, conversation_id=str(conv.id), error_type="OperationalError")
     assert secret not in emitted
 
 

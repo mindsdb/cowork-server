@@ -171,6 +171,14 @@ class TaskObjectService:
         dest_base = _artifacts_base(dest)
         dest_base.mkdir(parents=True, exist_ok=True)
         org_mode = self._org_mode
+        # Lazy, like artifact_ownership below. With live apps on, an app's
+        # shares, received mark and launches name its folder by project and
+        # slug, so they follow the folder.
+        from cowork.code_sandbox import live_apps_on
+
+        live_apps = live_apps_on()
+        if live_apps:
+            from cowork.services.live_apps import follow_moved_app
         creator = str(conversation.created_by) if conversation.created_by else None
         src_root = None
         resolutions: dict = {}
@@ -188,6 +196,7 @@ class TaskObjectService:
                 self.session, src_root, [row.ref for row in rows]
             )
         rekeys: list[tuple[str, str]] = []
+        moved_folders: list[tuple[Path, Path]] = []
         moved = 0
         for row in rows:
             src_folder = src_base / row.ref
@@ -215,11 +224,28 @@ class TaskObjectService:
                 continue
             if org_mode:
                 rekeys.append((row.ref, dest_slug))
+            moved_folders.append((src_folder, dest_base / dest_slug))
+            if live_apps:
+                follow_moved_app(
+                    self.session,
+                    partition_id=str(source.org_id),
+                    source_project_id=source.id,
+                    old_slug=row.ref,
+                    dest_project_id=dest.id,
+                    new_slug=dest_slug,
+                )
             row.project_id = dest.id
             row.ref = dest_slug
             self.session.add(row)
             moved += 1
         self.session.commit()
+        # A published page keeps its link: .published.json moved with the
+        # folder, and its owner record follows. A failed rekey is logged; the
+        # owner's next publish then gets a new link, as a copy would.
+        from cowork.services.published_page_ownership import rekey_published_page_paths
+
+        for old_folder, new_folder in moved_folders:
+            rekey_published_page_paths(old_folder, new_folder)
         # After the index commit: each rekey commits on its own, and must not
         # commit a half-applied batch of index rows along with it.
         if rekeys:

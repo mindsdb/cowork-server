@@ -1,0 +1,52 @@
+# Markup an XML parser would act on: external entities declared in a DOCTYPE
+# internal subset, and XInclude. The HTML parser acts on neither, so nothing
+# is listed in omitted; the guard, the recording server and the sentinel
+# check prove nothing was loaded. Where lxml's libxml2 has no HTTP client
+# ("http" missing from lxml.etree.LIBXML_FEATURES, as in the Linux and macOS
+# wheels), only the file:// sentinel check can catch a load. Where it has
+# one, as libxml2 2.11 in the Windows wheel does, the recording server
+# catches an HTTP fetch too.
+# Fields and placeholders: see tests/test_export_hostile.py.
+
+- id: doctype-external-entities
+  html: |
+    <!DOCTYPE html [
+    <!ENTITY remote SYSTEM "{server_url}/entity.xml">
+    <!ENTITY partition SYSTEM "{sentinel_text_file_url}">
+    <!ENTITY % parameter SYSTEM "{server_url}/parameter.dtd">
+    %parameter;
+    ]>
+    <html><body><p>remote: &remote;</p><p>partition: &partition;</p></body></html>
+  markdown: |
+    <!DOCTYPE html [
+    <!ENTITY remote SYSTEM "{server_url}/entity.xml">
+    <!ENTITY partition SYSTEM "{sentinel_text_file_url}">
+    <!ENTITY % parameter SYSTEM "{server_url}/parameter.dtd">
+    %parameter;
+    ]>
+
+    remote: &remote;
+
+    partition: &partition;
+  text: "remote:"
+  omitted: []
+
+- id: xinclude
+  html: |
+    <html xmlns:xi="http://www.w3.org/2001/XInclude"><body>
+    <p>before</p>
+    <xi:include href="{server_url}/include.xml"/>
+    <xi:include href="{sentinel_text_file_url}" parse="text"/>
+    <p>after</p>
+    </body></html>
+  markdown: |
+    before
+
+    <div xmlns:xi="http://www.w3.org/2001/XInclude">
+    <xi:include href="{server_url}/include.xml"/>
+    <xi:include href="{sentinel_text_file_url}" parse="text"/>
+    </div>
+
+    after
+  text: after
+  omitted: []

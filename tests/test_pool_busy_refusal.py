@@ -20,10 +20,11 @@ import pytest
 import cowork.db.session as db_session
 import cowork.handlers.responses as responses_mod
 from cowork.common.settings.app_settings import DatabaseSettings
-from cowork.handlers.response_routing import DELEGATED_AGENTIC, RouteDecision
+from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
 from cowork.db.scoped import LOCAL_SCOPE
-from cowork.db.units import run_db
+from cowork.db.units import DatabaseBusy, run_db
 from cowork.server import create_app
+from cowork.services.conversations import ConversationService
 from cowork.streaming import registry
 
 from _fakes import PausedHarness
@@ -187,3 +188,28 @@ def test_a_postgres_pool_waits_five_seconds_unless_pool_timeout_says_otherwise(m
 
     monkeypatch.setenv("POOL_TIMEOUT", "7")
     assert pool_wait() == 7
+
+
+async def test_a_direct_answer_whose_save_finds_no_connection_is_refused_as_busy(monkeypatch):
+    """The non-streaming direct answer catches its save's failures to quote a
+    Reference, but a database with no free connection is still the 503 every
+    other request gets, with its Retry-After, not a generic 500."""
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", WAIT)
+
+    async def decide(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.")
+
+    def no_connection(*_args, **_kwargs):
+        raise DatabaseBusy("no connection freed in time")
+
+    monkeypatch.setattr(responses_mod, "decide_route", decide)
+    monkeypatch.setattr(ConversationService, "save_assistant_turn", no_connection)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(), raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
+
+    assert response.status_code == 503, response.text[:300]
+    assert response.json() == BUSY
+    assert response.headers["retry-after"] == str(WAIT)

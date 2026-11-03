@@ -1,0 +1,28 @@
+# Each source is `html` encoded with the Python codec `encoding`. The output
+# declares UTF-8 and holds `text` in its paragraph. `utf-8-sig` and `utf-16`
+# write a byte order mark.
+
+- id: utf8-without-a-declaration
+  html: '<p>café ñ ü</p>'
+  encoding: utf-8
+  text: café ñ ü
+
+- id: utf8-with-a-bom
+  html: '<p>café</p>'
+  encoding: utf-8-sig
+  text: café
+
+- id: declared-windows-1252
+  html: '<meta charset="windows-1252"><p>café</p>'
+  encoding: cp1252
+  text: café
+
+- id: utf16-with-a-bom
+  html: '<p>café</p>'
+  encoding: utf-16
+  text: café
+
+- id: xml-declaration
+  html: '<?xml version="1.0" encoding="utf-8"?><p>café</p>'
+  encoding: utf-8
+  text: café

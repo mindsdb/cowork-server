@@ -37,7 +37,7 @@ _TOOL_NAME = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)(?:\([^`]*\))?`")
 
 def _sections(names: frozenset[str]) -> list[ast.expr]:
     """The values _build_chat_session assigns to these prompt sections."""
-    function = ast.parse(textwrap.dedent(inspect.getsource(harness.AntonHarness._build_chat_session))).body[0]
+    function = ast.parse(textwrap.dedent(inspect.getsource(harness.AntonHarness._build_turn_session))).body[0]
     return [
         node.value for node in ast.walk(function)
         if isinstance(node, ast.Assign)

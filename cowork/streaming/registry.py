@@ -68,13 +68,25 @@ _IDLE_POLL_SECONDS = 15
 
 # Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
 # partial answer before the process exits. The container's stop deadline must
-# cover Uvicorn's earlier request-drain budget (2s), this wait, and teardown.
+# cover Uvicorn's request-drain budget (2s), this wait, and teardown. With
+# remote turns the wait runs before that drain, from the SIGTERM handler
+# cowork.server installs, and the hosted chart's grace period counts it.
 #
 # A turn's end-of-turn save waits for a database connection only when the pool
 # is exhausted. If that happens during shutdown, the save can wait up to
-# POOL_TIMEOUT (5 s by default) and so use this whole grace; a turn still
-# saving when the grace runs out is left for the next boot's recovery.
+# POOL_TIMEOUT (5 s by default) and so use this whole grace. A turn still
+# saving when the grace runs out goes on saving until the process exits; what
+# happens to one that does not finish depends on the stream backend, see
+# RunRegistry.shutdown.
 TURN_SHUTDOWN_GRACE_SECONDS = 5
+
+# How long past RunRegistry.shutdown's own bound a turn it ended may wait for
+# its save before it writes its interrupted frame anyway. With remote turns,
+# Uvicorn's request drain starts once that bound passes, and about 2.2 s later
+# (its tick, its pause and --timeout-graceful-shutdown 2 in the image's
+# command) it cuts every stream still open. The frame goes out about a second
+# before that cut; the save goes on in the background.
+SHUTDOWN_FRAME_SECONDS_PAST_GRACE = 1.0
 
 
 class TurnInProgress(Exception):
@@ -89,6 +101,20 @@ class TurnInProgress(Exception):
         super().__init__(f"conversation {conversation_id} is still answering turn {turn_id}")
         self.conversation_id = conversation_id
         self.turn_id = turn_id
+
+
+class ServerShuttingDown(Exception):
+    """This server is ending its turns for a shutdown, so a new one is refused.
+
+    The app answers it with 503 and Retry-After, the refusal a server too busy
+    to take a turn gives (cowork.server), which reads ``status_code``. The
+    retry reaches another replica.
+    """
+
+    status_code = 503
+
+    def __init__(self) -> None:
+        super().__init__("the server is shutting down and starts no new turn")
 
 
 @dataclass(frozen=True)
@@ -120,6 +146,8 @@ class TurnLifecycle:
     ``shutting_down`` means "the server is exiting, not the user's own Stop".
     Set BEFORE the cancel, same ordering as ``discarded``: a producer's
     ``CancelledError`` handler checks it to persist an interrupted turn.
+    ``shutdown_frame_deadline``, set with it, is the loop time by which that
+    turn writes its frame, saved or not (SHUTDOWN_FRAME_SECONDS_PAST_GRACE).
 
     ``stalled`` means "the UI heard nothing for its idle window and gave up",
     not the user's own Stop. Set BEFORE the cancel, same ordering again: the
@@ -135,6 +163,7 @@ class TurnLifecycle:
 
     discarded: bool = False
     shutting_down: bool = False
+    shutdown_frame_deadline: float | None = None
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
     timed_out: bool = False
     saved_question: bool = False
@@ -235,6 +264,61 @@ class RunHandle:
         return True
 
 
+async def _stop_controller_turns(handles: list[RunHandle], *, timeout_seconds: float) -> None:
+    """Write the controller's cancel flag for each remote turn, all at once.
+
+    Waits at most ``timeout_seconds``; a write still in flight then finishes
+    on its own, within request_cancel's own bound. A failed write is logged
+    and never holds up the turn's interrupted save.
+    """
+    from cowork.streaming.cancellation import stop_controller_turn
+
+    writes = [
+        asyncio.create_task(stop_controller_turn(
+            handle.lifecycle.identity.correlation_id, turn_id=handle.run_id, reason="shutdown",
+        ))
+        for handle in handles
+    ]
+    await asyncio.wait(writes, timeout=timeout_seconds)
+
+
+async def _forget_unstarted_run(conversation_id: str, run_id: str) -> None:
+    """Remove a run start() published to the turn index but never started."""
+    from cowork.streaming.turn_index import forget_run
+
+    try:
+        async with asyncio.timeout(5):
+            await forget_run(conversation_id, run_id)
+    except Exception:
+        logger.exception("Could not remove unstarted run %s", run_id)
+
+
+async def _seal_interrupted(handle: RunHandle) -> None:
+    """End the stream of a turn whose task ended at shutdown without a
+    terminal record, as a producer cancelled before its first step does: the
+    turn-lost frame, then the terminal record. A failure is logged, so the
+    other turns are still sealed."""
+    from cowork.handlers.turn_errors import (
+        TURN_LOST_CODE,
+        TURN_LOST_MESSAGE,
+        response_failed_sse,
+    )
+
+    request_id = handle.lifecycle.identity.correlation_id
+    context = log_context(request_id=request_id, conversation_id=handle.conversation_id)
+    logger.warning(
+        "A turn ended at shutdown without a terminal record; sealing its stream as interrupted.",
+        extra={"event": "shutdown_turn_sealed", **context},
+    )
+    try:
+        await handle.buffer.append("sse", {"sse": response_failed_sse(
+            TURN_LOST_MESSAGE, TURN_LOST_CODE, request_id=request_id,
+        )})
+        await handle.buffer.close("interrupted")
+    except Exception:
+        logger.exception("Could not seal the stream of a turn ended at shutdown", extra=context)
+
+
 class RunRegistry:
     """Process-wide map of in-flight turns. Single-threaded (asyncio loop)."""
 
@@ -242,6 +326,26 @@ class RunRegistry:
         self._by_cid: dict[str, RunHandle] = {}
         self._lock = asyncio.Lock()
         self._start_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._closed = False
+
+    def close(self) -> None:
+        """Refuse every later start() with ServerShuttingDown.
+
+        cowork.server calls it before it ends the turns in flight for a
+        shutdown, so none starts behind that. A start() already waiting on
+        its buffer or the earlier turn when this runs is refused too, at its
+        last check before it registers the turn. Calling it again does
+        nothing.
+        """
+        self._closed = True
+
+    @staticmethod
+    def _shutdown_refusal(conversation_id: str) -> ServerShuttingDown:
+        logger.info(
+            "Refused a turn; the server is shutting down.",
+            extra=log_context(conversation_id=conversation_id),
+        )
+        return ServerShuttingDown()
 
     async def start(
         self,
@@ -273,9 +377,17 @@ class RunRegistry:
         its question's position in the history, which this question does not
         hold. A start after a turn that saved nothing keeps the number.
 
-        A refused start creates no buffer and no producer coroutine. An
-        accepted one opens its buffer clear of the records of an earlier turn
-        at the same number (backend.new_buffer).
+        Raises ServerShuttingDown once close() has run, whether close() ran
+        before this start or while it waited on the earlier turn, its buffer
+        or the turn index. The last check runs with no await between it and
+        the turn's registration, so shutdown() sees every turn that starts.
+
+        A start refused before it opens its buffer creates no buffer and no
+        producer coroutine. One refused by that last check has opened an
+        empty buffer, which the next start at that number opens clean again,
+        and removes the run it published to the turn index. An accepted start
+        opens its buffer clear of the records of an earlier turn at the same
+        number (backend.new_buffer).
         """
         loop = asyncio.get_running_loop()
         lock = self._start_locks.get(conversation_id)
@@ -283,6 +395,8 @@ class RunRegistry:
             lock = asyncio.Lock()
             self._start_locks[conversation_id] = lock
         async with lock:
+            if self._closed:
+                raise self._shutdown_refusal(conversation_id)
             existing = self._by_cid.get(conversation_id)
             if existing is not None and existing.is_answering:
                 logger.info(
@@ -309,9 +423,10 @@ class RunRegistry:
             buffer = await open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             from cowork.streaming.backend import get_backend
-            if get_backend() == "redis":
+            published = get_backend() == "redis"
+            if published:
                 from cowork.db.units import run_to_completion
-                from cowork.streaming.turn_index import forget_run, record_turn
+                from cowork.streaming.turn_index import record_turn
                 # Publish immutable identity before either the producer or its
                 # first reader can request cancellation. Dispatch never replaces it.
                 async def publish() -> None:
@@ -328,12 +443,15 @@ class RunRegistry:
                 except BaseException:
                     # Setup can be cancelled while Redis has committed but not
                     # replied. Settle that write, then remove only this instance.
-                    try:
-                        async with asyncio.timeout(5):
-                            await forget_run(conversation_id, lifecycle.identity.run_id)
-                    except Exception:
-                        logger.exception("Could not remove unstarted run %s", lifecycle.identity.run_id)
+                    await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
                     raise
+            # close() may have run during any await above. No await from this
+            # check to the registration below, so a shutdown that closed the
+            # registry either refuses this turn here or finds it in _by_cid.
+            if self._closed:
+                if published:
+                    await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
+                raise self._shutdown_refusal(conversation_id)
             task = asyncio.create_task(
                 self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),
                 name=f"turn[{conversation_id}/{turn_id}]",
@@ -486,24 +604,70 @@ class RunRegistry:
     async def shutdown(self, timeout_seconds: float = TURN_SHUTDOWN_GRACE_SECONDS) -> int:
         """Cancel every running turn so its partial answer persists instead of
         vanishing under a SIGKILL. Marks ``shutting_down`` before cancelling,
-        same ordering rule as ``discard``. Bounded by ``timeout_seconds``;
-        a turn still unwinding past it is left for the next boot's seal.
+        same ordering rule as ``discard``.
+
+        Cancelling a remote turn's relay stops only this server's side of it;
+        the sandbox controller would run the sandbox turn on with nobody
+        reading its replies. So each remote turn still answering first gets
+        the controller's cancel flag, written as ``/cancel`` writes it
+        (cancellation.request_cancel). ``cancel_run`` is not the way in: it
+        refuses a turn already marked ``shutting_down``. Whatever the
+        controller replies meanwhile, the relay's cancel branch sees
+        ``shutting_down`` and saves the turn as interrupted.
+
+        A task cancelled before its first step never runs its body, so a
+        producer cancelled that early saves no question and writes no
+        terminal record. Two loop passes before the cancel start the producer
+        of a turn that registered just before this call. A turn whose task
+        still ended with its stream open has the interrupted frame and
+        terminal record written here.
+
+        Bounded by ``timeout_seconds``, the flags and the unwinding together.
+        A turn already marked ``shutting_down`` is skipped, so a second call
+        leaves the turns the first one ended alone. Returns how many turns
+        this call cancelled.
         """
-        handles = self.in_flight()
+        handles = [h for h in self.in_flight() if not h.lifecycle.shutting_down]
         if not handles:
             return 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
         for handle in handles:
             handle.lifecycle.shutting_down = True
+            handle.lifecycle.shutdown_frame_deadline = deadline + SHUTDOWN_FRAME_SECONDS_PAST_GRACE
+        # One pass starts the _run_bounded task of a turn that registered in
+        # this loop pass, the next starts the producer task it creates.
+        for _ in range(2):
+            await asyncio.sleep(0)
+        # The identity the turn captured when it started, not a settings read:
+        # an in-process turn has no controller to stop. A turn that is only
+        # saving its finished answer has nothing left running there.
+        remote = [h for h in handles if h.lifecycle.identity.remote and h.is_answering]
+        if remote:
+            await _stop_controller_turns(remote, timeout_seconds=timeout_seconds)
         for handle in handles:
             handle.task.cancel()
         done, pending = await asyncio.wait(
-            [h.task for h in handles], timeout=timeout_seconds
+            [h.task for h in handles], timeout=max(0.0, deadline - loop.time())
         )
         if pending:
-            logger.warning(
-                "%d turn(s) still unwinding past the %ss shutdown budget; "
-                "left for boot recovery to seal.", len(pending), timeout_seconds,
-            )
+            from cowork.streaming.backend import get_backend
+            unfinished = {"event": "shutdown_turns_unfinished", "count": len(pending)}
+            if get_backend() == "redis":
+                logger.warning(
+                    "Turns still unwinding past the shutdown budget; each saves if it finishes "
+                    "before the process exits, and boot recovery does not read Redis buffers, so "
+                    "one that never finishes keeps its question pending, and its stream stays "
+                    "open until a reader's idle cut ends it.",
+                    extra=unfinished,
+                )
+            else:
+                logger.warning(
+                    "Turns still unwinding past the shutdown budget; each saves if it finishes "
+                    "before the process exits, and one that never finishes is sealed by the "
+                    "next boot's recovery.",
+                    extra=unfinished,
+                )
         for task in done:
             if task.cancelled():
                 continue
@@ -512,6 +676,9 @@ class RunRegistry:
                 logger.error(
                     "Turn raised while unwinding for shutdown", exc_info=exc,
                 )
+        for handle in handles:
+            if handle.task.done() and not handle.lifecycle.discarded and not handle.buffer.is_closed:
+                await _seal_interrupted(handle)
         return len(handles)
 
     def reset(self) -> None:
@@ -520,9 +687,11 @@ class RunRegistry:
         For tests: this object is a process global, so a handle registered by
         one test stays visible to the next. Deliberately does NOT cancel the
         tasks — the caller owns those, and cancelling here would make a
-        cleanup helper a scheduling side effect.
+        cleanup helper a scheduling side effect. Admits starts again after
+        close(), for the same reason.
         """
         self._by_cid.clear()
+        self._closed = False
 
     async def gc_finished(self, max_age_seconds: float = 300.0) -> int:
         """Drop handles whose producer finished > max_age ago. The buffer

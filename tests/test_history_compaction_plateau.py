@@ -121,6 +121,7 @@ async def _run_conversation(svc, *, compaction_enabled: bool):
 
     for turn in range(1, N_TURNS + 1):
         replayable = [m for m in svc.get_ordered_messages(conv.id) if m.role in {"user", "assistant"}]
+        assert [m.role for m in replayable] == ["user", "assistant"] * (turn - 1)
         summary = conv.history_summary if compaction_enabled else None
         initial_history, seed_info = AntonHarness._seed_history(
             replayable, summary, conv.history_summary_cutoff_id, AntonHarness._stamp_message,
@@ -134,17 +135,16 @@ async def _run_conversation(svc, *, compaction_enabled: bool):
             compactions += 1
             AntonHarness._persist_history_compaction(conv, anton_session, seed_info)
 
-        # Explicit strictly-increasing timestamps: the loop runs many turns in
-        # the same wall-clock second, and _MESSAGE_ORDER only disambiguates a
-        # same-turn user/assistant pair — without distinct created_at every
-        # user message would sort before every assistant message.
+        # Direct inserts must supply the monotonic sequence that the service's
+        # save methods assign. _MESSAGE_ORDER ignores timestamps; the default
+        # seq=0 would group users before assistants and scramble compaction cutoffs.
         svc.session.add(Message(
-            conversation_id=conv.id, role="user",
+            conversation_id=conv.id, role="user", seq=2 * turn,
             content=f"Turn {turn}: remember FACT_{turn} = value{turn}.",
             created_at=_BASE_TIME + timedelta(seconds=2 * turn),
         ))
         svc.session.add(Message(
-            conversation_id=conv.id, role="assistant", content=reply,
+            conversation_id=conv.id, role="assistant", content=reply, seq=2 * turn + 1,
             created_at=_BASE_TIME + timedelta(seconds=2 * turn + 1),
         ))
         svc.session.commit()

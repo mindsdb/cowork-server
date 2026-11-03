@@ -192,6 +192,30 @@ def test_delete_endpoint(client, memory_root, memory_settings):
     assert GlobalMemoryStore(root=memory_root).read(MemorySlot.PROFILE) == ""
 
 
+def test_the_desktop_keeps_edit_and_delete_and_gets_no_reset(client, memory_root, memory_settings):
+    """With no person in scope the desktop offers no reset and refuses one, and
+    its slots keep Edit and Delete, as before the reset existed."""
+    GlobalMemoryStore(root=memory_root).write(MemorySlot.RULES, "global rule")
+
+    assert client.get("/memory/capabilities").json() == {"canReset": False}
+    reset = client.delete("/memory/all")
+
+    assert reset.status_code == 403, reset.text
+    assert GlobalMemoryStore(root=memory_root).read(MemorySlot.RULES).strip() == "global rule"
+    items = client.get("/memory/").json()
+    assert "managed" not in {item["scope"] for item in items}
+    assert all(item["capabilities"] == {"canEdit": True, "canDelete": True} for item in items)
+
+
+def test_a_change_to_the_managed_scope_is_refused(client, memory_settings):
+    for response in (
+        client.put("/memory/", json={"scope": "managed", "category": "rules", "content": "x"}),
+        client.request("DELETE", "/memory/", json={"scope": "managed", "category": "rules"}),
+    ):
+        assert response.status_code == 403, response.text
+        assert response.json()["detail"] == memory_service_module.MANAGED_REFUSED
+
+
 def test_put_project_profile_returns_400(client, session, project, memory_settings):
     response = client.put(
         "/memory/",
@@ -513,3 +537,26 @@ def test_a_deleted_projects_tier_refuses_a_user_id_that_is_not_one_folder_name(
 
     assert outside.is_dir()
     assert deployment_tier.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_hosted_org_mode_keeps_its_capabilities_and_gets_no_reset(org_engine, tmp_path):
+    """An org member is no person on a deployment that trusts identity headers:
+    their own global tier keeps Edit and Delete, the project slot they wrote
+    keeps its author's rights, and the reset refuses with 403."""
+    project_id = _org_project(org_engine, tmp_path / "org-project")
+    alice = _org_memory(org_engine, ALICE)
+    await alice.update_memory(MemoryScope.global_, MemorySlot.RULES, "alice rule")
+    await alice.update_memory(MemoryScope.project, MemorySlot.LESSONS, "alice lesson", project_id)
+
+    items = alice.list_memory_sync()
+
+    [rule] = [item for item in items if item.scope == MemoryScope.global_ and item.category == MemorySlot.RULES]
+    assert rule.capabilities.can_edit is True and rule.capabilities.can_delete is True
+    [lesson] = [item for item in items if item.project_id == project_id and item.category == MemorySlot.LESSONS]
+    assert lesson.capabilities.can_edit is True and lesson.capabilities.can_delete is True
+    assert memory_service_module.person_may_reset_memory(_org_scope(ALICE)) is False
+    with pytest.raises(HTTPException) as refused:
+        alice.reset_own_memory_sync()
+    assert refused.value.status_code == 403
+    assert {item.content.strip() for item in alice.list_memory_sync()} >= {"alice rule", "alice lesson"}

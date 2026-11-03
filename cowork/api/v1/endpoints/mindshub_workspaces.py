@@ -1,0 +1,158 @@
+"""The MindsHub workspace selector's two routes.
+
+- GET  /            the caller's workspaces and which one is active
+- PUT  /active      switch the caller into another workspace
+
+A MindsHub Workspace is an org-internal container that owns hub resources and
+lives in the auth service. It is unrelated to the filesystem directories this
+repo calls workspaces; the stored key is ``hub_workspace_id`` for that reason.
+
+The listing is answered whatever its length. Whether a client draws a control
+is the client's decision, and Cowork's is to draw nothing below two rows.
+
+**Which workspace a usage row carries is decided by the credential the turn
+presents, not by this selector directly.** A desktop turn still runs against a
+long-lived key bound to a user and an organization only. A cloud turn now
+carries this stored pick: the remote producer reads `hub_workspace_id` and
+forwards it to the turn-key and artifact-publish-key mints (`cowork/turnqueue/
+producer.py`, `cowork/services/artifact_autopublish.py`), which bind the key's
+`workspace_id` to it. So the desktop path is still workspace-blind; the cloud
+path picks this up as soon as a caller uses the selector below.
+
+**The stored key has a second writer, and it grants nothing.**
+``hub_workspace_id`` is a declared ``UserSettings`` field, so
+``PUT /api/v1/settings/hub_workspace_id`` writes it with no grant check at all.
+That is fine rather than a hole, and only because of where the filtering lives:
+``resolve_active`` matches the stored id against the listing auth returned, so an
+id the caller holds no grant on resolves to the default workspace and the menu
+renders the same rows either way. The stored value decides which row carries a
+check, never which rows exist. Move the filtering and that stops being true.
+
+So nothing that REFUSES a request may read it. The archived check on
+``PUT /active`` reads the target row's own ``archived_at`` for exactly that
+reason: phrasing it as "is this in the set the menu offered" would have gone
+through ``selectable``, which keeps the active row even when archived, and one
+call to the settings route would then have made an archived workspace current
+and talked the refusal into accepting it.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlmodel import Session
+
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.session import get_session
+from cowork.principal import mindshub_credential
+from cowork.schemas.mindshub_workspaces import (
+    MindsHubWorkspaceActivateRequest,
+    MindsHubWorkspaceRow,
+    MindsHubWorkspaceView,
+)
+from cowork.services.mindshub_workspaces import (
+    fetch_mindshub_workspaces,
+    resolve_active,
+    selectable,
+)
+from cowork.services.settings import SettingService
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+SessionDep = Annotated[Session, Depends(get_session)]
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
+SETTING_KEY = "hub_workspace_id"
+
+
+async def _build_view(
+    request: Request, session: Session, scope: TenantScope
+) -> MindsHubWorkspaceView:
+    """The selector's whole state: the caller's workspaces and which is active."""
+    bearer = mindshub_credential(request)
+    org_id = scope.org_id or ""
+    user_id = scope.user_id or ""
+    listing = await fetch_mindshub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
+    stored = SettingService(session, scope).load().hub_workspace_id
+    active = resolve_active(listing.workspaces, stored)
+    active_id = active.id if active else None
+    return MindsHubWorkspaceView(
+        enabled=True,
+        reachable=listing.reachable,
+        workspaces=[
+            MindsHubWorkspaceRow.model_validate(workspace, from_attributes=True)
+            for workspace in selectable(listing.workspaces, active_id)
+        ],
+        active_workspace_id=active_id,
+    )
+
+
+@router.get("/", response_model=MindsHubWorkspaceView)
+async def get_mindshub_workspaces(
+    request: Request, session: SessionDep, scope: ScopeDep
+) -> MindsHubWorkspaceView:
+    return await _build_view(request, session, scope)
+
+
+@router.put("/active", response_model=MindsHubWorkspaceView)
+async def set_active_mindshub_workspace(
+    body: MindsHubWorkspaceActivateRequest,
+    request: Request,
+    session: SessionDep,
+    scope: ScopeDep,
+) -> MindsHubWorkspaceView:
+    """Switch the caller into another workspace.
+
+    The id has to appear in the caller's own listing before it is stored. Auth
+    already decides who may see which workspace and the listing is the answer, so
+    checking against it costs nothing and means a caller cannot store a workspace
+    from another organization by asking for it directly. An unreachable listing
+    refuses rather than storing an id nobody could verify: a stored id that names
+    nothing resolves to the default workspace on the next read, which would look
+    like the switch silently doing nothing.
+
+    Two refusals rather than one, because "you may not" and "not any more" are
+    different answers and the client can only act on one of them. A workspace
+    missing from the listing is a grant the caller does not hold, and that is a
+    403. A workspace in the listing but stamped archived is a 409, so the UI can
+    say retrying will not help instead of offering a loop with no exit.
+    """
+    bearer = mindshub_credential(request)
+    org_id = scope.org_id or ""
+    user_id = scope.user_id or ""
+    listing = await fetch_mindshub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
+    if not listing.reachable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="could not reach MindsHub to confirm the workspace",
+        )
+    if not any(workspace.id == body.workspace_id for workspace in listing.workspaces):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="no access to that workspace",
+        )
+
+    # Archived is refused on the target's own flag, deliberately NOT by asking
+    # whether it is in `selectable(...)`. `selectable` keeps the active row even
+    # when archived, so the set it returns depends on the stored pick, and the
+    # stored pick has a second writer that grants nothing (see this module's
+    # header): `PUT /api/v1/settings/hub_workspace_id` writes the same key with
+    # no gate and no listing check. Reading the offered set here would have let
+    # one call to that route make an archived workspace "current", and the
+    # refusal below would then wave it through. Nobody loses anything by reading
+    # the flag instead: re-selecting the archived workspace you are already in is
+    # a no-op, and every other row in the menu is live.
+    target = next(w for w in listing.workspaces if w.id == body.workspace_id)
+    if target.archived_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="that workspace is archived",
+        )
+
+    SettingService(session, scope).upsert_setting(SETTING_KEY, body.workspace_id)
+    return await _build_view(request, session, scope)

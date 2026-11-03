@@ -7,7 +7,7 @@ from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 
-from cowork.coding.approvals import ApprovalBroker
+from cowork.coding.approvals import ApprovalBroker, read_only_refusal
 from cowork.coding.questions import QuestionBroker
 from cowork.coding.service_questions import CodingQuestionOperations
 from cowork.coding.service_planning import CodingPlanningOperations
@@ -23,6 +23,7 @@ from cowork.coding.contracts import (
     EventPage,
     EventType,
     PendingApproval,
+    PermissionMode,
     SessionPage,
     SessionStatus,
     SessionUpdateRequest,
@@ -123,6 +124,10 @@ class CodingService(
         self.approvals = ApprovalBroker(
             self._approval_opened, self._approval_closed,
             lambda session_id: self.store.load_session(session_id).command_approval_grants,
+            is_read_only=lambda session_id: (
+                self.store.load_session(session_id).permission_mode == PermissionMode.read_only
+            ),
+            on_refuse=lambda session_id, pending: self._emit(session_id, read_only_refusal(pending)),
         )
         self.questions = QuestionBroker(self._question_opened, self._question_closed)
         self.runtimes = RuntimeManager(root, self.registry, self._engine_request)

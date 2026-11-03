@@ -35,6 +35,8 @@ class BuiltTurn:
     config: object
     scratch: Path | None
     project: Project
+    # The turn's BuiltChatSession.learns.
+    learns: bool
 
 
 def stub_turn_settings(monkeypatch) -> None:
@@ -117,10 +119,11 @@ async def built_turn(
             if before_build is not None:
                 before_build(Path(project.path))
             with use_settings_scope(scope) if scope is not None else nullcontext():
-                config, scratch, _ = await harness.AntonHarness()._build_chat_session(
+                built = await harness.AntonHarness()._build_chat_session(
                     conversation, disabled_connections=disabled_connections
                 )
-            yield BuiltTurn(config=config, scratch=scratch, project=project)
+                config, scratch = built.session, built.turn_scratch_dir
+            yield BuiltTurn(config=config, scratch=scratch, project=project, learns=built.learns)
         finally:
             await close_turn(config, scratch)
             db.exec(delete(Conversation).where(Conversation.id == conversation.id))

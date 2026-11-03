@@ -1,0 +1,36 @@
+{
+  "id": "duckdb",
+  "label": "DuckDB",
+  "aliases": ["duckdb", "duck db", "duckdb database"],
+  "keywords": ["database", "sql", "duckdb", "analytics", "file", "local", "tables", "queries"],
+  "description": "Query a DuckDB database file on this machine.",
+  "category": "database",
+  "logo": "database",
+  "logo_color": "#FFC107",
+  "usage_notes": "Open the file named by `database_path` with `duckdb.connect(path, read_only=True)`; never open it for writing. Install the `duckdb` package if it is missing. List the tables with `SHOW ALL TABLES`.",
+  "form": {
+    "form_id": "duckdb-connector",
+    "title": "Connect DuckDB",
+    "subtitle": "Point Anton at a DuckDB database file on this machine.",
+    "logo": "database",
+    "logo_color": "#FFC107",
+    "methods": [
+      {
+        "id": "file",
+        "label": "Database file",
+        "description": "The path of a DuckDB database file (.duckdb, .db) on this machine.",
+        "recommended": true,
+        "fields": [
+          {
+            "name": "database_path",
+            "label": "Database file path",
+            "type": "text",
+            "required": true,
+            "placeholder": "/path/to/database.duckdb",
+            "description": "Absolute path to the DuckDB file."
+          }
+        ]
+      }
+    ]
+  }
+}

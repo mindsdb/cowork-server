@@ -11,12 +11,12 @@ the value, so the derivation is imported rather than reimplemented.
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import secrets
 import stat
-import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -34,13 +34,14 @@ from anton.core.artifacts.models import (
     extend_legacy_id,
     resolve_artifact_id,
 )
+from cowork.code_sandbox import anchored_below_a_trusted_root
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_atomic_write,
     dir_open,
     dir_scandir,
     dir_stat,
-    dir_unlink,
     open_pinned_child,
     pinned_dir,
 )
@@ -78,10 +79,12 @@ def opened_artifact_root(source: "ProjectArtifacts") -> Iterator[PinnedDir]:
     """Pin an authorized artifacts root without following writable links.
 
     Resolvers created by :mod:`artifact_roots` carry a server-owned project
-    directory plus the relative storage components.  Opening those components
+    directory plus the relative storage components.  Opening the project
+    directory from the server's trusted root, and those components below it,
     one by one with ``O_NOFOLLOW`` closes both the ordinary symlink escape and
-    the check/swap/use race.  Explicit legacy/local sources have no anchor and
-    pin their base itself with ``O_NOFOLLOW`` instead.
+    the check/swap/use race (``_opened_from_trusted_root``).  Explicit
+    legacy/local sources have no anchor and pin their base itself with
+    ``O_NOFOLLOW`` instead.
     """
     base = Path(source.base)
     anchor_value = getattr(source, "trusted_anchor", None)
@@ -100,17 +103,51 @@ def opened_artifact_root(source: "ProjectArtifacts") -> Iterator[PinnedDir]:
     if not parts or normalized_base_parts != (*normalized_anchor_parts, *parts):
         raise ValueError("Artifact root does not match its trusted anchor")
 
-    # The project directory itself is writable storage and can be replaced by a
-    # symlink too. Pin its trusted parent, then open the basename and every root
-    # component relative to descriptors with O_NOFOLLOW. At no point is the
-    # already-authorized path re-walked as one joined string.
-    anchor_name = _component(anchor.name)
-    with pinned_dir(anchor.parent, nofollow_base=True) as parent:
-        with ExitStack() as opened:
-            root = opened.enter_context(_opened_child_directory(parent, anchor_name))
-            for part in parts:
-                root = opened.enter_context(_opened_child_directory(root, part))
-            yield root
+    # At no point is the already-authorized path re-walked as one joined string.
+    with _opened_from_trusted_root(anchor, *parts) as root:
+        yield root
+
+
+@contextmanager
+def _opened_from_trusted_root(anchor: Path, *names: str) -> Iterator[PinnedDir]:
+    """Pin ``anchor/<names...>``, opening every folder below the server's
+    trusted root that holds ``anchor`` relative to descriptors with
+    O_NOFOLLOW.
+
+    Every folder between that root and ``anchor`` is storage agent code could
+    write before the code sandbox: a person's partition folder in the shared
+    root, its ``projects`` store, the project folder. Any of them may be a
+    link, and a partition folder linked to another person's would hand over
+    that person's projects. The trusted root itself
+    (code_sandbox.anchored_below_a_trusted_root) is opened as configured, a
+    link included. An anchor outside every trusted root, such as an adopted
+    folder, trusts its parent instead.
+    """
+    lexical = Path(os.path.abspath(anchor))
+    anchored = anchored_below_a_trusted_root(lexical)
+    if anchored is None:
+        start, below = lexical.parent, (lexical.name,)
+    else:
+        # The root as ``anchor`` spells it, so every path opened below keeps
+        # the form the caller passed in.
+        start = Path(*lexical.parts[: len(lexical.parts) - len(anchored.names)])
+        below = anchored.names
+    with pinned_dir(start, nofollow_base=anchored is None) as top, ExitStack() as opened:
+        folder = top
+        for name in (*below, *names):
+            try:
+                folder = opened.enter_context(_opened_child_directory(folder, name))
+            except OSError as error:
+                # A missing folder is ordinary (a project with no artifacts yet);
+                # a link or a file is not, and the routes answer it as missing.
+                if isinstance(error, NotADirectoryError) or error.errno == errno.ELOOP:
+                    logger.warning(
+                        "artifacts: a folder on the way to an artifacts folder is a link "
+                        "or not a folder, so the artifacts below it are left out",
+                        extra={"event": "artifact_folder_refused", "reason": "linked_folder"},
+                    )
+                raise
+        yield folder
 
 
 @contextmanager
@@ -207,35 +244,35 @@ def read_full_id(folder: PinnedDir) -> tuple[str, dict]:
     return resolved, normalized
 
 
-def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:
-    name = _component(name)
-    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
+def _replaced_mode(folder: PinnedDir, name: str) -> int | None:
+    """The permission bits of the regular file at *name*, which a write replaces.
+
+    The replacement takes them, so whoever could read the old document can
+    read the new one; a document written for the first time stays private.
+    Windows keeps no such bits beyond read-only, so it gets None.
+    """
+    if folder.fd is None:
+        return None
     try:
-        # `O_EXCL | O_NOFOLLOW`: the name carries a uuid4 so a collision is not
-        # realistic, but creating rather than opening is what makes "write to a
-        # file somebody planted here" impossible rather than improbable.
-        fd = dir_open(
-            folder,
-            tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
-            0o600,
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-        # `os.replace` acts on the link itself, never its target, so a symlinked
-        # `metadata.json` is replaced by the real document instead of writing
-        # through it.
-        if folder.fd is not None:
-            os.replace(tmp, name, src_dir_fd=folder.fd, dst_dir_fd=folder.fd)
-        else:
-            os.replace(folder.path / tmp, folder.path / name)
-    finally:
-        try:
-            dir_unlink(folder, tmp)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+        existing = dir_stat(folder, name, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(existing.st_mode):
+        return None
+    return stat.S_IMODE(existing.st_mode) & 0o777
+
+
+def _atomic_json(folder: PinnedDir, name: str, payload: dict) -> None:
+    """Replace the document *name* with *payload*. A symlinked
+    `metadata.json` is replaced by the real document, never written through
+    (dir_atomic_write)."""
+    name = _component(name)
+    dir_atomic_write(
+        folder,
+        name,
+        content=(json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+        mode=_replaced_mode(folder, name),
+    )
 
 
 def _ensure_full_id(

@@ -42,6 +42,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 import cowork.server as cowork_server
 from cowork import managed, shared_skills
+from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -196,7 +197,7 @@ def _listed(scoped, scope: TenantScope) -> dict[str, dict]:
 
 
 def _set_sharing(scoped, scope: TenantScope, principal: Principal, slug: str, *, shared: bool) -> dict:
-    return skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), scoped(scope), principal)
+    return sharing_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), scoped(scope), principal)
 
 
 def _answers(call, status: int, detail: str) -> None:
@@ -1006,7 +1007,7 @@ def test_where_skills_are_shared_nobody_shares_one_at_a_time(all_shared, scoped)
     for slug in ("team-notes", "never-made"):
         for shared in (True, False):
             _answers(
-                lambda: skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), alice, ALICE_PRINCIPAL),
+                lambda: sharing_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), alice, ALICE_PRINCIPAL),
                 409,
                 SKILL_SHARING_UNAVAILABLE,
             )
@@ -1214,7 +1215,9 @@ def test_where_all_are_shared_a_skill_with_no_creator_is_the_operators(all_share
 def _every_route_works(session, principal, *, upload_creator: str | None) -> None:
     """Create, upload, list, read, edit, disable, rename and delete one skill
     each, as the caller who made them. None is ``shared``, and nothing stamps
-    a creator: an upload keeps what its file says (``upload_creator``)."""
+    a creator. On the desktop an upload keeps what its file says
+    (``upload_creator``); MindsHub mode drops it, since a skill's owner
+    there is its skill_access row's (cowork.services.skill_sharing)."""
     created = skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), session, principal)
     assert (created["shared"], created["capabilities"]) == (False, CHANGE_CAPABILITY)
     uploaded = skills_ep._upload_skill_bytes(
@@ -1277,7 +1280,7 @@ def hosted(org_deployment, monkeypatch, tmp_path):
 def test_hosted_org_tenancy_keeps_every_skills_route(hosted):
     principal = Principal(user_id=ORG_USER, org_id=ORG_ID, email="member@example.com")
 
-    _every_route_works(hosted, principal, upload_creator=SUB_B)
+    _every_route_works(hosted, principal, upload_creator=None)
 
     assert SkillService(hosted.scope).root.parent.name == ORG_ID
 
@@ -1287,7 +1290,7 @@ def test_hosted_org_tenancy_shares_no_skill(hosted):
     skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), hosted, principal)
 
     _answers(
-        lambda: skills_ep.set_skill_sharing("my-notes", SkillSharingRequest(shared=True), hosted, principal),
+        lambda: sharing_ep.set_skill_sharing("my-notes", SkillSharingRequest(shared=True), hosted, principal),
         409,
         SKILL_SHARING_UNAVAILABLE,
     )
@@ -1306,3 +1309,93 @@ def test_hosted_org_tenancy_shares_no_skill(hosted):
     # The refused upload reserved no claim: the name is still free.
     uploaded = skills_ep._upload_skill_bytes(_zip("new-upload", "x"), "skill.zip", hosted, principal)
     assert (uploaded["id"], uploaded["shared"]) == ("new-upload", False)
+
+
+# ── the skills an artifact build follows without a recall ───────────────────
+
+
+def _mark_for_artifacts(skill_dir: Path) -> None:
+    """Add `applies_to: artifacts` to a stored SKILL.md's frontmatter."""
+    path = skill_dir / "SKILL.md"
+    text = path.read_text()
+    path.write_text(text.replace("---\n", "---\napplies_to: artifacts\n", 1))
+
+
+def _followed_by_artifact_builds(settings) -> list[str]:
+    from anton.core.memory.skills import SkillStore
+
+    store = SkillStore(
+        root=settings.skills_root,
+        extra_roots=settings.skills_extra_roots,
+        artifact_roots=settings.skills_artifact_roots,
+    )
+    return [skill.label for skill in store.list_for_artifacts()]
+
+
+async def test_a_build_follows_bobs_marked_skills_and_never_alices_shared_one(sharing, monkeypatch, stores):
+    SkillService(BOB).create_skill("bobs-charts", "Use only Chart.js.")
+    _mark_for_artifacts(SkillService(BOB).root / "bobs-charts")
+    _mark_for_artifacts(SkillService(ALICE).root / SHARED)
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB) as turn:
+        roots = [Path(p).resolve() for p in turn.config.settings.skills_artifact_roots]
+        assert roots[0] == HOST_SKILLS_DIR.resolve()
+        assert (SkillService(BOB).root / "bobs-charts").resolve() in roots
+        alice = SkillService(ALICE).root.resolve()
+        assert not [p for p in roots if p.is_relative_to(alice)]
+        followed = _followed_by_artifact_builds(turn.config.settings)
+        assert "bobs-charts" in followed
+        assert SHARED not in followed
+
+
+async def test_a_build_follows_the_operators_marked_managed_skills(sharing, monkeypatch, stores):
+    (sharing.skills_dir / "gateway-rules").mkdir()
+    (sharing.skills_dir / "gateway-rules" / "SKILL.md").write_text(
+        _skill_md("gateway-rules", "Call only the endpoints listed here.")
+    )
+    _mark_for_artifacts(sharing.skills_dir / "gateway-rules")
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB) as turn:
+        assert "gateway-rules" in _followed_by_artifact_builds(turn.config.settings)
+
+
+async def test_in_one_shared_store_a_build_follows_only_the_askers_own(all_shared, monkeypatch, stores):
+    SkillService(ALICE_SHARED).create_skill("alices-charts", "Use only ECharts.")
+    SkillService(BOB_SHARED).create_skill("bobs-charts", "Use only Chart.js.")
+    store = SkillService(BOB_SHARED).root
+    assert store == SkillService(ALICE_SHARED).root
+    for slug in ("alices-charts", "bobs-charts"):
+        _mark_for_artifacts(store / slug)
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB_SHARED) as turn:
+        followed = _followed_by_artifact_builds(turn.config.settings)
+        assert "bobs-charts" in followed
+        assert "alices-charts" not in followed
+
+
+async def test_a_turn_with_no_person_follows_no_persons_skill(all_shared, managed_dir, monkeypatch, stores):
+    """A channel's turn or a shared schedule's runs in the operator view,
+    which is no operator in a turn (turn_changer_for): it owns no stored
+    skill, so it follows the managed folder's and not Alice's."""
+    SkillService(ALICE_SHARED).create_skill("alices-charts", "Use only ECharts.")
+    store = SkillService(ALICE_SHARED).root
+    _mark_for_artifacts(store / "alices-charts")
+    (managed_dir.skills_dir / "gateway-rules").mkdir()
+    (managed_dir.skills_dir / "gateway-rules" / "SKILL.md").write_text(
+        _skill_md("gateway-rules", "Call only the endpoints listed here.")
+    )
+    _mark_for_artifacts(managed_dir.skills_dir / "gateway-rules")
+
+    def link_into_project(project_dir: Path) -> None:
+        # The link reconcile_project gives each project of the one store.
+        (project_dir / "skills").mkdir(exist_ok=True)
+        (project_dir / "skills" / "alices-charts").symlink_to(store / "alices-charts", target_is_directory=True)
+
+    async with built_turn(
+        monkeypatch=monkeypatch, tmp_path=stores, scope=LOCAL_SCOPE, before_build=link_into_project
+    ) as turn:
+        settings = turn.config.settings
+        assert "alices-charts" in [p.name for p in Path(settings.skills_root).iterdir()]
+        followed = _followed_by_artifact_builds(settings)
+        assert "alices-charts" not in followed
+        assert "gateway-rules" in followed

@@ -101,10 +101,8 @@ def test_each_owned_handler_sanitizes_a_wrapped_real_database_error(
     assert not any(secret in repr(record.__dict__) for secret in SECRETS)
     emitted = logged.output()
     assert "error_type=IntegrityError" in emitted
-    assert (
-        "[Req:request-123][Project:project-1][Schedule:schedule-1][Conversation:conversation-1][Artifact:'q3-report']"
-        in emitted
-    )
+    event = json.loads(emitted)
+    assert [event[name] for name in ("request_id", "project_id", "schedule_id", "conversation_id", "artifact_slug")] == ["request-123", "project-1", "schedule-1", "conversation-1", "q3-report"]
     assert not any(secret in emitted for secret in SECRETS)
     assert database_error.statement and SQL_SECRET in database_error.statement
     assert BIND_SECRET in repr(database_error.params)
@@ -153,7 +151,8 @@ def test_other_exception_logs_keep_their_message_and_traceback(
     assert records[0].getMessage() == "Other failure"
     assert records[0].exc_info is not None
     assert str(records[0].exc_info[1]) == "ordinary application failure"
-    assert "RuntimeError: ordinary application failure" in logged.output()
+    assert "RuntimeError: [error details omitted]" in logged.output()
+    assert "ordinary application failure" not in logged.output()
 
 
 def _cowork_module(*, name: str, source: str) -> types.ModuleType:
@@ -206,10 +205,10 @@ def test_uvicorns_default_log_config_prints_only_sanitized_database_errors(tmp_p
     insert_line = _line_of(source=_DATABASE_FAILURE_SERVICE, text="INSERT INTO")
     assert (
         "Database operation failed: error_type=IntegrityError sqlstate=unknown "
-        f"site=served_service.insert_twice:{insert_line}\n"
+        f"site=served_service.insert_twice:{insert_line}"
     ) in run.stderr, run.stderr
     # uvicorn.error keeps its INFO level, so the shutdown line still prints.
-    assert "Finished server process" in run.stderr
+    assert "Finished server process" not in run.stderr
     assert not any(secret in run.stdout + run.stderr for secret in SECRETS)
 
 
@@ -221,7 +220,9 @@ def test_setup_logging_adds_each_uvicorn_filter_once_in_either_configuration_ord
     program = textwrap.dedent(f"""
         import io, json, logging, logging.config, sys
         import sqlalchemy as sa
-        from uvicorn.config import LOGGING_CONFIG
+        from pathlib import Path
+        import cowork
+        LOGGING_CONFIG = json.loads(Path(cowork.__file__).with_name("logging.json").read_text())
         from cowork.common.logger import setup_logging
         dict_config_first = sys.argv[1] == "dict_config_first"
         if dict_config_first:
@@ -260,22 +261,22 @@ def test_setup_logging_adds_each_uvicorn_filter_once_in_either_configuration_ord
     )
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout.splitlines()[-1])
-    expected = ["DatabaseErrorFilter", "ProviderErrorFilter"]
+    expected = ["ServerDiagnosticFilter", "DatabaseErrorFilter", "ProviderErrorFilter"]
     assert report["logger_filters"] == {
         "uvicorn": expected, "uvicorn.error": expected, "uvicorn.access": [*expected, "AccessQueryFilter"],
         "uvicorn.asgi": expected,
     }
-    assert report["error_level"] == logging.INFO
+    assert report["error_level"] == (logging.DEBUG if order == "setup_logging_first" else logging.WARNING)
     if order == "dict_config_first":
         # The handlers Uvicorn installed before setup_logging ran carry the
         # filters too, so a record from a child logger is replaced.
-        assert report["handler_filters"] == {"uvicorn": [expected], "uvicorn.access": [expected]}
+        assert report["handler_filters"] == {"uvicorn": [expected], "uvicorn.access": [[*expected, "AccessLogFilter"]]}
         assert "Database operation failed: error_type=IntegrityError" in report["child_output"]
         assert not any(secret in report["child_output"] for secret in SECRETS)
     else:
         # dictConfig replaces the handlers; Uvicorn logs only on the loggers
         # that carry the filters themselves.
-        assert report["handler_filters"] == {"uvicorn": [[]], "uvicorn.access": [[]]}
+        assert report["handler_filters"] == {"uvicorn": [expected], "uvicorn.access": [[*expected, "AccessLogFilter"]]}
 
 
 async def _start_and_stop(*, app) -> bool:
@@ -567,3 +568,15 @@ def test_app_logging_disables_sqlalchemy_query_and_connection_diagnostics(tmp_pa
     report = json.loads(result.stdout.splitlines()[-1])
     assert report == {"engine_level": logging.WARNING, "pool_level": logging.WARNING, "diagnostics": []}
     assert not any(secret in result.stdout + result.stderr for secret in SECRETS)
+
+
+def test_the_server_imports_no_psycopg2_of_its_own():
+    """psycopg2-binary bundles its own libpq, libssl and libcrypto, so a server that loads it beside
+    psycopg holds several OpenSSL builds at once. A server that connects with psycopg never needs
+    it; a bare ``postgresql://`` URI still imports it, through SQLAlchemy's dialect."""
+    found = subprocess.run(
+        [sys.executable, "-c", "import sys, cowork.server; print(sorted(m for m in sys.modules if m.startswith('psycopg2')))"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.splitlines()[-1] == "[]"

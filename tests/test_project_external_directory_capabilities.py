@@ -6,6 +6,7 @@ with an internal message. The same flag tells the delete confirmation that the
 folder is kept.
 """
 from __future__ import annotations
+import json
 
 import logging
 from pathlib import Path
@@ -211,7 +212,7 @@ def test_a_failed_rename_restore_names_the_project_on_its_log_lines(
         "Could not fully restore the project after rename staging failed",
     ]
     assert [r.project_id for r in records] == [str(project_id)] * 2
-    assert logged.output().count(f"[Project:{project_id}]: ") == 2
+    assert sum(json.loads(line).get("project_id") == str(project_id) for line in logged.output().splitlines()) == 2
 
 
 def test_a_failed_commit_restore_logs_the_project_without_querying_the_database(
@@ -261,7 +262,7 @@ def test_a_failed_commit_restore_logs_the_project_without_querying_the_database(
     assert [r.funcName for r in records] == ["rollback_project_rename", "_commit_staged_project_update"]
     assert [r.project_id for r in records] == [str(project_id)] * 2
     output = logged.output()
-    assert output.count(f"[Project:{project_id}]: Database operation failed") == 2
+    assert sum(json.loads(line).get("project_id") == str(project_id) and json.loads(line).get("error_type") == "OperationalError" for line in output.splitlines()) == 2
     assert DRIVER_TEXT not in output
 
 

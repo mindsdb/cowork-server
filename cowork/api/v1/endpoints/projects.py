@@ -37,6 +37,7 @@ from cowork.services.shared_resources import (
     project_resource_key,
 )
 from cowork.services.skills import SkillService
+from cowork.services.shared_projects import SharedProjectFiles
 
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -249,7 +250,8 @@ def list_projects(
     # the first listing (no-op in local mode / once claimed).
     service.ensure_general_for_scope()
     access = SharedResourceAccess(session, principal)
-    return [_project_response(project, access) for project in service.list_projects()]
+    owned = [_project_response(project, access) for project in service.list_projects()]
+    return [*owned, *SharedProjectFiles(session).list_projects()]
 
 
 def require_local_for_chosen_folder(

@@ -211,7 +211,8 @@ def test_a_5xx_http_exception_logs_its_status_and_cause_but_not_its_detail(
     else:
         assert record.getMessage() == "Session error: error_type=HTTPException status=500 cause=OSError"
         assert isinstance(record.exc_info[1], OSError) and record.exc_info[1] is exc.__context__
-        assert "OSError: [Errno 28] No space left on device" in logged.output()
+        assert "OSError: [error details omitted]" in logged.output()
+        assert "No space left on device" not in logged.output()
     assert not any(secret in logged.output() for secret in SECRETS)
     assert not any(secret in repr(record.__dict__) for secret in SECRETS)
 

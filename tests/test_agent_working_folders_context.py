@@ -145,9 +145,8 @@ async def _suffix(monkeypatch, conversation_id, channel_context=None) -> str:
     conversation = await run_db(
         partial(_conversation_for_harness, conversation_id=conversation_id), scope=LOCAL_SCOPE,
     )
-    config, _, _ = await harness.AntonHarness()._build_chat_session(
-        conversation, channel_context=channel_context
-    )
+    built = await harness.AntonHarness()._build_chat_session(conversation, channel_context=channel_context)
+    config = built.session
     return config.system_prompt_context.suffix
 
 
