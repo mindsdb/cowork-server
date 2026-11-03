@@ -802,7 +802,7 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
 
     import cowork.scheduler as scheduler_mod
 
-    monkeypatch.setattr(scheduler_mod, "_MAX_RUN_DURATION_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler_mod, "_run_duration_limit", lambda: 0.01)
 
     async def _hangs():
         await asyncio.sleep(5)
@@ -1400,21 +1400,25 @@ def test_reap_orphaned_runs_started_before_leaves_younger_runs():
 def test_boot_reap_cutoff_reaps_everything_only_on_the_desktop(monkeypatch):
     from types import SimpleNamespace
 
-    from cowork.scheduler import _ORPHANED_RUN_AGE_SECONDS, boot_reap_cutoff
+    from cowork.scheduler import boot_reap_cutoff
 
     now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
 
-    def _tenancy(mode):
+    def _tenancy(mode, run_limit=1800):
         monkeypatch.setattr(
-            "cowork.common.settings.app_settings.get_app_settings", lambda: SimpleNamespace(tenancy_mode=mode),
+            "cowork.common.settings.app_settings.get_app_settings",
+            lambda: SimpleNamespace(tenancy_mode=mode, scheduled_run_max_seconds=run_limit),
         )
 
     _tenancy("local")
     assert boot_reap_cutoff(now=now) is None
-    # A replica booting next to one mid-run must leave that run alone.
+    # A replica booting next to one mid-run must leave that run alone: the
+    # cutoff sits past the run's time limit and both of its last writes.
     _tenancy("org")
-    assert boot_reap_cutoff(now=now) == now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
-    assert _ORPHANED_RUN_AGE_SECONDS > 600
+    assert boot_reap_cutoff(now=now) == now - timedelta(seconds=1800 + 2 * 600 + 600)
+    # A deployment that lets runs go longer reaps them later too.
+    _tenancy("org", run_limit=7200)
+    assert boot_reap_cutoff(now=now) == now - timedelta(seconds=7200 + 2 * 600 + 600)
 
 
 def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):

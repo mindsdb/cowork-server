@@ -125,20 +125,27 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     from cowork.scheduler import (
         abandon_manual_run,
         claim_manual_run,
+        org_runs_full,
         release_run_place,
         reserve_run_place,
         run_admitted,
         schedule_conversation_topic,
     )
     from cowork.services.conversations import ConversationService
-    from cowork.services.schedules import ScheduleBusy
+    from cowork.services.schedules import OrgRunsAtLimit, ScheduleBusy
 
     already_running = HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This task is already running.")
+    org_full = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Your organization has too many scheduled tasks running right now. Try again in a few minutes.",
+    )
 
     # Refused with a reason rather than queued: the user is watching and can
     # press Run again.
     if ScheduleRunService(scoped).has_active_run(schedule_id):
         raise already_running
+    if org_runs_full(scoped, schedule):
+        raise org_full
     if not reserve_run_place():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -152,6 +159,11 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ScheduleBusy:
         release_run_place()
         raise already_running
+    except OrgRunsAtLimit:
+        # Counted in the claim's transaction, under the organization's lock, so
+        # two presses can't both take its last place.
+        release_run_place()
+        raise org_full
     except BaseException:
         release_run_place()
         raise
