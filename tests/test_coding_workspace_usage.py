@@ -33,6 +33,21 @@ def test_a_tree_is_measured_without_following_links_or_counting_hard_links_twice
     assert 64 * 1024 <= measured < 1024 * 1024
 
 
+def test_a_symlinked_task_root_is_not_followed(tmp_path: Path) -> None:
+    workspaces = tmp_path / "workspaces"
+    workspaces.mkdir()
+    outside = tmp_path / "checkout"
+    write(outside / "big.bin", 1024 * 1024)
+    (workspaces / "task-1").symlink_to(outside, target_is_directory=True)
+    usage = WorkspaceUsage(lambda: roots(workspaces), lambda: ["task-1"])
+
+    page = usage.measure()
+
+    assert tree_bytes(workspaces / "task-1") == 0
+    assert page.items[0].bytes == 0
+    assert page.total_bytes == 0
+
+
 def roots(*workspace: Path, recovery: tuple[Path, ...] = ()) -> UsageRoots:
     return UsageRoots(workspace=tuple(workspace), recovery=recovery)
 
@@ -119,6 +134,65 @@ def test_a_task_missing_from_the_last_measurement_is_measured_again(tmp_path: Pa
     if thread is not None:
         thread.join(timeout=3)
     assert {item.session_id for item in usage.snapshot("task-2").items} == {"task-1", "task-2"}
+
+
+def join_measurement(usage: WorkspaceUsage) -> None:
+    thread = usage._thread
+    if thread is not None:
+        thread.join(timeout=3)
+
+
+def test_a_task_measured_while_preparing_is_measured_again_once_ready(tmp_path: Path) -> None:
+    workspaces = tmp_path / "workspaces"
+    usage = WorkspaceUsage(lambda: roots(workspaces), lambda: ["task-1"], max_age=timedelta(hours=1))
+    assert usage.measure().items[0].bytes == 0  # the workspace is not written yet
+    write(workspaces / "task-1" / "file", 1024 * 1024)
+    assert not usage.snapshot("task-1").measuring
+
+    usage.invalidate()
+
+    assert usage.snapshot("task-1").measuring
+    join_measurement(usage)
+    settled = usage.snapshot("task-1")
+    assert not settled.measuring
+    assert settled.items[0].bytes >= 1024 * 1024
+
+
+def test_a_measurement_that_overlaps_an_invalidation_is_not_trusted(tmp_path: Path) -> None:
+    started, release = threading.Event(), threading.Event()
+
+    def slow_ids():
+        started.set()
+        assert release.wait(timeout=3)
+        return ["task-1"]
+
+    usage = WorkspaceUsage(lambda: roots(tmp_path), slow_ids, max_age=timedelta(hours=1))
+    usage.snapshot()
+    assert started.wait(timeout=3)
+    usage.invalidate()  # the workspace became ready mid-measurement
+    release.set()
+    join_measurement(usage)
+
+    assert usage.snapshot().measuring
+    join_measurement(usage)
+
+
+def test_preparing_a_task_invalidates_the_last_measurement(tmp_path: Path) -> None:
+    folder = tmp_path / "notes"
+    write(folder / "big.bin", 300_000)
+    service = service_with(tmp_path, FakeEngine())
+    service.workspace_usage.measure()
+
+    wait_for_status(
+        service,
+        service.create_session(
+            SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+        ).id,
+        SessionStatus.completed,
+    )
+
+    usage = service.workspace_usage
+    assert usage._measured_generation != usage._generation
 
 
 def test_the_service_reports_a_worktree_task_and_the_total(tmp_path: Path) -> None:

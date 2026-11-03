@@ -2,7 +2,7 @@
 
 Walking large trees is slow, so a measurement runs on its own thread and the
 last result is served from memory. Asking for usage starts a new measurement
-once the last one is older than ``max_age``.
+once the last one is older than ``max_age``, or after ``invalidate``.
 
 What is counted: each ``<task>`` folder under the workspace roots (worktrees,
 folder copies and their baselines) and the recovery roots (snapshots, saved
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import threading
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
@@ -50,6 +51,16 @@ class WorkspaceUsage:
         self._removed_task_bytes = 0
         self._measured_at: datetime | None = None
         self._thread: threading.Thread | None = None
+        # Bumped by ``invalidate``. A measurement started before the latest
+        # bump is already out of date when it finishes.
+        self._generation = 0
+        self._measured_generation = 0
+
+    def invalidate(self) -> None:
+        """Mark the last measurement out of date, such as when a task's
+        workspace finishes preparing. The next ``snapshot`` measures again."""
+        with self._lock:
+            self._generation += 1
 
     def snapshot(self, session_id: str | None = None) -> WorkspaceUsagePage:
         """The last measurement, starting a new one in the background if it is stale.
@@ -58,7 +69,11 @@ class WorkspaceUsage:
         before that task was created, counts as stale.
         """
         with self._lock:
-            stale = self._measured_at is None or utc_now() - self._measured_at > self._max_age
+            stale = (
+                self._measured_at is None
+                or utc_now() - self._measured_at > self._max_age
+                or self._measured_generation != self._generation
+            )
             if session_id is not None and all(item.session_id != session_id for item in self._items):
                 stale = True
             if stale and self._thread is None:
@@ -68,6 +83,8 @@ class WorkspaceUsage:
 
     def measure(self) -> WorkspaceUsagePage:
         """Measure now, on the calling thread."""
+        with self._lock:
+            generation = self._generation
         roots = self._roots()
         items: list[WorkspaceUsageItem] = []
         owned: set[str] = set()
@@ -89,6 +106,7 @@ class WorkspaceUsage:
             self._items = items
             self._removed_task_bytes = removed
             self._measured_at = utc_now()
+            self._measured_generation = generation
             return self._page()
 
     def _measure_in_background(self) -> None:
@@ -127,6 +145,12 @@ def _unowned_bytes(root: Path, owned: set[str]) -> int:
 def tree_bytes(root: Path, seen: set[tuple[int, int]] | None = None) -> int:
     """Disk allocated under ``root``, without following links or counting a hard link twice."""
     seen = set() if seen is None else seen
+    # ``os.scandir`` follows a symlinked root, so check the root itself first.
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return 0
+    except OSError:
+        return 0
     total = 0
     pending = [str(root)]
     while pending:
