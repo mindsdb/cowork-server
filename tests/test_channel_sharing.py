@@ -20,7 +20,7 @@ from cowork.channels.plugins.slack import SlackBridge
 from cowork.channels.plugins.telegram import TelegramBridge
 from cowork.channels.plugins.whatsapp import WhatsAppBridge
 from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
-from cowork.channels.sharing import is_shared
+from cowork.channels.sharing import is_shared, shared_state
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_for_org
 from cowork.models.channel import ChannelBinding
@@ -130,11 +130,11 @@ def db(monkeypatch):
     get_app_settings.cache_clear()
 
 
-def _route(engine, conversation_id=None) -> UUID:
+def _route(engine, conversation_id=None, channel_type: str = "discord") -> UUID:
     """A route as it may exist from before pinning was refused: written raw."""
     with Session(engine) as session:
         binding = ChannelBinding(
-            channel_type="discord", external_group_id=f"chan-{uuid4().hex[:6]}", external_thread_key="__default__",
+            channel_type=channel_type, external_group_id=f"chan-{uuid4().hex[:6]}", external_thread_key="__default__",
             org_id=ORG, anton_conversation_id=conversation_id,
         )
         session.add(binding)
@@ -151,7 +151,7 @@ def _serve(engine, runtime, binding_id, *, guild_id) -> UUID:
     with Session(engine) as session:
         scoped = ScopedSession(session, scope_for_org(ORG))
         binding = scoped.get(ChannelBinding, binding_id)
-        return runtime._ensure_conversation(scoped, binding, shared=is_shared(event)).id
+        return runtime._ensure_conversation(scoped, binding, shared=shared_state(event)).id
 
 
 def _conversation(engine, conversation_id) -> Conversation:
@@ -237,6 +237,66 @@ def test_desktop_keeps_reusing_a_pinned_conversation(db, monkeypatch):
         served = runtime._ensure_conversation(scoped, scoped.get(ChannelBinding, binding_id), shared=is_shared(event))
 
     assert served.id == local_id
+
+
+def test_a_slack_mention_in_a_g_channel_is_unknown_not_a_dm():
+    event = SlackBridge({"signing_secret": "s", "bot_token": "x"})._normalize_event(
+        {"type": "app_mention", "channel": "G3", "user": "U1", "text": "hi", "ts": "1700000000.0001"}
+    )
+
+    assert shared_state(event) is None
+    assert is_shared(event) is False
+
+
+def _slack(event: dict):
+    return SlackBridge({"signing_secret": "s", "bot_token": "x"})._normalize_event(
+        {"user": "U1", "text": "hi", "ts": uuid4().hex, **event}
+    )
+
+
+def _serve_event(engine, runtime, binding_id, event) -> UUID:
+    with Session(engine) as session:
+        scoped = ScopedSession(session, scope_for_org(ORG))
+        binding = scoped.get(ChannelBinding, binding_id)
+        return runtime._ensure_conversation(scoped, binding, shared=shared_state(event)).id
+
+
+def test_a_slack_private_channel_keeps_one_conversation_across_message_and_mention(db):
+    # One @-mention in a private channel arrives as a `message` (channel_type
+    # "group") and an `app_mention` (no channel_type); both must keep using the
+    # route's one marked conversation, not flip it on every event.
+    engine, runtime, _ = db
+    route = _route(engine, channel_type="slack")
+    served = {
+        _serve_event(engine, runtime, route, _slack({"type": kind, "channel": "G7", **extra}))
+        for kind, extra in [("message", {"channel_type": "group"}), ("app_mention", {})] * 2
+    }
+
+    assert len(served) == 1
+    assert _conversation(engine, served.pop()).channel_type == "slack"
+
+
+def test_an_unknown_first_message_starts_an_unmarked_conversation(db):
+    engine, runtime, _ = db
+    route = _route(engine, channel_type="slack")
+
+    served = _serve_event(engine, runtime, route, _slack({"type": "app_mention", "channel": "G8"}))
+
+    assert _conversation(engine, served).channel_type is None
+
+
+def test_a_dm_route_never_reuses_another_routes_conversation(db):
+    # A route pinned (before pinning was refused) to another DM route's
+    # conversation would mix two people's DMs; it gets its own instead.
+    engine, runtime, _ = db
+    first = _route(engine)
+    shared_dm = _serve(engine, runtime, first, guild_id=None)
+    second = _route(engine, conversation_id=shared_dm)
+
+    served = _serve(engine, runtime, second, guild_id=None)
+
+    assert served != shared_dm
+    assert _serve(engine, runtime, first, guild_id=None) == shared_dm
 
 
 def test_an_event_no_adapter_placed_is_not_shared():
