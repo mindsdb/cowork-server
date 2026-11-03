@@ -1,7 +1,7 @@
 """Org admins reading channel conversations: the ones the channel runtime
 created for a route, which have no owner and so no `/conversations` access.
 
-Read only. Posting, renaming and moving stay on the owner-only
+Read and delete only. Posting, renaming and moving stay on the owner-only
 `/conversations` routes, which never admit these rows. Org mode only: outside
 it the admin check admits everyone, so every route here answers 404.
 """
@@ -78,3 +78,10 @@ def get_channel_conversation_items(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return page.model_dump(by_alias=True)
+
+
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_channel_conversation(conversation_id: UUID, scoped: ScopedSessionDep) -> None:
+    """Delete a channel conversation; its route stays and starts a new one on the next message."""
+    if not ConversationService(scoped).delete_channel_conversation(conversation_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")

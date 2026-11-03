@@ -563,6 +563,15 @@ class ConversationService:
             self._channel_conversations().where(Conversation.id == conversation_id)
         ).first()
 
+    def delete_channel_conversation(self, conversation_id: UUID) -> bool:
+        """Delete a channel conversation the way an owner deletes their own:
+        its messages go, its route is kept and unpinned. False if it is not
+        a channel conversation in this org."""
+        conversation = self.channel_conversation(conversation_id)
+        if conversation is None:
+            return False
+        return self._delete_conversation(conversation)
+
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)
         if conversation is None:

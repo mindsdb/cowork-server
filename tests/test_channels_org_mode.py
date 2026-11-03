@@ -582,6 +582,13 @@ def test_only_marked_ownerless_conversations_are_channel_conversations(client, t
         for cid in (own.json()["id"], str(unmarked_id)):
             assert cid not in listed
             assert client.get(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
+            assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
+        session = get_open_session()
+        try:
+            assert session.get(Conversation, UUID(own.json()["id"])) is not None
+            assert session.get(Conversation, unmarked_id) is not None
+        finally:
+            session.close()
     finally:
         session = get_open_session()
         try:
@@ -618,6 +625,36 @@ def test_channel_conversation_routes_do_not_exist_outside_org_mode(client, chann
         cid = str(channel_conversation)
         for path in ("/", f"/{cid}", f"/{cid}/items"):
             assert client.get(f"/api/v1/channel-conversations{path}", headers=OWNER_A_ADMIN).status_code == 404
+        assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
     finally:
         monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
         get_app_settings.cache_clear()
+    assert _runtime_view_of_messages(channel_conversation), "the conversation must survive outside org mode"
+
+
+def test_org_admin_deletes_a_channel_conversation(client, channel_conversation, enforced_foreign_keys):
+    cid = str(channel_conversation)
+    session = get_open_session()
+    try:
+        binding_id = session.exec(
+            select(ChannelBinding.id).where(ChannelBinding.anton_conversation_id == channel_conversation)
+        ).one()
+    finally:
+        session.close()
+
+    assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=A).status_code == 403
+    assert client.delete(f"/api/v1/channel-conversations/{cid}", headers=B_ADMIN).status_code == 404
+
+    deleted = client.delete(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN)
+    assert deleted.status_code == 204, deleted.text
+
+    session = get_open_session()
+    try:
+        assert session.get(Conversation, channel_conversation) is None
+        assert not session.exec(select(Message).where(Message.conversation_id == channel_conversation)).all()
+        binding = session.get(ChannelBinding, binding_id)
+        assert binding is not None and binding.anton_conversation_id is None
+        assert not session.exec(select(ChannelSession).where(ChannelSession.binding_id == binding_id)).all()
+    finally:
+        session.close()
+    assert client.get(f"/api/v1/channel-conversations/{cid}", headers=OWNER_A_ADMIN).status_code == 404
