@@ -17,12 +17,23 @@ from typing import Any
 _ATTRIBUTE = "_shared"
 
 
-def mark_shared(event: Any, shared: bool) -> Any:
-    """Record on `event` whether it came from a shared channel; returns `event`."""
-    setattr(event, _ATTRIBUTE, bool(shared))
+def mark_shared(event: Any, shared: bool | None) -> Any:
+    """Record on `event` whether it came from a shared channel: True, False,
+    or None when the platform did not say (a Slack mention in a G channel,
+    which may be a private channel or a group DM). Returns `event`."""
+    setattr(event, _ATTRIBUTE, shared if shared is None else bool(shared))
     return event
+
+
+def shared_state(event: Any) -> bool | None:
+    """True or False as the adapter placed `event`, None when it could not
+    tell. An event no adapter placed reads False, never None."""
+    value = getattr(event, _ATTRIBUTE, False)
+    if value is None:
+        return None
+    return value is True
 
 
 def is_shared(event: Any) -> bool:
     """True only when an adapter placed `event` as coming from a shared channel."""
-    return getattr(event, _ATTRIBUTE, False) is True
+    return shared_state(event) is True
