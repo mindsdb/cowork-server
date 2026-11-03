@@ -322,7 +322,7 @@ class AntonChannelRuntime:
             # 1s slack for filesystem timestamp granularity.
             turn_started = time.time() - 1
             try:
-                conversation = self._ensure_conversation(scoped, binding)
+                conversation = self._ensure_conversation(scoped, binding, shared=bool(event.message.is_group))
                 self._touch_channel_session(scoped, binding, conversation, event)
                 channel_context = ChannelContext(
                     channel_type=channel_type,
@@ -428,7 +428,13 @@ class AntonChannelRuntime:
                 return False
         return True
 
-    def _ensure_conversation(self, scoped: ScopedSession, binding: ChannelBinding) -> Conversation:
+    def _ensure_conversation(self, scoped: ScopedSession, binding: ChannelBinding, *, shared: bool) -> Conversation:
+        """The route's conversation, created on its first message if it has none.
+
+        Only a conversation from a shared channel (`shared`) is marked with its
+        channel type, which is what makes it readable to org admins; a direct
+        message to the bot stays unmarked and so readable by nobody in the app.
+        """
         if binding.anton_conversation_id is not None:
             existing = scoped.get(Conversation, binding.anton_conversation_id)
             if existing is not None:
@@ -437,7 +443,7 @@ class AntonChannelRuntime:
         conversation = ConversationService(scoped).create_conversation(
             topic=topic,
             project_id=binding.anton_project_id or self._resolve_default_project_id(scoped),
-            channel_type=binding.channel_type,
+            channel_type=binding.channel_type if shared else None,
         )
         binding.anton_conversation_id = conversation.id
         scoped.add(binding)
