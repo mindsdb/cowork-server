@@ -426,17 +426,18 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
 
 def _create_run(
     session: ScopedSession, *, schedule_id: UUID, is_manual: bool, slot_at: datetime | None,
+    trial: bool = False,
 ) -> UUID:
     # A cron run waits for its organization's place, counted in the insert's
     # transaction so replicas can't overshoot together. Run now is checked by
     # its request instead (org_runs_full), and refused with a reason.
     return ScheduleRunService(session).create_run(
         schedule_id, is_manual=is_manual, slot_at=slot_at, lease_seconds=_RUN_LEASE_SECONDS,
-        org_limit=None if is_manual else _org_run_limit(),
+        org_limit=None if is_manual else _org_run_limit(), trial=trial,
     ).id
 
 
-def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID:
+def claim_manual_run(session: ScopedSession, schedule_id: UUID, *, trial: bool = False) -> UUID:
     """Insert a Run now's run row, leased, before the request answers. Raises
     ScheduleBusy when the schedule already has a run going, so two presses,
     or a press racing a cron claim, start one run. The run is then executed
@@ -445,7 +446,7 @@ def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID:
     organization is at its limit, counted in the same transaction."""
     return ScheduleRunService(session).create_run(
         schedule_id, is_manual=True, lease_seconds=_RUN_LEASE_SECONDS,
-        org_limit=_org_run_limit(),
+        org_limit=_org_run_limit(), trial=trial,
     ).id
 
 
@@ -572,6 +573,7 @@ def _delete_unstarted_conversation(
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, end: _AttemptEnd, is_manual: bool, conversation_id: UUID,
     shutdown_interrupted: bool = False,
+    trial: bool = False,
 ) -> _RunOutcome:
     schedule_service = ScheduleService(session)
     run_service = ScheduleRunService(session)
@@ -603,6 +605,10 @@ def _record_turn_outcome(
             _advance_next_run_at(schedule, session)
             if outcome.status == RunStatus.failed and end.outcome != AttemptOutcome.uncertain and not shutdown_interrupted:
                 count_settled_slot(session, schedule_id, failed=True)
+        if trial:
+            # A trial tries the task out: it leaves the streak and a one-off's
+            # own time as they were.
+            return
         if outcome.status is None:
             # A success of either kind ends the failure streak.
             count_settled_slot(session, schedule_id, failed=False)
@@ -693,6 +699,7 @@ async def execute_schedule(
     *,
     slot_at: datetime | None = None,
     run_id: UUID | None = None,
+    trial: bool = False,
 ) -> None:
     """Run one schedule's turn and record how it went.
 
@@ -711,6 +718,10 @@ async def execute_schedule(
 
     A Run now passes the ``run_id`` its request already claimed
     (claim_manual_run), so the press and its run are one claim.
+
+    A ``trial`` run is a run-now that tries the task out. It doesn't use a
+    one-off up, and neither the freshness guard nor the failure streak counts
+    it.
     """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
@@ -718,7 +729,10 @@ async def execute_schedule(
 
     try:
         run_id = run_id or await run_db(
-            partial(_create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at),
+            partial(
+                _create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at,
+                trial=trial and is_manual,
+            ),
             scope=SYSTEM_SCOPE,
         )
     except PoolTimeoutError:
@@ -864,7 +878,7 @@ async def execute_schedule(
             partial(
                 _record_turn_outcome, schedule_id=schedule_id, end=end,
                 shutdown_interrupted=evidence.shutdown_interrupted,
-                is_manual=is_manual, conversation_id=conversation_id,
+                is_manual=is_manual, conversation_id=conversation_id, trial=trial and is_manual,
             ),
             schedule_id=schedule_id,
         )

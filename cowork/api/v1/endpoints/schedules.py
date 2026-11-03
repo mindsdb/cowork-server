@@ -116,7 +116,12 @@ def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 
 
 @router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED)
-def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks):
+def run_schedule_now(
+    schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks, trial: bool = False,
+):
+    """Start a run now. ``trial=true`` tries the task out: the run leaves a
+    one-off scheduled for its own time, and neither the freshness guard nor
+    the failure streak counts it."""
     try:
         schedule = ScheduleService(scoped).get_schedule(schedule_id)
     except ValueError as e:
@@ -155,7 +160,7 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     # presses at once, or a press racing a cron claim, start one run (the
     # schedule allows one `running` run).
     try:
-        run_id = claim_manual_run(scoped, schedule_id)
+        run_id = claim_manual_run(scoped, schedule_id, trial=trial)
     except ScheduleBusy:
         release_run_place()
         raise already_running
@@ -190,7 +195,7 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
 
     background_tasks.add_task(
         run_admitted, schedule_id, is_manual=True,
-        conversation_id=conversation.id, run_id=run_id,
+        conversation_id=conversation.id, run_id=run_id, trial=trial,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
 

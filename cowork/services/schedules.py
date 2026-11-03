@@ -375,6 +375,7 @@ class ScheduleRunService:
         slot_at: datetime | None = None,
         lease_seconds: float | None = None,
         org_limit: int | None = None,
+        trial: bool = False,
     ) -> ScheduleRun:
         """Insert the run. With ``org_limit``, raises OrgRunsAtLimit instead when
         the schedule's organization already has that many runs going; counted
@@ -398,6 +399,7 @@ class ScheduleRunService:
             started_at=now,
             status=RunStatus.running,
             is_manual=is_manual,
+            trial=trial,
             slot_at=slot_at,
             lease_expires_at=now + timedelta(seconds=lease_seconds) if lease_seconds is not None else None,
         )
@@ -478,12 +480,15 @@ class ScheduleRunService:
     def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
         """When the schedule's most recent successful run (manual or cron)
         finished, or None if it never succeeded. Used by the scheduler's
-        freshness guard to skip a due slot right after e.g. a manual run.
+        freshness guard to skip a due slot right after e.g. a manual run. A
+        trial run doesn't count: it tries the task out, so the slot after it
+        still runs.
         """
         run = self.session.exec(
             self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.success)
+            .where(ScheduleRun.trial.is_(False))  # type: ignore[attr-defined]
             .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
             .limit(1)
         ).first()

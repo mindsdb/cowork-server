@@ -185,6 +185,8 @@ class ScheduleRunResponse(CamelResponse):
     error: str | None
     conversation_id: UUID | None
     is_manual: bool
+    # A run-now that tried the task out (POST .../run-now?trial=true).
+    trial: bool = False
     outcome: AttemptOutcome | None = None
     created_at: datetime | None
 
