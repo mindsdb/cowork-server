@@ -205,6 +205,31 @@ def test_a_dm_never_lands_in_a_members_own_conversation(db):
     assert _conversation(engine, served).created_by is None
 
 
+def test_a_dm_never_joins_its_own_routes_marked_conversation(db):
+    # One route, no second route involved: only the mark check stands between
+    # a DM and the conversation admins read.
+    engine, runtime, _ = db
+    route = _route(engine)
+    marked = _serve(engine, runtime, route, guild_id="g1")
+
+    served = _serve(engine, runtime, route, guild_id=None)
+
+    assert served != marked
+    assert _conversation(engine, served).channel_type is None
+
+
+def test_a_slack_group_dm_keeps_one_conversation_across_message_and_mention(db):
+    engine, runtime, _ = db
+    route = _route(engine, channel_type="slack")
+    served = {
+        _serve_event(engine, runtime, route, _slack({"type": kind, "channel": "G9", **extra}))
+        for kind, extra in [("message", {"channel_type": "mpim"}), ("app_mention", {})] * 2
+    }
+
+    assert len(served) == 1
+    assert _conversation(engine, served.pop()).channel_type is None
+
+
 def test_a_routes_own_conversation_is_reused(db):
     engine, runtime, _ = db
     route = _route(engine)
