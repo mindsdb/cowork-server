@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.channels.plugins.discord import DiscordBridge
 from cowork.channels.plugins.slack import SlackBridge
@@ -23,7 +23,7 @@ from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
 from cowork.channels.sharing import is_shared, shared_state
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_for_org
-from cowork.models.channel import ChannelBinding
+from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.services.conversations import ConversationService
@@ -255,10 +255,49 @@ def _slack(event: dict):
 
 
 def _serve_event(engine, runtime, binding_id, event) -> UUID:
+    """The runtime's bookkeeping for one inbound event: its conversation, then its session row."""
     with Session(engine) as session:
         scoped = ScopedSession(session, scope_for_org(ORG))
         binding = scoped.get(ChannelBinding, binding_id)
-        return runtime._ensure_conversation(scoped, binding, shared=shared_state(event)).id
+        conversation = runtime._ensure_conversation(scoped, binding, shared=shared_state(event))
+        runtime._touch_channel_session(scoped, binding, conversation, event)
+        return conversation.id
+
+
+def test_an_unknown_message_never_joins_a_marked_conversation_this_route_did_not_serve(db):
+    # A group DM route pinned (by an older server, mid-rollout) to a marked
+    # conversation: its unknown mention must not write group DM text there.
+    engine, runtime, _ = db
+    channel_route = _route(engine, channel_type="slack")
+    marked = _serve_event(engine, runtime, channel_route, _slack({"type": "message", "channel": "G1", "channel_type": "group"}))
+    with Session(engine) as session:
+        session.delete(session.get(ChannelBinding, channel_route))
+        session.commit()
+    dm_route = _route(engine, conversation_id=marked, channel_type="slack")
+
+    served = _serve_event(engine, runtime, dm_route, _slack({"type": "app_mention", "channel": "G2"}))
+
+    assert served != marked
+    assert _conversation(engine, served).channel_type is None
+
+
+def test_a_routes_session_names_the_conversation_it_last_served(db):
+    engine, runtime, project_id = db
+    with Session(engine) as session:
+        own = ConversationService(
+            ScopedSession(session, TenantScope(org_mode=True, org_id=ORG, user_id=MEMBER))
+        ).create_conversation(topic="mine", project_id=project_id)
+    route = _route(engine, conversation_id=own.id, channel_type="slack")
+    with Session(engine) as session:
+        session.add(ChannelSession(binding_id=route, external_session_key="__default__", anton_session_id=str(own.id)))
+        session.commit()
+
+    served = _serve_event(engine, runtime, route, _slack({"type": "message", "channel": "C1", "channel_type": "channel"}))
+
+    with Session(engine) as session:
+        sessions = session.exec(select(ChannelSession).where(ChannelSession.binding_id == route)).all()
+    assert served != own.id
+    assert [s.anton_session_id for s in sessions] == [str(served)]
 
 
 def test_a_slack_private_channel_keeps_one_conversation_across_message_and_mention(db):
