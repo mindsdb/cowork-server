@@ -343,3 +343,5 @@ def test_an_event_no_adapter_placed_is_not_shared():
     del event._shared
 
     assert is_shared(event) is False
+    # Not unknown either: only unknown may join a marked conversation.
+    assert shared_state(event) is False
