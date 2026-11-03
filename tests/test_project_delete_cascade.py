@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
@@ -27,6 +28,7 @@ from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.models.task_object import TaskObject
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
 from cowork.services.schedules import ScheduleRunService
+from tests.test_channel_binding_delete import postgres_engine  # noqa: F401  (fixture)
 
 
 def _fk_enforced_session() -> Session:
@@ -201,13 +203,7 @@ def test_delete_project_releases_a_channel_binding_without_deleting_it(
     assert survivor.external_group_id == "C123"
 
 
-def test_delete_project_drops_objects_a_moved_task_left_behind(tmp_path, monkeypatch):
-    """A task moved to another project without its objects keeps its
-    `task_objects` rows pointing at the old project. Those rows belong to a
-    conversation the project delete does not touch, and `task_objects.project_id`
-    has no `ondelete`, so the final `DELETE FROM projects` failed on Postgres."""
-    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
-    session = _fk_enforced_session()
+def _assert_delete_drops_objects_a_moved_task_left_behind(session: Session, tmp_path) -> None:
     scoped = ScopedSession(session, SYSTEM_SCOPE)
     project = _project(session, tmp_path, name="source")
     destination = _project(session, tmp_path, name="destination")
@@ -228,3 +224,22 @@ def test_delete_project_drops_objects_a_moved_task_left_behind(tmp_path, monkeyp
     assert session.get(Project, project.id) is None
     assert session.get(TaskObject, left_behind.id) is None
     assert session.get(Conversation, moved.id) is not None, "the moved task stays"
+
+
+def test_delete_project_drops_objects_a_moved_task_left_behind(tmp_path, monkeypatch):
+    """A task moved to another project without its objects keeps its
+    `task_objects` rows pointing at the old project. Those rows belong to a
+    conversation the project delete does not touch, and `task_objects.project_id`
+    has no `ondelete`, so the final `DELETE FROM projects` failed on Postgres."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    _assert_delete_drops_objects_a_moved_task_left_behind(_fk_enforced_session(), tmp_path)
+
+
+@pytest.mark.postgres_service
+def test_delete_project_drops_objects_a_moved_task_left_behind_on_postgres(
+    postgres_engine, tmp_path, monkeypatch  # noqa: F811
+):
+    """The same case against the migrated schema, where the bug was reported."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    with Session(postgres_engine) as session:
+        _assert_delete_drops_objects_a_moved_task_left_behind(session, tmp_path)
