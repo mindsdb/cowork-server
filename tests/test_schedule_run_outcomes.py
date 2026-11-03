@@ -33,7 +33,7 @@ SLOT = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0
 def _fresh_scheduler(monkeypatch):
     monkeypatch.setattr(scheduler, "_scheduler_task", None)
     monkeypatch.setattr(scheduler, "_scheduled_runs", set())
-    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._MAX_CONCURRENT_RUNS))
+    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._runs_per_process))
 
 
 def _make_schedule(*, cadence: str = "daily", next_run_at: datetime = SLOT) -> UUID:
@@ -321,7 +321,7 @@ async def test_due_slots_over_the_process_limit_stay_due_for_a_later_poll(monkey
     monkeypatch.setattr(scheduler, "_POLL_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(scheduler, "run_db", poll)
     monkeypatch.setattr(scheduler, "execute_schedule", execute_schedule)
-    for _ in range(scheduler._MAX_CONCURRENT_RUNS):
+    for _ in range(scheduler._runs_per_process()):
         assert scheduler.reserve_run_place()
 
     scheduler.start_scheduler()
@@ -341,7 +341,7 @@ async def test_due_slots_over_the_process_limit_stay_due_for_a_later_poll(monkey
 
 
 def test_a_run_place_is_given_back_when_its_run_ends():
-    admission = scheduler._Admission(1)
+    admission = scheduler._Admission(lambda: 1)
     assert admission.reserve()
     assert not admission.reserve()
     admission.release()
@@ -470,7 +470,7 @@ async def test_run_now_runs_the_run_its_request_claimed(schedule_id, turns):
 
 
 async def test_run_now_is_refused_when_the_process_is_at_its_limit(schedule_id):
-    for _ in range(scheduler._MAX_CONCURRENT_RUNS):
+    for _ in range(scheduler._runs_per_process()):
         assert scheduler.reserve_run_place()
 
     answer = await _run_now(schedule_id)

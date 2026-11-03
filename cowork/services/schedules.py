@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from datetime import timezone as timezone_
 from uuid import UUID
@@ -352,6 +353,16 @@ def _record_lost_run(run: ScheduleRun) -> None:
     )
 
 
+class AbandonedTurn(NamedTuple):
+    """A reaped run whose turn may still be going in a pod."""
+
+    conversation_id: str
+    run_started_at: datetime
+    # When the run's lease ran out: its process stopped renewing it about one
+    # lease earlier.
+    lease_expired_at: datetime
+
+
 class ScheduleRunService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
@@ -657,7 +668,7 @@ class ScheduleRunService:
         ).scalar_one()
 
     def reap_lapsed_runs(
-        self, *, now: datetime, error: str, abandoned: list[tuple[str, datetime]] | None = None,
+        self, *, now: datetime, error: str, abandoned: list[AbandonedTurn] | None = None,
     ) -> list[ScheduleRun]:
         """Fail every running run whose lease ran out: its process stopped
         renewing it, so it died without recording how the run ended.
@@ -673,8 +684,8 @@ class ScheduleRunService:
         replica's reap holds it, and the next poll reads it as committed.
 
         Each reaped run that linked a conversation, manual runs included, goes
-        on ``abandoned`` as its conversation id and start time: its turn may
-        still be running in a pod that nobody is recording.
+        on ``abandoned`` (AbandonedTurn): its turn may still be running in a
+        pod that nobody is recording.
         """
         runs = self.session.exec(
             self.session.select(ScheduleRun)
@@ -689,10 +700,15 @@ class ScheduleRunService:
             run.duration_ms = int((now - _utc(run.started_at)).total_seconds() * 1000)
             run.status = RunStatus.failed
             run.error = error
+            lease_expired_at = _utc(run.lease_expires_at)
             run.lease_expires_at = None
             _record_lost_run(run)
             if run.conversation_id is not None and abandoned is not None:
-                abandoned.append((str(run.conversation_id), _utc(run.started_at)))
+                abandoned.append(AbandonedTurn(
+                    conversation_id=str(run.conversation_id),
+                    run_started_at=_utc(run.started_at),
+                    lease_expired_at=lease_expired_at,
+                ))
             if run.execution_claimed_at is None:
                 run.slot_at = None
             elif run.slot_at is not None:

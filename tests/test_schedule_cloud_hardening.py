@@ -26,7 +26,7 @@ from cowork.db.session import get_open_session
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.schedules import OrgRunsAtLimit, ScheduleRunService, ScheduleService
+from cowork.services.schedules import AbandonedTurn, OrgRunsAtLimit, ScheduleRunService, ScheduleService
 
 # A slot that came due a minute ago, so the poll's missed-run pass leaves it due.
 SLOT = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0)
@@ -36,7 +36,7 @@ SLOT = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0
 def _fresh_scheduler(monkeypatch):
     monkeypatch.setattr(scheduler, "_scheduler_task", None)
     monkeypatch.setattr(scheduler, "_scheduled_runs", set())
-    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._MAX_CONCURRENT_RUNS))
+    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._runs_per_process))
 
 
 def _make_schedule(*, org_id: str | None = None) -> UUID:
@@ -186,7 +186,7 @@ def test_a_reaped_run_whose_turn_may_have_started_is_named_for_its_pod_to_stop(s
     abandoned: list = []
     _poll(abandoned)
 
-    assert [conversation for conversation, _ in abandoned] == [str(conversation_id)]
+    assert [turn.conversation_id for turn in abandoned] == [str(conversation_id)]
     (reaped,) = _runs(schedule_id)
     assert reaped.status == RunStatus.failed
 
@@ -212,22 +212,39 @@ def _cancels(monkeypatch, *, fails: bool = False) -> list[str]:
     return asked
 
 
+def _abandoned(*, run_started_ago: float = 300, lease_expired_ago: float = 10) -> AbandonedTurn:
+    """A run reaped just now: it started ``run_started_ago`` seconds ago and
+    its lease ran out ``lease_expired_ago`` seconds ago, so its process last
+    renewed it a lease before that."""
+    now = datetime.now(timezone.utc)
+    return AbandonedTurn(
+        conversation_id="conv-1",
+        run_started_at=now - timedelta(seconds=run_started_ago),
+        lease_expired_at=now - timedelta(seconds=lease_expired_ago),
+    )
+
+
+def _started_ago(seconds: float) -> str:
+    return str(time.time() - seconds)
+
+
 async def test_an_abandoned_turn_in_a_pod_is_flagged_to_stop(monkeypatch):
     monkeypatch.setattr(scheduler, "get_backend", lambda: "redis")
-    _turn_index(monkeypatch, {"correlation_id": "corr-1", "started_at": str(time.time())})
+    # The run's turn began soon after the run, while its process was alive.
+    _turn_index(monkeypatch, {"correlation_id": "corr-1", "started_at": _started_ago(290)})
     asked = _cancels(monkeypatch)
 
-    await scheduler._cancel_abandoned_turn("conv-1", datetime.now(timezone.utc) - timedelta(minutes=2))
+    await scheduler._cancel_abandoned_turn(_abandoned())
 
     assert asked == ["corr-1"]
 
 
 async def test_an_abandoned_turn_is_left_alone_on_the_in_process_backend(monkeypatch):
     monkeypatch.setattr(scheduler, "get_backend", lambda: "memory")
-    _turn_index(monkeypatch, {"correlation_id": "corr-1", "started_at": str(time.time())})
+    _turn_index(monkeypatch, {"correlation_id": "corr-1", "started_at": _started_ago(290)})
     asked = _cancels(monkeypatch)
 
-    await scheduler._cancel_abandoned_turn("conv-1", datetime.now(timezone.utc))
+    await scheduler._cancel_abandoned_turn(_abandoned())
 
     assert asked == []
 
@@ -236,20 +253,35 @@ async def test_an_older_turn_on_the_conversation_is_not_flagged(monkeypatch):
     """The turn index names the conversation's current turn. One that began
     well before the run did is not the run's turn, and is already over."""
     monkeypatch.setattr(scheduler, "get_backend", lambda: "redis")
-    _turn_index(monkeypatch, {"correlation_id": "old", "started_at": str(time.time() - 3600)})
+    _turn_index(monkeypatch, {"correlation_id": "old", "started_at": _started_ago(3600)})
     asked = _cancels(monkeypatch)
 
-    await scheduler._cancel_abandoned_turn("conv-1", datetime.now(timezone.utc))
+    await scheduler._cancel_abandoned_turn(_abandoned())
+
+    assert asked == []
+
+
+async def test_a_turn_begun_after_the_runs_process_stopped_is_not_flagged(monkeypatch):
+    """A person can chat in a scheduled run's conversation. A turn that began
+    after the run's process stopped renewing its lease is theirs, not the
+    run's, so the reap leaves it running."""
+    monkeypatch.setattr(scheduler, "get_backend", lambda: "redis")
+    # The lease ran out 10s ago, so the process last renewed it ~130s ago and
+    # was gone by ~100s ago; this turn began 60s ago.
+    _turn_index(monkeypatch, {"correlation_id": "theirs", "started_at": _started_ago(60)})
+    asked = _cancels(monkeypatch)
+
+    await scheduler._cancel_abandoned_turn(_abandoned())
 
     assert asked == []
 
 
 async def test_a_flag_that_cannot_be_written_is_logged_not_raised(monkeypatch):
     monkeypatch.setattr(scheduler, "get_backend", lambda: "redis")
-    _turn_index(monkeypatch, {"correlation_id": "corr-1", "started_at": str(time.time())})
+    _turn_index(monkeypatch, {"correlation_id": "corr-1", "started_at": _started_ago(290)})
     asked = _cancels(monkeypatch, fails=True)
 
-    await scheduler._cancel_abandoned_turn("conv-1", datetime.now(timezone.utc))
+    await scheduler._cancel_abandoned_turn(_abandoned())
 
     assert asked == ["corr-1"]
 
@@ -313,7 +345,7 @@ async def test_a_reaped_turn_is_stopped_here_and_in_its_pod(monkeypatch):
 
 async def test_a_slot_over_its_organizations_limit_stays_due(schedules, turns):
     turns.release.set()
-    busy = [schedules(org_id="org-a") for _ in range(scheduler._MAX_ORG_RUNS_IN_FLIGHT)]
+    busy = [schedules(org_id="org-a") for _ in range(scheduler._org_run_limit())]
     for schedule_id in busy:
         _running(schedule_id)
     waiting = schedules(org_id="org-a")
@@ -327,7 +359,7 @@ async def test_a_slot_over_its_organizations_limit_stays_due(schedules, turns):
 
 async def test_other_organizations_and_desktop_schedules_are_not_held_back(schedules, turns):
     turns.release.set()
-    for _ in range(scheduler._MAX_ORG_RUNS_IN_FLIGHT):
+    for _ in range(scheduler._org_run_limit()):
         _running(schedules(org_id="org-a"))
     other_org = schedules(org_id="org-b")
     desktop = schedules()
@@ -342,18 +374,18 @@ async def test_other_organizations_and_desktop_schedules_are_not_held_back(sched
 def test_two_replicas_claiming_for_one_organization_count_one_after_the_other(schedules):
     """Each claim counts its organization's runs in the insert's transaction,
     so the second replica sees the first replica's run."""
-    for _ in range(scheduler._MAX_ORG_RUNS_IN_FLIGHT - 1):
+    for _ in range(scheduler._org_run_limit() - 1):
         _running(schedules(org_id="org-a"))
     first, second = schedules(org_id="org-a"), schedules(org_id="org-a")
 
     replica_a, replica_b = get_open_session(), get_open_session()
     try:
         ScheduleRunService(ScopedSession(replica_a, SYSTEM_SCOPE)).create_run(
-            first, slot_at=SLOT, lease_seconds=60, org_limit=scheduler._MAX_ORG_RUNS_IN_FLIGHT,
+            first, slot_at=SLOT, lease_seconds=60, org_limit=scheduler._org_run_limit(),
         )
         with pytest.raises(OrgRunsAtLimit):
             ScheduleRunService(ScopedSession(replica_b, SYSTEM_SCOPE)).create_run(
-                second, slot_at=SLOT, lease_seconds=60, org_limit=scheduler._MAX_ORG_RUNS_IN_FLIGHT,
+                second, slot_at=SLOT, lease_seconds=60, org_limit=scheduler._org_run_limit(),
             )
     finally:
         replica_a.close()
@@ -370,7 +402,7 @@ def test_org_runs_full_counts_only_runs_going(schedules):
         scoped = ScopedSession(session, SYSTEM_SCOPE)
         schedule = ScheduleService(scoped).get_schedule(schedule_id)
         assert not scheduler.org_runs_full(scoped, schedule)
-        for _ in range(scheduler._MAX_ORG_RUNS_IN_FLIGHT):
+        for _ in range(scheduler._org_run_limit()):
             _running(schedules(org_id="org-a"))
         assert scheduler.org_runs_full(scoped, schedule)
         desktop = ScheduleService(scoped).get_schedule(schedules())
@@ -407,6 +439,63 @@ def test_the_time_limit_defaults_to_30_minutes_within_its_bounds(monkeypatch):
         monkeypatch.setenv("COWORK_SCHEDULED_RUN_MAX_SECONDS", out_of_bounds)
         with pytest.raises(ValidationError):
             AppSettings()
+
+
+def test_the_run_limits_default_by_where_turns_run_within_their_bounds(monkeypatch):
+    from cowork.common.settings.app_settings import AppSettings
+
+    monkeypatch.delenv("COWORK_SCHEDULED_RUNS_PER_PROCESS", raising=False)
+    monkeypatch.delenv("COWORK_SCHEDULED_RUNS_PER_ORG", raising=False)
+    settings = AppSettings()
+    assert settings.scheduled_runs_per_process is None
+    assert settings.scheduled_runs_per_org == 8
+    monkeypatch.setenv("COWORK_SCHEDULED_RUNS_PER_PROCESS", "24")
+    monkeypatch.setenv("COWORK_SCHEDULED_RUNS_PER_ORG", "12")
+    settings = AppSettings()
+    assert (settings.scheduled_runs_per_process, settings.scheduled_runs_per_org) == (24, 12)
+    for name, out_of_bounds in (
+        ("COWORK_SCHEDULED_RUNS_PER_PROCESS", "0"),
+        ("COWORK_SCHEDULED_RUNS_PER_PROCESS", "65"),
+        ("COWORK_SCHEDULED_RUNS_PER_ORG", "0"),
+        ("COWORK_SCHEDULED_RUNS_PER_ORG", "257"),
+    ):
+        monkeypatch.setenv(name, out_of_bounds)
+        with pytest.raises(ValidationError):
+            AppSettings()
+        monkeypatch.setenv(name, "4")
+
+
+@pytest.mark.parametrize(
+    ("backend", "configured", "expected"),
+    [("memory", None, 3), ("redis", None, 16), ("memory", 5, 5), ("redis", 40, 40)],
+)
+def test_the_process_limit_follows_the_backend_unless_set(monkeypatch, backend, configured, expected):
+    monkeypatch.setattr(
+        "cowork.common.settings.app_settings.get_app_settings",
+        lambda: SimpleNamespace(scheduled_runs_per_process=configured, scheduled_runs_per_org=8),
+    )
+    monkeypatch.setattr(scheduler, "get_backend", lambda: backend)
+
+    assert scheduler._runs_per_process() == expected
+
+
+def test_admission_reads_its_limit_at_each_reservation():
+    limit = {"value": 1}
+    admission = scheduler._Admission(lambda: limit["value"])
+
+    assert admission.reserve()
+    assert not admission.reserve()
+    limit["value"] = 2
+    assert admission.reserve()
+
+
+def test_the_organization_limit_comes_from_its_setting(monkeypatch):
+    monkeypatch.setattr(
+        "cowork.common.settings.app_settings.get_app_settings",
+        lambda: SimpleNamespace(scheduled_runs_per_process=None, scheduled_runs_per_org=11),
+    )
+
+    assert scheduler._org_run_limit() == 11
 
 
 def _limit(monkeypatch, seconds: int, backend: str = "memory") -> None:

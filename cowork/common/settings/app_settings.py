@@ -1368,6 +1368,27 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_SCHEDULED_RUN_MAX_SECONDS"),
         description="Longest a scheduled run may take before it is stopped.",
     )  # COWORK_SCHEDULED_RUN_MAX_SECONDS
+    # Scheduled runs one server process drives at once, across every
+    # organization. Unset, it follows where turns run: 3 on the desktop, where
+    # each run is an agent on the user's own machine, and 16 when turns run in
+    # sandbox pods, where the process only streams them (scheduler).
+    scheduled_runs_per_process: int | None = Field(
+        default=None,
+        ge=1,
+        le=64,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_PROCESS"),
+        description="Scheduled runs one server process drives at once; unset follows the backend.",
+    )  # COWORK_SCHEDULED_RUNS_PER_PROCESS
+    # Scheduled runs one organization may have going at once, counted across
+    # every replica, so one organization's burst can't take every place. A
+    # desktop schedule has no organization, so this doesn't apply there.
+    scheduled_runs_per_org: int = Field(
+        default=8,
+        ge=1,
+        le=256,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_ORG"),
+        description="Scheduled runs one organization may have going at once, across all replicas.",
+    )  # COWORK_SCHEDULED_RUNS_PER_ORG
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*

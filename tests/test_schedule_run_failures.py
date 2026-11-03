@@ -32,7 +32,7 @@ SLOT = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0
 def _fresh_scheduler(monkeypatch):
     monkeypatch.setattr(scheduler, "_scheduler_task", None)
     monkeypatch.setattr(scheduler, "_scheduled_runs", set())
-    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._MAX_CONCURRENT_RUNS))
+    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._runs_per_process))
 
 
 def _scoped():
