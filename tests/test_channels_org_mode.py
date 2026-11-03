@@ -21,6 +21,7 @@ from sqlmodel import select
 
 from cowork.channels.plugins.discord import DiscordBridge
 from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
+from cowork.channels.sharing import is_shared
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, scope_for_org
 from cowork.db.session import get_open_session
@@ -431,7 +432,7 @@ def _serve_first_discord_message(binding_id: UUID, project_id: UUID, guild_id: s
     try:
         scoped = ScopedSession(session, scope_for_org(ORG_A))
         binding = scoped.get(ChannelBinding, binding_id)
-        conversation = runtime._ensure_conversation(scoped, binding, shared=bool(message.message.is_group))
+        conversation = runtime._ensure_conversation(scoped, binding, shared=is_shared(message))
         runtime._touch_channel_session(scoped, binding, conversation, message)
         return conversation.id
     finally:
@@ -614,6 +615,59 @@ def test_only_marked_ownerless_conversations_are_channel_conversations(client, t
             session.commit()
         finally:
             session.close()
+
+
+def test_a_dm_route_can_never_feed_a_channel_conversation(client, channel_conversation, tmp_path):
+    cid = str(channel_conversation)
+    created = client.post(
+        "/api/v1/channels/bindings", headers=A,
+        json={"channel_type": "discord", "external_group_id": "dm-chan", "anton_conversation_id": cid},
+    )
+    assert created.status_code == 400, created.text
+    plain = client.post("/api/v1/channels/bindings", headers=A, json={"channel_type": "discord", "external_group_id": "dm-chan"})
+    dm_binding = UUID(plain.json()["id"])
+    repinned = client.patch(f"/api/v1/channels/bindings/{dm_binding}", headers=A, json={"anton_conversation_id": cid})
+    assert repinned.status_code == 400, repinned.text
+
+    # A DM route pinned before pinning was refused: its DM still never lands there.
+    session = get_open_session()
+    try:
+        session.get(ChannelBinding, dm_binding).anton_conversation_id = channel_conversation
+        session.commit()
+    finally:
+        session.close()
+    project_id = _conversation_project(channel_conversation)
+    dm_conversation = _serve_first_discord_message(dm_binding, project_id, guild_id=None)
+    session = get_open_session()
+    try:
+        ConversationService(ScopedSession(session, scope_for_org(ORG_A))).save_user_message(dm_conversation, "sam: private")
+    finally:
+        session.close()
+    try:
+        assert dm_conversation != channel_conversation
+        items = client.get(f"/api/v1/channel-conversations/{cid}/items", headers=OWNER_A_ADMIN).json()
+        assert [m["content"] for m in items] == ["hello"]
+    finally:
+        _drop_messages(dm_conversation)
+        session = get_open_session()
+        try:
+            for row in session.exec(select(ChannelSession).where(ChannelSession.binding_id == dm_binding)).all():
+                session.delete(row)
+            session.flush()
+            session.delete(session.get(ChannelBinding, dm_binding))
+            session.flush()
+            session.delete(session.get(Conversation, dm_conversation))
+            session.commit()
+        finally:
+            session.close()
+
+
+def _conversation_project(conversation_id: UUID) -> UUID:
+    session = get_open_session()
+    try:
+        return session.get(Conversation, conversation_id).project_id
+    finally:
+        session.close()
 
 
 def test_a_direct_message_to_the_bot_is_not_a_channel_conversation(client, tmp_path):
