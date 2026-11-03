@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
-from cowork.build_info import surface
+from cowork.build_info import supported_kwargs, surface
 from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
@@ -1518,12 +1518,16 @@ class WebToolKwargs(TypedDict, total=False):
 
     web_search_enabled: bool
     web_fetch_enabled: bool
+    # False: the agent answers from the connected data only (no web tools, no
+    # scratchpad web_search(), no internet guidance in its prompt).
+    internet_research_enabled: bool
 
 
 # anton's own setting names, so the CLI and a cowork-server read the same variables.
 _WEB_TOOL_ENV = {
     "web_search_enabled": "ANTON_WEB_SEARCH_ENABLED",
     "web_fetch_enabled": "ANTON_WEB_FETCH_ENABLED",
+    "internet_research_enabled": "ANTON_INTERNET_RESEARCH_ENABLED",
 }
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
@@ -1540,9 +1544,14 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     what its flavor provides.
 
     ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
-    value in the server's env turn that tool off for every session; they never
-    turn one on.
+    value in the server's env turn that tool off for every session this server
+    runs, and ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off;
+    they never turn anything on. Org turns run in a pod through
+    ``anton.cloud_turn``, which doesn't read this env. A field the installed
+    anton's ChatSessionConfig lacks is dropped (``supported_kwargs``): passing
+    it would fail every turn.
     """
+    from anton.core.session import ChatSessionConfig
     from cowork.common.settings.user_settings import Provider
 
     if (
@@ -1555,7 +1564,7 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     for field, env_name in _WEB_TOOL_ENV.items():
         if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
             kwargs[field] = False
-    return kwargs
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **kwargs))
 
 
 def build_llm_client(
