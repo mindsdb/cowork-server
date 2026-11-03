@@ -3,14 +3,17 @@
 The first inbound message writes a ChannelSession row that points at its
 route. Postgres enforces that foreign key, so these run on SQLite with
 `PRAGMA foreign_keys=ON`; the default test SQLite would let a wrong delete
-order through.
+order through. One case repeats the reported flow on a real PostgreSQL.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 from uuid import UUID
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import StaticPool
@@ -26,6 +29,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.schemas.channels import BindingCreateRequest
 from cowork.services.channel_bindings import ChannelBindingService
+from tests.integration.prereq import missing_prerequisite
 
 ORG = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 MEMBER = "11111111-1111-4111-8111-111111111111"
@@ -108,8 +112,25 @@ def _serve_first_message(engine: Engine, project_id: UUID, binding_id: UUID | No
         return binding.id
 
 
-def _service(engine: Engine, registry: PluginRegistry, user_id: str) -> ChannelBindingService:
-    return ChannelBindingService(ScopedSession(Session(engine), _user(user_id)), registry=registry)
+def _create_route(engine: Engine, registry: PluginRegistry, user_id: str, group_id: str, project_id: UUID) -> UUID:
+    """Add a Discord route as `user_id`, the way the Routes form does."""
+    with Session(engine) as session:
+        service = ChannelBindingService(ScopedSession(session, _user(user_id)), registry=registry)
+        request = BindingCreateRequest(channel_type="discord", external_group_id=group_id, anton_project_id=project_id)
+        return service.create(request).id
+
+
+def _delete_route(engine: Engine, registry: PluginRegistry, user_id: str, binding_id: UUID) -> bool:
+    """Remove a route as `user_id`; the session closes so no lock outlives the call."""
+    with Session(engine) as session:
+        return ChannelBindingService(ScopedSession(session, _user(user_id)), registry=registry).delete(binding_id)
+
+
+def _listed_ids(engine: Engine, registry: PluginRegistry, user_id: str) -> list[UUID]:
+    """Route ids `user_id` sees in the Routes list."""
+    with Session(engine) as session:
+        service = ChannelBindingService(ScopedSession(session, _user(user_id)), registry=registry)
+        return [b.id for b in service.list()]
 
 
 def _rows(engine: Engine, binding_id: UUID) -> tuple[ChannelBinding | None, list[ChannelSession]]:
@@ -120,17 +141,14 @@ def _rows(engine: Engine, binding_id: UUID) -> tuple[ChannelBinding | None, list
 
 
 def test_owner_removes_a_members_route_after_its_first_message(engine, registry, project_id):
-    binding_id = _service(engine, registry, MEMBER).create(
-        BindingCreateRequest(channel_type="discord", external_group_id="123", anton_project_id=project_id)
-    ).id
+    binding_id = _create_route(engine, registry, MEMBER, "123", project_id)
     _serve_first_message(engine, project_id, binding_id, "123")
     assert _rows(engine, binding_id)[1], "the first message must have written a session row"
 
-    owner = _service(engine, registry, OWNER)
-    assert owner.delete(binding_id) is True
+    assert _delete_route(engine, registry, OWNER, binding_id) is True
 
     assert _rows(engine, binding_id) == (None, [])
-    assert [b.id for b in owner.list()] == []
+    assert _listed_ids(engine, registry, OWNER) == []
 
 
 def test_route_created_by_the_first_message_can_be_removed(engine, registry, project_id):
@@ -138,7 +156,7 @@ def test_route_created_by_the_first_message_can_be_removed(engine, registry, pro
     binding, sessions = _rows(engine, binding_id)
     assert binding is not None and binding.created_by is None and sessions
 
-    assert _service(engine, registry, OWNER).delete(binding_id) is True
+    assert _delete_route(engine, registry, OWNER, binding_id) is True
 
     assert _rows(engine, binding_id) == (None, [])
 
@@ -147,17 +165,51 @@ def test_removing_a_route_keeps_its_conversation(engine, registry, project_id):
     binding_id = _serve_first_message(engine, project_id, None, "789")
     conversation_id = _rows(engine, binding_id)[0].anton_conversation_id
 
-    assert _service(engine, registry, OWNER).delete(binding_id) is True
+    assert _delete_route(engine, registry, OWNER, binding_id) is True
 
     with Session(engine) as session:
         assert session.get(Conversation, conversation_id) is not None
 
 
 def test_unused_route_still_removes(engine, registry, project_id):
-    binding_id = _service(engine, registry, MEMBER).create(
-        BindingCreateRequest(channel_type="discord", external_group_id="321", anton_project_id=project_id)
-    ).id
+    binding_id = _create_route(engine, registry, MEMBER, "321", project_id)
 
-    assert _service(engine, registry, OWNER).delete(binding_id) is True
+    assert _delete_route(engine, registry, OWNER, binding_id) is True
 
     assert _rows(engine, binding_id) == (None, [])
+
+
+@pytest.fixture()
+def postgres_engine(monkeypatch: pytest.MonkeyPatch):
+    """A disposable PostgreSQL migrated to head, downgraded to base after."""
+    uri = os.environ.get("COWORK_TEST_POSTGRES_URI")
+    if not uri:
+        missing_prerequisite(
+            "set COWORK_TEST_POSTGRES_URI to a disposable database", required_by="COWORK_REQUIRE_SERVICES",
+        )
+    monkeypatch.setenv("DATABASE_URI", uri)
+    get_app_settings.cache_clear()
+    cfg = Config("alembic.ini")
+    engine = create_engine(uri)
+    try:
+        command.upgrade(cfg, "head")
+        yield engine
+    finally:
+        engine.dispose()
+        command.downgrade(cfg, "base")
+        get_app_settings.cache_clear()
+
+
+@pytest.mark.postgres_service
+def test_owner_removes_a_members_route_after_its_first_message_on_postgres(postgres_engine, registry):
+    with Session(postgres_engine) as session:
+        project = Project(name="routes", path="/routes", org_id=ORG)
+        session.add(project)
+        session.commit()
+        project_id = project.id
+    binding_id = _create_route(postgres_engine, registry, MEMBER, "123", project_id)
+    _serve_first_message(postgres_engine, project_id, binding_id, "123")
+
+    assert _delete_route(postgres_engine, registry, OWNER, binding_id) is True
+
+    assert _rows(postgres_engine, binding_id) == (None, [])
