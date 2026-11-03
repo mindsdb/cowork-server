@@ -98,8 +98,10 @@ def test_last_successful_finish_ignores_failures_and_running():
 
     failed = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(failed.id, error="boom")
-    run_service.create_run(schedule.id, is_manual=False)  # still running
+    running = run_service.create_run(schedule.id, is_manual=False)
     assert run_service.last_successful_finish(schedule.id) is None
+    # A schedule holds one running run at a time.
+    run_service.finish_run(running.id, error="ended")
 
     ok = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(ok.id)
@@ -1482,7 +1484,8 @@ def test_delete_schedule_with_runs_under_enforced_foreign_keys():
     schedule = _schedule(session)
     run_service = ScheduleRunService(scoped)
     for _ in range(3):
-        run_service.create_run(schedule.id, is_manual=False)
+        # One running run at a time: finish each before the next.
+        run_service.finish_run(run_service.create_run(schedule.id, is_manual=False).id, error="ended")
 
     assert ScheduleService(scoped).delete_schedule(schedule.id) is True
 

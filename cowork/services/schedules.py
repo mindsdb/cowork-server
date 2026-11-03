@@ -192,6 +192,10 @@ class ScheduleService:
         return schedule
 
 
+class ScheduleBusy(Exception):
+    """The schedule already has a run going, manual or cron."""
+
+
 class SlotAlreadyClaimed(Exception):
     """Another run already holds this schedule's cron slot."""
 
@@ -243,7 +247,9 @@ class ScheduleRunService:
     ) -> ScheduleRun:
         """Insert the run. With ``slot_at``, the insert claims that cron slot:
         the unique index on (schedule_id, slot_at) refuses a second run for it,
-        and that refusal raises SlotAlreadyClaimed. With ``lease_seconds``, the
+        and that refusal raises SlotAlreadyClaimed. A schedule holds one
+        `running` run at a time (uq_schedule_runs_one_running), so an insert
+        while another run is going raises ScheduleBusy. With ``lease_seconds``, the
         run counts as alive until then unless renew_lease extends it.
         ``attempt`` and ``retry_of`` place a cron run in its slot's attempts
         (slot_attempts)."""
@@ -266,9 +272,19 @@ class ScheduleRunService:
             self.session.rollback()
             if slot_at is not None and self._slot_holder(schedule_id, slot_at) is not None:
                 raise SlotAlreadyClaimed(f"schedule {schedule_id} slot {slot_at.isoformat()} already has a run")
+            if self._running_run(schedule_id) is not None:
+                raise ScheduleBusy(f"schedule {schedule_id} already has a run going")
             raise
         self.session.refresh(run)
         return run
+
+    def _running_run(self, schedule_id: UUID) -> ScheduleRun | None:
+        return self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .limit(1)
+        ).first()
 
     def _slot_holder(self, schedule_id: UUID, slot_at: datetime) -> ScheduleRun | None:
         return self.session.exec(

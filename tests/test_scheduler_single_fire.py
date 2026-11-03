@@ -33,7 +33,7 @@ from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.schedules import ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.services.schedules import ScheduleBusy, ScheduleRunService, ScheduleService, SlotAlreadyClaimed
 from tests.integration.prereq import missing_prerequisite
 
 # A slot that came due a minute ago: one missed occurrence stays due, where
@@ -453,11 +453,17 @@ def test_a_second_insert_for_a_claimed_slot_raises_slot_already_claimed():
             model="default", timezone="UTC", project_id=GENERAL_PROJECT_ID, enabled=True,
         )
         runs = ScheduleRunService(scoped)
-        runs.create_run(schedule.id, slot_at=SLOT)
+        claimed = runs.create_run(schedule.id, slot_at=SLOT)
 
         with pytest.raises(SlotAlreadyClaimed):
             runs.create_run(schedule.id, slot_at=SLOT)
-        runs.create_run(schedule.id, is_manual=True)
+        # One running run per schedule: a run for another slot, or a manual
+        # one, waits for the running one to end.
+        with pytest.raises(ScheduleBusy):
+            runs.create_run(schedule.id, is_manual=True)
+        runs.finish_run(claimed.id)
+        manual = runs.create_run(schedule.id, is_manual=True)
+        runs.finish_run(manual.id)
         runs.create_run(schedule.id, slot_at=SLOT + timedelta(days=1))
         assert len(runs.list_runs(schedule.id)) == 3
         ScheduleService(scoped).delete_schedule(schedule.id)
@@ -535,6 +541,40 @@ def _reap(pg: PostgresSchedule) -> list[ScheduleRun]:
 def _run_row(pg: PostgresSchedule, run_id: UUID) -> ScheduleRun:
     with Session(pg.engine) as session:
         return session.get(ScheduleRun, run_id)
+
+
+@pytest.mark.postgres_service
+def test_two_run_now_claims_at_once_on_postgres_start_one_run(postgres):
+    """Two Run now presses that both pass the check claim the schedule at the
+    same moment on the database hosted Cowork runs: one gets the run, the
+    other is refused, and only one run is going."""
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def claim() -> None:
+        with Session(postgres.engine) as session:
+            scoped = ScopedSession(session, SYSTEM_SCOPE)
+            barrier.wait()
+            try:
+                scheduler.claim_manual_run(scoped, postgres.schedule_id)
+                outcomes.append("claimed")
+            except ScheduleBusy:
+                outcomes.append("refused")
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(outcomes) == ["claimed", "refused"]
+    with Session(postgres.engine) as session:
+        running = session.exec(
+            select(ScheduleRun).where(
+                ScheduleRun.schedule_id == postgres.schedule_id, ScheduleRun.status == RunStatus.running,
+            )
+        ).all()
+    assert len(running) == 1
 
 
 @pytest.mark.postgres_service

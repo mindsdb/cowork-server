@@ -7,6 +7,10 @@ and `retry_of` points a retry at the slot's first attempt. `outcome` says what
 is known about the run's execution, and `execution_started_at` when its turn
 was handed to the agent.
 
+A partial unique index allows one `running` run per schedule, so a manual run
+and a cron run, or two manual runs, can't go at once. Duplicate `running`
+rows left by older builds are failed first, keeping each schedule's newest.
+
 Revision ID: 5b7c2d9e4f10
 Revises: 2a366c1f4b9f
 """
@@ -42,9 +46,44 @@ def upgrade() -> None:
     indexes = {i["name"] for i in sa.inspect(op.get_bind()).get_indexes("schedule_runs")}
     if "ix_schedule_runs_for_slot" not in indexes:
         op.create_index("ix_schedule_runs_for_slot", "schedule_runs", ["schedule_id", "for_slot_at"])
+    if "uq_schedule_runs_one_running" not in indexes:
+        _fail_extra_running_runs()
+        op.create_index(
+            "uq_schedule_runs_one_running",
+            "schedule_runs",
+            ["schedule_id"],
+            unique=True,
+            sqlite_where=sa.text("status = 'running'"),
+            postgresql_where=sa.text("status = 'running'"),
+        )
+
+
+def _fail_extra_running_runs() -> None:
+    """Fail every `running` run but the newest of its schedule, so the
+    one-running index can be built. Such duplicates could only come from the
+    race the index now prevents."""
+    bind = op.get_bind()
+    rows = bind.execute(sa.text(
+        "SELECT id, schedule_id FROM schedule_runs WHERE status = 'running' "
+        "ORDER BY schedule_id, started_at DESC"
+    )).all()
+    seen: set = set()
+    for run_id, schedule_id in rows:
+        if schedule_id in seen:
+            bind.execute(
+                sa.text(
+                    "UPDATE schedule_runs SET status = 'failed', slot_at = NULL, lease_expires_at = NULL, "
+                    "finished_at = CURRENT_TIMESTAMP, "
+                    "error = 'Run ended by an upgrade: another run of this task was already going.' "
+                    "WHERE id = :id"
+                ),
+                {"id": run_id},
+            )
+        seen.add(schedule_id)
 
 
 def downgrade() -> None:
+    op.drop_index("uq_schedule_runs_one_running", table_name="schedule_runs")
     op.drop_index("ix_schedule_runs_for_slot", table_name="schedule_runs")
     with op.batch_alter_table("schedule_runs") as batch:
         batch.drop_constraint("fk_schedule_runs_retry_of", type_="foreignkey")

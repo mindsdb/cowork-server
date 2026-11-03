@@ -421,6 +421,74 @@ async def test_run_now_is_refused_while_the_task_is_running(schedule_id):
     assert "already running" in answer.json()["detail"]
 
 
+async def test_two_run_now_presses_that_both_pass_the_check_start_one_run(schedule_id, monkeypatch):
+    """The check before the claim can pass for two presses at once; the run
+    row is the claim, and the schedule allows one `running` run, so the press
+    that loses the insert is refused."""
+    session = get_open_session()
+    try:
+        held = scheduler.claim_manual_run(ScopedSession(session, SYSTEM_SCOPE), schedule_id)
+    finally:
+        session.close()
+    monkeypatch.setattr(ScheduleRunService, "has_active_run", lambda self, schedule_id: False)
+
+    answer = await _run_now(schedule_id)
+    assert answer.status_code == 409
+    assert "already running" in answer.json()["detail"]
+    assert [run.id for run in _runs(schedule_id) if run.status == RunStatus.running] == [held]
+    assert scheduler._admission.held == 0
+
+
+def test_concurrent_claims_for_one_schedule_start_one_run(schedule_id):
+    import threading
+
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def claim() -> None:
+        session = get_open_session()
+        try:
+            barrier.wait()
+            scheduler.claim_manual_run(ScopedSession(session, SYSTEM_SCOPE), schedule_id)
+            outcomes.append("claimed")
+        except scheduler.ScheduleBusy:
+            outcomes.append("refused")
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(outcomes) == ["claimed", "refused"]
+    assert len([run for run in _runs(schedule_id) if run.status == RunStatus.running]) == 1
+
+
+async def test_a_cron_claim_while_a_run_now_holds_the_schedule_leaves_its_slot_due(schedule_id, turns):
+    session = get_open_session()
+    try:
+        scheduler.claim_manual_run(ScopedSession(session, SYSTEM_SCOPE), schedule_id)
+    finally:
+        session.close()
+
+    await scheduler.execute_schedule(schedule_id, slot_at=SLOT)
+
+    assert turns.started == []
+    (run,) = _runs(schedule_id)
+    assert run.is_manual
+    assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT, "the slot stays due"
+
+
+async def test_run_now_runs_the_run_its_request_claimed(schedule_id, turns):
+    answer = await _run_now(schedule_id)
+    assert answer.status_code == 202, answer.text
+    (run,) = _runs(schedule_id)
+    assert run.is_manual and run.status == RunStatus.success
+    assert str(run.conversation_id) == answer.json()["conversation_id"]
+
+
 async def test_run_now_is_refused_while_a_retry_waits_and_the_task_reports_it(schedule_id, turns):
     turns.ending.reason, turns.ending.acted = "error", False
     (first,) = _poll(schedule_id)
@@ -510,7 +578,8 @@ def test_the_attempts_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
 
     added = {"for_slot_at", "attempt", "retry_of", "outcome", "execution_started_at"}
     assert added <= {c["name"] for c in inspect(engine).get_columns("schedule_runs")}
-    assert "ix_schedule_runs_for_slot" in {i["name"] for i in inspect(engine).get_indexes("schedule_runs")}
+    indexes = {i["name"] for i in inspect(engine).get_indexes("schedule_runs")}
+    assert {"ix_schedule_runs_for_slot", "uq_schedule_runs_one_running"} <= indexes
 
     config = _alembic_config(uri)
     with engine.begin() as connection:
@@ -524,3 +593,42 @@ def test_the_attempts_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
     with engine.connect() as connection:
         assert connection.execute(text("SELECT count(*) FROM schedule_runs")).scalar_one() == 0
     assert added <= {c["name"] for c in inspect(engine).get_columns("schedule_runs")}
+
+
+def test_the_migration_keeps_one_running_run_per_schedule(tmp_path, monkeypatch):
+    """Older builds could leave two `running` runs for one schedule; the
+    upgrade fails all but the newest, so the one-running index can be built."""
+    from alembic import command
+
+    from cowork.db.migrations import _alembic_config
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    uri = f"sqlite:///{tmp_path / 'one-running.db'}"
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    config = _alembic_config(uri)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.downgrade(config, "2a366c1f4b9f")
+
+    schedule_id = uuid4().hex
+    older, newer = uuid4().hex, uuid4().hex
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO schedules (id, title, prompt, cadence, timezone, next_run_at, enabled, project_id, model) "
+            "VALUES (:id, 't', 'p', 'daily', 'UTC', '2026-06-25 09:00:00', 1, :project, 'default')"
+        ), {"id": schedule_id, "project": GENERAL_PROJECT_ID.hex})
+        for run_id, started in ((older, "2026-06-25 09:00:00"), (newer, "2026-06-25 09:05:00")):
+            connection.execute(text(
+                "INSERT INTO schedule_runs (id, schedule_id, started_at, status, is_manual) "
+                "VALUES (:id, :schedule, :started, 'running', 1)"
+            ), {"id": run_id, "schedule": schedule_id, "started": started})
+
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
+    with engine.connect() as connection:
+        statuses = dict(connection.execute(text("SELECT id, status FROM schedule_runs")).all())
+    assert statuses == {older: "failed", newer: "running"}
+

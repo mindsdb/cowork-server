@@ -68,6 +68,16 @@ class ScheduleRun(BaseSQLModel, table=True):
         ),
         # The attempts at one slot, read on every poll for a due schedule.
         sa.Index("ix_schedule_runs_for_slot", "schedule_id", "for_slot_at"),
+        # One run going per schedule, manual or cron: inserting a second
+        # `running` row fails, so two Run now presses, or Run now racing a
+        # cron claim, start one run.
+        sa.Index(
+            "uq_schedule_runs_one_running",
+            "schedule_id",
+            unique=True,
+            sqlite_where=sa.text("status = 'running'"),
+            postgresql_where=sa.text("status = 'running'"),
+        ),
     )
 
     schedule_id: UUID = Field(

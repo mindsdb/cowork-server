@@ -27,7 +27,13 @@ from cowork.db.units import run_db
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
-from cowork.services.schedules import ScheduleRunService, ScheduleService, SlotAlreadyClaimed, SlotAttempts
+from cowork.services.schedules import (
+    ScheduleBusy,
+    ScheduleRunService,
+    ScheduleService,
+    SlotAlreadyClaimed,
+    SlotAttempts,
+)
 from cowork.streaming.liveness import MODEL_WAIT_PHASE
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import request_cancel
@@ -412,6 +418,25 @@ def _create_run(
     ).id
 
 
+def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID:
+    """Insert a Run now's run row, leased, before the request answers. Raises
+    ScheduleBusy when the schedule already has a run going, so two presses,
+    or a press racing a cron claim, start one run. The run is then executed
+    with ``execute_schedule(run_id=...)``; if that never starts, the lease
+    lapses and a poll reaps it."""
+    return ScheduleRunService(session).create_run(
+        schedule_id, is_manual=True, lease_seconds=_RUN_LEASE_SECONDS,
+    ).id
+
+
+def abandon_manual_run(session: ScopedSession, run_id: UUID, error: str) -> None:
+    """Finish a claimed Run now whose request failed before handing it off."""
+    ScheduleRunService(session).finish_run(
+        run_id, status=RunStatus.failed, error=error,
+        outcome=AttemptOutcome.failed_before_execution, counts_as_attempt=False,
+    )
+
+
 def _renew_run_lease(session: ScopedSession, *, run_id: UUID) -> bool:
     return ScheduleRunService(session).renew_lease(run_id, _RUN_LEASE_SECONDS)
 
@@ -618,6 +643,7 @@ async def execute_schedule(
     slot_at: datetime | None = None,
     attempt: int | None = None,
     retry_of: UUID | None = None,
+    run_id: UUID | None = None,
 ) -> None:
     """Run one schedule's turn and record how it went.
 
@@ -638,6 +664,9 @@ async def execute_schedule(
     When it fails before its agent acts and attempts are left, it leaves the
     slot due and gives it back, and a later poll starts the next attempt after
     the pause for it (_due_slots).
+
+    A Run now passes the ``run_id`` its request already claimed
+    (claim_manual_run), so the press and its run are one claim.
     """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
@@ -646,7 +675,7 @@ async def execute_schedule(
     if attempt is None and slot_at is not None and not is_manual:
         attempt = 1
     try:
-        run_id = await run_db(
+        run_id = run_id or await run_db(
             partial(
                 _create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at,
                 attempt=attempt, retry_of=retry_of,
@@ -664,6 +693,14 @@ async def execute_schedule(
     except SlotAlreadyClaimed:
         logger.info(
             "Schedule slot already started by another replica",
+            extra=log_context(schedule_id=schedule_id),
+        )
+        return
+    except ScheduleBusy:
+        # A Run now (or another replica's run) holds the schedule. Nothing
+        # was written, so a cron slot stays due for a later poll.
+        logger.info(
+            "Schedule already has a run going; not starting another",
             extra=log_context(schedule_id=schedule_id),
         )
         return
