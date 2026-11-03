@@ -93,7 +93,7 @@ def _blocked_handler(
         def close(self):
             pass
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         # What the elicitor does: publish the card, then wait on the broker.
         event_sink("response.ask_user", {"type": "response.ask_user", "question_id": QID})
         yield "event: response.ask_user\ndata: {}\n\n"

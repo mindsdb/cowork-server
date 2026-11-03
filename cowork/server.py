@@ -7,10 +7,14 @@ and all necessary configurations for the Cowork service.
 
 import asyncio
 import contextlib
+import contextvars
 import os
+import signal
 import stat
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import FrameType
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +36,7 @@ from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.draft_host.listener import start_draft_listener, stop_draft_listener
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings, check_write_approval_startup
 from cowork.harnesses.memory.policy import memory_start_warning
@@ -46,7 +51,8 @@ from cowork.principal import TrustedHeaderMiddleware
 from cowork.services.live_apps import live_app_slot_paths
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
-from cowork.streaming import TurnInProgress
+from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
+from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
@@ -57,7 +63,7 @@ from cowork.common.settings.app_settings import (
     get_export_pdf_settings,
 )
 from cowork.dev_setup import run_dev_setup
-from cowork.scheduler import start_scheduler
+from cowork.scheduler import start_scheduler, stop_scheduler, wait_for_scheduled_runs
 from cowork.services.pending_credential_clear import consume_pending_credential_clear
 
 
@@ -135,6 +141,131 @@ async def _cancel_and_wait(task: asyncio.Task | None) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+async def _end_remote_turns() -> None:
+    """End this replica's turns for a shutdown, where turns run remotely.
+
+    Refuses new turns and cancels the scheduler's poll loop, then ends every
+    turn in flight: RunRegistry.shutdown writes each remote turn's controller
+    cancel flag, and the turn's relay saves it as interrupted and writes
+    response.failed to its stream. Only then does it wait for the poll loop,
+    which finishes a database read it was in before it stops, and for the
+    scheduled runs those turns belonged to, so each run's record lands.
+    TURN_SHUTDOWN_GRACE_SECONDS bounds all of it. Each step does nothing for
+    what an earlier call ended.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + TURN_SHUTDOWN_GRACE_SECONDS
+
+    def remaining() -> float:
+        return max(0.0, deadline - loop.time())
+
+    registry.close()
+    poll_loop = stop_scheduler()
+    _log_cancelled_turns(await registry.shutdown(timeout_seconds=remaining()))
+    if poll_loop is not None:
+        await asyncio.wait([poll_loop], timeout=remaining())
+    unfinished = await wait_for_scheduled_runs(timeout_seconds=remaining())
+    if unfinished:
+        logger.warning(
+            "Scheduled runs still recording their outcome at shutdown",
+            extra={"event": "shutdown_scheduled_runs_unfinished", "count": unfinished},
+        )
+
+
+def _log_cancelled_turns(cancelled: int) -> None:
+    """The WARNING naming how many turns a shutdown ended. The count is a
+    field: the hosted log formatter drops a message's arguments."""
+    if cancelled:
+        logger.warning(
+            "Cancelled in-flight turns for shutdown",
+            extra={"event": "shutdown_turns_cancelled", "count": cancelled},
+        )
+
+
+def _server_busy(*, retry_after: int, status_code: int) -> JSONResponse:
+    """The refusal a client reads as "Cowork is busy": a sentence naming the
+    wait, its code, and Retry-After, which the web UI waits for before it
+    offers a retry."""
+    return JSONResponse(
+        Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+        status_code=status_code,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+# Another replica already serves while this one shuts down, so the retry needs
+# no longer than the client's own round trip.
+_SHUTDOWN_RETRY_AFTER_SECONDS = 1
+
+
+def _end_remote_turns_on_sigterm() -> None:
+    """Run _end_remote_turns on the first SIGTERM, then hand the signal on.
+
+    Uvicorn sets its own SIGTERM handler before lifespan startup runs
+    (Server.capture_signals), so the handler found here is Uvicorn's. On
+    SIGTERM it closes the listeners, waits at most --timeout-graceful-shutdown
+    for open responses, cuts the ones still open mid-stream, and only then
+    runs the lifespan's shutdown. Ending the turns first lets each open answer
+    stream carry its response.failed frame and end cleanly before that cut.
+    A second SIGTERM goes straight to Uvicorn.
+
+    The turns end in the context lifespan startup installed the handler in,
+    not in that of whatever task the signal interrupted, which may hold one
+    organization's settings scope.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "Server lifespan runs off the main thread, where no signal handler can be set; "
+            "turns in progress are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": "off_main_thread"},
+        )
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        # SIG_DFL or SIG_IGN, or None for a handler not set from Python.
+        reason = previous.name if isinstance(previous, signal.Handlers) else "not_set_from_python"
+        logger.warning(
+            "SIGTERM handler is not one to hand the signal on to; turns in progress "
+            "are ended only after the server's request drain",
+            extra={"event": "shutdown_predrain_not_installed", "reason": reason},
+        )
+        return
+    loop = asyncio.get_running_loop()
+    drain_context = contextvars.copy_context()
+    signalled = False
+    # Held here because the event loop keeps only a weak reference to a task.
+    drain: asyncio.Task | None = None
+
+    def on_sigterm(signum: int, frame: FrameType | None) -> None:
+        nonlocal signalled
+        if signalled:
+            previous(signum, frame)
+            return
+        signalled = True
+
+        def hand_on(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(
+                    "Ending turns before shutdown failed",
+                    exc_info=task.exception(),
+                    extra={"event": "shutdown_predrain_failed"},
+                )
+            previous(signum, frame)
+
+        def begin() -> None:
+            nonlocal drain
+            drain = loop.create_task(_end_remote_turns())
+            drain.add_done_callback(hand_on)
+
+        # A signal handler runs between two bytecodes of whatever the loop was
+        # doing, possibly while it waits in select(); call_soon_threadsafe
+        # wakes it to run begin(). Without a context it would run begin() in a
+        # copy of the interrupted task's, and the drain task would inherit it.
+        loop.call_soon_threadsafe(begin, context=drain_context)
+
+    signal.signal(signal.SIGTERM, on_sigterm)
 
 
 async def _run_artifact_owner_backfill() -> None:
@@ -245,15 +376,22 @@ async def lifespan(app: FastAPI):
         logger.exception("scratchpad-session boot sweep failed (non-fatal)")
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
-    # run and never fires that schedule again.
+    # run and never fires that schedule again. In org mode other replicas
+    # share the database and may still be running theirs, so only runs old
+    # enough to be presumed dead are released here. A younger run left by a
+    # hard-killed pod, including this one, stays `running` and wedges its
+    # schedule until a replica boots after it ages past the cutoff.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
+        from cowork.scheduler import boot_reap_cutoff
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
-            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
+            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
+                started_before=boot_reap_cutoff(),
+            )
             if reaped:
                 logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:
@@ -291,9 +429,19 @@ async def lifespan(app: FastAPI):
         # Bootstrap and credential clearing finish first; provider checks must
         # not delay readiness while the configured endpoint is unavailable.
         app.state.router_startup_probe = asyncio.create_task(run_router_startup_probe())
+    draft_listener = None
+    # Only where turns run remotely: desktop and in-process deployments keep
+    # Uvicorn's own SIGTERM handling and end their turns in the teardown below.
+    remote_turns = TurnQueueSettings().is_remote
+    if remote_turns:
+        _end_remote_turns_on_sigterm()
     try:
+        draft_listener = await start_draft_listener()
         yield
     finally:
+        # First, so no draft request is still reading files or the database
+        # while the steps below close them.
+        await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
@@ -301,13 +449,16 @@ async def lifespan(app: FastAPI):
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
-        from cowork.streaming.registry import registry
 
         # Uvicorn's request drain is bounded by the image command. Persist
         # interrupted turns before their database and runtime resources close.
-        cancelled = await registry.shutdown()
-        if cancelled:
-            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+        # Remote turns were usually ended already, by the SIGTERM handler while
+        # their streams were still open, and each step then does nothing; this
+        # covers a shutdown that began any other way.
+        if remote_turns:
+            await _end_remote_turns()
+        else:
+            _log_cancelled_turns(await registry.shutdown())
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
@@ -497,16 +648,19 @@ def create_app() -> FastAPI:
     # a retry, and the sentence names the wait for clients that don't read it.
     @app.exception_handler(PoolTimeoutError)
     async def _database_busy(request, exc):
-        retry_after = busy_retry_seconds()
         logger.warning(
             "%s %s refused with 503: no database connection freed in time",
             request.method, request.url.path,
         )
-        return JSONResponse(
-            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
-            status_code=DatabaseBusy.status_code,
-            headers={"Retry-After": str(retry_after)},
-        )
+        return _server_busy(retry_after=busy_retry_seconds(), status_code=DatabaseBusy.status_code)
+
+    # A question that reached a replica already ending its turns for a
+    # shutdown (RunRegistry.close). Refused as a busy server is: the client
+    # waits Retry-After, and its retry reaches another replica, which the
+    # rollout made ready before it stopped this one.
+    @app.exception_handler(ServerShuttingDown)
+    async def _shutting_down(request, exc: ServerShuttingDown):
+        return _server_busy(retry_after=_SHUTDOWN_RETRY_AFTER_SECONDS, status_code=exc.status_code)
 
     # A second question into a conversation whose turn is still answering.
     @app.exception_handler(TurnInProgress)

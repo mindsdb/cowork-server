@@ -62,7 +62,7 @@ class PausedHarness:
         self.started += 1
         return None
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         from cowork.streaming import sse_frame
 
         yield sse_frame("response.created", {"type": "response.created"})

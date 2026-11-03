@@ -31,7 +31,7 @@ class FakeHarness:
         if False:
             yield
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         async for _ in stream:
             pass
         event_sink("response.output_text.delta", {"delta": "pong from the org bot"})

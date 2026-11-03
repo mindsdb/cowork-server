@@ -125,6 +125,10 @@ def health() -> dict:
         # server (cowork.code_sandbox.live_apps_on): the client then offers
         # sharing and duplicating them.
         "live_apps": live_apps_on(),
+        # Whether this deployment serves draft previews on the draft host
+        # through signed links (cowork/draft_host). The web client reads it at
+        # boot and then opens an HTML draft by link instead of through srcdoc.
+        "draft_links": get_app_settings().draft_links_enabled(),
         "minds_runtime_credential_required": _minds_runtime_credential_required(
             settings, org_mode=_org_mode
         ),

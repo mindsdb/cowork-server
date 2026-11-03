@@ -49,8 +49,8 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
     )
     monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider: {})
     monkeypatch.setattr(
-        probe_handler.registry, "usage_notes_for",
-        lambda engines: {e: f"NOTE-{e}" for e in engines},
+        probe_handler.ConnectorCatalog, "usage_notes_for",
+        lambda self, engines: {e: f"NOTE-{e}" for e in engines},
     )
     store = SubmissionStore()
     monkeypatch.setattr(probe_handler, "store", store)

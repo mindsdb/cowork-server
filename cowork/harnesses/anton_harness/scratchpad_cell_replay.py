@@ -6,7 +6,7 @@ import contextlib
 import json
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 from anton.core.backends.base import Cell
@@ -24,6 +24,10 @@ SCRATCHPAD_REPLAY_ROLES = (_SCRATCHPAD_END, _SCRATCHPAD_RESULT)
 # Cell's stdout and stderr, which have no default, for a result cut before
 # them. Its error, which has no default either, comes from the stored status.
 _NO_OUTPUT = {"stdout": "", "stderr": ""}
+
+# The fields this anton's Cell declares. A result an anton of another version
+# saved may carry a field this one lacks, which Cell(**...) would refuse.
+_CELL_FIELDS = frozenset(field.name for field in fields(Cell))
 
 # What a replayed cell whose saved result lost its error field reads as, by the
 # status classify_cell_status gave the whole result: a known failure says so,
@@ -150,9 +154,11 @@ def _ran_cell(*, content: Any, sent_code: str | None, cell_status: str | None) -
         # success lets an earlier write establish file ownership.
         payload["error"] = None if cell_status == CellStatus.ok else _LOST_ERROR.get(cell_status, _UNCONFIRMED)
     # A result cut before its outputs still makes a cell, so the write check
-    # sees the code it ran.
+    # sees the code it ran, and so does one with a field this anton's Cell
+    # doesn't declare.
+    known = {key: value for key, value in payload.items() if key in _CELL_FIELDS}
     with contextlib.suppress(TypeError, ValueError):
-        return Cell(**{**_NO_OUTPUT, **payload})
+        return Cell(**{**_NO_OUTPUT, **known})
     return None
 
 

@@ -19,6 +19,18 @@ _REFUSAL_REASONS = frozenset(
         "expected_organization_missing",
         "expected_organization_invalid",
         "organization_mismatch",
+        # The draft-preview host (cowork/draft_host/app.py): why a signed link
+        # was refused, never the link itself.
+        "draft_links_disabled",
+        "draft_host_unknown",
+        "draft_no_fetch_metadata",
+        "draft_token_malformed",
+        "draft_token_kid",
+        "draft_token_signature",
+        "draft_token_purpose",
+        "draft_token_env",
+        "draft_token_expired",
+        "draft_token_identity",
     }
 )
 

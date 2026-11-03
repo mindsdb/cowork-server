@@ -1,19 +1,19 @@
 """MindsHub usage, read on behalf of the caller.
 
-Three auth reads behind one route: ``GET /v1/entitlements/me/`` for the free
+Three MindsHub reads behind one route: ``GET /v1/entitlements/me/`` for the free
 Air allowance, ``GET /v1/wallet/`` for the paid balance and auto top up, and
 ``GET /v1/usage/summary/`` for what the period's credit spend adds up to (the
 same figure the console's "Credit spend this period" shows).
 The desktop shows them above the composer and in Settings so a person sees
 "running low" before a turn fails on it.
 
-Same rules as ``hub_workspaces``: the sidecar makes the call because auth's
-ingress does not allow Cowork origins, the bearer is the caller's own, and the
+Same rules as ``mindshub_workspaces``: the sidecar makes the call because
+MindsHub's ingress does not allow Cowork origins, the bearer is the caller's own, and the
 host is the operator's (``default_minds_auth_host``), never the tenant-settable
-``minds_url``. Transport, cache key and sweep come from ``hub_workspaces``.
+``minds_url``. Transport and cache come from ``mindshub_client``.
 
 The cache is per credential, not per org or per user id: the allowance and
-``is_billing_owner`` are the caller's own, in org mode one process serves
+``is_billing_owner`` are the caller's own, in MindsHub mode one process serves
 everyone in the org, and on a desktop install the scope carries no user at all
 (``LOCAL_SCOPE``), so only the bearer tells one signed-in account from the next.
 """
@@ -23,21 +23,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import time
 from typing import Any, Optional
 
-from cowork.schemas.hub_usage import (
-    HubAutoTopUp,
-    HubBalance,
-    HubCreditSpend,
-    HubFreeTokens,
-    HubUsageView,
+from cowork.schemas.mindshub_usage import (
+    MindsHubAutoTopUp,
+    MindsHubBalance,
+    MindsHubCreditSpend,
+    MindsHubFreeTokens,
+    MindsHubUsageView,
 )
-from cowork.services.hub_workspaces import cache_key, get_auth_json, sweep_cache
+from cowork.services.mindshub_client import (
+    ENTITLEMENTS_PATH,
+    CallerCacheKey,
+    CallerTtlCache,
+    get_mindshub_json,
+)
 
 logger = logging.getLogger(__name__)
 
-ENTITLEMENTS_PATH = "/entitlements/me/"
 WALLET_PATH = "/wallet/"
 # No ``group_by``: auth collapses the breakdown into one totals-only bucket, and
 # ``totals`` is summed over every row before paging either way. Only ``totals``,
@@ -50,18 +53,11 @@ USAGE_SUMMARY_PATH = "/usage/summary/"
 _PROPORTION_LIMIT = 100.0
 
 # Short on purpose. A top up made in the console should show up in the desktop
-# within a poll or two, and a failed read should be retried soon.
+# within a poll or two, and a failed read should be retried soon. Per caller
+# (CallerCacheKey): the allowance and ``is_billing_owner`` are the caller's own.
 _TTL_OK = 30.0
 _TTL_FAIL = 15.0
-# Derived, not restated, so raising a TTL cannot start evicting live entries.
-_MAX_TTL_S = max(_TTL_OK, _TTL_FAIL)
-
-# Keyed by (auth host, org, user, credential digest): the workspace caches' key,
-# for the same reason. `user_id` is empty outside org mode, so without the bearer
-# in the key every caller on a desktop install would share one entry, and a
-# sign-out and sign-in as another account would be served the first account's
-# balance and owner flag for the rest of the TTL.
-_cache: dict[tuple[str, str, str, str], tuple[float, HubUsageView]] = {}
+_cache: CallerTtlCache[MindsHubUsageView] = CallerTtlCache(ttl_ok_s=_TTL_OK, ttl_fail_s=_TTL_FAIL)
 
 
 def _usd(value: Any) -> Optional[float]:
@@ -74,7 +70,7 @@ def _usd(value: Any) -> Optional[float]:
         return None
 
 
-def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
+def _parse_free_tokens(payload: Any) -> Optional[MindsHubFreeTokens]:
     """Read the allowance as a proportion.
 
     ``included_percent_remaining`` is the canonical field and the only one read.
@@ -104,12 +100,12 @@ def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
     # sends `next_refresh_at` for this organization, but it has no allowance to
     # refill, so relaying the instant would promise tokens that never arrive.
     if payload.get("free_grant_eligible") is False:
-        return HubFreeTokens(percent_remaining=0.0, limit=0, used=0, remaining=0, resets_at=None)
+        return MindsHubFreeTokens(percent_remaining=0.0, limit=0, used=0, remaining=0, resets_at=None)
 
     percent = payload.get("included_percent_remaining")
     if percent is None:
         # Uncapped: nothing to count down, and nothing for a bar to show.
-        return HubFreeTokens(percent_remaining=None, limit=-1, used=0, remaining=-1, resets_at=resets_at)
+        return MindsHubFreeTokens(percent_remaining=None, limit=-1, used=0, remaining=-1, resets_at=resets_at)
     # Fail closed on anything that is not a real number. ``NaN`` would survive
     # the clamp below as 100.0, because every comparison against it is false,
     # and hand the caller a full allowance on a malformed body. A JSON integer
@@ -125,7 +121,7 @@ def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
         return None
 
     percent = max(0.0, min(100.0, percent))
-    return HubFreeTokens(
+    return MindsHubFreeTokens(
         percent_remaining=percent,
         limit=_PROPORTION_LIMIT,
         used=_PROPORTION_LIMIT - percent,
@@ -134,13 +130,13 @@ def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
     )
 
 
-def _parse_balance(payload: Any) -> Optional[HubBalance]:
+def _parse_balance(payload: Any) -> Optional[MindsHubBalance]:
     if not isinstance(payload, dict):
         return None
     usd = _usd(payload.get("balance_usd"))
     if usd is None:
         return None
-    return HubBalance(
+    return MindsHubBalance(
         usd=usd,
         can_consume=bool(payload.get("can_consume", True)),
         has_topped_up=bool(payload.get("has_topped_up", False)),
@@ -148,7 +144,7 @@ def _parse_balance(payload: Any) -> Optional[HubBalance]:
     )
 
 
-def _parse_auto_top_up(payload: Any) -> Optional[HubAutoTopUp]:
+def _parse_auto_top_up(payload: Any) -> Optional[MindsHubAutoTopUp]:
     if not isinstance(payload, dict):
         return None
     auto = payload.get("auto_recharge")
@@ -161,7 +157,7 @@ def _parse_auto_top_up(payload: Any) -> Optional[HubAutoTopUp]:
         else "cap_reached" if auto.get("cap_reached")
         else "ok"
     )
-    return HubAutoTopUp(
+    return MindsHubAutoTopUp(
         enabled=bool(auto.get("enabled", False)),
         threshold_usd=_usd(auto.get("threshold_usd")),
         recharge_to_usd=_usd(auto.get("recharge_to_usd")),
@@ -169,7 +165,7 @@ def _parse_auto_top_up(payload: Any) -> Optional[HubAutoTopUp]:
     )
 
 
-def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
+def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[MindsHubCreditSpend]:
     """The period's paid spend.
 
     Prefer the usage summary, the console's own source, but only when its
@@ -192,7 +188,7 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
             usd = _usd(cost.get("total_usd"))
         source = meta.get("cost_source")
         if usd is not None and source in (None, "metronome_invoice"):
-            return HubCreditSpend(
+            return MindsHubCreditSpend(
                 usd=usd,
                 period_start=rng.get("start") if isinstance(rng.get("start"), str) else None,
                 period_end=rng.get("end") if isinstance(rng.get("end"), str) else None,
@@ -201,7 +197,7 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
         spend = wallet["credit_spend"]
         usd = _usd(spend.get("amount_usd"))
         if usd is not None:
-            return HubCreditSpend(
+            return MindsHubCreditSpend(
                 usd=usd,
                 period_start=spend.get("period_start") if isinstance(spend.get("period_start"), str) else None,
                 period_end=spend.get("period_end") if isinstance(spend.get("period_end"), str) else None,
@@ -209,11 +205,11 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[HubCreditSpend]:
     return None
 
 
-def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> HubUsageView:
+def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> MindsHubUsageView:
     """Turn the auth bodies into one view. Any body may be None."""
     if entitlements is None and wallet is None and summary is None:
-        return HubUsageView()
-    return HubUsageView(
+        return MindsHubUsageView()
+    return MindsHubUsageView(
         reachable=True,
         is_billing_owner=bool(entitlements.get("is_billing_owner")) if isinstance(entitlements, dict) else False,
         free_tokens=_parse_free_tokens(entitlements),
@@ -223,34 +219,31 @@ def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> HubUsage
     )
 
 
-async def fetch_hub_usage(*, bearer_token: str, org_id: str, user_id: str) -> HubUsageView:
+async def fetch_mindshub_usage(*, bearer_token: str, org_id: str, user_id: str) -> MindsHubUsageView:
     """The caller's free allowance and their organization's wallet.
 
     Unreachable returns ``reachable=False`` rather than raising: the surfaces
     render nothing and keep whatever they last had.
     """
     if not bearer_token:
-        return HubUsageView()
+        return MindsHubUsageView()
 
-    key = cache_key(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
-    cached = _cache.get(key)
-    if cached:
-        stamped, value = cached
-        if (time.monotonic() - stamped) < (_TTL_OK if value.reachable else _TTL_FAIL):
-            return value
+    key = CallerCacheKey.for_caller(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
+    cached = _cache.fresh(key)
+    if cached is not None:
+        return cached
 
-    # get_auth_json never raises by contract; return_exceptions keeps one
+    # get_mindshub_json never raises by contract; return_exceptions keeps one
     # surprise from taking the other two reads down with it.
     results = await asyncio.gather(
-        get_auth_json(ENTITLEMENTS_PATH, bearer_token),
-        get_auth_json(WALLET_PATH, bearer_token),
-        get_auth_json(USAGE_SUMMARY_PATH, bearer_token),
+        get_mindshub_json(ENTITLEMENTS_PATH, bearer_token),
+        get_mindshub_json(WALLET_PATH, bearer_token),
+        get_mindshub_json(USAGE_SUMMARY_PATH, bearer_token),
         return_exceptions=True,
     )
     entitlements, wallet, summary = (None if isinstance(r, BaseException) else r for r in results)
     view = parse_usage(entitlements, wallet, summary)
-    sweep_cache(_cache, max_ttl_s=_MAX_TTL_S)
-    _cache[key] = (time.monotonic(), view)
+    _cache.put(key, view)
     return view
 
 

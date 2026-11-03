@@ -362,8 +362,8 @@ async def test_download_skips_the_comment_layer(tmp_path, monkeypatch):
         ('evil" bad.txt', 'evil\\" bad.txt', "evil%22%20bad.txt"),
         # CR/LF are dropped: the header can never gain a second line.
         ("a\r\nX-Injected: 1.txt", "aX-Injected: 1.txt", "aX-Injected%3A%201.txt"),
-        # Non-ASCII survives only in the RFC 5987 spelling; the ASCII one degrades.
-        ("rapport-\u00e9.xlsx", "rapport-.xlsx", "rapport-%C3%A9.xlsx"),
+        # Non-ASCII survives only in the RFC 5987 spelling; the ASCII one drops the accent.
+        ("rapport-\u00e9.xlsx", "rapport-e.xlsx", "rapport-%C3%A9.xlsx"),
         # A fully non-ASCII stem must not degrade to a hidden ".xlsx" dotfile
         # (review finding on #413: two such names also collide, so a second
         # `curl -OJ` fails outright).

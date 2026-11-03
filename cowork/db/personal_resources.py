@@ -80,12 +80,26 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "channel_events": PersonalResource.CONVERSATIONS,
     "projects": PersonalResource.PROJECTS,
     "artifact_identities": PersonalResource.PROJECTS,
+    # The sharing an artifact's owner last chose: MindsHub mode only, where
+    # every resource is partitioned, so this entry decides nothing in
+    # single-tenant mode.
+    "artifact_owner_choices": PersonalResource.PROJECTS,
     # Authorship claims for skills, project memory and project instructions.
     # SharedResourceAccess reads and writes them only in org mode, where every
     # resource is partitioned, so this entry decides nothing in a personal scope.
     "shared_resource_attributions": PersonalResource.PROJECTS,
     "shared_resource_mutations": PersonalResource.PROJECTS,
     "files": PersonalResource.FILES,
+    # Shared exactly when the vault is, so a shared connection's connector
+    # definition is visible to everyone who sees the connection.
+    "custom_connectors": PersonalResource.CONNECTIONS,
+    # Who a skill is shared with: MindsHub mode only, where every resource
+    # is partitioned, so this entry decides nothing in single-tenant mode.
+    "skill_access": PersonalResource.SKILLS,
+    # One person's own on/off per skill: kept with the skills it names, so
+    # it is the partition's where skills are, and deployment-wide (keyed by
+    # the person alone) where skills are left shared.
+    "skill_user_setting": PersonalResource.SKILLS,
     "schedules": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
     # SettingService routes its own rows; ScopedSession leaves this table alone.

@@ -8,18 +8,46 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
+import stat
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
+from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, open_fd, read_bounded
+from cowork.services.artifact_journal import (
+    JOURNAL_DIRNAME,
+    MAX_JOURNAL_RECORD_BYTES,
+    JournalFileRefused,
+    iter_journal_json,
+    prune_journal_folder,
+    read_journal_file,
+    read_journal_json,
+    remove_journal_file,
+    write_journal_file,
+)
 from cowork.services.artifact_lock import artifact_lock
+
+logger = logging.getLogger(__name__)
 
 EDITABLE_EXTENSIONS = frozenset({".md", ".txt", ".html", ".htm"})
 MAX_SOURCE_BYTES = 2_000_000
 MAX_REVISIONS = 80
-JOURNAL_DIRNAME = REVISIONS_DIRNAME
+# Names inside the journal folder (artifact_journal.JOURNAL_DIRNAME).
+_MANIFEST = "manifest.json"
+_PENDING = "pending-source-write.json"
+_REPAIRS = "repairs"
+_BLOBS = "blobs"
+# The manifest holds at most MAX_REVISIONS entries, each a few kilobytes at
+# most (a 1,000-character path, a 240-character summary), so a larger one is
+# not the server's.
+_MAX_MANIFEST_BYTES = 1024 * 1024
+# A blob's name is the sha256 of its bytes. Matched with fullmatch: `$` would
+# also accept a trailing newline.
+_CONTENT_HASH = re.compile(r"[0-9a-f]{64}")
 # A queued repair whose turn never reported inside this window is presumed
 # dead. Without it a turn killed between minting the handoff and starting the
 # agent gates that source path forever.
@@ -72,29 +100,30 @@ def _sha(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _journal(folder: Path) -> Path:
-    return folder / JOURNAL_DIRNAME
+def _is_content_hash(value: object) -> bool:
+    return isinstance(value, str) and _CONTENT_HASH.fullmatch(value) is not None
 
 
-def _manifest_path(folder: Path) -> Path:
-    return _journal(folder) / "manifest.json"
-
-
-def _pending_path(folder: Path) -> Path:
-    return _journal(folder) / "pending-source-write.json"
-
-
-def _repairs_dir(folder: Path) -> Path:
-    return _journal(folder) / "repairs"
+def _is_repair_id(value: object) -> bool:
+    """Whether ``value`` is a repair id the server could have minted: a UUID in
+    its canonical spelling, which is also safe as a file name. A repair record
+    is a file the agent's code can write, so its id is checked before it names
+    a file."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
 
 
 def _read_manifest(folder: Path) -> dict:
     try:
-        data = json.loads(_manifest_path(folder).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {"version": 1, "revisions": []}
-    except (OSError, json.JSONDecodeError) as exc:
+        data = read_journal_json(folder, _MANIFEST, max_bytes=_MAX_MANIFEST_BYTES)
+    except (OSError, ValueError) as exc:
         raise RevisionValidationError("Artifact revision history is unreadable") from exc
+    if data is None:
+        return {"version": 1, "revisions": []}
     if not isinstance(data, dict) or not isinstance(data.get("revisions"), list):
         raise RevisionValidationError("Artifact revision history is invalid")
     return data
@@ -133,17 +162,17 @@ def _atomic_bytes(path: Path, content: bytes, *, mode: int | None = None) -> Non
 
 def _write_manifest(folder: Path, payload: dict) -> None:
     encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_bytes(_manifest_path(folder), encoded)
+    write_journal_file(folder, _MANIFEST, content=encoded)
 
 
 def _write_pending(folder: Path, payload: dict) -> None:
     encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_bytes(_pending_path(folder), encoded, mode=0o600)
+    write_journal_file(folder, _PENDING, content=encoded)
 
 
 def _clear_pending(folder: Path) -> None:
     try:
-        _pending_path(folder).unlink(missing_ok=True)
+        remove_journal_file(folder, _PENDING)
     except OSError:
         # The transaction is already committed or deliberately abandoned. A
         # stale marker is harmless and will be recognized on the next read.
@@ -151,37 +180,50 @@ def _clear_pending(folder: Path) -> None:
 
 
 def _write_repair(folder: Path, repair: dict) -> None:
+    repair_id = repair.get("id")
+    if not _is_repair_id(repair_id):
+        raise RevisionValidationError("Agent repair id is invalid")
     encoded = (json.dumps(repair, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_bytes(_repairs_dir(folder) / f"{repair['id']}.json", encoded, mode=0o600)
+    write_journal_file(folder, _REPAIRS, f"{repair_id}.json", content=encoded)
+
+
+def _own_record(repair_id: str, repair: object) -> dict | None:
+    """``repair`` when it is the record saved as ``repairs/<repair_id>.json``.
+
+    A record whose own id isn't its file name's is refused, so a copied or
+    planted record can't be written back under another name.
+    """
+    if not isinstance(repair, dict) or repair.get("id") != repair_id:
+        return None
+    return repair
+
+
+def _load_repair(folder: Path, repair_id: str) -> dict | None:
+    """The record saved as ``repairs/<repair_id>.json``, or None. A read that
+    couldn't be made raises."""
+    try:
+        repair = read_journal_json(folder, _REPAIRS, f"{repair_id}.json")
+    except (JournalFileRefused, ValueError):
+        return None
+    return _own_record(repair_id, repair)
 
 
 def _read_repair(folder: Path, repair_id: str) -> dict:
-    try:
-        uuid.UUID(repair_id)
-        repair = json.loads(
-            (_repairs_dir(folder) / f"{repair_id}.json").read_text(encoding="utf-8")
-        )
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
-        raise FileNotFoundError("Agent repair not found") from exc
-    if not isinstance(repair, dict) or repair.get("id") != repair_id:
+    repair = _load_repair(folder, repair_id) if _is_repair_id(repair_id) else None
+    if repair is None:
         raise FileNotFoundError("Agent repair not found")
     return repair
 
 
-def _repair_records(folder: Path) -> list[dict]:
-    try:
-        paths = sorted(_repairs_dir(folder).glob("*.json"))
-    except OSError:
-        return []
-    records: list[dict] = []
-    for path in paths:
-        try:
-            repair = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(repair, dict):
-            records.append(repair)
-    return records
+def _repair_records(folder: Path) -> Iterator[dict]:
+    """The repair records, one at a time, so a caller that stops early or
+    keeps only some holds no more than one parsed record."""
+    for repair_id, repair in iter_journal_json(
+        folder, _REPAIRS, suffix=".json", accept=_is_repair_id
+    ):
+        record = _own_record(repair_id, repair)
+        if record is not None:
+            yield record
 
 
 def _actionable_repairs_for_path(folder: Path, rel_path: str) -> list[dict]:
@@ -313,19 +355,86 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
             target.relative_to(canonical_folder)
         except ValueError as exc:
             raise RevisionValidationError("Invalid artifact source path") from exc
-    if not target.is_file() or target.is_symlink():
+    from cowork.services.artifacts import _is_the_projects_secrets
+
+    # The source route reads and writes the file in place, so the project's
+    # `.anton/.env` under a second name is refused too. Other hard-linked
+    # sources, such as one a backup tool made, still open.
+    if (
+        not target.is_file()
+        or target.is_symlink()
+        or _is_the_projects_secrets(target.lstat(), anton_dir=canonical_folder.parent.parent)
+    ):
         raise FileNotFoundError("Artifact source not found")
     if target.suffix.lower() not in EDITABLE_EXTENSIONS:
         raise RevisionValidationError("This artifact type is not source-editable")
     return target, target.resolve(strict=False).relative_to(canonical_folder).as_posix()
 
 
-def _content_for_revision(folder: Path, revision: dict) -> str:
-    blob = _journal(folder) / "blobs" / str(revision.get("contentHash", ""))
+def _read_source(target: Path) -> bytes:
+    """An editable source's bytes. One past MAX_SOURCE_BYTES is refused before
+    it's read, so a sparse file can't fill the server's memory."""
+    fd = open_fd(target, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     try:
-        return blob.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RevisionValidationError("Revision content is unavailable") from exc
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode):
+            raise FileNotFoundError("Artifact source not found")
+        if found.st_size > MAX_SOURCE_BYTES:
+            raise RevisionValidationError("Artifact source is too large to edit")
+        return b"".join(read_bounded(fd, found.st_size))
+    finally:
+        os.close(fd)
+
+
+def _refused_blob(reason: str) -> None:
+    logger.warning(
+        "Refused an artifact revision blob",
+        extra={"event": "artifact_revision_blob_refused", "reason": reason},
+    )
+
+
+def _blob_bytes(folder: Path, content_hash: object) -> bytes | None:
+    """The saved bytes of one revision, or None when there are none to trust.
+
+    The manifest and the pending record that name a blob are files the agent's
+    code can write. So a blob is read only as ``blobs/<sha256>`` from this
+    artifact's own journal, and a name that isn't 64 lowercase hex characters
+    is never opened. The blob must be a regular file with one name, no larger
+    than an editable source, and its bytes must match its name. Anything else
+    answers None, as a missing blob does. A read that couldn't be made raises.
+    """
+    if not _is_content_hash(content_hash):
+        _refused_blob("invalid_name")
+        return None
+    try:
+        content = read_journal_file(folder, _BLOBS, content_hash, max_bytes=MAX_SOURCE_BYTES)
+    except JournalFileRefused:
+        # read_journal_file logged why.
+        return None
+    if content is not None and _sha(content) != content_hash:
+        _refused_blob("hash_mismatch")
+        return None
+    return content
+
+
+def _store_blob(folder: Path, content_hash: str, content: bytes) -> None:
+    """Save ``content``, whose sha256 is ``content_hash``, unless a blob the
+    server can trust already holds it. A refused blob at that name is replaced
+    by the server's own bytes; the name goes, not the file it pointed to."""
+    if _blob_bytes(folder, content_hash) is None:
+        write_journal_file(folder, _BLOBS, content_hash, content=content)
+
+
+def _content_for_revision(folder: Path, revision: dict) -> str:
+    """A revision's saved text. A blob that is missing, refused or not UTF-8
+    answers as a missing revision does, so a route returns 404 and none of it."""
+    content = _blob_bytes(folder, revision.get("contentHash"))
+    if content is not None:
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    raise FileNotFoundError("Revision not found")
 
 
 def _new_revision(
@@ -364,11 +473,7 @@ def _persist_revision(folder: Path, manifest: dict, entry: dict, content: bytes)
     content_hash = str(entry.get("contentHash") or "")
     if content_hash != _sha(content):
         raise RevisionValidationError("Revision content hash is invalid")
-    blob = _journal(folder) / "blobs" / content_hash
-    if not blob.exists():
-        _atomic_bytes(blob, content, mode=0o600)
-    elif _sha(blob.read_bytes()) != content_hash:
-        raise RevisionValidationError("Stored revision content is corrupt")
+    _store_blob(folder, content_hash, content)
     revisions = manifest["revisions"]
     existing = next((item for item in revisions if item.get("id") == entry.get("id")), None)
     if existing is not None:
@@ -383,10 +488,7 @@ def _persist_revision(folder: Path, manifest: dict, entry: dict, content: bytes)
     if pruned:
         retained_hashes = {str(item.get("contentHash")) for item in revisions}
         try:
-            blobs = (_journal(folder) / "blobs").iterdir()
-            for path in blobs:
-                if path.name not in retained_hashes:
-                    path.unlink(missing_ok=True)
+            prune_journal_folder(folder, _BLOBS, keep=retained_hashes)
         except OSError:
             # The manifest is already durable; orphan cleanup is best-effort.
             pass
@@ -422,39 +524,60 @@ def _append_revision(
     return _persist_revision(folder, manifest, entry, content)
 
 
+def _abandon_pending(folder: Path, reason: str) -> None:
+    logger.warning(
+        "Abandoned an artifact's pending source write",
+        extra={"event": "artifact_pending_write_abandoned", "reason": reason},
+    )
+    _clear_pending(folder)
+
+
 def _recover_pending_source_write(folder: Path) -> None:
     """Finish or safely abandon a source/revision transaction after a crash.
 
     The artifact lock must be held. A pending edit is completed only while its
     recorded base is still the manifest head and the source is either the old
     or intended content. An unrelated external write always wins.
+
+    The record is a file the agent's code can write, so it is checked before
+    anything it names is opened. One the server couldn't have written is
+    abandoned: a damaged record, a source path outside the artifact's editable
+    files, or a blob the server doesn't trust. The server saves the blob before
+    the record, so a real crash never leaves one of those behind. A read that
+    couldn't be made raises and keeps the record for the next request.
     """
-    pending_path = _pending_path(folder)
     try:
-        pending = json.loads(pending_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        pending = read_journal_json(folder, _PENDING, max_bytes=MAX_JOURNAL_RECORD_BYTES)
+    except (JournalFileRefused, ValueError):
+        _abandon_pending(folder, "unreadable")
         return
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RevisionValidationError("Pending artifact edit is unreadable") from exc
-    if not isinstance(pending, dict) or pending.get("version") != 1:
-        raise RevisionValidationError("Pending artifact edit is invalid")
+    if pending is None:
+        return
+    if not isinstance(pending, dict):
+        _abandon_pending(folder, "invalid")
+        return
     entry = pending.get("revision")
     rel_path = pending.get("path")
     before_hash = pending.get("beforeContentHash")
-    if not isinstance(entry, dict) or not isinstance(rel_path, str) or entry.get("path") != rel_path:
-        raise RevisionValidationError("Pending artifact edit is invalid")
-    parts = Path(rel_path).parts
-    if Path(rel_path).is_absolute() or ".." in parts or JOURNAL_DIRNAME in parts:
-        raise RevisionValidationError("Pending artifact edit path is invalid")
-    target = (folder / rel_path).resolve(strict=False)
+    if (
+        pending.get("version") != 1
+        or not isinstance(entry, dict)
+        or not isinstance(rel_path, str)
+        or not rel_path.strip()
+        or entry.get("path") != rel_path
+    ):
+        _abandon_pending(folder, "invalid")
+        return
+    content = _blob_bytes(folder, entry.get("contentHash"))
+    if content is None:
+        _abandon_pending(folder, "blob_refused")
+        return
     try:
-        target.relative_to(folder.resolve())
-        content = (_journal(folder) / "blobs" / str(entry.get("contentHash") or "")).read_bytes()
-        current = target.read_bytes()
-    except (OSError, ValueError) as exc:
-        raise RevisionValidationError("Pending artifact edit cannot be recovered") from exc
-    if _sha(content) != entry.get("contentHash"):
-        raise RevisionValidationError("Pending artifact edit content is invalid")
+        target, _ = resolve_source(folder, {}, rel_path)
+        current = _read_source(target)
+    except (FileNotFoundError, ValueError):
+        _abandon_pending(folder, "source_unavailable")
+        return
 
     manifest = _read_manifest(folder)
     revisions = manifest["revisions"]
@@ -508,9 +631,7 @@ def _commit_source_revision(
         conversation_id=conversation_id,
         comment_thread_ids=comment_thread_ids,
     )
-    blob = _journal(folder) / "blobs" / entry["contentHash"]
-    if not blob.exists():
-        _atomic_bytes(blob, content, mode=0o600)
+    _store_blob(folder, entry["contentHash"], content)
     _write_pending(
         folder,
         {
@@ -532,9 +653,7 @@ def _current_source_locked(
     """Read/capture source while the caller holds the artifact revision lock."""
     _recover_pending_source_write(folder)
     target, relative = resolve_source(folder, metadata, rel_path)
-    content = target.read_bytes()
-    if len(content) > MAX_SOURCE_BYTES:
-        raise RevisionValidationError("Artifact source is too large to edit")
+    content = _read_source(target)
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -611,7 +730,7 @@ def save_source(
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
         target, relative = resolve_source(folder, metadata, rel_path)
-        existing = target.read_bytes()
+        existing = _read_source(target)
         manifest = _read_manifest(folder)
         latest = next(
             (r for r in reversed(manifest["revisions"]) if r.get("path") == relative),
@@ -685,9 +804,7 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
         with artifact_lock(folder):
             _recover_pending_source_write(folder)
             target, relative = resolve_source(folder, metadata)
-            content = target.read_bytes()
-            if len(content) > MAX_SOURCE_BYTES:
-                return None
+            content = _read_source(target)
             content.decode("utf-8")
             manifest = _read_manifest(folder)
             latest = next(

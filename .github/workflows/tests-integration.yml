@@ -144,9 +144,14 @@ jobs:
           # Selected by name rather than by label: the chart comes from an
           # external `deployment` dependency, so its label scheme is not ours to
           # rely on. Deployment pods are always <deployment>-<hash>-<suffix>.
+          # A pod being deleted keeps phase Running through its preStop sleep
+          # and shutdown, up to the chart's 60 s grace, and `helm --wait` does
+          # not wait for it. Skip any pod with a deletionTimestamp, or a
+          # port-forward can land on one that closes mid-test. A go-template
+          # rather than jq, which these runners need not have.
           mapfile -t pods < <(
             kubectl get pods -n "$ns" --field-selector=status.phase=Running \
-              -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+              -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null \
               | grep '^cowork-server-' || true
           )
           if [[ "${#pods[@]}" -lt 2 ]]; then
@@ -169,7 +174,7 @@ jobs:
                  "A green job here says nothing about it."
             exit 0
           fi
-          # 9010 is the port uvicorn binds (see the chart's args). Reached
+          # 9010 is the port uvicorn binds (see the Dockerfile's CMD). Reached
           # directly, so no ingress and no injected identity: the test sends the
           # identity headers itself.
           health=/api/v1/health/

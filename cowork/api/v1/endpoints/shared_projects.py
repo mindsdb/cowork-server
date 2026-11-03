@@ -1,10 +1,10 @@
 """Read-only recipient routes. Every request rechecks the operator's grant."""
 from contextlib import contextmanager
-from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
+from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.project_files import ProjectFileListResponse, ProjectFileReadResponse
@@ -50,7 +50,7 @@ def download_file(project_id: UUID, path: str, session: ScopedSessionDep):
     with _file_errors():
         content, _ = SharedProjectFiles(session).read_file(project_id, path, limit=DOWNLOAD_MAX_BYTES)
         return Response(content, media_type="application/octet-stream", headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(path.rsplit('/', 1)[-1], safe='')}",
+            "Content-Disposition": attachment_disposition(path.rsplit("/", 1)[-1]),
             "X-Content-Type-Options": "nosniff",
             "Cache-Control": "no-store",
             "Content-Security-Policy": "sandbox; default-src 'none'",
