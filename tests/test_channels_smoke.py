@@ -21,6 +21,7 @@ from cowork.channels.webhooks import drain_background_tasks
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import ChannelContext
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
+from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.server import create_app
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
@@ -213,6 +214,28 @@ def test_rich_turn_appends_conversation_link(monkeypatch):
     )
     assert assistant.content == REPLY
     s.close()
+
+
+def test_runtime_marks_its_conversation_with_the_routes_channel(monkeypatch):
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness())
+
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s", "bot_username": "b"})
+    event = asyncio.run(bridge.parse_inbound(
+        body=telegram_update(51, 98, 1, "hello"), headers={}, route_name=None,
+    ))[0]
+
+    adapters = LiveAdapterRegistry(registry)
+    adapters._cache[("telegram", None)] = FakeAdapter()
+    asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
+
+    s = get_open_session()
+    try:
+        binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == "98")).one()
+        assert s.get(Conversation, binding.anton_conversation_id).channel_type == "telegram"
+    finally:
+        s.close()
 
 
 def test_channel_turn_persists_tool_rows_and_hides_history_event(monkeypatch):
