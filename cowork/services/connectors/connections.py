@@ -295,11 +295,10 @@ class ConnectionsService:
             return remaining
 
     def picked_files_by_project(self, data_vault, project_name: str) -> dict[str, list[dict]]:
-        """Google-Picker-granted files visible to `project_name`, keyed by
-        connection name. Callers (the Anton harness, once per chat turn) use
-        this to tell the agent about files a plain files.list()/files.search()
-        call won't return — the google_drive connector's drive.file scope only
-        covers files the app created plus these specifically granted ones.
+        """Drive files the user added with the Google Picker that are visible
+        to `project_name`, keyed by connection name. Callers (the Anton
+        harness, once per chat turn) use this to tell the agent which files
+        the user added to the project.
 
         A file is visible if it's untagged (picked with no project context —
         a connection-wide grant meant to be usable everywhere, same as the

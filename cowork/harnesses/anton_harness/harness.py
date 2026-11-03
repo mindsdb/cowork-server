@@ -450,14 +450,13 @@ def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead
 
 
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
-    """Prompt text naming the Google-Picker-granted Drive files, or "".
+    """Prompt text naming the Drive files the user added to this project, or "".
 
-    A plain files.list()/files.search() call does NOT return these files (the
-    google_drive connector's drive.file scope only covers files the app
-    created itself, plus these specifically granted ones), so the agent has
-    to be told about them by name. The general Drive API rules
-    (supportsAllDrives, corpora) are not here: they apply to every Drive
-    connection and come from google_drive.json's usage_notes.
+    The agent is told about them by name so it knows which files the user
+    means. A connection whose user unticked drive.readonly on the consent
+    screen can still read these, because picking a file grants drive.file
+    access to it. The general Drive API rules come from google_drive.json's
+    usage_notes.
     """
     if not picked_by_connection:
         return ""
@@ -475,16 +474,11 @@ def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
         for f in files
     ]
     return (
-        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
-        "access to via the Google Picker, which a plain files.list()/files.search() call "
-        "will NOT return (the google_drive connector's scope only covers files this app "
-        "created itself, plus these specifically granted ones):\n"
+        "\n\nGoogle Drive files the user added to this project:\n"
         + "\n".join(picked_lines)
-        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
-        "include every file above IN ADDITION to whatever files.list()/files.search() "
-        "returns — do not report only the API call's results. To read one of these "
-        "files' content, call files.get(fileId=...) directly with its id above; do not "
-        "expect it to appear in a files.list() response first. If a file above has a "
+        + "\nWhen the user refers to their project files, they mean these. Read one "
+        "directly by its id above (files.get or files.export); it may not appear in a "
+        "files.list() response, for example when it was shared by link. If a file above has a "
         "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
         "even though access was actually granted — either add header "
         "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
