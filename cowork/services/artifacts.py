@@ -213,6 +213,8 @@ TEXT_EXTENSIONS = {
     ".ts", ".tsx", ".css", ".log",
 }
 
+PREVIEW_TEXT_MAX = 200_000
+
 
 # ─── Helpers ──────────────────────────────────────────────────────
 
@@ -1804,6 +1806,56 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                 continue
 
     return cards
+
+
+def _line_breaks(text: str, start: int, end: int) -> int:
+    # `\r\n` is one break; a bare `\n` or `\r` is one each.
+    return (
+        text.count("\n", start, end)
+        + text.count("\r", start, end)
+        - text.count("\r\n", start, end)
+    )
+
+
+def count_csv_rows(text: str) -> int:
+    """Count CSV records, header included, by the rules of the renderer's countCsvRows.
+
+    The preview footer sits under a table the renderer parses, so both sides must
+    agree on every input, including a quote that opens a field only at its start
+    and a last record counted by the final character alone. The scan jumps from
+    quote to quote and counts line breaks with str.count, so a large file never
+    runs a per-character Python loop.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    end = len(text)
+    rows = 0
+    pos = 0
+    while pos < end:
+        quote = text.find('"', pos)
+        if quote < 0:
+            rows += _line_breaks(text, pos, end)
+            break
+        rows += _line_breaks(text, pos, quote)
+        if quote and text[quote - 1] not in ",\n\r":
+            # A quote inside a field is literal.
+            pos = quote + 1
+            continue
+        # Skip the quoted field; `""` inside it is an escaped quote.
+        close = quote + 1
+        while True:
+            close = text.find('"', close)
+            if close < 0:
+                close = end
+                break
+            if text.startswith('"', close + 1):
+                close += 2
+                continue
+            break
+        pos = close + 1
+    if text and text[-1] not in "\n\r":
+        rows += 1
+    return rows
 
 
 def preview_artifact(path: Path) -> dict:
