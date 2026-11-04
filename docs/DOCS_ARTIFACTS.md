@@ -13,6 +13,9 @@ The modules depend in one direction, each on those above it:
 | `ops` | The atomic edit operations |
 | `undo` | What puts back one of the person's writes |
 | `render` | The agent's outline and full views, the page (`doc.html`) and export markup |
+| `store` | The doc file in its artifact folder: the lock, atomic writes, one kept version per editing session |
+| `hub` | In-process fan-out of changes to the editors and chats watching |
+| `service` | Create and apply (rendering the page under the doc's lock), and `announce` |
 
 ## The format
 
@@ -56,6 +59,33 @@ The person's ops (`by: "user"`) are taken as sent: an empty text empties a block
 
 `undo.undo_ops` gives the ops that put back what one write changed, from the doc just before and after it, and nothing else: another writer's change in between is never part of them. An undo is a write like any other, so its own undo is the redo.
 
+## Storage
+
+A doc is an ordinary anton artifact folder:
+
+```
+<project>/.anton/artifacts/<slug>/
+  metadata.json            type "document", primary "doc.cdoc.json"
+  doc.cdoc.json            the doc (schema cowork.doc/1)
+  doc.html                 its page, rendered after every write
+  .revisions/doc-history/  kept versions, index.json, and open.json (the session writing now)
+```
+
+The artifacts library, provenance and delete therefore work unchanged.
+
+## One write path
+
+Both the agent and the editor apply the same ops through `cowork.docs.service.apply`. That function:
+
+- serialises writers of one doc on its lock, which holds across processes too (the artifact's `.revisions/.lock`), so two replicas serving one shared tree never write the same rev;
+- keeps one version per editing session: when a session ends, the doc as it left it is kept. A session is one reply of the agent's (`turn`, which the doc tools name per turn), or a stretch of a person's typing that ends after a five-minute pause, after thirty minutes, or when the agent writes. The newest 100 are kept, and only as many as fit in 50 MB, always at least one;
+- re-renders `doc.html`, the page a doc is shared as, still under the lock;
+- for the person's writes, answers `undo`, the ops that put that write back, worked out under the same lock.
+
+Callers then announce the change (`service.announce`) on the in-process hub (`cowork.docs.hub`) to the editors and chats watching.
+
+Every write lands at once, like a Google Doc's: there is no save step and no versions to manage.
+
 ## Working on it
 
 Tests, in `tests/`:
@@ -63,3 +93,4 @@ Tests, in `tests/`:
 - `test_docs_format.py`: the model, Markdown and rendering.
 - `test_docs_ops.py`: the edit operations and the stale guard.
 - `test_docs_undo.py`: undoing and redoing each kind of edit.
+- `test_docs_store.py`: the write path, editing sessions and their versions, and the hub.
