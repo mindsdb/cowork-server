@@ -105,3 +105,27 @@ def test_malformed_body_is_rejected_before_queueing(client, turn, pod, body, exp
     assert resp.status_code == 400
     assert resp.json() == {"status": expected}
     assert pod["calls"] == []
+
+
+@pytest.mark.parametrize("result,question_id,values,extended", [
+    (RemoteAnswerResult.ACCEPTED, "limit:abc", ["continue"], True),
+    (RemoteAnswerResult.ACCEPTED, "limit:abc", ["stop"], False),
+    (RemoteAnswerResult.ALREADY_ANSWERED, "limit:abc", ["continue"], False),
+    (RemoteAnswerResult.ACCEPTED, QID, ["continue"], False),
+])
+def test_keep_going_at_a_limit_extends_the_turns_key(
+    client, turn, pod, monkeypatch, result, question_id, values, extended,
+):
+    """Only an answer the pod accepted extends the key: a second tab's
+    duplicate Keep going must not buy another window."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
+    extend = AsyncMock(return_value=True)
+    monkeypatch.setattr(endpoints, "extend_turn_key", extend)
+    pod["result"] = result
+    client.post("/api/v1/responses/answer",
+                json={"conversation_id": CID, "question_id": question_id, "values": values})
+    assert extend.called is extended
+    if extended:
+        assert extend.call_args.kwargs["instance_id"] == "corr-1"

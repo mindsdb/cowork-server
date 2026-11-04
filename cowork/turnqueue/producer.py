@@ -36,6 +36,7 @@ from cowork.turnqueue.auth_keys import (
     mint_turn_key,
     mint_turn_key_details,
     register_datasource_grants,
+    revoke_turn_key,
 )
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
@@ -205,7 +206,7 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+        ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
     return _build_llm_block(api_key, settings)
@@ -232,7 +233,7 @@ async def _mint_llm_block_with_turn_key_id(
         user_id=user_id,
         org_id=org_id,
         correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds,
+        ttl_seconds=settings.turn_key_lifetime_seconds,
         settings=settings,
         workspace_id=workspace_id,
     )
@@ -558,7 +559,36 @@ def step_stream_events(data: dict) -> list:
     return []
 
 
-async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
+async def stream_remote_replies(*, correlation_id: str | None = None, **kwargs):
+    """Run one remote turn (``_stream_remote_replies``), then revoke its turn key.
+
+    However the turn ends (completed, failed, stopped, the idle bound, or the
+    caller closing this generator), its key must not keep working afterwards:
+    the pod that held it may still be alive.
+    """
+    corr = correlation_id or _new_correlation_id()
+    inner = _stream_remote_replies(correlation_id=corr, **kwargs)
+    try:
+        async for item in inner:
+            yield item
+    finally:
+        await inner.aclose()
+        await _revoke_turn_key_quietly(corr)
+
+
+async def _revoke_turn_key_quietly(correlation_id: str) -> None:
+    """Revoke a turn's key, logging rather than raising: the turn is over either
+    way, and a failed revoke leaves the key to its own expiry."""
+    settings = TurnQueueSettings()
+    if not settings.auth_internal_base_url or not settings.auth_internal_secret:
+        return
+    try:
+        await asyncio.wait_for(revoke_turn_key(instance_id=correlation_id, settings=settings), timeout=5)
+    except Exception:
+        logger.warning("turn key revoke failed: correlation_id=%s", correlation_id, exc_info=True)
+
+
+async def _stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
                                 turn_id: int = 0,
@@ -687,6 +717,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         else None
     )
     workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
+    time_limit = settings.time_limit_seconds
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -711,6 +742,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
+              # The turn's time limit: anton asks at it and ends with a
+              # summary, and the controller raises its backstop above it.
+              **({"limits": {"max_turn_seconds": time_limit}} if time_limit else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its

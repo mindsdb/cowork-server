@@ -40,6 +40,7 @@ from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectW
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
+from cowork.turnqueue.auth_keys import extend_turn_key
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
     get_redis,
@@ -447,6 +448,30 @@ def _answer_response(result: SubmitResult | RemoteAnswerResult):
     return JSONResponse(status_code=status_code, content=content)
 
 
+#: anton asks its "Keep going / Stop here" limit question under this id prefix
+#: (ChatSession._continue_question), with this value for Keep going.
+_LIMIT_QUESTION_PREFIX = "limit:"
+_KEEP_GOING = "continue"
+
+
+def _keeps_going_past_a_limit(question_id: str, values: list[str]) -> bool:
+    return question_id.startswith(_LIMIT_QUESTION_PREFIX) and values == [_KEEP_GOING]
+
+
+async def _extend_turn_key_window(correlation_id: str) -> None:
+    """Give a time-limited turn's key one more window after "Keep going".
+
+    Any limit's Keep going extends it: the turn runs on either way, and auth
+    bounds each window and the key's whole life. A failed extension leaves the
+    turn running until its key's current expiry.
+    """
+    settings = TurnQueueSettings()
+    if settings.time_limit_seconds > 0:
+        await extend_turn_key(
+            instance_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
+        )
+
+
 @router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     """Deliver the user's answer to a question a turn is blocked on.
@@ -505,6 +530,8 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
             question_id=req.question_id,
             payload=payload,
         )
+        if remote_result == RemoteAnswerResult.ACCEPTED and _keeps_going_past_a_limit(req.question_id, values):
+            await _extend_turn_key_window(correlation_id)
         return _answer_response(remote_result)
 
     return _answer_response(broker.submit(req.conversation_id, req.question_id, payload))
