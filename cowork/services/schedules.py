@@ -13,7 +13,7 @@ from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun, ScheduleSkippedPeriod
-from cowork.schedule_timing import normalize_next_run
+from cowork.schedule_timing import advance_occurrence, normalize_next_run
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus
 
 logger = get_logger(__name__)
@@ -226,9 +226,12 @@ class ScheduleService:
 
     def _resume(self, schedule: Schedule) -> Schedule:
         """Turn the schedule back on, clearing a pause, an auto-pause and its
-        failure streak. The run history stays. Nothing runs at once: a
-        recurring schedule waits for its next slot. A one-off whose time has
-        passed cannot wait for anything; run it now or give it a new time."""
+        failure streak. The run history stays.
+
+        A recurring schedule waits for its next slot, with one exception: a
+        slot left due before the pause, by a run whose agent did nothing,
+        runs once more (see _slot_left_due). A one-off whose time has passed
+        cannot wait for anything; run it now or give it a new time."""
         now = datetime.now(timezone.utc)
         if schedule.cadence == Cadence.once and _utc(schedule.next_run_at) <= now:
             raise ScheduleConflict(
@@ -239,11 +242,39 @@ class ScheduleService:
         schedule.auto_paused_at = None
         schedule.missed_at = None
         schedule.consecutive_failures = 0
-        schedule.next_run_at = normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone, now=now)
+        if not self._slot_left_due(schedule, now):
+            schedule.next_run_at = normalize_next_run(
+                schedule.cadence, schedule.next_run_at, schedule.timezone, now=now,
+            )
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
+
+    def _slot_left_due(self, schedule: Schedule, now: datetime) -> bool:
+        """Whether a resumed recurring schedule keeps its due slot: the last
+        cron run at it gave it back before its agent acted (a pause or a
+        passing outage during that run), and no later slot has come due.
+        Slots that came due while paused never run, and a stale slot goes
+        with them. A slot whose run may have acted is used up, as it would
+        have been without the pause."""
+        if schedule.cadence == Cadence.once:
+            return False
+        slot = _utc(schedule.next_run_at)
+        if slot > now or advance_occurrence(schedule.cadence, slot, schedule.timezone) <= now:
+            return False
+        # While the slot is still due, a cron run that started at or after it
+        # was a run at it.
+        last_outcome = self.session.exec(
+            self.session.select(ScheduleRun.outcome)
+            .where(ScheduleRun.schedule_id == schedule.id)
+            .where(ScheduleRun.is_manual == sa.false())
+            .where(ScheduleRun.started_at >= slot)
+            .where(ScheduleRun.status != RunStatus.running)
+            .order_by(ScheduleRun.started_at.desc())  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+        return last_outcome == AttemptOutcome.failed_before_execution
 
     def last_skipped(self, schedule_id: UUID) -> ScheduleSkippedPeriod | None:
         return self.session.exec(

@@ -5,7 +5,9 @@ that slot is no more than seven days old, and the slots it passed over are
 summarized. A one-off runs up to an hour late; from an hour on it is marked
 missed and runs only on Run now, which uses a one-off up. Pause stops what
 would start on its own, a waiting retry included, and resume clears the pause
-and the failure streak and waits for the next slot. Three cron slots in a row
+and the failure streak. A resumed schedule waits for its next slot, unless a
+run left its due slot unused before the pause and no later slot has come due:
+that slot runs once more, continuing its attempts. Three cron slots in a row
 that settle failed pause the schedule; a success resets the count.
 """
 from __future__ import annotations
@@ -180,6 +182,19 @@ def _age_last_run(schedule_id: UUID, seconds: float) -> None:
         row = session.get(ScheduleRun, _runs(schedule_id)[-1].id)
         row.finished_at = ensure_utc(row.finished_at) - timedelta(seconds=seconds)
         session.add(row)
+        session.commit()
+    finally:
+        session.close()
+
+
+def _move_runs_to_slot(schedule_id: UUID, slot: datetime) -> None:
+    from sqlmodel import select
+
+    session = get_open_session()
+    try:
+        for run in session.exec(select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)).all():
+            run.for_slot_at = slot
+            session.add(run)
         session.commit()
     finally:
         session.close()
@@ -397,7 +412,7 @@ def test_pause_records_when_and_resume_waits_for_the_next_slot(made, turns):
     assert turns.started == []
 
 
-async def test_pause_drops_a_waiting_retry(made, turns):
+async def test_pause_holds_a_waiting_retry_and_resume_continues_its_attempts(made, turns):
     turns.ending.reason, turns.ending.acted = "error", False
     schedule_id = made(next_run_at=SLOT)
     (first,) = _poll(schedule_id)
@@ -410,12 +425,13 @@ async def test_pause_drops_a_waiting_retry(made, turns):
     assert _poll(schedule_id) == [], "no attempt starts while paused"
 
     _service(lambda s: s.resume_schedule(schedule_id))
-    assert _poll(schedule_id) == [], "resuming does not start the dropped retry"
-    assert ensure_utc(_schedule(schedule_id).next_run_at) > NOW
-    assert len(turns.started) == 1
+    assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT, "the slot left due is kept"
+    (second,) = _poll(schedule_id)
+    (failed,) = _runs(schedule_id)
+    assert (second.slot_at, second.attempt, second.retry_of) == (SLOT, 2, failed.id)
 
 
-async def test_a_run_going_when_paused_finishes_and_nothing_follows_it(made, turns):
+async def test_a_run_going_when_paused_finishes_and_nothing_follows_it_until_resumed(made, turns):
     turns.ending.reason, turns.ending.acted = "error", False
     schedule_id = made(next_run_at=SLOT)
     turns.during.append(lambda: _service(lambda s: s.pause_schedule(schedule_id)))
@@ -427,9 +443,33 @@ async def test_a_run_going_when_paused_finishes_and_nothing_follows_it(made, tur
     assert run.status == RunStatus.failed
     assert _retry_at(schedule_id) is None
     _age_last_run(schedule_id, 400)
-    assert _poll(schedule_id) == []
+    assert _poll(schedule_id) == [], "nothing follows the run while paused"
+    assert len(turns.started) == 1
+
     turns.during.clear()
     _service(lambda s: s.resume_schedule(schedule_id))
+    (again,) = _poll(schedule_id)
+    assert (again.slot_at, again.attempt) == (SLOT, 2), "the slot it left due runs once resumed"
+
+
+async def test_a_slot_left_due_is_not_run_once_a_later_slot_came_due_during_the_pause(made, turns):
+    turns.ending.reason, turns.ending.acted = "error", False
+    schedule_id = made(next_run_at=SLOT)
+    turns.during.append(lambda: _service(lambda s: s.pause_schedule(schedule_id)))
+    (first,) = _poll(schedule_id)
+    await _run(first)
+    turns.during.clear()
+    # The pause then lasts two days: move the slot it left due, and its run,
+    # back so that two later slots have come due since.
+    left_due = SLOT - timedelta(days=2)
+    _set(schedule_id, next_run_at=left_due)
+    _move_runs_to_slot(schedule_id, left_due)
+
+    _service(lambda s: s.resume_schedule(schedule_id))
+
+    assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT + timedelta(days=1), (
+        "slots that came due while paused are not run, and the stale one goes with them"
+    )
     assert _poll(schedule_id) == []
     assert len(turns.started) == 1
 
