@@ -217,7 +217,7 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+        ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
     return _build_llm_block(api_key, settings)
@@ -244,7 +244,7 @@ async def _mint_llm_block_with_turn_key_id(
         user_id=user_id,
         org_id=org_id,
         correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds,
+        ttl_seconds=settings.turn_key_lifetime_seconds,
         settings=settings,
         workspace_id=workspace_id,
     )
@@ -702,6 +702,12 @@ async def _scoped_browser_block(
     return config.to_dict() if config is not None else None
 
 
+async def _revoke_turn_key_quietly(correlation_id: str) -> None:
+    """Revoke the key the routing gate minted for a turn that never runs,
+    logging rather than raising: a failed revoke leaves it to its own expiry."""
+    await _revoke_turn_key_at_turn_end(correlation_id, TurnQueueSettings())
+
+
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
@@ -849,6 +855,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # session of its own.
     jev_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(jev_settings, "jev_decisions_enabled", True) is not False
+    time_limit = settings.time_limit_seconds
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -882,6 +889,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # with the `llm` turn key, which _scoped_browser_block scoped to
               # this session and project. Absent when the turn has no browser.
               **({"browser": browser_block} if browser_block else {}),
+              # The turn's time limit: anton asks at it and ends with a
+              # summary, and the controller raises its backstop above it.
+              **({"limits": {"max_turn_seconds": time_limit}} if time_limit else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its

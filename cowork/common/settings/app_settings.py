@@ -734,12 +734,40 @@ class TurnQueueSettings(Settings):
     turn_key_ttl_seconds: int = Field(
         default=1200,
         description=(
-            "TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within "
-            "auth's turn_key_max_ttl_seconds). scratchpad-controller's "
-            "MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from it (TTL - 120); change "
-            "both together."
+            "TTL, in seconds, of the minted per-turn MindsHub key for a turn without a "
+            "time limit (20 min; keep within auth's turn_key_max_ttl_seconds). "
+            "scratchpad-controller's MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from "
+            "it (TTL - 120); change both together."
         ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    time_limit_seconds: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Per-turn time limit sent to the pod as params.limits.max_turn_seconds. "
+            "anton asks \"Keep going / Stop here\" at it and ends with a summary. 0 sends "
+            "none, and the turn keeps today's caps. Turn it on only where auth extends "
+            "turn keys and scratchpad-controller raises its backstop for time-limited "
+            "turns; a turn key then lives one time-limit window at a time "
+            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\"."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_SECONDS
+    time_limit_key_margin_seconds: int = Field(
+        default=1800,
+        ge=0,
+        description=(
+            "How far past the time limit a turn key window reaches: a cell that is "
+            "already running finishes before anton asks (the pod caps one cell at 15 "
+            "minutes), then the summary is written."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS
+
+    @property
+    def turn_key_lifetime_seconds(self) -> int:
+        """How long a turn key minted now, or extended now, must last."""
+        if self.time_limit_seconds > 0:
+            return self.time_limit_seconds + self.time_limit_key_margin_seconds
+        return self.turn_key_ttl_seconds
     pod_shared_mount_root: str = Field(
         default="/mnt/cowork-shared",
         description=(

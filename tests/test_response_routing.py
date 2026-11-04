@@ -2714,3 +2714,50 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     ]
     decision = await _route(history)
     assert decision.route == DIRECT_CONTEXT and seen
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
+    """The gate mints a turn key for a delegated turn to reuse. When the
+    router answers itself, no turn runs to revoke it, so the handler does."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def direct(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = direct
+
+    async def answered(**_kwargs):
+        return "answered"
+
+    handler._handle_direct_response = answered
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+
+    assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
+    assert revoked == ["corr-gate"]

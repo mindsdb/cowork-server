@@ -76,7 +76,12 @@ from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
-from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
+from cowork.turnqueue.producer import (
+    RemoteWorkspace,
+    _revoke_turn_key_quietly,
+    step_stream_events,
+    stream_remote_replies,
+)
 from cowork.turnqueue.redis_client import (
     DISCARDED_CANCEL_REASON,
     STALLED_CANCEL_REASON,
@@ -948,14 +953,19 @@ class ResponsesHandler:
 
             if route.route == DIRECT_CONTEXT and route.text:
                 # The LLM gate decided and answered in one call.
-                return await self._handle_direct_response(
-                    request=request,
-                    conversation_id=start.conversation_id,
-                    turn_id=start.turn_id,
-                    original_content=original_content,
-                    question=prompt_text(start.harness_input),
-                    route=route,
-                )
+                try:
+                    return await self._handle_direct_response(
+                        request=request,
+                        conversation_id=start.conversation_id,
+                        turn_id=start.turn_id,
+                        original_content=original_content,
+                        question=prompt_text(start.harness_input),
+                        route=route,
+                    )
+                finally:
+                    # The gate minted this key for a turn that now never runs.
+                    if turn_llm and turn_llm.get("correlation_id"):
+                        await _revoke_turn_key_quietly(turn_llm["correlation_id"])
 
             # Jev decided the turn goes direct: the user's own model writes the
             # answer, and can still hand the turn to the agent, so the agent's
