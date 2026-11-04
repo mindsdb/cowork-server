@@ -600,6 +600,15 @@ class StreamSettings(Settings):
     )
 
 
+#: auth's turn_key_max_ttl_seconds (API_KEYS__TURN_KEY_MAX_TTL_SECONDS in
+#: mindsdb/auth): the longest a turn key may live from now, at mint and at each
+#: extension. Mirrored here only to refuse a time limit whose key window auth
+#: would refuse; change both together.
+AUTH_TURN_KEY_MAX_TTL_SECONDS = 6600
+#: Kept free under that cap for clock skew between cowork-server and auth.
+AUTH_TURN_KEY_SKEW_SECONDS = 300
+
+
 class TurnQueueSettings(Settings):
     model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
 
@@ -668,14 +677,29 @@ class TurnQueueSettings(Settings):
         ),
     )  # COWORK_TURN_TIME_LIMIT_SECONDS
     time_limit_key_margin_seconds: int = Field(
-        default=1800,
+        default=2400,
         ge=0,
         description=(
-            "How far past the time limit a turn key window reaches: a cell that is "
-            "already running finishes before anton asks (the pod caps one cell at 15 "
-            "minutes), then the summary is written."
+            "How far past the time limit a turn key window reaches: the pod starts "
+            "after the key is minted, a cell that is already running finishes before "
+            "anton asks (the pod caps one cell at 15 minutes), then the summary is "
+            "written. The limit plus this must stay within auth's per-window cap "
+            "(AUTH_TURN_KEY_MAX_TTL_SECONDS) less clock-skew headroom."
         ),
     )  # COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS
+
+    @model_validator(mode="after")
+    def _time_limit_key_fits_auth(self) -> "TurnQueueSettings":
+        if self.time_limit_seconds > 0 and self.turn_key_lifetime_seconds > (
+            AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
+        ):
+            raise ValueError(
+                f"COWORK_TURN_TIME_LIMIT_SECONDS + COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS "
+                f"({self.turn_key_lifetime_seconds}s) must leave {AUTH_TURN_KEY_SKEW_SECONDS}s "
+                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or every web "
+                f"turn's key mint is refused"
+            )
+        return self
 
     @property
     def turn_key_lifetime_seconds(self) -> int:

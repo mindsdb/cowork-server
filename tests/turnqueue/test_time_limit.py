@@ -65,7 +65,7 @@ def _params(fake):
 def test_the_key_lives_one_time_limit_window_and_the_old_twenty_minutes_without_one(monkeypatch):
     assert TurnQueueSettings().turn_key_lifetime_seconds == 1200
     monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
-    assert TurnQueueSettings().turn_key_lifetime_seconds == 3600 + 1800
+    assert TurnQueueSettings().turn_key_lifetime_seconds == 3600 + 2400
 
 
 @pytest.mark.asyncio
@@ -73,7 +73,7 @@ async def test_a_turn_carries_the_time_limit_and_a_key_that_covers_it(time_limit
     fake, minted, _ = remote_turn
     await _drain(_run())
     assert _params(fake)["limits"] == {"max_turn_seconds": 3600}
-    assert minted[0]["ttl_seconds"] == 5400
+    assert minted[0]["ttl_seconds"] == 6000
 
 
 @pytest.mark.asyncio
@@ -138,7 +138,7 @@ async def test_keep_going_gives_the_key_another_window(time_limit, monkeypatch):
     monkeypatch.setattr(endpoint, "extend_turn_key", extend)
     await endpoint._extend_turn_key_window("corr-1")
     assert extend.call_args.kwargs["instance_id"] == "corr-1"
-    assert extend.call_args.kwargs["ttl_seconds"] == 5400
+    assert extend.call_args.kwargs["ttl_seconds"] == 6000
 
 
 @pytest.mark.asyncio
@@ -147,7 +147,7 @@ async def test_without_a_time_limit_keep_going_leaves_the_key_alone(monkeypatch)
 
     extend = AsyncMock(return_value=True)
     monkeypatch.setattr(endpoint, "extend_turn_key", extend)
-    await endpoint._extend_turn_key_window("corr-1")
+    assert await endpoint._extend_turn_key_window("corr-1") is True
     extend.assert_not_called()
 
 
@@ -228,3 +228,42 @@ async def test_extend_without_auth_configured_does_nothing(monkeypatch):
         instance_id="corr-1", ttl_seconds=5400, settings=TurnQueueSettings(),
     )
     assert called == []
+
+
+@pytest.mark.asyncio
+async def test_the_datasource_mint_sizes_the_key_to_the_time_limit(time_limit, monkeypatch):
+    """The gate and producer mint through this path when datasources are on."""
+    seen = {}
+
+    async def _details(**kwargs):
+        seen.update(kwargs)
+        return auth_keys.MintedTurnKey(key="mdb_turnkey", prefix="mdb_tk")
+
+    monkeypatch.setattr(prod, "mint_turn_key_details", _details)
+    await prod._mint_llm_block_with_turn_key_id(
+        org_id="o", user_id="u", correlation_id="c", settings=TurnQueueSettings(),
+    )
+    assert seen["ttl_seconds"] == 3600 + 2400
+
+
+def test_a_time_limit_whose_key_window_auth_would_refuse_is_rejected(monkeypatch):
+    """Every web turn's mint would fail with permission_unavailable."""
+    from pydantic import ValidationError
+
+    from cowork.common.settings.app_settings import AUTH_TURN_KEY_MAX_TTL_SECONDS, AUTH_TURN_KEY_SKEW_SECONDS
+
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "4200")
+    with pytest.raises(ValidationError):
+        TurnQueueSettings()
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
+    assert TurnQueueSettings().turn_key_lifetime_seconds <= AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_failed_extension_is_retried_once(time_limit, monkeypatch):
+    from cowork.api.v1.endpoints import responses as endpoint
+
+    extend = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(endpoint, "extend_turn_key", extend)
+    assert await endpoint._extend_turn_key_window("corr-1") is True
+    assert extend.call_count == 2
