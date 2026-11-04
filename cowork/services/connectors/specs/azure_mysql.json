@@ -88,7 +88,7 @@
           }
         ],
         "cloud": {
-          "available": false,
+          "available": true,
           "engine": "mysql:host-password",
           "description": "Enter the host, port, database, username and password. Saved and read as a MySQL connection.",
           "how_to": "## Connect Azure Database for MySQL\n\nCloud saves this connection in your encrypted connection store and reads it through the hosted gateway.\n\n### Where to find each value\n\n1. **Host**: the server name from the Azure portal, such as `myserver.mysql.database.azure.com`.\n2. **Port**: `3306`.\n3. **Database / Username / Password**: a database on the server and a user that can read it.\n\nThe server must be reachable from the public internet, and its firewall must allow the hosted gateway. Use a database user that can read only the data you want to query.\n\nAllow the hosted gateway under **Networking** on the server.",

@@ -113,9 +113,15 @@ inference Service by name, and the same in every environment.
 Turn the switches on only after auth serves the datasource endpoints with the
 bundle above, mindshub_inference serves `/v1/datasources/`, and a scratchpad
 image with the datasource helper is deployed and older pods are recycled.
-Rollback is `datasourceTurnsEnabled` off: no new grants are registered and no
-datasource block is queued; encrypted records stay in auth and OAuth
-connections are unaffected.
+Rollback removes both `datasourceTurnsEnabled` and `datasourceCapabilities`
+from the environment's values file, and drops the environment from both
+`ENABLED_ENVIRONMENTS` and `OFFERED_METHODS` in `tests/test_chart_values.py`
+in the same change; the test expects both keys absent, not `"false"`, outside
+enabled environments.
+Without grants no datasource block is queued, and without the capability list
+no new connection is accepted or edited through this server. Encrypted records
+stay in auth, where users can still delete them, and OAuth connections are
+unaffected.
 
 ## Required cluster permissions
 

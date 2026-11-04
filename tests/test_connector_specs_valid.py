@@ -330,6 +330,8 @@ def test_method_descriptions_stay_short(path: Path):
 # The two connectors enabled for cloud execution. Every other method
 # in the corpus carries no `cloud` block and is therefore desktop-only.
 CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
+# Engines whose cloud method is marked available; managed services follow them.
+RELEASED_CLOUD_DATABASES = frozenset({"mysql"})
 
 # The desktop fields as (name, type, required, secret, default), pinned from
 # the specs before the cloud blocks existed. The cloud block is a second,
@@ -552,10 +554,13 @@ class TestCloudDatabaseSpecs:
         method = next(m for m in spec.form.methods if m.id == "connection-string")
         assert method.cloud is None
 
-    def test_cloud_is_not_advertised_before_the_adapters_are_proven(
+    def test_cloud_is_advertised_only_for_the_released_engines(
         self, spec, connector_id
     ):
-        assert self._cloud(spec, connector_id).available is False
+        """Each engine is released on its own once its adapter is proven, so the
+        released set is pinned here and moves only with that decision."""
+        expected = connector_id in RELEASED_CLOUD_DATABASES
+        assert self._cloud(spec, connector_id).available is expected
 
     def test_the_form_asks_one_yes_or_no_about_certificates(self, spec, connector_id):
         """The cloud form collects a connection and one question about trust:

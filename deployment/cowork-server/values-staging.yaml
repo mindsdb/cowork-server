@@ -33,6 +33,11 @@ deployment:
     maxReplicas: 4
     targetCPUUtilizationPercentage: 70
 
+  # Cloud datasource turns and the methods offered, on for staging by the
+  # release gate. Rollback removes both lines; see the chart README.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password"]}'
+
   ingress:
     enabled: true
     name: cowork-server
