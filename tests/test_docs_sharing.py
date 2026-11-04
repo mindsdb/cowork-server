@@ -14,6 +14,7 @@ from cowork.docs import republish, sharing, sync
 from cowork.docs.debounce import Debouncer
 from cowork.docs.service import create_doc
 from cowork.docs.store import DOC_HTML
+from cowork.services import share_hooks
 
 PAGE_URL = "https://view.staging.mindshub.ai/view/215f76ea7/4bbd890f"
 KEY = "artifact/814c74db-0218-48d5-a29d-50be7bbfa243"
@@ -80,11 +81,14 @@ def test_startup_catches_each_shared_doc_up_and_one_failing_holds_none_back(fold
 
     monkeypatch.setattr(sync, "shared_doc_folders", lambda: [folder, other])
     monkeypatch.setattr(sync.republish, "catch_up", catch_up)
+    monkeypatch.setattr(sync.cloud, "mirror_now", lambda f: caught.append(("mirrored", f)))
+    monkeypatch.setattr(sync.cloud, "ensure_listening", lambda: caught.append("listening"))
     sync.catch_up_shared_docs()
-    assert caught == [other]
+    assert caught == [other, ("mirrored", other), "listening"]
 
 
 def test_a_server_several_people_share_catches_nothing_up_at_startup(monkeypatch):
+    monkeypatch.setattr(share_hooks, "_hooks", None)
     monkeypatch.setattr(sync, "tenant_scope_required", lambda: True)
     monkeypatch.setattr(sync.threading, "Thread", lambda **kw: pytest.fail("walked the projects"))
     sync.start()

@@ -34,7 +34,8 @@ from urllib.parse import quote
 
 from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
 from cowork.common.minds_tls import minds_ssl_verify
-from cowork.docs.store import DOC_HTML, is_doc_primary
+from cowork.docs.store import DOC_FILENAME, DOC_HTML, is_doc_primary
+from cowork.services import share_hooks
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -1140,6 +1141,27 @@ def _unpublish_identifier(
         raise RuntimeError(f"Unpublishing failed: {message}") from exc
 
 
+def _holds_doc_file(folder: PinnedDir) -> bool:
+    """Whether a pinned artifact folder holds a doc file (a regular file, not a link)."""
+    try:
+        doc_stat = dir_stat(folder, DOC_FILENAME, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(doc_stat.st_mode)
+
+
+def _drop_shared_doc(record: dict) -> None:
+    """A shared doc is being deleted: its live copy in MindsHub goes with its
+    page. A network call alone, so the delete's network step makes it."""
+    hooks = share_hooks.registered()
+    if hooks is None:
+        return
+    try:
+        hooks.after_unshare(record, None)
+    except Exception:
+        logger.warning("could not take down the live copy of a deleted doc", exc_info=True)
+
+
 class _PageToTakeDown(NamedTuple):
     """A live page of an artifact's publish record that its delete takes down."""
 
@@ -1210,6 +1232,8 @@ def _unpublish_protected_pages(
             _unpublish_identifier(
                 identifier, page.entry, api_key=api_key, publish_url=publish_url
             )
+        if page.name == DOC_HTML and _holds_doc_file(folder):
+            _drop_shared_doc(dict(page.entry))
         page.entry["published"] = False
         published_map[page.name] = page.entry
         # Match the historical partial-progress behavior: if a later remote
@@ -1300,6 +1324,8 @@ class _PinnedDelete:
     descriptors: ExitStack
     folder_descriptor: ExitStack
     taken_down: list[str] = field(default_factory=list)
+    # The folder holds a doc file: taking down its page drops the doc's live copy.
+    holds_doc: bool = False
 
 
 def _pin_for_delete(
@@ -1351,8 +1377,10 @@ def _pin_for_delete(
         if protects_publisher(publish_url):
             _unpublish_protected_pages(folder=folder, api_key=api_key, publish_url=publish_url, scope=scope)
             pages: list[_PageToTakeDown] = []
+            holds_doc = False
         else:
             pages = _pages_to_take_down(folder=folder, published_map=_load_published_map_pinned(folder))
+            holds_doc = _holds_doc_file(folder)
     except BaseException:
         descriptors.close()
         raise
@@ -1363,6 +1391,7 @@ def _pin_for_delete(
         pages=pages,
         descriptors=descriptors,
         folder_descriptor=folder_descriptor,
+        holds_doc=holds_doc,
     )
 
 
@@ -1373,6 +1402,8 @@ def _take_down_pages(*, pinned: _PinnedDelete, api_key: str, publish_url: str) -
     part-way still records the pages already down."""
     for page in pinned.pages:
         _unpublish_identifier(page.identifier, page.entry, api_key=api_key, publish_url=publish_url)
+        if page.name == DOC_HTML and pinned.holds_doc:
+            _drop_shared_doc(dict(page.entry))
         pinned.taken_down.append(page.name)
 
 
