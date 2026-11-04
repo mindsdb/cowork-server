@@ -84,6 +84,27 @@ async def test_default_model_uses_the_verified_hosted_scope(monkeypatch, org_dep
     assert job["params"]["model"] == "minds-default"
 
 
+async def test_the_chimera_pseudo_model_reaches_the_pod_as_its_main_model(monkeypatch, org_deployment):
+    """The pod has no Chimera wiring yet: a stale or hand-sent `chimera` pick
+    runs the pair's main model there, never a model id the gateway lacks."""
+    from cowork.common.settings import user_settings
+    from cowork.common.settings.user_settings import Provider, UserSettings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+    settings = UserSettings(_env_file=None, planning_provider=Provider.MINDS_CLOUD, chimera_main_model="sonnet")
+    monkeypatch.setattr(user_settings, "get_user_settings", lambda scope: settings)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="org-verified", user_id="user-verified",
+        input_text="hi", model="chimera",
+    ))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["model"] == "sonnet"
+
+
 async def _scope_reaching_settings(monkeypatch, *, org_id, user_id):
     """The scope stream_remote_replies resolves the default model under."""
     from cowork.common.settings import user_settings

@@ -52,6 +52,12 @@ from cowork.models.conversation import Conversation
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.chimera import (
+    anton_supports_chimera,
+    build_chimera_config,
+    chimera_turn,
+    planning_cache_ttl,
+)
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.live_apps import (
     TurnLiveApps,
@@ -63,6 +69,7 @@ from cowork.services.live_apps import (
     turn_live_apps,
 )
 from cowork.services.projects import display_label
+from cowork.services.sidekick_contexts import scrubbed_state
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
@@ -733,6 +740,18 @@ def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list
     return ConversationService(session).archived_messages(conversation_id)
 
 
+def _sidekick_state(session: ScopedSession, *, conversation_id: UUID) -> dict | None:
+    from cowork.services.sidekick_contexts import SidekickContextService
+
+    return SidekickContextService(session).load(conversation_id)
+
+
+def _save_sidekick_state(session: ScopedSession, *, conversation_id: UUID, state: dict) -> None:
+    from cowork.services.sidekick_contexts import SidekickContextService
+
+    SidekickContextService(session).save(conversation_id, state)
+
+
 async def _turn_skills_off_for_me(scope: TenantScope | None) -> frozenset[str]:
     """The skills the turn's person turned off for themselves
     (cowork.services.skill_user_settings.off_for_me), in one database unit.
@@ -1004,6 +1023,22 @@ class AntonHarness:
                 except Exception:
                     logger.exception(
                         "[anton_harness] failed to persist history compaction",
+                        extra=log_context(conversation_id=conv_id),
+                    )
+            # The Chimera sidekick as the turn left it, for the next turn's
+            # session (_build_turn_session hands it back). None when no
+            # sidekick ran or was loaded, or on an anton without Chimera.
+            # Best-effort, like the compaction: a lost one restarts fresh.
+            sidekick_state = getattr(session, "sidekick_state", None) if session is not None else None
+            if isinstance(sidekick_state, dict):
+                try:
+                    await run_db(
+                        partial(_save_sidekick_state, conversation_id=conv_id, state=sidekick_state),
+                        scope=_units_scope(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to persist the sidekick context",
                         extra=log_context(conversation_id=conv_id),
                     )
             try:
@@ -1536,8 +1571,22 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir):
             _make_project_folder(base, directory, sandboxed=sandboxed)
 
-        llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
+        # Chimera (cowork.services.chimera): the pseudo-model or chimera_enabled
+        # gives this turn a sidekick, and the pseudo-model also names the
+        # planning model. With Chimera off, or on an anton without it, the
+        # client is built exactly as before and no Chimera kwarg reaches anton.
+        chimera = chimera_turn(model, user)
+        chimera_on = chimera.on and anton_supports_chimera()
+        client_kwargs: dict = {}
+        if chimera_on:
+            client_kwargs = {"sidekick": True, "sidekick_model_override": chimera.sidekick_model}
+        if cache_ttl := planning_cache_ttl(anton_settings, chimera=chimera_on):
+            client_kwargs["main_cache_ttl"] = cache_ttl
+        llm_client = self._build_llm_client(
+            effort=reasoning_effort, model=chimera.model, settings=user, **client_kwargs,
+        )
         _apply_client_models(anton_settings, llm_client)
+        chimera_config = build_chimera_config(anton_settings) if chimera_on else None
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.user_settings import current_settings_scope
@@ -1569,6 +1618,15 @@ class AntonHarness:
             partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
         ordered_messages = history.messages
+        # The conversation's sidekick, read only for a turn that can use it.
+        # Scrubbed below, beside the history, once the vault is registered.
+        stored_sidekick = (
+            await run_db(
+                partial(_sidekick_state, conversation_id=conversation.id), scope=_units_scope(),
+            )
+            if chimera_config is not None
+            else None
+        )
 
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
@@ -1734,6 +1792,19 @@ class AntonHarness:
             else:
                 initial_history = [self._stamp_message(m) for m in replayable]
                 seed_info = None
+            # Chimera's inputs to the session: its config, and the sidekick the
+            # last turn left, scrubbed as the history above is. Passed only on
+            # a Chimera turn, and dropped by an anton without the fields
+            # (chimera_on already required them).
+            chimera_kwargs = (
+                supported_kwargs(
+                    ChatSessionConfig,
+                    chimera=chimera_config,
+                    sidekick_state=scrubbed_state(stored_sidekick) if stored_sidekick else None,
+                )
+                if chimera_config is not None
+                else {}
+            )
 
             # The memory of the person who asked: their own tiers, or the
             # deployment's shared ones, read through the same resolvers as the
@@ -1948,6 +2019,7 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                **chimera_kwargs,
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -2017,6 +2089,8 @@ class AntonHarness:
             raise
 
     @staticmethod
-    def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
+    def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None, **chimera):
+        """``chimera`` is build_llm_client's sidekick / sidekick_model_override /
+        main_cache_ttl, passed only on a turn that sets them."""
         from cowork.services.providers import build_llm_client
-        return build_llm_client(effort_override=effort, model_override=model, settings=settings)
+        return build_llm_client(effort_override=effort, model_override=model, settings=settings, **chimera)

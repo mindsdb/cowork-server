@@ -55,6 +55,7 @@ from cowork.services.providers import (
     validate_provider as validate_provider_svc,
     warm_enabled_model_map,
 )
+from cowork.services.chimera import chimera_available
 from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
@@ -880,6 +881,13 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "modelProviders": model_providers,
         "modelFamilies": model_families,
         "gate": gate,
+        # Whether the composer offers the Chimera pseudo-model (sent back as the
+        # model id "chimera"). Snake case, unlike its neighbours: the name is
+        # the cross-repo Chimera contract's. True only where a pick would run
+        # Chimera: planning on MindsHub, turns built here, and an anton that
+        # ships it (cowork.services.chimera.chimera_available). Read from the
+        # same reloaded settings as the gate, so it follows a provider switch.
+        "chimera_available": chimera_available(gate_settings),
     }
 
 

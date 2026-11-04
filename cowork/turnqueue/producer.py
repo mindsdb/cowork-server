@@ -40,7 +40,7 @@ from cowork.turnqueue.auth_keys import (
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
-from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
+from cowork.common.settings.app_settings import CHIMERA_MODEL_ID, TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
 
@@ -608,6 +608,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     if run_id is None:
         await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
     reply_stream = reply_stream_key(conversation_id)
+
+    # The Chimera pseudo-model is not a model id. The pod has no Chimera wiring
+    # yet, so it runs the pair's main model alone (chimera.remote_turn_model).
+    if model == CHIMERA_MODEL_ID:
+        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.services.chimera import remote_turn_model
+        model = remote_turn_model(model, get_user_settings(scope))
 
     # No client-picked model → the deployment's resolved default (org mode: the
     # free-bucket model). Resolved here so the model reaching the pod is always
