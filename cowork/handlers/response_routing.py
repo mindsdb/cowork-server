@@ -658,14 +658,27 @@ def _text_history(history: list[dict]) -> list[dict]:
     return result
 
 
-def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_disabled_connections: bool) -> str | None:
-    """Return a deterministic delegation reason for unsupported turn shapes."""
+def ineligible_reason(
+    *,
+    has_non_text_input: bool,
+    has_attachments: bool,
+    has_disabled_connections: bool,
+    has_active_sidekick: bool = False,
+) -> str | None:
+    """Return a deterministic delegation reason for unsupported turn shapes.
+
+    `has_active_sidekick` says the conversation's Chimera sidekick handed its
+    work back to the main agent (status ``open``): the next prompt most likely
+    answers it, and only the agent holds the sidekick's report.
+    """
     if has_non_text_input:
         return "non_text_input"
     if has_attachments:
         return "attachments_present"
     if has_disabled_connections:
         return "connection_context_present"
+    if has_active_sidekick:
+        return "active_sidekick"
     return None
 
 
@@ -729,6 +742,7 @@ async def decide_route(
     after_router_answer: bool = False,
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
+    has_active_sidekick: bool = False,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation on the gate's own model.
 
@@ -751,6 +765,7 @@ async def decide_route(
         has_non_text_input=has_non_text_input,
         has_attachments=has_attachments,
         has_disabled_connections=has_disabled_connections,
+        has_active_sidekick=has_active_sidekick,
     )
     if reason:
         return RouteDecision(route=DELEGATED_AGENTIC, reason=reason)

@@ -130,6 +130,7 @@ from cowork.services.product_permissions import (
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
+from cowork.services.sidekick_contexts import SidekickContextService
 from cowork.schemas.turn_skills import TurnSkills
 from cowork.services.skill_sharing import SkillViewer, sharing_applies
 from cowork.services.skills import SkillService, has_always_on_skills
@@ -400,6 +401,10 @@ class _TurnStart:
     # Whether an always-on skill reaches the turn (has_always_on_skills),
     # which sends it to the agent: the gate's answer would not follow it.
     always_on_skills: bool = False
+    # Whether the conversation's Chimera sidekick handed its work back to the
+    # agent (sidekick_contexts status "open"), which sends the turn to the
+    # agent: only it holds the sidekick's report.
+    active_sidekick: bool = False
 
 
 @dataclass(frozen=True)
@@ -793,6 +798,7 @@ class ResponsesHandler:
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
+                    has_active_sidekick=start.active_sidekick,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -1044,10 +1050,12 @@ class ResponsesHandler:
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
         always_on_skills = False
+        active_sidekick = self._reads_active_sidekick(session, conversation=conversation)
         if ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
+            has_active_sidekick=active_sidekick,
         ) is None:
             reaches = self._reads_always_on_skills(session, conversation=conversation)
             if reaches is None:
@@ -1067,7 +1075,26 @@ class ResponsesHandler:
             turn_id=turn_id,
             gate_rows=gate_rows,
             always_on_skills=always_on_skills,
+            active_sidekick=active_sidekick,
         )
+
+    @staticmethod
+    def _reads_active_sidekick(session: ScopedSession, *, conversation: Conversation) -> bool:
+        """Whether the conversation's Chimera sidekick is open. False when the
+        read fails: the sidekick is an optimisation of the agent's turn, and a
+        failed read must not stop the gate answering a plain question."""
+        try:
+            return SidekickContextService(session).is_open(conversation)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.exception(
+                "[responses] could not read the conversation's sidekick; routing without it",
+                extra=log_context(conversation_id=conversation.id),
+            )
+            # Rolling back loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return False
 
     def _reads_always_on_skills(self, session: ScopedSession, *, conversation: Conversation) -> bool | None:
         """Whether an always-on skill reaches this turn in MindsHub mode, for
@@ -1125,6 +1152,7 @@ class ResponsesHandler:
         has_always_on_skills: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
+        has_active_sidekick: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
@@ -1149,6 +1177,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
+            has_active_sidekick=has_active_sidekick,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -1232,6 +1261,7 @@ class ResponsesHandler:
                         has_non_text_input=has_non_text_input,
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
+                        has_active_sidekick=has_active_sidekick,
                         after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
                         binding=binding,
                         binding_factory=binding_for_turn,
