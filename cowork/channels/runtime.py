@@ -18,6 +18,7 @@ from anton.core.dispatch import OutboundMessage
 from cowork.handlers._turn_history import reject_unreplayable_tool_rows
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
+from cowork.channels.sharing import shared_state
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, scope_for_background_context, scope_for_org
 from cowork.db.session import get_open_session
 from cowork.db.units import conversation_writes
@@ -46,6 +47,51 @@ log = logging.getLogger(__name__)
 # hotswitch (UserSettings.harness) never applies to channels.
 DEFAULT_CHANNEL_HARNESS = "anton"
 _DEFAULT_THREAD_KEY = "__default__"
+
+
+def _fits(conversation: Conversation, shared: bool | None) -> bool:
+    """Whether a message from a shared (or DM) chat may be added to
+    `conversation` in org mode: one the runtime made, marked to match. An
+    unknown `shared` (None) fits any such conversation: it never creates or
+    changes a mark, so it cannot move DM text into a readable conversation."""
+    if conversation.created_by is not None:
+        return False
+    return shared is None or (conversation.channel_type is not None) == shared
+
+
+def _served_on_route(scoped: ScopedSession, binding: ChannelBinding, conversation_id) -> bool:
+    """Whether the runtime itself last served `conversation_id` on `binding`
+    (its session row names it), as opposed to the route having been pointed
+    at it."""
+    return scoped.exec(
+        scoped.select(ChannelSession).where(
+            ChannelSession.binding_id == binding.id,
+            ChannelSession.anton_session_id == str(conversation_id),
+        )
+    ).first() is not None
+
+
+def _reusable_in_org(scoped: ScopedSession, binding: ChannelBinding, conversation: Conversation, shared: bool | None) -> bool:
+    """Org mode's reuse rule: the runtime's own conversation, marked to match,
+    on this route only. An unknown message joins a marked conversation only
+    when this route was the one served into it, so a group DM route pointed at
+    a marked conversation (by an older server mid-rollout) starts afresh."""
+    if not _fits(conversation, shared) or _shared_by_another_route(scoped, binding, conversation.id):
+        return False
+    if shared is None and conversation.channel_type is not None:
+        return _served_on_route(scoped, binding, conversation.id)
+    return True
+
+
+def _shared_by_another_route(scoped: ScopedSession, binding: ChannelBinding, conversation_id) -> bool:
+    """Whether a route other than `binding` points at `conversation_id`; such a
+    conversation (a legacy pin) would mix two chats' messages."""
+    return scoped.exec(
+        scoped.select(ChannelBinding).where(
+            ChannelBinding.anton_conversation_id == conversation_id,
+            ChannelBinding.id != binding.id,
+        )
+    ).first() is not None
 
 
 def turn_used_tools(events: list[dict]) -> bool:
@@ -322,7 +368,7 @@ class AntonChannelRuntime:
             # 1s slack for filesystem timestamp granularity.
             turn_started = time.time() - 1
             try:
-                conversation = self._ensure_conversation(scoped, binding)
+                conversation = self._ensure_conversation(scoped, binding, shared=shared_state(event))
                 self._touch_channel_session(scoped, binding, conversation, event)
                 channel_context = ChannelContext(
                     channel_type=channel_type,
@@ -428,15 +474,32 @@ class AntonChannelRuntime:
                 return False
         return True
 
-    def _ensure_conversation(self, scoped: ScopedSession, binding: ChannelBinding) -> Conversation:
+    def _ensure_conversation(
+        self, scoped: ScopedSession, binding: ChannelBinding, *, shared: bool | None
+    ) -> Conversation:
+        """The route's conversation, created on its first message if it has none.
+
+        Only a conversation from a shared channel (`shared` True) is marked with
+        its channel type, which is what makes it readable to org admins; a
+        direct message to the bot stays unmarked and so readable by nobody in
+        the app, and so does a first message the adapter could not place (None).
+        In org mode an existing conversation is reused only if this runtime
+        could have made it for this message (no owner, marked to match) and no
+        other route points at it. Anything else (a legacy pin to someone's chat,
+        a DM route pointed at a shared conversation, two routes on one
+        conversation) gets a fresh conversation instead.
+        """
         if binding.anton_conversation_id is not None:
             existing = scoped.get(Conversation, binding.anton_conversation_id)
-            if existing is not None:
+            if existing is not None and (
+                not scoped.scope.org_mode or _reusable_in_org(scoped, binding, existing, shared)
+            ):
                 return existing
         topic = f"{binding.channel_type}: {binding.display_name or binding.external_group_id}"[:80]
         conversation = ConversationService(scoped).create_conversation(
             topic=topic,
             project_id=binding.anton_project_id or self._resolve_default_project_id(scoped),
+            channel_type=binding.channel_type if shared is True else None,
         )
         binding.anton_conversation_id = conversation.id
         scoped.add(binding)
@@ -464,6 +527,9 @@ class AntonChannelRuntime:
                 last_message_at=now,
             )
         else:
+            # Always the conversation just served: _ensure_conversation may have
+            # replaced the route's, and its reuse rule reads this row.
+            row.anton_session_id = str(conversation.id)
             row.last_message_at = now
         scoped.add(row)
         scoped.commit()

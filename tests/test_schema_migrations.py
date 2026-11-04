@@ -325,6 +325,35 @@ def test_task_objects_downgrade_drops_table(tmp_path, monkeypatch):
     assert _alembic_version(db_path) == "c4e7a1b9d2f0"
 
 
+def _conversation_column(path, column_name: str) -> tuple | None:
+    """The `pragma table_info(conversations)` row for one column, or None."""
+    with sqlite3.connect(path) as connection:
+        for row in connection.execute("pragma table_info(conversations)"):
+            if row[1] == column_name:
+                return row
+    return None
+
+
+def test_conversation_channel_type_is_added_by_its_migration_and_dropped_on_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "channel-type.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    column = _conversation_column(db_path, "channel_type")
+    assert column is not None, "the migration must add conversations.channel_type"
+    _cid, _name, column_type, not_null, default, _pk = column
+    assert (column_type, not_null, default) == ("VARCHAR(64)", 0, None)
+
+    _downgrade_to(engine, uri, "2a366c1f4b9f")
+
+    assert _conversation_column(db_path, "channel_type") is None
+    assert _alembic_version(db_path) == "2a366c1f4b9f"
+
+
 def test_task_objects_downgrade_guards_missing_table(tmp_path, monkeypatch):
     # Mirrors the upgrade guard: downgrade() must not crash if task_objects
     # was already removed out-of-band before the alembic_version pointer is
