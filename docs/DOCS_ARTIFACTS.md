@@ -10,6 +10,8 @@ The modules depend in one direction, each on those above it:
 | --- | --- |
 | `model` | The doc shape, validation and limits |
 | `markdown` | The Markdown dialect the agent writes, both ways |
+| `ops` | The atomic edit operations |
+| `undo` | What puts back one of the person's writes |
 | `render` | The agent's outline and full views, the page (`doc.html`) and export markup |
 
 ## The format
@@ -36,8 +38,28 @@ Block types:
 
 Each block's `v` is the rev that last changed it, and `by` who changed it.
 
+## Edit operations
+
+`ops.apply_ops` is atomic: every op lands or none does. A refusal names the op by index and says how to fix it.
+
+| Ops | Applies to |
+| --- | --- |
+| `insert`, `replace`, `update`, `edit_text`, `delete`, `move` | Blocks |
+| `update_cell`, `add_rows`, `delete_rows`, `add_column`, `update_column`, `delete_column`, `sort_rows` | Tables |
+| `add_tab`, `rename_tab`, `delete_tab`, `move_tab`, `rename_doc` | Tabs and the doc |
+
+Positions are `start`, `end`, `{after}`, `{before}` and `{end_of_section: heading id}`.
+
+An edit that passes `if_rev` is refused as `stale` when a block it touches moved on after that rev, unless the change was made earlier in the same call. That rule lets an agent edit and a person's typing coexist without silent overwrites.
+
+The person's ops (`by: "user"`) are taken as sent: an empty text empties a block. The agent's are sifted for the blanks models fill into every field they are offered. A chart written with its own copy of a table's numbers is pointed at that table (`ops.link_inline_charts`), so the numbers live in one place.
+
+`undo.undo_ops` gives the ops that put back what one write changed, from the doc just before and after it, and nothing else: another writer's change in between is never part of them. An undo is a write like any other, so its own undo is the redo.
+
 ## Working on it
 
 Tests, in `tests/`:
 
 - `test_docs_format.py`: the model, Markdown and rendering.
+- `test_docs_ops.py`: the edit operations and the stale guard.
+- `test_docs_undo.py`: undoing and redoing each kind of edit.
