@@ -107,7 +107,7 @@ class _Harness:
     async def stream_response(
         self, *, conversation, input, model=None, reasoning_effort=None,
         disabled_connections=None, trace_tags=None, trace_metadata=None,
-        channel_context=None, tool_messages=False, model_wait=None,
+        channel_context=None, tool_messages=False, model_wait=None, docs=False,
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)

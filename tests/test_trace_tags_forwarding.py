@@ -48,7 +48,7 @@ def _run_harness(monkeypatch, session):
 
     async def _fake_build(
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
-        tool_messages=False,
+        tool_messages=False, docs=False,
     ):
         return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 

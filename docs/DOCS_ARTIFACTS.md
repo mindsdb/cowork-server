@@ -1,8 +1,8 @@
 # Docs: structured document artifacts
 
-A doc is a living document the agent and the person write together: tabs of typed blocks with stable ids, modelled on Claude's Docs artifacts.
+A doc is a living document the agent and the person write together. It opens beside the chat. The agent writes it section by section while the person watches, and the person types in it, picks statuses in its tables, and selects a passage to ask the agent to change. It is modelled on Claude's Docs artifacts.
 
-The code is in `cowork/docs/`, and the HTTP API is in `cowork/api/v1/endpoints/docs.py`. The renderer side lives in the cowork repo under `src/renderer/cowork/components/doc/`.
+The code is in `cowork/docs/`, the agent tools are in `cowork/harnesses/anton_harness/doc_tools.py`, and the HTTP API is in `cowork/api/v1/endpoints/docs.py`. The renderer side lives in the cowork repo under `src/renderer/cowork/components/doc/`.
 
 The modules depend in one direction, each on those above it:
 
@@ -17,7 +17,7 @@ The modules depend in one direction, each on those above it:
 | `hub` | In-process fan-out of changes to the editors and chats watching |
 | `images` | Images on this computer, kept beside the doc |
 | `service` | Create and apply (rendering the page under the doc's lock), and `announce` |
-| `export` | Downloads |
+| `prompt`, `export` | What the agent is told; downloads |
 
 The package uses the services; they never import its behaviour, and know a doc only by its files (`store`'s names).
 
@@ -59,7 +59,7 @@ Positions are `start`, `end`, `{after}`, `{before}` and `{end_of_section: headin
 
 An edit that passes `if_rev` is refused as `stale` when a block it touches moved on after that rev, unless the change was made earlier in the same call. That rule lets an agent edit and a person's typing coexist without silent overwrites.
 
-The person's ops (`by: "user"`) are taken as sent: an empty text empties a block. The agent's are sifted for the blanks models fill into every field they are offered. A chart written with its own copy of a table's numbers is pointed at that table (`ops.link_inline_charts`), so the numbers live in one place.
+The person's ops (`by: "user"`) are taken as sent: an empty text empties a block. The agent's are sifted for the blanks models fill into every field they are offered. A chart the agent writes with its own copy of a table's numbers is pointed at that table (`ops.link_inline_charts`), so the numbers live in one place.
 
 `undo.undo_ops` gives the ops that put back what one write changed, from the doc just before and after it, and nothing else: another writer's change in between is never part of them. An undo is a write like any other, so its own undo is the redo.
 
@@ -104,6 +104,28 @@ Everything is under `/api/v1/docs` and addressed like the artifact workspace rou
 | GET | `/{project}/{artifact}/export?format=md\|html\|docx\|pdf` | Download. Word and PDF are made as an artifact's export makes them (the fetch-free inliner, the Word writer, and for PDF the render service a deployment configures); the read's `capabilities.exportFormats` says which this deployment offers. They carry images beside the doc; a web image is left out, never fetched. |
 | GET | `/events?conversation_id=` | SSE `doc.created` / `doc.updated` for docs the agent touches in that conversation |
 
+`POST /api/v1/responses` takes three optional fields:
+
+- `docs: true`: the client shows docs, so the agent may write them. Without it (or one of the two below, which imply it) the turn has no doc tools.
+- `doc_context`: the doc, tab and selection open beside the chat, plus an "Edit with agent" `request`. It is handed to the agent as a `<doc-view-context>` block ahead of the message.
+- `output: "doc"`: the composer's "Write it as a doc" choice.
+
+## Agent tools
+
+`create_doc`, `read_doc`, `edit_doc` and `list_docs` are registered for in-process turns (desktop and local) whose client shows docs (`docs: true`). `create_doc` carries the system-prompt section (`cowork/docs/prompt.py`: `DOC_PROMPT`), which covers:
+
+- when to write a doc;
+- the outline-then-fill workflow with `{{pending: …}}` blocks;
+- the Markdown dialect: tables, `chart` and `metrics` fences, callouts and chips;
+- how to shape content;
+- how to edit safely with `if_rev` and the doc view context.
+
+Each handler streams one progress line, for example "Writing “Risks”", so the call shows as a step in the chat. Results are plain text built for a model: an outline of block ids, what was written, the pending sections still to fill, words an edit took out, and text it left in the doc twice.
+
+An image the agent puts in from a local path is copied beside the doc when it was attached to the conversation or is in the project (`cowork.docs.images`). Any other local path is refused with a message saying which images can be used.
+
+Turns that run on a remote worker (org mode) do not get these tools yet, so they are not handed `doc_context` or the Output: Doc note either: such a turn is answered like any other. Moving the engine and tools into anton and adding them to the cloud allowlist is the follow-up that brings docs there.
+
 ## Working on it
 
 Tests, in `tests/`:
@@ -114,5 +136,8 @@ Tests, in `tests/`:
 - `test_docs_store.py`: the write path, editing sessions and their versions, and the hub.
 - `test_docs_endpoints.py`: the HTTP API.
 - `test_docs_images.py`: images kept beside the doc.
+- `test_docs_tools.py`: the agent's tools.
 
 By hand: run the app against a server with a throwaway `COWORK_HOME` (never your own `~/.cowork`). The editor's tests sit beside it in the cowork repo, under `src/renderer/cowork/components/doc/`.
+
+Model-in-the-loop check: give a model only `DOC_PROMPT` and the tool schemas, and let it call the real handlers.
