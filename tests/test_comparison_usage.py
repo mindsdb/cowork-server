@@ -94,6 +94,21 @@ def test_the_gateway_cap_marks_the_totals_as_a_floor():
     assert side_usage(_starts(0), {"requests": [_call(1)], "truncated": True}).truncated is True
 
 
+@pytest.mark.parametrize(
+    ("calls_read", "truncated"),
+    [
+        # The cap was reached after the Continue: every call of the owned turns was read.
+        ([_call(1), _call(61), _call(130)], False),
+        # The cap was reached before it: owned turns may be missing calls.
+        ([_call(1), _call(61)], True),
+    ],
+    ids=["cap-after-continue", "cap-before-continue"],
+)
+def test_a_continued_side_is_partial_only_when_the_cap_cuts_its_own_turns(calls_read, truncated):
+    usage = side_usage(_starts(0, 60, 120), {"requests": calls_read, "truncated": True}, turn_limit=2)
+    assert usage.truncated is truncated
+
+
 def test_a_fast_local_clock_is_corrected_before_calls_are_filed():
     # The laptop runs 30 s fast: its turn starts read 30 s late against the
     # gateway's timestamps. Uncorrected, the second turn's first calls would be

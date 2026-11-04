@@ -130,10 +130,13 @@ def side_usage(
 
     turns = [TurnUsage(turn=index + 1) for index in range(len(owned))]
     unpriced = 0
+    last_read: datetime | None = None
     for call in payload["requests"]:
         if not isinstance(call, dict):
             continue
         at = _as_utc(call.get("timestamp"))
+        if at is not None and (last_read is None or at > last_read):
+            last_read = at
         if at is None or (cutoff is not None and at >= cutoff):
             continue
         turn = turns[max(0, bisect.bisect_right(owned, at) - 1)]
@@ -156,7 +159,11 @@ def side_usage(
         cache_write_tokens=sum(t.cache_write_tokens for t in turns),
         estimated_cost_usd=sum(priced) if priced else None,
         unpriced_calls=unpriced,
-        truncated=bool(payload.get("truncated")),
+        # The gateway returns a session's earliest calls up to its cap. Calls
+        # past it only cut the comparison's figures short while they could
+        # still fall inside the turns it owns, i.e. before a Continue.
+        truncated=bool(payload.get("truncated"))
+        and (cutoff is None or last_read is None or last_read < cutoff),
     )
 
 
