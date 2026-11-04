@@ -1063,6 +1063,7 @@ class AntonHarness:
         ui_locale: str | None = None,
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
+        docs: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1230,6 +1231,7 @@ class AntonHarness:
                 tool_messages=tool_messages,
                 interactive=interactive,
                 ui_locale=ui_locale,
+                docs=docs,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1557,10 +1559,16 @@ class AntonHarness:
         tool_messages: bool = False,
         interactive: bool = True,
         ui_locale: str | None = None,
+        docs: bool = False,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
-        result; a build that fails hands them back (release_stop_notices)."""
+        result; a build that fails hands them back (release_stop_notices).
+
+        ``docs``: the client shows docs, so the doc tools are registered, and
+        with them ``create_doc``'s prompt section (DOC_PROMPT). Without it the
+        agent never hears of docs and writes none the client can't show.
+        """
         notices: list[UUID] = []
         try:
             built = await self._build_turn_session(
@@ -1573,6 +1581,7 @@ class AntonHarness:
                 interactive=interactive,
                 ui_locale=ui_locale,
                 live_app_notices=notices,
+                docs=docs,
             )
         except BaseException:
             if notices:
@@ -1602,6 +1611,7 @@ class AntonHarness:
         interactive: bool,
         live_app_notices: list[UUID],
         ui_locale: str | None = None,
+        docs: bool,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -1633,6 +1643,15 @@ class AntonHarness:
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()
         LABEL_CONNECTION_TOOL = build_cowork_label_connection_tool()
         CREATE_SKILL_DRAFT_TOOL = build_cowork_create_skill_draft_tool()
+        from .doc_tools import DocToolContext, build_doc_tools
+        doc_tool_ctx = DocToolContext(
+            artifacts_base=Path(conversation.project.path) / ".anton" / "artifacts",
+            conversation_id=str(conversation.id),
+            project_id=str(conversation.project_id) if conversation.project_id else None,
+            project_name=conversation.project.name,
+            project_label=display_label(conversation.project),
+        ) if docs else None
+        DOC_TOOLS = build_doc_tools(doc_tool_ctx) if doc_tool_ctx is not None else []
 
         try:
             from anton.core.datasources.data_vault import LocalDataVault
@@ -1762,6 +1781,9 @@ class AntonHarness:
         # Read once: the prompt lists them, and the code sandbox grants their
         # folders read-only.
         attachment_rows = await _read_attachments(conversation, scope=current_settings_scope())
+        if doc_tool_ctx is not None:
+            # An attached image may go in a doc (copied beside it).
+            doc_tool_ctx.attached_files = frozenset(Path(a.path) for a in attachment_rows or [] if a.path)
         attachment_context = _attachment_context_for(attachment_rows, conversation=conversation)
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
@@ -2210,6 +2232,7 @@ class AntonHarness:
                     REQUEST_CREDENTIALS_TOOL,
                     LABEL_CONNECTION_TOOL,
                     CREATE_SKILL_DRAFT_TOOL,
+                    *DOC_TOOLS,
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
