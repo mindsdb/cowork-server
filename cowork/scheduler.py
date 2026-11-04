@@ -26,6 +26,8 @@ from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.streaming.backend import get_backend
+from cowork.streaming.cancellation import request_cancel
 from cowork.streaming.registry import ServerShuttingDown, registry
 
 if TYPE_CHECKING:
@@ -38,8 +40,12 @@ T = TypeVar("T")
 _POLL_INTERVAL_SECONDS = 30
 # Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
 # must not keep its ScheduleRun in `running` forever — that would block the
-# schedule from ever firing again. On timeout the run is recorded as failed.
+# schedule from ever firing again. On timeout the turn is stopped and the run
+# is recorded as failed.
 _MAX_RUN_DURATION_SECONDS = 600
+# The width of Conversation.topic. A schedule's title has no limit, and a run's
+# conversation is named after it.
+_TOPIC_MAX_LENGTH = 255
 # How long a run's last writes, its outcome and its finish, keep asking for a
 # database connection while the pool is full. They must land: a run left at
 # `running` stops its schedule firing until a restart, and an outcome never
@@ -65,6 +71,12 @@ _RUN_LEASE_SECONDS = 120
 _LEASE_RENEW_SECONDS = 30
 _LAPSED_RUN_ERROR = "Run was interrupted: the server running it stopped before it finished."
 _scheduler_task: asyncio.Task | None = None
+
+
+def schedule_conversation_topic(title: str) -> str:
+    """The topic of a run's conversation: the schedule's title, cut to fit."""
+    return title[:_TOPIC_MAX_LENGTH]
+
 # A run's error when its turn was refused because the server was shutting
 # down. The run never started, so the schedule's own last_error is left alone.
 _SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
@@ -331,7 +343,7 @@ def _link_conversation(
             unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
         )
         conversation_id = ConversationService(conv_session).create_conversation(
-            topic=scheduled.title,
+            topic=schedule_conversation_topic(scheduled.title),
             project_id=scheduled.project_id,
         ).id
     if not ScheduleRunService(session).set_run_conversation(run_id, conversation_id):
@@ -540,6 +552,9 @@ async def execute_schedule(
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
+            # The timeout cancels only this drain. The turn runs detached in
+            # the registry and would go on writing and publishing, so stop it.
+            await _stop_timed_out_turn(str(conversation_id))
             raise RuntimeError(
                 f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
             ) from exc
@@ -651,6 +666,32 @@ async def execute_schedule(
                 "Failed to finish the run record",
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
             )
+
+
+async def _stop_timed_out_turn(conversation_id: str) -> None:
+    """Stop a turn its run gave up on, the way the Stop button does.
+
+    A turn in a sandbox pod only stops when the controller sees its cancel
+    flag; cancelling the local producer alone ends just our tail of it. The
+    turn is marked timed out first, so it saves as interrupted, not as the
+    user's own Stop.
+    """
+    handle = registry.get(conversation_id)
+    if handle is None or not handle.is_running:
+        return
+    handle.lifecycle.timed_out = True
+    if get_backend() == "redis" or handle.lifecycle.identity.remote:
+        try:
+            await request_cancel(handle.lifecycle.identity.correlation_id)
+        except Exception:
+            # The local cancel below still runs; a pod turn then ends at the
+            # controller's own turn limit.
+            logger.warning(
+                "Could not flag a timed-out scheduled turn for cancellation",
+                exc_info=True,
+                extra=log_context(conversation_id=conversation_id),
+            )
+    await handle.cancel()
 
 
 async def _turn_terminal_reason(conversation_id: str) -> str | None:
