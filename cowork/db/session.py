@@ -4,6 +4,7 @@ import hashlib
 import re
 import time
 
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
@@ -24,10 +25,15 @@ _session_factories = {}
 
 
 def _is_expected_refusal(exc: BaseException) -> bool:
-    """True for an answer the request was meant to get: a 4xx HTTPException, or
-    the 503 for a pool that freed no connection in time (cowork.server answers
-    it). Another error's status_code, such as a provider SDK's, is not one."""
+    """True for an answer the request was meant to get: a 4xx HTTPException, the
+    422 for a body that failed validation, or the 503 for a pool that freed no
+    connection in time (cowork.server answers it). Another error's status_code,
+    such as a provider SDK's, is not one."""
     if isinstance(exc, PoolTimeoutError):
+        return True
+    # Its str() and traceback carry the submitted body, a password or a DSN on
+    # a connector form; FastAPI answers it with 422.
+    if isinstance(exc, RequestValidationError):
         return True
     if not isinstance(exc, HTTPException):
         return False
@@ -196,7 +202,7 @@ def get_session():
             logger.debug(
                 "Session rolled back after an expected refusal: error_type=%s status=%s",
                 type(e).__name__,
-                getattr(e, "status_code", 503),
+                422 if isinstance(e, RequestValidationError) else getattr(e, "status_code", 503),
             )
         elif isinstance(e, HTTPException):
             # Starlette answers an HTTPException (FastAPI's subclasses it)
