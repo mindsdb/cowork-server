@@ -2205,3 +2205,37 @@ def test_a_sides_backend_gets_no_blocked_connectors_credentials(tmp_path, monkey
 
     assert seen["DS_PG_URL"] == "pg"
     assert ("DS_SLACK_TOKEN" in seen) is (not sandboxed)
+
+
+@pytest.mark.parametrize("carried_all", [True, False], ids=["full-carry", "partial-carry"])
+def test_continue_releases_the_sandboxs_runtime_only_with_the_sandbox(client, monkeypatch, carried_all):
+    """Continue removes the sandbox once everything is carried, and with it
+    stops its backends and forgets its pads. A partial carry keeps the
+    sandbox, so its runtime stays too."""
+    from unittest.mock import MagicMock
+
+    from cowork.services import artifacts, comparisons, scratchpad_runtime
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    if not carried_all:
+        for i in range(3):
+            (sandbox / f"out{i}.csv").write_text("x")
+        monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 1)
+    workspace = scratchpad_runtime._resolve_workspace(str(sandbox))
+    scratchpad_runtime._pads.setdefault(workspace, {})["dash"] = scratchpad_runtime._CachedPad(object(), None)
+    proc = MagicMock(returncode=None)
+    artifacts._LAUNCHED_BACKENDS[str(sandbox.resolve())] = {"dash": {"proc": proc}}
+    try:
+        target = _real_project(client, f"release-target-{carried_all}")
+        r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+        assert r.status_code == 200, r.text
+        assert r.json()["carriedAll"] is carried_all
+
+        assert sandbox.exists() is (not carried_all)
+        assert (scratchpad_runtime.get("dash", workspace_path=str(sandbox)) is None) is carried_all
+        assert proc.terminate.called is carried_all
+    finally:
+        scratchpad_runtime._pads.clear()
+        artifacts._LAUNCHED_BACKENDS.clear()
