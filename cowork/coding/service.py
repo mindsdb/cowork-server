@@ -150,6 +150,7 @@ class CodingService(
             maintenance=self._maintenance,
             is_remote=self._is_remote,
             control_view=self._control_view,
+            on_disk_change=self.workspace_usage.invalidate,
         )
         self.lifecycle = SessionLifecycleOperations(
             maintenance_session=self._maintenance_session,

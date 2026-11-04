@@ -283,6 +283,21 @@ def test_a_new_turn_on_a_released_task_runs_in_its_rebuilt_workspace(tmp_path: P
     assert engine.prompts[-1] == "Continue"
 
 
+def test_releasing_and_restoring_a_workspace_marks_storage_out_of_date(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    session_id = completed_task(service, repo)
+    usage = service.workspace_usage
+
+    before = usage._generation
+    assert service.retention.release(session_id) is True
+    assert usage._generation > before
+
+    before = usage._generation
+    service.ensure_workspace(session_id)
+    assert usage._generation > before
+
+
 def test_deleting_a_released_task_forgets_its_saved_state(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())

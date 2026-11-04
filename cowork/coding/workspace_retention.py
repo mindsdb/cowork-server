@@ -70,6 +70,7 @@ class WorkspaceRetention:
         maintenance: set[str],
         is_remote: Callable[[CodingSession], bool],
         control_view: Callable[[CodingSession], CodingSession],
+        on_disk_change: Callable[[], None] = lambda: None,
     ) -> None:
         self.store = store
         self.workspaces = workspaces
@@ -80,6 +81,8 @@ class WorkspaceRetention:
         self.is_remote = is_remote
         # Run status lives in the control plane; the stored session can lag it.
         self.control_view = control_view
+        # Releasing or rebuilding a workspace changes how much disk it uses.
+        self.on_disk_change = on_disk_change
 
     def releasable(self, session: CodingSession, *, reserved: bool = False) -> bool:
         """Whether releasing this task's workspace can disturb nothing in use.
@@ -138,8 +141,10 @@ class WorkspaceRetention:
                         logger.exception("Could not restore the workspace of coding task %s after a failed release", session_id)
                     else:
                         self._mark_released(session_id, None)
+                    self.on_disk_change()
                     return False
             self._note(session_id, kept=None)
+            self.on_disk_change()
             return True
         finally:
             self._unreserve(session_id)
@@ -179,6 +184,7 @@ class WorkspaceRetention:
                 raise
             self._mark_released(session_id, None)
             self._note(session_id, restore_error=None)
+            self.on_disk_change()
         finally:
             if not reserved:
                 self._unreserve(session_id)
