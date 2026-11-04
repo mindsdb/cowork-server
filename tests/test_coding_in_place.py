@@ -84,6 +84,8 @@ def test_an_in_place_task_works_in_the_repository_and_reviews_against_its_start(
     assert session.workspace_kind == WorkspaceKind.direct_folder
     assert Path(session.workspace_path) == repo.resolve()
     assert session.base_revision == head(repo)
+    # The path is published before the first turn opens the engine.
+    assert engine.opened.wait(timeout=3)
     assert engine.opened_workspaces[-1] == session.workspace_path
     worktrees = subprocess.run(
         ["git", "worktree", "list", "--porcelain"], cwd=repo, check=True, capture_output=True, text=True,
