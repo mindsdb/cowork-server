@@ -1160,6 +1160,8 @@ class ResponsesHandler:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
+        # route_ms on both log lines starts here, before the history scrub.
+        route_started = time.monotonic()
         try:
             # Scrub credentials: this history bypasses the normal turn's
             # _scrub_user_input/_stamp_message pass. Its DS_* values were
@@ -1193,7 +1195,9 @@ class ResponsesHandler:
                     # decision <-> Jev answer an exact join. Never
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
+                    binding_started = time.monotonic()
                     binding, turn_llm = await self._router_binding()
+                    binding_ms = round((time.monotonic() - binding_started) * 1000)
 
                     @cache
                     def binding_for_turn() -> RouterBinding | None:
@@ -1225,6 +1229,12 @@ class ResponsesHandler:
                         },
                     ))
                     turn_queue_settings = TurnQueueSettings()
+                    # Remote turns only for now: the budget is a measured canary there.
+                    gate_total_seconds = (
+                        turn_queue_settings.gate_total_timeout_seconds
+                        if turn_queue_settings.is_remote
+                        else None
+                    )
 
                     gate_started = time.monotonic()
                     decision = await decide_route(
@@ -1234,9 +1244,12 @@ class ResponsesHandler:
                         has_disabled_connections=has_disabled_connections,
                         after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
                         binding=binding,
+                        gate_total_seconds=gate_total_seconds,
                         binding_factory=binding_for_turn,
                     )
-                    gate_ms = round((time.monotonic() - gate_started) * 1000)
+                    now = time.monotonic()
+                    gate_ms = round((now - gate_started) * 1000)
+                    route_ms = round((now - route_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
                     # WARNING (app_settings.py's own default too), so an info-level
                     # line here is silently dropped everywhere it would actually
@@ -1251,6 +1264,9 @@ class ResponsesHandler:
                             "reason": decision.reason,
                             "provider": decision.provider,
                             "duration_ms": gate_ms,
+                            "binding_ms": binding_ms,
+                            "route_ms": route_ms,
+                            "gate_budget_s": gate_total_seconds,
                             **log_context(conversation_id=conversation_id),
                         },
                     )
@@ -1277,7 +1293,10 @@ class ResponsesHandler:
             raise
         except Exception:
             # Non-authorization routing failures may delegate to the agent.
-            logger.exception("[responses] routing gate failed — delegating")
+            logger.exception(
+                "[responses] routing gate failed — delegating",
+                extra={"route_ms": round((time.monotonic() - route_started) * 1000)},
+            )
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
