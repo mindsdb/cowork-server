@@ -27,13 +27,7 @@ from cowork.db.units import run_db
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
-from cowork.services.schedules import (
-    ScheduleBusy,
-    ScheduleRunService,
-    ScheduleService,
-    SlotAlreadyClaimed,
-    SlotAttempts,
-)
+from cowork.services.schedules import ScheduleBusy, ScheduleRunService, ScheduleService, SlotAlreadyClaimed
 from cowork.streaming.liveness import MODEL_WAIT_PHASE
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import request_cancel
@@ -80,12 +74,6 @@ _RUN_LEASE_SECONDS = 120
 _LEASE_RENEW_SECONDS = 30
 _LAPSED_RUN_ERROR = "Run was interrupted: the server running it stopped before it finished."
 _scheduler_task: asyncio.Task | None = None
-# A cron slot whose run failed before its agent acted gets this many attempts
-# in all, each after the pause listed for it. Only such a failure is tried
-# again: the agent did nothing, so a second attempt cannot do its work twice.
-# A manual run gets one attempt; the user is there and can run it again.
-_MAX_CRON_ATTEMPTS = 3
-_RETRY_DELAYS_SECONDS = (60, 300)
 # Scheduled runs this process executes at once, cron and run-now alike
 # (_Admission). A due slot over the limit stays due for a later poll.
 _MAX_CONCURRENT_RUNS = 3
@@ -189,7 +177,6 @@ def _apply_success_write_back(
 
 def _handle_missed_runs(session) -> None:
     now = datetime.now(timezone.utc)
-    run_service = ScheduleRunService(session)
     schedules = ScheduleService(session).list_schedules()
     for schedule in schedules:
         if not schedule.enabled:
@@ -198,11 +185,6 @@ def _handle_missed_runs(session) -> None:
         next_run = ensure_utc(schedule.next_run_at)
 
         if next_run >= now:
-            continue
-
-        # A slot waiting for its next attempt is not missed: it gets its
-        # attempts, and consuming it afterwards moves on to the next slot.
-        if _retry_at(run_service.slot_attempts(schedule.id, next_run)) is not None:
             continue
 
         if schedule.cadence == Cadence.once:
@@ -271,13 +253,10 @@ class _ScheduledTurn:
 
 @dataclass(frozen=True)
 class DueSlot:
-    """A schedule due to run, the cron slot its run claims, and which attempt
-    at that slot the run is (``retry_of`` names the first)."""
+    """A schedule due to run, and the cron slot its run claims."""
 
     schedule_id: UUID
     slot_at: datetime
-    attempt: int = 1
-    retry_of: UUID | None = None
 
 
 class _Admission:
@@ -334,41 +313,6 @@ def release_run_place() -> None:
     _admission.release()
 
 
-def _retry_at(attempts: SlotAttempts) -> datetime | None:
-    """When the next attempt at a slot may start, or None when no attempt is
-    waiting: none failed yet, the last one did not fail before acting, or the
-    slot used every attempt."""
-    if (
-        attempts.count == 0
-        or attempts.count >= _MAX_CRON_ATTEMPTS
-        or attempts.last_outcome != AttemptOutcome.failed_before_execution
-        or attempts.last_finished_at is None
-    ):
-        return None
-    delay = _RETRY_DELAYS_SECONDS[min(attempts.count, len(_RETRY_DELAYS_SECONDS)) - 1]
-    return attempts.last_finished_at + timedelta(seconds=delay)
-
-
-def pending_retry_at(session: ScopedSession, schedule: Schedule) -> datetime | None:
-    """When the waiting retry of a schedule's due slot may start, or None.
-
-    A paused schedule reports none: nothing starts on it until it is resumed,
-    and the retry then waits out what is left of its pause."""
-    if not schedule.enabled:
-        return None
-    return _retry_at(ScheduleRunService(session).slot_attempts(schedule.id, ensure_utc(schedule.next_run_at)))
-
-
-def _will_retry(*, is_manual: bool, attempt: int | None, outcome: AttemptOutcome | None) -> bool:
-    """Whether a run's slot is left due for another attempt."""
-    return (
-        not is_manual
-        and attempt is not None
-        and attempt < _MAX_CRON_ATTEMPTS
-        and outcome == AttemptOutcome.failed_before_execution
-    )
-
-
 class RunClaimLost(Exception):
     """Another replica reaped this run before its turn started, so the slot
     may run there; this run must not start its turn."""
@@ -393,7 +337,7 @@ class _TurnEvidence:
 
 def _classify(evidence: _TurnEvidence) -> AttemptOutcome:
     """What the turn's ending says about whether its agent acted. When in
-    doubt it says the agent may have, so the run is not tried again."""
+    doubt it says the agent may have."""
     reason = evidence.reason
     if reason == "completed":
         return AttemptOutcome.completed
@@ -410,11 +354,9 @@ def _classify(evidence: _TurnEvidence) -> AttemptOutcome:
 
 def _create_run(
     session: ScopedSession, *, schedule_id: UUID, is_manual: bool, slot_at: datetime | None,
-    attempt: int | None = None, retry_of: UUID | None = None,
 ) -> UUID:
     return ScheduleRunService(session).create_run(
         schedule_id, is_manual=is_manual, slot_at=slot_at, lease_seconds=_RUN_LEASE_SECONDS,
-        attempt=attempt, retry_of=retry_of,
     ).id
 
 
@@ -432,8 +374,7 @@ def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID:
 def abandon_manual_run(session: ScopedSession, run_id: UUID, error: str) -> None:
     """Finish a claimed Run now whose request failed before handing it off."""
     ScheduleRunService(session).finish_run(
-        run_id, status=RunStatus.failed, error=error,
-        outcome=AttemptOutcome.failed_before_execution, counts_as_attempt=False,
+        run_id, status=RunStatus.failed, error=error, outcome=AttemptOutcome.failed_before_execution,
     )
 
 
@@ -542,7 +483,6 @@ def _delete_unstarted_conversation(
 
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
-    consume_slot: bool = True,
 ) -> _RunOutcome:
     schedule_service = ScheduleService(session)
     run_service = ScheduleRunService(session)
@@ -562,12 +502,11 @@ def _record_turn_outcome(
     else:
         _apply_success_write_back(schedule, run_service, conversation_id, session)
 
-    # Consume the cron slot: the schedule stays due otherwise and the loop
-    # would immediately restart the run the user killed (a cancelled/failed
-    # run isn't a success, so the freshness guard wouldn't block the
-    # restart). The one exception is a turn that failed before its agent
-    # acted with attempts left: its slot stays due for the next attempt.
-    if not is_manual and consume_slot:
+    # Always consume the cron slot: the schedule stays due otherwise and
+    # the loop would immediately restart the run the user killed (a
+    # cancelled/failed run isn't a success, so the freshness guard
+    # wouldn't block the restart).
+    if not is_manual:
         _advance_next_run_at(schedule, session)
 
     try:
@@ -581,7 +520,7 @@ def _record_turn_outcome(
         session.rollback()
         schedule = schedule_service.get_schedule(schedule_id)
         _apply_success_write_back(schedule, run_service, None, session)
-        if not is_manual and consume_slot:
+        if not is_manual:
             _advance_next_run_at(schedule, session)
         session.commit()
     return outcome
@@ -605,11 +544,11 @@ def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: 
 def _finish_run(
     session: ScopedSession, *, run_id: UUID, conversation_id: UUID | None, error: str | None,
     status: RunStatus | None, release_slot: bool = False,
-    outcome: AttemptOutcome | None = None, counts_as_attempt: bool = True,
+    outcome: AttemptOutcome | None = None,
 ) -> None:
     ScheduleRunService(session).finish_run(
         run_id, conversation_id=conversation_id, error=error, status=status, release_slot=release_slot,
-        outcome=outcome, counts_as_attempt=counts_as_attempt,
+        outcome=outcome,
     )
 
 
@@ -641,8 +580,6 @@ async def execute_schedule(
     conversation_id: UUID | None = None,
     *,
     slot_at: datetime | None = None,
-    attempt: int | None = None,
-    retry_of: UUID | None = None,
     run_id: UUID | None = None,
 ) -> None:
     """Run one schedule's turn and record how it went.
@@ -660,11 +597,6 @@ async def execute_schedule(
     its turn never started or a shutdown cut it, gives the slot back, so the
     next poll can claim it again.
 
-    A cron run is ``attempt`` at its slot (1 unless the poll says otherwise).
-    When it fails before its agent acts and attempts are left, it leaves the
-    slot due and gives it back, and a later poll starts the next attempt after
-    the pause for it (_due_slots).
-
     A Run now passes the ``run_id`` its request already claimed
     (claim_manual_run), so the press and its run are one claim.
     """
@@ -672,14 +604,9 @@ async def execute_schedule(
     from cowork.schemas.responses import ResponsesRequest
     from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
 
-    if attempt is None and slot_at is not None and not is_manual:
-        attempt = 1
     try:
         run_id = run_id or await run_db(
-            partial(
-                _create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at,
-                attempt=attempt, retry_of=retry_of,
-            ),
+            partial(_create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at),
             scope=SYSTEM_SCOPE,
         )
     except PoolTimeoutError:
@@ -710,9 +637,6 @@ async def execute_schedule(
     error: str | None = None
     final_status: RunStatus | None = None
     outcome: AttemptOutcome | None = None
-    # A run ended by something other than its task (a shutdown, a lost claim,
-    # a passing outage) is not one of its slot's attempts.
-    counts_as_attempt = True
     created_conversation = conversation_id is None
     turn_started = False
     timed_out = False
@@ -730,13 +654,6 @@ async def execute_schedule(
         # seam) so incident forensics don't have to reconstruct which schedule/
         # trigger produced a turn from timestamps.
         trigger = "manual" if is_manual else "cron"
-        trace_metadata = {
-            "schedule_id": str(schedule_id),
-            "schedule_run_id": str(run_id),
-            "trigger_type": trigger,
-        }
-        if attempt is not None:
-            trace_metadata["attempt"] = str(attempt)
         request = ResponsesRequest(
             # `schedule.model` is the "default" sentinel for every task the UI
             # creates, not a servable id. Resolve it to None so the harness
@@ -747,7 +664,11 @@ async def execute_schedule(
             stream=True,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger}"],
-            trace_metadata=trace_metadata,
+            trace_metadata={
+                "schedule_id": str(schedule_id),
+                "schedule_run_id": str(run_id),
+                "trigger_type": trigger,
+            },
         )
         async def _drain_run() -> None:
             # The schedule-derived principal is what lets the turn (and the
@@ -776,7 +697,6 @@ async def execute_schedule(
             # serving. The finally below finishes the run row.
             error = _SHUTDOWN_RUN_ERROR
             outcome = AttemptOutcome.failed_before_execution
-            counts_as_attempt = False
             logger.info(
                 "Schedule run did not start; the server is shutting down",
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
@@ -807,21 +727,15 @@ async def execute_schedule(
         # success.
         evidence = await _turn_evidence(str(conversation_id))
         outcome = _classify(evidence)
-        retry = _will_retry(is_manual=is_manual, attempt=attempt, outcome=outcome)
         recorded = await _until_it_lands(
             partial(
                 _record_turn_outcome, schedule_id=schedule_id, reason=evidence.reason,
-                is_manual=is_manual, conversation_id=conversation_id, consume_slot=not retry,
+                is_manual=is_manual, conversation_id=conversation_id,
             ),
             schedule_id=schedule_id,
         )
         final_status, error = recorded.status, recorded.error
-        slot_consumed = not is_manual and not retry
-        if retry:
-            logger.warning(
-                "Scheduled run failed before its agent acted; it will be tried again",
-                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
-            )
+        slot_consumed = not is_manual
 
     except RunClaimLost:
         # The lease ran out before the turn started, and another replica
@@ -829,7 +743,6 @@ async def execute_schedule(
         # poll claims it next, so this run records nothing on the schedule.
         error = _LAPSED_RUN_ERROR
         outcome = AttemptOutcome.failed_before_execution
-        counts_as_attempt = False
         logger.warning(
             "Scheduled run lost its claim before its turn started",
             extra=log_context(schedule_id=schedule_id),
@@ -840,7 +753,6 @@ async def execute_schedule(
         # cron run still going. The finally saves it as failed.
         error = _INTERRUPTED_RUN_ERROR
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
-        counts_as_attempt = False
         raise
     except Exception as exc:
         error = str(exc)
@@ -860,22 +772,16 @@ async def execute_schedule(
             outcome = AttemptOutcome.uncertain
         # A run that raised consumes its cron slot like one that failed inside
         # its turn. Left due, the next poll starts it again, and a failure that
-        # repeats (a timeout, a revoked permission) re-fires every poll. Two
-        # exceptions leave it due. A busy pool or an auth outage before the
-        # turn starts clears on its own, the agent has done nothing yet, and
-        # skipping the slot would drop a daily or weekly occurrence over a
-        # short blip; it is not an attempt, so the next poll simply starts the
-        # slot again. Any other failure before the agent acted, with attempts
-        # left, waits for its next attempt (_due_slots).
+        # repeats (a timeout, a revoked permission) re-fires every poll. A busy
+        # pool or an auth outage before the turn starts is the exception: it
+        # clears on its own, the agent has done nothing yet, and skipping the
+        # slot would drop a daily or weekly occurrence over a short blip.
         transient = not turn_started and isinstance(exc, (PoolTimeoutError, ProductPermissionUnavailable))
-        if transient:
-            counts_as_attempt = False
-        retry = not transient and _will_retry(is_manual=is_manual, attempt=attempt, outcome=outcome)
         try:
             slot_consumed = await _until_it_lands(
                 partial(
                     _record_schedule_error, schedule_id=schedule_id, error=error,
-                    consume_slot=not is_manual and not transient and not retry,
+                    consume_slot=not is_manual and not transient,
                 ),
                 schedule_id=schedule_id,
             )
@@ -896,7 +802,7 @@ async def execute_schedule(
                     _finish_run, run_id=run_id, conversation_id=conversation_id,
                     error=error, status=final_status,
                     release_slot=slot_at is not None and not slot_consumed,
-                    outcome=outcome, counts_as_attempt=counts_as_attempt,
+                    outcome=outcome,
                 ),
                 schedule_id=schedule_id,
             )
@@ -997,7 +903,7 @@ async def _turn_acted(conversation_id: str) -> bool:
     """Whether the turn's buffer holds anything beyond its start, its memory
     read, a wait for the model and its failure. True when the buffer is
     unavailable, and a record that is not a stream frame counts as action, so
-    a doubt never makes a run look safe to try again.
+    a doubt never reads as the agent having done nothing.
 
     Only call after the turn's stream has been fully drained: the buffer is
     closed then, so reading it returns at the terminal record."""
@@ -1028,22 +934,13 @@ def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: date
 
 
 def _due_schedules(session, now: datetime) -> list[Schedule]:
-    """Enabled schedules whose slot is due and should actually execute."""
-    return [schedule for schedule, _ in _due_slots(session, now)]
-
-
-def _due_slots(session, now: datetime) -> list[tuple[Schedule, DueSlot]]:
-    """Enabled schedules whose slot is due and should actually execute, each
-    with the slot its run claims and which attempt at it the run is.
+    """Enabled schedules whose slot is due and should actually execute.
 
     A due slot with a successful run inside the freshness window is skipped
-    and advanced to its next occurrence instead of returned. A slot whose last
-    attempt failed before its agent acted is returned again once the pause
-    before its next attempt is over, and the freshness guard does not apply:
-    the slot never ran.
+    and advanced to its next occurrence instead of returned.
     """
     run_service = ScheduleRunService(session)
-    due: list[tuple[Schedule, DueSlot]] = []
+    due: list[Schedule] = []
     skipped = False
     for s in ScheduleService(session).list_schedules():
         # Gate on ANY in-flight run, manual included: a manual run still
@@ -1062,28 +959,6 @@ def _due_slots(session, now: datetime) -> list[tuple[Schedule, DueSlot]]:
             continue  # deleted since this poll read it
         if not s.enabled or ensure_utc(s.next_run_at) > now:
             continue
-        slot = ensure_utc(s.next_run_at)
-        attempts = run_service.slot_attempts(s.id, slot)
-        if attempts.count:
-            retry_at = _retry_at(attempts)
-            if retry_at is None:
-                # Every attempt is used, or the last one ended in a way that is
-                # not tried again, yet the slot is still due: the run could not
-                # record that it consumed it. Consume it now rather than run
-                # the slot again.
-                logger.warning(
-                    "Consuming a schedule slot whose attempts are over",
-                    extra=log_context(schedule_id=s.id),
-                )
-                _advance_next_run_at(s, session)
-                skipped = True
-                continue
-            if retry_at > now:
-                continue
-            due.append((s, DueSlot(
-                schedule_id=s.id, slot_at=slot, attempt=attempts.count + 1, retry_of=attempts.first_id,
-            )))
-            continue
         if _ran_recently(s, run_service, now):
             logger.info(
                 "Skipping schedule slot after a recent successful run",
@@ -1092,7 +967,7 @@ def _due_slots(session, now: datetime) -> list[tuple[Schedule, DueSlot]]:
             _advance_next_run_at(s, session)
             skipped = True
             continue
-        due.append((s, DueSlot(schedule_id=s.id, slot_at=slot)))
+        due.append(s)
     if skipped:
         session.commit()
     return due
@@ -1139,7 +1014,10 @@ def _poll(session: ScopedSession) -> list[DueSlot]:
     the schedules due now with the slot each one's run claims."""
     _reap_lapsed_runs(session, datetime.now(timezone.utc))
     _handle_missed_runs(session)
-    return [slot for _, slot in _due_slots(session, datetime.now(timezone.utc))]
+    return [
+        DueSlot(schedule_id=schedule.id, slot_at=ensure_utc(schedule.next_run_at))
+        for schedule in _due_schedules(session, datetime.now(timezone.utc))
+    ]
 
 
 async def _scheduler_loop() -> None:
@@ -1169,10 +1047,7 @@ async def _scheduler_loop() -> None:
                     extra={"event": "schedule_admission_full", "waiting": len(due)},
                 )
                 break
-            run = asyncio.create_task(run_admitted(
-                slot.schedule_id, is_manual=False, slot_at=slot.slot_at,
-                attempt=slot.attempt, retry_of=slot.retry_of,
-            ))
+            run = asyncio.create_task(run_admitted(slot.schedule_id, is_manual=False, slot_at=slot.slot_at))
             _scheduled_runs.add(run)
             run.add_done_callback(_scheduled_runs.discard)
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -200,21 +199,6 @@ class SlotAlreadyClaimed(Exception):
     """Another run already holds this schedule's cron slot."""
 
 
-@dataclass(frozen=True)
-class SlotAttempts:
-    """The attempts at one cron slot that count toward its retry limit.
-
-    ``count`` is how many there were, ``first_id`` the first of them (which a
-    retry points back at), and ``last_outcome``/``last_finished_at`` how and
-    when the latest one ended. Empty when the slot has none yet.
-    """
-
-    count: int = 0
-    first_id: UUID | None = None
-    last_outcome: str | None = None
-    last_finished_at: datetime | None = None
-
-
 def _utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
@@ -222,13 +206,10 @@ def _utc(value: datetime) -> datetime:
 def _record_lost_run(run: ScheduleRun) -> None:
     """Record what is known of a run whose process died. One that never
     linked its conversation never started its turn; one that did may have
-    acted. Neither counts as an attempt at its slot: the task did not fail,
-    its process went away."""
+    acted."""
     run.outcome = (
         AttemptOutcome.failed_before_execution if run.conversation_id is None else AttemptOutcome.interrupted
     )
-    if run.conversation_id is None:
-        run.attempt = None
 
 
 class ScheduleRunService:
@@ -242,17 +223,13 @@ class ScheduleRunService:
         *,
         slot_at: datetime | None = None,
         lease_seconds: float | None = None,
-        attempt: int | None = None,
-        retry_of: UUID | None = None,
     ) -> ScheduleRun:
         """Insert the run. With ``slot_at``, the insert claims that cron slot:
         the unique index on (schedule_id, slot_at) refuses a second run for it,
         and that refusal raises SlotAlreadyClaimed. A schedule holds one
         `running` run at a time (uq_schedule_runs_one_running), so an insert
         while another run is going raises ScheduleBusy. With ``lease_seconds``, the
-        run counts as alive until then unless renew_lease extends it.
-        ``attempt`` and ``retry_of`` place a cron run in its slot's attempts
-        (slot_attempts)."""
+        run counts as alive until then unless renew_lease extends it."""
         now = datetime.now(timezone.utc)
         run = ScheduleRun(
             schedule_id=schedule_id,
@@ -260,9 +237,6 @@ class ScheduleRunService:
             status=RunStatus.running,
             is_manual=is_manual,
             slot_at=slot_at,
-            for_slot_at=slot_at,
-            attempt=attempt,
-            retry_of=retry_of,
             lease_expires_at=now + timedelta(seconds=lease_seconds) if lease_seconds is not None else None,
         )
         self.session.add(run)
@@ -410,9 +384,6 @@ class ScheduleRunService:
         if run is None or run.status != RunStatus.running:
             return False
         run.conversation_id = self.still_exists(conversation_id)
-        # The last write before the turn is handed to the agent: from here on
-        # the agent may act.
-        run.execution_started_at = datetime.now(timezone.utc)
         self.session.add(run)
         try:
             self.session.commit()
@@ -431,13 +402,9 @@ class ScheduleRunService:
         status: RunStatus | None = None,
         release_slot: bool = False,
         outcome: AttemptOutcome | None = None,
-        counts_as_attempt: bool = True,
     ) -> ScheduleRun:
         """Record how the run ended. ``release_slot`` gives its cron slot back,
-        for a run that left the slot due: the next poll can then claim it.
-        ``counts_as_attempt`` False takes the run out of its slot's attempts,
-        for one that ended for a reason other than the task, such as a
-        shutdown before its turn started."""
+        for a run that left the slot due: the next poll can then claim it."""
         run = self.session.get(ScheduleRun, run_id)
         if run is None:
             raise ValueError("ScheduleRun not found")
@@ -450,8 +417,6 @@ class ScheduleRunService:
         run.lease_expires_at = None
         if outcome is not None:
             run.outcome = outcome
-        if not counts_as_attempt:
-            run.attempt = None
         if release_slot:
             run.slot_at = None
         if conversation_id is not None:
@@ -466,8 +431,7 @@ class ScheduleRunService:
             # `running`, which would wedge the schedule until a restart.
             self.session.rollback()
             return self.finish_run(
-                run_id, error=error, status=status, release_slot=release_slot,
-                outcome=outcome, counts_as_attempt=counts_as_attempt,
+                run_id, error=error, status=status, release_slot=release_slot, outcome=outcome,
             )
         self.session.refresh(run)
         return run
@@ -549,27 +513,6 @@ class ScheduleRunService:
                 kept.append(run)
             self.session.add(run)
         return kept
-
-    def slot_attempts(self, schedule_id: UUID, slot_at: datetime) -> SlotAttempts:
-        """The finished attempts at a cron slot that count toward its retry
-        limit, oldest first, summarized."""
-        rows = self.session.exec(
-            self.session.select(ScheduleRun)
-            .where(ScheduleRun.schedule_id == schedule_id)
-            .where(ScheduleRun.for_slot_at == slot_at)
-            .where(ScheduleRun.attempt.is_not(None))  # type: ignore[union-attr]
-            .where(ScheduleRun.status != RunStatus.running)
-            .order_by(ScheduleRun.attempt, ScheduleRun.started_at)  # type: ignore[arg-type]
-        ).all()
-        if not rows:
-            return SlotAttempts()
-        last = rows[-1]
-        return SlotAttempts(
-            count=len(rows),
-            first_id=rows[0].id,
-            last_outcome=last.outcome,
-            last_finished_at=_utc(last.finished_at) if last.finished_at else None,
-        )
 
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
         # Anchor on parent visibility (child table, request-reachable).

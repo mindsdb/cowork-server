@@ -56,12 +56,8 @@ class RunStatus(str, Enum):
 
 
 class AttemptOutcome(str, Enum):
-    """What is known about a run's execution when it ended.
-
-    Only ``failed_before_execution`` shows the agent did nothing, so it is the
-    only failure a cron run may try again on its own. Every other ending keeps
-    its output for review and is not replayed.
-    """
+    """What is known about a run's execution when it ended. Only
+    ``failed_before_execution`` shows the agent did nothing."""
 
     completed = "completed"
     # Failed before the agent could act: setup or permission, or a turn whose
@@ -130,10 +126,6 @@ class ScheduleResponse(CamelResponse):
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
-    # Not a Schedule column either: when the run for the due slot failed before
-    # it acted and will be tried again, the earliest time the next attempt may
-    # start. None when no retry is waiting.
-    retry_at: datetime | None = None
     created_at: datetime | None
     modified_at: datetime | None
 
@@ -149,7 +141,4 @@ class ScheduleRunResponse(CamelResponse):
     conversation_id: UUID | None
     is_manual: bool
     outcome: AttemptOutcome | None = None
-    execution_started_at: datetime | None = None
-    attempt: int | None = None
-    retry_of: UUID | None = None
     created_at: datetime | None

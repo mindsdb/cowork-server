@@ -25,13 +25,9 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live `running` flag (any in-flight run) and
-    when a waiting retry of the due slot may start (`retryAt`)."""
-    from cowork.scheduler import pending_retry_at
-
+    """ScheduleResponse plus the live `running` flag (any in-flight run)."""
     data = ScheduleResponse.serialize(schedule)
     data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
-    data["retryAt"] = pending_retry_at(scoped, schedule)
     return data
 
 
@@ -115,7 +111,6 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     from cowork.scheduler import (
         abandon_manual_run,
         claim_manual_run,
-        pending_retry_at,
         release_run_place,
         reserve_run_place,
         run_admitted,
@@ -130,11 +125,6 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     # press Run again.
     if ScheduleRunService(scoped).has_active_run(schedule_id):
         raise already_running
-    if pending_retry_at(scoped, schedule) is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This task's last run failed before it started and is waiting to be tried again.",
-        )
     if not reserve_run_place():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

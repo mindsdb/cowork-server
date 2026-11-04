@@ -66,8 +66,6 @@ class ScheduleRun(BaseSQLModel, table=True):
             sqlite_where=sa.text("slot_at IS NOT NULL"),
             postgresql_where=sa.text("slot_at IS NOT NULL"),
         ),
-        # The attempts at one slot, read on every poll for a due schedule.
-        sa.Index("ix_schedule_runs_for_slot", "schedule_id", "for_slot_at"),
         # One run going per schedule, manual or cron: inserting a second
         # `running` row fails, so two Run now presses, or Run now racing a
         # cron claim, start one run.
@@ -116,30 +114,7 @@ class ScheduleRun(BaseSQLModel, table=True):
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="Until when the process running it has renewed its claim; a running run past this is dead",
     )
-    for_slot_at: datetime | None = Field(
-        default=None,
-        sa_type=sa.DateTime(timezone=True),  # type: ignore
-        description="The cron slot this run was for, kept after the run gives the slot back; NULL for a manual run",
-    )
-    attempt: int | None = Field(
-        default=None,
-        description="Which attempt at its slot this run was (1-based); NULL for a manual run, or one that did not count, such as a run a shutdown stopped before its turn",
-    )
-    retry_of: UUID | None = Field(
-        default=None,
-        sa_column=sa.Column(
-            sa.Uuid(),
-            sa.ForeignKey("schedule_runs.id", ondelete="SET NULL"),
-            nullable=True,
-        ),
-        description="The first attempt at the same slot, when this run tried it again",
-    )
     outcome: str | None = Field(
         default=None,
         description="What is known about the run's execution when it ended (AttemptOutcome); NULL while running and on runs from before outcomes were recorded",
-    )
-    execution_started_at: datetime | None = Field(
-        default=None,
-        sa_type=sa.DateTime(timezone=True),  # type: ignore
-        description="When the run's turn was handed to the agent; NULL when it never was",
     )
