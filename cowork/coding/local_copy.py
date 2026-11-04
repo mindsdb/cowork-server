@@ -10,7 +10,7 @@ import os
 import shutil
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -101,6 +101,8 @@ class PreparedLocalCopy:
     source: Path
     workspace: Path
     baseline: Path
+    # Folders left out of the copy, relative to the source, for the task to rebuild.
+    omitted: tuple[str, ...] = ()
 
 
 class LocalCopyManager:
@@ -244,7 +246,7 @@ class LocalCopyManager:
                 shutil.copy2(desired_path, temp)
                 os.replace(temp, target)
 
-    def cleanup(self, key: str, workspace: Path) -> None:
+    def cleanup(self, key: str, workspace: Path, before_remove: Callable[[Path], None] | None = None) -> None:
         relative = managed_key(key)
         actual = workspace.resolve()
         expected_roots = (self.copies_root, self.legacy_copies_root)
@@ -260,8 +262,15 @@ class LocalCopyManager:
                 self._copy_tree(workspace, recovery)
             except OSError as exc:
                 raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
+        if before_remove is not None and workspace.exists():
+            before_remove(workspace)
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
+
+    def match(self, target: Path, desired: Path) -> None:
+        """Make ``target``'s reviewable content identical to ``desired``'s."""
+        current, wanted = self._manifests(target, desired)
+        self._replace_changed(target, desired, self._changed(target, current, desired, wanted))
 
     def _baseline_for(self, workspace: Path) -> Path:
         actual = workspace.resolve()
