@@ -1,14 +1,14 @@
 """Model comparisons: two sides of one task, and the user's verdicts.
 
 Revision ID: a7c3e5f9b2d4
-Revises: 3e4b5f7586d3
+Revises: c69488788ac7
 """
 
 from alembic import op
 import sqlalchemy as sa
 
 revision = "a7c3e5f9b2d4"
-down_revision = "3e4b5f7586d3"
+down_revision = "c69488788ac7"
 branch_labels = None
 depends_on = None
 

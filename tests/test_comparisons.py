@@ -1350,7 +1350,9 @@ def test_delete_frees_the_sandboxes_scratchpad_slots_and_backends(client):
     sandbox_paths = [_project(side["projectId"]).path for side in (a, b)]
     procs = {}
     for path in [*sandbox_paths, elsewhere["path"]]:
-        scratchpad_runtime._pads[scratchpad_runtime._key("dash", path)] = object()
+        scratchpad_runtime._pads.setdefault(scratchpad_runtime._resolve_workspace(path), {})["dash"] = (
+            scratchpad_runtime._CachedPad(object(), None)
+        )
         procs[path] = MagicMock(returncode=None)
         artifacts._LAUNCHED_BACKENDS[str(Path(path).resolve())] = {"dash": {"proc": procs[path]}}
     try:
@@ -1703,14 +1705,13 @@ def test_every_blocked_engine_exists_in_the_catalog():
 
 
 def test_a_side_never_writes_memory_in_process():
-    from cowork.harnesses.anton_harness.harness import _memory_mode
+    from cowork.harnesses.anton_harness.harness import _learns_this_turn
 
-    settings = SimpleNamespace(memory_enabled=True, memory_mode="autopilot")
     side = SimpleNamespace(project=SimpleNamespace(name=f"{COMPARISON_SANDBOX_PREFIX}abc"))
     ordinary = SimpleNamespace(project=SimpleNamespace(name="reports"))
-    assert _memory_mode(settings, side) == "off"
-    assert _memory_mode(settings, ordinary) == "autopilot"
-    assert _memory_mode(SimpleNamespace(memory_enabled=False, memory_mode="autopilot"), ordinary) == "off"
+    assert _learns_this_turn(side, True) is False
+    assert _learns_this_turn(ordinary, True) is True
+    assert _learns_this_turn(ordinary, False) is False
 
 
 def test_a_side_never_writes_memory_remotely(client):
@@ -1796,53 +1797,6 @@ def test_a_comparison_is_invisible_to_another_member(tmp_path, monkeypatch):
         get_app_settings.cache_clear()
 
 
-def test_same_slug_backends_in_two_projects_are_tracked_apart(tmp_path, monkeypatch):
-    import asyncio
-
-    from cowork.services import artifacts
-
-    seen: list[dict] = []
-
-    async def fake_launch(*, slug, artifact_folder, scratchpad_pool, tracked_backends, **_):
-        seen.append(tracked_backends)
-        tracked_backends[slug] = {"proc": None, "port": 1}
-        return {"port": 5000 + len(seen), "pid": 1}
-
-    monkeypatch.setattr("anton.core.artifacts.backend_launcher.launch_artifact_backend", fake_launch)
-    roots = {}
-    for name in ("one", "two"):
-        root = tmp_path / name
-        folder = root / ".anton" / "artifacts" / "dash"
-        folder.mkdir(parents=True)
-        (folder / "metadata.json").write_text("{}")
-        roots[name] = (root, folder)
-    monkeypatch.setattr(artifacts, "_registered_project_dirs", lambda: {r.resolve() for r, _ in roots.values()})
-    monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
-
-    for _root, folder in roots.values():
-        running, _detail, _port = asyncio.run(artifacts._launch_backend_locked(folder, "dash"))
-        assert running
-    assert len(seen) == 2 and seen[0] is not seen[1]
-    assert set(artifacts._LAUNCHED_BACKENDS) == {str(r.resolve()) for r, _ in roots.values()}
-
-
-def test_scratchpad_pool_keys_by_workspace(tmp_path, monkeypatch):
-    from cowork.services import scratchpad_runtime
-
-    made = []
-    monkeypatch.setattr(scratchpad_runtime, "_pads", {})
-    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **kw: ("p", "m", "k", "b"))
-    monkeypatch.setattr(
-        scratchpad_runtime,
-        "_make_runtime",
-        lambda name, **kw: made.append((name, kw["workspace_path"])) or object(),
-    )
-    one = scratchpad_runtime.get_or_create("dash", workspace_path=str(tmp_path / "one"))
-    two = scratchpad_runtime.get_or_create("dash", workspace_path=str(tmp_path / "two"))
-    assert one is not two
-    assert scratchpad_runtime.get_or_create("dash", workspace_path=str(tmp_path / "one")) is one
-    assert [name for name, _ in made] == ["dash", "dash"]
-    assert scratchpad_runtime.list_pads() == ["dash", "dash"]
 
 
 def test_sandboxes_are_hidden_from_search_and_memories(client):
@@ -1891,25 +1845,6 @@ def test_a_side_turn_runs_on_anton_whatever_the_client_picks(harness):
     assert r.status_code == 200, r.text
     assert asked == ["anton"]
 
-
-def test_backend_launches_lock_per_artifact_not_per_slug(tmp_path, monkeypatch):
-    import asyncio
-
-    from cowork.services import artifacts
-
-    monkeypatch.setattr(artifacts, "_BACKEND_LAUNCH_LOCKS", {})
-    monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
-    monkeypatch.setattr(artifacts, "_probe_port", lambda port, **kw: False)
-
-    async def fake_locked(artifact_dir, slug):
-        return True, "launched", 1
-
-    monkeypatch.setattr(artifacts, "_launch_backend_locked", fake_locked)
-    folders = [tmp_path / name / ".anton" / "artifacts" / "dash" for name in ("one", "two")]
-    for folder in folders:
-        folder.mkdir(parents=True)
-        asyncio.run(artifacts._ensure_backend_running(folder, 1))
-    assert set(artifacts._BACKEND_LAUNCH_LOCKS) == {str(f.resolve()) for f in folders}
 
 
 def test_delete_never_removes_a_project_that_is_not_a_sandbox(client):

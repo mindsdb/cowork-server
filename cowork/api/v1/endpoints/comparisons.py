@@ -7,7 +7,7 @@ from cowork.api.v1.endpoints.responses import _shared_turn
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep, TenantScope
 from cowork.models.comparison import Comparison
-from cowork.principal import hub_credential
+from cowork.principal import mindshub_credential
 from cowork.schemas.comparisons import (
     ComparisonContinueRequest,
     ComparisonCreateRequest,
@@ -154,7 +154,7 @@ async def get_comparison_usage(comparison_id: UUID, request: Request, scoped: Sc
         (side.label, str(side.conversation_id), service.turn_starts(side), side.continued_turn_count)
         for side in sorted(comparison.sides, key=lambda s: s.label)
     ]
-    usage = await comparison_usage(sides, bearer_token=hub_credential(request))
+    usage = await comparison_usage(sides, bearer_token=mindshub_credential(request))
     service.record_usage(comparison, usage.sides)
     return usage.model_dump(by_alias=True)
 
