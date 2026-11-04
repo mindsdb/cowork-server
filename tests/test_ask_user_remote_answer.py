@@ -108,25 +108,42 @@ def test_malformed_body_is_rejected_before_queueing(client, turn, pod, body, exp
     assert pod["calls"] == []
 
 
-@pytest.mark.parametrize("result,question_id,values,extended", [
-    (RemoteAnswerResult.ACCEPTED, "limit:abc", ["continue"], True),
-    (RemoteAnswerResult.ACCEPTED, "limit:abc", ["stop"], False),
-    (RemoteAnswerResult.ALREADY_ANSWERED, "limit:abc", ["continue"], False),
-    (RemoteAnswerResult.ACCEPTED, QID, ["continue"], False),
+@pytest.mark.parametrize("question_id,values,extended", [
+    ("limit:abc", ["continue"], True),
+    ("limit:abc", ["stop"], False),
+    (QID, ["continue"], False),
 ])
-def test_keep_going_at_a_limit_extends_the_turns_key(
-    client, turn, pod, monkeypatch, result, question_id, values, extended,
+def test_keep_going_at_a_limit_extends_the_turns_key_first(
+    client, turn, pod, monkeypatch, question_id, values, extended,
 ):
-    """Only an answer the pod accepted extends the key: a second tab's
-    duplicate Keep going must not buy another window."""
+    """The key is extended before the answer reaches the pod, so the pod
+    never runs on past a key that won't last."""
     from unittest.mock import AsyncMock
 
     monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
     extend = AsyncMock(return_value=True)
     monkeypatch.setattr(endpoints, "extend_turn_key", extend)
-    pod["result"] = result
     client.post("/api/v1/responses/answer",
                 json={"conversation_id": CID, "question_id": question_id, "values": values})
     assert extend.called is extended
     if extended:
         assert extend.call_args.kwargs["instance_id"] == "corr-1"
+    assert pod["calls"][0]["payload"]["values"] == values
+
+
+def test_keep_going_whose_key_cannot_be_extended_reaches_the_pod_as_stop_here(
+    client, turn, pod, monkeypatch,
+):
+    """Twice refused (auth down, or an auth without the endpoint): the pod gets
+    Stop here, so the turn ends with its time-limit summary rather than on a
+    model 401 when the key expires."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
+    extend = AsyncMock(return_value=False)
+    monkeypatch.setattr(endpoints, "extend_turn_key", extend)
+    resp = client.post("/api/v1/responses/answer",
+                       json={"conversation_id": CID, "question_id": "limit:abc", "values": ["continue"]})
+    assert resp.status_code == 200
+    assert extend.call_count == 2
+    assert pod["calls"][0]["payload"]["values"] == ["stop"]
