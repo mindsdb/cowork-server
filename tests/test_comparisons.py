@@ -2052,3 +2052,48 @@ def test_a_finished_turn_does_not_block_continue_or_delete(client):
         )
         assert r.status_code == 200, r.text
         assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
+
+
+def test_one_persons_comparisons_are_not_anothers(personal_deployment, monkeypatch, tmp_path, harness):
+    """On a local deployment that keeps each person's projects apart, a
+    comparison is kept with its sandboxes: the person who made it lists,
+    reads and deletes it, and nobody else sees it."""
+    from sqlalchemy import delete
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.models.comparison import Comparison, ComparisonVerdict
+    from cowork.server import create_app
+    from tests._live_apps import A, B, BEARER_TOKEN, PARTITION_A, PARTITION_B
+
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", BEARER_TOKEN)
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    try:
+        with patch("cowork.handlers.responses.get_harness", return_value=harness):
+            client = TestClient(create_app())
+            created = client.post(
+                "/api/v1/comparisons/",
+                json={"title": "Alice's", "sides": [{"model": "kimi"}, {"model": "qwen"}]},
+                headers=A,
+            )
+            assert created.status_code == 201, created.text
+            comparison_id = created.json()["id"]
+
+            def listed(headers):
+                body = client.get("/api/v1/comparisons/", headers=headers).json()
+                return [item["id"] for item in body["comparisons"]]
+
+            assert comparison_id not in listed(B)
+            assert client.get(f"/api/v1/comparisons/{comparison_id}", headers=B).status_code == 404
+            assert client.delete(f"/api/v1/comparisons/{comparison_id}", headers=B).status_code == 404
+            assert comparison_id in listed(A)
+            assert client.get(f"/api/v1/comparisons/{comparison_id}", headers=A).status_code == 200
+    finally:
+        partitions = [PARTITION_A, PARTITION_B]
+        with get_open_session() as db:
+            for model in (ComparisonVerdict, ComparisonSide, Comparison, Conversation, Project):
+                db.exec(delete(model).where(model.org_id.in_(partitions)))
+            db.commit()
+        get_app_settings.cache_clear()
