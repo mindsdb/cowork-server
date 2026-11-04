@@ -1312,8 +1312,16 @@ async def enable_artifact_comments(
     from cowork.services.artifact_draft_review import enable_draft_review
     from cowork.services.artifact_authorization_identity import ensure_authorization_key
     from cowork.services.artifact_identity import artifact_key
+    from cowork.services.projects import path_in_comparison_sandbox
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
+    # In org mode this opens the draft to the organization, and nothing leaves
+    # a model comparison until the user continues with a side.
+    if path_in_comparison_sandbox(folder):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Sharing is off while models are being compared. Continue with this side to share it.",
+        )
     capabilities = await _current_capabilities(session, capabilities)
     if session.scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is
