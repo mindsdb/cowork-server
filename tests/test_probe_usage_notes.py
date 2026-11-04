@@ -31,6 +31,19 @@ def test_no_notes_no_section():
     assert "KNOWN API QUIRKS" not in _prompt(usage_notes="   ")
 
 
+def test_built_in_notes_can_define_what_counts_as_a_pass():
+    # Roam's append-only tokens can never return data without a write, so the
+    # notes must be able to override step 6's "a real data endpoint returned data".
+    rule = "follow them over steps 5–6"
+    notes = "A 400 from append-blocks is a pass."
+
+    assert rule in _prompt(usage_notes=notes, notes_define_pass=True)
+    # A custom connector's notes are model-written: still shown, never the rule.
+    assert notes in _prompt(usage_notes=notes)
+    assert rule not in _prompt(usage_notes=notes)
+    assert rule not in _prompt(notes_define_pass=True)
+
+
 def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
     created: list[dict] = []
 
@@ -49,8 +62,8 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
     )
     monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider: {})
     monkeypatch.setattr(
-        probe_handler.registry, "usage_notes_for",
-        lambda engines: {e: f"NOTE-{e}" for e in engines},
+        probe_handler.ConnectorCatalog, "usage_notes_for",
+        lambda self, engines: {e: f"NOTE-{e}" for e in engines},
     )
     store = SubmissionStore()
     monkeypatch.setattr(probe_handler, "store", store)

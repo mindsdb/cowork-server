@@ -296,11 +296,11 @@ async def _forget_unstarted_run(conversation_id: str, run_id: str) -> None:
 async def _seal_interrupted(handle: RunHandle) -> None:
     """End the stream of a turn whose task ended at shutdown without a
     terminal record, as a producer cancelled before its first step does: the
-    interrupted frame, then the terminal record. A failure is logged, so the
+    turn-lost frame, then the terminal record. A failure is logged, so the
     other turns are still sealed."""
     from cowork.handlers.turn_errors import (
-        GENERIC_TURN_ERROR_CODE,
-        INTERRUPTED_TURN_MESSAGE,
+        TURN_LOST_CODE,
+        TURN_LOST_MESSAGE,
         response_failed_sse,
     )
 
@@ -312,7 +312,7 @@ async def _seal_interrupted(handle: RunHandle) -> None:
     )
     try:
         await handle.buffer.append("sse", {"sse": response_failed_sse(
-            INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id,
+            TURN_LOST_MESSAGE, TURN_LOST_CODE, request_id=request_id,
         )})
         await handle.buffer.close("interrupted")
     except Exception:

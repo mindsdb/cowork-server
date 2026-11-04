@@ -211,11 +211,11 @@ def clear_live_app_rows() -> None:
     from sqlmodel import Session
 
     from cowork.db.session import get_engine
-    from cowork.models.live_app import LiveAppCopy, LiveAppLaunchRecord, LiveAppShare
+    from cowork.models.live_app import LiveAppAvailabilityWait, LiveAppCopy, LiveAppLaunchRecord, LiveAppShare
     from cowork.models.project import Project
 
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        for model in (LiveAppCopy, LiveAppLaunchRecord, LiveAppShare):
+        for model in (LiveAppAvailabilityWait, LiveAppCopy, LiveAppLaunchRecord, LiveAppShare):
             raw.exec(delete(model))
         raw.exec(delete(Project).where(Project.org_id.in_([PARTITION_A, PARTITION_B, PARTITION_C])))
         raw.commit()
