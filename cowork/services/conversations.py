@@ -545,10 +545,12 @@ class ConversationService:
         harness: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        channel_type: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
-        against it before the first stream creates the conversation."""
+        against it before the first stream creates the conversation.
+        `channel_type` is set only by the channel runtime, never from a request."""
         # Anchor the parent: the target project must be visible in scope —
         # otherwise org A could link a conversation to org B's project and
         # leak its name/path through serialization.
@@ -561,6 +563,7 @@ class ConversationService:
             harness=harness,
             model=model,
             reasoning_effort=reasoning_effort,
+            channel_type=channel_type,
         )
         if conversation_id is not None:
             conversation.id = conversation_id

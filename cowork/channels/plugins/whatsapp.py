@@ -20,6 +20,7 @@ from cowork.channels.plugin import (
     CredentialSchema,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.text import split_for_limit
 from cowork.channels.webhooks import SignatureError, WebhookHandshake
 
@@ -160,6 +161,7 @@ class WhatsAppBridge:
             ),
         )
         event._dedupe_key = f"whatsapp:{message_id}"  # type: ignore[attr-defined]
+        mark_shared(event, False)
         return event
 
     async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
