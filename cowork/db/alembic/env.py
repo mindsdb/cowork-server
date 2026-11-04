@@ -21,6 +21,7 @@ import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
 import cowork.models.shared_resource  # noqa: F401
+import cowork.models.sidekick_context  # noqa: F401
 import cowork.models.skill  # noqa: F401
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import lock_migrations

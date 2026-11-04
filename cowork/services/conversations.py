@@ -35,6 +35,7 @@ from cowork.schemas.responses import Role
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
+from cowork.services.sidekick_contexts import SidekickContextService
 from cowork.services.task_objects import TaskObjectService
 from cowork.streaming.answer_text import coalesce_text_deltas
 
@@ -687,6 +688,9 @@ class ConversationService:
         # outlive the conversation as orphans pointing at artifacts no
         # task owns anymore.
         TaskObjectService(self.session).delete_for_conversation(conversation)
+        # And its Chimera sidekick, whose row is keyed by the conversation:
+        # Postgres would refuse the delete below while it still points here.
+        SidekickContextService(self.session).stage_delete(conversation_id)
         # Drop the conversation's uploaded attachments (rows + bytes) — they're
         # keyed by conversation id and would otherwise orphan in the file store
         # forever, invisible in any UI (ENG-701). Stage the row deletes into
@@ -867,6 +871,10 @@ class ConversationService:
         # surviving turns may still reference the artifact).
         if cut_from == 0:
             TaskObjectService(self.session).delete_for_conversation(conversation)
+        # The sidekick's messages hold work from the turns just deleted, for
+        # the reason the scratchpad snapshot below goes: the next delegation
+        # starts it fresh from what survives.
+        SidekickContextService(self.session).stage_delete(conversation_id)
         self.session.commit()
         # After the rows are gone, reap the on-disk drafts whose only card lived
         # in a deleted turn (their `skill_created` events were just removed).

@@ -366,6 +366,36 @@ def test_shared_resource_audit_upgrade_and_downgrade(tmp_path, monkeypatch):
     assert _has_table(db_path, "shared_resource_mutations")
 
 
+def test_sidekick_contexts_upgrade_and_downgrade(tmp_path, monkeypatch):
+    """One row per conversation, keyed by its id; the downgrade drops the table
+    and a re-upgrade brings it back empty."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidekick-contexts.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "sidekick_contexts")
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1]: row for row in connection.execute("pragma table_info(sidekick_contexts)")}
+        foreign_keys = list(connection.execute("pragma foreign_key_list(sidekick_contexts)"))
+    assert set(columns) == {
+        "conversation_id", "sidekick_id", "model", "messages", "summary", "status",
+        "last_call_at", "signals", "updated_at",
+    }
+    assert columns["conversation_id"][5] == 1  # the primary key
+    assert [(fk[2], fk[3], fk[4]) for fk in foreign_keys] == [("conversations", "conversation_id", "id")]
+
+    _downgrade_to(engine, uri, "2a366c1f4b9f")
+    assert not _has_table(db_path, "sidekick_contexts")
+    assert _alembic_version(db_path) == "2a366c1f4b9f"
+
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "sidekick_contexts")
+    assert _alembic_version(db_path) == expected_head()
+
+
 # Org and person ids as SQLite holds a UUID column: 32 hex digits.
 _ORG = uuid.UUID(int=1).hex
 _OTHER_ORG = uuid.UUID(int=2).hex
