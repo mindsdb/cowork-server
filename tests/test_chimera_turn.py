@@ -117,8 +117,9 @@ def test_a_hosted_turn_runs_the_pairs_main_model_alone():
 
 # ── What the installed anton can do ──────────────────────────────────
 
-def test_the_pinned_anton_has_no_chimera():
+def test_an_anton_without_chimera_offers_none(monkeypatch):
     # uv.lock pins an anton that predates Chimera; nothing is offered or passed.
+    _chimera_anton.hide(monkeypatch)
     assert chimera.anton_supports_chimera() is False
     assert chimera.build_chimera_config() is None
 
@@ -162,7 +163,8 @@ def test_not_available_on_openai_compatible(monkeypatch):
     assert chimera.chimera_available(_openai_compatible()) is False
 
 
-def test_not_available_without_a_chimera_anton():
+def test_not_available_without_a_chimera_anton(monkeypatch):
+    _chimera_anton.hide(monkeypatch)
     assert chimera.chimera_available(_minds()) is False
 
 
@@ -258,12 +260,14 @@ async def test_a_turn_without_chimera_is_built_as_before(monkeypatch):
 
     assert config.chimera is None
     assert config.sidekick_state is None
-    assert config.llm_client.sidekick_model is None
+    assert config.llm_client.has_sidekick is False
     assert config.llm_client.main_cache_ttl is None
 
 
 @pytest.mark.asyncio
 async def test_an_anton_without_chimera_runs_the_pseudo_model_as_its_main_model(monkeypatch):
+    _chimera_anton.hide(monkeypatch)
+
     config = await _session_config(monkeypatch, _minds(), model=CHIMERA_MODEL_ID)
 
     assert not hasattr(config, "chimera")
