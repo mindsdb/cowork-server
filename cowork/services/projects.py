@@ -652,18 +652,6 @@ class ProjectService:
             self.session.rollback()
             self._rmtree_in_root(path)
             raise
-        # A side works with the same skills as any project, so it gets the
-        # same desktop links `create_project` makes.
-        if not self.session.scope.org_mode:
-            try:
-                from cowork.services.skill_links import reconcile_project
-                from cowork.services.skills import SkillService
-
-                reconcile_project(
-                    path, SkillService(self.session.scope).list_skills(), project_name=name
-                )
-            except Exception:
-                logger.exception("Could not reconcile desktop skill links for comparison sandbox %s", project.id)
         return project
 
     def get_project(self, project_id: UUID) -> Project:

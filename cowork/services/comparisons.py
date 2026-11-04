@@ -320,6 +320,8 @@ class ComparisonService:
                 )
                 self.session.add(conversation)
                 self.session.flush()
+                if not org_mode:
+                    copy_skills_into(Path(sandbox.path), self.session.scope, project_name=sandbox.name)
                 if source is not None and org_mode:
                     seed_hosted_side(Path(source.path), Path(sandbox.path), conversation.id)
                 elif source is not None:
@@ -863,6 +865,10 @@ def _changed_files(
         for name in names:
             if not rel and name == ".anton" and not agent_state:
                 continue
+            # Copies of the person's own skills (copy_skills_into), which their
+            # store already holds.
+            if not rel and name == "skills" and not agent_state:
+                continue
             if rel == ".anton/" and name == _SCRATCHPAD_VENVS:
                 continue
             try:
@@ -990,6 +996,34 @@ class _CopyBudget:
             raise ProjectTooLargeToCopyError(
                 f"This project holds more than {_COPY_MAX_BYTES // (1024 * 1024)} MB, too much to copy into a comparison"
             )
+
+
+def copy_skills_into(sandbox_root: Path, scope: TenantScope, *, project_name: str) -> None:
+    """Give a desktop side copies of the skills a new project works with.
+
+    Copies, never the links a project gets: a link leads into the person's own
+    skill store, and a side's code (there is no code sandbox on the desktop)
+    could then rewrite their real skills. A skill that can't be copied is left
+    out rather than failing the comparison.
+    """
+    from cowork.services.skill_links import project_skill_dirs
+    from cowork.services.skills import SkillService
+
+    try:
+        wanted = project_skill_dirs(SkillService(scope).list_skills(), project_name=project_name)
+    except Exception:
+        logger.exception("Could not list skills for comparison sandbox %s", project_name)
+        return
+    if not wanted:
+        return
+    skills_root = sandbox_root / "skills"
+    skills_root.mkdir(exist_ok=True)
+    for slug, store_dir in wanted:
+        try:
+            (skills_root / slug).mkdir(exist_ok=True)
+            copy_project_files(store_dir, skills_root / slug, org_mode=False, parts="files")
+        except Exception:
+            logger.exception("Could not copy skill %s into comparison sandbox %s", slug, project_name)
 
 
 def seed_hosted_side(source_root: Path, sandbox_root: Path, conversation_id: UUID) -> None:

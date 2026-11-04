@@ -1951,13 +1951,6 @@ def test_a_continued_side_shows_the_turns_it_was_compared_on(client):
     assert side["turnCount"] == 1
 
 
-def test_a_sandbox_gets_the_desktop_skill_links(client):
-    with patch("cowork.services.skill_links.reconcile_project") as reconcile:
-        body = _create(client).json()
-    linked = {Path(call.args[0]) for call in reconcile.call_args_list}
-    assert {Path(_project(s["projectId"]).path) for s in body["sides"]} <= linked
-
-
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
 def test_copy_skips_a_fifo_swapped_in_after_the_check(tmp_path, monkeypatch):
     from cowork.services import comparisons
@@ -2142,3 +2135,39 @@ def test_one_persons_comparisons_are_not_anothers(
             db.exec(delete(Project).where(Project.name.startswith(COMPARISON_SANDBOX_PREFIX)))
             db.commit()
         get_app_settings.cache_clear()
+
+
+def test_a_desktop_side_gets_copies_of_skills_never_links(client):
+    """A link would lead a side's code into the person's own skill store, and
+    the desktop has no code sandbox: a side gets copies, a skill made later
+    never links into a sandbox, and Continue leaves the copies behind."""
+    from cowork.services.skills import SkillService
+
+    skills = SkillService(LOCAL_SCOPE)
+    skill = skills.create_skill("Pallet maths", "Count in pallets of 40 cases.")
+    later = None
+    try:
+        body = _create(client).json()
+        later = skills.create_skill("Made later", "Not for the sandbox.")
+        for side in body["sides"]:
+            root = Path(_project(side["projectId"]).path) / "skills"
+            copy = root / skill.name
+            assert copy.is_dir() and not copy.is_symlink()
+            assert "pallets of 40" in "".join(p.read_text() for p in copy.rglob("*") if p.is_file())
+            for path in [root, *root.rglob("*")]:
+                assert not path.is_symlink(), path
+                assert path.resolve().is_relative_to(root.resolve()), path
+            assert not os.path.lexists(root / later.name)
+
+        project = _real_project(client, "skills-continue-target")
+        r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+        assert r.status_code == 200, r.text
+        assert r.json()["carriedAll"] is True
+        # The project keeps its own link to the store; no copy of the skill is
+        # carried in with the side's work.
+        carried = [p for p in Path(project["path"]).rglob(skill.name) if not p.is_symlink()]
+        assert carried == []
+    finally:
+        for made in (skill, later):
+            if made is not None:
+                skills.delete_skill(made.name)
