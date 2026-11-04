@@ -53,6 +53,17 @@ def test_roam_research_spec_supports_append_only_tokens():
     assert "call `report_success` now" in notes
 
 
+def test_roam_research_notes_send_a_refused_write_to_the_append_api():
+    # Roam refuses `/write` from read-only and append-only tokens alike, and a
+    # token can be swapped after the agent learned its scope, so a refusal must
+    # lead to append-blocks rather than to "read-only, reconnect".
+    notes = registry.usage_notes_for(["roam_research"])["roam_research"]
+
+    assert "never judge its access from memory" in notes
+    assert "`write access`, before telling the user, call append-blocks" in notes
+    assert "to add blocks, the real call" in notes
+
+
 def test_picker_guidance_lists_files_but_no_longer_the_drive_api_rules():
     text = harness._picked_files_guidance({
         "work": [{"id": "f1", "name": "Roadmap.gdoc", "resourceKey": "rk1"}],
