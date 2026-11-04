@@ -2054,10 +2054,20 @@ def test_a_finished_turn_does_not_block_continue_or_delete(client):
         assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
 
 
-def test_one_persons_comparisons_are_not_anothers(personal_deployment, monkeypatch, tmp_path, harness):
-    """On a local deployment that keeps each person's projects apart, a
-    comparison is kept with its sandboxes: the person who made it lists,
-    reads and deletes it, and nobody else sees it."""
+# Every resource personal (the default), and projects left shared while
+# conversations stay personal. Connections stay shared there too: private
+# connections require personal projects.
+@pytest.mark.parametrize(
+    "personal_resources",
+    [None, "conversations,files,skills,schedules,pins,memory,settings"],
+    ids=["all-personal", "projects-shared"],
+)
+def test_one_persons_comparisons_are_not_anothers(
+    personal_deployment, monkeypatch, tmp_path, harness, personal_resources
+):
+    """A comparison is one person's task, its title their first prompt: the
+    person who made it lists, reads, judges and deletes it, and nobody else
+    sees or changes it, even where the sandbox projects are shared."""
     from sqlalchemy import delete
 
     from cowork.common.settings.app_settings import get_app_settings
@@ -2069,6 +2079,8 @@ def test_one_persons_comparisons_are_not_anothers(personal_deployment, monkeypat
     monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("COWORK_AUTH_TOKEN", BEARER_TOKEN)
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    if personal_resources is not None:
+        monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", personal_resources)
     get_app_settings.cache_clear()
     try:
         with patch("cowork.handlers.responses.get_harness", return_value=harness):
@@ -2087,13 +2099,20 @@ def test_one_persons_comparisons_are_not_anothers(personal_deployment, monkeypat
 
             assert comparison_id not in listed(B)
             assert client.get(f"/api/v1/comparisons/{comparison_id}", headers=B).status_code == 404
+            verdict = f"/api/v1/comparisons/{comparison_id}/verdicts/0"
+            assert client.put(verdict, json={"winner": "a"}, headers=B).status_code == 404
             assert client.delete(f"/api/v1/comparisons/{comparison_id}", headers=B).status_code == 404
             assert comparison_id in listed(A)
             assert client.get(f"/api/v1/comparisons/{comparison_id}", headers=A).status_code == 200
+            assert client.put(verdict, json={"winner": "b"}, headers=A).json()["verdict"] == "b"
+            assert client.delete(f"/api/v1/comparisons/{comparison_id}", headers=A).status_code == 204
+            assert comparison_id not in listed(A)
     finally:
         partitions = [PARTITION_A, PARTITION_B]
         with get_open_session() as db:
             for model in (ComparisonVerdict, ComparisonSide, Comparison, Conversation, Project):
                 db.exec(delete(model).where(model.org_id.in_(partitions)))
+            # Shared sandbox projects carry no partition.
+            db.exec(delete(Project).where(Project.name.startswith(COMPARISON_SANDBOX_PREFIX)))
             db.commit()
         get_app_settings.cache_clear()

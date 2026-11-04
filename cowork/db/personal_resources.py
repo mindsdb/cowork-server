@@ -89,11 +89,12 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # resource is partitioned, so this entry decides nothing in a personal scope.
     "shared_resource_attributions": PersonalResource.PROJECTS,
     "shared_resource_mutations": PersonalResource.PROJECTS,
-    # A model comparison and its sides and verdicts are kept with the sandbox
-    # projects its sides run in.
-    "comparisons": PersonalResource.PROJECTS,
-    "comparison_sides": PersonalResource.PROJECTS,
-    "comparison_verdicts": PersonalResource.PROJECTS,
+    # A model comparison is one person's task: its title is their first prompt
+    # and its sides are their conversations, so it is kept with conversations,
+    # even where the sandbox projects those sides run in are shared.
+    "comparisons": PersonalResource.CONVERSATIONS,
+    "comparison_sides": PersonalResource.CONVERSATIONS,
+    "comparison_verdicts": PersonalResource.CONVERSATIONS,
     "files": PersonalResource.FILES,
     # Shared exactly when the vault is, so a shared connection's connector
     # definition is visible to everyone who sees the connection.
