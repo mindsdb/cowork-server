@@ -584,7 +584,7 @@ def test_the_attempts_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
     config = _alembic_config(uri)
     with engine.begin() as connection:
         config.attributes["connection"] = connection
-        command.downgrade(config, "2a366c1f4b9f")
+        command.downgrade(config, "c69488788ac7")
     assert not added & {c["name"] for c in inspect(engine).get_columns("schedule_runs")}
 
     with engine.begin() as connection:
@@ -610,7 +610,7 @@ def test_the_migration_keeps_one_running_run_per_schedule(tmp_path, monkeypatch)
     config = _alembic_config(uri)
     with engine.begin() as connection:
         config.attributes["connection"] = connection
-        command.downgrade(config, "2a366c1f4b9f")
+        command.downgrade(config, "c69488788ac7")
 
     schedule_id = uuid4().hex
     older, newer = uuid4().hex, uuid4().hex

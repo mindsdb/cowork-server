@@ -12,13 +12,13 @@ and a cron run, or two manual runs, can't go at once. Duplicate `running`
 rows left by older builds are failed first, keeping each schedule's newest.
 
 Revision ID: 5b7c2d9e4f10
-Revises: 2a366c1f4b9f
+Revises: c69488788ac7
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "5b7c2d9e4f10"
-down_revision = "2a366c1f4b9f"
+down_revision = "c69488788ac7"
 branch_labels = None
 depends_on = None
 
