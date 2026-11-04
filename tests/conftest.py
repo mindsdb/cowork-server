@@ -412,7 +412,7 @@ def granted_product_permissions(monkeypatch):
     Tests of live role decisions opt out and exercise the internal HTTP boundary.
     This fixture does not override artifact ownership or tenancy resolution.
     """
-    from cowork.services import product_permissions
+    from cowork.services import artifact_permissions, product_permissions
     from cowork.api.v1.endpoints import artifact_workspace
 
     async def allowed(scope, permission):
@@ -421,6 +421,7 @@ def granted_product_permissions(monkeypatch):
 
     monkeypatch.setattr(product_permissions, "has_product_permission", allowed)
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+    monkeypatch.setattr(artifact_permissions, "has_product_permission", allowed)
 
 
 def _set_datasource_adapter_flag(available: bool):
