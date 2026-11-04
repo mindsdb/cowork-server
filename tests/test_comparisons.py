@@ -3,6 +3,7 @@ hidden sandbox project, contained until the user continues with one."""
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -1704,14 +1705,40 @@ def test_every_blocked_engine_exists_in_the_catalog():
     assert all(registry.get_connector(engine) is not None for engine in BLOCKED_CONNECTOR_ENGINES)
 
 
-def test_a_side_never_writes_memory_in_process():
-    from cowork.harnesses.anton_harness.harness import _learns_this_turn
+@contextmanager
+def _project_row(tmp_path: Path, name: str):
+    path = tmp_path / "projects" / name
+    path.mkdir(parents=True)
+    with get_open_session() as db:
+        project = Project(name=name, path=str(path))
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+        db.expunge(project)
+    try:
+        yield project
+    finally:
+        with get_open_session() as db:
+            row = db.get(Project, project.id)
+            if row is not None:
+                db.delete(row)
+                db.commit()
 
-    side = SimpleNamespace(project=SimpleNamespace(name=f"{COMPARISON_SANDBOX_PREFIX}abc"))
-    ordinary = SimpleNamespace(project=SimpleNamespace(name="reports"))
-    assert _learns_this_turn(side, True) is False
-    assert _learns_this_turn(ordinary, True) is True
-    assert _learns_this_turn(ordinary, False) is False
+
+@pytest.mark.parametrize(
+    ("name", "writes"),
+    [(f"{COMPARISON_SANDBOX_PREFIX}{'a' * 32}", False), ("reports", True)],
+    ids=["side", "ordinary"],
+)
+async def test_a_side_reads_memory_in_process_but_never_writes_it(monkeypatch, tmp_path, name, writes):
+    from tests._turns import built_turn
+
+    with _project_row(tmp_path, name) as project:
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None, project=project) as turn:
+            assert turn.config.cortex.mode == ("autopilot" if writes else "off")
+            assert turn.config.background_memory is writes
+            # Reading is unchanged: the side still gets the person's memory.
+            assert turn.learns is True
 
 
 def test_a_side_never_writes_memory_remotely(client):

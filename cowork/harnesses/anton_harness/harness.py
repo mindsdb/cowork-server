@@ -1582,8 +1582,11 @@ class AntonHarness:
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
         # app slots outside this server for a turn with a launcher, the only
-        # turn that gets a host (live_app_host_for_turn).
-        launcher = current_live_app_launcher() if live_apps_on() else None
+        # turn that gets a host (live_app_host_for_turn). A model-comparison
+        # side gets neither: a live app is shareable and holds a capped slot,
+        # and nothing leaves a comparison until the user continues with a side.
+        comparison_side = is_comparison_sandbox(conversation.project.name)
+        launcher = current_live_app_launcher() if live_apps_on() and not comparison_side else None
         offers_live_apps = launcher is not None
         turn_apps = (
             await turn_live_apps(
@@ -1891,9 +1894,11 @@ class AntonHarness:
             cell_sandbox = await asyncio.to_thread(
                 build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
             )
-            # None with live apps off, or for a turn that names nobody with an
-            # email, and then not passed at all.
-            live_app_host = live_app_host_for_turn(project_id=conversation.project.id)
+            # None with live apps off, for a turn that names nobody with an
+            # email, or on a comparison side, and then not passed at all.
+            live_app_host = (
+                None if comparison_side else live_app_host_for_turn(project_id=conversation.project.id)
+            )
 
             deployment = identity_for_turn()
             deployment_kwargs = {} if deployment is None else {
