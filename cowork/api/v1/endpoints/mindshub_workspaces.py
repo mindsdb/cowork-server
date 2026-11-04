@@ -47,14 +47,14 @@ from sqlmodel import Session
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
-from cowork.principal import hub_credential
-from cowork.schemas.hub_workspaces import (
-    HubWorkspaceActivateRequest,
-    HubWorkspaceRow,
-    HubWorkspaceView,
+from cowork.principal import mindshub_credential
+from cowork.schemas.mindshub_workspaces import (
+    MindsHubWorkspaceActivateRequest,
+    MindsHubWorkspaceRow,
+    MindsHubWorkspaceView,
 )
-from cowork.services.hub_workspaces import (
-    fetch_hub_workspaces,
+from cowork.services.mindshub_workspaces import (
+    fetch_mindshub_workspaces,
     resolve_active,
     selectable,
 )
@@ -72,40 +72,40 @@ SETTING_KEY = "hub_workspace_id"
 
 async def _build_view(
     request: Request, session: Session, scope: TenantScope
-) -> HubWorkspaceView:
+) -> MindsHubWorkspaceView:
     """The selector's whole state: the caller's workspaces and which is active."""
-    bearer = hub_credential(request)
+    bearer = mindshub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
-    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
+    listing = await fetch_mindshub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     stored = SettingService(session, scope).load().hub_workspace_id
     active = resolve_active(listing.workspaces, stored)
     active_id = active.id if active else None
-    return HubWorkspaceView(
+    return MindsHubWorkspaceView(
         enabled=True,
         reachable=listing.reachable,
         workspaces=[
-            HubWorkspaceRow.model_validate(workspace, from_attributes=True)
+            MindsHubWorkspaceRow.model_validate(workspace, from_attributes=True)
             for workspace in selectable(listing.workspaces, active_id)
         ],
         active_workspace_id=active_id,
     )
 
 
-@router.get("/", response_model=HubWorkspaceView)
-async def get_hub_workspaces(
+@router.get("/", response_model=MindsHubWorkspaceView)
+async def get_mindshub_workspaces(
     request: Request, session: SessionDep, scope: ScopeDep
-) -> HubWorkspaceView:
+) -> MindsHubWorkspaceView:
     return await _build_view(request, session, scope)
 
 
-@router.put("/active", response_model=HubWorkspaceView)
-async def set_active_hub_workspace(
-    body: HubWorkspaceActivateRequest,
+@router.put("/active", response_model=MindsHubWorkspaceView)
+async def set_active_mindshub_workspace(
+    body: MindsHubWorkspaceActivateRequest,
     request: Request,
     session: SessionDep,
     scope: ScopeDep,
-) -> HubWorkspaceView:
+) -> MindsHubWorkspaceView:
     """Switch the caller into another workspace.
 
     The id has to appear in the caller's own listing before it is stored. Auth
@@ -122,10 +122,10 @@ async def set_active_hub_workspace(
     403. A workspace in the listing but stamped archived is a 409, so the UI can
     say retrying will not help instead of offering a loop with no exit.
     """
-    bearer = hub_credential(request)
+    bearer = mindshub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
-    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
+    listing = await fetch_mindshub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     if not listing.reachable:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

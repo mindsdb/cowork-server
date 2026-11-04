@@ -24,6 +24,7 @@ from cowork.handlers.turn_errors import (
     remote_error_label,
     remote_turn_error,
 )
+from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills, turn_skills_wire
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import scope_for_identity
 from cowork.services import product_permissions
@@ -103,10 +104,42 @@ def _request_wire_size(params: dict) -> int:
     return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
 
 
-def _fit_request(params: dict, conversation_id: str) -> dict:
-    """Drop project memory first, then warn if the request still will not fit.
+def _shed_skills(params: dict, *, size: int, budget: int, always_on: bool) -> int:
+    """Drop the skills block's on-demand skills (or, with ``always_on``, its
+    always-on ones) one at a time from the end of the block until the request
+    fits; the request's size after. The block holds the always-on skills
+    first, the ones shared with everyone before the team ones, then the
+    on-demand ones by slug (cowork.services.skills.build_turn_skills), so the
+    on-demand skills go in reverse slug order, and the always-on ones team
+    skills first. The block itself stays, empty at worst: it is the pod's
+    whole recallable set, so a turn that sheds skills has fewer, never a
+    fallback to a mounted skills tree."""
+    skills = params.get("skills")
+    if size <= budget or not isinstance(skills, dict):
+        return size
+    skills = params["skills"] = dict(skills)
+    ranked = [
+        slug for slug, entry in skills.items()
+        if TurnSkillEntry.model_validate(entry).always_on is always_on
+    ]
+    for slug in reversed(ranked):
+        if size <= budget:
+            break
+        # The entry's own bytes, ``"slug":{...}``, and the comma before or
+        # after it when another entry is left.
+        entry_bytes = _request_wire_size({slug: skills.pop(slug)}) - 2
+        size -= entry_bytes + (1 if skills else 0)
+    return size
 
-    Skills and personal/global memory live on read-only mounts. Project memory
+
+def _fit_request(params: dict, conversation_id: str) -> dict:
+    """Shed what is optional until the request fits, least needed first: the
+    skills recalled on demand, one at a time from the end of the block, which
+    orders them by slug; then project memory; then the always-on skills one
+    at a time, team ones before the ones shared with everyone (_shed_skills).
+    Then warn if the request still will not fit.
+
+    Personal/global memory lives on read-only mounts. Project memory
     does not: the worker mounts only this conversation's workspace, so its two
     shared slots ride the request again. They are the one optional block we can
     deterministically shed as a unit without changing the user's input or
@@ -117,16 +150,32 @@ def _fit_request(params: dict, conversation_id: str) -> dict:
     windowing remains the upstream fix for that required-payload case.
     """
     budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
-    size = _request_wire_size(params)
+    size = original = _request_wire_size(params)
+    skill_count = len(params["skills"]) if isinstance(params.get("skills"), dict) else 0
+    size = _shed_skills(params, size=size, budget=budget, always_on=False)
     if size > budget and params.pop("memory", None) is not None:
         logger.warning(
-            "[producer] dropped project memory from turn %s: request line was "
-            "%d bytes, over the %d-byte cap",
-            conversation_id,
-            size,
-            budget,
+            "[producer] dropped project memory from a turn's request: the request line was over its cap",
+            extra={
+                "event": "turn_memory_dropped",
+                "conversation_id": conversation_id,
+                "request_bytes": original,
+                "cap_bytes": budget,
+            },
         )
         size = _request_wire_size(params)
+    size = _shed_skills(params, size=size, budget=budget, always_on=True)
+    if isinstance(params.get("skills"), dict) and len(params["skills"]) < skill_count:
+        logger.warning(
+            "[producer] shed skills from a turn's request: the request line was over its cap",
+            extra={
+                "event": "turn_skills_shed",
+                "conversation_id": conversation_id,
+                "count": skill_count - len(params["skills"]),
+                "request_bytes": original,
+                "cap_bytes": budget,
+            },
+        )
     if size > budget:
         logger.warning(
             "[producer] turn %s request line is %d bytes, over the %d-byte cap; "
@@ -515,6 +564,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
                                 memory: dict | None = None,
+                                skills: TurnSkills | None = None,
                                 workspace: RemoteWorkspace | None = None,
                                 correlation_id: str | None = None,
                                 run_id: str | None = None,
@@ -527,7 +577,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
-    exactly one terminal — turn_completed, or turn_failed (classified with the
+    exactly one terminal: turn_completed, or turn_failed (classified with the
     same (code, message) the caller streams and persists; synthesized locally
     when the worker goes quiet past the idle timeout).
     `correlation_id`/`llm` reuse a turn key the routing gate already minted.
@@ -536,7 +586,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
     `workspace` is the project the turn runs in; None runs it in the org's
-    default project with no project on the job."""
+    default project with no project on the job.
+    `skills` is the caller's visible skills, each with `always_on` set on the
+    ones the pod puts in its prompt every turn
+    (cowork.services.skills.build_turn_skills). Always sent, None as an empty
+    block: the pod recalls only what the block names, and a request without
+    one would let it fall back to a mounted org skills tree
+    (cowork.handlers.responses.remote_turn_skills)."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -620,7 +676,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # <root>, so the two sit at different depths and an absolute path from
     # here is wrong inside the pod. Each side joins its own root.
     #
-    # Skills and personal/global memory are mounted read-only. Project memory is
+    # Personal/global memory is mounted read-only. Project memory is
     # outside the conversation-scoped workspace mount, so send only that tier on
     # the wire. Filtering here as well as in ResponsesHandler keeps a future
     # caller from accidentally serializing private global memory into the job.
@@ -641,6 +697,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
               **({"memory": memory_block} if memory_block else {}),
+              # Only the skills the caller sees, and the pod's whole
+              # recallable set, so always present, even empty.
+              "skills": turn_skills_wire(skills or {}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),

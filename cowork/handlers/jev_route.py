@@ -61,7 +61,9 @@ ROUTE_QUESTION: dict[str, Any] = {
             "data; new or changed analysis, charts, dashboards, files or code; "
             "querying, refreshing or exporting the user's data; questions about "
             "this user's own connections, files or account; research that needs "
-            "many searches or a multi-step plan."
+            "many searches or a multi-step plan; any request to change, send, "
+            "confirm or approve something, and any reply to a question the "
+            "assistant asked earlier in the conversation."
         ),
     },
 }

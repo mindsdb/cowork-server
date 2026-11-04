@@ -1,0 +1,69 @@
+# contentHash values the agent's code can write into an artifact's revision
+# journal: the manifest, a pending source write, or the base of a repair. None
+# may read a file. Each answers as a missing revision does.
+#
+# Placeholders, filled in by tests/test_artifact_revision_journal.py:
+#   {secret}          the project's own .anton/.env, absolute
+#   {other_secret}    another person's .anton/.env, absolute
+#   {other_relative}  the same file, relative to the artifact's blobs/ folder
+#   {home_file}       a file in the server's home folder, absolute
+#   {real}            the sha256 of a revision the server saved
+#   {real_upper}      the same hash in capitals
+#   {real_short}      the same hash without its last character
+
+# From blobs/: .revisions, the artifact, artifacts, .anton.
+- id: relative-own-env
+  content_hash: ../../../../.env
+
+# An absolute part replaces everything before it in a pathlib join, so this
+# never touches blobs/.
+- id: absolute-own-env
+  content_hash: "{secret}"
+
+- id: relative-other-person
+  content_hash: "{other_relative}"
+
+- id: absolute-other-person
+  content_hash: "{other_secret}"
+
+- id: server-home-file
+  content_hash: "{home_file}"
+
+# The server's own environment: its auth token, database URI and model keys.
+# Only Linux has /proc; elsewhere this case still pins the name check.
+- id: server-environment
+  content_hash: /proc/self/environ
+
+# Never ends: a read that trusts the name fills the server's memory.
+- id: endless-device
+  content_hash: /dev/zero
+
+- id: endless-device-relative
+  content_hash: ../../../../../../../../../../../../../../../../dev/zero
+
+# A disk that ignores case, such as macOS's default, opens the real blob under
+# this name; a case-sensitive one only pins the name check.
+- id: real-hash-in-capitals
+  content_hash: "{real_upper}"
+
+# Starts with 64 hex characters, so only a match of the whole name refuses it.
+- id: real-hash-then-a-path
+  content_hash: "{real}/../../../../.env"
+
+- id: real-hash-with-a-trailing-newline
+  content_hash: "{real}\n"
+
+- id: real-hash-one-short
+  content_hash: "{real_short}"
+
+- id: real-hash-one-long
+  content_hash: "{real}0"
+
+- id: not-a-string-null
+  content_hash: null
+
+- id: not-a-string-number
+  content_hash: 12345
+
+- id: not-a-string-list
+  content_hash: [a]

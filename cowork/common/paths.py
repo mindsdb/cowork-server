@@ -14,6 +14,7 @@ silently leak across builds and defeat the isolation.
 
 import os
 import shutil
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -170,19 +171,24 @@ def dir_stat(
     return os.stat(d.path / name, follow_symlinks=follow_symlinks)
 
 
+def is_child_name(name: str) -> bool:
+    """Whether *name* names one direct child: no separator, not ``.`` or
+    ``..``, and no NUL. Destructive helpers check it beside their sink."""
+    return (
+        os.path.basename(name) == name
+        and name not in {"", ".", ".."}
+        and "\\" not in name
+        and "\0" not in name
+    )
+
+
 def dir_unlink(d: PinnedDir, name: str) -> None:
-    safe_name = os.path.basename(name)
-    if (
-        safe_name != name
-        or safe_name in {"", ".", ".."}
-        or "\\" in safe_name
-        or "\0" in safe_name
-    ):
+    if not is_child_name(name):
         raise ValueError("Unlink path must be a direct-child name")
     if d.fd is not None:
-        os.unlink(safe_name, dir_fd=d.fd)
+        os.unlink(name, dir_fd=d.fd)
     else:
-        os.unlink(d.path / safe_name)
+        os.unlink(d.path / name)
 
 
 def dir_replace(d: PinnedDir, source_name: str, destination_name: str) -> None:
@@ -193,23 +199,12 @@ def dir_replace(d: PinnedDir, source_name: str, destination_name: str) -> None:
     that path needs ``os.replace`` instead, pinned the same way so the
     destination cannot be swapped for a link between the check and the write.
     """
-    safe_source = os.path.basename(source_name)
-    safe_destination = os.path.basename(destination_name)
-    for candidate, original in (
-        (safe_source, source_name),
-        (safe_destination, destination_name),
-    ):
-        if (
-            candidate != original
-            or candidate in {"", ".", ".."}
-            or "\\" in candidate
-            or "\0" in candidate
-        ):
-            raise ValueError("Replace paths must be direct-child names")
+    if not (is_child_name(source_name) and is_child_name(destination_name)):
+        raise ValueError("Replace paths must be direct-child names")
     if d.fd is not None:
-        os.replace(safe_source, safe_destination, src_dir_fd=d.fd, dst_dir_fd=d.fd)
+        os.replace(source_name, destination_name, src_dir_fd=d.fd, dst_dir_fd=d.fd)
     else:
-        os.replace(d.path / safe_source, d.path / safe_destination)
+        os.replace(d.path / source_name, d.path / destination_name)
 
 
 def dir_mkdir(d: PinnedDir, name: str) -> None:
@@ -220,33 +215,21 @@ def dir_mkdir(d: PinnedDir, name: str) -> None:
 
 
 def dir_rmdir(d: PinnedDir, name: str) -> None:
-    safe_name = os.path.basename(name)
-    if (
-        safe_name != name
-        or safe_name in {"", ".", ".."}
-        or "\\" in safe_name
-        or "\0" in safe_name
-    ):
+    if not is_child_name(name):
         raise ValueError("Directory removal path must be a direct-child name")
     if d.fd is not None:
-        os.rmdir(safe_name, dir_fd=d.fd)
+        os.rmdir(name, dir_fd=d.fd)
     else:
-        os.rmdir(d.path / safe_name)
+        os.rmdir(d.path / name)
 
 
 def dir_rmtree(d: PinnedDir, name: str) -> None:
-    safe_name = os.path.basename(name)
-    if (
-        safe_name != name
-        or safe_name in {"", ".", ".."}
-        or "\\" in safe_name
-        or "\0" in safe_name
-    ):
+    if not is_child_name(name):
         raise ValueError("Removal path must be a direct-child name")
     if d.fd is not None:
-        shutil.rmtree(safe_name, dir_fd=d.fd)
+        shutil.rmtree(name, dir_fd=d.fd)
     else:
-        shutil.rmtree(d.path / safe_name)
+        shutil.rmtree(d.path / name)
 
 
 def dir_rename(
@@ -256,30 +239,19 @@ def dir_rename(
     destination_name: str,
 ) -> None:
     """Rename one pinned direct child to another pinned direct child."""
-    safe_source_name = os.path.basename(source_name)
-    safe_destination_name = os.path.basename(destination_name)
-    if (
-        safe_source_name != source_name
-        or safe_destination_name != destination_name
-        or safe_source_name in {"", ".", ".."}
-        or safe_destination_name in {"", ".", ".."}
-        or "\\" in safe_source_name
-        or "\\" in safe_destination_name
-        or "\0" in safe_source_name
-        or "\0" in safe_destination_name
-    ):
+    if not (is_child_name(source_name) and is_child_name(destination_name)):
         raise ValueError("Rename paths must be direct-child names")
     if source.fd is not None and destination.fd is not None:
         os.rename(
-            safe_source_name,
-            safe_destination_name,
+            source_name,
+            destination_name,
             src_dir_fd=source.fd,
             dst_dir_fd=destination.fd,
         )
     else:
         os.rename(
-            source.path / safe_source_name,
-            destination.path / safe_destination_name,
+            source.path / source_name,
+            destination.path / destination_name,
         )
 
 
@@ -289,6 +261,53 @@ def dir_scandir(d: PinnedDir) -> "Iterator[os.DirEntry[str]]":
     if d.fd is not None:
         return os.scandir(d.fd)
     return os.scandir(d.path)
+
+
+def dir_fsync(d: PinnedDir) -> None:
+    """Make a rename inside *d* durable across a host crash. Windows has no
+    directory descriptor to sync, and keeps the atomic rename without it."""
+    if d.fd is not None:
+        os.fsync(d.fd)
+
+
+def dir_atomic_write(d: PinnedDir, name: str, *, content: bytes, mode: int | None = None) -> None:
+    """Replace the child *name* of *d* with *content* in one durable step.
+
+    The bytes go to a new file beside *name*, created with ``O_EXCL |
+    O_NOFOLLOW`` so nothing planted at that name is written through, synced,
+    and renamed over *name*. The rename acts on the name itself, so a link or a
+    second name already there is replaced, never written through. The new file
+    takes *mode* as its permission bits, and is private (0o600) without it.
+    """
+    if not is_child_name(name):
+        raise ValueError("Write path must be a direct-child name")
+    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        fd = dir_open(d, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            # Windows keeps no permission bits beyond read-only.
+            if mode is not None and d.fd is not None:
+                try:
+                    os.fchmod(stream.fileno(), mode)
+                except OSError:
+                    # A volume that keeps no modes, such as vfat, refuses the
+                    # change; the file is written all the same.
+                    pass
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        dir_replace(d, tmp, name)
+        try:
+            dir_fsync(d)
+        except OSError:
+            # The file is durable and the rename atomic; a filesystem that
+            # can't sync a folder only loses the rename's durability.
+            pass
+    finally:
+        try:
+            dir_unlink(d, tmp)
+        except OSError:
+            pass
 
 
 def open_pinned_child(d: PinnedDir, name: str, *, nofollow: bool = True) -> PinnedDir:

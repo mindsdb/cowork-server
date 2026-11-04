@@ -881,3 +881,23 @@ async def test_produce_answer_leaves_a_stop_after_delegation_to_the_agent(monkey
     assert buffer.status == "cancelled"
     assert buffer.frames == []
     assert await _rows(conversation_id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("history", "after_router_answer", "reason"), [
+    ([{"role": "user", "content": "Create two records and confirm on a card first"}], False,
+     "write_or_approval_request"),
+    ([{"role": "user", "content": "yes"}], False, "write_or_approval_request"),
+    (_GREETING, True, "follow_up_to_router_answer"),
+])
+async def test_write_approval_and_direct_follow_ups_reach_the_agent_before_jev(history, after_router_answer, reason):
+    """ENG-3896's checks hold with Jev too: only the agent shows the real
+    approval card, so Jev is never asked about these turns."""
+    seen = []
+    decision = await decide_route(**_route_kwargs(
+        history, after_router_answer=after_router_answer,
+        jev=_jev(jev_route.JevRoute(direct=True, p_direct=1.0), seen),
+    ))
+
+    assert (decision.route, decision.reason) == (DELEGATED_AGENTIC, reason)
+    assert seen == []

@@ -198,6 +198,9 @@ class ChannelBindingService:
             return False
 
         self._drop_sessions(binding_id)
+        # No relationship() orders these, so one flush would delete the binding
+        # before its sessions and trip their foreign key.
+        self.session.flush()
         self.session.delete(binding)
         self.session.commit()
         return True

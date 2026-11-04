@@ -10,15 +10,27 @@ test_channels_tenancy.py / test_channel_webhooks.py for those).
 from __future__ import annotations
 
 import os
+from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import event
+from sqlmodel import select
 
+from cowork.channels.plugins.discord import DiscordBridge
+from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import ScopedSession, scope_for_org
+from cowork.db.session import get_open_session
+from cowork.models.channel import ChannelBinding, ChannelSession
+from cowork.models.conversation import Conversation
+from cowork.models.project import Project
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 USER_A = "11111111-1111-4111-8111-111111111111"
 USER_B = "22222222-2222-4222-8222-222222222222"
+OWNER_A = "33333333-3333-4333-8333-333333333333"
 
 A = {"X-User-Id": USER_A, "X-Organization-Id": ORG_A}
 B = {"X-User-Id": USER_B, "X-Organization-Id": ORG_B}
@@ -339,3 +351,97 @@ def test_bindings_do_not_require_org_admin(client):
 def test_test_connection_does_not_require_org_admin(client):
     res = client.post("/api/v1/channels/slack/test-connection", headers=A)
     assert res.status_code == 200
+
+
+@pytest.fixture()
+def enforced_foreign_keys():
+    """Enforce SQLite foreign keys on the app database for one test, as
+    Postgres always does. The pool is disposed after so no connection keeps
+    the setting into later tests."""
+    session = get_open_session()
+    engine = session.get_bind()
+    session.close()
+    engine.dispose()
+
+    def _fk_on(dbapi_conn: Any, _record: Any, _proxy: Any) -> None:
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    event.listen(engine, "checkout", _fk_on)
+    try:
+        yield
+    finally:
+        event.remove(engine, "checkout", _fk_on)
+        engine.dispose()
+
+
+def test_owner_removes_a_members_route_after_its_first_message(client, tmp_path, enforced_foreign_keys):
+    owner = {"X-User-Id": OWNER_A, "X-Organization-Id": ORG_A, "X-User-Roles": "manage-organization"}
+    project_id = _org_project(tmp_path)
+    created = client.post(
+        "/api/v1/channels/bindings", headers=A,
+        json={"channel_type": "discord", "external_group_id": "route-1", "anton_project_id": str(project_id)},
+    )
+    assert created.status_code == 201, created.text
+    binding_id = UUID(created.json()["id"])
+    conversation_id = _serve_first_discord_message(binding_id, project_id)
+    try:
+        res = client.delete(f"/api/v1/channels/bindings/{binding_id}", headers=owner)
+        assert res.status_code == 204, res.text
+
+        listed = client.get("/api/v1/channels/bindings", headers=owner)
+        assert str(binding_id) not in {b["id"] for b in listed.json()}
+        session = get_open_session()
+        try:
+            assert not session.exec(select(ChannelSession).where(ChannelSession.binding_id == binding_id)).all()
+        finally:
+            session.close()
+    finally:
+        _drop_rows(binding_id, conversation_id, project_id)
+
+
+def _org_project(tmp_path) -> UUID:
+    """A project in ORG_A for the route to point at."""
+    session = get_open_session()
+    try:
+        project = Project(name=f"routes-{uuid4().hex[:8]}", path=str(tmp_path), org_id=ORG_A)
+        session.add(project)
+        session.commit()
+        return project.id
+    finally:
+        session.close()
+
+
+def _serve_first_discord_message(binding_id: UUID, project_id: UUID) -> UUID:
+    """The runtime's first-message bookkeeping, under its org scope with no user."""
+    runtime = AntonChannelRuntime(LiveAdapterRegistry(), default_project_id=project_id)
+    message = DiscordBridge({})._normalize_message(
+        {"id": "m-route-1", "channel_id": "route-1", "content": "hello", "author": {"id": "42"}}
+    )
+    session = get_open_session()
+    try:
+        scoped = ScopedSession(session, scope_for_org(ORG_A))
+        binding = scoped.get(ChannelBinding, binding_id)
+        conversation = runtime._ensure_conversation(scoped, binding)
+        runtime._touch_channel_session(scoped, binding, conversation, message)
+        return conversation.id
+    finally:
+        session.close()
+
+
+def _drop_rows(binding_id: UUID, conversation_id: UUID, project_id: UUID) -> None:
+    """Remove what the test wrote, on the raw session: nobody owns the conversation."""
+    session = get_open_session()
+    try:
+        for row in session.exec(select(ChannelSession).where(ChannelSession.binding_id == binding_id)).all():
+            session.delete(row)
+        session.flush()
+        for model, row_id in ((ChannelBinding, binding_id), (Conversation, conversation_id), (Project, project_id)):
+            row = session.get(model, row_id)
+            if row is not None:
+                session.delete(row)
+                session.flush()
+        session.commit()
+    finally:
+        session.close()

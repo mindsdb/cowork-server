@@ -376,15 +376,22 @@ async def lifespan(app: FastAPI):
         logger.exception("scratchpad-session boot sweep failed (non-fatal)")
     # Release scheduled runs left in `running` by a previous process (crash/
     # restart). Otherwise the due-check treats the stale row as an in-flight
-    # run and never fires that schedule again.
+    # run and never fires that schedule again. In org mode other replicas
+    # share the database and may still be running theirs, so only runs old
+    # enough to be presumed dead are released here. A younger run left by a
+    # hard-killed pod, including this one, stays `running` and wedges its
+    # schedule until a replica boots after it ages past the cutoff.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
+        from cowork.scheduler import boot_reap_cutoff
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
-            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
+            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
+                started_before=boot_reap_cutoff(),
+            )
             if reaped:
                 logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
         finally:

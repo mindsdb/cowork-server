@@ -46,13 +46,12 @@ USAGE_NOTES_MAX_CHARS = 1600
 #                   connection panel read the TOP-LEVEL `logo_url`, which
 #                   survives. Tidying it would be a no-op, not a fix.
 #   form.engine     (3 specs)
-#   method.name_from (2 specs)
 #
 # Do not add to this list to make a new spec pass. It exists to bound
 # pre-existing debt, and a new entry means a key that will be silently ignored.
 LEGACY_EXTRA_KEYS = {
     "form": {"logo_url", "engine"},
-    "method": {"name_from"},
+    "method": set(),
     "field": set(),
     "spec": set(),
     "cloud": set(),
@@ -69,14 +68,14 @@ KNOWN_KEYS = {
 
 # LEGACY_EXTRA_KEYS bounds key *names*, not the number of specs using them, so
 # on its own it is a request for restraint rather than a gate — a new spec can
-# adopt a dead key and stay green. This baseline makes the two genuinely dead
-# ones a tripwire.
+# adopt a dead key and stay green. This baseline makes the genuinely dead one a
+# tripwire.
 #
 # `form.logo_url` is deliberately NOT here. It is inert but it is also what 169
 # of 213 specs do, so it is the convention; failing a new connector for
-# following it would be backwards. The other two have no known consumer, so a
-# fourth `form.engine` is almost certainly a mistake worth catching.
-DEAD_KEY_BASELINE = {"form.engine": 3, "method.name_from": 2}
+# following it would be backwards. `form.engine` has no known consumer, so a
+# fourth one is almost certainly a mistake worth catching.
+DEAD_KEY_BASELINE = {"form.engine": 3}
 
 
 def _count_dead_keys() -> dict[str, int]:
@@ -86,9 +85,6 @@ def _count_dead_keys() -> dict[str, int]:
         form = data.get("form") or {}
         if "engine" in form:
             counts["form.engine"] += 1
-        for method in form.get("methods") or []:
-            if "name_from" in method:
-                counts["method.name_from"] += 1
     return counts
 
 
@@ -312,6 +308,23 @@ def test_usage_notes_fit_the_length_limit(path: Path):
         "They are sent in the system prompt on every LLM call for each connected engine; "
         "keep only what the agent cannot guess."
     )
+
+
+# A method's `description` is the helper line under its button on the connect
+# form, so it is user copy. Instructions for the prober go in `usage_notes`.
+METHOD_DESCRIPTION_MAX_CHARS = 400
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_method_descriptions_stay_short(path: Path):
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    for method in (spec.get("form") or {}).get("methods") or []:
+        description = method.get("description") or ""
+        assert len(description) <= METHOD_DESCRIPTION_MAX_CHARS, (
+            f"{path.name}: method {method.get('id')!r} description is {len(description)} chars, "
+            f"over {METHOD_DESCRIPTION_MAX_CHARS}. Users see it on the connect form; "
+            "move prober instructions to usage_notes."
+        )
 
 
 # The two connectors enabled for cloud execution. Every other method
