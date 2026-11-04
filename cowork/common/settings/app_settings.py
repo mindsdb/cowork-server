@@ -624,6 +624,19 @@ class StreamSettings(Settings):
     )
 
 
+class ChimeraSettings(Settings):
+    model_config = SettingsConfigDict(env_prefix="COWORK_CHIMERA_")
+
+    picker: bool = Field(
+        default=False,
+        description=(
+            "Offer the Chimera pseudo-model in the composer (COWORK_CHIMERA_PICKER). Off "
+            "until Chimera passes its eval gate; the chimera_enabled setting the evals use "
+            "does not read it."
+        ),
+    )
+
+
 class TurnQueueSettings(Settings):
     model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
 

@@ -155,11 +155,19 @@ def test_the_planning_cache_lifetime():
 
 def test_available_on_mindshub_with_a_chimera_anton(monkeypatch):
     _chimera_anton.install(monkeypatch)
+    monkeypatch.setenv("COWORK_CHIMERA_PICKER", "1")
     assert chimera.chimera_available(_minds()) is True
+
+
+def test_not_offered_until_the_rollout_switch_is_on(monkeypatch):
+    _chimera_anton.install(monkeypatch)
+    monkeypatch.delenv("COWORK_CHIMERA_PICKER", raising=False)
+    assert chimera.chimera_available(_minds()) is False
 
 
 def test_not_available_on_openai_compatible(monkeypatch):
     _chimera_anton.install(monkeypatch)
+    monkeypatch.setenv("COWORK_CHIMERA_PICKER", "1")
     assert chimera.chimera_available(_openai_compatible()) is False
 
 

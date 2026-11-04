@@ -115,16 +115,19 @@ def anton_supports_chimera() -> bool:
 def chimera_available(settings: UserSettings) -> bool:
     """Whether the composer may offer the Chimera pseudo-model (``chimera_available``).
 
-    True only where a pick would run Chimera: planning on MindsHub, turns built
-    in this process, and an anton that ships it. Hosted turns run on a pod that
-    has no Chimera wiring yet, and openai-compatible operator deployments have
-    no MindsHub models to pair, so neither is offered it.
+    True only where a pick would run Chimera: the rollout switch on
+    (COWORK_CHIMERA_PICKER), planning on MindsHub, turns built in this process,
+    and an anton that ships it. Hosted turns run on a pod that has no Chimera
+    wiring yet, and openai-compatible operator deployments have no MindsHub
+    models to pair, so neither is offered it.
     """
     from cowork.common.chat_session import in_process_agent_allowed
-    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.common.settings.app_settings import ChimeraSettings, TurnQueueSettings
     from cowork.common.settings.user_settings import Provider
 
     try:
+        if not ChimeraSettings().picker:
+            return False
         if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
             return False
         if TurnQueueSettings().is_remote or not in_process_agent_allowed():

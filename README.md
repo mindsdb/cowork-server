@@ -1102,7 +1102,7 @@ Chimera gives the planning model anton's `delegate` tool, which hands bounded, c
 
 Chimera is ignored on `openai_compatible`. It also needs an anton that ships it; the anton `uv.lock` pins does not, and then nothing Chimera-related reaches anton. On a Chimera turn the planning role asks MindsHub to cache its prompt for an hour unless `ANTON_MAIN_CACHE_TTL` says otherwise, and anton's `ANTON_CHIMERA_MAX_ROUNDS`, `ANTON_CHIMERA_JEV_EVERY` and `ANTON_CHIMERA_JEV_THRESHOLD` set the delegation loop's limits. The sidekick's own messages, summary and status are kept between turns in `sidekick_contexts`, one row per conversation; deleting the conversation or rewinding its history drops the row. While a sidekick's last report handed its work back to the main agent (status `open`), the route gate sends every turn of that conversation to the agent (`active_sidekick`).
 
-`GET /api/v1/settings/recommended-models` returns `chimera_available`, which the composer reads to offer the pseudo-model: true only with planning on MindsHub, turns built in this process, and an anton with Chimera. Hosted turns run on a pod that has no Chimera wiring yet, so they are not offered it, and a `chimera` pick that reaches one runs `chimera_main_model` alone.
+`GET /api/v1/settings/recommended-models` returns `chimera_available`, which the composer reads to offer the pseudo-model: true only with the rollout switch `COWORK_CHIMERA_PICKER` on (off by default, until Chimera passes its eval gate), planning on MindsHub, turns built in this process, and an anton with Chimera. Hosted turns run on a pod that has no Chimera wiring yet, so they are not offered it, and a `chimera` pick that reaches one runs `chimera_main_model` alone.
 
 ### Operator commands
 
