@@ -96,13 +96,15 @@ def _credentials(env_file: Path) -> tuple[str, str]:
 
 
 async def _ask_jev(client: httpx.AsyncClient, *, base_url: str, key: str, model: str,
-                   state, question: dict) -> dict:
+                   state, question: dict, search: bool = False) -> dict:
     started = time.monotonic()
     try:
         response = await client.post(
             f"{base_url}/decisions",
             headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "state": state, "questions": {"route": question}},
+            json={"model": model, "state": state, "questions": {
+                "route": question, **({"search": jev_route.SEARCH_QUESTION} if search else {}),
+            }},
         )
     except httpx.HTTPError as exc:
         return {"ms": round((time.monotonic() - started) * 1000), "error": type(exc).__name__}
@@ -117,7 +119,11 @@ async def _ask_jev(client: httpx.AsyncClient, *, base_url: str, key: str, model:
         p_direct = probabilities.get("answer_directly")
         if p_direct is None:
             p_direct = 1.0 if choice == "answer_directly" else 0.0
-        return {"ms": ms, "choice": choice, "p_direct": float(p_direct)}
+        result = {"ms": ms, "choice": choice, "p_direct": float(p_direct)}
+        if search:
+            # The production parse: only sets how long a direct answer may take to start.
+            result["needs_search"] = jev_route._needs_search(response.json())
+        return result
     except Exception as exc:
         return {"ms": ms, "error": f"malformed:{type(exc).__name__}"}
 
@@ -164,7 +170,8 @@ async def _run_case(case: dict, *, args, key: str, base_url: str, client: httpx.
     if "jev_proposed" in args.only:
         check = _check_route(history, with_prior_tools=False)
         jev = await _ask_jev(client, base_url=base_url, key=key, model=args.jev_model,
-                             state=jev_route.route_state(messages), question=jev_route.ROUTE_QUESTION)
+                             state=jev_route.route_state(messages), question=jev_route.ROUTE_QUESTION,
+                             search=True)
         result["jev_proposed"] = {"check": check, **jev}
     return result
 

@@ -24,7 +24,7 @@ class _FakeResponse:
 
 
 class _FakeAsyncClient:
-    """Stands in for httpx.AsyncClient; scripts one POST response or raises."""
+    """Stands in for the shared httpx client; scripts one POST response or raises."""
 
     def __init__(self, *, response=None, exception=None, captured=None, delay=0.0):
         self._response = response
@@ -32,19 +32,11 @@ class _FakeAsyncClient:
         self._captured = captured if captured is not None else {}
         self._delay = delay
 
-    def __call__(self, *_args, **_kwargs):
-        return self
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_exc):
-        return False
-
-    async def post(self, url, *, headers, json):
+    async def post(self, url, *, headers, json, timeout):
         self._captured["url"] = url
         self._captured["headers"] = headers
         self._captured["json"] = json
+        self._captured["timeout"] = timeout
         if self._delay:
             await asyncio.sleep(self._delay)
         if self._exception is not None:
@@ -52,19 +44,21 @@ class _FakeAsyncClient:
         return self._response
 
 
-def _body(choice="answer_directly", p_direct=0.97):
-    return {
-        "model": "jev-1.13.0",
-        "answers": {"route": {
-            "type": "choice", "choice": choice, "confidence": 0.9,
-            "probabilities": {"answer_directly": p_direct, "needs_agent": 1 - p_direct},
-        }},
-        "usage": {"input_tokens": 42, "output_tokens": 0},
-    }
+def _body(choice="answer_directly", p_direct=0.97, p_search=0.1):
+    answers = {"route": {
+        "type": "choice", "choice": choice, "confidence": 0.9,
+        "probabilities": {"answer_directly": p_direct, "needs_agent": 1 - p_direct},
+    }}
+    if p_search is not None:
+        answers["search"] = {
+            "type": "choice", "choice": "search_web" if p_search >= 0.5 else "no_search",
+            "probabilities": {"search_web": p_search, "no_search": 1 - p_search},
+        }
+    return {"model": "jev-1.13.0", "answers": answers, "usage": {"input_tokens": 42, "output_tokens": 0}}
 
 
 async def _decide(monkeypatch, client, *, min_p_direct=0.5, timeout_seconds=1.0):
-    monkeypatch.setattr(jev_route.httpx, "AsyncClient", client)
+    monkeypatch.setattr(jev_route, "_http_client", lambda: client)
     return await jev_route.decide(
         target=TARGET, messages=MESSAGES, model="jev",
         timeout_seconds=timeout_seconds, min_p_direct=min_p_direct,
@@ -83,9 +77,64 @@ async def test_decide_sends_the_route_question_with_the_latest_message_apart(mon
             "latest_user_message": "what were those headline numbers again?",
             "earlier_conversation": MESSAGES[:-1],
         },
-        "questions": {"route": jev_route.ROUTE_QUESTION},
+        "questions": {"route": jev_route.ROUTE_QUESTION, "search": jev_route.SEARCH_QUESTION},
     }
-    assert result == jev_route.JevRoute(direct=True, p_direct=0.97, ms=result.ms, model="jev-1.13.0")
+    assert captured["timeout"] == 1.0
+    assert result == jev_route.JevRoute(
+        direct=True, p_direct=0.97, needs_search=False, ms=result.ms, model="jev-1.13.0",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("search", "needs_search"), [
+    ({"choice": "search_web", "probabilities": {"search_web": 0.9, "no_search": 0.1}}, True),
+    ({"choice": "no_search", "probabilities": {"search_web": 0.2, "no_search": 0.8}}, False),
+    # Missing or malformed: assume a search, which only costs a longer wait.
+    (None, True),
+    ({"choice": "maybe", "probabilities": {"search_web": 0.1}}, True),
+    ({"choice": "no_search", "probabilities": {}}, True),
+])
+async def test_decide_reads_whether_the_reply_needs_a_web_search(monkeypatch, search, needs_search):
+    body = _body(p_search=None)
+    if search is not None:
+        body["answers"]["search"] = {"type": "choice", **search}
+    result = await _decide(monkeypatch, _FakeAsyncClient(response=_FakeResponse(200, body)))
+
+    assert result.error == ""
+    assert result.direct is True
+    assert result.needs_search is needs_search
+
+
+@pytest.mark.asyncio
+async def test_decide_reuses_one_client_across_calls(monkeypatch):
+    """One connection pool per event loop: a client per call paid a TLS
+    handshake inside the gate's budget on every turn."""
+    monkeypatch.setattr(jev_route, "_client", None)
+    first = jev_route._http_client()
+    try:
+        assert jev_route._http_client() is first
+    finally:
+        await jev_route.close_client()
+    assert first.is_closed
+    second = jev_route._http_client()
+    try:
+        assert second is not first
+    finally:
+        await jev_route.close_client()
+
+
+@pytest.mark.parametrize(("error", "falls_back"), [
+    ("", False),
+    ("http_403", True),
+    ("http_402", True),
+    ("http_500", True),
+    ("transport_error", True),
+    ("malformed_response", True),
+    # The gate's time is spent: straight to the agent.
+    ("timeout", False),
+])
+def test_which_failures_fall_back_to_the_llm_gate(error, falls_back):
+    assert jev_route.JevRoute(error=error).falls_back_to_llm_gate is falls_back
 
 
 @pytest.mark.asyncio

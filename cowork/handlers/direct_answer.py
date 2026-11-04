@@ -39,9 +39,12 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = 40
 _MAX_MESSAGE_CHARS = 12_000
 _MAX_TOKENS = 4_096
-# Until the first decisive event. Generous because a web search runs on the
-# gateway before any event arrives: about 8s measured for a weather question.
+# Until the first decisive event. Generous when Jev expects a web search,
+# which runs on the gateway before any event arrives (about 8s measured for a
+# weather question); otherwise first text comes in a few seconds, so a wrong
+# direct route reaches the agent sooner.
 _FIRST_EVENT_SECONDS = 30.0
+_FIRST_EVENT_NO_SEARCH_SECONDS = 10.0
 # Silence between later text events.
 _IDLE_SECONDS = 30.0
 
@@ -127,10 +130,20 @@ class DirectAnswer:
         await _close(self._events)
 
 
-async def start_answer(binding: RouterBinding, *, history: list[dict]) -> DirectAnswer | None:
+def first_event_seconds(*, needs_search: bool) -> float:
+    """How long the answer may take to start before the turn delegates."""
+    return _FIRST_EVENT_SECONDS if needs_search else _FIRST_EVENT_NO_SEARCH_SECONDS
+
+
+async def start_answer(
+    binding: RouterBinding, *, history: list[dict], needs_search: bool = True,
+) -> DirectAnswer | None:
     """Start the direct answer: a `DirectAnswer` once it begins with text, or
     None to delegate. Never raises, except the caller's cancel, which closes
-    the model call first."""
+    the model call first.
+
+    Web search stays available either way; `needs_search` (Jev's expectation)
+    only sets how long the answer may take to start."""
     from anton.core.llm.provider import StreamComplete, StreamTextDelta, StreamToolUseStart
 
     messages = _text_history(history, max_messages=MAX_HISTORY_MESSAGES, max_chars=_MAX_MESSAGE_CHARS)
@@ -146,12 +159,14 @@ async def start_answer(binding: RouterBinding, *, history: list[dict]) -> Direct
             tools=[_DELEGATE_TOOL],
             max_tokens=_MAX_TOKENS,
             native_web_tools=native_web_tools() if callable(native_web_tools) else None,
+            reasoning_effort=binding.reasoning_effort,
         )
     except Exception:
         logger.warning("[direct] could not start the answer; delegating", exc_info=True)
         return None
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _FIRST_EVENT_SECONDS
+    timeout_seconds = first_event_seconds(needs_search=needs_search)
+    deadline = loop.time() + timeout_seconds
     try:
         while True:
             budget = deadline - loop.time()
@@ -176,7 +191,11 @@ async def start_answer(binding: RouterBinding, *, history: list[dict]) -> Direct
     except TimeoutError:
         logger.warning(
             "Direct answer did not start in time; delegating",
-            extra={"event": "direct_answer_timeout", "timeout_seconds": _FIRST_EVENT_SECONDS},
+            extra={
+                "event": "direct_answer_timeout",
+                "timeout_seconds": timeout_seconds,
+                "needs_search": needs_search,
+            },
         )
     except Exception:
         logger.warning("[direct] answer failed before it started; delegating", exc_info=True)
@@ -184,11 +203,13 @@ async def start_answer(binding: RouterBinding, *, history: list[dict]) -> Direct
     return None
 
 
-async def complete_answer(binding: RouterBinding, *, history: list[dict]) -> str | None:
+async def complete_answer(
+    binding: RouterBinding, *, history: list[dict], needs_search: bool = True,
+) -> str | None:
     """The whole direct answer, for a turn that does not stream, or None to
     delegate. Nothing is saved before it returns, so a failure part way still
     delegates."""
-    answer = await start_answer(binding, history=history)
+    answer = await start_answer(binding, history=history, needs_search=needs_search)
     if answer is None:
         return None
     parts = [answer.first_text]

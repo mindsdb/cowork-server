@@ -814,9 +814,9 @@ class UserSettings(Settings):
     # and anton's completion check (verifier_jev, overlaid in anton_harness).
     # Off is the opt-out for organizations that cannot send conversation text
     # to it; with no decision model of their own configured below, every turn
-    # on MindsHub then runs the full agent. Zero data retention needs no switch:
-    # MindsHub refuses Jev to those organizations, and both callers read that
-    # refusal (jev_route.zdr_restricted) and stop asking.
+    # on MindsHub then runs the full agent. Jev is billed like any MindsHub
+    # model; when MindsHub refuses a call (allowance spent, a restriction on the
+    # organization), the gate falls back to the LLM gate (jev_route.decide).
     jev_decisions_enabled: Annotated[bool, ORG] = Field(
         default=True,
         title="Use Jev on MindsHub",
@@ -824,8 +824,7 @@ class UserSettings(Settings):
             "Send each message and the recent conversation to Jev, MindsHub's decision model, "
             "to decide whether your chosen model can answer it directly instead of running the "
             "full agent. Jev also checks whether the agent finished its work. Turn off to have "
-            "every message run the full agent, unless you configure a decision model of your own. "
-            "Organizations with zero data retention have it off automatically."
+            "every message run the full agent, unless you configure a decision model of your own."
         ),
     )
     # A decision model of the organization's own, for teams that bring their

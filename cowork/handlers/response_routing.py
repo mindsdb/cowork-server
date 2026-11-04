@@ -313,6 +313,9 @@ class RouterBinding:
     provider: object
     model: str
     label: str
+    # The reasoning effort the user picked in the composer, for the direct
+    # answer on their own model. None leaves the provider's default.
+    reasoning_effort: str | None = None
 
 
 _END = object()  # `anext` default: the stream ended without a StreamComplete
@@ -513,6 +516,9 @@ class RouteDecision:
     fallback: bool = False
     # Jev's probability of a direct answer, when Jev decided.
     p_direct: float | None = None
+    # Whether Jev expects the direct answer to need a web search; sets how
+    # long the answer may take to start (`direct_answer.start_answer`).
+    needs_search: bool = True
 
 
 def _condense_content(content) -> str | None:
@@ -654,8 +660,9 @@ async def decide_route(
 
     With `jev` (turns that answer on MindsHub), Jev decides and the direct
     answer is written afterwards by the user's own model, so a direct route
-    carries no text. Otherwise the LLM gate decides and answers in one call on
-    the gate's own model.
+    carries no text. Otherwise, or when Jev refuses or fails without running
+    out the time budget, the LLM gate decides and answers in one call on the
+    gate's own model.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -690,18 +697,32 @@ async def decide_route(
 
     if jev is not None:
         result = await jev(messages)
-        if result.error:
+        if not result.error:
+            return RouteDecision(
+                route=DIRECT_CONTEXT if result.direct else DELEGATED_AGENTIC,
+                reason="jev_direct" if result.direct else "jev_needs_agent",
+                provider="jev",
+                model=result.model or None,
+                p_direct=result.p_direct,
+                needs_search=result.needs_search,
+            )
+        if not result.falls_back_to_llm_gate:
+            # Jev ran out the gate's time: asking the LLM gate now would only
+            # make the agent start later.
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason=f"jev_{result.error}", provider="jev",
                 model=result.model or None, fallback=True,
             )
-        return RouteDecision(
-            route=DIRECT_CONTEXT if result.direct else DELEGATED_AGENTIC,
-            reason="jev_direct" if result.direct else "jev_needs_agent",
-            provider="jev",
-            model=result.model or None,
-            p_direct=result.p_direct,
+        # Jev refused (a spent allowance, a restriction on the organization)
+        # or failed: the LLM gate decides instead, as it does on providers with
+        # no decision model, with the structural rule it was measured with.
+        # Fields, not template values: the log formatter drops those.
+        logger.warning(
+            "Jev could not decide the route; the LLM gate decides",
+            extra={"event": "jev_route_fallback", "reason": f"jev_{result.error}", "duration_ms": result.ms},
         )
+        if prior_turn_ran_tools(history):
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
 
     try:
         if binding is None:

@@ -8,9 +8,11 @@ leans direct. Its wording and the default threshold were chosen with
 ``scripts/eval_jev_route`` (results in that folder): rerun it before changing
 either.
 
-Every failure, a bad response, a timeout, a network error, comes back as an
-`error` on the decision, never raised, and the caller delegates: the agent is
-always a correct answer, only a slower one.
+Every failure, a refusal, a bad response, a timeout, a network error, comes
+back as an `error` on the decision, never raised. Jev bills like any MindsHub
+model, so a refusal (a spent allowance, a restriction on the organization) is
+an ordinary failure: the caller falls back to the LLM gate, or to the agent
+when Jev ran out the gate's time (`falls_back_to_llm_gate`).
 """
 from __future__ import annotations
 
@@ -64,6 +66,31 @@ ROUTE_QUESTION: dict[str, Any] = {
     },
 }
 
+# Asked in the same call: whether the reply needs a web search. The direct
+# answer waits for its first text far longer when it does (the search runs on
+# the gateway before any text), so a slow wrong route costs less when it does
+# not. Never decides the route.
+_SEARCH = "search_web"
+_SEARCH_CHOICES = frozenset({_SEARCH, "no_search"})
+SEARCH_QUESTION: dict[str, Any] = {
+    "type": "choice",
+    "instructions": (
+        "Decide whether a good reply to the latest user message needs a web "
+        "search for current or public facts that are not in the conversation."
+    ),
+    "criteria": {
+        _SEARCH: (
+            "Current events, news, prices, weather, schedules, recent releases, or "
+            "any public fact that may have changed or that a careful answer would check."
+        ),
+        "no_search": (
+            "Greetings and small talk; restating or reasoning over what the "
+            "conversation already says; stable general knowledge; questions about "
+            "the product or the assistant itself; anything the agent must do."
+        ),
+    },
+}
+
 # Separates the gate's Jev traces from user turns in Langfuse; the same tag
 # the LLM gate's calls carry, since this is that gate.
 JEV_ROUTE_TAG = "cowork-gate"
@@ -91,24 +118,23 @@ class JevRoute:
 
     direct: bool = False
     p_direct: float | None = None
+    # Whether Jev expects the reply to need a web search. True when it did not
+    # say, so the direct answer keeps its longer wait.
+    needs_search: bool = True
     ms: int = 0
     model: str = ""
-    # Empty on a usable answer; otherwise why the turn delegates by default.
+    # Empty on a usable answer; otherwise why Jev could not decide.
     error: str = ""
 
+    @property
+    def falls_back_to_llm_gate(self) -> bool:
+        """Whether a failed decision should ask the LLM gate instead. Every
+        failure does, except a timeout: that one already spent the gate's
+        time budget, so the turn goes straight to the agent."""
+        return bool(self.error) and self.error != "timeout"
 
-GateMode = Literal["own", "jev", "off", "zdr", "llm"]
 
-# MindsHub's reason for refusing a model to an organization with zero data
-# retention on, whose agreements do not cover the model's provider (Jev's,
-# TypeSafe, today). Read from the model listing's `disabled_reason`.
-ZDR_RESTRICTED = "zdr_restricted"
-
-
-def zdr_restricted(decision_disabled_reasons, model: str) -> bool:
-    """Whether MindsHub refuses the decision model `model` to this
-    organization for zero data retention (`MindsModelListing.decision_disabled_reasons`)."""
-    return (decision_disabled_reasons or {}).get(model) == ZDR_RESTRICTED
+GateMode = Literal["own", "jev", "off", "llm"]
 
 
 def own_decision_target(settings) -> "JevTarget | None":
@@ -119,7 +145,7 @@ def own_decision_target(settings) -> "JevTarget | None":
     return JevTarget(url=url, api_key=key) if key and url else None
 
 
-def gate_mode(settings, *, zdr: bool = False) -> GateMode:
+def gate_mode(settings) -> GateMode:
     """Which gate decides a turn, from settings alone. One source for the turn
     handler and for the settings response, so the UI shows what turns do.
 
@@ -128,10 +154,10 @@ def gate_mode(settings, *, zdr: bool = False) -> GateMode:
     - "jev": Jev on MindsHub, for turns that answer on MindsHub.
     - "off": the organization turned Jev on MindsHub off and has no decision
       model of its own: MindsHub turns run the agent.
-    - "zdr": as "off", but because MindsHub refuses Jev to the organization
-      under zero data retention (`zdr`, from `zdr_restricted`), whatever the
-      switch says.
     - "llm": the LLM gate, for turns that answer on other providers.
+
+    A decision MindsHub refuses (an organization it does not serve Jev to)
+    needs no mode of its own: the turn falls back to the LLM gate.
     """
     from cowork.common.settings.user_settings import Provider
 
@@ -139,8 +165,6 @@ def gate_mode(settings, *, zdr: bool = False) -> GateMode:
         return "own"
     if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
         return "llm"
-    if zdr:
-        return "zdr"
     return "jev" if settings.jev_decisions_enabled else "off"
 
 
@@ -192,17 +216,56 @@ def _trace_headers() -> dict[str, str]:
     return headers
 
 
-def _p_direct(answer: dict) -> float:
-    """The probability of a direct answer, validated."""
-    value = (answer.get("probabilities") or {}).get(_ANSWER_DIRECTLY)
+# One client per event loop keeps the connection to the decision endpoint open
+# across turns: a client per call paid a TCP and TLS handshake inside the
+# gate's budget on every turn. An httpx client is bound to the loop it first
+# ran on, so a loop change (tests run one per test) gets a fresh client.
+# Timeouts are per request, from the caller's budget.
+_client: tuple[asyncio.AbstractEventLoop, httpx.AsyncClient] | None = None
+
+
+def _http_client() -> httpx.AsyncClient:
+    global _client
+    loop = asyncio.get_running_loop()
+    if _client is None or _client[0] is not loop or _client[1].is_closed:
+        _client = (loop, httpx.AsyncClient())
+    return _client[1]
+
+
+async def close_client() -> None:
+    """Close the shared client during shutdown. Idempotent."""
+    global _client
+    if _client is None:
+        return
+    loop, client = _client
+    _client = None
+    if loop is asyncio.get_running_loop():
+        await client.aclose()
+
+
+def _probability(answer: dict, choice: str) -> float:
+    """The probability Jev gives `choice`, validated."""
+    value = (answer.get("probabilities") or {}).get(choice)
     if value is None:
-        raise ValueError("no probability for answer_directly")
+        raise ValueError(f"no probability for {choice}")
     # bool is an int subclass; a JSON true must not pass as probability 1.
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"probability is not a finite number: {value!r}")
     if not 0 <= value <= 1:
         raise ValueError(f"probability out of range: {value!r}")
     return float(value)
+
+
+def _needs_search(body: dict) -> bool:
+    """Jev's answer to the search question; True when it is missing or
+    malformed, which only costs the direct answer a longer wait."""
+    try:
+        answer = body["answers"]["search"]
+        if answer["choice"] not in _SEARCH_CHOICES:
+            return True
+        return _probability(answer, _SEARCH) >= 0.5
+    except Exception:
+        return True
 
 
 async def decide(
@@ -214,23 +277,28 @@ async def decide(
     min_p_direct: float,
 ) -> JevRoute:
     """One `/v1/decisions` call: direct when Jev gives a direct answer at
-    least `min_p_direct`. Never raises.
+    least `min_p_direct`, and whether the reply needs a web search. Never
+    raises.
 
     Wrapped in `asyncio.timeout`, not just httpx's own timeout kwarg: httpx's
     applies per phase (connect/write/read/pool) and measures inactivity, not
     total elapsed time, so a trickling response could run past the budget
     without tripping it. This call sits ahead of every turn on MindsHub.
     """
-    payload = {"model": model, "state": route_state(messages), "questions": {"route": ROUTE_QUESTION}}
+    payload = {
+        "model": model,
+        "state": route_state(messages),
+        "questions": {"route": ROUTE_QUESTION, "search": SEARCH_QUESTION},
+    }
     started = time.monotonic()
     try:
         async with asyncio.timeout(timeout_seconds):
-            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-                response = await client.post(
-                    target.url,
-                    headers={**_trace_headers(), "Authorization": f"Bearer {target.api_key}"},
-                    json=payload,
-                )
+            response = await _http_client().post(
+                target.url,
+                headers={**_trace_headers(), "Authorization": f"Bearer {target.api_key}"},
+                json=payload,
+                timeout=timeout_seconds,
+            )
     except TimeoutError:
         return JevRoute(ms=_elapsed_ms(started), error="timeout")
     except httpx.HTTPError:
@@ -246,9 +314,10 @@ async def decide(
         answer = body["answers"]["route"]
         if answer["choice"] not in _VALID_CHOICES:
             raise ValueError(f"unexpected choice {answer['choice']!r}")
-        p_direct = _p_direct(answer)
+        p_direct = _probability(answer, _ANSWER_DIRECTLY)
     except Exception:  # any shape problem is one error class
         return JevRoute(ms=ms, error="malformed_response")
     return JevRoute(
-        direct=p_direct >= min_p_direct, p_direct=p_direct, ms=ms, model=str(body.get("model") or ""),
+        direct=p_direct >= min_p_direct, p_direct=p_direct, needs_search=_needs_search(body),
+        ms=ms, model=str(body.get("model") or ""),
     )

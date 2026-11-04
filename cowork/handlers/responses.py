@@ -765,10 +765,14 @@ class ResponsesHandler:
             answer_binding: RouterBinding | None = None
             answer_history: list[dict] = []
             if route.route == DIRECT_CONTEXT:
-                answer_binding = self._answer_binding(model=request.model, turn_llm=turn_llm)
+                answer_binding = self._answer_binding(
+                    model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
+                )
                 answer_history = _routing_history(start.gate_rows or [], start.harness_input)
                 if answer_binding is not None and not request.stream:
-                    text = await direct_answer.complete_answer(answer_binding, history=answer_history)
+                    text = await direct_answer.complete_answer(
+                        answer_binding, history=answer_history, needs_search=route.needs_search,
+                    )
                     if text is not None:
                         return await self._handle_direct_response(
                             request=request,
@@ -1193,9 +1197,8 @@ class ResponsesHandler:
     def _jev_gate(self, turn_llm: dict | None):
         """How this turn is gated: a decision callable, "off" when the turn
         answers on MindsHub and the organization opted out of Jev there, or
-        None for the LLM gate. On MindsHub the callable first checks that
-        MindsHub does not refuse Jev to the organization under zero data
-        retention, and runs the agent without asking Jev when it does.
+        None for the LLM gate. A decision MindsHub refuses falls back to the
+        LLM gate (`decide_route`).
 
         The organization's own decision model, when configured, decides for
         every provider: configuring it is the opt-in, so the Jev opt-out does
@@ -1225,10 +1228,6 @@ class ResponsesHandler:
             model = queue_settings.jev_route_model
 
         async def ask(messages: list[dict]) -> jev_route.JevRoute:
-            if mode == "jev" and await self._jev_zdr_restricted(target, model, queue_settings):
-                # Refused to the organization under zero data retention: no
-                # call, and the turn runs the agent (reason "jev_zdr").
-                return jev_route.JevRoute(model=model, error="zdr")
             return await jev_route.decide(
                 target=target,
                 messages=messages,
@@ -1239,35 +1238,15 @@ class ResponsesHandler:
 
         return ask
 
-    async def _jev_zdr_restricted(self, target: jev_route.JevTarget, model: str, queue_settings) -> bool:
-        """Whether MindsHub refuses Jev to this organization under zero data
-        retention, from the model listing it publishes for the same key
-        (cached per caller, see `fetch_minds_models`). A listing slower than
-        the gate's own timeout reads as no: the turn asks Jev, which MindsHub
-        refuses, and the turn runs the agent all the same. The fetch finishes
-        in the background so the next turn reads it from the cache."""
-        from cowork.services.providers import fetch_minds_models
-
-        base_url = target.url.removesuffix("/decisions")
-        fetch = asyncio.ensure_future(fetch_minds_models(
-            base_url, target.api_key,
-            # Hosted turns mint a key per turn, so their entry is the org
-            # member's; elsewhere it is the stored key's own.
-            tenant_key=self.scope.org_id if self.scope.org_mode else None,
-            user_id=self.scope.user_id if self.scope.org_mode else None,
-        ))
-        try:
-            listing = await asyncio.wait_for(asyncio.shield(fetch), queue_settings.jev_route_timeout_seconds)
-        except TimeoutError:
-            return False
-        return jev_route.zdr_restricted(listing.decision_disabled_reasons, model)
-
-    def _answer_binding(self, *, model: str | None, turn_llm: dict | None) -> RouterBinding | None:
+    def _answer_binding(
+        self, *, model: str | None, reasoning_effort: str | None = None, turn_llm: dict | None,
+    ) -> RouterBinding | None:
         """The model that writes a direct answer the gate routed: the
         composer's pick, else the planning model, on the planning provider,
-        which is the user's own keys when they brought them. A MindsHub turn
-        uses the key the gate minted for it when there is one. None when no
-        model resolves, which delegates."""
+        which is the user's own keys when they brought them, at the reasoning
+        effort the composer picked. A MindsHub turn uses the key the gate
+        minted for it when there is one. None when no model resolves, which
+        delegates."""
         settings = get_user_settings(self.scope)
         answer_model = model or settings.resolved_planning_model
         if not answer_model:
@@ -1288,7 +1267,9 @@ class ResponsesHandler:
         except Exception:
             logger.warning("[direct] could not build the answer's provider; delegating", exc_info=True)
             return None
-        return RouterBinding(provider=provider, model=answer_model, label=provider_kind.value)
+        return RouterBinding(
+            provider=provider, model=answer_model, label=provider_kind.value, reasoning_effort=reasoning_effort,
+        )
 
     async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
         """Hosted orgs keep no stored Minds key (remote turns mint one), so the
@@ -1729,7 +1710,9 @@ class ResponsesHandler:
 
         try:
             try:
-                answer = await direct_answer.start_answer(binding, history=history)
+                answer = await direct_answer.start_answer(
+                    binding, history=history, needs_search=route.needs_search,
+                )
             finally:
                 reset_trace_context(token)
             if answer is None:

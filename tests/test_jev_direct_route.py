@@ -23,7 +23,6 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
-from cowork.services.providers import fetch_minds_models as _REAL_FETCH
 
 _TOOL_ROWS = [
     {"role": "user", "content": "Build me a dashboard of our 2025 sales."},
@@ -87,10 +86,66 @@ async def test_jev_needs_agent_delegates_without_a_fallback_flag():
 
 
 @pytest.mark.asyncio
-async def test_a_jev_failure_delegates_as_a_fallback():
-    decision = await decide_route(**_route_kwargs(_RECALL, jev=_jev(jev_route.JevRoute(error="timeout"))))
+async def test_a_jev_timeout_delegates_without_asking_the_llm_gate():
+    """The gate's time is spent: asking the LLM gate would only start the agent later."""
+    decision = await decide_route(**_route_kwargs(
+        _GREETING, jev=_jev(jev_route.JevRoute(error="timeout")),
+        binding_factory=lambda: pytest.fail("LLM gate asked"),
+    ))
 
     assert (decision.route, decision.reason, decision.fallback) == (DELEGATED_AGENTIC, "jev_timeout", True)
+
+
+_GREETING = [{"role": "user", "content": "hi there"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["http_403", "http_402", "http_500", "transport_error", "malformed_response"])
+async def test_a_refused_or_failed_jev_falls_back_to_the_llm_gate(monkeypatch, error):
+    """Jev bills like any MindsHub model: a spent allowance or a restriction on
+    the organization is a refusal, and the LLM gate decides instead, so the
+    turn keeps its direct answer rather than running the agent."""
+    from cowork.handlers import response_routing
+
+    asked = []
+
+    async def fake_gate(binding, *, history):
+        asked.append((binding.model, history))
+        return "Hello! How can I help?"
+
+    monkeypatch.setattr(response_routing, "_gate", fake_gate)
+    binding = RouterBinding(provider=object(), model="mindshub_air", label="minds-cloud")
+
+    decision = await decide_route(**_route_kwargs(
+        _GREETING, jev=_jev(jev_route.JevRoute(error=error)), binding=binding,
+    ))
+
+    assert (decision.route, decision.reason, decision.text) == (
+        DIRECT_CONTEXT, "router_direct_response", "Hello! How can I help?",
+    )
+    assert decision.model == "mindshub_air"
+    assert [model for model, _history in asked] == ["mindshub_air"]
+
+
+@pytest.mark.asyncio
+async def test_the_llm_gate_fallback_keeps_the_prior_tools_rule():
+    """The LLM gate was measured with the structural rule, so its fallback
+    keeps it: a follow-up to tool work runs the agent."""
+    decision = await decide_route(**_route_kwargs(
+        _RECALL, jev=_jev(jev_route.JevRoute(error="http_403")),
+        binding_factory=lambda: pytest.fail("LLM gate asked"),
+    ))
+
+    assert decision.reason == "prior_turn_ran_tools"
+
+
+@pytest.mark.asyncio
+async def test_jev_passes_on_whether_the_answer_needs_a_web_search():
+    decision = await decide_route(**_route_kwargs(
+        _GREETING, jev=_jev(jev_route.JevRoute(direct=True, p_direct=0.9, needs_search=False)),
+    ))
+
+    assert decision.needs_search is False
 
 
 @pytest.mark.asyncio
@@ -131,27 +186,6 @@ def _settings(*, planning=Provider.MINDS_CLOUD, enabled=True, model="opus-5-5", 
         decision_model_api_key=SecretStr(own["key"]) if own.get("key") else None,
         decision_model=own.get("model", "jev"),
     )
-
-
-@pytest.fixture(autouse=True)
-def _listing(monkeypatch):
-    """The MindsHub model listing the gate checks for a zero data retention
-    refusal: none by default. Set `.reasons` to the decision models' reasons,
-    or `.delay` to make it slower than the gate's timeout."""
-    from cowork.services import providers
-
-    state = SimpleNamespace(reasons={}, delay=0.0, asked=[])
-
-    async def fake_fetch(minds_url, api_key, **kwargs):
-        state.asked.append((minds_url, api_key, kwargs))
-        if state.delay:
-            await asyncio.sleep(state.delay)
-        return providers.MindsModelListing(
-            ["opus-5-5"], {}, {}, {}, {}, {}, {}, {}, decision_disabled_reasons=state.reasons,
-        )
-
-    monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
-    return state
 
 
 def _gate(monkeypatch, settings, *, stored_key=None):
@@ -323,6 +357,20 @@ async def test_start_answer_streams_once_text_starts():
     # Web search runs on the gateway, so the model can answer current facts.
     assert call["native_web_tools"] == {"web_search", "web_fetch"}
     assert "opus-5-5" in call["system"]
+    # No effort picked: the provider's default.
+    assert call["reasoning_effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_start_answer_runs_at_the_composers_reasoning_effort():
+    """The effort the user picked reaches their model, which also keeps
+    MindsHub from classifying an Air pick a second time."""
+    provider = _Provider([_text("Hi."), _complete()])
+    binding = RouterBinding(provider=provider, model="mindshub_air", label="minds_cloud", reasoning_effort="low")
+
+    await direct_answer.start_answer(binding, history=_RECALL)
+
+    assert provider.calls[0]["reasoning_effort"] == "low"
 
 
 @pytest.mark.asyncio
@@ -359,6 +407,26 @@ async def test_start_answer_delegates_when_the_first_event_is_late(monkeypatch):
 
     assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
     assert provider.closed
+
+
+@pytest.mark.asyncio
+async def test_start_answer_waits_less_when_jev_expects_no_web_search(monkeypatch):
+    """A wrong direct route reaches the agent sooner when no search runs
+    before the first text; web search stays available either way."""
+    monkeypatch.setattr(direct_answer, "_FIRST_EVENT_SECONDS", 5.0)
+    monkeypatch.setattr(direct_answer, "_FIRST_EVENT_NO_SEARCH_SECONDS", 0.01)
+    late = _Provider([_text("late")], delay=0.5)
+
+    assert await direct_answer.start_answer(_binding(late), history=_RECALL, needs_search=False) is None
+    assert late.calls[0]["native_web_tools"] == {"web_search", "web_fetch"}
+
+    searching = _Provider([_text("Sunny, 21C."), _complete()], delay=0.05)
+    answer = await direct_answer.start_answer(_binding(searching), history=_RECALL, needs_search=True)
+    assert answer.first_text == "Sunny, 21C."
+
+
+def test_first_event_budget_is_shorter_without_a_search():
+    assert direct_answer.first_event_seconds(needs_search=False) < direct_answer.first_event_seconds(needs_search=True)
 
 
 @pytest.mark.asyncio
@@ -407,10 +475,12 @@ def test_answer_binding_uses_the_composer_pick_on_the_minted_key(monkeypatch):
 
     handler = _gate(monkeypatch, _settings(model="sonnet-5-5"))
     binding = handler._answer_binding(
-        model="opus-5-5", turn_llm={"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}},
+        model="opus-5-5", reasoning_effort="high",
+        turn_llm={"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}},
     )
 
     assert binding.model == "opus-5-5"
+    assert binding.reasoning_effort == "high"
     assert isinstance(binding.provider, OpenAIProvider)
     assert binding.provider.native_web_tools() == {"web_search", "web_fetch"}
 
@@ -502,7 +572,7 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
 async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None):
     from cowork.streaming.registry import TurnLifecycle
 
-    async def fake_start(_binding, *, history):
+    async def fake_start(_binding, *, history, needs_search=True):
         if started is not None:
             # An answer that has not started yet: wait to be stopped.
             started.set()
@@ -656,7 +726,7 @@ async def test_jev_gate_unwraps_the_real_stored_minds_key(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("planning", "enabled"), [
     (Provider.ANTHROPIC, True),  # brought their own inference keys
-    (Provider.MINDS_CLOUD, False),  # MindsHub under ZDR, with Jev there turned off
+    (Provider.MINDS_CLOUD, False),  # MindsHub, with Jev there turned off
 ])
 async def test_an_own_decision_model_routes_any_provider(monkeypatch, planning, enabled):
     own = {"url": " https://api.typesafe.ai/v1/systemone ", "key": "own-key", "model": "jev-latest"}
@@ -811,112 +881,3 @@ async def test_produce_answer_leaves_a_stop_after_delegation_to_the_agent(monkey
     assert buffer.status == "cancelled"
     assert buffer.frames == []
     assert await _rows(conversation_id) == []
-
-
-# ── zero data retention ─────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_jev_gate_runs_the_agent_without_asking_jev_under_zdr(monkeypatch, _listing):
-    _listing.reasons = {"jev": "zdr_restricted"}
-    handler = _gate(monkeypatch, _settings(), stored_key="stored")
-
-    seen = await _asked(monkeypatch, handler)
-
-    assert seen == {}  # Jev was never asked
-    result = await handler._jev_gate(None)([{"role": "user", "content": "hi"}])
-    assert result.error == "zdr"
-    # Read with the key the turn would ask Jev with, on the same gateway.
-    assert _listing.asked[0][:2] == ("https://api.mindshub.ai/v1", "stored")
-
-
-@pytest.mark.asyncio
-async def test_jev_gate_asks_jev_when_refused_for_another_reason(monkeypatch, _listing):
-    _listing.reasons = {"jev": "wallet_empty", "other-decider": "zdr_restricted"}
-    handler = _gate(monkeypatch, _settings(), stored_key="stored")
-
-    assert (await _asked(monkeypatch, handler))["model"] == "jev"
-
-
-@pytest.mark.asyncio
-async def test_jev_gate_asks_jev_when_the_listing_is_slow(monkeypatch, _listing):
-    """A slow listing never holds the turn past the gate's own timeout."""
-    _listing.reasons = {"jev": "zdr_restricted"}
-    _listing.delay = 5
-    monkeypatch.setenv("COWORK_TURN_JEV_ROUTE_TIMEOUT_SECONDS", "0.05")
-    handler = _gate(monkeypatch, _settings(), stored_key="stored")
-
-    assert (await _asked(monkeypatch, handler))["model"] == "jev"
-
-
-@pytest.mark.asyncio
-async def test_an_own_decision_model_is_not_checked_against_mindshub(monkeypatch, _listing):
-    _listing.reasons = {"jev": "zdr_restricted"}
-    own = {"url": "https://api.typesafe.ai/v1/systemone", "key": "own-key"}
-    handler = _gate(monkeypatch, _settings(own=own), stored_key="stored")
-
-    assert (await _asked(monkeypatch, handler))["target"].url == own["url"]
-    assert _listing.asked == []
-
-
-def test_gate_mode_reports_zdr_whatever_the_switch_says():
-    assert jev_route.gate_mode(_settings(enabled=True), zdr=True) == "zdr"
-    assert jev_route.gate_mode(_settings(enabled=False), zdr=True) == "zdr"
-    # Not for other providers, nor an organization's own decision model.
-    assert jev_route.gate_mode(_settings(planning=Provider.ANTHROPIC), zdr=True) == "llm"
-    own = {"url": "https://d.example/decide", "key": "k"}
-    assert jev_route.gate_mode(_settings(own=own), zdr=True) == "own"
-
-
-def test_the_listing_keeps_decision_models_refusal_apart():
-    import httpx
-
-    from cowork.services import providers
-
-    rows = {"data": [
-        {"id": "opus-5-5", "enabled": True},
-        {"id": "jev", "kind": "decision", "enabled": False, "disabled_reason": "zdr_restricted"},
-        {"id": "jev-1.13.0", "kind": "decision", "enabled": True},
-    ]}
-
-    async def fetch():
-        transport = httpx.MockTransport(lambda _request: httpx.Response(200, json=rows))
-        real = httpx.AsyncClient
-
-        class Client(real):
-            def __init__(self, *a, **k):
-                super().__init__(*a, transport=transport, **k)
-
-        httpx.AsyncClient = Client
-        try:
-            # The real fetch, past the module fixture's stub.
-            return await _REAL_FETCH("https://zdr.example", "key-zdr-parse")
-        finally:
-            httpx.AsyncClient = real
-
-    listing = asyncio.run(fetch())
-
-    assert listing.ids == ["opus-5-5"]
-    assert dict(listing.decision_disabled_reasons) == {"jev": "zdr_restricted"}
-    assert listing.disabled_reasons == {}
-
-
-@pytest.mark.parametrize(("reasons", "verifier_jev"), [({"jev": "zdr_restricted"}, "off"), ({}, "on")])
-def test_zdr_turns_off_antons_completion_check(monkeypatch, reasons, verifier_jev):
-    from anton.config.settings import AntonSettings
-
-    from cowork.common.settings.user_settings import UserSettings
-    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
-    from cowork.services import providers
-
-    def cached(minds_url, tenant_key=None, *, user_id=None, api_key=""):
-        assert api_key == "stored-key"
-        return providers.MindsModelListing(["opus-5-5"], {}, {}, {}, {}, {}, {}, {}, decision_disabled_reasons=reasons)
-
-    monkeypatch.setattr(providers, "cached_minds_models", cached)
-    anton = AntonSettings(_env_file=None)
-    _overlay_user_settings(anton, UserSettings.model_validate({
-        "planning_provider": "minds_cloud", "minds_api_key": "stored-key",
-    }))
-
-    assert anton.verifier_jev == verifier_jev
