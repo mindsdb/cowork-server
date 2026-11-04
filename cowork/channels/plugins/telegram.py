@@ -27,6 +27,7 @@ from cowork.channels.plugin import (
     CredentialSchema,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.webhooks import SignatureError, WebhookHandshake
 
 if TYPE_CHECKING:
@@ -351,6 +352,7 @@ class TelegramBridge:
             if update_id is not None
             else f"telegram:message:{chat_id}:{message_id}"
         )
+        mark_shared(event, is_group)
         return event
 
     async def poll(self, *, offset: int | None) -> tuple[list[InboundEvent], int | None]:

@@ -192,6 +192,9 @@ _ROUTES = [
     ("GET", "/api/v1/live-apps/1/stopped-page", None),
     ("POST", "/api/v1/live-apps/1/stopped", {"boot_id": "b" * 32, "reason": "idle"}),
     ("GET", "/api/v1/live-apps/mine", None),
+    ("GET", "/api/v1/live-apps/availability", None),
+    ("POST", "/api/v1/live-apps/availability/00000000-0000-4000-8000-000000000001/ack", None),
+    ("POST", "/api/v1/live-apps/availability/not-a-uuid/ack", None),
     ("POST", "/api/v1/artifacts/live-app-share", {"projectId": "00000000-0000-4000-8000-000000000001", "slug": "app", "everyone": True}),
     ("GET", "/api/v1/artifacts/shared-live-apps", None),
     ("POST", "/api/v1/artifacts/live-app-duplicate", {"shareId": "00000000-0000-4000-8000-000000000001", "projectId": "00000000-0000-4000-8000-000000000002", "confirmed": True}),
@@ -302,3 +305,17 @@ async def test_no_backend_starts_in_this_server(stack, tmp_path):
 
     assert status == (False, sandbox.BACKENDS_OFF_MESSAGE, 0)
     assert artifacts._LAUNCHED_BACKENDS == {}
+
+
+@pytest.mark.parametrize("hook", ["launch_lock", "slots_full", "slots_available"])
+def test_live_apps_require_antons_shared_admission_protocol(stack, hook):
+    module = turn_on_live_apps(stack)
+    stack.delattr(module.LiveAppHost, hook)
+    assert f"has a LiveAppHost without {hook}" in _refusal()
+
+
+def test_old_admission_protocol_is_allowed_when_live_apps_are_off(stack):
+    import anton.core.artifacts.live_app_slots as module
+
+    stack.delattr(module.LiveAppHost, "launch_lock")
+    cowork_server.create_app()

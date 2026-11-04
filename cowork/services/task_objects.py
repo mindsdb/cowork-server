@@ -135,6 +135,21 @@ class TaskObjectService:
             self.session.delete(row)
         return len(rows)
 
+    def delete_for_project(self, project_id: UUID) -> int:
+        """Drop every object row that still points at a project being deleted.
+
+        A task that moved out without its objects, or whose objects could not
+        all follow it, leaves rows here under a conversation in another
+        project. The project's own conversations do not reach those, and the
+        foreign key into projects has no cascade. Stages the deletes; the
+        caller commits. Returns the count."""
+        rows = self.session.exec(
+            self.session.select(TaskObject).where(TaskObject.project_id == project_id)
+        ).all()
+        for row in rows:
+            self.session.delete(row)
+        return len(rows)
+
     # ── moving ────────────────────────────────────────────────────────
 
     def relocate_to_project(

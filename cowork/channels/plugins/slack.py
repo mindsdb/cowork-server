@@ -22,6 +22,7 @@ from cowork.channels.plugin import (
     VerifyResult,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.text import split_for_limit
 from cowork.channels.webhooks import SignatureError, WebhookHandshake
 
@@ -69,6 +70,25 @@ def extract_team_id(body: bytes, headers: Mapping[str, str]) -> str | None:
         return None
     team_id = data.get("team_id") if isinstance(data, dict) else None
     return team_id if isinstance(team_id, str) and team_id else None
+
+
+def _slack_shared(event: dict, channel: str) -> bool | None:
+    """Whether a Slack event came from a shared channel, not a DM or group DM.
+
+    `message` events name the conversation's kind in `channel_type`: shared for
+    `channel` and `group` (private channel), not for `im` or `mpim`. An
+    `app_mention` carries none: a `C` channel is shared, a `D` is a DM, and a
+    `G` may be a private channel or a group DM, so it is unknown (None) and
+    the runtime leaves the route's conversation as its `message` events set it.
+    """
+    channel_type = event.get("channel_type")
+    if channel_type:
+        return channel_type in ("channel", "group")
+    if channel.startswith("C"):
+        return True
+    if channel.startswith("G"):
+        return None
+    return False
 
 
 class SlackBridge:
@@ -222,7 +242,7 @@ class SlackBridge:
         except (TypeError, ValueError):
             timestamp = datetime.now(timezone.utc)
         is_group = not channel.startswith("D")
-        return InboundEvent(
+        event_out = InboundEvent(
             address=PlatformAddress(channel_type=CHANNEL_TYPE, platform_id=channel, thread_id=thread_ts),
             message=InboundMessage(
                 id=ts,
@@ -235,6 +255,7 @@ class SlackBridge:
                 attachments=attachments,
             ),
         )
+        return mark_shared(event_out, _slack_shared(event, channel))
 
     async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
         """Upload via the external-upload flow (files.upload is deprecated):
