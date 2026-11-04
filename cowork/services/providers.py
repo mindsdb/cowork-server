@@ -746,8 +746,13 @@ async def fetch_org_model_catalog(
 #: The settings whose VALUE names a model id. `UserSettings` types these as bare
 #: `str | None`, so the settings API validates the key and the type and nothing
 #: else — an id no provider can serve saves cleanly and only fails much later, at
-#: turn time. Router model is included: same field shape, same failure.
-MODEL_VALUE_SETTINGS = frozenset({"planning_model", "coding_model", "router_model"})
+#: turn time. Router and sidekick models are included: same field shape, same
+#: failure. So is Chimera's pair, which only ever runs on the planning provider
+#: (cowork.services.chimera), so it is checked against that provider's catalog.
+MODEL_VALUE_SETTINGS = frozenset({
+    "planning_model", "coding_model", "router_model", "sidekick_model",
+    "chimera_main_model", "chimera_sidekick_model",
+})
 
 
 #: Deprecated-but-live alias namespace. MindsHub aliases are bare (``sonnet``),
@@ -813,6 +818,9 @@ async def model_value_rejection(
         "planning_model": "resolved_planning_provider",
         "coding_model": "resolved_coding_provider",
         "router_model": "resolved_router_provider",
+        "sidekick_model": "resolved_sidekick_provider",
+        "chimera_main_model": "resolved_planning_provider",
+        "chimera_sidekick_model": "resolved_planning_provider",
     }[key]
     try:
         from cowork.common.settings.user_settings import Provider
@@ -1543,6 +1551,9 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
 def build_llm_client(
     effort_override: str | None = None, *, model_override: str | None = None,
     settings: UserSettings | None = None,
+    sidekick: bool = False,
+    sidekick_model_override: str | None = None,
+    main_cache_ttl: str | None = None,
 ):
     """Build an Anton LLMClient from the current user settings.
 
@@ -1577,6 +1588,17 @@ def build_llm_client(
     actually in use this turn, unlike a stale persisted choice that may have
     been made for a different model). With a model override, a coding role
     on a different provider retains its own model and effort.
+
+    ``sidekick`` adds Chimera's sidekick role, and only a turn Chimera is on
+    for asks for it (cowork.services.chimera): anton offers the `delegate` tool
+    only to a client with a sidekick model, so without it nothing changes. It
+    runs ``resolved_sidekick_model`` on ``resolved_sidekick_provider``, or
+    ``sidekick_model_override`` (the Chimera pseudo-model's pair, a model from
+    the planning provider's catalogue, like ``model_override``) on the planning
+    provider. ``model_override`` never reaches it: a composer pick names the
+    model that plans, and moving the sidekick onto it would undo the split.
+    ``main_cache_ttl`` is the prompt-cache lifetime the planning role asks
+    MindsHub for. Each is passed only to an anton whose LLMClient takes it.
     """
     from anton.core.llm.anthropic import AnthropicProvider
     from anton.core.llm.client import LLMClient
@@ -1803,6 +1825,47 @@ def build_llm_client(
     except (ValueError, TypeError):
         router_kw = {}
 
+    # Chimera's sidekick role, guarded the way the router's is: an anton whose
+    # LLMClient predates the kwargs gets none and runs the turn without a
+    # sidekick, so without the `delegate` tool. Built before planning and
+    # coding, as the router is, so the coding provider stays the last one made.
+    # Its effort is its own, under the same stored-vs-resolved guard.
+    chimera_kw: dict = {}
+    if sidekick:
+        if sidekick_model_override:
+            sidekick_role, sidekick_model = settings.resolved_planning_provider, sidekick_model_override
+        else:
+            sidekick_role, sidekick_model = (
+                settings.resolved_sidekick_provider, settings.resolved_sidekick_model
+            )
+        try:
+            _params = inspect.signature(LLMClient.__init__).parameters
+            if "sidekick_provider" in _params and sidekick_model:
+                chimera_kw = {
+                    "sidekick_provider": _make_provider(
+                        sidekick_role,
+                        _effort_for(
+                            settings.sidekick_model, sidekick_model, settings.sidekick_reasoning_effort
+                        ),
+                        api=agent_api,
+                    ),
+                    "sidekick_model": sidekick_model,
+                }
+            elif "sidekick_provider" not in _params:
+                logger.info("Installed anton has no sidekick role; this turn runs without Chimera")
+        except (ValueError, TypeError):
+            logger.warning("Could not build the sidekick role; this turn runs without Chimera", exc_info=True)
+            chimera_kw = {}
+    # The planning role's prompt-cache lifetime, for the MindsHub gateway
+    # (X-MindsHub-Cache-TTL). Chimera's main agent idles through whole
+    # delegations, longer than the gateway's default five minutes.
+    if main_cache_ttl:
+        try:
+            if "main_cache_ttl" in inspect.signature(LLMClient.__init__).parameters:
+                chimera_kw["main_cache_ttl"] = main_cache_ttl
+        except (ValueError, TypeError):
+            pass
+
     planning_effort = effort_override or _effort_for(
         settings.planning_model,
         planning_model,
@@ -1834,6 +1897,7 @@ def build_llm_client(
         ),
         coding_model=coding_model,
         **router_kw,
+        **chimera_kw,
     )
 
 

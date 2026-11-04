@@ -36,6 +36,7 @@ def _minds_settings(**overrides):
         planning_provider=Provider.MINDS_CLOUD,
         coding_provider=Provider.MINDS_CLOUD,
         router_provider=Provider.MINDS_CLOUD,
+        sidekick_provider=Provider.MINDS_CLOUD,
     )
     base.update(overrides)
     return UserSettings.model_validate(base)
@@ -80,7 +81,8 @@ def test_rejection_names_real_models_and_leaks_no_credentials(catalog):
 
 @pytest.mark.parametrize("key", sorted(MODEL_VALUE_SETTINGS))
 def test_every_model_valued_setting_is_gated(catalog, key):
-    """planning/coding/router share the bare `str | None` shape and the failure."""
+    """Every role's model, and Chimera's pair, share the failure: an id the
+    catalog lacks saves cleanly and 404s at turn time."""
     assert _reject(_minds_settings(), key, "not-a-model") is not None
 
 
