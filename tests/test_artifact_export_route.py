@@ -38,7 +38,7 @@ from cowork.common.settings.app_settings import get_app_settings, get_export_pdf
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.schemas.artifact_export import ExportPdfSettings, ExportRequest, ExportResult, RenderPdfRequest
-from cowork.services import artifact_export
+from cowork.services import artifact_export, artifact_permissions
 from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
 from cowork.services.artifact_export import ExportRefused, ExportSource, export_slot
@@ -907,7 +907,8 @@ def role(monkeypatch):
         return decision.artifact_manage if permission == "artifact.manage" else True
 
     monkeypatch.setattr(product_permissions, "has_product_permission", decide)
-    monkeypatch.setattr(workspace_ep, "has_product_permission", decide)
+    # The workspace response narrows its capabilities through artifact_permissions.
+    monkeypatch.setattr(artifact_permissions, "has_product_permission", decide)
     return decision
 
 

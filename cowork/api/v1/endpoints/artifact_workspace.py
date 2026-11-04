@@ -35,9 +35,10 @@ from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
-from cowork.services.product_permissions import has_product_permission, require_product_permission
+from cowork.services.product_permissions import require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
+    current_capabilities,
     require_artifact_owner,
     with_export_formats,
 )
@@ -593,23 +594,6 @@ async def _acquire_live_publish_lock(folder: Path) -> bool:
     return True
 
 
-async def _current_capabilities(session, capabilities: dict) -> dict:
-    if not capabilities["canEdit"]:
-        return capabilities
-    can_edit = await has_product_permission(session.scope, "artifact.manage")
-    can_execute = await has_product_permission(session.scope, "product.execute")
-    current = {
-        **capabilities,
-        "canEdit": can_edit,
-        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
-        "canResolveComments": capabilities["canResolveComments"] and can_edit,
-    }
-    # The export route needs `artifact.manage` too, so it offers nothing here.
-    if not can_edit and "exportFormats" in capabilities:
-        current["exportFormats"] = []
-    return current
-
-
 @router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
@@ -646,7 +630,7 @@ async def artifact_source(
             export_source = await run_in_threadpool(
                 primary_export_source, folder=folder, metadata=metadata
             )
-        capabilities = await _current_capabilities(
+        capabilities = await current_capabilities(
             session, with_export_formats(session, owner_capabilities, export_source)
         )
         return {**result, "capabilities": capabilities, "repair": repair}
@@ -810,7 +794,7 @@ async def artifact_review_entry(
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = await _current_capabilities(
+    capabilities = await current_capabilities(
         session, artifact_capabilities(session, source, folder.name)
     )
     current_revision = None
@@ -1314,7 +1298,7 @@ async def enable_artifact_comments(
     from cowork.services.artifact_identity import artifact_key
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
-    capabilities = await _current_capabilities(session, capabilities)
+    capabilities = await current_capabilities(session, capabilities)
     if session.scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is
         # the caller; resolving it again would only repeat that query.

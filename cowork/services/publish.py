@@ -70,6 +70,7 @@ from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
+from cowork.docs.store import DOC_HTML, is_doc_folder, is_doc_primary
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
@@ -599,8 +600,16 @@ def _resolve_publish_target(
     (`_scan_artifact_dirs(scope=...)`), which only sees the desktop layout.
 
     Returns (publish_target, published_dir, published_key, is_fullstack).
+
+    A doc (cowork.docs) is shared as its rendered page, doc.html, never as the
+    JSON its metadata names as the primary. So every route that shares a doc's
+    folder, re-publishes it, or reads how it is shared addresses the page, as
+    the doc's own Share menu does.
     """
-    return _anton_resolve_publish_target(artifact, container_dirs)
+    target, published_dir, published_key, is_fullstack = _anton_resolve_publish_target(artifact, container_dirs)
+    if is_doc_primary(published_key) and is_doc_folder(published_dir):
+        return published_dir / DOC_HTML, published_dir, DOC_HTML, False
+    return target, published_dir, published_key, is_fullstack
 
 
 def _resolve_publish_endpoint(settings) -> tuple[str, str]:
