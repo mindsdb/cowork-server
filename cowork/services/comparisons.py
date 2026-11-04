@@ -907,10 +907,11 @@ def _file_digest(directory: PinnedDir, name: str) -> str | None:
 
 
 def _release_project_runtime(project_path: str | None) -> None:
-    """Stop a sandbox's backend previews and free its scratchpad slots.
+    """Stop a sandbox's backend previews and forget its scratchpad pads.
 
-    Each project holds its own, and the pool is capped: without this, a few
-    deleted comparisons would use up every slot until the server restarts.
+    The folder goes with the project, so a backend left running would serve a
+    deleted sandbox until the server restarts, and its pads would stay
+    registered under a workspace that no longer exists.
     """
     if not project_path:
         return

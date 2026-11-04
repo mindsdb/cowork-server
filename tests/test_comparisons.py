@@ -1340,7 +1340,7 @@ def test_a_second_carry_into_the_same_project_gets_its_own_folder(tmp_path):
     assert (destination / "Run (Kimi) 2" / "a.txt").read_text() == "a"
 
 
-def test_delete_frees_the_sandboxes_scratchpad_slots_and_backends(client):
+def test_delete_stops_the_sandboxes_backends_and_forgets_their_pads(client):
     from unittest.mock import MagicMock
 
     from cowork.services import artifacts, scratchpad_runtime
