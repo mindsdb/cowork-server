@@ -1299,6 +1299,61 @@ async def test_a_relayed_liveness_reply_right_after_output_shows_nothing(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_no_still_working_line_over_an_open_question(monkeypatch):
+    """The pod heartbeats while a question waits on the user. A relay then must
+    not put "Still working" over the question card; once it's answered, a
+    quiet stretch shows the line again."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+    asked = {"step": "ask_user", "id": "q1", "prompt": "Which one?", "timeout_s": 300,
+             "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", asked
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_step", {"step": "ask_user_answered", "id": "q1", "status": "answered", "values": ["a"]}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_delta", {"text": "done"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    kinds = [
+        "question" if "response.ask_user\"" in f or '"type": "response.ask_user"' in f
+        else "answered" if "ask_user_answered" in f
+        else "wait" if "model_wait" in f
+        else None
+        for f in buffer.frames
+    ]
+    kinds = [k for k in kinds if k]
+    assert kinds == ["question", "answered", "wait"]
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_persists_on_failure(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)

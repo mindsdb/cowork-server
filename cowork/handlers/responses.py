@@ -2386,6 +2386,10 @@ class ResponsesHandler:
             compacted = False
             # When the pod last sent this turn anything but a liveness relay.
             quiet_since = time.monotonic()
+            # Questions the pod asked that are still open. Its heartbeat goes on
+            # while one waits, and a "Still working" line over the question card
+            # would say the turn is busy when it is waiting on the user.
+            open_questions: set[str] = set()
 
             async for kind, data in stream_remote_replies(
                 conversation_id=str(conv_id),
@@ -2422,7 +2426,7 @@ class ResponsesHandler:
                     # only after a quiet stretch, as the model_wait frame the
                     # UI and the idle watchdog already count as activity, so
                     # it never flashes "Still working" while text streams.
-                    if time.monotonic() - quiet_since >= liveness.MODEL_WAIT_TICK_SECONDS:
+                    if not open_questions and time.monotonic() - quiet_since >= liveness.MODEL_WAIT_TICK_SECONDS:
                         quiet_since = time.monotonic()
                         # The UI shows the message, or "Waiting for the model"
                         # without one, which a long cell is not doing.
@@ -2437,6 +2441,10 @@ class ResponsesHandler:
                 elif kind == "turn_step":
                     if data.get("step") == "compacted":
                         compacted = True
+                    if data.get("step") == "ask_user" and data.get("id"):
+                        open_questions.add(data["id"])
+                    elif data.get("step") == "ask_user_answered":
+                        open_questions.discard(data.get("id"))
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":
