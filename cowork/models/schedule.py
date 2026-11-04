@@ -73,36 +73,6 @@ class Schedule(BaseSQLModel, table=True):
     runs: list["ScheduleRun"] = Relationship(
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
-    skipped_periods: list["ScheduleSkippedPeriod"] = Relationship(
-        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
-    )
-
-
-class ScheduleSkippedPeriod(BaseSQLModel, table=True):
-    """Slots a schedule passed over without running, summarized: one row each
-    time the scheduler found it behind, however many slots that covered."""
-
-    __tablename__ = "schedule_skipped_periods"
-
-    schedule_id: UUID = Field(
-        sa_column=sa.Column(
-            sa.Uuid(),
-            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        ),
-        description="Parent schedule",
-    )
-    first_slot: datetime = Field(
-        sa_type=sa.DateTime(timezone=True),  # type: ignore
-        description="UTC instant of the first slot passed over",
-    )
-    last_slot: datetime = Field(
-        sa_type=sa.DateTime(timezone=True),  # type: ignore
-        description="UTC instant of the last slot passed over",
-    )
-    slot_count: int = Field(description="Slots passed over, first and last included")
-    reason: str = Field(description="offline (the app was not running) | one_off_missed")
 
 
 class ScheduleRun(BaseSQLModel, table=True):

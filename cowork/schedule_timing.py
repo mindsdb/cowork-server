@@ -116,10 +116,8 @@ class MissedSlots:
     # The latest overdue slot no older than the lookback, which runs once;
     # None when every overdue slot is older than that.
     run: datetime | None
-    # The slots passed over without running: how many, the first and the last.
+    # How many slots are passed over without running.
     skipped: int
-    first_skipped: datetime | None
-    last_skipped: datetime | None
     # The first slot after now.
     future: datetime
 
@@ -139,35 +137,23 @@ def missed_slots(
     if reference is None or cursor is None:
         raise ValueError("next_run_at and now must be datetimes")
     floor = reference - lookback
-    overdue: list[datetime] = []
+    latest: datetime | None = None
     count = 0
-    first: datetime | None = None
     interval = FIXED_INTERVALS.get(cadence)
     if interval is not None and cursor < floor - interval:
         # Slots well before the lookback can only be passed over, so they are
         # counted rather than walked: a schedule a year behind would otherwise
         # step through every one of them.
-        first = cursor
         jumped = int((floor - cursor) // interval) - 1
         count += jumped
         cursor += interval * jumped
     while cursor <= reference:
         count += 1
-        if first is None:
-            first = cursor
-        # Only the last two are kept: the one that may run and the one before it.
-        overdue = [*overdue[-1:], cursor]
+        latest = cursor
         cursor = advance_occurrence(cadence, cursor, timezone_name)
-    if not overdue:
-        return MissedSlots(run=None, skipped=0, first_skipped=None, last_skipped=None, future=cursor)
-    latest = overdue[-1]
-    if latest >= floor:
-        before = overdue[0] if len(overdue) == 2 else None
-        return MissedSlots(
-            run=latest, skipped=count - 1, first_skipped=first if count > 1 else None,
-            last_skipped=before, future=cursor,
-        )
-    return MissedSlots(run=None, skipped=count, first_skipped=first, last_skipped=latest, future=cursor)
+    if latest is not None and latest >= floor:
+        return MissedSlots(run=latest, skipped=count - 1, future=cursor)
+    return MissedSlots(run=None, skipped=count, future=cursor)
 
 
 def normalize_next_run(

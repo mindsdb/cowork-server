@@ -13,7 +13,6 @@ from cowork.schemas.schedules import (
     ScheduleResponse,
     ScheduleRunResponse,
     ScheduleUpdateRequest,
-    SkippedPeriodResponse,
     schedule_state,
 )
 from cowork.services.schedules import ScheduleConflict, ScheduleRunService, ScheduleService
@@ -30,14 +29,11 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live state: `running` (any in-flight run),
-    `state` (what the schedule will do next) and `lastSkipped` (the latest
-    slots it passed over)."""
+    """ScheduleResponse plus the live state: `running` (any in-flight run)
+    and `state` (what the schedule will do next)."""
     data = ScheduleResponse.serialize(schedule)
     data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
     data["state"] = schedule_state(schedule).value
-    skipped = ScheduleService(scoped).last_skipped(schedule.id)
-    data["lastSkipped"] = SkippedPeriodResponse.serialize(skipped) if skipped else None
     return data
 
 

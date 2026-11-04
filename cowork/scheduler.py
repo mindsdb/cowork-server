@@ -25,7 +25,7 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.db.units import run_db
-from cowork.models.schedule import Schedule, ScheduleSkippedPeriod
+from cowork.models.schedule import Schedule
 from cowork.schedule_timing import missed_slots, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import (
@@ -204,10 +204,10 @@ def _catch_up(session: ScopedSession, schedule: Schedule, now: datetime) -> None
 
     A recurring schedule moves its slot to the latest missed one inside the
     lookback, which the due-check then runs once, or past now when there is
-    none; the slots passed over are summarized. A one-off at or past the late
-    limit is marked missed. The write is conditional on the slot this read, so
-    another replica bringing the same schedule up to date records nothing
-    twice.
+    none; the slots passed over are added to `missed_runs`. A one-off at or
+    past the late limit is marked missed. The write is conditional on the slot
+    this read, so another replica bringing the same schedule up to date counts
+    nothing twice.
     """
     seen = schedule.next_run_at
     next_run = ensure_utc(seen)
@@ -215,8 +215,7 @@ def _catch_up(session: ScopedSession, schedule: Schedule, now: datetime) -> None
         if now - next_run < _ONCE_LATE_LIMIT:
             return
         moved = dict(enabled=False, missed_at=now)
-        first = last = next_run
-        count, reason = 1, "one_off_missed"
+        count = 1
     elif schedule.cadence in _RECURRING_CADENCES:
         missed = missed_slots(
             schedule.cadence, next_run, schedule.timezone, now=now, lookback=_MISSED_RUN_LOOKBACK,
@@ -225,8 +224,7 @@ def _catch_up(session: ScopedSession, schedule: Schedule, now: datetime) -> None
             # At most one slot is overdue, and it is recent: the due-check runs it.
             return
         moved = dict(next_run_at=missed.run or missed.future)
-        first, last = missed.first_skipped, missed.last_skipped
-        count, reason = missed.skipped, "offline"
+        count = missed.skipped
     else:
         return
     landed = unsafe_unscoped_session(session).execute(
@@ -235,15 +233,8 @@ def _catch_up(session: ScopedSession, schedule: Schedule, now: datetime) -> None
         .values(missed_runs=Schedule.missed_runs + count, **moved)
         .execution_options(synchronize_session=False)
     ).rowcount
-    if not landed:
-        return
-    session.add(ScheduleSkippedPeriod(
-        schedule_id=schedule.id, first_slot=first, last_slot=last, slot_count=count, reason=reason,
-    ))
-    logger.info(
-        "Passed over %s missed schedule slot(s) (%s)", count, reason,
-        extra=log_context(schedule_id=schedule.id),
-    )
+    if landed:
+        logger.info("Passed over %s missed schedule slot(s)", count, extra=log_context(schedule_id=schedule.id))
 
 
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:

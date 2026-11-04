@@ -2,13 +2,13 @@
 
 A recurring schedule that fell behind runs its latest missed slot once, if
 that slot is no more than seven days old, and the slots it passed over are
-summarized. A one-off runs up to an hour late; from an hour on it is marked
+counted. A one-off runs up to an hour late; from an hour on it is marked
 missed and runs only on Run now, which uses a one-off up. Pause stops what
-would start on its own, a waiting retry included, and resume clears the pause
-and the failure streak. A resumed schedule waits for its next slot, unless a
-run left its due slot unused before the pause and no later slot has come due:
-that slot runs once more, continuing its attempts. Three cron slots in a row
-that settle failed pause the schedule; a success resets the count.
+would start on its own, and resume clears the pause and the failure streak.
+A resumed schedule waits for its next slot, unless a run gave its due slot
+back before its agent acted and no later slot has come due: that slot runs
+once more. Three cron slots in a row that settle failed pause the schedule;
+a success resets the count.
 """
 from __future__ import annotations
 
@@ -27,9 +27,9 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import run_schema_migrations
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
-from cowork.models.schedule import Schedule, ScheduleRun, ScheduleSkippedPeriod
+from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schedule_timing import FIXED_INTERVALS, advance_occurrence, missed_slots
-from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, ScheduleState, schedule_state
+from cowork.schemas.schedules import Cadence, RunStatus, ScheduleState, schedule_state
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.schedules import MAX_FAILED_SLOTS, ScheduleConflict, ScheduleRunService, ScheduleService
 
@@ -151,14 +151,6 @@ def _runs(schedule_id: UUID) -> list[ScheduleRun]:
         session.close()
 
 
-def _skipped(schedule_id: UUID) -> ScheduleSkippedPeriod | None:
-    session = get_open_session()
-    try:
-        return ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).last_skipped(schedule_id)
-    finally:
-        session.close()
-
-
 def _set(schedule_id: UUID, **values) -> None:
     session = get_open_session()
     try:
@@ -188,41 +180,8 @@ def _service(call):
         session.close()
 
 
-def _age_last_run(schedule_id: UUID, seconds: float) -> None:
-    session = get_open_session()
-    try:
-        row = session.get(ScheduleRun, _runs(schedule_id)[-1].id)
-        row.finished_at = ensure_utc(row.finished_at) - timedelta(seconds=seconds)
-        session.add(row)
-        session.commit()
-    finally:
-        session.close()
-
-
-def _move_runs_to_slot(schedule_id: UUID, slot: datetime) -> None:
-    from sqlmodel import select
-
-    session = get_open_session()
-    try:
-        for run in session.exec(select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)).all():
-            run.for_slot_at = slot
-            session.add(run)
-        session.commit()
-    finally:
-        session.close()
-
-
-def _retry_at(schedule_id: UUID) -> datetime | None:
-    session = get_open_session()
-    try:
-        scoped = ScopedSession(session, SYSTEM_SCOPE)
-        return scheduler.pending_retry_at(scoped, ScheduleService(scoped).get_schedule(schedule_id))
-    finally:
-        session.close()
-
-
 async def _run(slot: scheduler.DueSlot) -> None:
-    await scheduler.execute_schedule(slot.schedule_id, slot_at=slot.slot_at, attempt=slot.attempt, retry_of=slot.retry_of)
+    await scheduler.execute_schedule(slot.schedule_id, slot_at=slot.slot_at)
 
 
 def _client() -> httpx.AsyncClient:
@@ -242,20 +201,16 @@ def _walked(cadence: str, next_run_at: datetime, *, now: datetime, lookback: tim
     while cursor <= now:
         slots.append(cursor)
         cursor = advance_occurrence(cadence, cursor, "UTC")
-    if not slots:
-        return None, 0, None, None, cursor
-    latest = slots[-1]
-    if latest >= now - lookback:
-        passed = slots[:-1]
-        return latest, len(passed), passed[0] if passed else None, passed[-1] if passed else None, cursor
-    return None, len(slots), slots[0], slots[-1], cursor
+    if slots and slots[-1] >= now - lookback:
+        return slots[-1], len(slots) - 1, cursor
+    return None, len(slots), cursor
 
 
 def test_the_latest_missed_slot_inside_the_lookback_runs_and_the_rest_are_passed_over():
     start = NOW - timedelta(days=3, hours=2)
     missed = missed_slots(Cadence.daily, start, "UTC", now=NOW, lookback=timedelta(days=7))
     assert missed.run == start + timedelta(days=3)
-    assert (missed.skipped, missed.first_skipped, missed.last_skipped) == (3, start, start + timedelta(days=2))
+    assert missed.skipped == 3
     assert missed.future == start + timedelta(days=4)
 
 
@@ -263,7 +218,7 @@ def test_no_missed_slot_runs_when_every_one_is_older_than_the_lookback():
     start = NOW - timedelta(days=30)
     missed = missed_slots(Cadence.weekly, start, "UTC", now=NOW - timedelta(days=10), lookback=timedelta(days=5))
     assert missed.run is None
-    assert (missed.skipped, missed.first_skipped, missed.last_skipped) == (3, start, start + timedelta(weeks=2))
+    assert missed.skipped == 3
 
 
 @pytest.mark.parametrize("cadence", sorted(FIXED_INTERVALS, key=str))
@@ -274,7 +229,7 @@ def test_counting_fixed_interval_slots_agrees_with_walking_them(cadence):
         behind = timedelta(minutes=rng.randint(1, 60 * 24 * 40))
         start = (NOW - behind).replace(second=0)
         missed = missed_slots(cadence, start, "UTC", now=NOW, lookback=lookback)
-        assert (missed.run, missed.skipped, missed.first_skipped, missed.last_skipped, missed.future) == _walked(
+        assert (missed.run, missed.skipped, missed.future) == _walked(
             cadence, start, now=NOW, lookback=lookback,
         ), behind
 
@@ -282,9 +237,8 @@ def test_counting_fixed_interval_slots_agrees_with_walking_them(cadence):
 # --- Catching up after the app was not running --------------------------------
 
 
-def test_a_daily_schedule_days_behind_runs_its_latest_slot_once_and_summarizes_the_rest(made, turns):
-    start = SLOT - timedelta(days=3)
-    schedule_id = made(next_run_at=start)
+def test_a_daily_schedule_days_behind_runs_its_latest_slot_once_and_counts_the_rest(made, turns):
+    schedule_id = made(next_run_at=SLOT - timedelta(days=3))
 
     (due,) = _poll(schedule_id)
 
@@ -292,9 +246,6 @@ def test_a_daily_schedule_days_behind_runs_its_latest_slot_once_and_summarizes_t
     schedule = _schedule(schedule_id)
     assert ensure_utc(schedule.next_run_at) == SLOT
     assert schedule.missed_runs == 3
-    period = _skipped(schedule_id)
-    assert (period.slot_count, period.reason) == (3, "offline")
-    assert (ensure_utc(period.first_slot), ensure_utc(period.last_slot)) == (start, start + timedelta(days=2))
 
 
 def test_an_hourly_schedule_a_month_behind_runs_its_latest_slot_once(made, turns):
@@ -305,7 +256,6 @@ def test_an_hourly_schedule_a_month_behind_runs_its_latest_slot_once(made, turns
 
     assert due.slot_at == SLOT
     assert _schedule(schedule_id).missed_runs == 30 * 24
-    assert _skipped(schedule_id).slot_count == 30 * 24
 
 
 def test_a_single_recent_missed_slot_just_runs(made, turns):
@@ -315,24 +265,13 @@ def test_a_single_recent_missed_slot_just_runs(made, turns):
 
     assert due.slot_at == SLOT
     assert _schedule(schedule_id).missed_runs == 0
-    assert _skipped(schedule_id) is None
 
 
-def test_catching_up_twice_records_the_stretch_once(made, turns):
+def test_catching_up_twice_counts_the_missed_slots_once(made, turns):
     schedule_id = made(next_run_at=SLOT - timedelta(days=2))
     _poll(schedule_id)
     _poll(schedule_id)
 
-    from sqlmodel import select
-
-    session = get_open_session()
-    try:
-        periods = session.exec(
-            select(ScheduleSkippedPeriod).where(ScheduleSkippedPeriod.schedule_id == schedule_id)
-        ).all()
-    finally:
-        session.close()
-    assert len(periods) == 1
     assert _schedule(schedule_id).missed_runs == 2
 
 
@@ -358,8 +297,7 @@ def test_a_one_off_less_than_an_hour_late_runs(made, turns):
 
 
 def test_a_one_off_an_hour_late_or_more_is_missed_and_does_not_run(made, turns):
-    late = NOW - timedelta(minutes=61)
-    schedule_id = made(cadence="once", next_run_at=late)
+    schedule_id = made(cadence="once", next_run_at=NOW - timedelta(minutes=61))
 
     assert _poll(schedule_id) == []
 
@@ -367,8 +305,6 @@ def test_a_one_off_an_hour_late_or_more_is_missed_and_does_not_run(made, turns):
     assert schedule_state(schedule) == ScheduleState.missed
     assert schedule.enabled is False and schedule.missed_at is not None
     assert schedule.missed_runs == 1
-    period = _skipped(schedule_id)
-    assert (period.reason, period.slot_count, ensure_utc(period.first_slot)) == ("one_off_missed", 1, late)
 
 
 async def test_run_now_uses_up_a_missed_one_off(made, turns):
@@ -424,25 +360,6 @@ def test_pause_records_when_and_resume_waits_for_the_next_slot(made, turns):
     assert turns.started == []
 
 
-async def test_pause_holds_a_waiting_retry_and_resume_continues_its_attempts(made, turns):
-    turns.ending.reason, turns.ending.acted = "error", False
-    schedule_id = made(next_run_at=SLOT)
-    (first,) = _poll(schedule_id)
-    await _run(first)
-    assert _retry_at(schedule_id) is not None
-
-    _service(lambda s: s.pause_schedule(schedule_id))
-    assert _retry_at(schedule_id) is None
-    _age_last_run(schedule_id, 400)
-    assert _poll(schedule_id) == [], "no attempt starts while paused"
-
-    _service(lambda s: s.resume_schedule(schedule_id))
-    assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT, "the slot left due is kept"
-    (second,) = _poll(schedule_id)
-    (failed,) = _runs(schedule_id)
-    assert (second.slot_at, second.attempt, second.retry_of) == (SLOT, 2, failed.id)
-
-
 async def test_a_run_going_when_paused_finishes_and_nothing_follows_it_until_resumed(made, turns):
     turns.ending.reason, turns.ending.acted = "error", False
     schedule_id = made(next_run_at=SLOT)
@@ -453,29 +370,49 @@ async def test_a_run_going_when_paused_finishes_and_nothing_follows_it_until_res
 
     (run,) = _runs(schedule_id)
     assert run.status == RunStatus.failed
-    assert _retry_at(schedule_id) is None
-    _age_last_run(schedule_id, 400)
     assert _poll(schedule_id) == [], "nothing follows the run while paused"
-    assert len(turns.started) == 1
 
     turns.during.clear()
     _service(lambda s: s.resume_schedule(schedule_id))
-    (again,) = _poll(schedule_id)
-    assert (again.slot_at, again.attempt) == (SLOT, 2), "the slot it left due runs once resumed"
+    assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT + timedelta(days=1), "its turn used the slot up"
+    assert len(turns.started) == 1
 
 
-async def test_a_slot_left_due_is_not_run_once_a_later_slot_came_due_during_the_pause(made, turns):
-    turns.ending.reason, turns.ending.acted = "error", False
-    schedule_id = made(next_run_at=SLOT)
-    turns.during.append(lambda: _service(lambda s: s.pause_schedule(schedule_id)))
+async def _fail_before_the_turn_while_paused(schedule_id: UUID, monkeypatch) -> None:
+    """Run the due slot; the schedule is paused, and the run then fails
+    before its turn starts, so it gives the slot back."""
+    import cowork.services.product_permissions as permissions
+
+    async def paused_then_refused(*_args, **_kwargs):
+        _service(lambda s: s.pause_schedule(schedule_id))
+        raise RuntimeError("could not read the task's settings")
+
+    monkeypatch.setattr(permissions, "require_product_permission", paused_then_refused)
     (first,) = _poll(schedule_id)
     await _run(first)
-    turns.during.clear()
-    # The pause then lasts two days: move the slot it left due, and its run,
-    # back so that two later slots have come due since.
-    left_due = SLOT - timedelta(days=2)
-    _set(schedule_id, next_run_at=left_due)
-    _move_runs_to_slot(schedule_id, left_due)
+
+
+async def test_a_slot_given_back_before_acting_while_paused_runs_once_resumed(made, turns, monkeypatch):
+    schedule_id = made(next_run_at=SLOT)
+    await _fail_before_the_turn_while_paused(schedule_id, monkeypatch)
+
+    (run,) = _runs(schedule_id)
+    assert run.status == RunStatus.failed and run.slot_at is None
+    assert _poll(schedule_id) == [], "nothing follows the run while paused"
+
+    _service(lambda s: s.resume_schedule(schedule_id))
+    assert _poll(schedule_id) == [scheduler.DueSlot(schedule_id=schedule_id, slot_at=SLOT)], (
+        "the slot it left due runs once resumed"
+    )
+    assert turns.started == []
+
+
+async def test_a_slot_left_due_is_not_run_once_a_later_slot_came_due_during_the_pause(made, turns, monkeypatch):
+    schedule_id = made(next_run_at=SLOT)
+    await _fail_before_the_turn_while_paused(schedule_id, monkeypatch)
+    # The pause then lasts two days: move the slot it left due back so that
+    # two later slots have come due since.
+    _set(schedule_id, next_run_at=SLOT - timedelta(days=2))
 
     _service(lambda s: s.resume_schedule(schedule_id))
 
@@ -483,7 +420,6 @@ async def test_a_slot_left_due_is_not_run_once_a_later_slot_came_due_during_the_
         "slots that came due while paused are not run, and the stale one goes with them"
     )
     assert _poll(schedule_id) == []
-    assert len(turns.started) == 1
 
 
 def test_resume_refuses_a_one_off_whose_time_has_passed(made, turns):
@@ -566,24 +502,6 @@ async def test_a_success_resets_the_streak(made, turns):
     assert _schedule(schedule_id).consecutive_failures == 0
 
 
-async def test_the_attempts_at_one_slot_count_once(made, turns):
-    schedule_id = made(next_run_at=SLOT)
-    turns.ending.reason, turns.ending.acted = "error", False
-
-    (due,) = _poll(schedule_id)
-    await _run(due)
-    assert _schedule(schedule_id).consecutive_failures == 0, "a slot waiting for its retry has not settled"
-    _age_last_run(schedule_id, 61)
-    (due,) = _poll(schedule_id)
-    await _run(due)
-    _age_last_run(schedule_id, 301)
-    (due,) = _poll(schedule_id)
-    await _run(due)
-
-    assert len(turns.started) == 3
-    assert _schedule(schedule_id).consecutive_failures == 1
-
-
 async def test_a_manual_failure_does_not_count(made, turns):
     schedule_id = made(next_run_at=NOW + timedelta(days=1))
     turns.ending.reason, turns.ending.acted = "error", True
@@ -600,7 +518,7 @@ def _left_running(schedule_id: UUID, *, linked_conversation: bool) -> None:
     session = get_open_session()
     try:
         scoped = ScopedSession(session, SYSTEM_SCOPE)
-        run = ScheduleRunService(scoped).create_run(schedule_id, slot_at=SLOT, lease_seconds=-60, attempt=1)
+        run = ScheduleRunService(scoped).create_run(schedule_id, slot_at=SLOT, lease_seconds=-60)
         if linked_conversation:
             conversation = ConversationService(scoped).create_conversation(
                 topic=_schedule(schedule_id).title, project_id=GENERAL_PROJECT_ID,
@@ -656,18 +574,15 @@ async def test_the_api_reports_state_and_the_pause_actions_change_it(made, turns
 
     async with _client() as client:
         shown = (await client.get(f"/api/v1/schedules/{schedule_id}")).json()
-        assert (shown["state"], shown["pausedAt"], shown["consecutiveFailures"], shown["lastSkipped"]) == (
-            "active", None, 0, None,
-        )
+        assert (shown["state"], shown["pausedAt"], shown["consecutiveFailures"]) == ("active", None, 0)
         paused = (await client.post(f"/api/v1/schedules/{schedule_id}/pause")).json()
         assert paused["state"] == "paused" and paused["pausedAt"] is not None
         resumed = (await client.post(f"/api/v1/schedules/{schedule_id}/resume")).json()
         assert resumed["state"] == "active"
 
 
-async def test_the_api_reports_an_auto_pause_and_a_skipped_stretch(made, turns):
-    schedule_id = made(next_run_at=SLOT - timedelta(days=2))
-    _poll(schedule_id)
+async def test_the_api_reports_an_auto_pause(made, turns):
+    schedule_id = made(next_run_at=NOW + timedelta(hours=3))
     _set(schedule_id, enabled=False, auto_paused_at=NOW, consecutive_failures=3)
 
     async with _client() as client:
@@ -676,8 +591,6 @@ async def test_the_api_reports_an_auto_pause_and_a_skipped_stretch(made, turns):
     assert shown["state"] == "auto_paused"
     assert shown["autoPausedAt"] is not None
     assert shown["consecutiveFailures"] == 3
-    assert shown["lastSkipped"]["slotCount"] == 2
-    assert shown["lastSkipped"]["reason"] == "offline"
 
 
 async def test_resuming_a_one_off_whose_time_passed_answers_409(made, turns):
@@ -712,7 +625,6 @@ def test_the_pause_migration_upgrades_sorts_disabled_schedules_and_downgrades(tm
         command.downgrade(config, "5b7c2d9e4f10")
     columns = {c["name"] for c in inspect(engine).get_columns("schedules")}
     assert not {"consecutive_failures", "auto_paused_at", "paused_at", "missed_at"} & columns
-    assert "schedule_skipped_periods" not in inspect(engine).get_table_names()
 
     project_id = GENERAL_PROJECT_ID.hex
     rows = {
@@ -753,4 +665,3 @@ def test_the_pause_migration_upgrades_sorts_disabled_schedules_and_downgrades(tm
     assert got["one_off_missed"] == (False, True, 0)
     assert got["one_off_paused"] == (True, False, 0)
     assert got["one_off_on"] == (False, False, 0)
-    assert "schedule_skipped_periods" in inspect(engine).get_table_names()

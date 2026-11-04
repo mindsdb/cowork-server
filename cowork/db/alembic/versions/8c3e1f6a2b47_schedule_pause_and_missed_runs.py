@@ -1,11 +1,10 @@
-"""schedules: explicit pause, missed one-offs, the failure streak, skipped slots
+"""schedules: explicit pause, missed one-offs, the failure streak
 
 paused_at records a pause the user asked for, and missed_at a one-off whose
 time passed by too much to run on its own; `enabled` alone could not tell
 those apart from a one-off that has run. consecutive_failures counts cron
 slots in a row that settled failed, and auto_paused_at records when that
-streak paused the schedule. schedule_skipped_periods summarizes slots passed
-over while the app was not running, one row per stretch.
+streak paused the schedule.
 
 Existing disabled schedules are sorted into those states: a recurring one
 was paused by the user; a one-off with runs has run; a one-off counted as
@@ -36,24 +35,6 @@ def upgrade() -> None:
             batch.add_column(sa.Column("paused_at", sa.DateTime(timezone=True), nullable=True))
         if "missed_at" not in existing:
             batch.add_column(sa.Column("missed_at", sa.DateTime(timezone=True), nullable=True))
-
-    if "schedule_skipped_periods" not in inspector.get_table_names():
-        op.create_table(
-            "schedule_skipped_periods",
-            sa.Column("id", sa.Uuid(), nullable=False),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=True),
-            sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=True),
-            sa.Column("schedule_id", sa.Uuid(), nullable=False),
-            sa.Column("first_slot", sa.DateTime(timezone=True), nullable=False),
-            sa.Column("last_slot", sa.DateTime(timezone=True), nullable=False),
-            sa.Column("slot_count", sa.Integer(), nullable=False),
-            sa.Column("reason", sa.String(), nullable=False),
-            sa.ForeignKeyConstraint(["schedule_id"], ["schedules.id"], ondelete="CASCADE"),
-            sa.PrimaryKeyConstraint("id"),
-        )
-        op.create_index(
-            "ix_schedule_skipped_periods_schedule_id", "schedule_skipped_periods", ["schedule_id"],
-        )
 
     when = sa.func.coalesce(sa.column("modified_at"), sa.func.now())
     no_runs = sa.text("NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id = schedules.id)")
@@ -89,8 +70,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_schedule_skipped_periods_schedule_id", table_name="schedule_skipped_periods")
-    op.drop_table("schedule_skipped_periods")
     with op.batch_alter_table("schedules") as batch:
         batch.drop_column("missed_at")
         batch.drop_column("paused_at")

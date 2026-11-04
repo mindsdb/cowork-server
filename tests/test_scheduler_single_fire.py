@@ -352,7 +352,7 @@ async def test_a_resumed_schedule_uses_up_a_left_due_slot_whose_run_may_have_act
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", PausedThenFailingHandler)
 
-    await scheduler.execute_schedule(schedule_id, slot_at=SLOT, attempt=1)
+    await scheduler.execute_schedule(schedule_id, slot_at=SLOT)
     (failed,) = _runs(schedule_id)
     assert failed.status == RunStatus.failed and failed.slot_at is None
     assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT, "the pause left the slot due"

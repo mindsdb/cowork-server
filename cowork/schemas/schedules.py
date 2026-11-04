@@ -137,14 +137,6 @@ class ScheduleUpdateRequest(CamelRequest):
     _next_run_utc = field_validator("next_run_at")(_utc_next_run)
 
 
-class SkippedPeriodResponse(CamelResponse):
-    first_slot: datetime
-    last_slot: datetime
-    slot_count: int
-    reason: str
-    created_at: datetime | None
-
-
 class ScheduleResponse(CamelResponse):
     id: UUID
     title: str
@@ -163,10 +155,8 @@ class ScheduleResponse(CamelResponse):
     auto_paused_at: datetime | None = None
     paused_at: datetime | None = None
     missed_at: datetime | None = None
-    # Filled by the endpoints: the derived ScheduleState, and the most recent
-    # stretch of slots the schedule passed over without running.
+    # Filled by the endpoints: the derived ScheduleState.
     state: ScheduleState = ScheduleState.active
-    last_skipped: SkippedPeriodResponse | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False

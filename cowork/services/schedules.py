@@ -12,7 +12,7 @@ from cowork.common.logger import get_logger, log_context
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
-from cowork.models.schedule import Schedule, ScheduleRun, ScheduleSkippedPeriod
+from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schedule_timing import advance_occurrence, normalize_next_run
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus
 
@@ -275,14 +275,6 @@ class ScheduleService:
             .limit(1)
         ).first()
         return last_outcome == AttemptOutcome.failed_before_execution
-
-    def last_skipped(self, schedule_id: UUID) -> ScheduleSkippedPeriod | None:
-        return self.session.exec(
-            self.session.select(ScheduleSkippedPeriod)
-            .where(ScheduleSkippedPeriod.schedule_id == schedule_id)
-            .order_by(ScheduleSkippedPeriod.created_at.desc())  # type: ignore[union-attr]
-            .limit(1)
-        ).first()
 
 
 def _runs_on_its_own(schedule: Schedule) -> bool:
