@@ -151,7 +151,7 @@ SIDEKICK_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["sidekick"]
 CHIMERA_MODEL_ID = "chimera"
 CHIMERA_MODEL_LABEL = "Chimera"
 CHIMERA_MAIN_MODEL_DEFAULT = "opus"
-CHIMERA_SIDEKICK_MODEL_DEFAULT = "gpt-sol"
+CHIMERA_SIDEKICK_MODEL_DEFAULT = "gpt-luna-6"
 
 # Per-provider default model tuple served to the picker as `recommendedPair`.
 # Order: AGENT_ROLE_ORDER; values derived from MODEL_ROLE_DEFAULTS above.

@@ -41,7 +41,7 @@ def test_chimera_is_off_by_default():
 def test_the_pseudo_models_pair_defaults_to_the_contract_pair():
     settings = _settings()
     assert settings.chimera_main_model == CHIMERA_MAIN_MODEL_DEFAULT == "opus"
-    assert settings.chimera_sidekick_model == CHIMERA_SIDEKICK_MODEL_DEFAULT == "gpt-sol"
+    assert settings.chimera_sidekick_model == CHIMERA_SIDEKICK_MODEL_DEFAULT == "gpt-luna-6"
 
 
 @pytest.mark.parametrize(

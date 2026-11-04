@@ -58,7 +58,7 @@ def _openai_compatible(**kw) -> UserSettings:
 
 def test_the_pseudo_model_runs_its_pair_on_mindshub():
     turn = chimera.chimera_turn(CHIMERA_MODEL_ID, _minds())
-    assert turn == chimera.ChimeraTurn(True, "opus", "gpt-sol")
+    assert turn == chimera.ChimeraTurn(True, "opus", "gpt-luna-6")
 
 
 def test_the_pseudo_model_follows_the_configured_pair():
@@ -245,7 +245,7 @@ async def test_a_pseudo_model_turn_hands_anton_chimera_and_the_saved_sidekick(mo
     assert config.chimera == _chimera_anton.ChimeraConfig(enabled=True)
     assert config.sidekick_state == _STATE
     assert config.llm_client.planning_model == "opus"
-    assert config.llm_client.sidekick_model == "gpt-sol"
+    assert config.llm_client.sidekick_model == "gpt-luna-6"
     assert config.llm_client.main_cache_ttl == "1h"
 
 
