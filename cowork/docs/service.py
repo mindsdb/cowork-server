@@ -2,7 +2,8 @@
 
 Both callers create docs and apply ops through here, so an agent edit and a
 person's keystrokes are serialised by the same lock and kept in the same
-history; ``announce`` tells the editors and chats watching.
+history; ``announce`` tells the editors and chats watching (``sync.after_write``
+does that and the rest of what follows a write).
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from typing import Any
 from .hub import conv_topic, doc_topic, hub
 from .model import Doc, DocError
 from .ops import apply_ops, build_new_doc
-from .store import NewDoc, create_doc_folder, mutate_doc, write_html
+from .store import NewDoc, create_doc_folder, mutate_doc, with_doc, write_html
 from .undo import undo_ops
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,11 @@ logger = logging.getLogger(__name__)
 def render_page(folder: Path, doc: Doc) -> None:
     """Rewrite the doc's page (doc.html) from ``doc``."""
     write_html(folder, doc)
+
+
+def refresh_page(folder: Path) -> None:
+    """Re-render the page from the doc as it is now (for a change that wasn't a write)."""
+    with_doc(folder, lambda doc: render_page(folder, doc))
 
 
 def create_doc(
@@ -111,4 +117,4 @@ def announce(
         logger.warning("could not announce doc change for %s", artifact_id, exc_info=True)
 
 
-__all__ = ["announce", "apply", "create_doc", "render_page"]
+__all__ = ["announce", "apply", "create_doc", "refresh_page", "render_page"]
