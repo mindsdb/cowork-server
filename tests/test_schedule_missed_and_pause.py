@@ -39,13 +39,25 @@ SLOT = NOW - timedelta(minutes=1)
 
 
 @pytest.fixture(autouse=True)
+def _now_at_test_start():
+    """Take NOW and SLOT when each test starts. The scheduler reads the real
+    clock, so a NOW taken once at import drifts by however long the rest of
+    the suite ran first: in a full run, a one-off "50 minutes late" became
+    more than an hour late and counted as missed."""
+    global NOW, SLOT
+    NOW = datetime.now(timezone.utc).replace(microsecond=0)
+    SLOT = NOW - timedelta(minutes=1)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_scheduler(monkeypatch):
     monkeypatch.setattr(scheduler, "_scheduler_task", None)
     monkeypatch.setattr(scheduler, "_scheduled_runs", set())
     monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._MAX_CONCURRENT_RUNS))
 
 
-def _make_schedule(*, cadence: str = "daily", next_run_at: datetime = SLOT, enabled: bool = True) -> UUID:
+def _make_schedule(*, cadence: str = "daily", next_run_at: datetime | None = None, enabled: bool = True) -> UUID:
+    next_run_at = SLOT if next_run_at is None else next_run_at
     session = get_open_session()
     try:
         return ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
