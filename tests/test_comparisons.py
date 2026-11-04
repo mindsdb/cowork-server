@@ -2171,3 +2171,37 @@ def test_a_desktop_side_gets_copies_of_skills_never_links(client):
         for made in (skill, later):
             if made is not None:
                 skills.delete_skill(made.name)
+
+
+@pytest.mark.parametrize("sandboxed", [True, False], ids=["comparison-side", "ordinary-project"])
+def test_a_sides_backend_gets_no_blocked_connectors_credentials(tmp_path, monkeypatch, sandboxed):
+    """metadata.json is the agent's to write, so a side could declare a
+    connection its turn is kept from. Its backend gets the data sources it
+    declared, never a blocked connector's credentials."""
+    import asyncio
+    import json as json_module
+
+    from cowork.services import artifacts
+
+    root = tmp_path / (f"{COMPARISON_SANDBOX_PREFIX}{'d' * 24}" if sandboxed else "reports")
+    folder = root / ".anton" / "artifacts" / "dash"
+    folder.mkdir(parents=True)
+    (folder / "metadata.json").write_text(json_module.dumps({
+        "slug": "dash", "type": "fullstack-stateless-app",
+        "datasources": [{"engine": "postgres", "name": "warehouse"}, {"engine": "slack", "name": "team"}],
+    }))
+    secrets_by_engine = {"postgres": {"DS_PG_URL": "pg"}, "slack": {"DS_SLACK_TOKEN": "xoxb"}}
+    vault = SimpleNamespace(env_for=lambda engine, name: secrets_by_engine.get(engine))
+    monkeypatch.setattr("cowork.services.connectors.persist.turn_vault_for_scope", lambda scope: vault)
+    seen: dict = {}
+
+    async def fake_launch(*, slug, artifact_folder, scratchpad_pool, tracked_backends, ds_env, health_timeout):
+        seen.update(ds_env)
+        return {"port": 5000, "pid": 1}
+
+    monkeypatch.setattr("anton.core.artifacts.backend_launcher.launch_artifact_backend", fake_launch)
+    monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
+    asyncio.run(artifacts._launch_backend_locked(folder, project_root=root, scope=LOCAL_SCOPE))
+
+    assert seen["DS_PG_URL"] == "pg"
+    assert ("DS_SLACK_TOKEN" in seen) is (not sandboxed)

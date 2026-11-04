@@ -2265,10 +2265,24 @@ async def _launch_backend_locked(
             from cowork.services.connectors.persist import turn_vault_for_scope
 
             vault = turn_vault_for_scope(scope)
+            # The agent writes metadata.json, so a comparison side could name a
+            # connection its turn is kept from: its backend gets none of those.
+            from cowork.services.projects import path_in_comparison_sandbox
+
+            comparison_side = path_in_comparison_sandbox(project_root)
             for ds in datasources:
                 engine, name = ds.get("engine"), ds.get("name")
                 if not engine or not name:
                     continue
+                if comparison_side:
+                    from cowork.services.comparisons import _blocked
+
+                    if _blocked(engine):
+                        logger.info(
+                            "Comparison side's backend %s declared blocked connector %s; not passed",
+                            slug, engine,
+                        )
+                        continue
                 env = vault.env_for(engine, name)
                 if env is None:
                     logger.warning(
