@@ -249,10 +249,12 @@ def normalize_datasource_input(model: DatasourceCreateRequest) -> dict[str, Any]
     """Turn a create or edit body into the payload auth accepts.
 
     Returns only the canonical fields: never `dsn`, never `input_mode`, and
-    never `expected_revision`, which travels as its own relay argument.
+    never `expected_revision`, which travels as its own relay argument. A
+    managed service's pair becomes its engine's, which is what auth stores.
     """
-    connector_id = (model.connector_id or "").strip().lower()
-    method = (model.method or "").strip()
+    connector_id, method = load_datasource_capabilities().cloud_target(
+        (model.connector_id or "").strip().lower(), (model.method or "").strip()
+    )
     if connector_id not in SUPPORTED_METHODS or method != SUPPORTED_METHODS[connector_id]:
         raise InvalidDatasourceInput("this connector method is not supported for cloud connections")
 
