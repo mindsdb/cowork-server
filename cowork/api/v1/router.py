@@ -41,6 +41,7 @@ from cowork.api.v1.endpoints import (
 from cowork.api.v1.endpoints.connectors import (
     connections,
     custom,
+    google_drive,
     oauth,
     posthog,
     sharepoint,
@@ -69,6 +70,7 @@ api_router.include_router(custom.router, prefix="/connectors/custom", tags=["con
 api_router.include_router(submissions.router, prefix="/connectors/submissions", tags=["connectors"])
 api_router.include_router(posthog.router, prefix="/connectors/posthog", tags=["connectors"])
 api_router.include_router(sharepoint.router, prefix="/connectors/sharepoint", tags=["connectors"])
+api_router.include_router(google_drive.router, prefix="/connectors/google_drive", tags=["connectors"])
 api_router.include_router(connections.router, prefix="/connectors/connections", tags=["connectors"])
 api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["connectors"])
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])

@@ -22,13 +22,25 @@ def test_google_drive_spec_carries_the_drive_api_rules():
     assert "corpora='allDrives'" in notes
 
 
-def test_google_drive_spec_explains_the_picker_instead_of_broader_access():
+def test_google_drive_requests_read_access_to_the_whole_drive():
+    spec = registry.get_connector("google_drive")
+    oauth_methods = [m for m in spec.form.methods if m.oauth is not None]
+
+    assert {m.id for m in oauth_methods} == {"browser_oauth_builtin", "oauth"}
+    for method in oauth_methods:
+        assert "https://www.googleapis.com/auth/drive.readonly" in method.oauth.scopes
+        assert "https://www.googleapis.com/auth/drive.file" in method.oauth.scopes
+
+
+def test_google_drive_spec_explains_full_read_access_and_the_reconnect_case():
     notes = registry.usage_notes_for(["google_drive"])["google_drive"]
 
-    assert "Add files from Google Drive" in notes
+    assert "can read every file in the user's Drive" in notes
     assert "files.export" in notes
     assert "alt=media" in notes
-    assert "never suggest reconnecting with broader permissions" in notes
+    assert "reconnect Google Drive" in notes
+    assert "Google Picker" not in notes
+    assert "Add files from Google Drive" not in notes
 
 
 def test_roam_research_spec_carries_the_redirect_rule():
@@ -121,7 +133,7 @@ async def test_usage_notes_reach_the_session_config(monkeypatch, tmp_path):
     async with _session_config(monkeypatch, vault) as config:
         assert config.connector_usage_notes == registry.usage_notes_for(["google_drive"])
         suffix = config.system_prompt_context.suffix
-        assert "Roadmap.gdoc" in suffix  # the Picker block still renders
+        assert "Roadmap.gdoc" in suffix  # the project files block still renders
         assert "corpora" not in suffix   # ...without the moved Drive API rules
 
 
@@ -154,10 +166,10 @@ async def test_drive_notes_reach_the_session_config_without_picked_files(monkeyp
     async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
         notes = config.connector_usage_notes["google_drive"]
         assert "corpora='allDrives'" in notes
-        # A fresh connection has no picked files, so the Picker block is empty;
-        # the usage notes alone must tell the agent how to reach an existing file.
-        assert "Google Picker" not in config.system_prompt_context.suffix
-        assert "Add files from Google Drive" in notes
+        # A fresh connection has no project files, so that block is empty; the
+        # usage notes alone must tell the agent how to reach an existing file.
+        assert "files the user added to this project" not in config.system_prompt_context.suffix
+        assert "can read every file in the user's Drive" in notes
 
 
 @pytest.mark.parametrize(
