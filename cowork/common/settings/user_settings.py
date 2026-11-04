@@ -15,11 +15,14 @@ from pydantic import Field, PrivateAttr, SecretStr, ValidationInfo, field_valida
 
 from cowork.common.settings.app_settings import (
     AGENT_ROLE_NAMES,
+    CHIMERA_MAIN_MODEL_DEFAULT,
+    CHIMERA_SIDEKICK_MODEL_DEFAULT,
     CODING_MODEL_DEFAULTS,
     MINDS_FREE_MODEL,
     PLANNING_MODEL_DEFAULTS,
     ROLE_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
+    SIDEKICK_MODEL_DEFAULTS,
     Settings,
     default_minds_url,
     get_app_settings,
@@ -477,6 +480,10 @@ SETTING_ENV_ALIASES: dict[str, str] = {
     "planning_provider": "ANTON_PLANNING_PROVIDER",
     "coding_provider": "ANTON_CODING_PROVIDER",
     "router_provider": "ANTON_ROUTER_PROVIDER",
+    # The sidekick's model and effort stay out for the router's reasons (a
+    # model is CLI-only, ENG-739), and so does chimera_enabled: a stale anton
+    # CLI line would switch on a paid second agent for every turn.
+    "sidekick_provider": "ANTON_SIDEKICK_PROVIDER",
     "minds_url": "ANTON_MINDS_URL",
     "openai_base_url": "ANTON_OPENAI_BASE_URL",
     "memory_enabled": "ANTON_MEMORY_ENABLED",
@@ -650,6 +657,59 @@ class UserSettings(Settings):
             "model for the selected provider (MindsHub → MindsHub Air; other "
             "providers → their smallest model)."
         ),
+    )
+    # Sidekick role (Chimera): the cheaper model anton's `delegate` tool runs a
+    # bounded loop on while the planning model plans and reviews. Shaped like
+    # the router role above. It reaches anton only on a turn Chimera is on for
+    # (cowork.services.chimera.chimera_turn), so with Chimera off nothing here
+    # changes a turn.
+    sidekick_provider: Annotated[Provider, ORG, PINNED] = Field(
+        default_factory=_default_provider,
+        title="Sidekick Provider",
+        description="The provider for the Chimera sidekick model.",
+    )
+    sidekick_model: Annotated[str | None, PINNED] = Field(
+        default=None,
+        title="Sidekick Model",
+        description=(
+            "The model Chimera's sidekick runs delegated work on when Chimera is "
+            "switched on with chimera_enabled. Defaults to the recommended coding "
+            "model for the selected provider. A turn on the Chimera pseudo-model "
+            "runs chimera_sidekick_model instead."
+        ),
+    )
+    sidekick_reasoning_effort: Annotated[str | None, PINNED] = Field(
+        default=None,
+        title="Sidekick Reasoning Effort",
+        description=(
+            "Opaque reasoning-effort level for the sidekick model. None or empty "
+            "sends none. Sent only while the sidekick runs the model it was "
+            "chosen for; the composer's per-task pick never applies to it."
+        ),
+    )
+    chimera_enabled: Annotated[bool, PINNED] = Field(
+        default=False,
+        title="Chimera",
+        description=(
+            "Run every turn as Chimera: the planning model gets a `delegate` tool "
+            "that hands bounded, checkable work to the sidekick model. Off by "
+            "default. Ignored on openai-compatible. Picking the Chimera "
+            "pseudo-model in the composer turns it on for that conversation alone."
+        ),
+    )
+    chimera_main_model: Annotated[str, PINNED] = Field(
+        default=CHIMERA_MAIN_MODEL_DEFAULT,
+        min_length=1,
+        max_length=256,
+        title="Chimera Main Model",
+        description="The MindsHub model that plans and reviews on a Chimera pseudo-model turn.",
+    )
+    chimera_sidekick_model: Annotated[str, PINNED] = Field(
+        default=CHIMERA_SIDEKICK_MODEL_DEFAULT,
+        min_length=1,
+        max_length=256,
+        title="Chimera Sidekick Model",
+        description="The MindsHub model that does delegated work on a Chimera pseudo-model turn.",
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
         default="anton",
@@ -1187,6 +1247,15 @@ class UserSettings(Settings):
                 self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
                 enabled_map,
             )
+        # Filled for the reason the others are (build_llm_client's effort
+        # guard compares stored to resolved), from the sidekick's own provider:
+        # the router's wart above is not carried over to a new role.
+        if self.sidekick_model is None:
+            self.sidekick_model = _enabled_aware_default(
+                self.sidekick_provider.value,
+                self._defaults_for_role("sidekick", SIDEKICK_MODEL_DEFAULTS),
+                enabled_map,
+            )
         return self
 
     def _has_key(self, p: Provider) -> bool:
@@ -1325,6 +1394,24 @@ class UserSettings(Settings):
             provider.value,
             self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
+        )
+
+    @property
+    def resolved_sidekick_provider(self) -> Provider:
+        return self._resolve_provider(self.sidekick_provider)
+
+    @property
+    def resolved_sidekick_model(self) -> str | None:
+        # wallet_aware: the sidekick runs unseen inside a delegation, so a
+        # locked pin would fail every delegation with nothing on screen to
+        # explain it — the coding role's reason (ENG-1632).
+        return _resolved_model(
+            self.resolved_sidekick_provider,
+            self.sidekick_provider,
+            self.sidekick_model,
+            self._defaults_for_role("sidekick", SIDEKICK_MODEL_DEFAULTS),
+            self._minds_enabled_map(),
+            wallet_aware=True,
         )
 
     @property

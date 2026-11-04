@@ -400,7 +400,7 @@ def test_the_picker_is_told_what_the_server_will_resolve(monkeypatch):
     static table it would show the compiled model while turns ran the declared
     one, and saving would then pin the wrong one.
     """
-    declared = {"planning": "sonnet", "coding": "haiku", "router": "kimi"}
+    declared = {"planning": "sonnet", "coding": "haiku", "router": "kimi", "sidekick": "haiku"}
     _stub_listing(
         monkeypatch,
         ids=["mindshub_air", "sonnet", "haiku", "kimi"],
@@ -411,7 +411,7 @@ def test_the_picker_is_told_what_the_server_will_resolve(monkeypatch):
     with _Endpoint() as endpoint:
         payload = endpoint.call()
 
-    assert payload["recommendedPair"]["minds-cloud"] == ["sonnet", "haiku", "kimi"]
+    assert payload["recommendedPair"]["minds-cloud"] == ["sonnet", "haiku", "kimi", "haiku"]
 
     resolved = UserSettings(
         planning_provider=Provider.MINDS_CLOUD,
@@ -424,6 +424,7 @@ def test_the_picker_is_told_what_the_server_will_resolve(monkeypatch):
         resolved.resolved_planning_model,
         resolved.resolved_coding_model,
         resolved.resolved_router_model,
+        resolved.resolved_sidekick_model,
     ]
 
 
@@ -439,22 +440,25 @@ def test_the_pair_is_availability_adjusted_like_resolution_is(monkeypatch):
         monkeypatch,
         ids=["mindshub_air", "sonnet"],
         enabled={"mindshub_air": True, "sonnet": False},
-        role_defaults={"planning": "sonnet", "coding": "sonnet", "router": "sonnet"},
+        role_defaults={"planning": "sonnet", "coding": "sonnet", "router": "sonnet", "sidekick": "sonnet"},
     )
 
     with _Endpoint() as endpoint:
         payload = endpoint.call()
 
-    assert payload["recommendedPair"]["minds-cloud"] == ["mindshub_air"] * 3
+    assert payload["recommendedPair"]["minds-cloud"] == ["mindshub_air"] * 4
 
     resolved = _minds(
-        minds_role_defaults=json.dumps({"planning": "sonnet", "coding": "sonnet", "router": "sonnet"}),
+        minds_role_defaults=json.dumps(
+            {"planning": "sonnet", "coding": "sonnet", "router": "sonnet", "sidekick": "sonnet"}
+        ),
         minds_model_enabled=json.dumps({"mindshub_air": True, "sonnet": False}),
     )
     assert payload["recommendedPair"]["minds-cloud"] == [
         resolved.resolved_planning_model,
         resolved.resolved_coding_model,
         resolved.resolved_router_model,
+        resolved.resolved_sidekick_model,
     ]
 
 
@@ -585,7 +589,7 @@ def test_a_hand_written_role_map_is_rejected_rather_than_filtered():
 
 
 def test_a_role_the_catalog_omits_keeps_the_compiled_slot_in_the_pair(monkeypatch):
-    """The pair stays a full triple, so an older client indexing it still works."""
+    """The pair keeps a slot for every role, so an older client indexing it still works."""
     _stub_listing(
         monkeypatch,
         ids=["mindshub_air", "sonnet"],
@@ -599,6 +603,7 @@ def test_a_role_the_catalog_omits_keeps_the_compiled_slot_in_the_pair(monkeypatc
         "sonnet",
         COMPILED["coding"],
         COMPILED["router"],
+        COMPILED["sidekick"],
     ]
 
 

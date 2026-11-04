@@ -70,26 +70,33 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 # be its only reader.
 MINDS_FREE_MODEL = "mindshub_air"
 
-# Single source for the per-role defaults: PLANNING/CODING/ROUTER_MODEL_
-# DEFAULTS and RECOMMENDED_PAIR below are all derived from this table.
+# Single source for the per-role defaults: PLANNING/CODING/ROUTER/SIDEKICK_
+# MODEL_DEFAULTS and RECOMMENDED_PAIR below are all derived from this table.
+#
+# The sidekick (Chimera's delegate loop) starts on the coding model everywhere:
+# it does the same bounded, mechanical work, and anton falls back to the coding
+# role when no sidekick is configured, so the two agree on what "unset" runs.
 MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     "anthropic": {
         "planning": "claude-sonnet-4-6",
         "coding": "claude-haiku-4-5-20251001",
         "router": "claude-haiku-4-5-20251001",
+        "sidekick": "claude-haiku-4-5-20251001",
     },
     "openai": {
         "planning": "gpt-5.5",
         "coding": "gpt-5.5-mini",
         "router": "gpt-5.5-mini",
+        "sidekick": "gpt-5.5-mini",
     },
     "gemini": {
-        # All three roles use the one id confirmed to work on a fresh
-        # free-tier Google key; other ids were zero-quota/404 for new keys
-        # but stay reachable via the picker.
+        # All roles use the one id confirmed to work on a fresh free-tier
+        # Google key; other ids were zero-quota/404 for new keys but stay
+        # reachable via the picker.
         "planning": "gemini-3.6-flash",
         "coding": "gemini-3.6-flash",
         "router": "gemini-3.6-flash",
+        "sidekick": "gemini-3.6-flash",
     },
     # Every role defaults to the free model, so a user who has picked nothing
     # can complete a whole turn without the wallet being charged for any of it.
@@ -107,6 +114,7 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
         # Not chosen on price: this role gates every turn, and a slow model here
         # is measurably worse than no router at all. Unmeasured on that axis.
         "router": MINDS_FREE_MODEL,
+        "sidekick": MINDS_FREE_MODEL,
     },
 }
 # The agent roles a model is resolved for, in the order the picker's
@@ -116,7 +124,9 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
 # policy's JSON Schema; the two are a cross-repo contract and a role in one and
 # not the other is silently dropped at the parse in fetch_minds_models.
 # `test_role_default_dicts_match_the_source_table` holds it to the table above.
-AGENT_ROLE_ORDER: tuple[str, ...] = ("planning", "coding", "router")
+# New roles are appended, never inserted: the picker reads the pair by
+# position, and a client that predates a role ignores the slots past its own.
+AGENT_ROLE_ORDER: tuple[str, ...] = ("planning", "coding", "router", "sidekick")
 AGENT_ROLE_NAMES: frozenset[str] = frozenset(AGENT_ROLE_ORDER)
 
 # The table above, pivoted: role -> provider -> model. Anything that resolves a
@@ -128,6 +138,20 @@ ROLE_MODEL_DEFAULTS: dict[str, dict[str, str]] = {
 PLANNING_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["planning"]
 CODING_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["coding"]
 ROUTER_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["router"]
+SIDEKICK_MODEL_DEFAULTS: dict[str, str] = ROLE_MODEL_DEFAULTS["sidekick"]
+
+# Chimera: a frontier model plans and reviews while a cheaper sidekick does the
+# bounded legwork through anton's `delegate` tool. The composer offers it as one
+# pseudo-model, sent to this server as CHIMERA_MODEL_ID and stored on the
+# conversation as such; a turn that names it runs the pair below (the
+# chimera_main_model / chimera_sidekick_model settings start on these). Both
+# are MindsHub aliases, which is why the pick only exists on MindsHub
+# (cowork.services.chimera). The sidekick default is the provisional pair until
+# the Chimera evals pick a winner.
+CHIMERA_MODEL_ID = "chimera"
+CHIMERA_MODEL_LABEL = "Chimera"
+CHIMERA_MAIN_MODEL_DEFAULT = "opus"
+CHIMERA_SIDEKICK_MODEL_DEFAULT = "gpt-sol"
 
 # Per-provider default model tuple served to the picker as `recommendedPair`.
 # Order: AGENT_ROLE_ORDER; values derived from MODEL_ROLE_DEFAULTS above.
