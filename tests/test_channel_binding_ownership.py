@@ -1,8 +1,9 @@
-"""Channel bindings are org-scoped but not owner-scoped: any org member could
-bind a channel into another member's private conversation and read the
-traffic that flows through it. These tests pin down the fix — a binding
-pointed at someone else's conversation is invisible and unwritable to anyone
-but its owner.
+"""Channel bindings are org-scoped but not owner-scoped. In org mode a route
+can no longer be pinned to a conversation at all: the runtime keeps each
+route's conversation, so nobody can steer a chat (a DM in particular) into a
+conversation they or an admin can read. Routes pinned before that rule still
+exist; for those, a binding pointed at someone else's conversation stays
+invisible and unwritable to anyone but its owner.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from cowork.services.conversations import ConversationService
 ORG = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 USER_A = "11111111-1111-4111-8111-111111111111"
 USER_B = "22222222-2222-4222-8222-222222222222"
+NOT_IN_ORG_MODE = "cannot be pinned to a conversation in org mode"
 
 
 def _fake_registry() -> PluginRegistry:
@@ -80,36 +82,90 @@ def _conversation(engine, user_id: str, project_id) -> Conversation:
     return conv
 
 
-# --- create: binding a channel into someone else's conversation ------------
+def _ownerless_conversation(engine) -> Conversation:
+    """An org conversation with no owner, as the channel runtime creates them.
+    Written raw: ScopedSession.add() would stamp an owner."""
+    raw = Session(engine)
+    project = Project(name="legacy-proj", path="/tmp/legacy-proj", org_id=ORG)
+    raw.add(project)
+    raw.commit()
+    raw.refresh(project)
+    conv = Conversation(topic="slack: g", project_id=project.id, org_id=ORG, created_by=None)
+    raw.add(conv)
+    raw.commit()
+    raw.refresh(conv)
+    return conv
 
-def test_create_denies_a_conversation_owned_by_another_org_member(engine):
+
+def _legacy_pinned_binding(engine, conversation_id, created_by: str = USER_A) -> ChannelBinding:
+    """A route pinned to a conversation before pinning was refused in org
+    mode; such rows exist and the read and write gates still apply to them."""
+    raw = Session(engine)
+    binding = ChannelBinding(
+        channel_type="slack", external_group_id="g1", external_thread_key="__default__",
+        org_id=ORG, created_by=created_by, anton_conversation_id=conversation_id,
+    )
+    raw.add(binding)
+    raw.commit()
+    raw.refresh(binding)
+    return binding
+
+
+# --- create and update never pin in org mode --------------------------------
+
+def test_create_refuses_a_pin_even_to_the_callers_own_conversation(engine):
     project = _project(engine, USER_A)
     conv = _conversation(engine, USER_A, project.id)
 
-    with pytest.raises(ValueError, match="conversation not found"):
+    with pytest.raises(ValueError, match=NOT_IN_ORG_MODE):
+        _svc(engine, USER_A).create(
+            BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
+        )
+
+
+def test_create_refuses_a_pin_to_another_members_conversation(engine):
+    project = _project(engine, USER_A)
+    conv = _conversation(engine, USER_A, project.id)
+
+    with pytest.raises(ValueError, match=NOT_IN_ORG_MODE):
         _svc(engine, USER_B).create(
             BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
         )
 
 
-def test_create_allows_the_conversations_own_owner(engine):
+def test_create_refuses_a_pin_to_a_conversation_with_no_owner(engine):
+    conv = _ownerless_conversation(engine)
+
+    with pytest.raises(ValueError, match=NOT_IN_ORG_MODE):
+        _svc(engine, USER_B).create(
+            BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
+        )
+
+
+def test_update_refuses_a_new_pin(engine):
+    conv = _ownerless_conversation(engine)
+    binding = _svc(engine, USER_A).create(BindingCreateRequest(channel_type="slack", external_group_id="g2"))
+
+    with pytest.raises(ValueError, match=NOT_IN_ORG_MODE):
+        _svc(engine, USER_A).update(binding.id, BindingUpdateRequest(anton_conversation_id=conv.id))
+
+
+def test_update_may_still_unpin(engine):
     project = _project(engine, USER_A)
     conv = _conversation(engine, USER_A, project.id)
+    binding = _legacy_pinned_binding(engine, conv.id)
 
-    binding = _svc(engine, USER_A).create(
-        BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
-    )
-    assert binding.anton_conversation_id == conv.id
+    updated = _svc(engine, USER_A).update(binding.id, BindingUpdateRequest(anton_conversation_id=None))
+
+    assert updated.anton_conversation_id is None
 
 
-# --- list: bindings pinned to another member's conversation stay hidden ----
+# --- list: legacy bindings pinned to another member's conversation stay hidden
 
 def test_list_excludes_a_binding_pinned_to_another_members_conversation(engine):
     project = _project(engine, USER_A)
     conv = _conversation(engine, USER_A, project.id)
-    _svc(engine, USER_A).create(
-        BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
-    )
+    _legacy_pinned_binding(engine, conv.id)
 
     assert _svc(engine, USER_B).list() == []
     assert len(_svc(engine, USER_A).list()) == 1
@@ -123,25 +179,21 @@ def test_list_still_includes_a_binding_not_pinned_to_any_conversation(engine):
     assert len(_svc(engine, USER_B).list()) == 1
 
 
-# --- update: can't touch a binding tied to someone else's conversation -----
+# --- update: can't touch a legacy binding tied to someone else's conversation
 
 def test_update_denies_caller_who_is_not_the_conversations_owner(engine):
     project = _project(engine, USER_A)
     conv = _conversation(engine, USER_A, project.id)
-    binding = _svc(engine, USER_A).create(
-        BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
-    )
+    binding = _legacy_pinned_binding(engine, conv.id)
 
     with pytest.raises(BindingNotFoundError):
         _svc(engine, USER_B).update(binding.id, BindingUpdateRequest(display_name="renamed"))
 
 
-def test_update_allows_the_conversations_own_owner(engine):
+def test_update_allows_the_conversations_own_owner_to_rename_it(engine):
     project = _project(engine, USER_A)
     conv = _conversation(engine, USER_A, project.id)
-    binding = _svc(engine, USER_A).create(
-        BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
-    )
+    binding = _legacy_pinned_binding(engine, conv.id)
 
     updated = _svc(engine, USER_A).update(binding.id, BindingUpdateRequest(display_name="renamed"))
     assert updated.display_name == "renamed"
@@ -152,9 +204,7 @@ def test_update_allows_the_conversations_own_owner(engine):
 def test_delete_denies_caller_who_is_not_the_conversations_owner(engine):
     project = _project(engine, USER_A)
     conv = _conversation(engine, USER_A, project.id)
-    binding = _svc(engine, USER_A).create(
-        BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
-    )
+    binding = _legacy_pinned_binding(engine, conv.id)
 
     assert _svc(engine, USER_B).delete(binding.id) is False
     assert _svc(engine, USER_A).list() != []
@@ -163,35 +213,20 @@ def test_delete_denies_caller_who_is_not_the_conversations_owner(engine):
 def test_delete_allows_the_conversations_own_owner(engine):
     project = _project(engine, USER_A)
     conv = _conversation(engine, USER_A, project.id)
-    binding = _svc(engine, USER_A).create(
-        BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
-    )
+    binding = _legacy_pinned_binding(engine, conv.id)
 
     assert _svc(engine, USER_A).delete(binding.id) is True
 
 
-# --- edges: legacy rows and local mode are unaffected -----------------------
+# --- edges: ownerless conversations and local mode --------------------------
 
-def test_unstamped_legacy_conversation_stays_visible(engine):
-    # A conversation from before org attribution landed (created_by NULL)
-    # isn't "owned" by anyone in particular — same lenient treatment
-    # ScopedSession already gives other NULL-owner rows elsewhere. Written
-    # through a raw session: ScopedSession.add() would stamp created_by itself,
-    # which is exactly the pre-attribution row this test needs to not have.
-    raw = Session(engine)
-    project = Project(name="legacy-proj", path="/tmp/legacy-proj", org_id=ORG)
-    raw.add(project)
-    raw.commit()
-    raw.refresh(project)
-    conv = Conversation(topic="legacy", project_id=project.id, org_id=ORG, created_by=None)
-    raw.add(conv)
-    raw.commit()
-    raw.refresh(conv)
+def test_a_binding_pinned_to_a_conversation_with_no_owner_stays_visible(engine):
+    # The runtime's own conversations have no owner, so the route pointing at
+    # one is org-wide: the owner removes it in the reported flow.
+    conv = _ownerless_conversation(engine)
+    _legacy_pinned_binding(engine, conv.id)
 
-    binding = _svc(engine, USER_B).create(
-        BindingCreateRequest(channel_type="slack", external_group_id="g1", anton_conversation_id=conv.id)
-    )
-    assert binding.anton_conversation_id == conv.id
+    assert len(_svc(engine, USER_B).list()) == 1
 
 
 def test_local_mode_is_unaffected_by_the_owner_gate(engine):

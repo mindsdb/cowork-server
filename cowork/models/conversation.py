@@ -39,6 +39,11 @@ class Conversation(BaseSQLModel, table=True):
     reasoning_effort: str | None = Field(
         default=None, description="Reasoning effort the task's harness was launched with"
     )
+    channel_type: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Channel the runtime created this conversation for (discord, slack, ...); NULL otherwise",
+    )
 
     project: "Project" = Relationship()
     messages: list["Message"] = Relationship()

@@ -423,7 +423,7 @@ def _serve_first_discord_message(binding_id: UUID, project_id: UUID) -> UUID:
     try:
         scoped = ScopedSession(session, scope_for_org(ORG_A))
         binding = scoped.get(ChannelBinding, binding_id)
-        conversation = runtime._ensure_conversation(scoped, binding)
+        conversation = runtime._ensure_conversation(scoped, binding, shared=bool(message.message.is_group))
         runtime._touch_channel_session(scoped, binding, conversation, message)
         return conversation.id
     finally:

@@ -25,6 +25,12 @@ from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
 
 
+@dataclass(frozen=True)
+class UsageRoots:
+    workspace: tuple[Path, ...]
+    recovery: tuple[Path, ...]
+
+
 class WorkspaceError(RuntimeError):
     pass
 
@@ -752,6 +758,22 @@ class WorkspaceManager:
                     shutil.rmtree(actual)
             if source.is_dir():
                 self.git.run(source, "worktree", "prune")
+
+    def usage_roots(self) -> UsageRoots:
+        """Folders holding a ``<task>`` directory of each task's managed storage.
+
+        These are what storage reporting measures, which is wider than what
+        task cleanup prunes: recovery data outlives a task's workspace.
+        """
+        return UsageRoots(
+            workspace=(
+                self.worktrees_root,
+                self.legacy_worktrees_root,
+                self.local_copies.legacy_copies_root,
+                self.local_copies.baselines_root,
+            ),
+            recovery=(self.snapshots_root,),
+        )
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""

@@ -107,7 +107,7 @@ def _serve_first_message(engine: Engine, project_id: UUID, binding_id: UUID | No
             binding = runtime._resolve_or_create_binding(scoped, "discord", message)
         else:
             binding = scoped.get(ChannelBinding, binding_id)
-        conversation = runtime._ensure_conversation(scoped, binding)
+        conversation = runtime._ensure_conversation(scoped, binding, shared=bool(message.message.is_group))
         runtime._touch_channel_session(scoped, binding, conversation, message)
         return binding.id
 
