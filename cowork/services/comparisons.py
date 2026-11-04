@@ -66,22 +66,32 @@ SIDE_LABELS = ("a", "b")
 COMPARISON_HARNESS = "anton"
 VERDICT_WINNERS = frozenset({"a", "b", "tie", "neither"})
 
-#: Connector categories whose purpose is reaching people or acting in the
-#: world: chat, email, outreach sequences, campaigns, support replies, meeting
-#: invites, signature requests, rides and orders, shipping labels. Two agents
-#: running the same task would each do it, so they are off in a comparison.
-#: Other categories stay on -- building a dashboard from the CRM or the
-#: warehouse is the comparison people run.
+#: Connector categories whose purpose is reaching people, acting in the world
+#: or spending money: chat, email, outreach sequences, campaigns, support
+#: replies, meeting invites, signature requests, rides and orders, shipping
+#: labels, the books, charges and refunds, ad spend, and pushing data out to
+#: other tools (reverse ETL, event routing). Two agents running the same task
+#: would each do it, so they are off in a comparison. Other categories stay on
+#: -- building a dashboard from the CRM or the warehouse is the comparison
+#: people run.
 BLOCKED_CONNECTOR_CATEGORIES = frozenset(
     {
         "communication", "sales-engagement", "marketing", "support", "scheduling", "documents",
-        "mobility", "logistics",
+        "mobility", "logistics", "accounting", "billing", "ads", "data",
     }
 )
-#: Connectors that reach people from a category that otherwise stays on: a
-#: calendar event invites its attendees, an incident pages whoever is on call,
-#: a status page posts publicly.
-BLOCKED_CONNECTOR_ENGINES = frozenset({"google_calendar", "pagerduty", "opsgenie", "statuspage"})
+#: Connectors that act in the world from a category that otherwise stays on:
+#: a calendar event invites its attendees, an incident pages whoever is on
+#: call, a status page posts publicly, a deploy target publishes a site or app,
+#: a CI trigger usually deploys, and a feature flag changes production.
+#: aws, gcp and azure stay on: they are where much of the data lives.
+BLOCKED_CONNECTOR_ENGINES = frozenset(
+    {
+        "google_calendar", "pagerduty", "opsgenie", "statuspage",
+        "netlify", "vercel", "render", "fly_io", "heroku", "cloudflare", "digitalocean",
+        "circleci", "launchdarkly",
+    }
+)
 
 # What a copied project may hold. Generous for documents and data files; it
 # exists so a comparison started from a project with a vendored dependency tree

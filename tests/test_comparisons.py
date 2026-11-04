@@ -1674,6 +1674,32 @@ def test_blocked_connections_are_the_messaging_ones(monkeypatch):
     assert blocked == ["slack", "gmail", "google_calendar", "pagerduty", "doordash", "shippo", "my-custom-thing"]
 
 
+NEWLY_BLOCKED = [
+    # Deploy targets and other connectors that act on production.
+    "netlify", "vercel", "render", "fly_io", "heroku", "cloudflare", "digitalocean", "circleci", "launchdarkly",
+    # The books, charges and refunds, and ad spend.
+    "quickbooks", "xero", "netsuite", "stripe", "chargebee", "google_ads", "meta_ads",
+    # Pushing data out to other tools.
+    "census", "hightouch", "segment", "rudderstack",
+]
+# Data sources a comparison is run on, and what deliberately stays on.
+STAYS_ON = ["postgres", "snowflake", "google_drive", "sharepoint", "notion", "confluence", "jira", "github", "hubspot", "aws"]
+
+
+@pytest.mark.parametrize("engine", NEWLY_BLOCKED + STAYS_ON)
+def test_a_side_cannot_publish_deploy_spend_or_push_data_out(monkeypatch, engine):
+    import asyncio
+
+    from cowork.services import comparisons
+    from cowork.services.connectors import connections
+
+    monkeypatch.setattr(
+        connections.ConnectionsService, "list", lambda self: [SimpleNamespace(engine=engine, name="c")]
+    )
+    blocked = [item["engine"] for item in asyncio.run(comparisons.blocked_connections(LOCAL_SCOPE))]
+    assert blocked == ([engine] if engine in NEWLY_BLOCKED else [])
+
+
 def test_blocked_connections_read_auths_list_on_a_hosted_deployment(monkeypatch):
     import asyncio
 
