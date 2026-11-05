@@ -284,7 +284,7 @@ def test_copy_keeps_temporary_blobs_out_of_source_objects(tmp_path, monkeypatch,
     assert after == before
 
 
-def test_local_folders_are_copied_and_cannot_receive_branch_overrides(tmp_path):
+def test_local_folders_are_never_copied_and_cannot_receive_branch_overrides(tmp_path):
     folder = tmp_path / "notes"
     folder.mkdir()
     (folder / "note.md").write_text("original")
@@ -301,10 +301,11 @@ def test_local_folders_are_copied_and_cannot_receive_branch_overrides(tmp_path):
         task_project(
             project, TaskRepositorySetup(base_branches={"notes": "main"}), None
         )
-    prepared = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "runtime")).prepare(
-        "task", project, TaskRepositorySetup()
-    )
-    (Path(prepared.primary.workspace_path) / "note.md").write_text("task")
+    # A worktree needs Git, and the folder is never copied instead.
+    with pytest.raises(WorkspaceError, match="Notes: This folder isn't a Git repository"):
+        ProjectWorkspaceManager(WorkspaceManager(tmp_path / "runtime")).prepare(
+            "task", project, TaskRepositorySetup()
+        )
     assert (folder / "note.md").read_text() == "original"
 
 
@@ -546,10 +547,9 @@ def test_empty_repository_never_silently_ignores_branch_or_exclude_choice(tmp_pa
     ):
         with pytest.raises(WorkspaceError, match="no commits"):
             manager.prepare("task", project_for(repo), options)
-    prepared = manager.prepare(
-        "task", project_for(repo), TaskRepositorySetup(include_local_changes=True)
-    )
-    assert Path(prepared.primary.workspace_path, "uncommitted.txt").read_text() == "new"
+    # A worktree needs a commit, so even without branch choices nothing is copied.
+    with pytest.raises(WorkspaceError, match="Make a first commit"):
+        manager.prepare("task", project_for(repo), TaskRepositorySetup(include_local_changes=True))
 
 
 def test_failure_after_preparation_removes_only_the_new_unmodified_branch(

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
+from coding_service_fakes import CREDS, FakeEngine, copy_folders_without_git, repository, service_with, wait_for_status
 from cowork.coding.contracts import (
     DeliveryAutomationPolicy,
     SessionCreateRequest,
@@ -21,14 +21,6 @@ from cowork.coding.workspace import WorkspaceManager
 from cowork.coding.workspace_retention import RetentionPolicy
 
 
-
-def copying_folders_as_before(service) -> None:
-    """Make the service copy folders without Git, as tasks created before copies stopped were."""
-    workspaces = service.workspaces
-    workspaces.check_source = lambda raw_path: None
-    workspaces.prepare = lambda session_id, raw_path, *args, **kwargs: workspaces._prepare_local_copy(
-        session_id, Path(raw_path).resolve()
-    )
 
 def git(cwd: Path, *args: str) -> str:
     return subprocess.run(
@@ -224,7 +216,7 @@ def test_archiving_a_folder_copy_task_leaves_its_folder_untouched(tmp_path: Path
     folder.mkdir()
     (folder / "plan.md").write_text("plan\n", encoding="utf-8")
     service = service_with(tmp_path, FakeEngine())
-    copying_folders_as_before(service)
+    copy_folders_without_git(service.workspaces)
     created = service.create_session(
         SessionCreateRequest(path=str(folder), prompt="Work", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "fake-model"
     )

@@ -337,7 +337,10 @@ class CodingService(
                 self.session_factory.in_place_roots(project, None, path)
             except (WorkspaceError, ValueError) as exc:
                 options = without_in_place(options, str(exc))
-        if project is not None or not path:
+        if project is not None:
+            problem = self.project_workspaces.worktree_problem(project)
+            return without_worktree(options, problem) if problem else options
+        if not path:
             return options
         try:
             self.workspaces.check_source(path)
