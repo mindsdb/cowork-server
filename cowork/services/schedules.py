@@ -51,6 +51,16 @@ class ScheduleService:
             raise ValueError("Schedule not found")
         return schedule
 
+    def lock_schedule(self, schedule_id: UUID) -> "Schedule | None":
+        """The schedule as stored now, locked until the unit commits, so a
+        check made on it still holds when the unit writes."""
+        return self.session.exec(
+            self._owned_select()
+            .where(Schedule.id == schedule_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+
     def create_schedule(
         self,
         title: str,

@@ -170,6 +170,26 @@ def _delete_unit(session: ScopedSession, *, schedule_id: UUID) -> bool:
     return ScheduleService(session).delete_schedule(schedule_id)
 
 
+class _ChangedSinceCard(Exception):
+    """The task was changed elsewhere after its card was shown."""
+
+    def __init__(self, current: dict) -> None:
+        self.current = current
+
+
+def _if_unchanged(session: ScopedSession, *, schedule_id: UUID, shown: dict, apply):
+    """Apply the confirmed action only to the task the card showed.
+
+    The Scheduled Tasks page or another chat can change it while the card
+    waits; confirming must not approve details the user never saw. A task
+    that is gone is left to `apply`, which reports it.
+    """
+    current = ScheduleService(session).lock_schedule(schedule_id)
+    if current is not None and _summary(current) != shown:
+        raise _ChangedSinceCard(_summary(current))
+    return apply(session)
+
+
 # ---------------------------------------------------------------------------
 # Validation: the request schemas the HTTP routes parse with, plus the
 # page's form rules.
@@ -270,7 +290,11 @@ def _schedule_id(tc_input: dict) -> UUID:
 
 
 def _local(at: datetime, tz_name: str) -> datetime:
-    return ensure_utc(at).astimezone(ZoneInfo(tz_name)) if tz_name else ensure_utc(at)
+    # A stored task may hold "local", which only the scheduler's resolver
+    # understands. New input is still checked strictly by _check_timezone.
+    from cowork.schedule_timing import resolve_timezone
+
+    return ensure_utc(at).astimezone(resolve_timezone(tz_name)) if tz_name else ensure_utc(at)
 
 
 def _clock(at: datetime) -> str:
@@ -499,6 +523,7 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
                 apply = partial(_resume_unit, schedule_id=schedule_id)
             else:
                 apply = partial(_delete_unit, schedule_id=schedule_id)
+            apply = partial(_if_unchanged, schedule_id=schedule_id, shown=before, apply=apply)
     except _Invalid as exc:
         return _result(f"Not sent for confirmation: {exc}")
     except ValueError:
@@ -510,6 +535,12 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
 
     try:
         outcome = await run_db(apply, scope=scope)
+    except _ChangedSinceCard as changed:
+        return _result(
+            "Nothing was changed: the task was edited somewhere else while the card was open. "
+            "Tell the user what it is now, and ask again if they still want the change.",
+            changed.current,
+        )
     except ValueError as exc:
         # The task was deleted, or its project went away, while the card waited.
         return _result(f"Nothing was changed: {exc}.")

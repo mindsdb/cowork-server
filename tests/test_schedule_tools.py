@@ -302,6 +302,62 @@ async def test_a_resume_card_shows_the_run_that_will_really_happen(hours_overdue
     assert schedule_tools.describe_start(overdue, "UTC") not in request.prompt
 
 
+class _CardThenEdit(_Card):
+    """Confirms, but first changes the task somewhere else, as the Scheduled
+    Tasks page or another chat can while a card is open."""
+
+    def __init__(self, schedule_id: str, **changes) -> None:
+        super().__init__(CONFIRM)
+        self.schedule_id = UUID(schedule_id)
+        self.changes = changes
+
+    async def ask(self, question_id, request) -> AskAnswer:
+        with unit_session(scope=LOCAL_SCOPE) as session:
+            schedule = session.get(Schedule, self.schedule_id)
+            for field, value in self.changes.items():
+                setattr(schedule, field, value)
+            session.add(schedule)
+        return await super().ask(question_id, request)
+
+
+@pytest.mark.parametrize(("action", "tc_input"), [
+    ("resume", {}),
+    ("update", {"title": "Morning sales"}),
+])
+async def test_a_task_changed_while_its_card_is_open_is_left_alone(action, tc_input):
+    task = await _create_confirmed()
+    if action == "resume":
+        await _call(MANAGE_TOOL_NAME, _Session(_Card(CONFIRM)), {"action": "pause", "schedule_id": task["schedule_id"]})
+    card = _CardThenEdit(task["schedule_id"], prompt="Email every customer a discount code.")
+
+    result = await _call(
+        MANAGE_TOOL_NAME, _Session(card), {"action": action, "schedule_id": task["schedule_id"], **tc_input},
+    )
+
+    assert result["result"].startswith("Nothing was changed: the task was edited")
+    assert result["task"]["prompt"] == "Email every customer a discount code."
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        assert schedule.enabled is (action != "resume")
+        assert schedule.title == "Daily sales"
+
+
+async def test_a_task_in_the_local_timezone_can_be_paused_from_chat():
+    # The scheduler and the client accept "local"; the tool must at least show
+    # and act on such a task, even though it doesn't accept "local" as input.
+    task = await _create_confirmed()
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        schedule.timezone = "local"
+        session.add(schedule)
+    card = _Card(CONFIRM)
+
+    result = await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "pause", "schedule_id": task["schedule_id"]})
+
+    assert result["task"]["paused"] is True
+    assert "(local)" in card.shown[0].prompt
+
+
 async def test_a_confirmed_resume_reports_the_run_the_card_showed():
     # The stored time stays in the past until the scheduler's next poll, so a
     # result that echoed it would have the agent tell the user the next run
