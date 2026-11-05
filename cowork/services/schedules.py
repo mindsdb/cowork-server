@@ -5,7 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm.attributes import set_attribute
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
@@ -59,11 +59,15 @@ class ScheduleService:
         SQLite ignores FOR UPDATE, so a write that changes nothing comes
         first: it takes SQLite's database write lock (and the row lock on
         Postgres), and the read after it sees whatever committed before.
+        The write is `SET title = title`, done in the database, so a rename
+        saved since `_owned` read the row is kept rather than written over.
         """
         schedule = self._owned(schedule_id)
         if schedule is None:
             return None
-        flag_modified(schedule, "title")
+        # Through the ORM's instrumentation: SQLModel's own setattr would
+        # validate the SQL expression as a string and refuse it.
+        set_attribute(schedule, "title", Schedule.title)
         self.session.add(schedule)
         self.session.flush()
         return self.session.exec(

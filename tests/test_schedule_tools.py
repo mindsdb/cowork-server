@@ -377,6 +377,46 @@ async def test_an_edit_cannot_land_between_the_check_and_the_write(monkeypatch):
     assert edit_done.wait(5)
 
 
+async def test_taking_the_lock_keeps_a_rename_made_just_before_it(monkeypatch):
+    # The lock's own write must not put back a title read before the lock: a
+    # rename saved in that gap stays, and counts as a change since the card.
+    import threading
+
+    from cowork.services.schedules import ScheduleService
+
+    task = await _create_confirmed()
+    await _call(MANAGE_TOOL_NAME, _Session(_Card(CONFIRM)), {"action": "pause", "schedule_id": task["schedule_id"]})
+    owned = ScheduleService._owned
+
+    def rename_elsewhere() -> None:
+        with unit_session(scope=LOCAL_SCOPE) as session:
+            ScheduleService(session).update_schedule(UUID(task["schedule_id"]), title="Morning sales")
+
+    def read_then_rename(self, schedule_id):
+        row = owned(self, schedule_id)
+        monkeypatch.setattr(ScheduleService, "_owned", owned)
+        thread = threading.Thread(target=rename_elsewhere)
+        thread.start()
+        thread.join(5)
+        return row
+
+    class _CardThenRace(_Card):
+        async def ask(self, question_id, request):
+            # The next read is the lock's own, made after Confirm.
+            monkeypatch.setattr(ScheduleService, "_owned", read_then_rename)
+            return await super().ask(question_id, request)
+
+    result = await _call(
+        MANAGE_TOOL_NAME, _Session(_CardThenRace(CONFIRM)), {"action": "resume", "schedule_id": task["schedule_id"]},
+    )
+
+    assert result["result"].startswith("Nothing was changed: the task was edited")
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        assert schedule.title == "Morning sales"
+        assert schedule.enabled is False
+
+
 async def test_a_task_in_the_local_timezone_can_be_paused_from_chat():
     # The scheduler and the client accept "local"; the tool must at least show
     # and act on such a task, even though it doesn't accept "local" as input.
