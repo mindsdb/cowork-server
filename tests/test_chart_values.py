@@ -71,7 +71,7 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
 # The exact methods each enabled environment offers.
-OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password"})}
+OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
 # (src/shared/draft-link-origins.ts there) and refuses a link to any other.
 DRAFT_HOSTS = {

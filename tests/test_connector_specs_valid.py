@@ -331,7 +331,7 @@ def test_method_descriptions_stay_short(path: Path):
 # in the corpus carries no `cloud` block and is therefore desktop-only.
 CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
 # Engines whose cloud method is marked available; managed services follow them.
-RELEASED_CLOUD_DATABASES = frozenset({"mysql"})
+RELEASED_CLOUD_DATABASES = frozenset({"mysql", "postgres"})
 
 # The desktop fields as (name, type, required, secret, default), pinned from
 # the specs before the cloud blocks existed. The cloud block is a second,

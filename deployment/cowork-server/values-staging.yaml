@@ -36,7 +36,7 @@ deployment:
   # Cloud datasource turns and the methods offered, on for staging by the
   # release gate. Rollback removes both lines; see the chart README.
   datasourceTurnsEnabled: "true"
-  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password"]}'
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
 
   ingress:
     enabled: true
