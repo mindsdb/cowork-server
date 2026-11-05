@@ -74,7 +74,7 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager, _org_mode
-from cowork.coding.workspace_mode import without_in_place, workspace_mode_options
+from cowork.coding.workspace_mode import without_in_place, without_worktree, workspace_mode_options
 from cowork.coding.workspace_retention import RetentionPolicy, WorkspaceRetention
 from cowork.coding.workspace_usage import WorkspaceUsage
 from cowork.common.settings.app_settings import get_app_settings
@@ -318,22 +318,40 @@ class CodingService(
 
         A task with no computer chosen is shown as running here, matching the
         composer's default target. Given the folder a folder task would use,
-        the answer also reflects whether that folder can be worked in
-        directly, checked the same way creating the task checks it.
+        the answer also reflects what that folder allows, checked the same way
+        creating the task checks it: any existing folder can be worked in, and
+        a worktree needs a Git repository with a commit.
         """
         project = self.projects.get(project_id) if project_id else None
+        runs_locally = computer_id in {None, self.control.local_computer.id}
         options = workspace_mode_options(
             project.default_workspace_mode if project else None,
-            runs_locally=computer_id in {None, self.control.local_computer.id},
+            runs_locally=runs_locally,
             org_mode=_org_mode(),
             project_task=project is not None,
         )
-        if project is None and path and WorkspaceMode.in_place in options.supported:
+        if project is not None or not path or not runs_locally:
+            return options
+        if WorkspaceMode.in_place in options.supported:
             try:
                 self.workspaces.in_place_root(path)
             except WorkspaceError as exc:
-                return without_in_place(options, str(exc))
+                options = without_in_place(options, str(exc))
+        try:
+            self.workspaces.check_source(path)
+        except WorkspaceError as exc:
+            inspection = self.workspaces.inspect(path)
+            options = without_worktree(
+                options,
+                str(exc),
+                can_initialize_git=inspection.is_directory and not inspection.is_git and not _org_mode(),
+            )
         return options
+
+    def initialize_git(self, path: str) -> WorkspaceModeOptions:
+        """Make a folder on this computer a Git repository, then say what it allows."""
+        self.workspaces.initialize_git(path)
+        return self.workspace_mode_options(None, None, path)
 
     def inspect_workspace(self, path: str) -> WorkspaceInspection:
         return self.workspaces.inspect(path)

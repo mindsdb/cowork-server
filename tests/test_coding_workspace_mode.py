@@ -145,7 +145,7 @@ def test_the_composer_learns_which_modes_a_new_task_can_use(tmp_path: Path, monk
     monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset({sys.platform}))
     folder = service.workspace_mode_options(None, None)
     assert folder.supported == [WorkspaceMode.worktree, WorkspaceMode.in_place]
-    assert folder.default == WorkspaceMode.worktree
+    assert folder.default == WorkspaceMode.in_place
     assert service.workspace_mode_options(project.id, None).supported == [WorkspaceMode.worktree]
     assert service.workspace_mode_options(None, "another-computer").supported == [WorkspaceMode.worktree]
 
@@ -175,13 +175,65 @@ def test_the_modes_offered_for_a_folder_are_the_modes_creation_accepts(
 
     options = service.workspace_mode_options(None, None, str(folder))
 
+    # Every folder can be worked in, and that is the default.
+    assert options.default == WorkspaceMode.in_place
     for mode in (WorkspaceMode.worktree, WorkspaceMode.in_place):
-        request = SessionCreateRequest(path=str(folder), prompt="Go", workspace_mode=mode, allow_folder_copy=True)
+        request = SessionCreateRequest(path=str(folder), prompt="Go", workspace_mode=mode)
         if mode in options.supported:
             created = service.create_session(request, CREDS, "fake", "fake-model")
             wait_for_status(service, created.id, SessionStatus.completed)
         else:
-            assert options.in_place_unavailable_reason
-            with pytest.raises((RuntimeError, ValueError, WorkspaceError)):
+            with pytest.raises((RuntimeError, ValueError, WorkspaceError), match="Worktree"):
                 service.create_session(request, CREDS, "fake", "fake-model")
-    assert (WorkspaceMode.in_place in options.supported) == (kind == "repository")
+    assert (WorkspaceMode.worktree in options.supported) == (kind == "repository")
+    assert WorkspaceMode.in_place in options.supported
+    if kind in {"plain", "repositories"}:
+        assert "Initialize Git" in (options.worktree_unavailable_reason or "")
+        assert options.can_initialize_git is True
+    elif kind == "empty repository":
+        assert "first commit" in (options.worktree_unavailable_reason or "")
+        assert options.can_initialize_git is False
+
+
+def test_where_in_place_is_unavailable_a_folder_without_git_has_no_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
+    folder = tmp_path / "plain"
+    folder.mkdir()
+    service = service_with(tmp_path, FakeEngine())
+
+    options = service.workspace_mode_options(None, None, str(folder))
+
+    assert options.supported == []
+    assert options.default is None
+    assert options.can_initialize_git is True
+    with pytest.raises(WorkspaceError, match="Initialize Git to use a Worktree"):
+        service.create_session(SessionCreateRequest(path=str(folder), prompt="Go"), CREDS, "fake", "fake-model")
+
+
+def test_initializing_git_offers_a_worktree_after_a_first_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset({sys.platform}))
+    folder = tmp_path / "plain"
+    folder.mkdir()
+    inner = repository(folder)
+    (folder / "notes.md").write_text("notes\n", encoding="utf-8")
+    service = service_with(tmp_path, FakeEngine())
+
+    options = service.initialize_git(str(folder))
+
+    assert (folder / ".git").is_dir()
+    # Nothing is committed for the user, and the inner repository stays its own.
+    assert options.can_initialize_git is False
+    assert "first commit" in (options.worktree_unavailable_reason or "")
+    assert (inner / ".git").is_dir()
+    with pytest.raises(WorkspaceError, match="already in a Git repository"):
+        service.initialize_git(str(folder))
+    with pytest.raises(WorkspaceError, match="already in a Git repository"):
+        service.initialize_git(str(inner))
+
+    git(folder, "add", "notes.md")
+    git(folder, "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-m", "first")
+    assert WorkspaceMode.worktree in service.workspace_mode_options(None, None, str(folder)).supported
