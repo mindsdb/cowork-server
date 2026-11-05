@@ -746,8 +746,11 @@ class UserSettings(Settings):
     # The shared browser (ENG-3298). Untagged, so per-user in org mode and the
     # single global row on desktop, like `hub_workspace_id`: it is the person's
     # own MindsHub browser instance, not org configuration.
+    # On by default: it only does something where a browser is available
+    # (the router, a provisioned instance, or a configured standalone
+    # service); `services.browser.turn_block` returns None otherwise.
     browser_enabled: bool = Field(
-        default=False,
+        default=True,
         title="Browser Enabled",
         description="Let the agent use your MindsHub browser, shown beside the chat.",
     )

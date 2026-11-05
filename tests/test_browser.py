@@ -135,7 +135,7 @@ def test_status_before_provisioning(client, mindshub):
     res = client.get("/api/v1/browse/status", headers=HUB)
     assert res.status_code == 200
     assert res.json() == {
-        "provisioned": False, "status": "none", "endpoint": "", "mode": "mindshub", "enabled": False, "available": False,
+        "provisioned": False, "status": "none", "endpoint": "", "mode": "mindshub", "enabled": True, "available": False,
     }
 
 
@@ -389,7 +389,7 @@ def test_standalone_routes_need_no_mindshub_credential(client, service):
     status = client.get("/api/v1/browse/status")
     assert status.status_code == 200
     assert status.json() == {"provisioned": True, "status": "running", "endpoint": SERVICE,
-                             "mode": "standalone", "enabled": False, "available": False}
+                             "mode": "standalone", "enabled": True, "available": True}
 
     provision = client.post("/api/v1/browse/provision")
     assert provision.status_code == 200 and provision.json()["mode"] == "standalone"
