@@ -14,11 +14,21 @@ from cowork.coding.contracts import (
     SessionCreateRequest,
     SessionStatus,
     WorkspaceKind,
+    WorkspaceMode,
     utc_now,
 )
 from cowork.coding.workspace import WorkspaceManager
 from cowork.coding.workspace_retention import RetentionPolicy
 
+
+
+def copying_folders_as_before(service) -> None:
+    """Make the service copy folders without Git, as tasks created before copies stopped were."""
+    workspaces = service.workspaces
+    workspaces.check_source = lambda raw_path: None
+    workspaces.prepare = lambda session_id, raw_path, *args, **kwargs: workspaces._prepare_local_copy(
+        session_id, Path(raw_path).resolve()
+    )
 
 def git(cwd: Path, *args: str) -> str:
     return subprocess.run(
@@ -36,7 +46,7 @@ def ref_exists(repo: Path, ref: str) -> bool:
 def test_released_worktree_restores_commits_uncommitted_and_untracked_changes(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("task-1", str(repo), allow_folder_copy=False)
+    prepared = manager.prepare("task-1", str(repo))
     worktree = prepared.workspace_path
     (worktree / "committed.txt").write_text("committed\n", encoding="utf-8")
     git(worktree, "add", "committed.txt")
@@ -62,7 +72,7 @@ def test_released_worktree_restores_commits_uncommitted_and_untracked_changes(tm
 def test_a_worktree_is_kept_when_its_source_repository_is_gone(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("task-2", str(repo), allow_folder_copy=False)
+    prepared = manager.prepare("task-2", str(repo))
 
     released = manager.release(
         "task-2", str(tmp_path / "moved-away"), str(prepared.workspace_path), WorkspaceKind.git_worktree
@@ -77,7 +87,7 @@ def test_a_folder_copy_is_never_released(tmp_path: Path) -> None:
     source.mkdir()
     (source / "edit.txt").write_text("before\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
-    copy = manager.prepare("task-3", str(source), allow_folder_copy=True).workspace_path
+    copy = manager._prepare_local_copy("task-3", source).workspace_path
     (copy / "edit.txt").write_text("after\n", encoding="utf-8")
 
     assert manager.release("task-3", str(source), str(copy), WorkspaceKind.local_copy) is False
@@ -91,7 +101,7 @@ def test_a_folder_copy_is_never_released(tmp_path: Path) -> None:
 def test_a_worktree_with_a_task_created_repository_is_kept(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare("task-4", str(repo), allow_folder_copy=False).workspace_path
+    worktree = manager.prepare("task-4", str(repo)).workspace_path
     nested = worktree / "vendor" / "lib"
     nested.mkdir(parents=True)
     git(nested, "init", "-q")
@@ -107,7 +117,7 @@ def test_a_worktree_with_a_task_created_repository_is_kept(tmp_path: Path) -> No
 def test_a_repository_initialized_inside_a_tracked_directory_is_kept(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare("task-6", str(repo), allow_folder_copy=False).workspace_path
+    worktree = manager.prepare("task-6", str(repo)).workspace_path
     (worktree / "src").mkdir()
     (worktree / "src" / "lib.py").write_text("tracked\n", encoding="utf-8")
     git(worktree, "add", "src/lib.py")
@@ -125,7 +135,7 @@ def test_a_repository_initialized_inside_a_tracked_directory_is_kept(tmp_path: P
 def test_a_task_created_repository_staged_in_the_parent_is_kept(tmp_path: Path, commit_in_parent: bool) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare("task-8", str(repo), allow_folder_copy=False).workspace_path
+    worktree = manager.prepare("task-8", str(repo)).workspace_path
     private = worktree / "private"
     private.mkdir()
     git(private, "init", "-q")
@@ -147,7 +157,7 @@ def test_restore_replaces_a_folder_left_partly_removed_by_a_release(tmp_path: Pa
     source = repository(tmp_path)
     edited = "README.md"
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task-7", str(source), allow_folder_copy=False).workspace_path
+    workspace = manager.prepare("task-7", str(source)).workspace_path
     (workspace / edited).write_text("task change\n", encoding="utf-8")
     (workspace / "locked.txt").write_text("locked\n", encoding="utf-8")
     assert manager.release("task-7", str(source), str(workspace), kind) is True
@@ -177,7 +187,7 @@ def test_restoring_without_a_saved_release_fails_without_touching_disk(tmp_path:
 
 
 def completed_task(service, repo: Path, prompt: str = "Work") -> str:
-    created = service.create_session(SessionCreateRequest(path=str(repo), prompt=prompt), CREDS, "fake", "fake-model")
+    created = service.create_session(SessionCreateRequest(path=str(repo), workspace_mode=WorkspaceMode.worktree, prompt=prompt), CREDS, "fake", "fake-model")
     wait_for_status(service, created.id, SessionStatus.completed)
     return created.id
 
@@ -214,8 +224,9 @@ def test_archiving_a_folder_copy_task_leaves_its_folder_untouched(tmp_path: Path
     folder.mkdir()
     (folder / "plan.md").write_text("plan\n", encoding="utf-8")
     service = service_with(tmp_path, FakeEngine())
+    copying_folders_as_before(service)
     created = service.create_session(
-        SessionCreateRequest(path=str(folder), prompt="Work", allow_direct_folder=True), CREDS, "fake", "fake-model"
+        SessionCreateRequest(path=str(folder), prompt="Work", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "fake-model"
     )
     session = wait_for_status(service, created.id, SessionStatus.completed)
     assert session.workspace_kind == WorkspaceKind.local_copy

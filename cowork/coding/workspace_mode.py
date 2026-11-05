@@ -15,10 +15,8 @@ from cowork.coding.contracts import WorkspaceMode
 # been verified for a task in the user's own folder, so Windows keeps
 # worktrees until it is.
 _IN_PLACE_PLATFORMS = frozenset({"darwin", "linux"})
-# In place stays opt-in until users have tried it; a computer that offers it
-# still isolates a task that does not ask for it.
-_LOCAL_DEFAULT = WorkspaceMode.worktree
-_RUNTIME_DEFAULT = WorkspaceMode.worktree
+# Like Claude Code and the Codex app, a task works in the user's folder unless
+# it asks for a worktree; isolation is opt-in.
 
 
 def supported_workspace_modes(
@@ -65,7 +63,7 @@ def resolve_workspace_mode(
         return requested
     if project_default is not None and project_default in supported:
         return project_default
-    return _LOCAL_DEFAULT if runs_locally and not org_mode else _RUNTIME_DEFAULT
+    return WorkspaceMode.in_place if WorkspaceMode.in_place in supported else WorkspaceMode.worktree
 
 
 def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool, project_task: bool) -> str:
