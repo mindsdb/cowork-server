@@ -100,6 +100,10 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # it is the partition's where skills are, and deployment-wide (keyed by
     # the person alone) where skills are left shared.
     "skill_user_setting": PersonalResource.SKILLS,
+    # An organization's look (ENG-4020): MindsHub mode only, where every
+    # resource is partitioned, so this entry decides nothing in
+    # single-tenant mode.
+    "org_appearance": PersonalResource.SETTINGS,
     "schedules": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
     # SettingService routes its own rows; ScopedSession leaves this table alone.

@@ -199,6 +199,9 @@ def _skill_response(
         can_change = (
             not pending
             and not (builtin and _builtins_immutable(access.session.scope))
+            # Generated from the org's branding; only its per-person switch
+            # (PUT /skills/{slug}/me) is the caller's.
+            and not service.is_brand_guidelines(skill.name)
             and may_change
             and not theirs
         )
@@ -238,6 +241,7 @@ def _skill_response(
             can_share=(
                 visible.origin is SkillOrigin.OWN
                 and not is_builtin_skill(skill.name)
+                and not service.is_brand_guidelines(skill.name)
                 and (
                     viewer.can_manage_sharing(rule)
                     if viewer is not None

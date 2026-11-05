@@ -160,6 +160,19 @@ CODE_BUILTIN_SKILLS_VERSION = 1
 CODE_BUILTIN_SKILLS_MARKER = ".builtins_seeded"
 
 
+# The org's Brand guidelines skill (ENG-4020): generated per org from its
+# branding by cowork.services.org_branding, shared with everyone and always
+# on, in MindsHub mode only. Nobody edits, renames, deletes or shares it as a
+# skill; an org admin changes it through the org's appearance (its
+# ``guidelines``). Each member may still turn it off for themselves.
+BRAND_GUIDELINES_SLUG = "brand-guidelines"
+BRAND_GUIDELINES_REFUSAL = (
+    "The Brand guidelines skill is generated from your organization's branding and can't "
+    "be changed, renamed, shared or deleted here. An organization admin edits it in "
+    "Settings > Branding (Brand guidelines for Anton). You can still turn it off for yourself."
+)
+
+
 def is_builtin_skill(slug: str) -> bool:
     """Whether ``slug`` is reserved by the packaged, immutable skill set."""
     return slug in BUILTIN_SKILL_SLUGS
@@ -933,6 +946,11 @@ class SkillService:
     def is_managed_skill(self, slug: str) -> bool:
         return slug in self.managed_skill_slugs()
 
+    def is_brand_guidelines(self, slug: str) -> bool:
+        """Whether ``slug`` is the org's generated Brand guidelines skill
+        (BRAND_GUIDELINES_SLUG), which only exists where org sharing does."""
+        return self.org_sharing and slug == BRAND_GUIDELINES_SLUG
+
     @cached_property
     def _sharing(self) -> _Sharing:
         """What this store's owner shares and is shared, read live from the
@@ -1019,6 +1037,8 @@ class SkillService:
         """
         if any(self.is_managed_skill(slug) for slug in slugs):
             raise SkillImmutableError(SHARED_SKILL_REFUSAL)
+        if any(self.is_brand_guidelines(slug) for slug in slugs):
+            raise SkillImmutableError(BRAND_GUIDELINES_REFUSAL)
         shared = self.shared_with_owner()
         taken = [slug for slug in slugs if slug in shared]
         if taken:
