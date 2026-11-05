@@ -35,6 +35,8 @@ from _fakes import FakeRequest
 
 FLARE = IMAGE_MODEL_DEFAULT
 SUNBURST = "gpt-image-2.6-sunburst"
+# The cached image availability map once MindsHub lists its image models.
+IMAGE_CATALOG = json.dumps({FLARE: True, SUNBURST: True})
 CHAT_ENABLED = json.dumps({MINDS_FREE_MODEL: True, "sonnet": True})
 
 
@@ -354,6 +356,14 @@ def test_a_catalog_without_image_models_keeps_the_stored_image_map(session, monk
     assert json.loads(SettingService(session, LOCAL_SCOPE).load().minds_image_model_enabled) == {FLARE: True}
 
 
+def test_the_picker_has_nothing_to_show_before_image_models_are_published(session, monkeypatch):
+    payload = _desktop_picker(session, monkeypatch, _listing(image_models={}))
+
+    assert payload["imageModels"] == []
+    assert "imageModelDefault" not in payload
+    assert FLARE not in payload["modelEnabled"]
+
+
 def test_an_org_members_restricted_image_model_is_theirs_alone(session, monkeypatch, org_mode):
     from cowork.api.v1.endpoints import settings as ep
     from cowork.services.settings import SettingService
@@ -527,8 +537,12 @@ def _custom_endpoint_only(**kw) -> UserSettings:
         ),
         pytest.param(lambda: _gemini_only(image_model=SUNBURST), SUNBURST, id="gemini-with-an-explicit-pick"),
         pytest.param(
-            lambda: _custom_endpoint_only(minds_api_key=SecretStr("mdb_test")), FLARE,
-            id="custom-endpoint-with-a-mindshub-key",
+            lambda: _custom_endpoint_only(minds_api_key=SecretStr("mdb_test"), minds_image_model_enabled=IMAGE_CATALOG),
+            FLARE, id="custom-endpoint-with-a-mindshub-key",
+        ),
+        pytest.param(
+            lambda: _custom_endpoint_only(minds_api_key=SecretStr("mdb_test")), None,
+            id="mindshub-key-before-image-models-are-published",
         ),
         pytest.param(
             lambda: _settings(
@@ -545,7 +559,21 @@ def _custom_endpoint_only(**kw) -> UserSettings:
             ),
             FLARE, id="one-role-on-openai",
         ),
-        pytest.param(lambda: _minds(), FLARE, id="mindshub-key"),
+        pytest.param(lambda: _minds(minds_image_model_enabled=IMAGE_CATALOG), FLARE, id="mindshub-key"),
+        pytest.param(
+            lambda: _minds(minds_role_defaults=json.dumps({"image": SUNBURST}), minds_image_model_enabled=IMAGE_CATALOG),
+            SUNBURST, id="mindshub-declared-default",
+        ),
+        pytest.param(lambda: _minds(), None, id="mindshub-before-image-models-are-published"),
+        pytest.param(lambda: _minds(image_model=SUNBURST), SUNBURST, id="mindshub-pick-before-publishing"),
+        pytest.param(
+            lambda: _settings(
+                planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+                router_provider=Provider.OPENAI, openai_api_key=SecretStr("sk-test"),
+                minds_api_key=SecretStr("mdb_test"),
+            ),
+            FLARE, id="openai-key-whatever-mindshub-lists",
+        ),
     ],
 )
 def test_the_image_model_is_handed_over_only_where_it_can_be_served(settings, handed):
@@ -556,8 +584,9 @@ def test_the_image_model_is_handed_over_only_where_it_can_be_served(settings, ha
     assert s.model_copy().image_model_for_agent == handed
 
 
-def test_org_mode_always_hands_the_image_model_over(org_mode):
-    assert UserSettings().image_model_for_agent == FLARE
+def test_org_mode_hands_the_image_model_over_once_mindshub_lists_one(org_mode):
+    assert UserSettings().image_model_for_agent is None
+    assert UserSettings(minds_image_model_enabled=IMAGE_CATALOG).image_model_for_agent == FLARE
 
 
 def test_a_stored_pick_counts_as_a_pick(session):

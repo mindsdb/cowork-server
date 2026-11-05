@@ -889,7 +889,9 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "imageModels": image_models,
         # What an unset `image_model` resolves to, from the same reload as the
         # gate below, so the picker's default is the model a turn would use.
-        "imageModelDefault": gate_settings._image_model_default(),
+        # Left out while MindsHub lists no image model (a gateway that has not
+        # published them yet), so the picker has nothing to show.
+        **({"imageModelDefault": gate_settings._image_model_default()} if image_models else {}),
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelDisabledReasons": model_disabled_reasons,

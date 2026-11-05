@@ -1405,21 +1405,24 @@ class UserSettings(Settings):
         endpoint only when it is given an image model, and the default here is a
         MindsHub/OpenAI id, so handing it to everyone would give a Gemini-key-only
         or self-hosted-endpoint user a tool that fails every call. So the model
-        goes over only where it can be served: when the user picked it, when
-        MindsHub is in play (a MindsHub key, org mode, or a role on minds-cloud),
-        or when a role runs on OpenAI's own API, which serves the default too.
+        goes over only where it can be served: when the user picked it, when a
+        role runs on OpenAI's own API, which serves the default, or when MindsHub
+        is in play (a MindsHub key, org mode, or a role on minds-cloud) and its
+        cached catalog lists an image model. Without that last condition a
+        MindsHub that has not published its image models yet (this release can
+        ship first) would be handed the compiled default it cannot serve.
         """
+        if not self._image_model_defaulted:
+            return self.resolved_image_model
         roles = {
             self.resolved_planning_provider,
             self.resolved_coding_provider,
             self.resolved_router_provider,
         }
-        if (
-            not self._image_model_defaulted
-            or self._has_key(Provider.MINDS_CLOUD)
-            or Provider.MINDS_CLOUD in roles
-            or Provider.OPENAI in roles
-        ):
+        if Provider.OPENAI in roles:
+            return self.resolved_image_model
+        mindshub = self._has_key(Provider.MINDS_CLOUD) or Provider.MINDS_CLOUD in roles
+        if mindshub and self._minds_image_enabled_map():
             return self.resolved_image_model
         return None
 

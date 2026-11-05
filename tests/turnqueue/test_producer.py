@@ -808,8 +808,10 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
     assert llm["api_key"] == "mdb_turnkey"
     assert llm["base_url"]
     assert llm["coding_model"]  # rides along so the pod's coding calls stay payable
-    # The user's image model rides along too; with no pick it is the catalog default.
-    assert llm["image_model"] == "gpt-image-2.6-flare"
+    # No image model rides along: nothing is picked and no cached catalog lists
+    # an image model yet (test_the_users_image_model_reaches_the_pod_... covers
+    # the block carrying one).
+    assert "image_model" not in llm
     # Only the internal shared secret authenticates the mint call; no
     # per-tenant credential is looked up or passed.
     assert "credential" not in captured
@@ -1383,7 +1385,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
     assert register.await_args.kwargs["turn_key_id"] == "mdb_gate"
     assert register.await_args.kwargs["correlation_id"] == "r"
     params = json.loads(fake.added[0][1]["payload"])["params"]
-    assert params["llm"] == {**block, "image_model": "gpt-image-2.6-flare"}
+    assert params["llm"] == block
     assert params["datasource"] == {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3}]}
 
 
@@ -1415,7 +1417,7 @@ async def test_a_listing_auth_cannot_answer_costs_the_turn_its_databases_not_the
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert "datasource" not in params
-    assert params["llm"] == {**block, "image_model": "gpt-image-2.6-flare"}
+    assert params["llm"] == block
     omitted = [(a, k) for a, k in warnings if "datasource" in str(a[0])]
     assert omitted and omitted[-1][1].get("exc_info") is True
 
@@ -1750,7 +1752,7 @@ async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kep
     monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
     monkeypatch.setattr(
         user_settings.UserSettings,
-        "resolved_image_model",
+        "image_model_for_agent",
         property(lambda self: "gpt-image-2.6-sunburst"),
     )
 
@@ -1767,3 +1769,22 @@ async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kep
         correlation_id="r", llm=block,
     )), timeout=5)
     assert json.loads(fake.added[0][1]["payload"])["params"]["llm"]["image_model"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_no_image_model_reaches_the_pod_before_mindshub_lists_one(monkeypatch):
+    """image_model_for_agent is None until the cached catalog lists an image model
+    (MindsHub can publish them after this release), and then the block has none."""
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
+    monkeypatch.setattr(user_settings.UserSettings, "image_model_for_agent", property(lambda self: None))
+
+    await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    )), timeout=5)
+
+    assert "image_model" not in json.loads(fake.added[0][1]["payload"])["params"]["llm"]
