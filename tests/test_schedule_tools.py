@@ -302,6 +302,28 @@ async def test_a_resume_card_shows_the_run_that_will_really_happen(hours_overdue
     assert schedule_tools.describe_start(overdue, "UTC") not in request.prompt
 
 
+async def test_a_confirmed_resume_reports_the_run_the_card_showed():
+    # The stored time stays in the past until the scheduler's next poll, so a
+    # result that echoed it would have the agent tell the user the next run
+    # already happened.
+    task = await _create_confirmed(cadence="daily")
+    card = _Card(CONFIRM)
+    await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "pause", "schedule_id": task["schedule_id"]})
+    overdue = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=3 * 24 + 1)
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        schedule.next_run_at = overdue
+        session.add(schedule)
+
+    result = await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "resume", "schedule_id": task["schedule_id"]})
+
+    assert datetime.fromisoformat(result["task"]["next_run_at"]) > datetime.now(timezone.utc)
+    assert result["task"]["catch_up"] == "The 4 runs it missed while paused are skipped."
+    assert schedule_tools.describe_start(
+        datetime.fromisoformat(result["task"]["next_run_at"]), "UTC"
+    ) in card.shown[-1].prompt
+
+
 async def test_an_unknown_task_is_reported_without_a_card():
     card = _Card(CONFIRM)
     result = await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "pause", "schedule_id": str(uuid4())})

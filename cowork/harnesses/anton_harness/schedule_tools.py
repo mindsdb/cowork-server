@@ -517,6 +517,10 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
         if not outcome:
             return _result("Nothing was deleted: the task was already gone.")
         return _result(f"Deleted “{preview['title']}”.")
+    if action == "resume":
+        # The stored time stays in the past until the scheduler's next poll;
+        # report the run the card promised instead.
+        _show_resume_catch_up(outcome)
     verb = {"create": "Scheduled", "update": "Updated", "pause": "Paused", "resume": "Resumed"}[action]
     return _result(f"{verb} “{outcome['title']}”. It's on the Scheduled Tasks page.", outcome)
 
