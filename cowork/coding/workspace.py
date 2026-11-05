@@ -63,6 +63,14 @@ class GitIdentityMissingError(WorkspaceError):
         self.detail = detail
 
 
+# A worktree is a Git checkout, so isolation needs a repository with a commit.
+# Tasks on other folders work in them directly.
+NOT_A_REPOSITORY = "This folder isn't a Git repository. Initialize Git to use a Worktree"
+NO_COMMITS = "This repository has no commits yet. Make a first commit to use a Worktree"
+# Review compares against a starting commit, so an in-place task without one
+# works in the folder but has nothing to compare to.
+NO_REVIEW_WITHOUT_GIT = "This folder isn't a Git repository, so the task's changes cannot be reviewed. Initialize Git to review them."
+NO_REVIEW_WITHOUT_COMMITS = "This repository has no commits yet, so the task's changes cannot be reviewed. Make a first commit to review them."
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024
@@ -261,34 +269,43 @@ class WorkspaceManager:
             ),
         )
 
-    def check_source(self, raw_path: str, allow_folder_copy: bool) -> None:
-        """Reject a task folder ``prepare`` would refuse, without its slower Git status work."""
-        path = self._resolve_existing(raw_path)
-        if path is None or not path.is_dir():
-            raise WorkspaceError("Choose an existing local folder")
-        if not allow_folder_copy and self._git_root(path) is None:
-            raise WorkspaceError("Local folder isolation was not enabled for this request")
-
-    def in_place_root(self, raw_path: str) -> Path:
-        """Return the repository an in-place task on ``raw_path`` works in.
-
-        Review compares an in-place task against the commit it started from,
-        so the folder must be in a Git repository that has one.
-        """
+    def check_source(self, raw_path: str) -> None:
+        """Reject a folder a worktree task cannot use, without the slower Git status work."""
         path = self._resolve_existing(raw_path)
         if path is None or not path.is_dir():
             raise WorkspaceError("Choose an existing local folder")
         root = self._git_root(path)
         if root is None:
-            raise WorkspaceError("Working in the original folder needs a Git repository; choose Worktree")
+            raise WorkspaceError(NOT_A_REPOSITORY)
         if self._head_revision(root) is None:
-            raise WorkspaceError("Working in the original folder needs a repository with a commit; choose Worktree")
-        return root
+            raise WorkspaceError(NO_COMMITS)
+
+    def in_place_root(self, raw_path: str) -> Path:
+        """Return the folder an in-place task on ``raw_path`` works in.
+
+        Inside a Git repository that is the repository, so review and the
+        one-task-per-folder check see all of it. Any other folder, including
+        one holding several repositories, is worked in as it is.
+        """
+        path = self._resolve_existing(raw_path)
+        if path is None or not path.is_dir():
+            raise WorkspaceError("Choose an existing local folder")
+        return self._git_root(path) or path
 
     def prepare_in_place(self, raw_path: str) -> PreparedWorkspace:
-        """Point a task at the user's repository itself; nothing is created."""
+        """Point a task at the user's folder itself; nothing is created."""
         root = self.in_place_root(raw_path)
         inspection = self.inspect(str(root))
+        if not inspection.is_git or not inspection.revision:
+            return PreparedWorkspace(
+                source_path=root,
+                workspace_path=root,
+                kind=WorkspaceKind.direct_folder,
+                repository_root=root if inspection.is_git else None,
+                base_revision=None,
+                source_dirty=False,
+                warning=NO_REVIEW_WITHOUT_COMMITS if inspection.is_git else NO_REVIEW_WITHOUT_GIT,
+            )
         return PreparedWorkspace(
             source_path=root,
             workspace_path=root,
@@ -307,20 +324,24 @@ class WorkspaceManager:
         self,
         session_id: str,
         raw_path: str,
-        allow_folder_copy: bool,
         base_branch: str | None = None,
         *,
         include_local_changes: bool = False,
+        copy_without_git: bool = False,
     ) -> PreparedWorkspace:
+        """Create an isolated worktree for a task.
+
+        ``copy_without_git`` keeps the old folder copy for Code Project tasks,
+        which cannot work in their folders yet.
+        """
         with self._mutation_lock:
             inspection = self.inspect(raw_path)
             if not inspection.exists or not inspection.is_directory:
                 raise WorkspaceError("Choose an existing local folder")
-            source = Path(inspection.path)
             if not inspection.is_git:
-                if not allow_folder_copy:
-                    raise WorkspaceError("Local folder isolation was not enabled for this request")
-                return self._prepare_local_copy(session_id, source)
+                if copy_without_git:
+                    return self._prepare_local_copy(session_id, Path(inspection.path))
+                raise WorkspaceError(NOT_A_REPOSITORY)
 
             repo = Path(inspection.repository_root or inspection.path)
             revision = inspection.revision
@@ -328,12 +349,11 @@ class WorkspaceManager:
                 revision = self.branch_revision(repo, base_branch)
                 if revision is None:
                     raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
-            # Git cannot create a detached worktree until the repository has a
-            # commit. Preserve the same isolation guarantee with the existing
-            # conflict-checkable folder-copy engine; no source mutation or
-            # synthetic commit is required.
+            # Git cannot create a worktree until the repository has a commit.
             if revision is None:
-                return self._prepare_local_copy(session_id, repo)
+                if copy_without_git:
+                    return self._prepare_local_copy(session_id, repo)
+                raise WorkspaceError(NO_COMMITS)
 
             worktree = self.worktrees_root / managed_key(session_id)
             if worktree.exists():

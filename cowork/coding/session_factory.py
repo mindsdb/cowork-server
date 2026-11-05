@@ -33,7 +33,7 @@ from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
 from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
-from cowork.coding.workspace import WorkspaceManager, _org_mode
+from cowork.coding.workspace import NO_REVIEW_WITHOUT_COMMITS, NO_REVIEW_WITHOUT_GIT, WorkspaceManager, _org_mode
 from cowork.coding.workspace_mode import resolve_workspace_mode
 from cowork.services.skills import CodeSkillService
 
@@ -276,7 +276,7 @@ class CodingSessionFactory:
             if project is None and workspace_mode == WorkspaceMode.in_place:
                 self.workspaces.in_place_root(request.path or "")
             elif project is None:
-                self.workspaces.check_source(request.path or "", request.allow_folder_copy)
+                self.workspaces.check_source(request.path or "")
             validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):
@@ -475,7 +475,7 @@ class CodingSessionFactory:
             prepared = (
                 self.workspaces.prepare_in_place(request.path or "")
                 if workspace_mode == WorkspaceMode.in_place
-                else self.workspaces.prepare(session_id, request.path or "", request.allow_folder_copy)
+                else self.workspaces.prepare(session_id, request.path or "")
             )
             workspace = TaskWorkspace(
                 folder_id="folder",
@@ -714,6 +714,8 @@ class CodingSessionFactory:
                 if session.source_dirty
                 else ""
             )
+            if not session.base_revision and len(session.workspaces) <= 1:
+                text += " " + (NO_REVIEW_WITHOUT_COMMITS if session.repository_root else NO_REVIEW_WITHOUT_GIT)
         elif count > 1:
             text = f"Created an isolated task workspace across {count} folders."
         else:

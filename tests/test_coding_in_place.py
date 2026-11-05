@@ -54,7 +54,7 @@ def head(repo: Path) -> str:
 def test_macos_and_linux_offer_in_place_for_a_folder_task(platform: str) -> None:
     modes = supported_workspace_modes(runs_locally=True, org_mode=False, platform=platform)
     assert WorkspaceMode.in_place in modes
-    assert resolve_workspace_mode(None, None, runs_locally=True, org_mode=False, platform=platform) == WorkspaceMode.worktree
+    assert resolve_workspace_mode(None, None, runs_locally=True, org_mode=False, platform=platform) == WorkspaceMode.in_place
 
 
 def test_windows_keeps_worktrees_until_its_sandbox_is_verified() -> None:
@@ -114,17 +114,26 @@ def test_a_subfolder_runs_in_its_repository(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("kind", ["plain", "empty-repo"])
-def test_a_folder_review_cannot_compare_against_is_refused_before_the_task_exists(tmp_path: Path, kind: str) -> None:
+def test_a_folder_without_a_commit_is_worked_in_place_without_review(tmp_path: Path, kind: str) -> None:
     folder = tmp_path / kind
     folder.mkdir()
     if kind == "empty-repo":
         git(folder, "init")
     service = service_with(tmp_path, FakeEngine())
 
-    with pytest.raises(WorkspaceError, match="choose Worktree"):
-        in_place(service, folder)
+    session = wait_for_workspace(service, in_place(service, folder).id)
+    assert session.workspace_kind == WorkspaceKind.direct_folder
+    assert Path(session.workspace_path) == folder.resolve()
+    assert session.base_revision is None
+    (folder / "made-by-agent.txt").write_text("new\n", encoding="utf-8")
+    assert service.diff(session.id) == []
 
-    assert service.list_sessions().items == []
+    # A worktree still needs Git with a commit, and nothing is copied instead.
+    with pytest.raises(WorkspaceError, match="Worktree"):
+        service.create_session(
+            SessionCreateRequest(path=str(folder), prompt="Isolate", workspace_mode=WorkspaceMode.worktree),
+            CREDS, "fake", "fake-model",
+        )
 
 
 def test_existing_changes_are_called_out_when_the_task_starts(tmp_path: Path) -> None:
@@ -152,7 +161,8 @@ def test_only_one_in_place_task_runs_in_a_repository_at_a_time(tmp_path: Path) -
             in_place(service, repo / ".", "Second")
         # A worktree task on the same repository runs alongside it.
         isolated = service.create_session(
-            SessionCreateRequest(path=str(repo), prompt="Isolated"), CREDS, "fake", "fake-model",
+            SessionCreateRequest(path=str(repo), prompt="Isolated", workspace_mode=WorkspaceMode.worktree),
+            CREDS, "fake", "fake-model",
         )
         assert isolated.workspace_mode == WorkspaceMode.worktree
     finally:

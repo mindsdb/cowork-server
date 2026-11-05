@@ -10,7 +10,6 @@ import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -47,6 +46,7 @@ from cowork.coding.contracts import (
     TaskCapabilities,
     WorkspaceKind,
     utc_now,
+    WorkspaceMode,
 )
 from cowork.api.v1.endpoints import coding
 from cowork.api.v1.endpoints.guards import require_local
@@ -1253,31 +1253,35 @@ def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_
     )
 
 
-def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None:
+def test_a_folder_without_git_is_worked_in_place_and_never_copied(tmp_path: Path) -> None:
     folder = tmp_path / "plain-folder"
     folder.mkdir()
     service = service_with(tmp_path, FakeEngine())
 
+    # Older clients still send the copy flag; it no longer makes a copy.
     created = service.create_session(
-        SessionCreateRequest(
-            path=str(folder),
-            prompt="Use the folder",
-            allow_folder_copy=True,
-        ),
+        SessionCreateRequest(path=str(folder), prompt="Use the folder", allow_folder_copy=True),
         CREDS,
         "fake",
         "fake-model",
     )
     created = wait_for_status(service, created.id, SessionStatus.completed)
 
+    assert created.workspace_mode == WorkspaceMode.in_place
+    assert created.workspace_kind == WorkspaceKind.direct_folder
+    assert created.workspace_path == str(folder.resolve())
     ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
-    assert ready.text == "Created an isolated task workspace."
-    assert ready.data["workspaceKind"] == "local_copy"
-    assert created.workspace_path != str(folder.resolve())
-    assert created.source_path == str(folder.resolve())
+    assert "Initialize Git to review them" in (ready.text or "")
+    with pytest.raises(WorkspaceError, match="Initialize Git to use a Worktree"):
+        service.create_session(
+            SessionCreateRequest(path=str(folder), prompt="Isolate it", workspace_mode=WorkspaceMode.worktree),
+            CREDS,
+            "fake",
+            "fake-model",
+        )
 
 
-def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -> None:
+def test_repository_without_commits_can_start_a_coding_session_in_place(tmp_path: Path) -> None:
     repo = tmp_path / "unborn-repo"
     repo.mkdir()
     git(repo, "init")
@@ -1292,9 +1296,9 @@ def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -
     )
     created = wait_for_status(service, created.id, SessionStatus.completed)
 
-    assert created.workspace_kind == WorkspaceKind.local_copy
-    assert created.workspace_path != str(repo.resolve())
-    assert Path(created.workspace_path, "README.md").read_text(encoding="utf-8") == "uncommitted source\n"
+    assert created.workspace_kind == WorkspaceKind.direct_folder
+    assert created.workspace_path == str(repo.resolve())
+    assert created.base_revision is None
 
 
 def test_git_mutation_cannot_race_a_new_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2220,10 +2224,10 @@ def test_tasks_inheriting_a_legacy_default_model_run_with_the_catalog_id(tmp_pat
         "gpt-5.6-sol",
     )
     from_settings = service.create_session(
-        SessionCreateRequest(path=str(repo), prompt="Use the settings default"), CREDS, "fake", "gpt-5.6-sol"
+        SessionCreateRequest(path=str(repo), prompt="Use the settings default", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "gpt-5.6-sol"
     )
     explicit = service.create_session(
-        SessionCreateRequest(path=str(repo), prompt="Use an unknown id", model="fable"), CREDS, "fake", "gpt"
+        SessionCreateRequest(path=str(repo), prompt="Use an unknown id", model="fable", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "gpt"
     )
 
     assert (from_project.model, from_settings.model, explicit.model) == ("gpt", "gpt", "fable")

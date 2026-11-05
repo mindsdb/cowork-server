@@ -9,11 +9,20 @@ from pathlib import Path
 
 from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status
 
-from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind
+from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
 from cowork.coding.workspace import UsageRoots
 from cowork.coding.workspace_usage import WorkspaceUsage, tree_bytes
 
+
+
+def copying_folders_as_before(service) -> None:
+    """Make the service copy folders without Git, as tasks created before copies stopped were."""
+    workspaces = service.workspaces
+    workspaces.check_source = lambda raw_path: None
+    workspaces.prepare = lambda session_id, raw_path, *args, **kwargs: workspaces._prepare_local_copy(
+        session_id, Path(raw_path).resolve()
+    )
 
 def write(path: Path, size: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,12 +190,13 @@ def test_preparing_a_task_invalidates_the_last_measurement(tmp_path: Path) -> No
     folder = tmp_path / "notes"
     write(folder / "big.bin", 300_000)
     service = service_with(tmp_path, FakeEngine())
+    copying_folders_as_before(service)
     service.workspace_usage.measure()
 
     wait_for_status(
         service,
         service.create_session(
-            SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+            SessionCreateRequest(path=str(folder), prompt="Go", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "fake-model",
         ).id,
         SessionStatus.completed,
     )
@@ -252,7 +262,7 @@ def test_the_service_reports_a_worktree_task_and_the_total(tmp_path: Path) -> No
     service = service_with(tmp_path, FakeEngine())
     session = wait_for_status(
         service,
-        service.create_session(SessionCreateRequest(path=str(repo), prompt="Go"), CREDS, "fake", "fake-model").id,
+        service.create_session(SessionCreateRequest(path=str(repo), workspace_mode=WorkspaceMode.worktree, prompt="Go"), CREDS, "fake", "fake-model").id,
         SessionStatus.completed,
     )
 
@@ -267,10 +277,11 @@ def test_a_deleted_folder_copy_keeps_counting_its_recovery_copy(tmp_path: Path) 
     folder = tmp_path / "notes"
     write(folder / "big.bin", 300_000)
     service = service_with(tmp_path, FakeEngine())
+    copying_folders_as_before(service)
     session = wait_for_status(
         service,
         service.create_session(
-            SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+            SessionCreateRequest(path=str(folder), prompt="Go", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "fake-model",
         ).id,
         SessionStatus.completed,
     )

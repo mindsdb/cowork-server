@@ -203,8 +203,9 @@ class ProjectWorkspaceManager:
                         if not inspection.revision and (setup.branch or not setup.include_local_changes):
                             raise WorkspaceError(f"{resource.name} has no commits. Make an initial commit, or leave the task branch blank and include local changes")
                     item = self.workspaces.prepare(
-                        key, folder.path, True, folder.base_branch,
+                        key, folder.path, folder.base_branch,
                         include_local_changes=include_local_changes,
+                        copy_without_git=True,
                     )
                     prepared.append(self._task_workspace(
                         session_id, project.name, folder, item, task_branch=setup.branch if setup else None,
