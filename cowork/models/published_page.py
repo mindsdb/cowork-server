@@ -3,6 +3,8 @@
 A record's owner never changes. Its source path follows only a folder move
 the server itself makes (published_page_ownership.rekey_published_page_paths).
 """
+from enum import StrEnum
+
 import sqlalchemy as sa
 from sqlmodel import Field
 
@@ -23,3 +25,14 @@ class PublishedPageOwner(BaseSQLModel, table=True):
     artifact_path: str = Field(sa_type=sa.Text)
     owner_user_id: str = Field(max_length=36)
     # No artifact FK or cascade: removing a source cannot release its live URL.
+
+
+class PageClaim(StrEnum):
+    """What an artifact's recorded page id is to the person acting on it."""
+
+    OWNED = "owned"
+    # No owner record names the page, as for one published before Cowork
+    # recorded owners on a stack whose projects were shared.
+    NO_OWNER_RECORD = "no_owner_record"
+    # The owner record names another artifact.
+    OTHER_ARTIFACT = "other_artifact"

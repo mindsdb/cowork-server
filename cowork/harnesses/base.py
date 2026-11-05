@@ -44,6 +44,8 @@ class ChannelContext:
 class HarnessProvider(Protocol):
     id: str
     label: str
+    # Called as formatter(stream, model, event_sink, form_blocks=...); the
+    # in-process UI turn passes form_blocks=True (format_responses_stream).
     formatter: AsyncIterator[str]
     # Whether this harness is offered in org (multi-tenant) deployments.
     # Defaults True for implementers that don't set it (see _harness_options).

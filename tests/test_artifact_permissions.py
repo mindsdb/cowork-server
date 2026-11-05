@@ -170,7 +170,7 @@ async def test_creator_can_open_the_workspace_of_a_project_root_artifact(
 
 
 from cowork.services import artifact_access
-from cowork.services.artifact_authorization_identity import ArtifactIdentity, _session as identity_session
+from cowork.services.artifact_authorization_identity import ArtifactIdentity, authorization_session as identity_session
 
 
 @pytest.fixture

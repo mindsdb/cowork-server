@@ -60,6 +60,32 @@ async def cancel_disconnected_run(handle: RunHandle | None) -> None:
         logger.exception("Could not cancel disconnected run %s", handle.run_id)
 
 
+async def stop_controller_turn(correlation_id: str, *, turn_id: str, reason: str) -> None:
+    """Write the sandbox controller's cancel flag for a turn this server is
+    ending without its user's Stop, so the sandbox turn stops too.
+
+    A failure is logged as a WARNING, never raised: the caller is already
+    ending the turn, and the cancel it is unwinding must not turn into a
+    Redis error. The line carries the correlation id as ``request_id``, as
+    the turn's other lines do, plus ``turn_id`` and why the turn is ending
+    (``reason``), as fields: the hosted log formatter drops a message's
+    arguments.
+    """
+    try:
+        await request_cancel(correlation_id)
+    except Exception:
+        logger.warning(
+            "Could not ask the sandbox controller to stop a turn; the sandbox turn may run on.",
+            exc_info=True,
+            extra={
+                "event": "controller_turn_stop_failed",
+                "request_id": correlation_id,
+                "turn_id": turn_id,
+                "reason": reason,
+            },
+        )
+
+
 async def watch_cancel(task: asyncio.Task, buffer: StreamBuffer, lifecycle: TurnLifecycle) -> None:
     """Let any replica cancel a direct/in-process producer using the worker flag protocol.
 

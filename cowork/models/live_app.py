@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlmodel import Field
@@ -138,3 +138,22 @@ class LiveAppCopy(BaseSQLModel, table=True):
     slug: str = Field(max_length=255)
     owner_email: str = Field(max_length=EMAIL_MAX_LENGTH)
     share_id: UUID
+
+
+class LiveAppAvailabilityWait(BaseSQLModel, table=True):
+    """One unresolved full-slot refusal per person, durable across reloads.
+
+    ``generation`` is also the eventual notice id. A new refusal after a
+    notice starts a new generation, so an older acknowledgement cannot clear
+    it. The admission lock serializes refusal, notification and launch.
+    """
+
+    __tablename__ = "live_app_availability_waits"
+    __table_args__ = (
+        sa.UniqueConstraint("partition_id", "user_id", name="uq_live_app_availability_person"),
+    )
+
+    partition_id: str = Field(max_length=36)
+    user_id: str = Field(max_length=36)
+    generation: UUID = Field(default_factory=uuid4)
+    notified: bool = False

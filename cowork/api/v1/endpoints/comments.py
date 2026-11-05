@@ -131,7 +131,7 @@ async def comments_stream(user_dir: str, report_id: str, request: Request, sessi
         # ``route is None`` is possible only in desktop's canonical namespace,
         # where the boundary helper always returns a UUID.
         assert local_report_id is not None
-        return local_comments_stream(local_report_id, scope=session.scope)
+        return await local_comments_stream(local_report_id, scope=session.scope)
     return await forward_comments_stream(request, route[0], route[1])
 
 
