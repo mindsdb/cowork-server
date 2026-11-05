@@ -110,7 +110,7 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
         def close(self):
             pass
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         event_sink("response.ask_user", _ask("ask:1"))
         yield "event: response.ask_user\ndata: {}\n\n"
         published.set()

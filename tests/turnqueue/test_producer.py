@@ -818,7 +818,7 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypatch):
-    """cowork's own workspace selector (hub_workspaces.py) stores the caller's
+    """cowork's own workspace selector (mindshub_workspaces.py) stores the caller's
     pick as UserSettings.hub_workspace_id; the mint must forward it so the
     key's spend lands in that workspace instead of always the org Default."""
     from types import SimpleNamespace

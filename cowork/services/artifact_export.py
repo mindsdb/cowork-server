@@ -17,7 +17,6 @@ import html
 import json
 import os
 import secrets
-import stat
 from collections.abc import AsyncIterator, Callable
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -53,6 +52,7 @@ from cowork.services.artifact_identity import (
 from cowork.services.artifact_inline import inline_artifact_html
 from cowork.services.artifacts import (
     ProjectArtifacts,
+    _is_single_named_file,
     _org_mode,
     _pick_primary,
     _pinned_directory_path,
@@ -253,7 +253,7 @@ def _exportable_primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...
     the route answers 422, as for any format the artifact doesn't offer.
     """
     parts = _primary_parts(folder=folder, metadata=metadata)
-    if parts is not None and not _single_link_file(folder.joinpath(*parts)):
+    if parts is not None and not _is_single_named_file(folder.joinpath(*parts)):
         return None
     return parts
 
@@ -265,14 +265,6 @@ def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
         source_name="/".join(parts or ()),
         is_backend=is_backend_type(metadata.get("type")),
     )
-
-
-def _single_link_file(path: Path) -> bool:
-    try:
-        found = path.lstat()
-    except OSError:
-        return False
-    return stat.S_ISREG(found.st_mode) and found.st_nlink == 1
 
 
 def card_export_source(card: dict) -> ExportSource:
@@ -292,7 +284,7 @@ def card_export_source(card: dict) -> ExportSource:
     if (
         relative.parts
         and not org_export_refused(org_mode=_org_mode())
-        and not _single_link_file(Path(str(card["path"])))
+        and not _is_single_named_file(Path(str(card["path"])))
     ):
         relative = Path()
     return ExportSource(

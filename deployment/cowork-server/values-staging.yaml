@@ -19,9 +19,9 @@ networkPolicy:
 
 deployment:
   # One uvicorn process per pod can use about one core, so cowork-server scales
-  # by replicas, not workers (see `image.args` in values.yaml). The HPA adds a
-  # pod when average CPU passes 70% of the 1-CPU request. The subchart's default
-  # 90% memory target applies too, as it does for auth.
+  # by replicas, not workers (see the `image` comment in values.yaml). The HPA
+  # adds a pod when average CPU passes 70% of the 1-CPU request. The subchart's
+  # default 90% memory target applies too, as it does for auth.
   #
   # The ceiling stays at 4 because each replica widens a race. Every replica runs
   # the scheduler, and `_due_schedules` in cowork/scheduler.py checks
@@ -49,6 +49,15 @@ deployment:
           - path: /api
             serviceName: cowork-server
             servicePort: 80
+
+  # Draft-preview host. values.yaml builds the draft Ingress and the
+  # COWORK_DRAFT_* variables from these two; ingress_secondary.enabled is not
+  # templated, so it is switched on here too. webOrigin is the primary host
+  # above, where the web app runs.
+  draftHost: draft-staging.mindshub.co
+  webOrigin: https://cowork.staging.mindshub.ai
+  ingress_secondary:
+    enabled: true
 
   extraEnvs:
 

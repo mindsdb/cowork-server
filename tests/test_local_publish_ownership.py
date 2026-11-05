@@ -17,6 +17,7 @@ from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 from cowork.api.v1.endpoints import publish as routes
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.db.session import get_engine
@@ -64,8 +65,12 @@ def publisher(personal_deployment, monkeypatch, tmp_path):
             target.write_text("<html><body>original</body></html>")
             return target
 
-        def send(self, page, scope=ALICE, **kwargs):
-            return publish.publish_artifact(page, artifacts_base=tmp_path, api_key="test-key", publish_url=endpoint, scope=scope, **kwargs)
+        def send(self, page, scope=ALICE, *, access=None, **kwargs):
+            """Publish ``page``, with ``access`` as anton's publisher names it."""
+            return publish.publish_artifact(
+                page, artifacts_base=tmp_path, api_key="test-key", publish_url=endpoint, scope=scope,
+                access=ArtifactAccessRequest.of_publisher(access) if access is not None else None, **kwargs,
+            )
 
         def remove(self, page, scope=ALICE):
             return asyncio.run(routes.unpublish_artifact(scope=scope, path=str(page)))
@@ -631,11 +636,11 @@ def test_an_unrecorded_page_is_logged_and_the_upload_runs_outside_a_transaction(
     old_url = "https://old-viewer.example/view/legacy-page/"
     publisher.plant(page, {"report_id": "legacy-page", "url": old_url, "published": True})
     sessions, in_transaction = [], []
-    checked = ownership.PublicationOwner.checked_report_id
+    claim = ownership.PublicationOwner.claim
 
     def capture(self, *args, **kwargs):
         sessions.append(self.session)
-        return checked(self, *args, **kwargs)
+        return claim(self, *args, **kwargs)
 
     upload = anton.publisher.publish
 
@@ -643,7 +648,7 @@ def test_an_unrecorded_page_is_logged_and_the_upload_runs_outside_a_transaction(
         in_transaction.append(sessions[-1].in_transaction())
         return upload(*args, **kwargs)
 
-    monkeypatch.setattr(ownership.PublicationOwner, "checked_report_id", capture)
+    monkeypatch.setattr(ownership.PublicationOwner, "claim", capture)
     monkeypatch.setattr(anton.publisher, "publish", watched_upload)
     with caplog.at_level(logging.WARNING, logger=ownership.logger.name):
         publisher.send(page)

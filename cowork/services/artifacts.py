@@ -43,7 +43,13 @@ from cowork.common.paths import (
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
+from cowork.models.artifact_owner_choice import AccessMode
+from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
+from anton.core.artifacts.internal_files import (
+    NON_CONTENT_NAMES,
+    REVISIONS_DIRNAME,
+    is_bytecode_name,
+)
 from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
@@ -212,6 +218,8 @@ TEXT_EXTENSIONS = {
     ".ts", ".tsx", ".css", ".log",
 }
 
+PREVIEW_TEXT_MAX = 200_000
+
 
 # ─── Helpers ──────────────────────────────────────────────────────
 
@@ -299,12 +307,10 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
     against these dirs, so a link to another person's folder would make it
     the caller's.
     """
-    from cowork.services.artifact_roots import _storage_components_are_safe
-
     dirs: dict[str, Path] = {}
     for project_dir in _registered_project_dirs(scope=scope):
-        if _storage_components_are_safe(project_dir, may_be_absent=False):
-            candidate = project_dir / ".anton" / "artifacts"
+        candidate = _real_artifacts_dir(project_dir)
+        if candidate is not None:
             dirs[str(candidate.resolve())] = candidate
     return list(dirs.values())
 
@@ -341,42 +347,10 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
     """All non-housekeeping files inside an artifact folder, paired with their
     mtime in nanoseconds, sorted by mtime desc.
 
-    One `os.scandir` pass: `DirEntry.is_file(follow_symlinks=False)` and
-    `DirEntry.stat(follow_symlinks=False)` are served from the entry the
-    kernel already returned, so each file is stat'd once instead of the
-    two-to-four times separate `rglob`/`is_file`/`is_symlink`/`stat` calls cost.
+    anton's `iter_content_files` decides what is content, so the card and
+    anton's own view of the artifact cannot disagree.
     """
-    out: list[tuple[Path, int]] = []
-
-    def _walk(start: Path, start_top: str | None) -> None:
-        # Explicit stack, not recursion: a folder deep enough to exhaust the
-        # call stack raises RecursionError, which is not an OSError and would
-        # otherwise escape every handler in the card builder above this.
-        stack: list[tuple[Path, str | None]] = [(start, start_top)]
-        while stack:
-            dir_path, top = stack.pop()
-            try:
-                with os.scandir(dir_path) as it:
-                    entries = list(it)
-            except OSError:
-                continue
-            for entry in entries:
-                entry_top = top if top is not None else entry.name
-                # First path component only: `static/prd.md` is content.
-                if entry_top in NON_CONTENT_NAMES:
-                    continue
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append((Path(entry.path), entry_top))
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
-                except OSError:
-                    continue
-                out.append((Path(entry.path), mtime_ns))
-
-    _walk(folder, None)
+    out = [(path, st.st_mtime_ns) for path, st in iter_content_files(folder)]
     out.sort(key=lambda item: item[1], reverse=True)
     return out
 
@@ -657,67 +631,89 @@ def _is_modified(
     return False
 
 
-def _published_access_for(
+def published_access_view(
     folder: Path,
     primary: Path | None,
     *,
     published_map: dict | None = None,
-) -> dict:
+) -> ArtifactAccessView:
     """Owner-side access state for the primary file, from `.published.json`.
 
-    Returns ``accessMode`` (public|password|restricted) plus the mode-specific
-    state needed to pre-fill the publish dialog on re-publish:
-    ``accessProtected``/``accessPassword`` (password) and
-    ``accessEmails``/``orgAllowed``/``ownerOnly`` (restricted). The plaintext password and
-    the email list are owner-only — `.published.json` never enters the
-    published bundle — so callers must only return this to the artifact's owner
-    (the local/authenticated session).
+    The mode (public|password|restricted) plus the mode-specific state needed
+    to pre-fill the publish dialog on re-publish: the password (password) and
+    who a restricted artifact is shared with. The plaintext password and the
+    email list are owner-only (`.published.json` never enters the published
+    bundle), so callers must only return this to the artifact's owner (the
+    local/authenticated session).
+
+    In MindsHub mode the entry doesn't say who a restricted artifact is
+    shared with: MindsHub's rule is the one record of it, which GET /access
+    reads (cowork.services.publish.stored_artifact_rule). So the audience
+    reads as unknown here (ArtifactAccessView.audience_unknown), even for an
+    entry written before that: a card never shows a copy that could have
+    gone stale or been planted, nor an empty audience it doesn't know. An
+    entry whose mode is none of the three reads as public, the mode anton's
+    publisher republishes it in.
     """
-    out = {
-        "accessMode": "public",
-        "accessProtected": False,
-        "accessPassword": "",
-        "accessEmails": [],
-        "orgAllowed": False,
-        "ownerOnly": False,
-        # Composite comments scope {user_dir}/{report_id} (Plan 5); "" when
-        # unpublished or published before the key was persisted.
-        "artifactKey": "",
-    }
     if primary is None:
-        return out
+        return ArtifactAccessView()
     try:
         pmap = published_map if published_map is not None else _load_published_map(folder)
         entry = pmap.get(primary.name)
         # A soft-deleted record (published=False) is no longer live, so it must
         # not report a password/restricted mode — that would draw a lock icon on
         # an artifact whose publishedUrl is empty. Legacy entries have no flag.
-        if isinstance(entry, dict) and entry.get("published", True):
-            # `mode` is authoritative; fall back to the legacy requires_password
-            # flag for artifacts published before the mode field existed.
-            mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
-            out["accessMode"] = mode
-            out["artifactKey"] = entry.get("artifact_key", "") or ""
-            if mode == "password":
-                out["accessProtected"] = True
-                out["accessPassword"] = entry.get("access_password", "") or ""
-            elif mode == "restricted":
-                out["accessEmails"] = entry.get("emails", []) or []
-                out["orgAllowed"] = bool(entry.get("org_allowed"))
-                out["ownerOnly"] = bool(entry.get("owner_only"))
+        if not (isinstance(entry, dict) and entry.get("published", True)):
+            return ArtifactAccessView()
+        # `mode` is authoritative; fall back to the legacy requires_password
+        # flag for artifacts published before the mode field existed.
+        recorded = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
+        mode = AccessMode(recorded) if recorded in set(AccessMode) else AccessMode.PUBLIC
+        artifact_key = entry.get("artifact_key", "") or ""
+        if mode is AccessMode.PASSWORD:
+            return ArtifactAccessView(
+                access_mode=mode,
+                artifact_key=artifact_key,
+                access_protected=True,
+                access_password=entry.get("access_password", "") or "",
+            )
+        if mode is AccessMode.RESTRICTED and _org_mode():
+            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key)
+        if mode is AccessMode.RESTRICTED:
+            return ArtifactAccessView(
+                access_mode=mode,
+                artifact_key=artifact_key,
+                access_emails=entry.get("emails", []) or [],
+                org_allowed=bool(entry.get("org_allowed")),
+                owner_only=bool(entry.get("owner_only")),
+            )
+        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key)
     except Exception:
-        pass
-    return out
+        return ArtifactAccessView()
 
 
-def _external_project_artifacts_base(
+def _published_access_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> dict:
+    """published_access_view, under the app's names, for the artifact card's
+    access fields."""
+    return published_access_view(folder, primary, published_map=published_map).model_dump(
+        by_alias=True, mode="json"
+    )
+
+
+def _external_project_dir(
     project_name: str, session: ScopedSession
 ) -> Path | None:
-    """The artifacts dir of an adopted-folder project, addressed by row name.
+    """The folder of an adopted-folder project, addressed by row name.
 
     Scoped read, so it cannot reach another tenant's project. Returns None for
-    every project the filesystem scan already resolves, leaving that path
-    untouched.
+    every project the filesystem scan resolves, and for a row whose folder is
+    gone: a row created before the projects root moved still looks adopted,
+    and its folder now lives under the new root, where the scan finds it.
     """
     from cowork.services.projects import ProjectService
 
@@ -725,28 +721,112 @@ def _external_project_artifacts_base(
     project = service.get_project_by_name_or_none(project_name)
     if project is None or not service.directory_is_external(project):
         return None
-    base = Path(project.path) / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    folder = Path(project.path)
+    # lstat, not is_dir: a dangling link at the folder's path is not a stale
+    # row, and neither is a folder lstat can't reach. Only a missing path
+    # hands the name to a folder in the projects root.
+    try:
+        folder.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    return folder
+
+
+def _real_artifacts_dir(project_dir: Path) -> Path | None:
+    """``project_dir``'s `.anton/artifacts`, or None when it's missing or
+    either folder is a link: the scan skips such a project too
+    (_scan_artifact_dirs), since a link to another person's folder would serve
+    their files as this project's."""
+    from cowork.services.artifact_roots import _storage_components_are_safe
+
+    if not _storage_components_are_safe(project_dir, may_be_absent=False):
+        return None
+    return project_dir / ".anton" / "artifacts"
+
+
+def _served_artifacts_dir(
+    project_dir: Path, *, project_name: str, session: ScopedSession
+) -> Path | None:
+    """_real_artifacts_dir for /serve, with one warning when a link in
+    `.anton` or `.anton/artifacts` is why it refuses: the route answers 404
+    then, as for a missing folder, and only this line tells the two apart."""
+    from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH
+    from cowork.services.projects import ProjectService
+
+    base = _real_artifacts_dir(project_dir)
+    # os.path.islink, not Path.is_symlink: it answers False when lstat
+    # fails, where is_symlink raises on EACCES.
+    if base is None and (
+        os.path.islink(project_dir / _ARTIFACTS_SUBPATH[0])
+        or os.path.islink(project_dir.joinpath(*_ARTIFACTS_SUBPATH))
+    ):
+        # The JSON log keeps only its listed fields, so the project goes in
+        # by id; a name in `extra` would never reach it.
+        project = ProjectService(session).get_project_by_name_or_none(project_name)
+        logger.warning(
+            "Refused a linked artifacts folder",
+            extra={
+                "event": "artifact_folder_refused",
+                "reason": "linked_folder",
+                "project_id": str(project.id) if project is not None else None,
+            },
+        )
+    return base
+
+
+def _is_single_named_file(path: Path) -> bool:
+    """A regular file, not a link, with no second name. A hard link in an
+    artifacts folder to a file outside it, such as the project's
+    `.anton/.env`, resolves inside the folder and passes every path check,
+    and the code sandbox lets a cell make one. A route that hands out a
+    file's content checks this; the drafts route refuses such a file the same
+    way (artifact_files._open_regular_file)."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def _is_the_projects_secrets(found: os.stat_result, *, anton_dir: Path) -> bool:
+    """Whether ``found`` is the project's `.anton/.env` under a second name: a
+    hard link a cell can make anywhere in its project, past the proxy's
+    refusal of `.anton/`. Matched by device and inode, so the project's other
+    hard-linked files, such as a package store's or a backup tool's, still
+    open."""
+    if found.st_nlink == 1:
+        return False
+    try:
+        saved = (anton_dir / ".env").lstat()
+    except OSError:
+        return False
+    return (found.st_dev, found.st_ino) == (saved.st_dev, saved.st_ino)
 
 
 def _project_artifacts_base(
     project_name: str, session: ScopedSession
 ) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
-    maps to a registered project of the session's scope. Returns None for
-    unknown projects or path-traversal attempts.
+    maps to a registered project of the session's scope and neither `.anton`
+    nor `.anton/artifacts` is a link. Returns None for unknown projects,
+    path-traversal attempts and linked folders.
 
     The scan below derives the directory as `<root>/<name>`, which is only true
     for a project the scan can see. A project pointed at a folder the user
-    chose is resolved from its row instead.
+    chose is resolved from its row instead. A row whose folder is gone, such
+    as one created before the projects root moved, is resolved by the scan.
     """
     if (not project_name or "\x00" in project_name
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
         return None
-    base = _external_project_artifacts_base(project_name, session)
-    if base is not None:
-        return base
+    external = _external_project_dir(project_name, session)
+    if external is not None:
+        # Final: the scan lists every folder in the projects root, so falling
+        # through would serve a same-named folder there instead.
+        return _served_artifacts_dir(external, project_name=project_name, session=session)
     # Compare canonical paths on both sides. On macOS, temporary and user
     # paths commonly cross aliases such as /var -> /private/var; comparing a
     # resolved candidate with raw registry entries incorrectly rejects a
@@ -764,8 +844,7 @@ def _project_artifacts_base(
         return None
     if candidate not in registered:
         return None
-    base = candidate / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    return _served_artifacts_dir(candidate, project_name=project_name, session=session)
 
 
 def serve_url_for(
@@ -804,7 +883,11 @@ def serve_url_for(
         rel_str = "/".join(quote(part) for part in rel.parts)
         return f"/api/v1/artifacts/serve/{quote(project_name)}/{rel_str}"
     for project_dir in _registered_project_dirs(scope=scope):
-        base = project_dir / ".anton" / "artifacts"
+        # The route's own rule (_project_artifacts_base): a URL for a linked
+        # folder would get only a 404.
+        base = _real_artifacts_dir(project_dir)
+        if base is None:
+            continue
         try:
             rel = p.relative_to(base.resolve())
         except (ValueError, OSError):
@@ -1400,9 +1483,9 @@ def _prepare_artifact_card(
         # Dropped at the single card builder so inline chat cards are covered
         # too: they call this function as well, and a filter applied only at the
         # list endpoint would still hand the plaintext password to the chat.
-        # Access in org mode is always restricted-to-org, so neither field has a
-        # consumer there. `accessMode` stays — ArtifactStatus draws its badge
-        # from it.
+        # In org mode the owner reads the password and the emails from GET
+        # .../access, which can tell owner from co-member, so the card carries
+        # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
         card.pop("accessPassword", None)
         card.pop("accessEmails", None)
     return _PreparedArtifactCard(
@@ -1550,16 +1633,7 @@ def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
         return None
 
 
-def _blank_artifact_status() -> dict:
-    """The stable response for an unknown or no-longer-readable artifact."""
-    return {
-        "publishedUrl": "", "modified": False, "accessMode": "public",
-        "accessProtected": False, "accessEmails": [], "orgAllowed": False,
-        "ownerOnly": False,
-    }
-
-
-def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> dict:
+def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Fresh owner-side status for an already resolved artifact path.
 
     The HTTP boundary resolves an untrusted request through
@@ -1572,9 +1646,8 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     subset only — the cheap read the viewer polls on window focus to light up
     the "Update" button when the artifact changes underneath an open preview.
     """
-    blank = _blank_artifact_status()
     if not isinstance(artifact, Path) or not artifact.is_absolute():
-        return dict(blank)
+        return ArtifactStatusView()
     # Fullstack artifacts keep their primary file in a `static/` subdir, so a
     # naive `artifact.parent` would land there instead of the artifact root
     # (where metadata.json + .published.json actually live) — climb via
@@ -1592,27 +1665,18 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     # One response shape for BOTH branches: explicitly the published /
     # modified / access subset, and NEVER `accessPassword` — that owner-only
     # plaintext (which `_published_access_for` and the card both carry) must
-    # not leave this endpoint.
-    return {
-        "publishedUrl": card.get("publishedUrl", ""),
-        "modified": bool(card.get("modified")),
-        "accessMode": card.get("accessMode", "public"),
-        "accessProtected": bool(card.get("accessProtected")),
-        "accessEmails": card.get("accessEmails", []),
-        "orgAllowed": bool(card.get("orgAllowed")),
-        "ownerOnly": bool(card.get("ownerOnly")),
-        "artifactKey": card.get("artifactKey", ""),
-    }
+    # not leave this endpoint. ArtifactStatusView has no field for it.
+    return ArtifactStatusView.of_card(card)
 
 
-def artifact_status(raw_path: str, *, scope: TenantScope | None) -> dict:
+def artifact_status(raw_path: str, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Compatibility wrapper accepting the historical raw path string."""
     try:
         artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     except Exception:
-        return _blank_artifact_status()
+        return ArtifactStatusView()
     if artifact is None:
-        return _blank_artifact_status()
+        return ArtifactStatusView()
     return artifact_status_for_resolved(artifact, scope=scope)
 
 
@@ -1717,19 +1781,75 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     return cards
 
 
+def _line_breaks(text: str, start: int, end: int, has_cr: bool) -> int:
+    # `\r\n` is one break; a bare `\n` or `\r` is one each.
+    breaks = text.count("\n", start, end)
+    if has_cr:
+        breaks += text.count("\r", start, end) - text.count("\r\n", start, end)
+    return breaks
+
+
+def count_csv_rows(text: str) -> int:
+    """Count CSV records, header included, by the rules of the renderer's countCsvRows.
+
+    The preview footer sits under a table the renderer parses, so both sides must
+    agree on every input, including a quote that opens a field only at its start
+    and a last record counted by the final character alone. The scan jumps from
+    quote to quote and counts line breaks with str.count, so the Python loop runs
+    once per quote rather than once per character.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    end = len(text)
+    # read_text already turns `\r\n` and `\r` into `\n`, so this usually saves
+    # two counts per segment.
+    has_cr = "\r" in text
+    rows = 0
+    pos = 0
+    while pos < end:
+        quote = text.find('"', pos)
+        if quote < 0:
+            rows += _line_breaks(text, pos, end, has_cr)
+            break
+        rows += _line_breaks(text, pos, quote, has_cr)
+        if quote and text[quote - 1] not in ",\n\r":
+            # A quote inside a field is literal.
+            pos = quote + 1
+            continue
+        # Skip the quoted field; `""` inside it is an escaped quote.
+        close = quote + 1
+        while True:
+            close = text.find('"', close)
+            if close < 0:
+                close = end
+                break
+            if text.startswith('"', close + 1):
+                close += 2
+                continue
+            break
+        pos = close + 1
+    if text and text[-1] not in "\n\r":
+        rows += 1
+    return rows
+
+
 def preview_artifact(path: Path) -> dict:
     suffix = path.suffix.lower()
     if suffix not in TEXT_EXTENSIONS:
         raise ValueError("Preview is available for text, Markdown, code, JSON, CSV, and HTML files")
     text = path.read_text(encoding="utf-8", errors="replace")
-    return {
+    preview = {
         "path": str(path),
         "title": path.name,
         "kind": KIND_BY_EXT.get(suffix, "File"),
         "mime": mimetypes.guess_type(str(path))[0] or "text/plain",
-        "content": text[:200_000],
-        "truncated": len(text) > 200_000,
+        "content": text[:PREVIEW_TEXT_MAX],
+        "truncated": len(text) > PREVIEW_TEXT_MAX,
     }
+    if suffix == ".csv" and preview["truncated"]:
+        # The client only sees the cut content, so the total has to come from here.
+        preview["total_rows"] = max(0, count_csv_rows(text) - 1)
+    return preview
 
 
 async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
@@ -1873,7 +1993,8 @@ _PUBLISHABLE_LIST_LIMIT = 40
 def is_non_content_path(path: Path, container: Path) -> bool:
     """True when `path` is not artifact content: its first component inside the
     artifact folder is in anton's `NON_CONTENT_NAMES` (`static/prd.md` is
-    content), or it lies in a revision journal at any depth.
+    content), it lies in a revision journal at any depth, or it is Python
+    bytecode at any depth inside the artifact folder.
 
     `container` is an artifacts dir whose direct children are artifact folders.
     A path outside it is not judged here and returns False.
@@ -1882,7 +2003,11 @@ def is_non_content_path(path: Path, container: Path) -> bool:
         parts = path.resolve().relative_to(container.resolve()).parts
     except (OSError, ValueError, RuntimeError):
         return False
-    return REVISIONS_DIRNAME in parts or (len(parts) > 1 and parts[1] in NON_CONTENT_NAMES)
+    return (
+        REVISIONS_DIRNAME in parts
+        or (len(parts) > 1 and parts[1] in NON_CONTENT_NAMES)
+        or any(is_bytecode_name(part) for part in parts[1:])
+    )
 
 
 class _PublishableCandidate(NamedTuple):

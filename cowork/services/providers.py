@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -15,12 +16,12 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
-from cowork.build_info import surface
+from cowork.build_info import supported_kwargs, surface
 from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
-from cowork.services.hub_workspaces import sweep_cache
+from cowork.services.mindshub_client import sweep_cache
 
 if TYPE_CHECKING:
     from cowork.common.settings.app_settings import OpenAICompatibleAPI
@@ -386,8 +387,8 @@ _minds_models_cache: OrderedDict[_ListingCacheKey, tuple[float, MindsModelListin
 def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
     """Cache ``listing`` under ``key``: expired entries go first, then any past the cap.
 
-    Swept on write, the one place the cache grows, with the hub workspace
-    caches' ``sweep_cache``. A departed caller's entry is never read or
+    Swept on write, the one place the cache grows, with the MindsHub client's
+    ``sweep_cache``. A departed caller's entry is never read or
     overwritten again, so nothing else would drop it.
     """
     sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S)
@@ -1517,6 +1518,18 @@ class WebToolKwargs(TypedDict, total=False):
 
     web_search_enabled: bool
     web_fetch_enabled: bool
+    # False: the agent answers from the connected data only (no web tools, no
+    # scratchpad web_search(), no internet guidance in its prompt).
+    internet_research_enabled: bool
+
+
+# anton's own setting names, so the CLI and a cowork-server read the same variables.
+_WEB_TOOL_ENV = {
+    "web_search_enabled": "ANTON_WEB_SEARCH_ENABLED",
+    "web_fetch_enabled": "ANTON_WEB_FETCH_ENABLED",
+    "internet_research_enabled": "ANTON_INTERNET_RESEARCH_ENABLED",
+}
+_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
@@ -1529,15 +1542,29 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     onto that flavor runs with both off. Every other session keeps anton's
     defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
     what its flavor provides.
+
+    ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
+    value in the server's env turn that tool off for every session this server
+    runs, and ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off;
+    they never turn anything on. Org turns run in a pod through
+    ``anton.cloud_turn``, which doesn't read this env. A field the installed
+    anton's ChatSessionConfig lacks is dropped (``supported_kwargs``): passing
+    it would fail every turn.
     """
+    from anton.core.session import ChatSessionConfig
     from cowork.common.settings.user_settings import Provider
 
     if (
         planning_provider is Provider.OPENAI_COMPATIBLE
         and openai_compatible_agent_api() == "responses"
     ):
-        return WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
-    return WebToolKwargs()
+        kwargs = WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
+    else:
+        kwargs = WebToolKwargs()
+    for field, env_name in _WEB_TOOL_ENV.items():
+        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
+            kwargs[field] = False
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **kwargs))
 
 
 def build_llm_client(
