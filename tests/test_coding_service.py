@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from coding_service_fakes import (
     CREDS,
+    copy_folders_without_git,
     FakeEngine,
     git,
     repository,
@@ -266,6 +267,7 @@ def test_remote_runtime_claims_a_portable_task_without_receiving_local_paths(tmp
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=code_project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -350,6 +352,7 @@ def test_compatibility_events_cannot_overwrite_a_remote_runtime_lifecycle(tmp_pa
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -466,6 +469,7 @@ def test_remote_cancel_is_deduplicated_per_turn_not_per_runtime_epoch(tmp_path: 
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="First turn",
@@ -538,6 +542,7 @@ def test_active_remote_task_must_stop_before_deletion(tmp_path: Path) -> None:
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Keep working",
@@ -612,6 +617,7 @@ def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_pa
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -710,6 +716,7 @@ def test_remote_run_state_is_projected_and_can_be_restored(tmp_path: Path) -> No
     ))
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             computer_id=remote.id,
             prompt="Build remotely",
@@ -763,7 +770,7 @@ def remote_task(tmp_path: Path, service, prompt: str = "Build remotely"):
         )],
     ))
     created = service.create_session(
-        SessionCreateRequest(project_id=project.id, computer_id=remote.id, prompt=prompt, engine_id="fake"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, computer_id=remote.id, prompt=prompt, engine_id="fake"),
         CREDS,
         "fake",
         "fake-model",
@@ -2218,7 +2225,7 @@ def test_tasks_inheriting_a_legacy_default_model_run_with_the_catalog_id(tmp_pat
     ))
 
     from_project = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Use the project default"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Use the project default"),
         CREDS,
         "fake",
         "gpt-5.6-sol",
@@ -2245,10 +2252,10 @@ def test_a_project_default_reasoning_effort_applies_unless_the_task_chooses_its_
     ))
 
     inherited = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Use the project default"), CREDS, "fake", "fake-model"
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Use the project default"), CREDS, "fake", "fake-model"
     )
     chosen = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Pick my own", reasoning_effort="xhigh"), CREDS, "fake", "fake-model"
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Pick my own", reasoning_effort="xhigh"), CREDS, "fake", "fake-model"
     )
 
     assert inherited.reasoning_effort == "low"
@@ -2277,16 +2284,16 @@ def test_effort_levels_follow_what_the_gateway_advertises_for_the_task_model(tmp
 
     with pytest.raises(ValueError, match='Reasoning effort "xhigh" isn\'t available for fake-model. It offers: low, high, max.'):
         service.create_session(
-            SessionCreateRequest(project_id=project.id, prompt="Ask for a level it lacks", reasoning_effort="xhigh"),
+            SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Ask for a level it lacks", reasoning_effort="xhigh"),
             CREDS, "fake", "fake-model", model_levels=levels,
         )
     assert service.list_sessions(False).items == []
 
     inherited = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Inherit max"), CREDS, "fake", "fake-model", model_levels=levels
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Inherit max"), CREDS, "fake", "fake-model", model_levels=levels
     )
     other_model = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="A model without max", model="fake-small"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="A model without max", model="fake-small"),
         CREDS, "fake", "fake-model", model_levels=levels,
     )
 
@@ -2309,7 +2316,7 @@ def test_failed_fork_preparation_does_not_leave_control_records(
         default_model="fake-model",
     ))
     parent = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare parent"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare parent"),
         CREDS,
         "fake",
         "fake-model",
@@ -2336,6 +2343,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     (notes / "plan.txt").write_text("base\n", encoding="utf-8")
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
+    copy_folders_without_git(service.workspaces)
     project = service.projects.create(
         ProjectCreateRequest(
             name="Product",
@@ -2348,7 +2356,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
         )
     )
     parent = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Build across both folders"),
         CREDS,
         "fake",
         "fake-model",
@@ -2391,7 +2399,7 @@ def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: P
         )
     )
     early = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Started before any checks existed"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Started before any checks existed"),
         CREDS,
         "fake",
         "fake-model",
@@ -2430,7 +2438,7 @@ def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: P
 
     # New tasks keep receiving the saved commands without any extra step.
     late = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Started after"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Started after"),
         CREDS,
         "fake",
         "fake-model",
@@ -2544,6 +2552,7 @@ def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path
     )
     parent = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             resource_ids=["app"],
             prompt="Work only on the app",
@@ -2589,6 +2598,7 @@ def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_avai
     (notes / "plan.txt").write_text("base\n", encoding="utf-8")
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
+    copy_folders_without_git(service.workspaces)
     project = service.projects.create(
         ProjectCreateRequest(
             name="Product",
@@ -2602,7 +2612,7 @@ def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_avai
     )
 
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build across both folders"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Build across both folders"),
         CREDS,
         "fake",
         "fake-model",
@@ -2631,7 +2641,7 @@ def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_pa
         )
     )
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare delivery"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare delivery"),
         CREDS,
         "fake",
         "fake-model",
@@ -2685,7 +2695,7 @@ def test_pull_request_actions_are_limited_to_deliveries_linked_to_the_task(tmp_p
         default_model="fake-model",
     ))
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare delivery"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare delivery"),
         CREDS,
         "fake",
         "fake-model",
@@ -2734,6 +2744,7 @@ def test_external_updates_are_limited_to_work_items_linked_to_the_task(tmp_path:
     ))
     task = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             prompt="Implement the issue",
             source_contexts=[SourceContext(
@@ -2812,7 +2823,7 @@ def test_project_delivery_can_publish_a_selected_repository_with_its_own_copy(tm
         default_model="fake-model",
     ))
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Prepare both repositories"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Prepare both repositories"),
         CREDS,
         "fake",
         "fake-model",
@@ -2907,7 +2918,7 @@ def test_failed_project_setup_is_visible_to_the_agent_without_stranding_the_task
     )
 
     task = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Recover and finish the feature"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Recover and finish the feature"),
         CREDS,
         "fake",
         "fake-model",
@@ -2927,6 +2938,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
     notes.mkdir()
     engine = FakeEngine()
     first = service_with(tmp_path, engine)
+    copy_folders_without_git(first.workspaces)
     project = first.projects.create(
         ProjectCreateRequest(
             name="Restart",
@@ -2939,7 +2951,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
         )
     )
     task = first.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="First turn"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="First turn"),
         CREDS,
         "fake",
         "fake-model",
@@ -2952,11 +2964,12 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
 
     restarted_engine = FakeEngine()
     restarted = service_with(tmp_path, restarted_engine)
+    copy_folders_without_git(restarted.workspaces)
     loaded = restarted.get_session(task.id)
     restarted.submit_turn(task.id, "Continue", CREDS)
     wait_for_status(restarted, task.id, SessionStatus.completed)
     next_task = restarted.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Parallel task"),
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Parallel task"),
         CREDS,
         "fake",
         "fake-model",

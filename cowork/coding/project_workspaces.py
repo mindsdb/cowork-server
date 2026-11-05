@@ -213,11 +213,13 @@ class ProjectWorkspaceManager:
                         inspection = inspect_repository_checkout(self.workspaces, Path(folder.path))
                         if not inspection.revision and (setup.branch or not setup.include_local_changes):
                             raise WorkspaceError(f"{resource.name} has no commits. Make an initial commit, or leave the task branch blank and include local changes")
-                    item = self.workspaces.prepare(
-                        key, folder.path, folder.base_branch,
-                        include_local_changes=include_local_changes,
-                        copy_without_git=True,
-                    )
+                    try:
+                        item = self.workspaces.prepare(
+                            key, folder.path, folder.base_branch,
+                            include_local_changes=include_local_changes,
+                        )
+                    except WorkspaceError as exc:
+                        raise WorkspaceError(f"{folder.name}: {exc}") from exc
                     prepared.append(self._task_workspace(
                         session_id, project.name, folder, item, task_branch=setup.branch if setup else None,
                     ))
@@ -231,6 +233,22 @@ class ProjectWorkspaceManager:
                         self.rollback_task_branch(workspace)
                 self.ports.release(session_id)
                 raise
+
+    def worktree_problem(self, project: CodeProject) -> str | None:
+        """Why a worktree task cannot use this project's folders, if it cannot.
+
+        A worktree needs each local folder to be a Git repository with a
+        commit; a repository without a checkout here is cloned instead.
+        """
+        for resource in project.resources:
+            if not isinstance(resource, LocalFolderResource):
+                continue
+            folder = resource_folder(resource)
+            try:
+                self.workspaces.check_source(folder.path)
+            except WorkspaceError as exc:
+                return f"{folder.name}: {exc}"
+        return None
 
     def in_place_roots(self, project: CodeProject) -> list[tuple[ProjectFolder, Path]]:
         """Each project folder and the repository an in-place task would work in.

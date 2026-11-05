@@ -302,6 +302,12 @@ class CodingSessionFactory:
                     workspace_mode = WorkspaceMode.worktree
             if workspace_mode != WorkspaceMode.in_place and project is None:
                 self.workspaces.check_source(request.path or "")
+            elif workspace_mode != WorkspaceMode.in_place and project is not None:
+                problem = self.project_workspaces.worktree_problem(
+                    self._selected_project(project, request.resource_ids)
+                )
+                if problem:
+                    raise WorkspaceError(problem)
             validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):

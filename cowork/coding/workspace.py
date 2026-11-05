@@ -341,20 +341,13 @@ class WorkspaceManager:
         base_branch: str | None = None,
         *,
         include_local_changes: bool = False,
-        copy_without_git: bool = False,
     ) -> PreparedWorkspace:
-        """Create an isolated worktree for a task.
-
-        ``copy_without_git`` keeps the old folder copy for Code Project tasks,
-        which cannot work in their folders yet.
-        """
+        """Create an isolated worktree for a task."""
         with self._mutation_lock:
             inspection = self.inspect(raw_path)
             if not inspection.exists or not inspection.is_directory:
                 raise WorkspaceError("Choose an existing local folder")
             if not inspection.is_git:
-                if copy_without_git:
-                    return self._prepare_local_copy(session_id, Path(inspection.path))
                 raise WorkspaceError(NOT_A_REPOSITORY)
 
             repo = Path(inspection.repository_root or inspection.path)
@@ -365,8 +358,6 @@ class WorkspaceManager:
                     raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
             # Git cannot create a worktree until the repository has a commit.
             if revision is None:
-                if copy_without_git:
-                    return self._prepare_local_copy(session_id, repo)
                 raise WorkspaceError(NO_COMMITS)
 
             worktree = self.worktrees_root / managed_key(session_id)

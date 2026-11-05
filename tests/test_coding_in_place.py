@@ -414,17 +414,6 @@ def test_in_place_project_tasks_are_refused_where_they_cannot_work(tmp_path: Pat
     with pytest.raises(ValueError, match="Branch choices"):
         start_project_task(service, project.id, repository_setup=TaskRepositorySetup(branch="feature/x"))
 
-    plain = tmp_path / "notes"
-    plain.mkdir()
-    mixed = service.projects.create(ProjectCreateRequest(
-        name="Mixed",
-        folders=[ProjectFolder(id="notes", name="Notes", path=str(plain))],
-        default_engine_id="fake",
-        default_model="fake-model",
-    ))
-    with pytest.raises(WorkspaceError, match="Notes: Working in the original folder needs a Git repository"):
-        start_project_task(service, mixed.id)
-
     remote = service.projects.create(ProjectCreateRequest(
         name="Remote",
         resources=[RepositoryResource(id="lib", name="lib", source_url="https://github.com/example/lib.git")],
@@ -436,7 +425,7 @@ def test_in_place_project_tasks_are_refused_where_they_cannot_work(tmp_path: Pat
     assert service.list_sessions().items == []
 
 
-def test_a_project_default_of_local_falls_back_where_it_cannot_apply(tmp_path: Path) -> None:
+def test_a_project_of_folders_without_git_works_in_place_and_cannot_use_a_worktree(tmp_path: Path) -> None:
     service = service_with(tmp_path, FakeEngine())
     plain = tmp_path / "notes"
     plain.mkdir()
@@ -446,29 +435,47 @@ def test_a_project_default_of_local_falls_back_where_it_cannot_apply(tmp_path: P
         folders=[ProjectFolder(id="notes", name="Notes", path=str(plain))],
         default_engine_id="fake",
         default_model="fake-model",
-        default_workspace_mode=WorkspaceMode.in_place,
     ))
 
     options = service.workspace_mode_options(notes.id, None)
-    assert options.supported == [WorkspaceMode.worktree]
-    assert options.default == WorkspaceMode.worktree
-    assert "needs a Git repository" in (options.in_place_unavailable_reason or "")
+    assert options.supported == [WorkspaceMode.in_place]
+    assert options.default == WorkspaceMode.in_place
+    assert "Notes: This folder isn't a Git repository" in (options.worktree_unavailable_reason or "")
     created = service.create_session(SessionCreateRequest(project_id=notes.id, prompt="Go"), CREDS, "fake", "fake-model")
     session = wait_for_status(service, created.id, SessionStatus.completed)
+    assert session.workspace_mode == WorkspaceMode.in_place
+    assert Path(session.workspaces[0].workspace_path) == plain.resolve()
+    with pytest.raises(WorkspaceError, match="Notes: This folder isn't a Git repository"):
+        service.create_session(
+            SessionCreateRequest(project_id=notes.id, prompt="Isolate", workspace_mode=WorkspaceMode.worktree),
+            CREDS, "fake", "fake-model",
+        )
+
+
+def test_a_project_default_of_local_falls_back_where_it_cannot_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    repo = repository(tmp_path)
+    project = service.projects.create(ProjectCreateRequest(
+        name="App",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+        default_workspace_mode=WorkspaceMode.in_place,
+    ))
+
+    def cannot_work_in_place(*_args, **_kwargs):
+        raise WorkspaceError("App has no checkout on this computer to work in; choose Worktree")
+
+    monkeypatch.setattr(service.session_factory.project_workspaces, "in_place_roots", cannot_work_in_place)
+    options = service.workspace_mode_options(project.id, None)
+    assert options.supported == [WorkspaceMode.worktree]
+    assert options.default == WorkspaceMode.worktree
+    assert "no checkout" in (options.in_place_unavailable_reason or "")
+    created = service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model")
+    session = wait_for_status(service, created.id, SessionStatus.completed)
     assert session.workspace_mode == WorkspaceMode.worktree
-    assert Path(session.workspaces[0].workspace_path) != plain.resolve()
-
-    # A branch choice needs a worktree, so the default gives way to it too.
-    shop, _, _ = two_repo_project(service, tmp_path, default_workspace_mode=WorkspaceMode.in_place)
-    assert service.workspace_mode_options(shop.id, None).default == WorkspaceMode.in_place
-    branched = service.create_session(
-        SessionCreateRequest(project_id=shop.id, prompt="Go", repository_setup=TaskRepositorySetup(branch="feature/x")),
-        CREDS,
-        "fake",
-        "fake-model",
-    )
-    assert wait_for_status(service, branched.id, SessionStatus.completed).workspace_mode == WorkspaceMode.worktree
-
 
 def test_a_project_task_and_a_folder_task_cannot_both_work_in_one_repository(tmp_path: Path) -> None:
     engine = FakeEngine()
