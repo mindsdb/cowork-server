@@ -213,6 +213,8 @@ TEXT_EXTENSIONS = {
     ".ts", ".tsx", ".css", ".log",
 }
 
+PREVIEW_TEXT_MAX = 200_000
+
 
 # ─── Helpers ──────────────────────────────────────────────────────
 
@@ -1806,19 +1808,75 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     return cards
 
 
+def _line_breaks(text: str, start: int, end: int, has_cr: bool) -> int:
+    # `\r\n` is one break; a bare `\n` or `\r` is one each.
+    breaks = text.count("\n", start, end)
+    if has_cr:
+        breaks += text.count("\r", start, end) - text.count("\r\n", start, end)
+    return breaks
+
+
+def count_csv_rows(text: str) -> int:
+    """Count CSV records, header included, by the rules of the renderer's countCsvRows.
+
+    The preview footer sits under a table the renderer parses, so both sides must
+    agree on every input, including a quote that opens a field only at its start
+    and a last record counted by the final character alone. The scan jumps from
+    quote to quote and counts line breaks with str.count, so the Python loop runs
+    once per quote rather than once per character.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    end = len(text)
+    # read_text already turns `\r\n` and `\r` into `\n`, so this usually saves
+    # two counts per segment.
+    has_cr = "\r" in text
+    rows = 0
+    pos = 0
+    while pos < end:
+        quote = text.find('"', pos)
+        if quote < 0:
+            rows += _line_breaks(text, pos, end, has_cr)
+            break
+        rows += _line_breaks(text, pos, quote, has_cr)
+        if quote and text[quote - 1] not in ",\n\r":
+            # A quote inside a field is literal.
+            pos = quote + 1
+            continue
+        # Skip the quoted field; `""` inside it is an escaped quote.
+        close = quote + 1
+        while True:
+            close = text.find('"', close)
+            if close < 0:
+                close = end
+                break
+            if text.startswith('"', close + 1):
+                close += 2
+                continue
+            break
+        pos = close + 1
+    if text and text[-1] not in "\n\r":
+        rows += 1
+    return rows
+
+
 def preview_artifact(path: Path) -> dict:
     suffix = path.suffix.lower()
     if suffix not in TEXT_EXTENSIONS:
         raise ValueError("Preview is available for text, Markdown, code, JSON, CSV, and HTML files")
     text = path.read_text(encoding="utf-8", errors="replace")
-    return {
+    preview = {
         "path": str(path),
         "title": path.name,
         "kind": KIND_BY_EXT.get(suffix, "File"),
         "mime": mimetypes.guess_type(str(path))[0] or "text/plain",
-        "content": text[:200_000],
-        "truncated": len(text) > 200_000,
+        "content": text[:PREVIEW_TEXT_MAX],
+        "truncated": len(text) > PREVIEW_TEXT_MAX,
     }
+    if suffix == ".csv" and preview["truncated"]:
+        # The client only sees the cut content, so the total has to come from here.
+        preview["total_rows"] = max(0, count_csv_rows(text) - 1)
+    return preview
 
 
 async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
