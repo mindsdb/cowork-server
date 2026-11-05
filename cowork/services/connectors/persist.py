@@ -362,6 +362,42 @@ def persist_connection(
         return slug
 
 
+_LABEL_FIELDS = ("label", "_label", "user_label", "_user_label")
+
+
+def connection_a_new_save_replaces(
+    connector_id: str,
+    method: str | None,
+    credentials: dict,
+    *,
+    vault,
+    spec_form: dict | None = None,
+) -> dict | None:
+    """The saved connection that an unnamed save of ``credentials`` would overwrite.
+
+    A connector named from its own fields (Roam's graph, Gmail's address) maps a
+    second token for the same account onto the same record, so persist_connection
+    replaces it in place. Returns ``{"name", "label"}`` for that record so the
+    caller can ask first, or None when the save would create a new connection.
+    Follows persist_connection's own naming so the two can't disagree.
+    """
+    cred = {k: v for k, v in credentials.items() if k not in _LABEL_FIELDS}
+    base_slug = derive_connection_name(connector_id, method, cred)
+    if not base_slug:
+        return None
+    payload = {**cred, "_connector_id": connector_id}
+    if method:
+        payload["_method"] = method
+    secure_keys = secure_keys_for(connector_id, method, payload, spec_form)
+    slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
+    record = vault.read_record(connector_id, slug)
+    if record is None:
+        return None
+    fields = record.get("fields") or {}
+    label = str(fields.get("_user_label") or fields.get("_label") or "").strip()
+    return {"name": slug, "label": label}
+
+
 def set_connection_label(engine: str, name: str, label: str, *, vault=None,
                          scope: "TenantScope | None" = None) -> str | None:
     """Set the human label on an existing connection in place. Returns the
