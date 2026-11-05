@@ -294,6 +294,71 @@ def test_a_field_the_cloud_form_no_longer_has_is_refused(org_client, relay):
     assert recorded == []
 
 
+@pytest.fixture()
+def mysql_org_client(monkeypatch, adapter_verified_datasources, forbid_local_paths) -> TestClient:
+    """Org mode with MySQL enabled and the adapters reported as verified."""
+    return _org_client(monkeypatch, '{"manifest_version": 1, "enabled": ["mysql:host-password"]}')
+
+
+def mysql_submission(**trust) -> dict:
+    """A MySQL cloud submission with the given trust fields added to its values."""
+    values = {
+        "host": "db.example.com",
+        "port": "3306",
+        "database": "appdb",
+        "username": "dbuser",
+        "password": PASSWORD,
+        **trust,
+    }
+    return submission(connector_id="mysql", method="host-password", values=values)
+
+
+@pytest.mark.parametrize(
+    ("trust", "stored"),
+    [
+        pytest.param({"tls_mode": "prefer"}, {"mode": "prefer", "ca_pem": None}, id="prefer"),
+        pytest.param({"tls_mode": "system"}, {"mode": "system", "ca_pem": None}, id="system"),
+        pytest.param(
+            {"tls_mode": "custom_ca", "ca_pem": CA_PEM}, {"mode": "custom_ca", "ca_pem": CA_PEM}, id="custom_ca"
+        ),
+    ],
+)
+def test_a_mysql_trust_choice_is_relayed_as_chosen(mysql_org_client, relay, trust, stored):
+    """MySQL's form chooses a mode, and a server signed by its own authority
+    gets in by pasting that authority, since the gateway sends a MySQL 8
+    password only to a server it verified."""
+    recorded, _ = relay
+
+    res = mysql_org_client.post(PATH, json=mysql_submission(**trust), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert json.loads(recorded[0].content)["tls"] == stored
+
+
+@pytest.mark.parametrize("mode", ["prefer", "system"])
+def test_a_ca_left_in_the_box_under_a_mode_that_reads_none_is_refused(mysql_org_client, relay, mode):
+    """The app sends the box only for `custom_ca`; this path forwards it, and a
+    row that names one trust while carrying another bundle is refused."""
+    recorded, _ = relay
+
+    res = mysql_org_client.post(PATH, json=mysql_submission(tls_mode=mode, ca_pem=CA_PEM), headers=AUTH_HEADERS)
+
+    assert res.status_code == 400
+    assert PASSWORD not in res.text
+    assert recorded == []
+
+
+def test_mysql_no_longer_takes_the_certificate_checkbox(mysql_org_client, relay):
+    """The checkbox left MySQL's form; PostgreSQL keeps it (tested above)."""
+    recorded, _ = relay
+
+    res = mysql_org_client.post(PATH, json=mysql_submission(tls_verify=True), headers=AUTH_HEADERS)
+
+    assert res.status_code == 400
+    assert res.json()["detail"]["code"] == "invalid_connection"
+    assert recorded == []
+
+
 def test_the_default_deployment_refuses_the_method_without_calling_auth(default_org_client, relay):
     recorded, _ = relay
 
