@@ -1730,3 +1730,39 @@ async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatc
         await asyncio.wait_for(_drain(prod.stream_remote_replies(
             conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
         )), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_gives_the_task_its_router_session_and_warms_it(monkeypatch, org_deployment):
+    """With the shared browser router (ENG-3188): the block names this task's
+    session and project, and the pod is warmed as the caller with the turn
+    key, without waiting for it."""
+    from cowork.common.settings import user_settings
+    from cowork.services import browser
+
+    router = "https://cowork.example.com/browser"
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+    settings = SimpleNamespace(
+        browser_enabled=True, browser_mode="mindshub", browser_url="",
+        resolved_planning_model="m", hub_workspace_id="",
+    )
+    monkeypatch.setattr(user_settings, "get_user_settings", lambda scope=None: settings)
+    monkeypatch.setattr(browser, "router_url", lambda: router)
+    warmed = []
+    monkeypatch.setattr(browser, "start_early", lambda s, bearer: warmed.append((s, bearer)) or True)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+        workspace=prod.RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/p"),
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["browser"] == {
+        "base_url": router,
+        "profile": browser.router_session("u1", "conv-1"),
+        "project": browser.project_key("u1", "proj-1"),
+    }
+    assert warmed == [(settings, "mdb_turnkey")]

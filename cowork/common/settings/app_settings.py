@@ -205,6 +205,28 @@ def _bare_origin(value: str) -> tuple[str, str] | None:
     return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
 
 
+_ROUTER_URL = re.compile(
+    r"(?P<scheme>https?)://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?"
+    r"(?P<path>(?:/[A-Za-z0-9._~-]+)*)/?",
+    re.IGNORECASE,
+)
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1"})
+
+
+def _router_url(value: str) -> str | None:
+    """``value`` as a browser router base URL without its trailing slash, or
+    None when it isn't one: https to any host, http only to loopback (it
+    carries callers' credentials), an optional plain path, and nothing else
+    (no query, fragment or userinfo, which the pattern can't match)."""
+    match = _ROUTER_URL.fullmatch(value.strip())
+    if match is None:
+        return None
+    scheme, host = match["scheme"].lower(), match["host"].lower().rstrip(".")
+    if scheme == "http" and host not in _LOOPBACK_HOSTS:
+        return None
+    return f"{scheme}://{host}{match['port'] or ''}{match['path']}"
+
+
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
 
@@ -1080,6 +1102,35 @@ class AppSettings(Settings):
             "refuses live apps with fewer than 32 characters."
         ),
     )
+
+    browser_router_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_ROUTER_URL"),
+        description=(
+            "The shared browser router (ENG-3188), for example "
+            "https://cowork.mindshub.ai/browser: served on the cowork host "
+            "under /browser, it starts one browser pod per user and routes "
+            "each caller to their own by the credential they present. When "
+            "set, the MindsHub browser mode uses it for status, warm-up and "
+            "viewer URLs (cowork.services.browser) instead of provisioning a "
+            "per-user instance. https with an optional path, or http to "
+            "loopback for local testing; the trailing slash is dropped. "
+            "Blank (default): the per-user instance path."
+        ),
+    )
+
+    @field_validator("browser_router_url", mode="before")
+    @classmethod
+    def _check_browser_router_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_ROUTER_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials), or http to localhost"
+            )
+        return normalized
 
     organization_switch_enabled: bool = Field(
         default=False,

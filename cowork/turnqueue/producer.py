@@ -699,11 +699,21 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # the wire. Filtering here as well as in ResponsesHandler keeps a future
     # caller from accidentally serializing private global memory into the job.
     from cowork.common.settings.user_settings import get_user_settings
-    from cowork.services.browser import turn_block
+    from cowork.services.browser import start_early, turn_block
 
     try:
-        # user_id picks the user's own profile on a shared standalone service.
-        browser_block = turn_block(get_user_settings(scope), scope.user_id)
+        # One session per task, and the project's saved tabs, both keyed on
+        # the user too (their own profiles on a shared standalone service).
+        browser_settings = get_user_settings(scope)
+        browser_block = turn_block(
+            browser_settings, scope.user_id, conversation_id,
+            workspace.project_id if workspace is not None else None,
+        )
+        if browser_block:
+            # With the shared router, start the user's pod now so it is up by
+            # the time the agent reaches for it. As the caller: the router
+            # takes the turn key and resolves it to them. Not awaited.
+            start_early(browser_settings, llm_block.get("api_key", ""))
     except Exception:
         # A turn must not fail over the browser; it just runs without one.
         logger.warning("[producer] could not resolve the browser block", exc_info=True)

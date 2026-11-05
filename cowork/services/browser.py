@@ -14,8 +14,21 @@ cowork at a browser service they run themselves (the same Node service with a
 static bearer token, `browser_service_url` + `browser_service_api_key`): there
 is nothing to provision, every call carries that key instead of the caller's
 MindsHub credential, and anton is handed the key in its turn block. The service
-is shared by the org, so each user gets their own profile on it
-(`standalone_profile`).
+is shared by the org, so each user gets their own profiles on it, one per task
+(`standalone_session`), all named under that user's own prefix.
+
+The shared browser router (ENG-3188) replaces the per-user instance in
+`mindshub` mode when `COWORK_BROWSER_ROUTER_URL` is set (`router_url`). It is
+one URL for everyone, on the cowork host under `/browser`: the router finds or
+starts the caller's own browser pod from the credential they present, so
+nothing is provisioned, nothing per user is stored (`browser_url` is left
+alone), and a session id can't reach anyone else's pod. Status, warm-up and
+viewer URLs go to it as the caller, like the instance calls do. Each task gets
+its own session (`router_session`), and its project a key for saved tabs
+(`project_key`); logins are per user on the pod and shared by every session.
+A turn that starts with the browser on warms the pod without waiting
+(`start_early`), so it is likely up by the time the agent reaches for it.
+Unset, the per-user instance path below is unchanged.
 """
 
 from __future__ import annotations
@@ -80,8 +93,23 @@ def instance_api_base() -> str:
     return "https://4nton.ai" if host == "https://api.mindshub.ai" else host
 
 
+def router_url() -> str:
+    """The shared browser router's base URL, or "" when this deployment has
+    none. Validated and stripped of its trailing slash by the app setting."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    return str(getattr(get_app_settings(), "browser_router_url", "") or "")
+
+
 def valid_endpoint(url: str) -> bool:
-    return bool(url) and _ENDPOINT.match(url.rstrip("/")) is not None
+    """A MindsHub browser endpoint anton may be handed and a viewer URL may
+    point under: a provisioned instance, or this deployment's router."""
+    if not url:
+        return False
+    router = router_url()
+    if router and url.rstrip("/") == router:
+        return True
+    return _ENDPOINT.match(url.rstrip("/")) is not None
 
 
 def browser_mode(user_settings: Any) -> str:
@@ -134,12 +162,53 @@ def standalone_profile(user_id: Optional[str]) -> str:
     return "u-" + hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:24]
 
 
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def router_session(user_id: Optional[str], conversation_id: str) -> str:
+    """The router session for one task: a context of its own on the user's
+    pod, so two tasks never share tabs. Hashed, so the pod never sees the ids;
+    the user id is in it so the name means nothing outside that user."""
+    return "t-" + _digest(f"{user_id or ''}:{conversation_id}")[:24]
+
+
+def project_key(user_id: Optional[str], project_id: Any) -> str:
+    """The opaque key a project's saved tabs live under, or "" without a project."""
+    if project_id is None or str(project_id) == "":
+        return ""
+    return "p-" + _digest(f"{user_id or ''}:{project_id}")[:24]
+
+
+def _standalone_prefix(user_id: Optional[str]) -> str:
+    return "u-" + _digest(str(user_id or ""))[:16] + "-"
+
+
+def standalone_session(user_id: Optional[str], conversation_id: str) -> str:
+    """One task's profile on a shared standalone service.
+
+    Unlike the router, the service's key opens every session on it, so the
+    name itself proves whose it is: the user's own prefix, then the task.
+    `embed_for` grants a viewer only for a session under the caller's prefix.
+    """
+    return _standalone_prefix(user_id) + _digest(str(conversation_id))[:16]
+
+
+def _owns_standalone_session(user_id: Optional[str], session_id: str) -> bool:
+    return session_id == standalone_profile(user_id) or (
+        session_id.startswith(_standalone_prefix(user_id))
+        and len(session_id) == len(_standalone_prefix(user_id)) + 16
+    )
+
+
 async def _call(
     method: str, url: str, bearer: str, *,
-    json: Optional[dict] = None, params: Optional[dict] = None, standalone: bool = False,
+    json: Optional[dict] = None, params: Optional[dict] = None, standalone: bool = False, quiet: bool = False,
 ) -> Any:
     # Messages name what failed: MindsHub, or the admin's own service. Never
     # the bearer, which in standalone mode is the service's shared key.
+    # `quiet` logs failures at debug: a warm-up nobody waits for.
+    log = logger.debug if quiet else logger.warning
     if not bearer:
         raise BrowserServiceError(401, _NOT_CONFIGURED if standalone else "Sign in to MindsHub to use the browser.")
 
@@ -152,7 +221,7 @@ async def _call(
     try:
         response = await asyncio.wait_for(_send(), _TIMEOUT_S)
     except Exception as exc:
-        logger.warning("browser %s %s failed: %r", method, url, exc)
+        log("browser %s %s failed: %r", method, url, exc)
         what = (
             f"The browser service at {_host(url)} did not answer" if standalone
             else f"MindsHub did not answer at {_host(url)}"
@@ -166,7 +235,7 @@ async def _call(
         raise BrowserServiceError(response.status_code, _message(response) or "MindsHub refused this request.")
     where = f"The browser service at {_host(url)}" if standalone else _host(url)
     if response.status_code >= 400:
-        logger.warning("browser %s %s returned HTTP %s: %s", method, url, response.status_code, response.text[:300])
+        log("browser %s %s returned HTTP %s: %s", method, url, response.status_code, response.text[:300])
         reason = _message(response) or "no reason given"
         raise BrowserServiceError(UPSTREAM_FAILED, f"{where} returned HTTP {response.status_code}: {reason}")
     try:
@@ -212,6 +281,76 @@ async def provision(bearer: str) -> dict:
     return view
 
 
+def _router_view(raw: Any, router: str) -> dict:
+    """The router's `/_status` or `/_warm` answer in `fetch_status`'s shape.
+
+    `starting` passes through as is: the renderer shows it while the pod
+    comes up. The endpoint is always the router, the one URL every caller
+    uses; whether this user's pod is up is what `status` says.
+    """
+    status = str(raw.get("status") or "none") if isinstance(raw, dict) else "none"
+    return {"provisioned": status != "none", "status": status, "endpoint": router}
+
+
+async def router_status(bearer: str, router: str) -> dict:
+    return _router_view(await _call("GET", f"{router}/_status", bearer), router)
+
+
+async def warm(bearer: str, router: str, *, quiet: bool = False) -> dict:
+    """Start or claim the caller's pod without waiting for it. Safe to repeat."""
+    return _router_view(await _call("POST", f"{router}/_warm", bearer, quiet=quiet), router)
+
+
+async def status_for(bearer: str) -> dict:
+    """The MindsHub mode's status: the router's when there is one, else the
+    caller's instance."""
+    router = router_url()
+    return await router_status(bearer, router) if router else await fetch_status(bearer)
+
+
+async def provision_for(bearer: str) -> dict:
+    """The MindsHub mode's provision: warm the router's pod, or create the
+    caller's instance."""
+    router = router_url()
+    return await warm(bearer, router) if router else await provision(bearer)
+
+
+#: Warm-ups in flight. asyncio keeps only a weak reference to a task, so one
+#: nobody holds can be collected before it runs.
+_WARMING: set[asyncio.Task] = set()
+
+
+async def _warm_quietly(bearer: str, router: str) -> None:
+    try:
+        await warm(bearer, router, quiet=True)
+    except Exception as exc:
+        # Only a head start: the router starts the pod on first use anyway.
+        logger.debug("browser warm-up failed: %r", exc)
+
+
+def start_early(user_settings: Any, bearer: Optional[str]) -> bool:
+    """Warm the caller's pod as a turn starts, without waiting or failing.
+
+    Only in MindsHub mode with a router, with the browser on and a credential
+    to warm it as; the router starts the pod on the agent's first call
+    anyway, this just takes the minute of startup off it. Needs a running
+    loop (every turn has one). True when a warm-up was started. Never raises.
+    """
+    try:
+        router = router_url()
+        if not (router and bearer and getattr(user_settings, "browser_enabled", False)):
+            return False
+        if browser_mode(user_settings) != MINDSHUB:
+            return False
+        task = asyncio.get_running_loop().create_task(_warm_quietly(bearer, router))
+    except Exception as exc:
+        logger.debug("browser warm-up not started: %r", exc)
+        return False
+    _WARMING.add(task)
+    task.add_done_callback(_WARMING.discard)
+    return True
+
+
 async def service_status(user_settings: Any) -> dict:
     """The standalone service's health, in the same shape as `fetch_status`.
 
@@ -239,7 +378,9 @@ async def embed(
     """A fresh viewer URL for one browser session, to put in an iframe.
 
     The worker mints it (`POST /_embed`, mindshub_services ENG-3295): a token
-    good for that session's viewer and event stream only, for an hour. A
+    good for that session's viewer and event stream only, for an hour. The
+    router answers the same route for the caller's pod, with a viewer URL
+    under the router itself (`valid_endpoint` accepts it). A
     standalone service serves the same route itself, with its API key as the
     bearer; its endpoint was checked by `standalone_service`, not
     `valid_endpoint`, which stays MindsHub-only.
@@ -259,52 +400,73 @@ async def embed(
 
 
 async def embed_for(user_settings: Any, bearer: str, user_id: Optional[str], session_id: Optional[str] = None) -> dict:
-    """`embed` for the configured mode: the caller's MindsHub instance with
-    their credential, or the standalone service with its key. The session
-    defaults to the user's profile, the one anton drives; on a standalone
-    service it can't be anything else."""
+    """`embed` for the configured mode: the router or the caller's MindsHub
+    instance with their credential, or the standalone service with its key.
+
+    The session defaults to the user's own profile. On a standalone service it
+    must be one of the caller's, by its prefix (`standalone_session`). The
+    router routes by the caller's credential to their own pod, so any
+    well-formed session id is passed through: it can only name their own."""
     if browser_mode(user_settings) == STANDALONE:
         service = standalone_service(user_settings)
         if service is None:
             raise BrowserServiceError(409, _NOT_CONFIGURED)
         url, key = service
-        profile = standalone_profile(user_id)
         # The service is shared and its key opens every session on it, so a
-        # caller only ever gets a viewer for their own profile, not one named
-        # in the request.
-        if session_id and session_id != profile:
+        # caller only ever gets a viewer for a session named as their own.
+        if session_id and not _owns_standalone_session(user_id, session_id):
             raise BrowserServiceError(403, "That browser session belongs to someone else.")
-        return await embed(key, url, profile, standalone=True)
-    return await embed(bearer, str(getattr(user_settings, "browser_url", "") or ""), session_id or PROFILE)
+        return await embed(key, url, session_id or standalone_profile(user_id), standalone=True)
+    endpoint = router_url() or str(getattr(user_settings, "browser_url", "") or "")
+    return await embed(bearer, endpoint, session_id or PROFILE)
 
 
-def turn_block(user_settings: Any, user_id: Optional[str] = None) -> Optional[dict]:
+def turn_block(
+    user_settings: Any, user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None, project_id: Any = None,
+) -> Optional[dict]:
     """Where the browser is, for one anton turn; None when it isn't on.
 
     The same shape anton's ``BrowserConfig.from_dict`` reads, both in-process
-    (desktop) and in a cloud pod's ``TurnRequestV1.browser``. In standalone
-    mode it carries the service's key as ``token`` (anton has no other way to
-    authenticate there) and the user's own profile; an anton that predates
-    ``token`` ignores it. Holds a secret then: never log the block.
+    (desktop) and in a cloud pod's ``TurnRequestV1.browser``. With the router,
+    the task's own session and the project's saved-tabs key (absent without a
+    project); anton reaches the router with its own MindsHub credential. In
+    standalone mode it carries the service's key as ``token`` (anton has no
+    other way to authenticate there) and the task's session under the user's
+    prefix; an anton that predates ``token`` or ``project`` ignores it. Holds
+    a secret then: never log the block. Without a conversation id, the user's
+    one profile, as before tasks had their own. The per-user instance keeps
+    its one profile either way.
     """
     if not getattr(user_settings, "browser_enabled", False):
         return None
+    project = project_key(user_id, project_id)
     if browser_mode(user_settings) == STANDALONE:
         service = standalone_service(user_settings)
         if service is None:
             return None
         url, key = service
-        return {"base_url": url, "profile": standalone_profile(user_id), "token": key}
+        if not conversation_id:
+            return {"base_url": url, "profile": standalone_profile(user_id), "token": key}
+        block = {"base_url": url, "profile": standalone_session(user_id, conversation_id), "token": key}
+        return {**block, "project": project} if project else block
+    router = router_url()
+    if router:
+        profile = router_session(user_id, conversation_id) if conversation_id else PROFILE
+        return {"base_url": router, "profile": profile, **({"project": project} if project else {})}
     endpoint = str(getattr(user_settings, "browser_url", "") or "").rstrip("/")
     if not valid_endpoint(endpoint):
         return None
     return {"base_url": endpoint, "profile": PROFILE}
 
 
-def anton_browser_config(user_settings: Any, user_id: Optional[str] = None):
+def anton_browser_config(
+    user_settings: Any, user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None, project_id: Any = None,
+):
     """`turn_block` as anton's BrowserConfig, or None when it's off or anton
     predates the browser tool (cowork-server and anton deploy independently)."""
-    block = turn_block(user_settings, user_id)
+    block = turn_block(user_settings, user_id, conversation_id, project_id)
     if block is None:
         return None
     try:

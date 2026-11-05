@@ -10,6 +10,12 @@ Replaces the compat stub that always answered ``{"available": false}``;
 In ``standalone`` browser mode the same routes talk to the org's own browser
 service with its API key instead: no MindsHub credential needed, nothing to
 provision, and ``mode`` in the answer says which one the renderer is showing.
+
+With the shared browser router (``COWORK_BROWSER_ROUTER_URL``, ENG-3188) the
+MindsHub mode's routes go to it instead of the per-user instance: status reads
+the caller's pod (``starting`` while it comes up), provision warms it, and the
+answer's ``endpoint`` is the router. Nothing is remembered in ``browser_url``
+then: the router is the same for everyone.
 """
 
 from __future__ import annotations
@@ -55,6 +61,9 @@ def _answer(view: dict, user) -> dict:
 
 
 def _remember_endpoint(session: Session, scope: TenantScope, endpoint: str) -> None:
+    # The router is deployment config, not where this user's instance is.
+    if browser_service.router_url():
+        return
     if endpoint and get_user_settings(scope).browser_url != endpoint:
         SettingService(session, scope).upsert_setting("browser_url", endpoint)
 
@@ -70,7 +79,7 @@ async def browse_status(request: Request, scope: ScopeDep, session: SessionDep) 
     try:
         if browser_service.browser_mode(user) == browser_service.STANDALONE:
             return _answer(await browser_service.service_status(user), user)
-        view = await browser_service.fetch_status(mindshub_credential(request))
+        view = await browser_service.status_for(mindshub_credential(request))
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
     _remember_endpoint(session, scope, view.get("endpoint", ""))
@@ -85,7 +94,7 @@ async def browse_provision(request: Request, scope: ScopeDep, session: SessionDe
             # Nothing to create on someone's own service, and `browser_url`
             # stays MindsHub's: answer as status does.
             return _answer(await browser_service.service_status(user), user)
-        view = await browser_service.provision(mindshub_credential(request))
+        view = await browser_service.provision_for(mindshub_credential(request))
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
     _remember_endpoint(session, scope, view.get("endpoint", ""))
