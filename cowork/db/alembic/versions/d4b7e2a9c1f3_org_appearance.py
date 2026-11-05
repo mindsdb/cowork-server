@@ -46,6 +46,7 @@ def upgrade() -> None:
         sa.Column("skin", sa.String(length=32), nullable=True),
         sa.Column("default_theme", sa.String(length=8), nullable=True),
         sa.Column("greeting", sa.String(length=200), nullable=True),
+        sa.Column("sidebar_title", sa.String(length=40), nullable=True),
         sa.Column("members_can_choose", sa.Boolean(), nullable=False),
         sa.Column("guidelines", sa.Text(), nullable=True),
         sa.PrimaryKeyConstraint("id"),

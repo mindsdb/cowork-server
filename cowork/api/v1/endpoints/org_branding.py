@@ -32,6 +32,7 @@ from cowork.services.org_branding import (
     appearance_row,
     appearance_view,
     fetch_auth_branding,
+    resolve_sidebar_title,
     save_appearance,
     sync_brand_skill,
 )
@@ -69,6 +70,8 @@ def _sync_skill(scoped: ScopedSession, images: AuthBranding, row: OrgAppearance 
 def _view(images: AuthBranding, row: OrgAppearance | None, principal: Principal | None) -> dict:
     return OrgBrandingView(
         enabled=True,
+        org_name=images.org_name if images.org_known else None,
+        sidebar_title=resolve_sidebar_title(row, images.org_name if images.org_known else None),
         icon_url=images.icon_url,
         logo_url=images.logo_url,
         logo_dark_url=images.logo_dark_url,

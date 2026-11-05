@@ -153,7 +153,8 @@ def test_outside_org_mode_branding_is_off(monkeypatch):
     finally:
         get_app_settings.cache_clear()
     assert out == {
-        "enabled": False, "iconUrl": None, "logoUrl": None, "logoDarkUrl": None,
+        "enabled": False, "orgName": None, "sidebarTitle": None,
+        "iconUrl": None, "logoUrl": None, "logoDarkUrl": None,
         "appearance": None, "canEdit": False,
     }
 
@@ -162,12 +163,15 @@ def test_a_member_reads_the_images_from_auth_and_the_stock_look(org):
     out = _get(org, ALICE)
     assert out == {
         "enabled": True,
+        "orgName": "Acme",
+        "sidebarTitle": "Acme",
         "iconUrl": BRANDING["icon_url"],
         "logoUrl": BRANDING["logo_url"],
         "logoDarkUrl": None,
         "appearance": {
             "accent": None, "background": None, "font": None, "radius": None, "skin": None,
-            "defaultTheme": None, "greeting": None, "membersCanChoose": True, "guidelines": None,
+            "defaultTheme": None, "greeting": None, "sidebarTitle": None,
+            "membersCanChoose": True, "guidelines": None,
         },
         "canEdit": False,
     }
@@ -203,14 +207,15 @@ def test_the_auth_read_is_cached_per_caller(org, monkeypatch):
 def test_an_admin_sets_the_look_and_a_partial_change_keeps_the_rest(org):
     out = _put(
         org, ADMIN, accent="#1A2B3C", background="#ffffff", font="mono", radius=10, skin="custom",
-        default_theme="light", greeting="Welcome to Acme", members_can_choose=False,
-        guidelines="Write in plain English.",
+        default_theme="light", greeting="Welcome to Acme", sidebar_title="Acme Assist",
+        members_can_choose=False, guidelines="Write in plain English.",
     )
     assert out["appearance"] == {
         "accent": "#1a2b3c", "background": "#ffffff", "font": "mono", "radius": 10, "skin": "custom",
-        "defaultTheme": "light", "greeting": "Welcome to Acme", "membersCanChoose": False,
-        "guidelines": "Write in plain English.",
+        "defaultTheme": "light", "greeting": "Welcome to Acme", "sidebarTitle": "Acme Assist",
+        "membersCanChoose": False, "guidelines": "Write in plain English.",
     }
+    assert out["sidebarTitle"] == "Acme Assist"
     out = _put(org, ADMIN, greeting=None, members_can_choose=None)
     assert out["appearance"]["accent"] == "#1a2b3c"
     assert out["appearance"]["greeting"] is None
@@ -235,6 +240,7 @@ def test_a_member_cannot_change_the_look(org):
         {"radius": 17},
         {"default_theme": "sepia"},
         {"greeting": "x" * 201},
+        {"sidebar_title": "x" * 41},
         {"guidelines": "x" * (GUIDELINES_MAX_CHARS + 1)},
     ],
 )
@@ -244,8 +250,39 @@ def test_values_the_app_cannot_apply_are_refused(body):
 
 
 def test_the_body_accepts_camel_case_too():
-    update = OrgAppearanceUpdate(defaultTheme="dark", membersCanChoose=False)
-    assert (update.default_theme, update.members_can_choose) == ("dark", False)
+    update = OrgAppearanceUpdate(defaultTheme="dark", membersCanChoose=False, sidebarTitle="Acme AI")
+    assert (update.default_theme, update.members_can_choose, update.sidebar_title) == (
+        "dark", False, "Acme AI",
+    )
+
+
+# ── the sidebar title ────────────────────────────────────────────────────────
+
+
+def test_the_sidebar_title_is_the_admins_then_a_short_org_name_then_mindshub(org):
+    assert _get(org, ALICE)["sidebarTitle"] == "Acme"
+    org.set_auth(current={**CURRENT_ORG, "display_name": "Acme Widgets International Holdings"})
+    out = _get(org, ALICE)
+    assert (out["orgName"], out["sidebarTitle"]) == ("Acme Widgets International Holdings", "MindsHub")
+    org.set_auth(current={**CURRENT_ORG, "display_name": "x" * 24})
+    assert _get(org, ALICE)["sidebarTitle"] == "x" * 24
+    _put(org, ADMIN, sidebar_title="Acme AI")
+    out = _get(org, ALICE)
+    assert (out["sidebarTitle"], out["appearance"]["sidebarTitle"]) == ("Acme AI", "Acme AI")
+    _put(org, ADMIN, sidebar_title="  ")
+    assert _get(org, ALICE)["appearance"]["sidebarTitle"] is None
+
+
+def test_an_unknown_org_name_falls_back_to_mindshub(org):
+    org.set_auth(current=None)
+    out = _get(org, ALICE)
+    assert (out["orgName"], out["sidebarTitle"], out["logoUrl"]) == (None, "MindsHub", BRANDING["logo_url"])
+
+
+def test_the_org_name_still_names_the_sidebar_when_the_images_are_unknown(org):
+    org.set_auth(branding=None)
+    out = _get(org, ALICE)
+    assert (out["orgName"], out["sidebarTitle"], out["logoUrl"]) == ("Acme", "Acme", None)
 
 
 # ── the Brand guidelines skill ───────────────────────────────────────────────
@@ -297,6 +334,13 @@ def test_the_skill_follows_the_look_and_stays_compact(org):
     _put(org, ADMIN, accent="#ff5500")
     text = _skill_md(org)
     assert "#ff5500" in text and "#0055ff" not in text
+
+
+def test_the_skill_names_the_admins_sidebar_title(org):
+    _put(org, ADMIN, accent="#0055ff", sidebar_title="Acme AI")
+    assert "appears as **Acme AI**" in _skill_md(org)
+    _put(org, ADMIN, sidebar_title=None)
+    assert "appears as" not in _skill_md(org)
 
 
 def test_long_guidelines_spill_into_a_file_beside_the_skill(org):

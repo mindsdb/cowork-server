@@ -76,6 +76,7 @@ _APPEARANCE_FIELDS = (
     "skin",
     "default_theme",
     "greeting",
+    "sidebar_title",
     "members_can_choose",
     "guidelines",
 )
@@ -121,6 +122,24 @@ def save_appearance(session: ScopedSession, update: OrgAppearanceUpdate) -> OrgA
         raise
     session.refresh(row)
     return row
+
+
+# The sidebar title with no admin's title and no org name short enough.
+DEFAULT_SIDEBAR_TITLE = "MindsHub"
+# The longest org name the sidebar shows as its title.
+SIDEBAR_ORG_NAME_MAX_CHARS = 24
+
+
+def resolve_sidebar_title(row: OrgAppearance | None, org_name: str | None) -> str:
+    """The title at the top of the app's sidebar: the admin's, else the org's
+    display name when it fits (SIDEBAR_ORG_NAME_MAX_CHARS), else
+    DEFAULT_SIDEBAR_TITLE, which is also the answer when auth couldn't name
+    the org."""
+    if row is not None and row.sidebar_title:
+        return row.sidebar_title
+    if org_name and len(org_name) <= SIDEBAR_ORG_NAME_MAX_CHARS:
+        return org_name
+    return DEFAULT_SIDEBAR_TITLE
 
 
 # ── the org's images, from auth ──────────────────────────────────────────────
@@ -183,17 +202,20 @@ async def fetch_auth_branding(*, bearer_token: str, org_id: str, user_id: str) -
         get_mindshub_reply(AUTH_CURRENT_ORG_PATH, bearer_token),
     )
     payload = branding_reply.payload
+    org_known = org_reply.answer is MindsHubAnswer.OK
+    org_name = _org_name(org_reply.payload) if org_known else None
     if branding_reply.answer is MindsHubAnswer.OK and isinstance(payload, dict):
         value = AuthBranding(
             icon_url=_absolute_url(payload.get("icon_url")),
             logo_url=_absolute_url(payload.get("logo_url")),
             logo_dark_url=_absolute_url(payload.get("logo_dark_url")),
-            org_name=_org_name(org_reply.payload),
+            org_name=org_name,
             reachable=True,
-            org_known=org_reply.answer is MindsHubAnswer.OK,
+            org_known=org_known,
         )
     else:
-        value = AuthBranding()
+        # The org's name still counts for the sidebar title.
+        value = AuthBranding(org_name=org_name, org_known=org_known)
     _branding_cache.put(key, value)
     return value
 
@@ -238,7 +260,7 @@ def _text_on(color: str) -> str:
 def has_brand_content(images: AuthBranding, row: OrgAppearance | None) -> bool:
     """Whether the org has anything the skill can teach: an image, a color,
     a font, a radius, a light/dark default or the admin's guidelines. The
-    app-only fields (skin, greeting, members_can_choose) alone don't make a
+    app-only fields (skin, greeting, sidebar_title, members_can_choose) alone don't make a
     skill."""
     if images.icon_url or images.logo_url or images.logo_dark_url:
         return True
@@ -287,6 +309,13 @@ def render_brand_skill(images: AuthBranding, row: OrgAppearance | None) -> tuple
         "reports, HTML pages and apps, dashboards and charts. Plain chat answers don't need it. "
         "The user's explicit instructions in the conversation win over these.",
     ]
+    title = row.sidebar_title if row else None
+    if title and title != images.org_name:
+        lines += [
+            "",
+            f"In {owner} workspace the assistant appears as **{title}**: use that name when "
+            "branded output refers to the assistant or the workspace.",
+        ]
 
     if logo or logo_dark or icon:
         lines += ["", "## Logo and icon", ""]

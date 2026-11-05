@@ -32,6 +32,9 @@ class OrgAppearance(BaseSQLModel, table=True):
     skin: str | None = Field(default=None, max_length=32, description="One of the app's skin keys")
     default_theme: str | None = Field(default=None, max_length=8, description="'light' or 'dark'")
     greeting: str | None = Field(default=None, max_length=200, description="The new-chat greeting")
+    sidebar_title: str | None = Field(
+        default=None, max_length=40, description="The title at the top of the app's sidebar"
+    )
     members_can_choose: bool = Field(
         default=True, description="False: every member gets the org's look"
     )

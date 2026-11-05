@@ -27,6 +27,7 @@ APP_SKINS: tuple[str, ...] = ("normal", "8bit", "custom")
 RADIUS_MIN = 0
 RADIUS_MAX = 16
 GREETING_MAX_CHARS = 200
+SIDEBAR_TITLE_MAX_CHARS = 40
 GUIDELINES_MAX_CHARS = 8000
 
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -42,6 +43,9 @@ class OrgAppearanceView(CamelResponse):
     skin: str | None = None
     default_theme: Literal["light", "dark"] | None = None
     greeting: str | None = None
+    # The title an admin set, or null; OrgBrandingView.sidebar_title is the
+    # one to show.
+    sidebar_title: str | None = None
     members_can_choose: bool | None = None
     guidelines: str | None = None
 
@@ -50,9 +54,14 @@ class OrgBrandingView(CamelResponse):
     """What every member's app reads on startup, org switch, sign-in and
     when Settings opens. Outside hosted org mode ``enabled`` is false and the
     rest is null. The image URLs are auth's (absolute, with ``?v=<hash>``),
-    null when unset or when auth couldn't be asked."""
+    null when unset or when auth couldn't be asked. ``sidebar_title`` is the
+    title to show: the admin's, else the org's name when it is short enough,
+    else the product's (cowork.services.org_branding.resolve_sidebar_title).
+    ``org_name`` is the org's display name from auth, null when unknown."""
 
     enabled: bool = False
+    org_name: str | None = None
+    sidebar_title: str | None = None
     icon_url: str | None = None
     logo_url: str | None = None
     logo_dark_url: str | None = None
@@ -78,6 +87,7 @@ class OrgAppearanceUpdate(CamelRequest):
     skin: str | None = None
     default_theme: Literal["light", "dark"] | None = None
     greeting: str | None = Field(default=None, max_length=GREETING_MAX_CHARS)
+    sidebar_title: str | None = Field(default=None, max_length=SIDEBAR_TITLE_MAX_CHARS)
     members_can_choose: bool | None = None
     guidelines: str | None = Field(default=None, max_length=GUIDELINES_MAX_CHARS)
 
@@ -112,7 +122,7 @@ class OrgAppearanceUpdate(CamelRequest):
     def _theme(cls, value: object) -> object:
         return _blank_to_none(value)
 
-    @field_validator("greeting", "guidelines", mode="before")
+    @field_validator("greeting", "sidebar_title", "guidelines", mode="before")
     @classmethod
     def _text(cls, value: object) -> object:
         return _blank_to_none(value)
