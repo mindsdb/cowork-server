@@ -363,14 +363,148 @@ DESKTOP_FIELDS = {
     },
 }
 
+# Managed services that are PostgreSQL or MySQL underneath: the one method
+# whose cloud form is saved and run as the engine it names.
+CLOUD_SERVICE_METHODS = {
+    "aws_aurora_postgres": ("direct-connection", "postgres:host-port"),
+    "aws_rds_postgres": ("connection-string", "postgres:host-port"),
+    "azure_postgres": ("connection-string", "postgres:host-port"),
+    "gcp_cloudsql_postgres": ("direct-connection", "postgres:host-port"),
+    "heroku_postgres": ("manual-credentials", "postgres:host-port"),
+    "neon": ("individual-credentials", "postgres:host-port"),
+    "aws_rds_mysql": ("direct-connection", "mysql:host-password"),
+    "azure_mysql": ("connection-string", "mysql:host-password"),
+    "gcp_cloudsql_mysql": ("direct-connection", "mysql:host-password"),
+    "supabase": ("individual-credentials", "postgres:host-port"),
+}
+
+# Their desktop fields, pinned before the cloud blocks existed.
+SERVICE_DESKTOP_FIELDS = {"aws_aurora_postgres": {"direct-connection": [("host", "text", True, False, None),
+                                               ("port", "text", True, False, "5432"),
+                                               ("database", "text", True, False, None),
+                                               ("username", "text", True, False, None),
+                                               ("password", "password", True, True, None),
+                                               ("ssl_enabled", "boolean", False, False, "true"),
+                                               ("endpoint_type", "select", False, False, "writer")],
+                         "iam-auth": [("host", "text", True, False, None),
+                                      ("port", "text", True, False, "5432"),
+                                      ("database", "text", True, False, None),
+                                      ("db_username", "text", True, False, None),
+                                      ("aws_access_key_id", "text", True, False, None),
+                                      ("aws_secret_access_key", "password", True, True, None),
+                                      ("aws_region", "text", True, False, None),
+                                      ("ssl_enabled", "boolean", False, False, "true")]},
+ "aws_rds_postgres": {"connection-string": [("host", "text", True, False, None),
+                                            ("port", "text", True, False, "5432"),
+                                            ("database", "text", True, False, None),
+                                            ("username", "text", True, False, None),
+                                            ("password", "password", True, True, None),
+                                            ("ssl_enabled", "boolean", False, False, "true")],
+                      "iam-auth": [("host", "text", True, False, None),
+                                   ("port", "text", True, False, "5432"),
+                                   ("database", "text", True, False, None),
+                                   ("db_username", "text", True, False, None),
+                                   ("aws_region", "text", True, False, None),
+                                   ("aws_access_key_id", "text", True, False, None),
+                                   ("aws_secret_access_key", "password", True, True, None)]},
+ "azure_postgres": {"connection-string": [("host", "text", True, False, None),
+                                          ("port", "text", True, False, "5432"),
+                                          ("database", "text", True, False, None),
+                                          ("username", "text", True, False, None),
+                                          ("password", "password", True, True, None),
+                                          ("ssl_mode", "select", True, False, "require")]},
+ "gcp_cloudsql_postgres": {"direct-connection": [("host", "text", True, False, None),
+                                                 ("port", "text", True, False, "5432"),
+                                                 ("database", "text", True, False, None),
+                                                 ("username", "text", True, False, None),
+                                                 ("password", "password", True, True, None),
+                                                 ("ssl_enabled", "boolean", False, False, "true")],
+                           "auth-proxy": [("host", "text", True, False, "127.0.0.1"),
+                                          ("port", "text", True, False, "5432"),
+                                          ("database", "text", True, False, None),
+                                          ("username", "text", True, False, None),
+                                          ("password", "password", True, True, None),
+                                          ("ssl_enabled", "boolean", False, False, "false")],
+                           "private-ip": [("host", "text", True, False, None),
+                                          ("port", "text", True, False, "5432"),
+                                          ("database", "text", True, False, None),
+                                          ("username", "text", True, False, None),
+                                          ("password", "password", True, True, None),
+                                          ("ssl_enabled", "boolean", False, False, "true")]},
+ "heroku_postgres": {"database-url": [("database_url", "password", True, True, None),
+                                      ("ssl_mode", "select", True, False, "require")],
+                     "manual-credentials": [("host", "text", True, False, None),
+                                            ("port", "text", True, False, "5432"),
+                                            ("database", "text", True, False, None),
+                                            ("username", "text", True, False, None),
+                                            ("password", "password", True, True, None),
+                                            ("ssl_mode", "select", True, False, "require")]},
+ "neon": {"connection-string": [("connection_string", "password", True, True, None)],
+          "individual-credentials": [("host", "text", True, False, None),
+                                     ("port", "text", True, False, "5432"),
+                                     ("database", "text", True, False, None),
+                                     ("username", "text", True, False, None),
+                                     ("password", "password", True, True, None),
+                                     ("ssl", "boolean", False, False, "true")]},
+ "aws_rds_mysql": {"direct-connection": [("host", "text", True, False, None),
+                                         ("port", "text", True, False, "3306"),
+                                         ("database", "text", True, False, None),
+                                         ("username", "text", True, False, None),
+                                         ("password", "password", True, True, None),
+                                         ("use_ssl", "boolean", False, False, "true")],
+                   "iam-auth": [("host", "text", True, False, None),
+                                ("port", "text", True, False, "3306"),
+                                ("database", "text", True, False, None),
+                                ("db_username", "text", True, False, None),
+                                ("aws_access_key_id", "text", True, False, None),
+                                ("aws_secret_access_key", "password", True, True, None),
+                                ("aws_region", "text", True, False, None)]},
+ "azure_mysql": {"connection-string": [("host", "url", True, False, None),
+                                       ("port", "text", False, False, "3306"),
+                                       ("database", "text", True, False, None),
+                                       ("username", "text", True, False, None),
+                                       ("password", "password", True, True, None),
+                                       ("ssl_enabled", "boolean", False, False, "true")]},
+ "gcp_cloudsql_mysql": {"direct-connection": [("host", "text", True, False, None),
+                                              ("port", "text", True, False, "3306"),
+                                              ("database", "text", True, False, None),
+                                              ("username", "text", True, False, None),
+                                              ("password", "password", True, True, None),
+                                              ("use_ssl", "boolean", False, False, "true"),
+                                              ("ssl_ca_cert", "textarea", False, False, None)],
+                        "cloud-sql-auth-proxy": [("host", "text", True, False, "127.0.0.1"),
+                                                 ("port", "text", True, False, "3306"),
+                                                 ("database", "text", True, False, None),
+                                                 ("username", "text", True, False, None),
+                                                 ("password", "password", True, True, None),
+                                                 ("service_account_json",
+                                                  "textarea",
+                                                  False,
+                                                  True,
+                                                  None)]}}
+
+
+SERVICE_DESKTOP_FIELDS["supabase"] = {"browser_oauth_builtin": [],
+ "connection-string": [("connection_string", "password", True, True, None)],
+ "individual-credentials": [("host", "text", True, False, None),
+                            ("port", "text", True, False, "5432"),
+                            ("database", "text", True, False, "postgres"),
+                            ("user", "text", True, False, "postgres"),
+                            ("password", "password", True, True, None),
+                            ("ssl_mode", "select", False, False, "require")],
+ "service-role-api-key": [("project_url", "url", True, False, None),
+                          ("service_role_key", "password", True, True, None)]}
+
+
 @pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
 def test_no_other_method_declares_cloud_support(path: Path):
-    """Only the methods in CLOUD_DATABASE_METHODS carry a `cloud` block."""
+    """Only the methods in CLOUD_DATABASE_METHODS and CLOUD_SERVICE_METHODS carry a `cloud` block."""
     data = json.loads(path.read_text(encoding="utf-8"))
     data.setdefault("id", path.stem)
     spec = ConnectorSpecResponse(**data)
+    service_method = CLOUD_SERVICE_METHODS.get(spec.id, (None, None))[0]
     for method in spec.form.methods or []:
-        if CLOUD_DATABASE_METHODS.get(spec.id) != method.id:
+        if method.id not in (CLOUD_DATABASE_METHODS.get(spec.id), service_method):
             assert method.cloud is None, f"{spec.id}.{method.id} declares cloud support"
 
 
@@ -477,6 +611,73 @@ class TestCloudDatabaseSpecs:
         wanted = CLOUD_DATABASE_METHODS[connector_id]
         method = next(m for m in spec.form.methods if m.id == wanted)
         assert method.cloud is not None
+        return method.cloud
+
+
+class TestCloudServiceSpecs:
+    """Managed services that are PostgreSQL or MySQL underneath.
+
+    Each one's cloud form is its engine's form under the service's own name:
+    the same fields, saved and run as the engine, available exactly when the
+    engine is. The UI reads each method's own `available`, so the two flags
+    may never drift apart.
+    """
+
+    @pytest.fixture(params=sorted(CLOUD_SERVICE_METHODS), ids=sorted(CLOUD_SERVICE_METHODS))
+    def service_id(self, request):
+        return request.param
+
+    @pytest.fixture
+    def registry(self):
+        return ConnectorSpecRegistry(SPECS_DIR)
+
+    def test_only_its_password_method_declares_cloud_support(self, registry, service_id):
+        spec = registry.get_connector(service_id)
+        declared = [m.id for m in spec.form.methods if m.cloud is not None]
+        assert declared == [CLOUD_SERVICE_METHODS[service_id][0]]
+        assert spec.category == "database"
+
+    def test_it_names_its_engine(self, registry, service_id):
+        method_id, engine = CLOUD_SERVICE_METHODS[service_id]
+        assert self._cloud(registry, service_id, method_id).engine == engine
+
+    def test_its_cloud_fields_are_its_engine_s(self, registry, service_id):
+        method_id, engine = CLOUD_SERVICE_METHODS[service_id]
+        engine_id, engine_method = engine.split(":")
+        mine = self._cloud(registry, service_id, method_id)
+        theirs = self._cloud(registry, engine_id, engine_method)
+        assert [f.model_dump() for f in mine.fields] == [f.model_dump() for f in theirs.fields]
+        assert mine.available == theirs.available
+
+    def test_its_cloud_copy_offers_no_local_server(self, registry, service_id):
+        cloud = self._cloud(registry, service_id, CLOUD_SERVICE_METHODS[service_id][0])
+        copy = f"{cloud.description or ''} {cloud.how_to or ''}".lower()
+        assert cloud.description and cloud.how_to
+        for phrase in ("localhost", "127.0.0.1", "sslmode=disable"):
+            assert phrase not in copy
+
+    def test_desktop_fields_are_untouched(self, registry, service_id):
+        spec = registry.get_connector(service_id)
+        actual = {
+            m.id: [(f.name, f.type, f.required, f.secret, f.default) for f in m.fields]
+            for m in spec.form.methods
+        }
+        assert actual == SERVICE_DESKTOP_FIELDS[service_id]
+
+    def test_supabase_points_at_the_session_pooler(self, registry):
+        """Supabase's direct host is IPv6-only without its add-on; the session
+        pooler answers on 5432 with a project-qualified user. The postgres
+        text's 6432 pooler line is not Supabase's."""
+        cloud = self._cloud(registry, "supabase", "individual-credentials")
+        assert "session pooler" in cloud.how_to.lower()
+        assert "postgres.<project-ref>" in cloud.how_to
+        assert "6432" not in cloud.how_to
+
+    @staticmethod
+    def _cloud(registry, connector_id, method_id):
+        spec = registry.get_connector(connector_id)
+        method = next(m for m in spec.form.methods if m.id == method_id)
+        assert method.cloud is not None, f"{connector_id}.{method_id} has no cloud block"
         return method.cloud
 
 
