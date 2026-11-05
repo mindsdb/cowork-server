@@ -648,7 +648,10 @@ class UserSettings(Settings):
             "provider (see resolved_gate_model), except on openai-compatible, "
             "where this is the only model there is. Defaults to the recommended "
             "model for the selected provider (MindsHub → MindsHub Air; other "
-            "providers → their smallest model)."
+            "providers → their smallest model). Outside MindsHub mode it can be "
+            "set with the ROUTER_MODEL environment variable, meant for an own "
+            "inference provider: Settings hides the choice once turns are "
+            "routed by Jev or an own decision model."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(

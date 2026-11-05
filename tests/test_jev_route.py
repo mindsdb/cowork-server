@@ -396,3 +396,17 @@ async def test_a_desktop_server_dials_an_own_endpoint_as_configured(monkeypatch)
     )
 
     assert route.direct and captured["url"] == "http://localhost:8000/v1/systemone"
+
+
+def test_router_model_from_the_environment_picks_the_summarization_model(monkeypatch):
+    """With the Settings row hidden, ROUTER_MODEL is how an own-inference
+    deployment picks the summarization model; the route gate keeps its fast
+    default."""
+    from cowork.common.settings.user_settings import UserSettings
+
+    monkeypatch.setenv("ROUTER_PROVIDER", "anthropic")
+    monkeypatch.setenv("ROUTER_MODEL", "claude-haiku-9")
+    settings = UserSettings(anthropic_api_key="key", planning_provider="anthropic")
+
+    assert settings.resolved_router_model == "claude-haiku-9"
+    assert settings.resolved_gate_model != "claude-haiku-9"
