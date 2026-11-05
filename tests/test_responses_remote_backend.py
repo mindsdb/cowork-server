@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed, and its database
 units run inline on fakes (inline_run_db) unless a test needs the real ones.
 """
 from __future__ import annotations
+from tests._event_loop import on_the_event_loop
 from tests._logging_assertions import assert_log_fields
 
 import asyncio
@@ -886,12 +887,14 @@ async def test_a_cancel_during_a_memory_save_waits_for_it_then_saves_the_turn(mo
 
 
 def _no_workspace_or_memory_units(monkeypatch):
-    """Staging, the project memory read and the workspace lookups do nothing.
+    """Staging, the project memory read, the workspace lookups and the skills
+    block do nothing.
     The fake unit session cannot run them, and each would log an error."""
     monkeypatch.setattr(ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id, *, workspace: None))
+    monkeypatch.setattr(responses_mod, "remote_turn_skills", lambda session, conv_id, *, viewer=None: {})
 
 
 @pytest.mark.asyncio
@@ -2435,8 +2438,11 @@ def test_a_remote_turns_inputs_look_up_the_workspace_once(monkeypatch):
     monkeypatch.setattr(ResponsesHandler, "_remote_started_at", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
     monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(remote_agent_files))
+    monkeypatch.setattr(responses_mod, "remote_turn_skills", lambda session, conv_id, *, viewer=None: {})
 
-    inputs = object.__new__(ResponsesHandler)._read_remote_turn_inputs(None, conv_id=uuid4())
+    handler = object.__new__(ResponsesHandler)
+    handler._skill_viewer = None
+    inputs = handler._read_remote_turn_inputs(None, conv_id=uuid4())
 
     assert len(looked_up) == 1
     assert inputs.workspace is workspace
@@ -2626,6 +2632,7 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
 
     def spy_diff(**kwargs):
         indexed["completed_cleanly"] = kwargs["completed_cleanly"]
+        indexed["on_the_event_loop"] = on_the_event_loop()
         return diff(**kwargs)
 
     def spy_index(session, **kwargs):
@@ -2654,7 +2661,8 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
-    assert indexed == {"completed_cleanly": False, "slugs": ["half-written"]}
+    # The diff waits on artifact locks and parses journals: off the loop.
+    assert indexed == {"completed_cleanly": False, "on_the_event_loop": False, "slugs": ["half-written"]}
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
 
 

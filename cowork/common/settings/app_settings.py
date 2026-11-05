@@ -402,6 +402,29 @@ class DatabaseSettings(Settings):
             "with 503. Short, so a full pool answers within seconds."
         ),
     )  # POOL_TIMEOUT
+    # PostgreSQL session settings for the app's own connections, set when each
+    # connection opens. Migrations run with both off: the db-migrate init
+    # container opens its own engine, and the server's startup migration turns
+    # them off for its transaction (cowork.db.migrations.run_schema_migrations).
+    # SQLite engines ignore all three.
+    statement_timeout_ms: int = Field(
+        default=0,
+        ge=0,
+        description="PostgreSQL statement_timeout, in milliseconds. 0 leaves it off.",
+    )  # STATEMENT_TIMEOUT_MS
+    idle_in_transaction_timeout_ms: int = Field(
+        default=0,
+        ge=0,
+        description="PostgreSQL idle_in_transaction_session_timeout, in milliseconds. 0 leaves it off.",
+    )  # IDLE_IN_TRANSACTION_TIMEOUT_MS
+    slow_statement_log_ms: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Log a db_statement_slow line for each PostgreSQL statement that takes at "
+            "least this many milliseconds. 0 leaves it off."
+        ),
+    )  # SLOW_STATEMENT_LOG_MS
 
 
 class ProjectSettings(Settings):
@@ -434,6 +457,28 @@ class CodingSettings(Settings):
             "so it is not partitioned per organization there."
         ),
     )  # COWORK_CODING_DIR
+    workspace_retention_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_RETENTION"),
+        description=(
+            "Also release the workspaces of long-idle, unarchived coding tasks "
+            "to reclaim disk, beyond the most recent few. Archiving a task "
+            "releases its workspace either way. A released workspace is "
+            "rebuilt with its changes when the task is next used."
+        ),
+    )  # COWORK_CODING_WORKSPACE_RETENTION
+    workspace_keep_count: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_KEEP_COUNT"),
+        description="Most recently active task workspaces that are never released automatically.",
+    )  # COWORK_CODING_WORKSPACE_KEEP_COUNT
+    workspace_min_idle_hours: float = Field(
+        default=14 * 24,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS"),
+        description="How long a task must be idle before its workspace can be released automatically.",
+    )  # COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS
 
 
 class StorageSettings(Settings):
@@ -696,6 +741,15 @@ class TurnQueueSettings(Settings):
         repr=False,
         description="Secret for the dedicated datasource producer service role.",
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
+    datasource_gateway_base_url: str = Field(
+        default="",
+        description=(
+            "In-cluster base URL of the datasource gateway, used to validate a captured "
+            "connection. The Service name, as auth is addressed (http://mindshub-inference): "
+            "the public datasource ingress admits execution alone. Empty means no validation "
+            "runs and a captured connection stays pending."
+        ),
+    )  # COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
 
 
 # The OpenAI API an openai_compatible provider's planning, coding and router roles call.
@@ -777,6 +831,20 @@ class AppSettings(Settings):
                 f"http://127.0.0.1:{self.renderer_port}",
             ]
         return self
+
+    # Which connector methods this deployment may run as a cloud datasource:
+    # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,
+    # not a dict: pydantic-settings parses a dict field from the environment
+    # while the settings object is built, so malformed JSON would raise before
+    # any policy code runs and crash the process at import. Parsed, and failed
+    # closed, in services/connectors/datasource_capabilities.py instead.
+    # One spelling only: a second alias would also become an unprefixed
+    # environment name for a policy that decides what this deployment stores.
+    datasource_capabilities: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DATASOURCE_CAPABILITIES"),
+        description="Versioned datasource capability manifest as JSON; empty means nothing is enabled.",
+    )
 
     require_auth: bool = Field(
         default=False,

@@ -15,10 +15,11 @@ from cowork.server import create_app
 
 
 PRODUCT = "Acme & Co's $workbench"
-# Exact prompts at staging 8b1ecf4, before deployment identity support; the gate's
-# since then also forbids clarifying questions. These compatibility assertions
-# exercise provider requests, not just the constants.
-DEFAULT_GATE_SHA256 = "539afb476ec02efc9b1384c046348ce8c222d681a3e313c27f4674081a8dbeab"
+# Exact unbranded prompts: the gate's since it delegates write, approval and
+# reply-to-a-question turns and forbids clarifying questions, the take's since
+# staging 8b1ecf4. These compatibility assertions exercise provider requests,
+# not just the constants.
+DEFAULT_GATE_SHA256 = "993e1e39e6ce02dad8cae975fcc9c86a0d098113ca3f5a36f2c21d99febf3da3"
 DEFAULT_TAKE_SHA256 = "423cf10dd88589f84adadb158b7851a89cfd32da4bad967c473062f07a51427a"
 
 
@@ -137,7 +138,7 @@ async def test_real_routing_starts_a_first_take_with_the_same_startup_identity(
     decision, _ = await handler._route_request(
         conversation_id=None,
         gate_rows=[],
-        harness_input=[{"type": "text", "text": "How do I update this installation?"}],
+        harness_input=[{"type": "text", "text": "How do I install this on another computer?"}],
         has_attachments=False,
         has_disabled_connections=False,
         first_take=True,

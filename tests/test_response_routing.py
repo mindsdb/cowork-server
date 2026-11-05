@@ -687,6 +687,39 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_resolves_the_skill_viewer_before_the_turn_start_unit(monkeypatch):
+    """The first unit reads which always-on skills reach the caller, team
+    skills among them, so the caller's teams are read before it runs."""
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    calls = []
+
+    async def no_secrets(_scope):
+        return None
+
+    async def resolve_viewer(scope):
+        calls.append(("resolve_viewer", scope))
+
+    class _StopHere(Exception):
+        pass
+
+    async def first_unit(work, *, scope):
+        calls.append(("turn_start", work.func.__name__))
+        raise _StopHere
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+    monkeypatch.setattr(responses, "run_db", first_unit)
+    handler._resolve_skill_viewer = resolve_viewer
+
+    with pytest.raises(_StopHere):
+        await handler.handle(ResponsesRequest(input="hi"))
+
+    assert calls == [("resolve_viewer", handler.scope), ("turn_start", "_read_turn_start")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failure", "reason", "fallback"),
     [
@@ -1783,7 +1816,7 @@ def _router_on_an_endpoint_answering(monkeypatch, status: int, error: dict):
 
 async def _route_on(provider):
     return await decide_route(
-        history=[{"role": "user", "content": "Make an HTML artifact with a bar chart."}],
+        history=[{"role": "user", "content": "What is a bar chart good for?"}],
         has_non_text_input=False,
         has_attachments=False,
         has_disabled_connections=False,
@@ -2788,15 +2821,22 @@ async def test_streamed_gate_answer_asking_a_question_is_discarded_and_delegated
     provider = _StreamProvider([_text(answer[:20]), _text(answer[20:]), _complete()])
 
     decision = await decide_route(
-        history=[{"role": "user", "content": "build a comparison page for base plan vs surge"}],
+        history=[{"role": "user", "content": "compare the base plan with the demand surge scenario"}],
         has_non_text_input=False,
         has_attachments=False,
         has_disabled_connections=False,
         binding=_binding(provider),
     )
 
+    from cowork.handlers.response_routing import imitates_approval
+
+    # The approval-imitation check runs first; an answer it catches ("Where
+    # should I get the data?") keeps that reason.
+    expected = (
+        "router_answer_imitated_approval" if imitates_approval(answer) else "router_answer_asked_question"
+    )
     assert decision.route == DELEGATED_AGENTIC
-    assert decision.reason == "router_answer_asked_question"
+    assert decision.reason == expected
     assert decision.text == ""
     assert decision.fallback is False
     assert decision.model == "gate-model"

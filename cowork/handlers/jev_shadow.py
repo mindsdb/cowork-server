@@ -49,7 +49,9 @@ _ROUTE_QUESTION: dict[str, Any] = {
             "multi-step planning. It is not about the assistant's runtime "
             "identity, provider, model, permissions, or available "
             "resources, and it is not about using, installing, updating, "
-            "pricing, supporting platforms, or configuring Cowork."
+            "pricing, supporting platforms, or configuring Cowork. It does "
+            "not ask to change, send, confirm, or approve anything, and it "
+            "does not reply to a question asked earlier in the conversation."
         ),
         "needs_agent": (
             "The reply requires any tool use; browsing or external "
@@ -61,7 +63,9 @@ _ROUTE_QUESTION: dict[str, Any] = {
             "runtime identity, provider, model, permissions, or available "
             "resources, and for questions about using, installing, "
             "updating, pricing, supporting platforms, or configuring "
-            "Cowork. Choose this option when uncertain."
+            "Cowork, for any request to change, send, confirm, or approve "
+            "something, and for any reply to a question asked earlier in "
+            "the conversation. Choose this option when uncertain."
         ),
     },
 }

@@ -7,15 +7,17 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db
+from cowork.handlers.datasource_relay import relay_cloud_submission
 from cowork.handlers.probe import ProbeHandler
 from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.custom_connectors import (
     UnstorableFormError,
     check_handcrafted_form,
@@ -26,15 +28,16 @@ from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 from cowork.services.connectors.specs._registry import registry
-from cowork.services.connectors.submissions import store
+from cowork.services.connectors.submissions import missing_required_fields, store
 
 # AuthenticatedInOrgMode: in org mode a request with no verified principal is
 # refused with 401 before the form is read. The stream holds no request
-# session: the probe handler's database units open their own tenant-scoped
-# sessions, so no connection stays checked out while the probe waits on the
-# model.
+# session: the probe handler's and the cloud relay's database units open
+# their own tenant-scoped sessions, so no connection stays checked out while
+# the probe waits on the model or the relay waits on auth.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+_DATABASE_CATEGORY = "database"
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -70,24 +73,52 @@ def _fields_from_spec_dict(form_spec: dict, method_id: str | None) -> list[Conne
     return fields
 
 
-def _missing_required(fields: list, values: dict, skipped: list[str]) -> list[str]:
-    skipped_set = set(skipped)
-    return [
-        f.name for f in fields
-        if f.required
-        and f.name not in skipped_set
-        and (values.get(f.name) is None or str(values.get(f.name, "")).strip() == "")
-    ]
+def _connector_id(req: SubmitFormRequest) -> str:
+    """Return the submission's connector id.
 
-
-@router.post("/")
-async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> StreamingResponse:
+    Raises the HTTP error a malformed id earns: 422 for an invalid id, 400
+    when the form names none.
+    """
     try:
-        connector_id = req.resolve_connector_id()
+        return req.resolve_connector_id()
     except InvalidConnectorIdError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+def _relayed_in_org_mode(connector_id: str) -> bool:
+    """True when an org's credential for this connector may go only to auth's store.
+
+    That is a connector with a cloud datasource form, or any built-in
+    database connector; the relay refuses those it has no enabled method for.
+    """
+    if load_datasource_capabilities().is_cloud_datasource(connector_id):
+        return True
+    spec = registry.get_connector(connector_id)
+    return spec is not None and spec.category == _DATABASE_CATEGORY
+
+
+@router.post("/", name="submit_form")
+async def submit_form_route(req: SubmitFormRequest, request: Request, scope: TenantScopeDep) -> StreamingResponse:
+    """Answer one form submission.
+
+    In org mode a cloud datasource or built-in database submission goes to
+    the relay, which stores an enabled method in auth's encrypted store and
+    refuses the rest, so no database password is saved locally. Every other
+    submission takes submit_form. The relay needs ``request`` to forward the
+    caller's bearer to auth.
+    """
+    if scope.org_mode:
+        connector_id = _connector_id(req)
+        if _relayed_in_org_mode(connector_id):
+            return await relay_cloud_submission(req, connector_id, req.resolve_method(), scope, request)
+    return await submit_form(req, scope)
+
+
+async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingResponse:
+    """Stage a submission and stream its probe; never used for a cloud datasource in org mode."""
+    connector_id = _connector_id(req)
 
     if connector_id == SHAREPOINT:
         # Only the SharePoint routes may save it: they check the key first.
@@ -170,7 +201,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
             # staged. The vault refuses the save itself too.
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_CONNECTION_REFUSAL)
 
-    missing = _missing_required(fields, req.values, req.skipped)
+    missing = missing_required_fields(fields, req.values, req.skipped)
     if missing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

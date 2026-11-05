@@ -1,0 +1,15 @@
+# What GET /api/v1/artifacts/status answers as linkOwnerRecorded. `recorded`
+# is what the owner lookup finds for the artifact's live page; with no live
+# link the route asks nothing and answers null.
+- name: a live link with no owner record warns
+  published_url: https://viewer.example/view/a/
+  recorded: false
+  link_owner_recorded: false
+- name: a live link on record does not warn
+  published_url: https://viewer.example/view/a/
+  recorded: true
+  link_owner_recorded: true
+- name: no live link carries no answer
+  published_url: ""
+  recorded: true
+  link_owner_recorded: null

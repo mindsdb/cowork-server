@@ -125,18 +125,18 @@ TOKEN_LIMIT_USER_MESSAGE = (
 TOKEN_LIMIT_CODE = "token_limit"
 
 # Curated copy + wire code for a spent or absent FREE allowance (gateway 429
-# `included_allowance_exhausted`). Split from `token_limit`: both denials used
-# to share the out-of-credits card, but they are different situations.
-# `access.py` in auth decides it, and the logic is exact. This reason fires
+# `included_allowance_exhausted`). Kept apart from `token_limit` and its
+# out-of-credits card: they are different situations.
+# MindsHub decides it, and the logic is exact. This reason fires
 # ONLY for a free-bucket model on an org that has NEVER topped up ("a non-free
 # model always needs the wallet"). So the person seeing this card has not spent
 # money. Credits genuinely unlock the rest of the catalogue for them, because
 # non-free models need a wallet they do not have.
-# The same reason also fires for an org with NO free grant at all: auth zeroes
+# The same reason also fires for an org with NO free grant at all: MindsHub zeroes
 # the allowance of an org that is not `free_grant_eligible`, so its first
 # free-bucket request lands here and nothing ever refills. The denial does not
-# say which case it is. The card learns that from the hub usage read instead:
-# `cowork/services/hub_usage.py` relays auth's `free_grant_eligible: false` as
+# say which case it is. The card learns that from the MindsHub usage read instead:
+# `cowork/services/mindshub_usage.py` relays MindsHub's `free_grant_eligible: false` as
 # `freeTokens.limit` 0, and the card says there is no grant when it reads that.
 # The failure frame's `reset_at` only supplies the refill time. This string is
 # the fallback for consumers that don't render the card, including the channel
@@ -358,10 +358,23 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
-# Message for a turn cut off by boot recovery or shutdown, not by the model,
-# provider, or user Stop. Paired with GENERIC_TURN_ERROR_CODE, not a code of
-# its own — same as TurnInterrupted below.
+# Message for a turn the watchdog ended after it made no progress
+# (TurnLifecycle.timed_out), not the model, provider, or user Stop. Paired
+# with GENERIC_TURN_ERROR_CODE, not a code of its own — same as
+# TurnInterrupted below.
 INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
+
+# The server stopped while the turn ran: a shutdown, or a crash that boot
+# recovery finds afterwards. A code of its own because the next step differs
+# from anton_error: nothing about the request or the agent failed, the answer
+# streamed so far is kept, and sending the question again works once the
+# server is back. A proxy that outlives the server can send the same frame to
+# a client whose stream the crash cut.
+TURN_LOST_CODE = "turn_lost"
+TURN_LOST_MESSAGE = (
+    "The server stopped before this answer finished. The answer ends where it "
+    "was cut off. Please send your question again."
+)
 
 # anton ended a model call that sent no output within its deadline. Its own
 # message names the deadline, so it passes through; this is the fallback for

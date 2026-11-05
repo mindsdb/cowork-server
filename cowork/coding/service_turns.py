@@ -105,6 +105,9 @@ class CodingTurnOperations:
                 lambda current: fail_turn(current, False, message),
             )
             return
+        # Setup commands may have written into the workspace since it was
+        # first published.
+        self.workspace_usage.invalidate()
         with self._lock:
             preparing = self._running.pop(session_id, None)
             if preparing is not None and preparing.delete_requested:
@@ -249,6 +252,8 @@ class CodingTurnOperations:
         ``announced`` means the prompt is already in the timeline, as it is for
         a new task's first turn.
         """
+        # A released workspace is rebuilt before validation reads its files.
+        self.ensure_workspace(session_id, reserved=maintenance_reserved)
         intent = self._validated_command_intent(self.get_session(session_id), prompt, attachments)
         if intent.runs_immediately:
             if maintenance_reserved:
