@@ -342,36 +342,6 @@ def test_standalone_embed_refuses_someone_elses_session_and_a_foreign_viewer(ser
     assert err.value.status == 409
 
 
-def test_standalone_sessions_are_per_task_under_the_users_prefix():
-    a1 = svc.standalone_session("user-a", "conv-1")
-    assert a1 == svc.standalone_session("user-a", "conv-1")
-    assert a1 != svc.standalone_session("user-a", "conv-2")
-    assert svc._SESSION_ID.match(a1) and "user-a" not in a1 and "conv-1" not in a1
-    prefix = svc.standalone_session("user-a", "conv-2")[:19]
-    assert a1.startswith(prefix) and not svc.standalone_session("user-b", "conv-1").startswith(prefix)
-
-
-def test_standalone_embed_accepts_only_the_callers_own_sessions(service):
-    own = svc.standalone_session("user-a", "conv-1")
-    out = asyncio.run(svc.embed_for(_standalone(), "", "user-a", own))
-    assert out["session_id"] == own
-    assert service.calls[-1][2:] == ({"session_id": own}, f"Bearer {SERVICE_KEY}")
-    # The legacy per-user profile is still the caller's own.
-    assert asyncio.run(svc.embed_for(_standalone(), "", "user-a", svc.standalone_profile("user-a")))["session_id"]
-
-    calls = len(service.calls)
-    for foreign in [
-        svc.standalone_session("user-b", "conv-1"),
-        own[:19] + "x",  # the right prefix, but not a task session
-        own + "0",
-        "main",
-    ]:
-        with pytest.raises(svc.BrowserServiceError) as err:
-            asyncio.run(svc.embed_for(_standalone(), "", "user-a", foreign))
-        assert err.value.status == 403, foreign
-    assert len(service.calls) == calls
-
-
 def test_turn_block_standalone_carries_the_token_and_the_users_profile():
     block = svc.turn_block(_standalone(), "user-a")
     assert block == {"base_url": SERVICE, "profile": svc.standalone_profile("user-a"), "token": SERVICE_KEY}
@@ -384,9 +354,10 @@ def test_turn_block_standalone_carries_the_token_and_the_users_profile():
     assert svc.turn_block(on, "user-a") == {"base_url": ENDPOINT, "profile": "main"}
     config = svc.anton_browser_config(_standalone(), "user-a")
     assert (config.base_url, config.profile) == (SERVICE, svc.standalone_profile("user-a"))
-    # A task gets its own session under the user's prefix, and its project a key.
+    # Every task keeps the user's one profile (the service has no login store
+    # of its own); its project gets a key for saved tabs.
     assert svc.turn_block(_standalone(), "user-a", "conv-1", "proj-1") == {
-        "base_url": SERVICE, "profile": svc.standalone_session("user-a", "conv-1"), "token": SERVICE_KEY,
+        "base_url": SERVICE, "profile": svc.standalone_profile("user-a"), "token": SERVICE_KEY,
         "project": svc.project_key("user-a", "proj-1"),
     }
     assert "project" not in svc.turn_block(_standalone(), "user-a", "conv-1")
@@ -401,7 +372,7 @@ def test_the_harness_uses_the_turns_user_for_the_standalone_profile():
 
     with use_settings_scope(TenantScope(org_mode=True, org_id="o", user_id="user-a")):
         assert _browser_config(_standalone()).profile == svc.standalone_profile("user-a")
-        assert _browser_config(_standalone(), conversation_id="c1").profile == svc.standalone_session("user-a", "c1")
+        assert _browser_config(_standalone(), conversation_id="c1").profile == svc.standalone_profile("user-a")
     assert _browser_config(_standalone()).profile == "main"
 
 

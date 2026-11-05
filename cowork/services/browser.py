@@ -14,8 +14,10 @@ cowork at a browser service they run themselves (the same Node service with a
 static bearer token, `browser_service_url` + `browser_service_api_key`): there
 is nothing to provision, every call carries that key instead of the caller's
 MindsHub credential, and anton is handed the key in its turn block. The service
-is shared by the org, so each user gets their own profiles on it, one per task
-(`standalone_session`), all named under that user's own prefix.
+is shared by the org, so each user gets their own profile on it
+(`standalone_profile`). One per user rather than per task: the service has no
+login store of its own, so a profile is the only thing that keeps a user
+signed in from one task to the next.
 
 The shared browser router (ENG-3188) replaces the per-user instance in
 `mindshub` mode when `COWORK_BROWSER_ROUTER_URL` is set (`router_url`). It is
@@ -178,27 +180,6 @@ def project_key(user_id: Optional[str], project_id: Any) -> str:
     if project_id is None or str(project_id) == "":
         return ""
     return "p-" + _digest(f"{user_id or ''}:{project_id}")[:24]
-
-
-def _standalone_prefix(user_id: Optional[str]) -> str:
-    return "u-" + _digest(str(user_id or ""))[:16] + "-"
-
-
-def standalone_session(user_id: Optional[str], conversation_id: str) -> str:
-    """One task's profile on a shared standalone service.
-
-    Unlike the router, the service's key opens every session on it, so the
-    name itself proves whose it is: the user's own prefix, then the task.
-    `embed_for` grants a viewer only for a session under the caller's prefix.
-    """
-    return _standalone_prefix(user_id) + _digest(str(conversation_id))[:16]
-
-
-def _owns_standalone_session(user_id: Optional[str], session_id: str) -> bool:
-    return session_id == standalone_profile(user_id) or (
-        session_id.startswith(_standalone_prefix(user_id))
-        and len(session_id) == len(_standalone_prefix(user_id)) + 16
-    )
 
 
 async def _call(
@@ -404,19 +385,21 @@ async def embed_for(user_settings: Any, bearer: str, user_id: Optional[str], ses
     instance with their credential, or the standalone service with its key.
 
     The session defaults to the user's own profile. On a standalone service it
-    must be one of the caller's, by its prefix (`standalone_session`). The
-    router routes by the caller's credential to their own pod, so any
-    well-formed session id is passed through: it can only name their own."""
+    can't be anything else. The router routes by the caller's credential to
+    their own pod, so any well-formed session id is passed through: it can
+    only name their own."""
     if browser_mode(user_settings) == STANDALONE:
         service = standalone_service(user_settings)
         if service is None:
             raise BrowserServiceError(409, _NOT_CONFIGURED)
         url, key = service
+        profile = standalone_profile(user_id)
         # The service is shared and its key opens every session on it, so a
-        # caller only ever gets a viewer for a session named as their own.
-        if session_id and not _owns_standalone_session(user_id, session_id):
+        # caller only ever gets a viewer for their own profile, not one named
+        # in the request.
+        if session_id and session_id != profile:
             raise BrowserServiceError(403, "That browser session belongs to someone else.")
-        return await embed(key, url, session_id or standalone_profile(user_id), standalone=True)
+        return await embed(key, url, profile, standalone=True)
     endpoint = router_url() or str(getattr(user_settings, "browser_url", "") or "")
     return await embed(bearer, endpoint, session_id or PROFILE)
 
@@ -432,11 +415,11 @@ def turn_block(
     the task's own session and the project's saved-tabs key (absent without a
     project); anton reaches the router with its own MindsHub credential. In
     standalone mode it carries the service's key as ``token`` (anton has no
-    other way to authenticate there) and the task's session under the user's
-    prefix; an anton that predates ``token`` or ``project`` ignores it. Holds
-    a secret then: never log the block. Without a conversation id, the user's
-    one profile, as before tasks had their own. The per-user instance keeps
-    its one profile either way.
+    other way to authenticate there) and the user's one profile; an anton
+    that predates ``token`` or ``project`` ignores it. Holds a secret then:
+    never log the block. Without a conversation id, the router gives the
+    user's one profile, as before tasks had their own. The per-user instance
+    keeps its one profile either way.
     """
     if not getattr(user_settings, "browser_enabled", False):
         return None
@@ -446,9 +429,7 @@ def turn_block(
         if service is None:
             return None
         url, key = service
-        if not conversation_id:
-            return {"base_url": url, "profile": standalone_profile(user_id), "token": key}
-        block = {"base_url": url, "profile": standalone_session(user_id, conversation_id), "token": key}
+        block = {"base_url": url, "profile": standalone_profile(user_id), "token": key}
         return {**block, "project": project} if project else block
     router = router_url()
     if router:
