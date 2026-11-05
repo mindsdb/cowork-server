@@ -425,6 +425,10 @@ def test_an_org_with_no_name_still_reads_well():
     assert extra is None
 
 
+def test_auths_json_route_ends_with_a_slash():
+    assert org_branding.AUTH_BRANDING_PATH == "/organizations/current/branding/"
+
+
 def test_fixed_image_url_drops_the_version():
     assert org_branding.fixed_image_url(f"{AUTH}/logo?v=abc") == f"{AUTH}/logo"
     assert org_branding.fixed_image_url(None) is None

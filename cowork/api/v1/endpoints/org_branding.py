@@ -2,7 +2,7 @@
 
 ``GET /org-branding``: what every member's app applies. The org's look
 (cowork.models.org_appearance) plus its images, whose URLs come from auth's
-``GET /v1/organizations/current/branding`` read with the caller's own bearer
+``GET /v1/organizations/current/branding/`` read with the caller's own bearer
 (cowork.principal.caller_bearer), cached per caller. Auth unreachable means
 null image URLs, still a 200. ``canEdit`` is org-admin standing
 (cowork.principal.can_manage_org). Outside hosted org mode branding is off:

@@ -4,7 +4,7 @@ Three things live here:
 
 - The org's look (cowork.models.org_appearance.OrgAppearance): read by every
   member, written by an org admin.
-- The org's images, read from auth's ``GET /v1/organizations/current/branding``
+- The org's images, read from auth's ``GET /v1/organizations/current/branding/``
   with the caller's own bearer, cached per caller (CallerTtlCache, 60 s when
   auth answers). Auth is the source of truth for the images; cowork-server
   stores none of them. The org's name comes from auth's
@@ -51,7 +51,7 @@ from cowork.services.skills import BRAND_GUIDELINES_SLUG, SkillService, _skill_f
 
 logger = logging.getLogger(__name__)
 
-AUTH_BRANDING_PATH = "/organizations/current/branding"
+AUTH_BRANDING_PATH = "/organizations/current/branding/"
 AUTH_CURRENT_ORG_PATH = "/organizations/current/"
 
 BRAND_SKILL_DISPLAY_NAME = "Brand guidelines"
