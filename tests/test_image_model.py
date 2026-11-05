@@ -630,7 +630,24 @@ async def test_a_turn_with_no_known_project_still_streams_the_image(tmp_path):
 
     assert event["thought_role"] == "thought.tool_call.result"
     assert event["content"] == content
-    assert "generated_images" not in event
+    assert event["generated_images"] == []
+
+
+async def test_an_image_that_resolves_to_no_project_file_names_none(tmp_path):
+    """Always present, empty when nothing resolves, so the UI never falls back to
+    the raw path: on a cloud pod that is relative to the conversation's folder,
+    and read at the project root it names a different file or none."""
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+    from cowork.harnesses.anton_harness.stream_formatter import TurnContext
+
+    conversation_id = uuid.uuid4()
+    _image(tmp_path)  # images/cat.png at the project root, not in the conversation's folder
+    files = AgentFiles.in_cloud_pod(tmp_path, conversation_id=conversation_id, workspace_rel_path=None)
+    context = TurnContext(question="draw a cat", files=files)
+
+    (event,) = await _stream(context, _image_result(json.dumps({"path": "images/cat.png"})))
+
+    assert event["generated_images"] == []
 
 
 @pytest.fixture

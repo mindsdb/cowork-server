@@ -1047,8 +1047,11 @@ async def format_responses_stream(
             # The result's path is the one the agent's OS read: the project's
             # on the desktop, but a mount of the conversation's folder on a cloud
             # pod, which the UI cannot map. So the files it names are also
-            # given as project paths, the ones files-raw serves. Additive:
-            # absent when none of them resolves to an image in the project.
+            # given as project paths, the ones files-raw serves. Always present,
+            # empty when none resolves to an image in the project, so the UI
+            # shows nothing rather than guessing from the raw path, which on a
+            # pod can name a different file at the project root.
+            images: list[dict[str, str]] = []
             if turn_context.files is not None:
                 try:
                     images = await asyncio.to_thread(generated_images, event.content, turn_context.files)
@@ -1056,9 +1059,7 @@ async def format_responses_stream(
                     # Never fail the turn over showing an image: the content
                     # still names the file.
                     logger.warning("Could not resolve the images a generate_image result names", exc_info=True)
-                    images = []
-                if images:
-                    image_payload["generated_images"] = images
+            image_payload["generated_images"] = images
             yield _event("response.in_progress", image_payload)
 
         elif isinstance(event, StreamToolResult):
