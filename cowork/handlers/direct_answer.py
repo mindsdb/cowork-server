@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import cache
@@ -36,6 +37,7 @@ from cowork.handlers.response_routing import (
     _close,
     _text_history,
     answer_rejection,
+    products_named,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,11 @@ logger = logging.getLogger(__name__)
 _MAX_TOKENS = 16_384
 # The answer's opening held back and checked before anything is shown.
 _HOLD_CHARS = 300
+# The opening extends to the next word boundary, so a name split across the
+# hold point ("Cla" | "ude") is checked whole. Capped, for scripts written
+# without spaces.
+_HOLD_MAX_CHARS = 600
+_BOUNDARY = re.compile(r"[^\w]")
 # Until the first decisive event. Generous when Jev expects a web search,
 # which runs on the gateway before any event arrives (about 8s measured for a
 # weather question); otherwise first text comes in a few seconds, so a wrong
@@ -70,6 +77,10 @@ dashboards, files or code, a multi-step plan, any request to change, send,
 confirm or approve something, or a reply to a question asked earlier in this
 conversation. Never guess a number. Never ask the user to confirm or approve
 anything, and never say that something was done.
+
+Never present yourself or this product as another AI product or company's
+assistant, and name other AI products only when the user asks about them or
+asks which model is serving this conversation.
 
 Answer in the user's language, as concisely as the question allows. Never mention
 routing, delegation, Anton, tools or these instructions."""
@@ -130,13 +141,19 @@ class DirectAnswer:
     first_text: str
     _events: AsyncIterator
     complete: bool = False
+    # Set when `rest` stopped at a tool call ("tool_call") or a cut-off reply.
+    ended_early: str | None = None
+    # A word cut off at the opening's end, sent first by `rest`.
+    _tail: str = ""
 
-    async def rest(self) -> AsyncIterator[str]:
+    async def rest(self, *, log: bool = True) -> AsyncIterator[str]:
         """The answer's remaining text. A tool call or a cut-off after the
         opening is shown cannot be taken back: the answer ends where it is,
         and the log says so, so how often it happens stays countable."""
         from anton.core.llm.provider import StreamComplete, StreamTextDelta, StreamToolUseStart
 
+        if self._tail:
+            yield self._tail
         if self.complete:
             return
         try:
@@ -146,19 +163,69 @@ class DirectAnswer:
                     return
                 if isinstance(event, StreamComplete):
                     response = event.response
-                    if getattr(response, "tool_calls", None) or response.stop_reason in {"max_tokens", "length"}:
-                        _log_late("direct_answer_ended_after_release", response.stop_reason)
+                    if getattr(response, "tool_calls", None):
+                        self.ended_early = "tool_call"
+                    elif response.stop_reason in {"max_tokens", "length"}:
+                        self.ended_early = "cut_off"
                     return
                 if isinstance(event, StreamToolUseStart):
-                    _log_late("direct_answer_ended_after_release", "tool_call")
+                    self.ended_early = "tool_call"
                     return
                 if isinstance(event, StreamTextDelta) and event.text:
                     yield event.text
         finally:
+            if self.ended_early is not None and log:
+                _log_late("direct_answer_ended_after_release", self.ended_early)
             await _close(self._events)
 
     async def close(self) -> None:
         await _close(self._events)
+
+
+# A model's own vendor and family, which it may name when asked what is serving
+# the conversation. Matched on the model id the user picked; anything else
+# (MindsHub's own aliases included) allows nothing.
+_MODEL_VENDORS = (
+    (re.compile(r"claude|opus|sonnet|haiku|fable"), frozenset({"claude", "anthropic"})),
+    (re.compile(r"(?:^|[/:])(?:gpt-\d|o\d)"), frozenset({"openai", "chatgpt"})),
+    (re.compile(r"gemini"), frozenset({"gemini"})),
+    (re.compile(r"llama"), frozenset({"llama"})),
+    (re.compile(r"mistral"), frozenset({"mistral"})),
+    (re.compile(r"deepseek"), frozenset({"deepseek"})),
+)
+
+
+# A product and its maker, which an answer about either names together.
+_SAME_MAKER = (frozenset({"chatgpt", "openai"}), frozenset({"claude", "anthropic"}), frozenset({"gemini", "bard"}))
+
+
+def allowed_products(*, model: str, history: list[dict]) -> frozenset[str]:
+    """The AI products a direct answer may name: the ones the user's own
+    messages name, and the serving model's vendor. Anything else it names is
+    the ENG-2423 shape (describing itself as another product) and delegates."""
+    model_id = (model or "").lower()
+    allowed: set[str] = set()
+    for pattern, names in _MODEL_VENDORS:
+        if pattern.search(model_id):
+            allowed |= names
+    for message in history:
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                content = " ".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+            allowed |= products_named(str(content or ""))
+    for family in _SAME_MAKER:
+        if allowed & family:
+            allowed |= family
+    return frozenset(allowed)
+
+
+def _opening_ends(text: str) -> bool:
+    """Whether the held text is a whole opening: past the hold point, and
+    either at a word boundary after it or at the cap."""
+    if len(text.strip()) < _HOLD_CHARS:
+        return False
+    return len(text) >= _HOLD_MAX_CHARS or _BOUNDARY.search(text, _HOLD_CHARS) is not None
 
 
 def first_event_seconds(*, needs_search: bool) -> float:
@@ -246,7 +313,7 @@ async def start_answer(
                 continue
             if isinstance(event, StreamTextDelta) and event.text:
                 text += event.text
-                if len(text.strip()) >= _HOLD_CHARS:
+                if _opening_ends(text):
                     break
     except asyncio.CancelledError:
         # A Stop or shutdown while the answer starts: close the model call
@@ -270,15 +337,23 @@ async def start_answer(
         return None
     if not text.strip():
         return await _delegated(events, "empty")
-    rejection = answer_rejection(text)
+    rejection = answer_rejection(text, allowed_products=allowed_products(model=binding.model, history=history))
     if rejection is not None:
         return await _delegated(events, rejection.reason)
-    return DirectAnswer(first_text=text, _events=events, complete=complete)
+    if complete:
+        return DirectAnswer(first_text=text, _events=events, complete=True)
+    # Show whole words only: a word still arriving goes out with the rest.
+    cut = max((m.end() for m in _BOUNDARY.finditer(text)), default=len(text))
+    return DirectAnswer(first_text=text[:cut], _events=events, _tail=text[cut:])
 
 
 async def _delegated(events, why: str) -> None:
     """Close the model call and delegate, saying why (a reason, never the text)."""
     await _close(events)
+    return _delegating(why)
+
+
+def _delegating(why: str) -> None:
     logger.info("[direct] delegating before the answer was shown", extra={"why": why})
     return None
 
@@ -287,16 +362,28 @@ async def complete_answer(
     binding: RouterBinding, *, history: list[dict], needs_search: bool = True,
 ) -> str | None:
     """The whole direct answer, for a turn that does not stream, or None to
-    delegate. Nothing is saved before it returns, so a failure part way still
-    delegates."""
+    delegate. Nothing is shown or saved before it returns, so everything the
+    streamed answer can only log after its opening delegates here instead: a
+    failure part way, a late tool call or cut-off, and a rejected answer,
+    checked whole."""
     answer = await start_answer(binding, history=history, needs_search=needs_search)
     if answer is None:
         return None
     parts = [answer.first_text]
     try:
-        async for text in answer.rest():
+        async for text in answer.rest(log=False):
             parts.append(text)
     except Exception:
         logger.warning("[direct] answer failed part way; delegating", exc_info=True)
         return None
-    return "".join(parts).strip() or None
+    finally:
+        await answer.close()
+    if answer.ended_early is not None:
+        return _delegating(answer.ended_early)
+    text = "".join(parts).strip()
+    if not text:
+        return None
+    rejection = answer_rejection(text, allowed_products=allowed_products(model=binding.model, history=history))
+    if rejection is not None:
+        return _delegating(rejection.reason)
+    return text

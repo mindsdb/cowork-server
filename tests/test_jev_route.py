@@ -323,3 +323,76 @@ async def test_an_own_decision_endpoint_never_receives_the_trace_headers(monkeyp
         reset_trace_context(token)
 
     assert captured["headers"] == {"Authorization": "Bearer own"}
+
+
+_OWN = jev_route.JevTarget(url="https://decide.example.com/v1/systemone", api_key="own")
+
+
+def _hosted(monkeypatch, addresses):
+    monkeypatch.setattr(jev_route, "_hosted", lambda: True)
+    monkeypatch.setattr(
+        jev_route, "_RESOLVER",
+        lambda host, port, type=None: [(None, None, None, None, (address, port)) for address in addresses],
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_server_dials_an_own_endpoint_at_its_vetted_address(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen.update(host=request.url.host, header=request.headers["host"], sni=request.extensions.get("sni_hostname"))
+        return httpx.Response(200, json=_body())
+
+    _hosted(monkeypatch, ["93.184.216.34"])
+    monkeypatch.setattr(jev_route, "_PINNED_TRANSPORT", httpx.MockTransport(handler))
+    # The shared client is not used for an organization's own endpoint.
+    monkeypatch.setattr(jev_route, "_http_client", lambda: pytest.fail("used the shared client"))
+
+    route = await jev_route.decide(target=_OWN, messages=MESSAGES, model="jev", timeout_seconds=1.0, min_p_direct=0.5)
+
+    assert route.direct and not route.error
+    assert seen == {"host": "93.184.216.34", "header": "decide.example.com", "sni": "decide.example.com"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("url", "addresses"), [
+    ("https://decide.example.com/v1/systemone", ["10.0.0.5"]),
+    ("https://decide.example.com/v1/systemone", ["93.184.216.34", "169.254.169.254"]),
+    ("http://decide.example.com/v1/systemone", ["93.184.216.34"]),
+    ("https://127.0.0.1:8443/v1/systemone", []),
+])
+async def test_a_hosted_server_refuses_an_own_endpoint_it_must_not_dial(monkeypatch, url, addresses):
+    """An organization admin sets the URL: an internal address must not
+    receive a request every turn."""
+    _hosted(monkeypatch, addresses)
+    monkeypatch.setattr(jev_route, "_PINNED_TRANSPORT", httpx.MockTransport(lambda r: pytest.fail("dialed")))
+
+    route = await jev_route.decide(
+        target=jev_route.JevTarget(url=url, api_key="own"),
+        messages=MESSAGES, model="jev", timeout_seconds=1.0, min_p_direct=0.5,
+    )
+
+    assert route.error == "endpoint_refused"
+    assert route.falls_back_to_llm_gate
+
+
+@pytest.mark.asyncio
+async def test_mindshub_is_dialed_on_the_shared_client_when_hosted(monkeypatch):
+    monkeypatch.setattr(jev_route, "_hosted", lambda: True)
+    route = await _decide(monkeypatch, _FakeAsyncClient(response=_FakeResponse(200, _body())))
+
+    assert route.direct
+
+
+@pytest.mark.asyncio
+async def test_a_desktop_server_dials_an_own_endpoint_as_configured(monkeypatch):
+    """On desktop the server is the user's own machine: a local endpoint is theirs to use."""
+    monkeypatch.setattr(jev_route, "_hosted", lambda: False)
+    captured = {}
+    route = await _decide(
+        monkeypatch, _FakeAsyncClient(response=_FakeResponse(200, _body()), captured=captured),
+        target=jev_route.JevTarget(url="http://localhost:8000/v1/systemone", api_key="own"),
+    )
+
+    assert route.direct and captured["url"] == "http://localhost:8000/v1/systemone"

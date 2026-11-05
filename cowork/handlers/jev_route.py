@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import socket
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -238,6 +240,68 @@ def _http_client() -> httpx.AsyncClient:
     return _client[1]
 
 
+# Replaced in tests.
+_RESOLVER: Callable[..., list[tuple]] = socket.getaddrinfo
+_PINNED_TRANSPORT: httpx.AsyncBaseTransport | None = None
+
+
+class _EndpointRefused(Exception):
+    """An organization's own decision endpoint this server will not dial."""
+
+
+def _hosted() -> bool:
+    from cowork.common.settings.app_settings import get_app_settings
+
+    return get_app_settings().tenancy_mode == "org"
+
+
+async def _post_pinned(target: "JevTarget", *, headers: dict, payload: dict, timeout_seconds: float) -> httpx.Response:
+    """Post to an organization's own endpoint from the hosted server, at an
+    address vetted as public (the connectors' pattern, `connectors.egress`).
+
+    An organization admin sets the URL, so without this the server would post
+    to any internal address it can reach, every turn. https only, resolved
+    once, and the vetted address dialed as a literal, with the hostname kept on
+    ``Host`` and SNI so the certificate is still checked against it. A client
+    of its own per call: a shared pool keys connections by address, and two
+    hostnames behind one address would share a connection whose certificate
+    was checked for only one of them. trust_env stays off, since a proxy
+    would tunnel to the pinned address and defeat the pin.
+    """
+    from cowork.services.connectors.egress import (
+        EgressHostNotPublic,
+        EgressHostUnresolved,
+        connection_attempts,
+        vetted_public_addresses,
+    )
+
+    url = httpx.URL(target.url)
+    if url.scheme != "https" or not url.host:
+        raise _EndpointRefused("not https")
+    try:
+        addresses = await asyncio.to_thread(vetted_public_addresses, url.host, _RESOLVER)
+    except (EgressHostUnresolved, EgressHostNotPublic) as exc:
+        raise _EndpointRefused("not public") from exc
+    headers = {**headers, "Host": url.netloc.decode("ascii")}
+    extensions = {"sni_hostname": url.host}
+    attempts = connection_attempts(addresses, total_seconds=timeout_seconds, fallback_seconds=1.0)
+    async with httpx.AsyncClient(follow_redirects=False, trust_env=False, transport=_PINNED_TRANSPORT) as client:
+        for index, (address, connect_seconds) in enumerate(attempts):
+            try:
+                return await client.post(
+                    url.copy_with(host=str(address)),
+                    headers=headers,
+                    json=payload,
+                    extensions=extensions,
+                    timeout=httpx.Timeout(timeout_seconds, connect=connect_seconds),
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # Only a failed connect moves on: the key is sent after it.
+                if index == len(attempts) - 1:
+                    raise
+    raise AssertionError("unreachable")  # connection_attempts never returns []
+
+
 async def close_client() -> None:
     """Close the shared client during shutdown. Idempotent."""
     global _client
@@ -299,15 +363,21 @@ async def decide(
     started = time.monotonic()
     try:
         async with asyncio.timeout(timeout_seconds):
-            response = await _http_client().post(
-                target.url,
-                headers={
-                    **(_trace_headers() if target.mindshub_gateway else {}),
-                    "Authorization": f"Bearer {target.api_key}",
-                },
-                json=payload,
-                timeout=timeout_seconds,
-            )
+            headers = {
+                **(_trace_headers() if target.mindshub_gateway else {}),
+                "Authorization": f"Bearer {target.api_key}",
+            }
+            if not target.mindshub_gateway and _hosted():
+                response = await _post_pinned(
+                    target, headers=headers, payload=payload, timeout_seconds=timeout_seconds,
+                )
+            else:
+                response = await _http_client().post(
+                    target.url, headers=headers, json=payload, timeout=timeout_seconds,
+                )
+    except _EndpointRefused:
+        # Falls back to the LLM gate, as any failure but a timeout does.
+        return JevRoute(ms=_elapsed_ms(started), error="endpoint_refused")
     except (TimeoutError, httpx.TimeoutException):
         # httpx's own timeouts fire at the same budget: the gate's time is
         # spent either way, so both read as a timeout (no LLM gate after it).

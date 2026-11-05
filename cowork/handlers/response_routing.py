@@ -284,8 +284,9 @@ class _RejectedAnswer(Exception):
         self.evidence = evidence
 
 
-def names_foreign_product(text: str) -> str | None:
-    """The first foreign product name in ``text``, or None.
+def names_foreign_product(text: str, *, allowed: frozenset[str] = frozenset()) -> str | None:
+    """The first foreign product name in ``text``, or None. Names in
+    ``allowed`` (lowercase) are skipped.
 
     Exported so the regression suite asserts against the same matcher the gate
     uses, rather than a copy that can drift away from it.
@@ -296,8 +297,15 @@ def names_foreign_product(text: str) -> str | None:
         # name ("Acme Copilot"). Only the whole name is removed, so a listed
         # name elsewhere in the text still matches.
         text = re.sub(_configured_name(identity.product_name), "", text or "", flags=re.IGNORECASE)
-    match = _FOREIGN_PRODUCT_RE.search(text or "")
-    return match.group(0) if match else None
+    for match in _FOREIGN_PRODUCT_RE.finditer(text or ""):
+        if match.group(0).lower() not in allowed:
+            return match.group(0)
+    return None
+
+
+def products_named(text: str) -> frozenset[str]:
+    """The foreign product names ``text`` mentions, lowercase."""
+    return frozenset(match.group(0).lower() for match in _FOREIGN_PRODUCT_RE.finditer(text or ""))
 
 
 def denies_our_product(text: str) -> str | None:
@@ -465,16 +473,20 @@ def _spawn_drain(events, *, deadline: float, model: str) -> None:
     task.add_done_callback(_drain_tasks.discard)
 
 
-def answer_rejection(answer: str) -> "_RejectedAnswer | None":
+def answer_rejection(
+    answer: str, *, allowed_products: frozenset[str] = frozenset(),
+) -> "_RejectedAnswer | None":
     """Why a direct answer must not ship, or None. Shared by the LLM gate and
     the direct answer on the user's own model (`direct_answer`), so both
     reject the same shapes under the same reasons.
 
     - It names the gate's own tool.
-    - It names another AI product (ENG-2423). On a direct answer that is
+    - It names another AI product (ENG-2423). On the gate's answer that is
       overwhelmingly the model describing itself as that product, for example
       telling a user to install the ChatGPT desktop app when they asked how to
-      install Cowork.
+      install Cowork. ``allowed_products`` are names that are not that: the
+      direct answer passes the ones the user named and its own model's vendor,
+      so "which model are you?" and "ChatGPT or Gemini?" can be answered.
     - It denies that our own product can be identified or exists.
     - It imitates an approval card or claims a finished change (ENG-3896):
       saved, it reads as an approval or as work that never ran, and a "yes"
@@ -485,7 +497,7 @@ def answer_rejection(answer: str) -> "_RejectedAnswer | None":
     """
     if names_gate_tool(answer) is not None:
         return _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
-    foreign = names_foreign_product(answer)
+    foreign = names_foreign_product(answer, allowed=allowed_products)
     if foreign is not None:
         return _RejectedAnswer("router_answer_named_foreign_product", foreign)
     denial = denies_our_product(answer)

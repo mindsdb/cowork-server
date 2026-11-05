@@ -578,7 +578,9 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
     return direct_answer.DirectAnswer(first_text=first.text, _events=stream)
 
 
-async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None):
+async def _produce(
+    monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None, first_take=None,
+):
     from cowork.streaming.registry import TurnLifecycle
 
     lifecycle = lifecycle or TurnLifecycle()
@@ -605,6 +607,7 @@ async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifec
         trace_metadata={},
         buffer=buffer,
         delegate=delegate or (lambda: pytest.fail("must not delegate")),
+        first_take=first_take,
     )
     return handler, buffer, coro
 
@@ -646,18 +649,22 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
 async def test_produce_answer_hands_a_delegated_turn_to_the_agent(monkeypatch):
     conversation_id = await _conversation()
     delegated = []
+    buffers = []
 
     async def delegate():
+        # The agent's producer ends the turn and closes the buffer.
         delegated.append(True)
+        await buffers[0].close("completed")
 
     lifecycle = TurnLifecycle()
     _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate, lifecycle=lifecycle)
+    buffers.append(buffer)
 
     await coro
 
     assert delegated == [True]
-    # Nothing shown; the question was saved pending before the answer
-    # started, and the agent's producer is handed that row to finish.
+    # Nothing shown by the direct answer; the question was saved pending
+    # before the answer started, and the agent's producer is handed that row.
     assert buffer.frames == []
     rows = await _rows(conversation_id)
     assert rows == [("user", "what were those headline numbers again?", True, None)]
@@ -1111,3 +1118,149 @@ async def test_jev_reads_long_replies_whole_within_its_budget():
     assert sum(len(m["content"]) for m in seen[0]) <= response_routing.JEV_HISTORY_CHARS
     assert seen[0][-1]["content"] == "and now?"
     assert seen[0][0]["role"] == "user"
+
+
+class _Take:
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hand_off_still_ends_the_turn(monkeypatch):
+    """Delegation that raises before the agent's producer runs (a harness
+    that no longer resolves) must not leave the client's stream open, or
+    the question pending."""
+    conversation_id = await _conversation()
+    take = _Take()
+
+    async def delegate():
+        raise RuntimeError("no such harness")
+
+    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate, first_take=take)
+
+    await coro
+
+    assert _events(buffer) == ["response.failed"]
+    assert buffer.status == "error"
+    assert await _rows(conversation_id) == [("user", "what were those headline numbers again?", False, None)]
+    assert take.cancelled
+
+
+@pytest.mark.asyncio
+async def test_the_first_take_goes_to_the_agent_on_delegation(monkeypatch):
+    conversation_id = await _conversation()
+    take = _Take()
+    buffers = []
+
+    async def delegate():
+        await buffers[0].close("completed")
+
+    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate, first_take=take)
+    buffers.append(buffer)
+    await coro
+
+    # Left running: the agent's producer shows it, then ends it.
+    assert take.cancelled is False
+
+
+@pytest.mark.asyncio
+async def test_the_first_take_ends_once_the_answer_is_shown(monkeypatch):
+    conversation_id = await _conversation()
+    take = _Take()
+    answer = await _answer(["Revenue was ", "$4.81M."])
+    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, answer, first_take=take)
+
+    await coro
+
+    assert take.cancelled
+    assert buffer.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_answers_sequence_numbers_have_no_gap(monkeypatch):
+    conversation_id = await _conversation()
+    answer = await _answer(["Revenue was ", "$4.81M."])
+    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, answer)
+
+    await coro
+
+    numbers = [_payload(frame)["sequence_number"] for frame in buffer.frames]
+    assert numbers == list(range(1, len(numbers) + 1))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("question", "reply"), [
+    ("which model are you?", "I'm Cowork, running on Claude Opus 5.5 by Anthropic."),
+    ("what's the difference between ChatGPT and Gemini?", "ChatGPT is OpenAI's assistant; Gemini is Google's."),
+])
+async def test_the_direct_answer_may_name_its_own_model_and_products_the_user_named(question, reply):
+    provider = _Provider([_text(reply), _complete()])
+
+    answer = await direct_answer.start_answer(
+        _binding(provider), history=[{"role": "user", "content": question}],
+    )
+
+    assert answer is not None and answer.first_text == reply
+
+
+@pytest.mark.parametrize(("model", "allowed"), [
+    ("opus-5-5", {"claude", "anthropic"}),
+    ("claude-sonnet-5-5", {"claude", "anthropic"}),
+    ("gpt-5.1", {"openai", "chatgpt"}),
+    ("openai/o3", {"openai", "chatgpt"}),
+    # MindsHub's own aliases name no vendor.
+    ("gpt-terra", set()),
+    ("muse-spark", set()),
+    ("gemini-3-pro", {"gemini", "bard"}),
+])
+def test_allowed_products_follow_the_serving_models_vendor(model, allowed):
+    assert direct_answer.allowed_products(model=model, history=[]) == allowed
+
+
+def test_allowed_products_read_only_the_users_messages():
+    history = [
+        {"role": "assistant", "content": "Unlike ChatGPT, I can run code."},
+        {"role": "user", "content": [{"type": "text", "text": "and Perplexity?"}]},
+    ]
+
+    assert direct_answer.allowed_products(model="muse-spark", history=history) == {"perplexity"}
+
+
+@pytest.mark.asyncio
+async def test_the_held_opening_ends_at_a_word_boundary(monkeypatch):
+    """A name split across the hold point is checked whole, not as "Cla"."""
+    monkeypatch.setattr(direct_answer, "_HOLD_CHARS", 20)
+    provider = _Provider([_text("I can help. I am Cla"), _text("ude, by Anthropic."), _complete()])
+
+    answer = await direct_answer.start_answer(_binding(provider, model="muse-spark"), history=_RECALL)
+
+    assert answer is None
+
+
+@pytest.mark.asyncio
+async def test_the_shown_opening_never_ends_inside_a_word(monkeypatch):
+    monkeypatch.setattr(direct_answer, "_HOLD_CHARS", 10)
+    provider = _Provider([_text("Revenue was $4.81M, and marg"), _text("in 31%."), _complete()])
+
+    answer = await direct_answer.start_answer(_binding(provider), history=_RECALL)
+
+    assert answer.first_text == "Revenue was $4.81M, and "
+    assert "".join([t async for t in answer.rest()]) == "margin 31%."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", [
+    [_text("More."), _tool_start()],
+    [_text("More."), _complete(stop_reason="max_tokens")],
+    [_text(" Install the ChatGPT app."), _complete()],
+])
+async def test_complete_answer_delegates_what_a_streamed_answer_could_only_log(monkeypatch, ending):
+    """Nothing is shown before the whole answer is in hand, so a late tool
+    call, a cut-off or a rejected later passage still reaches the agent."""
+    monkeypatch.setattr(direct_answer, "_HOLD_CHARS", 10)
+    provider = _Provider([_text("Revenue was $4.81M. "), *ending])
+
+    assert await direct_answer.complete_answer(_binding(provider), history=_RECALL) is None

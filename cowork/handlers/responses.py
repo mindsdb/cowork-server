@@ -840,8 +840,10 @@ class ResponsesHandler:
                 },
             )
 
-            if route.route == DIRECT_CONTEXT and first_take is not None:
-                # The gate answered: there is nothing to fill the wait for.
+            if route.text and first_take is not None:
+                # The gate answered: there is nothing to fill the wait for. A
+                # Jev direct route keeps the take: its frames wait for the
+                # agent to attach them, and the answer cancels it once shown.
                 first_take.cancel()
                 first_take = None
 
@@ -869,9 +871,21 @@ class ResponsesHandler:
                     start.gate_rows or [], start.harness_input,
                 )
                 if answer_binding is not None and not request.stream:
-                    text = await direct_answer.complete_answer(
-                        answer_binding, history=answer_history, needs_search=route.needs_search,
-                    )
+                    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
+                    # Attributes the answer's model call, as the streamed one's is.
+                    token = set_trace_context(TraceContext(
+                        session_id=str(start.conversation_id),
+                        harness=self.harness_name,
+                        tags=("cowork-direct",),
+                        metadata={**trace_metadata, **({"correlation_id": cid} if (cid := (turn_llm or {}).get("correlation_id")) else {})},
+                    ))
+                    try:
+                        text = await direct_answer.complete_answer(
+                            answer_binding, history=answer_history, needs_search=route.needs_search,
+                        )
+                    finally:
+                        reset_trace_context(token)
                     if text is not None:
                         return await self._handle_direct_response(
                             request=request,
@@ -945,6 +959,7 @@ class ResponsesHandler:
                         trace_metadata=trace_metadata,
                         buffer=buffer,
                         delegate=lambda: delegated(buffer, {**trace_metadata, **_DIRECT_DELEGATED_METADATA}),
+                        first_take=first_take,
                     )
 
                 try:
@@ -1730,9 +1745,14 @@ class ResponsesHandler:
         trace_metadata: dict[str, str],
         buffer,
         delegate: Callable[[], Awaitable[None]],
+        first_take: FirstTake | None = None,
     ) -> None:
         """Stream the direct answer Jev routed, on the user's own model, or
         hand the turn to the agent on this same buffer.
+
+        `first_take` runs while the answer starts and goes to the agent on a
+        delegation, whose producer shows it; the answer cancels it once its
+        own text is shown, and on any other ending.
 
         The question is saved pending first (`_start_turn`, ENG-1231), as on
         the agent's producers, so a crash while the answer starts cannot lose
@@ -1764,12 +1784,14 @@ class ResponsesHandler:
         delegated = False
         sequence = 1
 
-        def text_delta(text: str) -> dict:
+        def text_delta(text: str, *, sequence_number: int | None = None) -> dict:
             nonlocal sequence
-            sequence += 1
+            if sequence_number is None:
+                sequence += 1
+                sequence_number = sequence
             return {
                 "type": "response.output_text.delta",
-                "sequence_number": sequence,
+                "sequence_number": sequence_number,
                 "item_id": item_id,
                 "delta": text,
                 "response_route": route.route,
@@ -1830,7 +1852,7 @@ class ResponsesHandler:
             only until ``lifecycle.shutdown_frame_deadline``, so its frame
             reaches the open stream before Uvicorn's request drain cuts it."""
             # A turn stopped before its answer started saves no answer row.
-            events = [text_delta("".join(parts)), _DIRECT_MEMORY_READ.payload()] if parts else []
+            events = [text_delta("".join(parts), sequence_number=2), _DIRECT_MEMORY_READ.payload()] if parts else []
             if lifecycle.shutdown_frame_deadline is None:
                 saved = await persist(events)
             else:
@@ -1878,6 +1900,8 @@ class ResponsesHandler:
                 await delegate()
                 return
 
+            if first_take is not None:
+                first_take.cancel()
             parts.append(answer.first_text)
             response = Response(status=ResponseStatus.created, model=binding.model)
             await buffer.append("sse", {"sse": sse_frame("response.created", {
@@ -1906,7 +1930,7 @@ class ResponsesHandler:
             # Saved as one delta holding the whole answer, as the gate's direct
             # answers are: a reload replays the text, not its chunking.
             saved_events = [
-                {**text_delta(text), "sequence_number": 2},
+                text_delta(text, sequence_number=2),
                 memory_frame,
                 *([] if sources_frame is None else [sources_frame]),
                 {"type": "response.completed"},
@@ -1968,9 +1992,20 @@ class ResponsesHandler:
                 return
             await run_to_completion(end_turn("cancelled"))
         except Exception as exc:
-            if delegated:
+            if delegated and buffer.is_closed:
+                # The agent's producer ended the turn, then raised.
                 raise
-            if isinstance(exc, PoolTimeoutError):
+            if delegated:
+                # The hand-off failed before the agent's producer ended the
+                # turn, for example on a harness that no longer resolves:
+                # close it here, clearing the question's pending flag.
+                logger.exception(
+                    "[direct] hand-off to the agent failed",
+                    extra=log_context(request_id=corr, conversation_id=conv_id),
+                )
+                if first_take is not None:
+                    first_take.cancel()
+            elif isinstance(exc, PoolTimeoutError):
                 logger.warning(
                     "[direct] turn found no free database connection",
                     extra=log_context(request_id=corr, conversation_id=conv_id),
@@ -1984,9 +2019,10 @@ class ResponsesHandler:
         finally:
             if answer is not None:
                 await answer.close()
-            if not delegated:
-                # A delegated turn's producer seals the buffer itself.
-                await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
+            if first_take is not None and not delegated:
+                first_take.cancel()
+            # A no-op when a producer closed the buffer, a delegated one included.
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
 
     def _select_producer(
         self,
