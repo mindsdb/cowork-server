@@ -932,7 +932,8 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     _refuse_a_second_name(artifact)
     try:
-        return _preview_artifact(artifact)
+        # Reading and counting a large file would stall every other request.
+        return await run_in_threadpool(_preview_artifact, artifact)
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
     except Exception as e:

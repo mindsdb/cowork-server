@@ -360,3 +360,26 @@ def test_scope_is_none_when_neither_source_has_one(conv, tmp_path, monkeypatch):
     _, _, scope = t.index_turn_artifacts(conv, conv.id, conv.project_id, base, set(), {})
 
     assert scope is None
+
+
+def test_index_ignores_bytecode_written_during_the_turn(conv, tmp_path):
+    """A scratchpad import from the artifact folder writes `__pycache__`; the
+    agent did not edit the artifact, so no revision is captured."""
+    base = tmp_path / "artifacts"
+    _make_artifact(
+        base, "old",
+        files={"backend.py": "x = 1", "routes/x.py": "y = 1"},
+        meta={"slug": "old", "type": "document"},
+    )
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    cache = base / "old" / "routes" / "__pycache__" / "x.cpython-313.pyc"
+    cache.parent.mkdir()
+    cache.write_bytes(b"\0")
+    _bump_mtime(cache, 120)
+
+    new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    )
+    assert new == []
+    assert touched == set()

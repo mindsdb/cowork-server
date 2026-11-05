@@ -111,7 +111,73 @@
               }
             ]
           }
-        ]
+        ],
+        "cloud": {
+          "available": false,
+          "engine": "postgres:host-port",
+          "description": "Enter the host, port, database, username and password. Saved and read as a PostgreSQL connection.",
+          "how_to": "## Connect Amazon Aurora PostgreSQL\n\nCloud saves this connection in your encrypted connection store and reads it through the hosted gateway.\n\n### Where to find each value\n\n1. **Host**: the cluster or instance endpoint from the RDS console, under **Connectivity & security**.\n2. **Port**: `5432` unless you changed it.\n3. **Database / Username / Password**: a database in the cluster and a user that can read it.\n\nThe server must be reachable from the public internet, and its firewall must allow the hosted gateway. Use a database user that can read only the data you want to query.",
+          "fields": [
+            {
+              "name": "host",
+              "label": "Host",
+              "type": "text",
+              "required": true,
+              "placeholder": "db.example.com",
+              "description": "Hostname of your PostgreSQL server. Must resolve to a public address."
+            },
+            {
+              "name": "port",
+              "label": "Port",
+              "type": "text",
+              "required": true,
+              "placeholder": "5432",
+              "default": "5432",
+              "description": "Whatever your server listens on, 5432 unless it was changed."
+            },
+            {
+              "name": "database",
+              "label": "Database name",
+              "type": "text",
+              "required": true,
+              "placeholder": "mydb",
+              "description": "The name of the specific database (schema container) to connect to."
+            },
+            {
+              "name": "schema",
+              "label": "Schema",
+              "type": "text",
+              "required": false,
+              "placeholder": "public",
+              "description": "Optional. The schema unqualified table names resolve in. It does not limit what can be read."
+            },
+            {
+              "name": "username",
+              "label": "Username",
+              "type": "text",
+              "required": true,
+              "placeholder": "readonly",
+              "description": "A PostgreSQL role with CONNECT on the database and USAGE plus SELECT on the schemas to be read."
+            },
+            {
+              "name": "password",
+              "label": "Password",
+              "type": "password",
+              "required": true,
+              "secret": true,
+              "placeholder": "••••••••",
+              "description": "Password for the above role. Stored encrypted and never shown again."
+            },
+            {
+              "name": "tls_verify",
+              "label": "Certificate",
+              "type": "boolean",
+              "required": false,
+              "checkbox_label": "Only connect if the certificate is signed by a public authority",
+              "description": "Off by default, because a self-hosted server usually presents a certificate it generated for itself, which no public authority signed. The connection is still encrypted whenever the server offers it. Turn this on for a managed provider, whose certificate a public authority signed."
+            }
+          ]
+        }
       },
       {
         "id": "iam-auth",
