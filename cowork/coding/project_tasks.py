@@ -14,7 +14,7 @@ from cowork.coding.project_models import (
     PullRequestActionRequest,
     PullRequestStatus,
 )
-from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.project_workspaces import ProjectWorkspaceManager, is_git_workspace
 from cowork.coding.store import CodingStore
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 
@@ -70,7 +70,7 @@ class ProjectTaskOperations:
                 selected = next((item for item in session.workspaces if item.folder_id == folder_id), None)
                 if selected is None:
                     raise WorkspaceError("Choose a file from this task")
-                if selected.workspace_kind != WorkspaceKind.git_worktree:
+                if not is_git_workspace(selected):
                     raise WorkspaceError("Review actions require a Git task workspace")
                 self.workspaces.review_file_action(selected.workspace_path, path, action)
             else:
@@ -89,7 +89,7 @@ class ProjectTaskOperations:
             if session.workspaces:
                 states = []
                 for workspace in session.workspaces:
-                    if workspace.workspace_kind != WorkspaceKind.git_worktree:
+                    if not is_git_workspace(workspace):
                         continue
                     state = self.workspaces.create_branch(workspace.workspace_path, name)
                     states.append(state.model_copy(update={
@@ -151,6 +151,8 @@ class ProjectTaskOperations:
             "Wait for the active turn to finish before applying task changes",
             touches_source=True,
         ) as session:
+            if session.workspace_mode == WorkspaceMode.in_place:
+                raise WorkspaceError("This task works in the original folders, so its changes are already there")
             if session.workspaces:
                 applied = self.project_workspaces.apply(session.id, session.workspaces)
                 text = (
@@ -163,11 +165,7 @@ class ProjectTaskOperations:
                 )
                 return {"status": "applied" if applied else "no_changes", "snapshot": None}
             if session.workspace_kind == WorkspaceKind.direct_folder:
-                raise WorkspaceError(
-                    "This task works in the original folder, so its changes are already there"
-                    if session.workspace_mode == WorkspaceMode.in_place
-                    else "This legacy task uses its source folder directly and has no isolated handoff"
-                )
+                raise WorkspaceError("This legacy task uses its source folder directly and has no isolated handoff")
             snapshot = self.workspaces.apply_to_source(
                 session.id,
                 session.source_path,

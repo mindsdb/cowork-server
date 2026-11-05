@@ -318,7 +318,7 @@ def test_setup_commands_report_progress_while_they_run(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(project_workspaces.ProjectCommandRunner, "_run_one", staticmethod(slow))
     created = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build it"), CREDS, "fake", "fake-model"
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Build it"), CREDS, "fake", "fake-model"
     )
     assert running.wait(timeout=3)
 
@@ -396,6 +396,7 @@ def test_deleting_a_task_before_its_first_turn_rolls_back_its_new_branch(
     monkeypatch.setattr(service.session_factory, "complete", held)
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             prompt="Build it",
             repository_setup=TaskRepositorySetup(branch="feat/aborted"),

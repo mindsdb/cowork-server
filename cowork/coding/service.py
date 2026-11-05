@@ -317,10 +317,11 @@ class CodingService(
         """The workspace modes a new task on this project and computer could use.
 
         A task with no computer chosen is shown as running here, matching the
-        composer's default target. Given the folder a folder task would use,
-        the answer also reflects what that folder allows, checked the same way
-        creating the task checks it: any existing folder can be worked in, and
-        a worktree needs a Git repository with a commit.
+        composer's default target. For a project, or given the folder a
+        folder task would use, the answer also reflects what those folders
+        allow, checked the same way creating the task checks them: any
+        existing folder can be worked in, and a worktree needs a Git
+        repository with a commit.
         """
         project = self.projects.get(project_id) if project_id else None
         runs_locally = computer_id in {None, self.control.local_computer.id}
@@ -328,15 +329,19 @@ class CodingService(
             project.default_workspace_mode if project else None,
             runs_locally=runs_locally,
             org_mode=_org_mode(),
-            project_task=project is not None,
         )
-        if project is not None or not path or not runs_locally:
+        if not runs_locally:
             return options
-        if WorkspaceMode.in_place in options.supported:
+        if WorkspaceMode.in_place in options.supported and (project is not None or path):
             try:
-                self.workspaces.in_place_root(path)
-            except WorkspaceError as exc:
+                self.session_factory.in_place_roots(project, None, path)
+            except (WorkspaceError, ValueError) as exc:
                 options = without_in_place(options, str(exc))
+        if project is not None:
+            problem = self.project_workspaces.worktree_problem(project)
+            return without_worktree(options, problem) if problem else options
+        if not path:
+            return options
         try:
             self.workspaces.check_source(path)
         except WorkspaceError as exc:
