@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -373,6 +375,20 @@ class BrandSkillSync:
     changed: bool
 
 
+def _write_beside_skill(service: SkillService, skill_dir: Path, name: str, text: str) -> None:
+    """Write ``name`` in the skill's folder atomically, against a pinned
+    descriptor, as SkillService writes SKILL.md: a temporary file, then a
+    replace that never follows a link."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=skill_dir, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        service._replace_direct_child(skill_dir, Path(tmp_name).name, name)
+    except Exception:
+        service._unlink_direct_child(skill_dir, Path(tmp_name).name, ignore_errors=True)
+        raise
+
+
 def _current_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
@@ -430,7 +446,7 @@ def sync_brand_skill(
             service._unlink_direct_child(skill_dir, GUIDELINES_FILE, ignore_errors=True)
             changed = True
     elif _current_text(extra_path) != extra:
-        extra_path.write_text(extra, encoding="utf-8")
+        _write_beside_skill(service, skill_dir, GUIDELINES_FILE, extra)
         changed = True
 
     row_now = access_row(session, BRAND_GUIDELINES_SLUG)
