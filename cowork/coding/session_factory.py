@@ -33,7 +33,7 @@ from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
 from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
-from cowork.coding.workspace import WorkspaceManager, _org_mode
+from cowork.coding.workspace import NO_REVIEW_WITHOUT_COMMITS, NO_REVIEW_WITHOUT_GIT, WorkspaceManager, _org_mode
 from cowork.coding.workspace_mode import resolve_workspace_mode
 from cowork.services.skills import CodeSkillService
 
@@ -251,6 +251,7 @@ class CodingSessionFactory:
                 project.default_workspace_mode if project else None,
                 runs_locally=runs_locally,
                 org_mode=_org_mode(),
+                project_task=project is not None,
             )
         except ValueError:
             with suppress(KeyError, ValueError):
@@ -272,8 +273,10 @@ class CodingSessionFactory:
         try:
             # Preparation runs in the background, so reject a folder it would
             # refuse now, while the composer can still show the error.
-            if project is None:
-                self.workspaces.check_source(request.path or "", request.allow_folder_copy)
+            if project is None and workspace_mode == WorkspaceMode.in_place:
+                self.workspaces.in_place_root(request.path or "")
+            elif project is None:
+                self.workspaces.check_source(request.path or "")
             validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):
@@ -308,7 +311,11 @@ class CodingSessionFactory:
                 CodingEvent(
                     type=EventType.session,
                     title="Preparing task workspace",
-                    text="Creating an isolated copy of the task folders.",
+                    text=(
+                        "Working in the original folder."
+                        if workspace_mode == WorkspaceMode.in_place
+                        else "Creating an isolated copy of the task folders."
+                    ),
                     phase="pending",
                 ),
             )
@@ -327,7 +334,7 @@ class CodingSessionFactory:
         request = pending.request
         preparation: LocalSessionPreparation | None = None
         try:
-            preparation = self._prepare_local_session(session_id, request, pending.project)
+            preparation = self._prepare_local_session(session_id, request, pending.project, pending.workspace_mode)
             contexts = list(request.source_contexts)
             skill_resolution = self.skills.resolve(session_id, preparation.project, pending.code_skills)
             session = self._build_local_session(
@@ -461,10 +468,15 @@ class CodingSessionFactory:
         session_id: str,
         request: SessionCreateRequest,
         project: CodeProject | None,
+        workspace_mode: WorkspaceMode = WorkspaceMode.worktree,
     ) -> LocalSessionPreparation:
         requested_dirs = validate_directories(request.additional_dirs)
         if project is None:
-            prepared = self.workspaces.prepare(session_id, request.path or "", request.allow_folder_copy)
+            prepared = (
+                self.workspaces.prepare_in_place(request.path or "")
+                if workspace_mode == WorkspaceMode.in_place
+                else self.workspaces.prepare(session_id, request.path or "")
+            )
             workspace = TaskWorkspace(
                 folder_id="folder",
                 folder_name=Path(prepared.source_path).name,
@@ -696,12 +708,24 @@ class CodingSessionFactory:
 
     def _emit_workspace_ready(self, session: CodingSession) -> None:
         count = len(session.workspaces) or 1
+        if session.workspace_mode == WorkspaceMode.in_place:
+            text = "Working in the original folder; the agent's changes are made there directly." + (
+                " It already had uncommitted changes, which appear in this task's review alongside the agent's."
+                if session.source_dirty
+                else ""
+            )
+            if not session.base_revision and len(session.workspaces) <= 1:
+                text += " " + (NO_REVIEW_WITHOUT_COMMITS if session.repository_root else NO_REVIEW_WITHOUT_GIT)
+        elif count > 1:
+            text = f"Created an isolated task workspace across {count} folders."
+        else:
+            text = "Created an isolated task workspace."
         self.emit(
             session.id,
             CodingEvent(
                 type=EventType.session,
                 title="Task workspace ready",
-                text=f"Created an isolated task workspace across {count} folders." if count > 1 else "Created an isolated task workspace.",
+                text=text,
                 phase="completed",
                 data={
                     "workspaceKind": session.workspace_kind.value,

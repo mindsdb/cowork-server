@@ -67,7 +67,7 @@ def test_prepare_uses_detached_worktree_and_preserves_dirty_source(tmp_path: Pat
     (repo / "source-only.txt").write_text("uncommitted\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
 
-    prepared = manager.prepare("session-1", str(repo), False)
+    prepared = manager.prepare("session-1", str(repo))
 
     assert prepared.kind == WorkspaceKind.git_worktree
     assert prepared.workspace_path != repo
@@ -80,7 +80,7 @@ def test_prepare_uses_detached_worktree_and_preserves_dirty_source(tmp_path: Pat
 def test_diff_includes_uncommitted_untracked_deleted_and_committed_changes(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-2", str(repo), False)
+    prepared = manager.prepare("session-2", str(repo))
     worktree = prepared.workspace_path
     (worktree / "keep.txt").write_text("changed\n", encoding="utf-8")
     (worktree / "new.txt").write_text("new\n", encoding="utf-8")
@@ -106,7 +106,7 @@ def test_diff_includes_uncommitted_untracked_deleted_and_committed_changes(tmp_p
 def test_review_file_actions_stage_unstage_and_discard(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-review", str(repo), False)
+    prepared = manager.prepare("session-review", str(repo))
     worktree = prepared.workspace_path
     (worktree / "keep.txt").write_text("changed\n", encoding="utf-8")
     (worktree / "new.txt").write_text("new\n", encoding="utf-8")
@@ -132,7 +132,7 @@ def test_review_file_actions_stage_unstage_and_discard(tmp_path: Path) -> None:
 def test_review_file_actions_reject_paths_outside_workspace(tmp_path: Path, path: str) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare(f"session-review-{len(path)}", str(repo), False)
+    prepared = manager.prepare(f"session-review-{len(path)}", str(repo))
 
     with pytest.raises(WorkspaceError, match="inside this task workspace"):
         manager.review_file_action(str(prepared.workspace_path), path, "discard")
@@ -141,7 +141,7 @@ def test_review_file_actions_reject_paths_outside_workspace(tmp_path: Path, path
 def test_diff_bounds_large_tracked_file_content(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-large", str(repo), False)
+    prepared = manager.prepare("session-large", str(repo))
     large = prepared.workspace_path / "large.txt"
     large.write_text("x" * (2 * 1024 * 1024 + 1), encoding="utf-8")
     git(prepared.workspace_path, "add", "large.txt")
@@ -155,7 +155,7 @@ def test_diff_bounds_large_tracked_file_content(tmp_path: Path) -> None:
 def test_untracked_symlink_diff_does_not_follow_external_content(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-symlink", str(repo), False)
+    prepared = manager.prepare("session-symlink", str(repo))
     secret = tmp_path / "outside-secret.txt"
     secret.write_text("must-not-appear-in-review\n", encoding="utf-8")
     link = prepared.workspace_path / "outside-link"
@@ -174,7 +174,7 @@ def test_untracked_symlink_diff_does_not_follow_external_content(tmp_path: Path)
 def test_diff_bounds_the_combined_inline_patch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-budget", str(repo), False)
+    prepared = manager.prepare("session-budget", str(repo))
     (prepared.workspace_path / "keep.txt").write_text("changed\n", encoding="utf-8")
     (prepared.workspace_path / "remove.txt").write_text("also changed\n", encoding="utf-8")
     monkeypatch.setattr(workspace_module, "MAX_TOTAL_DIFF_BYTES", 1)
@@ -190,7 +190,7 @@ def test_cleanup_snapshot_is_truncated_at_the_combined_patch_budget(
 ) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-snapshot-budget", str(repo), False)
+    prepared = manager.prepare("session-snapshot-budget", str(repo))
     (prepared.workspace_path / "keep.txt").write_text("changed\n", encoding="utf-8")
     (prepared.workspace_path / "large.bin").write_bytes(random.Random(0).randbytes(50_000))
     monkeypatch.setattr(workspace_module, "MAX_TOTAL_DIFF_BYTES", 4_096)
@@ -215,7 +215,7 @@ def test_cleanup_snapshot_keeps_only_the_note_when_the_first_file_exceeds_the_bu
 ) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-snapshot-oversized", str(repo), False)
+    prepared = manager.prepare("session-snapshot-oversized", str(repo))
     (prepared.workspace_path / "large.bin").write_bytes(random.Random(0).randbytes(50_000))
     monkeypatch.setattr(workspace_module, "MAX_TOTAL_DIFF_BYTES", 4_096)
 
@@ -235,7 +235,7 @@ def test_handoff_and_fork_move_a_patch_over_the_cleanup_budget_intact(
 ) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-handoff-budget", str(repo), False)
+    prepared = manager.prepare("session-handoff-budget", str(repo))
     (prepared.workspace_path / "keep.txt").write_text("from task\n", encoding="utf-8")
     (prepared.workspace_path / "new.bin").write_bytes(bytes(range(256)) * 20)
     monkeypatch.setattr(workspace_module, "MAX_TOTAL_DIFF_BYTES", 1)
@@ -254,7 +254,7 @@ def test_handoff_and_fork_move_a_patch_over_the_cleanup_budget_intact(
 def test_failed_snapshot_leaves_no_partial_patch_behind(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-snapshot-failure", str(repo), False)
+    prepared = manager.prepare("session-snapshot-failure", str(repo))
     (prepared.workspace_path / "keep.txt").write_text("changed\n", encoding="utf-8")
 
     with pytest.raises(WorkspaceError):
@@ -266,7 +266,7 @@ def test_failed_snapshot_leaves_no_partial_patch_behind(tmp_path: Path) -> None:
 def test_apply_preflights_and_saves_recovery_patch(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-3", str(repo), False)
+    prepared = manager.prepare("session-3", str(repo))
     (prepared.workspace_path / "keep.txt").write_text("from task\n", encoding="utf-8")
     (prepared.workspace_path / "new.txt").write_text("new\n", encoding="utf-8")
 
@@ -283,7 +283,7 @@ def test_apply_preflights_and_saves_recovery_patch(tmp_path: Path) -> None:
 def test_apply_conflict_does_not_partially_change_source(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-4", str(repo), False)
+    prepared = manager.prepare("session-4", str(repo))
     (prepared.workspace_path / "keep.txt").write_text("from task\n", encoding="utf-8")
     (repo / "keep.txt").write_text("from user\n", encoding="utf-8")
 
@@ -293,20 +293,18 @@ def test_apply_conflict_does_not_partially_change_source(tmp_path: Path) -> None
     assert (repo / "keep.txt").read_text(encoding="utf-8") == "from user\n"
 
 
-def test_non_git_folder_requires_isolation_and_uses_a_managed_copy(tmp_path: Path) -> None:
+def test_a_worktree_needs_a_git_repository_and_a_folder_is_never_copied(tmp_path: Path) -> None:
     folder = tmp_path / "plain"
     folder.mkdir()
     manager = WorkspaceManager(tmp_path / "coding")
-    with pytest.raises(WorkspaceError, match="Local folder isolation was not enabled"):
-        manager.prepare("direct-1", str(folder), False)
-
-    prepared = manager.prepare("direct-2", str(folder), True)
-    assert prepared.kind == WorkspaceKind.local_copy
-    assert prepared.workspace_path != folder.resolve()
-    assert prepared.workspace_path.is_dir()
+    with pytest.raises(WorkspaceError, match="Initialize Git to use a Worktree"):
+        manager.check_source(str(folder))
+    with pytest.raises(WorkspaceError, match="Initialize Git to use a Worktree"):
+        manager.prepare("direct-1", str(folder))
+    assert not (tmp_path / "coding" / "workspaces").exists() or not any((tmp_path / "coding" / "workspaces").iterdir())
 
 
-def test_repository_without_commits_uses_an_isolated_copy(tmp_path: Path) -> None:
+def test_a_repository_without_commits_cannot_start_a_worktree(tmp_path: Path) -> None:
     repo = tmp_path / "empty-repository"
     repo.mkdir()
     git(repo, "init")
@@ -314,18 +312,36 @@ def test_repository_without_commits_uses_an_isolated_copy(tmp_path: Path) -> Non
     manager = WorkspaceManager(tmp_path / "coding")
 
     inspection = manager.inspect(str(repo))
-    prepared = manager.prepare("unborn-1", str(repo), False)
-
     assert inspection.is_git is True
     assert inspection.revision is None
-    assert inspection.warning is None
-    assert prepared.kind == WorkspaceKind.local_copy
-    assert prepared.workspace_path != repo.resolve()
-    assert (prepared.workspace_path / "untracked.txt").read_text(encoding="utf-8") == "source\n"
-    assert manager.git_state(str(repo), str(prepared.workspace_path)).revision is None
+    with pytest.raises(WorkspaceError, match="Make a first commit to use a Worktree"):
+        manager.check_source(str(repo))
+    with pytest.raises(WorkspaceError, match="Make a first commit to use a Worktree"):
+        manager.prepare("unborn-1", str(repo))
 
 
-def test_unborn_repository_copy_never_reviews_or_hands_off_git_metadata(tmp_path: Path) -> None:
+def test_a_folder_without_git_or_commits_is_worked_in_place_without_review(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    (plain / "inner-repo").mkdir(parents=True)
+    git(plain / "inner-repo", "init")
+    empty = tmp_path / "empty-repository"
+    empty.mkdir()
+    git(empty, "init")
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    for folder, repository_root, hint in ((plain, None, "Initialize Git"), (empty, empty.resolve(), "first commit")):
+        prepared = manager.prepare_in_place(str(folder))
+        assert prepared.kind == WorkspaceKind.direct_folder
+        assert prepared.workspace_path == folder.resolve()
+        assert prepared.repository_root == repository_root
+        assert prepared.base_revision is None
+        assert hint in (prepared.warning or "")
+    # A subfolder of a folder of repositories is its own folder, not a repository.
+    assert manager.in_place_root(str(plain / "inner-repo")) == (plain / "inner-repo").resolve()
+    assert manager.in_place_root(str(plain)) == plain.resolve()
+
+
+def test_an_existing_unborn_repository_copy_never_reviews_or_hands_off_git_metadata(tmp_path: Path) -> None:
     source = tmp_path / "repository-container"
     nested = source / "nested"
     nested.mkdir(parents=True)
@@ -333,7 +349,8 @@ def test_unborn_repository_copy_never_reviews_or_hands_off_git_metadata(tmp_path
     git(nested, "init")
     (nested / "file.txt").write_text("base\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("container-1", str(source), False)
+    # Folder copies are no longer made, but tasks that have one keep working.
+    prepared = manager._prepare_local_copy("container-1", source)
 
     assert prepared.kind == WorkspaceKind.local_copy
     git(prepared.workspace_path / "nested", "add", "file.txt")
@@ -354,7 +371,7 @@ def test_unborn_repository_copy_never_reviews_or_hands_off_git_metadata(tmp_path
 def test_cleanup_only_removes_the_managed_task_worktree(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-5", str(repo), False)
+    prepared = manager.prepare("session-5", str(repo))
     (prepared.workspace_path / "uncommitted.txt").write_text("discarded\n", encoding="utf-8")
 
     manager.cleanup(
@@ -431,7 +448,7 @@ def test_local_folder_does_not_require_git_to_be_installed(
     manager = WorkspaceManager(tmp_path / "coding")
 
     inspection = manager.inspect(str(source))
-    prepared = manager.prepare("session-without-git", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("session-without-git", source)
 
     assert inspection.is_git is False
     assert prepared.kind == WorkspaceKind.local_copy
@@ -479,7 +496,7 @@ def test_a_local_copy_is_reviewable_and_applies_back_without_git(
     (source / "notes.txt").write_text("v1\n", encoding="utf-8")
     monkeypatch.setattr(subprocess, "run", missing_git)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("session-review-without-git", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("session-review-without-git", source)
 
     (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
     (prepared.workspace_path / "added.txt").write_text("new\n", encoding="utf-8")
@@ -501,7 +518,7 @@ def prepared_copy(tmp_path: Path, key: str) -> tuple[Path, Path, WorkspaceManage
     (source / "notes.txt").write_text("v1\n", encoding="utf-8")
     (source / "script.sh").write_text("echo hi\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare(key, str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy(key, source)
     return source, prepared.workspace_path, manager
 
 
@@ -567,7 +584,7 @@ def test_a_local_copy_skips_entries_a_copy_cannot_reproduce(tmp_path: Path) -> N
     os.mkfifo(data / "pipe.fifo")
     manager = WorkspaceManager(tmp_path / "coding")
 
-    prepared = manager.prepare("socket-1", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("socket-1", source)
     workspace = prepared.workspace_path
     baseline = manager.local_copies.baselines_root / managed_key("socket-1")
 
@@ -591,7 +608,7 @@ def test_fork_and_cleanup_survive_a_socket_made_inside_the_task(tmp_path: Path) 
     source.mkdir()
     (source / "notes.txt").write_text("v1\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("socket-2", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("socket-2", source)
     workspace = prepared.workspace_path
     # A task that runs a dev server leaves a socket in its own workspace.
     (workspace / "notes.txt").write_text("v2\n", encoding="utf-8")
@@ -636,7 +653,7 @@ def test_a_local_copy_falls_back_to_a_byte_copy_when_the_filesystem_cannot_clone
     attempts = disable_clone(monkeypatch)
     manager = WorkspaceManager(tmp_path / "coding")
 
-    prepared = manager.prepare("fallback-1", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("fallback-1", source)
     workspace = prepared.workspace_path
     baseline = manager.local_copies.baselines_root / managed_key("fallback-1")
 
@@ -663,7 +680,7 @@ def test_a_failed_clone_leaves_no_partial_tree_behind_the_byte_copy(
     monkeypatch.setattr(local_copy_module, "_clone_tree", partial_clone)
     manager = WorkspaceManager(tmp_path / "coding")
 
-    prepared = manager.prepare("partial-1", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("partial-1", source)
 
     assert sorted(path.name for path in prepared.workspace_path.iterdir()) == ["notes.txt"]
 
@@ -683,7 +700,7 @@ def test_a_special_file_in_a_read_only_directory_is_skipped(
         disable_clone(monkeypatch)
     manager = WorkspaceManager(tmp_path / "coding")
     try:
-        prepared = manager.prepare("locked-1", str(source), allow_folder_copy=True)
+        prepared = manager._prepare_local_copy("locked-1", source)
         baseline = manager.local_copies.baselines_root / managed_key("locked-1")
         for root in (prepared.workspace_path, baseline):
             assert (root / "locked" / "notes.txt").read_text(encoding="utf-8") == "v1\n"
@@ -718,11 +735,11 @@ def test_a_failed_copy_with_read_only_directories_can_be_retried(
     try:
         monkeypatch.setattr(local_copy_module.LocalCopyManager, "_copy_tree", classmethod(fail_second_copy))
         with pytest.raises(WorkspaceError):
-            manager.prepare("retry-1", str(source), allow_folder_copy=True)
+            manager._prepare_local_copy("retry-1", source)
         monkeypatch.undo()
 
         # Both partial trees, read-only directories included, were removed.
-        prepared = manager.prepare("retry-1", str(source), allow_folder_copy=True)
+        prepared = manager._prepare_local_copy("retry-1", source)
         assert (prepared.workspace_path / "locked" / "notes.txt").read_text(encoding="utf-8") == "v1\n"
     finally:
         for directory in tmp_path.rglob("locked"):
@@ -745,7 +762,7 @@ def test_a_local_copy_on_apfs_is_a_copy_on_write_clone(monkeypatch: pytest.Monke
     monkeypatch.setattr(shutil, "copytree", lambda *_args, **_kwargs: pytest.fail("byte copy used on APFS"))
     manager = WorkspaceManager(tmp_path / "coding")
 
-    prepared = manager.prepare("clone-1", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("clone-1", source)
     baseline = manager.local_copies.baselines_root / managed_key("clone-1")
     (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
 
@@ -777,7 +794,7 @@ def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
     monkeypatch.setattr(shutil, "copytree", failing_copytree)
 
     with pytest.raises(WorkspaceError, match="notes.txt") as raised:
-        manager.prepare("copy-fail-1", str(source), allow_folder_copy=True)
+        manager._prepare_local_copy("copy-fail-1", source)
 
     # The destination is a managed path under the coding root; a caller cannot
     # act on it, so it stays out of the message.
@@ -792,7 +809,7 @@ def test_handoff_refuses_to_replace_a_live_special_file_in_the_source(tmp_path: 
     bind_socket(data / "cli.sock")
     os.mkfifo(data / "pipe.fifo")
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("collide-1", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("collide-1", source)
 
     # Neither entry was copied, so a task file at the same path looks like a
     # clean addition to every manifest.
@@ -813,7 +830,7 @@ def test_handoff_refuses_a_source_entry_it_cannot_inspect(
     source.mkdir()
     (source / "notes.txt").write_text("v1\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("inspect-1", str(source), allow_folder_copy=True)
+    prepared = manager._prepare_local_copy("inspect-1", source)
     (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
 
     blinded = source / "notes.txt"
@@ -849,7 +866,7 @@ def test_a_copy_error_with_shredded_arguments_still_becomes_a_task_error(
     monkeypatch.setattr(shutil, "copytree", failing_copytree)
 
     with pytest.raises(WorkspaceError):
-        manager.prepare("shredded-1", str(source), allow_folder_copy=True)
+        manager._prepare_local_copy("shredded-1", source)
 
 
 def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:

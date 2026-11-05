@@ -38,8 +38,9 @@ class WorkspaceMode(str, Enum):
 
     The mode is the user's choice; ``WorkspaceKind`` is what preparation
     produced for it. ``in_place`` works in the user's own folder and maps to
-    ``direct_folder``; ``worktree`` isolates the task and maps to
-    ``git_worktree`` or, for a folder without Git, ``local_copy``.
+    ``direct_folder``; ``worktree`` isolates the task in a ``git_worktree``
+    and needs a Git repository with a commit. ``local_copy`` remains only for
+    tasks created before folders stopped being copied.
     """
 
     in_place = "in_place"
@@ -554,9 +555,9 @@ class SessionCreateRequest(BaseModel):
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
     # ``None`` lets the server choose from the project and the computer.
     workspace_mode: WorkspaceMode | None = None
-    # Lets an isolated task on a folder without Git copy that folder. Older
-    # clients send it as ``allow_direct_folder``, a name from before tasks
-    # could run in the folder itself.
+    # Ignored: folders are no longer copied. A folder without Git runs in
+    # place, and Worktree needs a repository. Still accepted, also as
+    # ``allow_direct_folder``, so older clients' requests validate.
     allow_folder_copy: bool = Field(
         default=False,
         validation_alias=AliasChoices("allow_folder_copy", "allow_direct_folder"),

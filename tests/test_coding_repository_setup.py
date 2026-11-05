@@ -152,7 +152,7 @@ def test_conflicting_local_changes_fail_without_touching_either_checkout(tmp_pat
     manager = WorkspaceManager(tmp_path / "runtime")
     index = (repo / ".git/index").read_bytes()
     with pytest.raises(WorkspaceError, match="conflict"):
-        manager.prepare("task", str(repo), True, "old", include_local_changes=True)
+        manager.prepare("task", str(repo), "old", include_local_changes=True)
     assert (repo / "README.md").read_text() == "my work\n"
     assert (repo / ".git/index").read_bytes() == index
     assert not (manager.worktrees_root / "task").exists()
@@ -213,7 +213,7 @@ def test_oversized_changes_fail_without_altering_source_or_leaking_worktree(
     index = (repo / ".git/index").read_bytes()
     monkeypatch.setattr("cowork.coding.workspace.MAX_TOTAL_DIFF_BYTES", 8)
     with pytest.raises(WorkspaceError, match="too large"):
-        manager.prepare("task", str(repo), True, include_local_changes=True)
+        manager.prepare("task", str(repo), include_local_changes=True)
     assert (repo / ".git/index").read_bytes() == index
     assert (repo / "large.txt").read_text() == "a large patch"
     assert not (manager.worktrees_root / "task").exists()
@@ -275,9 +275,9 @@ def test_copy_keeps_temporary_blobs_out_of_source_objects(tmp_path, monkeypatch,
     if reject_patch:
         monkeypatch.setattr("cowork.coding.workspace.MAX_TOTAL_DIFF_BYTES", 8)
         with pytest.raises(WorkspaceError, match="too large"):
-            manager.prepare("task", str(source), True, include_local_changes=True)
+            manager.prepare("task", str(source), include_local_changes=True)
     else:
-        prepared = manager.prepare("task", str(source), True, include_local_changes=True)
+        prepared = manager.prepare("task", str(source), include_local_changes=True)
         assert (prepared.workspace_path / "new.bin").read_bytes() == (source / "new.bin").read_bytes()
         assert (prepared.workspace_path / "README.md").read_text() == "modified working file\n"
     after = {str(path.relative_to(objects)): path.read_bytes() for path in objects.rglob("*") if path.is_file()}
@@ -332,7 +332,7 @@ def test_copy_preserves_worktree_representation_of_filtered_files(tmp_path, trac
     path.write_text("WORKTREE:new\n")
     index = (repo / ".git/index").read_bytes()
     prepared = WorkspaceManager(tmp_path / "runtime").prepare(
-        "task", str(repo), True, include_local_changes=True,
+        "task", str(repo), include_local_changes=True,
     )
     assert (prepared.workspace_path / path.name).read_bytes() == path.read_bytes()
     assert (repo / ".git/index").read_bytes() == index
@@ -345,7 +345,7 @@ def test_copy_rejects_untracked_embedded_repositories_without_losing_files(tmp_p
     index = (repo / ".git/index").read_bytes()
     manager = WorkspaceManager(tmp_path / "runtime")
     with pytest.raises(WorkspaceError, match="embedded repositor"):
-        manager.prepare("task", str(repo), True, include_local_changes=True)
+        manager.prepare("task", str(repo), include_local_changes=True)
     assert (repo / ".git/index").read_bytes() == index
     assert (nested / "README.md").read_text() == "nested\n"
     assert (nested / "untracked.txt").read_text() == "keep this too"
