@@ -21,11 +21,13 @@ tests/test_*_tenancy.py files for conversations, files, schedules and settings.
 from __future__ import annotations
 
 import os
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.session import get_open_session
+from cowork.models.conversation import Conversation
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -185,6 +187,8 @@ def test_shared_resource_authorization_and_contract_through_http(client):
         "canRename": True,
         "canDelete": True,
         "canEditInstructions": True,
+        "canRun": True,
+        "canWriteFiles": True,
         # Org deployments never adopt a folder, so this is always False there.
         "directoryIsExternal": False,
     }
@@ -224,14 +228,17 @@ def test_shared_resource_authorization_and_contract_through_http(client):
     skill = skill_created.json()
     assert skill["attribution"]["createdBy"]["userId"] == USER_A
     assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable", "canShare"}
-    # Hosted org tenancy shares no skill one at a time.
-    assert skill["capabilities"]["canShare"] is False
+    # Sharing in MindsHub mode: the owner chooses who a new skill reaches,
+    # and it starts as theirs alone.
+    assert skill["capabilities"]["canShare"] is True
+    assert (skill["section"], skill["access"]["orgAllowed"]) == ("mine", False)
     denied = client.put(
         f"/api/v1/skills/{skill['id']}",
         json={"instructions": "Peer overwrite"},
         headers=A_PEER,
     )
-    assert denied.status_code == 403, denied.text
+    # A new skill is its creator's alone, so a peer doesn't find it at all.
+    assert denied.status_code == 404, denied.text
     skill_updated = client.put(
         f"/api/v1/skills/{skill['id']}",
         json={"enabled": False},
@@ -657,3 +664,18 @@ def test_member_can_save_and_clear_favicon_without_changing_peers(client):
     )
     assert cleared.status_code == 200, cleared.text
     assert _setting(client, A, "favicon")["value"] == ""
+
+
+def test_a_client_cannot_mark_its_conversation_as_a_channel_conversation(client):
+    created = client.post(
+        "/api/v1/conversations/",
+        json={"topic": "discord: 123", "projectId": _project(client, A), "channelType": "discord"},
+        headers=A,
+    )
+    assert created.status_code == 201, created.text
+
+    session = get_open_session()
+    try:
+        assert session.get(Conversation, UUID(created.json()["id"])).channel_type is None
+    finally:
+        session.close()

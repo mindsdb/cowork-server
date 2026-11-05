@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -128,36 +127,62 @@ async def test_mount_preview_proxy_still_registers_on_desktop(monkeypatch, tmp_p
     get_app_settings.cache_clear()
 
 
-# ─── I5: PDF/Word export can SSRF via the source HTML's own URIs ──
+# ─── I5: export reads only the artifact's own folder; the role check gates it ──
+
+_EXPORT_ARTIFACT_ID = "33333333333343338333333333333333"
+
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fmt", ["pdf", "docx", "PDF", ".docx"])
-async def test_export_pdf_docx_refused_in_org_mode(org_mode, fmt):
+@pytest.mark.parametrize("fmt", ["docx", "html", "pdf"])
+async def test_export_in_org_mode_checks_artifact_manage_before_resolving(
+    org_mode, monkeypatch, fmt
+):
+    """Word export no longer fetches what the source names, so org mode is no
+    longer refused by format. It is refused by the caller's role instead,
+    before any artifact or file is resolved."""
     from fastapi import HTTPException
 
-    from cowork.api.v1.endpoints.artifacts import _ExportBody, export_artifact_endpoint
+    from cowork.api.v1.endpoints import artifact_workspace
+    from cowork.db.scoped import TenantScope
+    from cowork.schemas.artifact_export import ExportRequest
+    from cowork.services import product_permissions
+
+    async def denied(_scope, _permission):
+        return False
+
+    def resolved(*_args):
+        raise AssertionError("an artifact was resolved before the role check")
+
+    monkeypatch.setattr(product_permissions, "has_product_permission", denied)
+    monkeypatch.setattr(artifact_workspace, "_owner_workspace", resolved)
+    session = SimpleNamespace(scope=TenantScope(org_mode=True, org_id="org", user_id="user"))
 
     with pytest.raises(HTTPException) as exc:
-        await export_artifact_endpoint(
-            _ExportBody(path="/tmp/whatever.md", format=fmt), scope=LOCAL_SCOPE
+        await artifact_workspace.export_workspace_artifact(
+            "project", _EXPORT_ARTIFACT_ID, ExportRequest(format=fmt), session
         )
     assert exc.value.status_code == 403
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fmt", ["pdf", "docx"])
-async def test_export_pdf_docx_not_refused_on_desktop(desktop, tmp_path, fmt):
-    """PDF and Word export are default-on desktop paths: the gate widened to
-    `_org_mode() or scope.personal`, both false on desktop, so a desktop export
-    must reach path resolution. The 404 (not 403) proves it got past the gate;
-    it comes before any URI fetch, so nothing is executed."""
+@pytest.mark.parametrize("fmt", ["docx", "html"])
+async def test_export_on_desktop_reaches_artifact_resolution(desktop, monkeypatch, fmt):
+    """The desktop passes the role check and reaches artifact resolution: the
+    404 for an artifact nobody has (not a 403) proves no format gate stands in
+    front, and it comes before any file is read."""
     from fastapi import HTTPException
 
-    from cowork.api.v1.endpoints.artifacts import _ExportBody, export_artifact_endpoint
+    from cowork.api.v1.endpoints import artifact_workspace
+    from cowork.schemas.artifact_export import ExportRequest
+
+    def missing(*_args):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    monkeypatch.setattr(artifact_workspace, "review_artifact_for_request", missing)
 
     with pytest.raises(HTTPException) as exc:
-        await export_artifact_endpoint(
-            _ExportBody(path=str(tmp_path / "missing.md"), format=fmt), scope=LOCAL_SCOPE
+        await artifact_workspace.export_workspace_artifact(
+            "local", _EXPORT_ARTIFACT_ID, ExportRequest(format=fmt), SimpleNamespace(scope=LOCAL_SCOPE)
         )
     assert exc.value.status_code == 404
 
@@ -175,21 +200,17 @@ async def test_open_not_refused_on_desktop(desktop, tmp_path):
     assert exc.value.status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_export_html_not_refused_in_org_mode(org_mode, tmp_path):
-    """Guard against the I5 fix being a blanket export ban: HTML export does
-    no URI resolution (no fetch, no local read beyond the source itself), so
-    it stays available. The 404 below (not 403) proves the request reached
-    path resolution instead of being stopped by the export guard."""
-    from fastapi import HTTPException
+def test_the_path_export_route_is_gone(desktop):
+    """The old route took an absolute server path and fetched what the source
+    named. Nothing keeps it alive: no alias, no redirect."""
+    from fastapi.testclient import TestClient
 
-    from cowork.api.v1.endpoints.artifacts import _ExportBody, export_artifact_endpoint
+    from cowork.server import create_app
 
-    with pytest.raises(HTTPException) as exc:
-        await export_artifact_endpoint(
-            _ExportBody(path=str(tmp_path / "missing.md"), format="html"), scope=LOCAL_SCOPE
-        )
-    assert exc.value.status_code == 404
+    response = TestClient(create_app()).post(
+        "/api/v1/artifacts/export", json={"path": "/tmp/whatever.md", "format": "html"}
+    )
+    assert response.status_code in (404, 405)
 
 
 # ─── C2: apply_env_to_process would pollute this whole process's env ──

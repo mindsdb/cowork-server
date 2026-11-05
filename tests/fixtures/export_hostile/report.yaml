@@ -1,0 +1,19 @@
+# The report from the manual check: art/report.html beside art/chart.png,
+# with other/secret.txt in another partition. Exported to Word, it keeps the
+# chart and the one link, and lists exactly these two references in omitted.
+# Placeholders: see tests/test_export_hostile.py.
+
+html: |
+  <!DOCTYPE html [<!ENTITY x SYSTEM "{server_url}/e">]>
+  <html><head><title>Report</title></head><body>
+  <p>entity: &x;</p>
+  <xi:include href="{server_url}/x"/>
+  <p><a href="https://example.com/">site</a></p>
+  <p><img src="chart.png" alt="chart"></p>
+  <p><img src="../other/secret.txt" alt="secret"></p>
+  <p><img src="{server_url}/img.png" alt="remote"></p>
+  </body></html>
+omitted:
+  - [traversal, ../other/secret.txt]
+  - [scheme, "{server_url}/img.png"]
+link: https://example.com/

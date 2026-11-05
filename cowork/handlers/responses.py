@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cache, partial
@@ -35,6 +35,7 @@ from cowork.handlers.first_take import FirstTake, clears_take as first_take_clea
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    DIRECT_HARNESS,
     _MAX_HISTORY_MESSAGES,
     _settings_binding,
     _text_history,
@@ -98,6 +99,8 @@ from cowork.handlers.turn_errors import (
     SERVER_BUSY_CODE,
     STALLED_CODE,
     STALLED_TURN_MESSAGE,
+    TURN_LOST_CODE,
+    TURN_LOST_MESSAGE,
     auth_error_detail,
     friendly_turn_error,
     gate_reset_at,
@@ -111,6 +114,7 @@ from cowork.handlers.turn_errors import (
     server_busy_message,
 )
 from cowork.db.scoped import (
+    MissingTenantScopeError,
     ScopedSession,
     scope_from_principal,
     unsafe_unscoped_session,
@@ -119,13 +123,16 @@ from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
+from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService
 from cowork.services.settings import SettingService
-from cowork.services.skills import SkillService
+from cowork.schemas.turn_skills import TurnSkills
+from cowork.services.skill_sharing import SkillViewer, sharing_applies
+from cowork.services.skills import SkillService, has_always_on_skills
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
 
 
@@ -233,9 +240,11 @@ async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bo
     """Whether a remote ``turn_failed`` is the user's own Stop, not a failure.
 
     ``REMOTE_CANCEL_LITERAL`` is proof on its own. ``REMOTE_CANCEL_VIA_FAIL_JOB``
-    is not: a controller replica taking SIGTERM mid-turn unwinds through the
-    same handler that a keepalive-driven cancel does, so the string cannot tell
-    a Stop from a rolling deploy killing the turn.
+    is not: a controller replica without a shutdown drain sends it too when its
+    whole process is cancelled mid-turn, as SIGINT in a local run does, through
+    the same handler that a keepalive-driven cancel uses. So the string cannot
+    tell a Stop from the process ending the turn. A hosted SIGTERM never takes
+    that path: such a controller runs as PID 1 and ignores it.
 
     The cancel flag separates them. ``/cancel`` writes it, the producer clears
     a stale one before each turn, and the keepalive-driven path never clears
@@ -305,11 +314,12 @@ async def _seal_unterminated_buffer(
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
 
-    ``request_id`` is the producing turn's own correlation id — the remote
-    one for ``_produce_remote``, the locally minted one for ``_run_turn``.
-    This is the hardest-failing turn (one that escaped every named ``except``),
-    so it's exactly the one a user is most likely to report. Still optional:
-    the direct/channel producers have no such id to offer.
+    ``request_id`` is the producing turn's own correlation id — the remote one
+    for ``_produce_remote``, the locally minted one for ``_run_turn``, the
+    caller's ``direct-`` id for ``_produce_direct``. This is the hardest-failing
+    turn (one that escaped every named ``except``), so it's exactly the one a
+    user is most likely to report. Every producer that reaches this now has one;
+    the parameter stays optional only so a test double can omit it.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
@@ -383,9 +393,13 @@ class _TurnStart:
     conversation_id: UUID
     turn_id: int
     # The gate's history: user and assistant rows, oldest first, at most
-    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape skips the gate, and
-    # None when the read failed, which sends the turn to the agent.
+    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape or an always-on
+    # skill skips the gate, and None when the history or always-on read
+    # failed, which sends the turn to the agent.
     gate_rows: list[Message] | None
+    # Whether an always-on skill reaches the turn (has_always_on_skills),
+    # which sends it to the agent: the gate's answer would not follow it.
+    always_on_skills: bool = False
 
 
 @dataclass(frozen=True)
@@ -413,6 +427,25 @@ class _SavedAnswer:
     def assistant_message_id(self) -> str | None:
         """The row's id as the terminal frames carry it, or None."""
         return str(self.message_id) if self.message_id is not None else None
+
+
+# Saves that outlived the wait in _saved_by. Held here because the event loop
+# keeps only a weak reference to a task.
+_saves_past_their_deadline: set[asyncio.Task] = set()
+
+
+async def _saved_by(save: Awaitable[_SavedAnswer], *, deadline: float) -> _SavedAnswer:
+    """Run ``save`` in its own task and wait for it until the loop time
+    ``deadline``. One still running then goes on in the background and this
+    returns an empty _SavedAnswer, which names no row and no failure."""
+    task = asyncio.ensure_future(save)
+    loop = asyncio.get_running_loop()
+    await asyncio.wait([task], timeout=max(0.0, deadline - loop.time()))
+    if task.done():
+        return task.result()
+    _saves_past_their_deadline.add(task)
+    task.add_done_callback(_saves_past_their_deadline.discard)
+    return _SavedAnswer()
 
 
 @dataclass(frozen=True)
@@ -512,6 +545,42 @@ class _RemoteTurnInputs:
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
     files: AgentFiles | None
+    # The skills the caller sees, the pod's whole recallable set
+    # (remote_turn_skills); empty when they see none.
+    skills: TurnSkills
+
+
+def remote_turn_skills(
+    session: ScopedSession, conv_id: UUID, *, viewer: SkillViewer | None = None
+) -> TurnSkills:
+    """The skills block for a cloud turn's request: every skill the pod's
+    agent may recall in it, and the always-on ones flagged and first
+    (cowork.services.skills.build_turn_skills). In MindsHub mode only the
+    skills ``viewer`` sees; without one (a scheduled or channel turn, or one
+    whose teams couldn't be read) the fail-closed viewer's.
+
+    Never None: the pod's anton recalls only what a block names, and falls
+    back to whatever org skills tree its pod mounts for a request without
+    one, which can hold every member's skills, so every turn path sends one.
+    A failure sends an empty block, a turn with no skills, rather than
+    failing the turn or leaving the pod to fall back.
+    """
+    from cowork.services.skills import build_turn_skills
+
+    try:
+        conversation = ConversationService(session).get_conversation(conv_id)
+        return build_turn_skills(
+            session.scope,
+            project_name=conversation.project.name,
+            viewer=viewer,
+            session=session,
+        )
+    except Exception:
+        logger.exception(
+            "[responses] failed to build the turn's skills; sending none",
+            extra=log_context(conversation_id=conv_id),
+        )
+        return {}
 
 
 @dataclass
@@ -554,6 +623,12 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
             retry_after=retry_after, retry_at=retry_at_instant(retry_after), request_id=request_id,
         )
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
+
+
+def _last_answer_harness(rows: list[Message]) -> str | None:
+    """The harness of the newest assistant row in `rows`, oldest first; None without one."""
+    answer = next((row for row in reversed(rows) if row.role == Role.assistant), None)
+    return None if answer is None else answer.harness
 
 
 def _first_take_binding(
@@ -616,9 +691,24 @@ def _start_first_take(
 
 
 class ResponsesHandler:
-    def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        principal: Principal | None = None,
+        interactive: bool = True,
+        mindshub_bearer: str = "",
+    ) -> None:
         self.principal = principal
         self.scope = scope_from_principal(principal)
+        # The Authorization the gateway validated (cowork.principal.caller_bearer),
+        # used only to read the caller's teams and permissions for skill
+        # sharing. Empty for a turn with no caller present, such as a
+        # scheduled one: that turn gets the fail-closed set, without skills
+        # shared only with a team.
+        self.mindshub_bearer = mindshub_bearer
+        # Skill sharing's view of the caller in MindsHub mode, resolved once
+        # per remote turn before its inputs are read (remote_turn_skills).
+        self._skill_viewer: SkillViewer | None = None
         # The harness this turn runs: the request's own pick or the stored
         # setting, resolved by handle() from the settings its first unit reads.
         # Anton itself is built lazily, only after Cowork delegates a turn:
@@ -670,6 +760,9 @@ class ResponsesHandler:
         # in this request's context, so the vault's secrets are registered
         # first. It needs only the scope.
         await register_vault_secrets(self.scope)
+        # The unit reads which always-on skills reach the caller, so their
+        # teams are read first (cached per caller). A no-op outside MindsHub mode.
+        await self._resolve_skill_viewer(self.scope)
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
@@ -699,6 +792,7 @@ class ResponsesHandler:
                     gate_rows=start.gate_rows,
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
+                    has_always_on_skills=start.always_on_skills,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -717,10 +811,18 @@ class ResponsesHandler:
                 **({"response_router_model": route.model} if route.model else {}),
                 **({"response_route_fallback": "true"} if route.fallback else {}),
             }
-            logger.info(
-                "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
-                route.route, route.reason, route.fallback, route.provider, route.model,
-                start.conversation_id,
+            # Fields, not template values: the log formatter drops those. A
+            # fallback is WARNING so the default level keeps it.
+            logger.log(
+                logging.WARNING if route.fallback else logging.INFO,
+                "Router fell back to the agent" if route.fallback else "Router chose the turn's route",
+                extra={
+                    "event": "router_fallback" if route.fallback else "router_route",
+                    "outcome": route.route,
+                    "reason": route.reason,
+                    "provider": route.provider,
+                    **log_context(conversation_id=start.conversation_id),
+                },
             )
 
             if route.route == DIRECT_CONTEXT and first_take is not None:
@@ -834,7 +936,7 @@ class ResponsesHandler:
                 partial(_conversation_for_harness, conversation_id=start.conversation_id),
                 scope=self.scope,
             )
-            with use_settings_scope(self.scope):
+            with use_settings_scope(self.scope), use_live_app_launcher(self.principal):
                 stream = harness.stream_response(
                     conversation=conversation,
                     input=start.harness_input,
@@ -937,16 +1039,25 @@ class ResponsesHandler:
         # this is a stable per-conversation index for the buffer file.
         turn_id = conversation_service.message_count(conversation)
 
-        # Shape checks first: a turn the gate cannot route skips the history
-        # read, as _route_request skips the gate.
+        # Shape checks first, then the always-on skills: a turn the gate
+        # cannot route skips the history read, as _route_request skips the gate.
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
+        always_on_skills = False
         if ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
         ) is None:
-            gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
+            reaches = self._reads_always_on_skills(session, conversation=conversation)
+            if reaches is None:
+                # The read failed: the turn goes to the agent as when the
+                # history read fails.
+                gate_rows = None
+            elif reaches:
+                always_on_skills = True
+            else:
+                gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
 
         return _TurnStart(
             settings=settings,
@@ -955,7 +1066,34 @@ class ResponsesHandler:
             conversation_id=conversation_id,
             turn_id=turn_id,
             gate_rows=gate_rows,
+            always_on_skills=always_on_skills,
         )
+
+    def _reads_always_on_skills(self, session: ScopedSession, *, conversation: Conversation) -> bool | None:
+        """Whether an always-on skill reaches this turn in MindsHub mode, for
+        the viewer handle() resolved (has_always_on_skills). None when the
+        read fails: like a failed history read, that sends the turn to the
+        agent as a fallback, so the gate never answers past a skill it could
+        not check, and the route names no skill that may not exist."""
+        if not sharing_applies(session.scope):
+            return False
+        try:
+            return has_always_on_skills(
+                session.scope,
+                project_name=conversation.project.name,
+                viewer=self._skill_viewer,
+                session=session,
+            )
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.exception(
+                "[responses] could not read the turn's always-on skills; delegating",
+                extra=log_context(conversation_id=conversation.id),
+            )
+            # Rolling back loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return None
 
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
@@ -984,6 +1122,7 @@ class ResponsesHandler:
         gate_rows: list[Message] | None,
         has_attachments: bool,
         has_disabled_connections: bool,
+        has_always_on_skills: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -994,7 +1133,9 @@ class ResponsesHandler:
         or cancel once the route is known.
 
         `gate_rows` is the history handle()'s first unit read for the gate
-        (see _TurnStart).
+        (see _TurnStart). `has_always_on_skills` delegates the turn without a
+        gate call: an always-on skill applies to every answer, and only the
+        agent's prompt carries it.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1011,6 +1152,8 @@ class ResponsesHandler:
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
+        if has_always_on_skills:
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="always_on_skills"), None
         if gate_rows is None:
             # The history read failed. Like any other gate failure, the turn
             # goes to the agent rather than failing.
@@ -1089,6 +1232,7 @@ class ResponsesHandler:
                         has_non_text_input=has_non_text_input,
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
+                        after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
                         binding=binding,
                         binding_factory=binding_for_turn,
                     )
@@ -1097,12 +1241,18 @@ class ResponsesHandler:
                     # WARNING (app_settings.py's own default too), so an info-level
                     # line here is silently dropped everywhere it would actually
                     # be read from — found live on staging, zero [gate] lines
-                    # across 8 real requests until this was bumped.
+                    # across 8 real requests until this was bumped. Fields, not
+                    # template values: the log formatter drops those.
                     logger.warning(
-                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
-                        "provider=%s model=%s gate_ms=%d",
-                        conversation_id, correlation_id, decision.route, decision.reason,
-                        decision.provider, decision.model, gate_ms,
+                        "Router gate decided the turn's route",
+                        extra={
+                            "event": "router_gate_decided",
+                            "outcome": decision.route,
+                            "reason": decision.reason,
+                            "provider": decision.provider,
+                            "duration_ms": gate_ms,
+                            **log_context(conversation_id=conversation_id),
+                        },
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
                     # would make a ready gate decision wait for Jev, exactly the
@@ -1196,6 +1346,12 @@ class ResponsesHandler:
 
         `question` is the text the turn was sent with (prompt_text), which a
         figure in the answer may repeat."""
+        # One id for the turn, not one per consumer: both halves quote it on a
+        # failure. The streaming half also carries it on the turn's identity,
+        # which registry.start records in the turn index on the Redis backend,
+        # so there the Reference a user reports resolves in the index too; the
+        # non-streaming half leaves only the log line.
+        corr = f"direct-{uuid4()}"
         if not request.stream:
             text = route.text
             sources = await self._direct_figure_sources(
@@ -1215,12 +1371,34 @@ class ResponsesHandler:
                 service = ConversationService(session)
                 user_message = service.save_user_message(conversation_id, original_content)
                 assistant_message = service.save_assistant_turn(
-                    conversation_id, text, events, harness="cowork-direct",
+                    conversation_id, text, events, harness=DIRECT_HARNESS,
                 )
                 return _turn_anchor_id(user_message, assistant_message)
 
-            async with conversation_writes(conversation_id):
-                anchor_id = await run_db(save_turn, scope=self.scope)
+            try:
+                async with conversation_writes(conversation_id):
+                    anchor_id = await run_db(save_turn, scope=self.scope)
+            except (MissingTenantScopeError, PoolTimeoutError):
+                # server.py classifies both on purpose: a missing org scope is a
+                # 401, and a database with no free connection (DatabaseBusy
+                # included) is a 503 with Retry-After. The blanket clause below
+                # would answer either as a 500.
+                raise
+            except Exception:
+                # Without this the escape reaches the client as Starlette's bare
+                # 500: no body, no code, no id. Same shape the delegated
+                # non-streaming path raises, so a caller reads one body whichever
+                # producer answered.
+                logger.exception(
+                    "[responses] direct turn failed",
+                    extra=log_context(request_id=corr, conversation_id=conversation_id),
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=response_failed_payload(
+                        GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    ),
+                )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
@@ -1228,7 +1406,7 @@ class ResponsesHandler:
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
-        lifecycle = TurnLifecycle()
+        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr))
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -1240,6 +1418,7 @@ class ResponsesHandler:
                 question=question,
                 route=route,
                 buffer=buffer,
+                request_id=corr,
             ),
             org_id=self.scope.org_id,
             user_id=self.scope.user_id,
@@ -1273,6 +1452,7 @@ class ResponsesHandler:
         question: str,
         route: RouteDecision,
         buffer,
+        request_id: str,
     ) -> None:
         """Persist and emit a direct answer using the normal detached lifecycle.
 
@@ -1284,7 +1464,11 @@ class ResponsesHandler:
 
         The save, the frames that report it and the terminal record are one
         step a Stop cannot split: a Stop that lands during the save waits for
-        it, so the stream ends with what the database holds."""
+        it, so the stream ends with what the database holds.
+
+        ``request_id`` is the turn's correlation id, minted by the caller and
+        carried on the turn's identity, so that on the Redis backend the same
+        value reaches the turn index through ``registry.start``."""
         item_id = f"msg-{conv_id.hex[:12]}"
         delta = {
             "type": "response.output_text.delta",
@@ -1304,7 +1488,7 @@ class ResponsesHandler:
             service = ConversationService(session)
             user_message = service.save_user_message(conv_id, original_content)
             assistant_message = service.save_assistant_turn(
-                conv_id, route.text, events, harness="cowork-direct",
+                conv_id, route.text, events, harness=DIRECT_HARNESS,
             )
             return _DirectTurn(
                 user_message_id=user_message.id,
@@ -1342,7 +1526,7 @@ class ResponsesHandler:
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "run_id": lifecycle.identity.run_id,
-                "harness": "cowork-direct",
+                "harness": DIRECT_HARNESS,
                 "user_message_id": str(saved.user_message_id),
                 "response": response.model_dump(),
             })})
@@ -1388,14 +1572,17 @@ class ResponsesHandler:
                 # frame says so with the wait, as a refused request's 503 does.
                 logger.warning(
                     "[responses] direct turn for conversation %s found no free database connection",
-                    conv_id,
+                    conv_id, extra=log_context(request_id=request_id, conversation_id=conv_id),
                 )
             else:
-                logger.exception("[responses] direct turn failed", extra=log_context(conversation_id=conv_id))
-            await buffer.append("sse", {"sse": _failed_frame_for(exc)})
+                logger.exception(
+                    "[responses] direct turn failed",
+                    extra=log_context(request_id=request_id, conversation_id=conv_id),
+                )
+            await buffer.append("sse", {"sse": _failed_frame_for(exc, request_id=request_id)})
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=request_id)
 
     def _select_producer(
         self,
@@ -1462,17 +1649,31 @@ class ResponsesHandler:
             first_take=first_take,
         )
 
+    async def _resolve_skill_viewer(self, scope) -> None:
+        """Skill sharing's view of the caller in MindsHub mode, for this
+        turn's skills. Never fails the turn: a failure leaves the fail-closed
+        view (build_turn_skills)."""
+        from cowork.services.skill_sharing import resolve_skill_viewer
+
+        try:
+            self._skill_viewer = await resolve_skill_viewer(
+                scope=scope, principal=self.principal, bearer_token=self.mindshub_bearer
+            )
+        except Exception:
+            logger.warning("[responses] could not resolve the caller's teams for skills", exc_info=True)
+            self._skill_viewer = None
+
     @staticmethod
     def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
-        """Stage the project-level files the pod can't otherwise see — the
-        conversation's attachments and the project's anton.md instructions —
+        """Stage the project-level files the pod can't otherwise see (the
+        conversation's attachments and the project's anton.md instructions)
         into the conversation workspace on the shared mount, and seed this
         org's skill store with the packaged builtins if it hasn't been yet.
 
-        The seeding call belongs here, not just behind ``GET /skills``: the pod
-        reads skills straight off the shared mount (no payload), so this is the
-        only place that runs on every remote turn and can catch an org that
-        chats before it ever opens the skills menu. Never fails the turn: a
+        The seeding call belongs here, not just behind ``GET /skills``: this
+        runs before every remote turn, web or channel, and catches an org that
+        chats before it ever opens the skills menu, as the turn's skills block
+        (remote_turn_skills) seeds again. Never fails the turn: a
         staging error degrades to a turn without the missing piece."""
         try:
             from cowork.services.artifact_roots import project_artifacts_base
@@ -1639,11 +1840,20 @@ class ResponsesHandler:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
 
+        Honours the user's memory settings the way the desktop harness does:
+        memory disabled, or the mode "off", writes nothing. A settings read that
+        fails writes nothing either, like every other error on this path.
+
         Never fails the turn — a lost memory is recoverable, a lost reply isn't.
         """
         if not entries:
             return
         try:
+            settings = get_user_settings(session.scope)
+            if not settings.memory_enabled or settings.memory_mode == "off":
+                logger.info("[responses] memory is off; dropped %d memory entr(ies) for conversation %s",
+                            len(entries), conv_id, extra=log_context(conversation_id=conv_id))
+                return
             conversation = ConversationService(session).get_conversation(conv_id)
             from cowork.models.project import Project
             from cowork.services.shared_resources import (
@@ -1702,6 +1912,7 @@ class ResponsesHandler:
             workspace=workspace,
             started_at=self._remote_started_at(session, conv_id),
             files=self._remote_agent_files(session, conv_id, workspace=workspace),
+            skills=remote_turn_skills(session, conv_id, viewer=self._skill_viewer),
         )
 
     @staticmethod
@@ -1957,7 +2168,10 @@ class ResponsesHandler:
             turn_artifacts.recorded = True
             directory = turn_artifacts.directory
             try:
-                changes = turn_artifact_changes(
+                # It waits on each touched artifact's lock and parses its
+                # journal, so it runs off the event loop the server shares.
+                changes = await asyncio.to_thread(
+                    turn_artifact_changes,
                     conversation_id=conv_id,
                     artifacts_base=directory.base,
                     before=turn_artifacts.before_slugs,
@@ -2075,6 +2289,10 @@ class ResponsesHandler:
                 await buffer.append("sse", {"sse": self._inject_completion_id(completed_frame, saved.message_id)})
             await buffer.close("completed")
 
+        async def save_as_it_stands() -> _SavedAnswer:
+            await record_artifacts(completed_cleanly=False)
+            return await persist(clean=False)
+
         async def end_turn(
             reason: TerminalReason, failed_frame: Callable[[str | None], str] | None = None,
         ) -> None:
@@ -2083,9 +2301,17 @@ class ResponsesHandler:
             and the terminal record. The cancel and error branches below run it
             under run_to_completion, so a second Stop or a shutdown that lands
             during a save waits for it, and the stream still ends the way this
-            turn did."""
-            await record_artifacts(completed_cleanly=False)
-            saved = await persist(clean=False)
+            turn did.
+
+            A turn a shutdown ended waits for its save only until
+            ``lifecycle.shutdown_frame_deadline``, so its frame reaches the
+            open stream before Uvicorn's request drain cuts it. A save still
+            running then goes on in the background, and the frame carries no
+            row id, as a failed save's does."""
+            if lifecycle.shutdown_frame_deadline is None:
+                saved = await save_as_it_stands()
+            else:
+                saved = await _saved_by(save_as_it_stands(), deadline=lifecycle.shutdown_frame_deadline)
             if lifecycle.discarded:
                 # Deleted while it saved: see finish().
                 return
@@ -2131,6 +2357,9 @@ class ResponsesHandler:
             # compaction against exactly the history seeded here, so
             # re-reading it when the reply arrives could map the count onto a
             # different list.
+            # The caller's teams and permissions, read from MindsHub (cached
+            # per caller) before the seed, which selects the skills they see.
+            await self._resolve_skill_viewer(scope)
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
@@ -2163,10 +2392,12 @@ class ResponsesHandler:
                 model=model,
                 turn_id=turn_id,
                 history=seed.history,
-                # Global memory and skills use read-only mounts. Project
-                # memory is outside the conversation workspace and therefore
-                # travels as a bounded, sheddable wire block.
+                # Global memory uses a read-only mount. Project memory is
+                # outside the conversation workspace and therefore travels as
+                # a bounded, sheddable wire block. Skills travel as the
+                # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
+                skills=seed.skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
@@ -2384,7 +2615,8 @@ class ResponsesHandler:
             if interrupted or lifecycle.stalled:
                 # Same split as _run_turn's branch; see there.
                 message, code = (
-                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    (TURN_LOST_MESSAGE, TURN_LOST_CODE) if lifecycle.shutting_down
+                    else (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
                     else (STALLED_TURN_MESSAGE, STALLED_CODE)
                 )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
@@ -2429,7 +2661,7 @@ class ResponsesHandler:
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
-        with use_settings_scope(scope_from_principal(self.principal)):
+        with use_settings_scope(scope_from_principal(self.principal)), use_live_app_launcher(self.principal):
             try:
                 await self._run_turn(**kwargs)
             finally:
@@ -2620,7 +2852,7 @@ class ResponsesHandler:
             # The ticker stops before finish() or any branch below closes the
             # buffer, so it can never write after the terminal record.
             async with model_wait.running(buffer=buffer):
-                async for sse_string in harness.formatter(stream, model, event_sink):
+                async for sse_string in harness.formatter(stream, model, event_sink, form_blocks=True):
                     if lifecycle.discarded:
                         # A frame sent after a turn delete's cancel landed, such
                         # as the turn's memory record: the delete removed this
@@ -2674,7 +2906,8 @@ class ResponsesHandler:
             interrupted = lifecycle.shutting_down or lifecycle.timed_out
             if interrupted or lifecycle.stalled:
                 message, code = (
-                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    (TURN_LOST_MESSAGE, TURN_LOST_CODE) if lifecycle.shutting_down
+                    else (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
                     else (STALLED_TURN_MESSAGE, STALLED_CODE)
                 )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
@@ -2827,10 +3060,12 @@ class ResponsesHandler:
             # Set after the branches above, each of which REPLACES `extra`
             # rather than adding to it — seeding it earlier would survive only
             # the unmapped path. Carried on every failure so the payload shape
-            # stays uniform, but only the unmapped branch tags its log line
-            # with the id, so a curated failure can reach the log with nothing
-            # to match a quoted reference against. The client renders it on
-            # the generic card alone, so there is nothing to quote for one.
+            # stays uniform. Both branches tag their log line with the id, but
+            # only the unmapped one does so above the deployed level floor:
+            # the curated line is INFO and staging/prod run at WARNING, so a
+            # curated failure's id can reach the log with nothing to match. The
+            # client renders it on the generic card alone, so there is nothing
+            # to quote for one anyway.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             # Append to collected_events BEFORE persisting — persist()

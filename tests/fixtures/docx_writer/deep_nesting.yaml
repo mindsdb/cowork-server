@@ -1,0 +1,10 @@
+# html is open * repeat + "deep text" + close * repeat + "<p>after</p>".
+# Each must convert without a RecursionError. The parser stops at depth 256,
+# so each document ends with the closing note.
+- {name: divs, open: "<div>", close: "</div>", repeat: 5000}
+- {name: inline_bold, open: "<b>", close: "</b>", repeat: 5000}
+- {name: lists, open: "<ul><li>", close: "</li></ul>", repeat: 2000}
+- {name: ordered_lists, open: "<ol><li>", close: "</li></ol>", repeat: 2000}
+- {name: tables, open: "<table><tr><td>", close: "</td></tr></table>", repeat: 400}
+- {name: blockquotes, open: "<blockquote>", close: "</blockquote>", repeat: 5000}
+- {name: links_in_spans, open: '<span><a href="https://example.com/">', close: "</a></span>", repeat: 3000}

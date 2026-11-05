@@ -38,6 +38,28 @@ async def test_list_connections_flattens_the_catalogue(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_connections_passes_on_needs_reconnect_only(monkeypatch):
+    async def fake_proxy_catalogue(request, settings):
+        return {
+            "items": [
+                {
+                    "id": "hubspot",
+                    "connections": [
+                        {"engine": "hubspot", "name": "revoked", "user_label": "a@b.com", "status": "needs_reconnect"},
+                        {"engine": "hubspot", "name": "healthy", "user_label": "c@d.com", "status": "active"},
+                    ],
+                },
+            ]
+        }
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_catalogue", fake_proxy_catalogue)
+
+    result = await connections_endpoints.list_connections(ORG_SCOPE, FakeRequest())
+
+    assert {c.name: c.status for c in result} == {"revoked": "needs_reconnect", "healthy": None}
+
+
+@pytest.mark.asyncio
 async def test_get_connection_surfaces_non_secret_fields_only(monkeypatch):
     async def fake_proxy_connection_detail(engine, name, request, settings):
         assert engine == "google_drive" and name == "work"

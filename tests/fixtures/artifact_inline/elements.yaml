@@ -1,0 +1,267 @@
+# Each case runs in every mode unless `modes` names some. `present` and
+# `absent` are substrings of the output HTML; `omitted` is the exact list of
+# [reason, reference] pairs, in document order (empty when left out).
+# `{outside}` is a 127.0.0.1 recording server that must see no request.
+
+- id: noscript-goes-with-its-content
+  html: '<noscript><p>NOSCRIPT-TEXT</p></noscript><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['noscript', 'NOSCRIPT-TEXT']
+
+- id: iframe-goes-with-srcdoc-and-content
+  html: '<iframe src="{outside}/frame" srcdoc="&lt;p&gt;SRCDOC&lt;/p&gt;">IFRAME-TEXT</iframe><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['iframe', 'SRCDOC', 'IFRAME-TEXT']
+  omitted: [[scheme, '{outside}/frame']]
+
+- id: frame-is-void-so-what-follows-stays
+  html: '<div><frame src="{outside}/frame">FRAME-AFTER</div>'
+  present: ['<div>FRAME-AFTER</div>']
+  absent: ['<frame']
+  omitted: [[scheme, '{outside}/frame']]
+
+- id: object-and-its-params
+  html: '<object data="{outside}/object" type="text/html"><param name="movie" value="{outside}/movie">OBJECT-TEXT</object><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['object', 'param', 'OBJECT-TEXT', 'movie']
+  omitted: [[scheme, '{outside}/object']]
+
+- id: embed-is-void-so-what-follows-stays
+  html: '<div><embed src="{outside}/embed"><p>kept</p></div>'
+  present: ['<p>kept</p>']
+  absent: ['embed']
+  omitted: [[scheme, '{outside}/embed']]
+
+- id: applet
+  html: '<applet code="A.class" codebase="{outside}/" archive="{outside}/a.jar">APPLET-TEXT</applet><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['applet', 'APPLET-TEXT']
+  omitted: [[scheme, '{outside}/'], [scheme, '{outside}/a.jar']]
+
+- id: portal
+  html: '<portal src="{outside}/portal">PORTAL-TEXT</portal><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['portal', 'PORTAL-TEXT']
+  omitted: [[scheme, '{outside}/portal']]
+
+- id: base-never-moves-references
+  html: '<html><head><base href="{outside}/"></head><body><img src="chart.png"></body></html>'
+  present: ['<img src="data:image/png;base64,']
+  absent: ['<base', '{outside}']
+
+- id: meta-other-than-the-output-charset
+  html: '<html><head><meta http-equiv="refresh" content="0;url={outside}/refresh"><meta name="viewport" content="width=device-width"><meta charset="windows-1252"></head><body>x</body></html>'
+  present: ['<head><meta charset="utf-8"></head>']
+  absent: ['refresh', 'viewport', 'windows-1252']
+
+- id: link-elements
+  html: '<html><head><link rel="stylesheet" href="{outside}/style.css"><link rel="icon" href="favicon.png"><link rel="preconnect" href="#x"></head><body>x</body></html>'
+  absent: ['<link', 'style.css', 'favicon']
+  omitted: [[scheme, '{outside}/style.css'], [unsupported_type, favicon.png]]
+
+# The artifact's own stylesheet takes its link's place in a style element,
+# spliced as an @import of it would be, under the same caps.
+- id: own-linked-stylesheet-splices-in
+  html: '<html><head><link rel="Stylesheet" href="css/more.css" media="print" crossorigin="anonymous" onload="alert(1)"></head><body>x</body></html>'
+  present: ['<head><meta charset="utf-8"><style media="print">.more{background:url(data:image/png;base64,']
+  absent: ['<link', 'crossorigin', 'onload', 'more.css']
+  inlined: [css/more.css, css/inner.png]
+
+- id: own-linked-stylesheet-in-the-body
+  html: '<p>a<link rel="stylesheet" href="css/d4.css">b</p>'
+  present: ['<style>.d4{color:red;}</style>']
+  absent: ['<link']
+  inlined: [css/d4.css]
+
+- id: own-linked-stylesheet-imports-nest-as-deep-as-an-import
+  html: '<link rel="stylesheet" href="css/d1.css"><p>x</p>'
+  present: ['.d1{color:red;}', '.d2{color:red;}', '.d3{color:red;}']
+  absent: ['.d4', '@import', '<link']
+  omitted: [[budget, d4.css]]
+
+- id: own-linked-stylesheet-is-escaped
+  html: '<link rel="stylesheet" href="css/angles.css"><p>x</p>'
+  present: ['p::after{content:"\3c /style\3e \3c script\3e alert(1)\3c /script\3e ";}']
+  absent: ['<script', '</style><script']
+
+- id: linked-stylesheets-that-cannot-splice
+  html: '<head><link rel="stylesheet" href="absent.css"><link rel="stylesheet" href="metadata.json"><link rel="stylesheet" href="../other/secret.css"><link rel="stylesheet" href="data:text/css,p{color:red}"><link rel="stylesheet" href="#x"><link rel="stylesheet"></head><p>x</p>'
+  absent: ['<link', '<style', 'color:red']
+  omitted:
+    - [missing, absent.css]
+    - [housekeeping, metadata.json]
+    - [traversal, ../other/secret.css]
+    - [unsupported_type, 'data:text/css,p{color:red}']
+
+- id: stylesheets-a-browser-does-not-apply-stay-out
+  html: '<link rel="alternate stylesheet" href="css/more.css"><link rel="stylesheet" href="css/more.css" disabled><p>x</p>'
+  absent: ['<link', '<style', '.more']
+  omitted: [[unsupported_type, css/more.css], [unsupported_type, css/more.css]]
+
+- id: video-audio-source-track
+  html: '<video src="{outside}/v.mp4" poster="{outside}/poster.png"><source src="{outside}/s.mp4"><track src="{outside}/t.vtt">VIDEO-TEXT</video><audio src="a.mp3">AUDIO-TEXT</audio><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['video', 'audio', 'source', 'track', 'VIDEO-TEXT', 'AUDIO-TEXT']
+  omitted:
+    - [scheme, '{outside}/v.mp4']
+    - [scheme, '{outside}/poster.png']
+    - [scheme, '{outside}/s.mp4']
+    - [scheme, '{outside}/t.vtt']
+    - [unsupported_type, a.mp3]
+
+# A segment holding ':' names a Windows alternate data stream, so a load
+# nothing reads still records it as traversal.
+- id: video-naming-a-stream
+  html: '<video src="sub/inner.mp4:stream"></video><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['video', 'stream']
+  omitted: [[traversal, 'sub/inner.mp4:stream']]
+
+- id: picture-keeps-only-its-img
+  html: '<picture><source srcset="{outside}/x.webp 1x, y.webp 2x" type="image/webp"><img src="chart.png" alt="chart"></picture>'
+  present: ['<img alt="chart" src="data:image/png;base64,']
+  absent: ['picture', 'source', 'webp']
+  omitted: [[scheme, '{outside}/x.webp'], [unsupported_type, y.webp]]
+
+- id: xmp-raw-text
+  html: '<xmp><img src="{outside}/x" onerror="alert(1)"></xmp><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['xmp', 'onerror', 'alert']
+  # libxml2 before 2.14 (the Windows wheel bundles 2.11) reads xmp's content
+  # as markup, so the dropped element's img is listed there.
+  omitted_before_libxml2_2_14: [[scheme, '{outside}/x']]
+
+- id: noembed-and-noframes
+  html: '<noembed><b>NOEMBED-TEXT</b></noembed><noframes>NOFRAMES-TEXT</noframes><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['noembed', 'noframes', 'NOEMBED-TEXT', 'NOFRAMES-TEXT']
+
+- id: plaintext-takes-the-rest
+  html: '<p>kept</p><plaintext><b>PLAINTEXT-TEXT</b>'
+  present: ['<p>kept</p>']
+  absent: ['plaintext', 'PLAINTEXT-TEXT']
+
+- id: template-content
+  html: '<template><img src="{outside}/template.png"><p>TEMPLATE-TEXT</p></template><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['template', 'TEMPLATE-TEXT']
+  omitted: [[scheme, '{outside}/template.png']]
+
+# What a dropped element holds goes with it, and what it would have loaded
+# is listed, at any depth inside it.
+- id: loads-inside-dropped-elements
+  html: '<noscript><div><img src="photo.jpg" srcset="{outside}/2x.png 2x"></div></noscript><object data="x.swf"><img src="../other/secret.png"><a href="{outside}/link">not a load</a></object><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['noscript', 'object', 'photo', 'secret', 'not a load']
+  omitted:
+    - [unsupported_type, photo.jpg]
+    - [scheme, '{outside}/2x.png']
+    - [unsupported_type, x.swf]
+    - [traversal, ../other/secret.png]
+
+# Inside a dropped element an svg still switches namespace, so an SVG image's
+# href is read as a load.
+- id: svg-load-inside-dropped-element
+  html: '<template><svg><image href="{outside}/i.png"/></svg></template><p>kept</p>'
+  present: ['<p>kept</p>']
+  omitted: [[scheme, '{outside}/i.png']]
+
+- id: textarea-raw-text
+  html: '<textarea>&lt;/textarea&gt;&lt;img src=x onerror=alert(1)&gt;</textarea><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['textarea', 'onerror']
+
+- id: select-and-options
+  html: '<select name="s"><option>OPTION-TEXT</option><optgroup label="g"><option>2</option></optgroup></select><datalist><option>DATALIST</option></datalist><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['select', 'option', 'OPTION-TEXT', 'datalist', 'DATALIST']
+
+- id: form-controls-that-load-or-submit
+  html: '<form action="{outside}/submit" method="post"><input type="image" src="{outside}/input.png"><button formaction="{outside}/button">BUTTON-TEXT</button><label for="q">kept label</label></form>'
+  present: ['<label for="q">kept label</label>']
+  absent: ['form', 'input', 'button', 'BUTTON-TEXT', 'submit']
+  omitted: [[scheme, '{outside}/input.png']]
+
+- id: keygen-is-void-so-what-follows-stays
+  html: '<div><keygen name="k">KEYGEN-AFTER</div>'
+  present: ['<div>KEYGEN-AFTER</div>']
+  absent: ['keygen']
+
+- id: title-only-in-head
+  html: '<html><head><title>Doc title</title></head><body><title>BODY-TITLE</title><p>kept</p><svg><title>SVG-TITLE</title></svg></body></html>'
+  present: ['<title>Doc title</title>', '<p>kept</p>']
+  absent: ['BODY-TITLE', 'SVG-TITLE']
+
+- id: title-outside-head-with-no-title-before-it
+  html: '<p>kept</p><title>BODY-TITLE</title><svg><title>SVG-TITLE</title></svg>'
+  present: ['<p>kept</p>']
+  absent: ['BODY-TITLE', 'SVG-TITLE', '<title']
+
+- id: second-title-in-head
+  html: '<html><head><title>First</title><title>SECOND-TITLE</title></head><body>x</body></html>'
+  present: ['<title>First</title>']
+  absent: ['SECOND-TITLE']
+
+- id: style-inside-svg
+  html: '<svg viewBox="0 0 10 10"><style>@import url({outside}/svg.css); rect { fill: red }</style><rect width="1" height="1"/></svg>'
+  present: ['<rect width="1" height="1"></rect>']
+  absent: ['<style', '@import', '{outside}']
+
+- id: style-inside-math
+  html: '<math><style>MATH-STYLE</style><mi>x</mi></math>'
+  present: ['<math><mi>x</mi></math>']
+  absent: ['<style', 'MATH-STYLE']
+
+- id: svg-animation-elements
+  html: '<svg><a href="#x"><animate attributeName="href" to="javascript:alert(1)"/><set attributeName="href" to="javascript:alert(2)"/>link</a><animateMotion dur="1s"/><animateTransform attributeName="transform"/><discard begin="1s"/></svg>'
+  present: ['<a href="#x">link</a>']
+  absent: ['animate', '<set', 'javascript', 'discard']
+
+- id: foreign-object
+  html: '<svg><foreignObject width="10" height="10"><iframe src="{outside}/inside"></iframe><p>FOREIGN-TEXT</p></foreignObject></svg><p>kept</p>'
+  present: ['<p>kept</p>']
+  absent: ['foreignobject', 'FOREIGN-TEXT', 'iframe']
+  omitted: [[scheme, '{outside}/inside']]
+
+- id: svg-elements-that-load
+  html: '<svg><image href="{outside}/image.png" width="1" height="1"/><filter id="f"><feImage href="photo.jpg"/></filter><rect filter="url(#f)"/></svg>'
+  present: ['<filter id="f"></filter>', '<rect filter="url(#f)"></rect>']
+  absent: ['image', 'photo']
+  omitted: [[scheme, '{outside}/image.png'], [unsupported_type, photo.jpg]]
+
+- id: mathml-html-integration-points
+  html: '<math><mtext><mglyph src="{outside}/glyph.png"/><table><tr><td>cell</td></tr></table></mtext><annotation-xml encoding="text/html"><p>ANNOTATION-TEXT</p></annotation-xml></math>'
+  present: ['<math><mtext>cell</mtext></math>']
+  absent: ['mglyph', 'table', 'annotation', 'ANNOTATION-TEXT']
+  omitted: [[scheme, '{outside}/glyph.png']]
+
+- id: comments-and-processing-instructions
+  html: '<p>a<!-- COMMENT-TEXT --><?php echo 1 ?>b</p>'
+  present: ['<p>ab</p>']
+  absent: ['COMMENT-TEXT', 'php', '<!--']
+
+- id: unknown-element-unwrapped-keeps-text
+  html: '<custom-card data-x="1"><b>CUSTOM-TEXT</b></custom-card><center>centered</center><font color="red">font</font>'
+  present: ['<b>CUSTOM-TEXT</b>', 'centered', 'font']
+  absent: ['custom-card', '<center', '<font']
+
+# Without the unknown wrapper the parser closes the paragraph or list item
+# first, so the output already has the structure a second parse builds.
+- id: unknown-wrapper-around-a-block
+  html: '<p><custom-wrap><div>block</div></custom-wrap></p><ul><li>a<custom-wrap><li>b</li></custom-wrap></li></ul>'
+  present: ['<p></p><div>block</div>', '<ul><li>a</li><li>b</li></ul>']
+
+- id: html-elements-inside-svg-are-unwrapped
+  html: '<svg><p>SVG-P</p><div><rect/></div></svg>'
+  present: ['<svg>SVG-P<rect></rect></svg>']
+
+- id: kept-structure
+  html: '<article><h1>Title</h1><table><caption>Cap</caption><thead><tr><th colspan="2" scope="col">H</th></tr></thead><tbody><tr><td rowspan="2">a</td><td>b</td></tr></tbody></table><ol start="3"><li>one<ul><li>nested</li></ul></li></ol><details open><summary>S</summary>D</details><pre>  keep   space</pre><canvas width="10" height="10"></canvas></article>'
+  present:
+    - '<h1>Title</h1>'
+    - '<th colspan="2" scope="col">H</th>'
+    - '<td rowspan="2">a</td>'
+    - '<ol start="3"><li>one<ul><li>nested</li></ul></li></ol>'
+    - '<details open><summary>S</summary>D</details>'
+    - '<pre>  keep   space</pre>'
+    - '<canvas width="10" height="10"></canvas>'

@@ -234,6 +234,99 @@ async def test_card_omits_owner_side_access_fields_in_org_mode(session, tmp_path
     assert "accessEmails" not in card
 
 
+def _published(folder: Path, **entry) -> None:
+    """A .published.json entry for the folder's index.html, as a publish
+    writes it."""
+    (folder / ".published.json").write_text(json.dumps({"index.html": {
+        "report_id": f"r-{folder.name}", "url": f"https://view.example/r/{folder.name}",
+        "published": True, **entry,
+    }}))
+
+
+def _audience(card: dict) -> tuple:
+    """The card's audience fields, indexed so a card without one fails: the
+    app reads a missing field as an empty audience, never as unknown."""
+    return tuple(card[field] for field in ("orgAllowed", "ownerOnly", "allowedTeamIds", "allowedUserIds"))
+
+
+# What an entry written before MindsHub mode stopped keeping a copy of the
+# audience says, or what an agent in the pod could write there.
+_OWNER_ONLY = {"mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True}
+_TEAM_SHARED = {"mode": "restricted", "emails": [], "org_allowed": False, "owner_only": False,
+                "allowed_team_ids": ["33333333-3333-4333-8333-333333333333"]}
+
+
+async def test_an_org_card_says_it_does_not_know_who_a_restricted_artifact_reaches(
+    session, tmp_path, org_mode
+):
+    """In MindsHub mode .published.json keeps no copy of a restricted
+    artifact's audience: MindsHub's rule is the one record, which only the
+    owner's GET .../access reads. So the list answers its audience fields as
+    null, for an artifact only its owner can open and for one shared with a
+    team alike, never as an empty audience it doesn't know. A public card's
+    audience is no one in particular."""
+    _row, owner_only = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="draft")
+    team_shared = owner_only.parent / "team"
+    public = owner_only.parent / "public"
+    for folder in (team_shared, public):
+        folder.mkdir()
+        (folder / "index.html").write_text("<html></html>")
+        (folder / "metadata.json").write_text(json.dumps({"slug": folder.name, "type": "html-app"}))
+    _published(owner_only, **_OWNER_ONLY)
+    _published(team_shared, **_TEAM_SHARED)
+    _published(public, mode="public")
+
+    cards = {
+        card["slug"]: card
+        for card in await ep.list_artifacts(_scoped(session, ORG_A), project_id=None, project_path=None)
+    }
+
+    for slug in ("draft", "team"):
+        assert cards[slug]["accessMode"] == "restricted"
+        assert _audience(cards[slug]) == (None, None, None, None), slug
+        assert "accessEmails" not in cards[slug]
+    assert (cards["public"]["accessMode"], _audience(cards["public"])) == ("public", (False, False, [], []))
+
+
+async def test_a_desktop_card_says_who_a_restricted_artifact_reaches(session, tmp_path, local_mode):
+    """On the desktop the entry is the record, so the list answers it."""
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="draft")
+    _published(folder, **_OWNER_ONLY)
+
+    [card] = ep.artifacts_for_request(ScopedSession(session, LOCAL_SCOPE), project_id=row.id)
+
+    assert (card["accessMode"], card["accessEmails"], _audience(card)) == (
+        "restricted", [], (False, True, [], []),
+    )
+
+
+def test_a_desktop_status_says_an_artifact_only_its_owner_can_open(session, tmp_path, monkeypatch, local_mode):
+    """The preview viewer's refresh reads who a desktop artifact reaches from
+    GET /status, so an artifact only its owner can open answers ownerOnly
+    true there, as its card does: without it the app reads "Specific people"
+    with nobody listed."""
+    from cowork.server import create_app
+
+    _row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="draft")
+    _published(folder, **_OWNER_ONLY)
+    source = ep_artifacts.ProjectArtifacts(
+        base=folder.parent,
+        project_id=None,
+        project_name="mine",
+        trusted_anchor=folder.parent.parent.parent,
+        root_parts=(".anton", "artifacts"),
+    )
+    monkeypatch.setattr(ep, "artifacts_sources_for_scan", lambda *, scope: [source])
+
+    res = TestClient(create_app()).get("/api/v1/artifacts/status", params={"path": str(folder / "index.html")})
+
+    assert res.status_code == 200
+    status = res.json()
+    assert (status["accessMode"], status["accessEmails"], status["orgAllowed"], status["ownerOnly"]) == (
+        "restricted", [], False, True,
+    )
+
+
 async def test_card_has_one_identity_for_draft_and_comments(session, tmp_path, org_mode):
     row, folder = _project_with_artifact(
         session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
@@ -326,7 +419,7 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
     enabled = await workspace_ep.enable_artifact_comments(
         str(row.id), card["id"], _scoped(session, org_id)
     )
-    assert enabled["enabled"] is True
+    assert enabled.enabled is True
     return row, folder, card
 
 

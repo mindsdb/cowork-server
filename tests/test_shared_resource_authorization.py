@@ -154,6 +154,8 @@ def test_pending_claims_hide_attribution_and_fail_capabilities_closed(org_engine
         "canRename": False,
         "canDelete": False,
         "canEditInstructions": False,
+        "canRun": True,
+        "canWriteFiles": True,
         "directoryIsExternal": False,
     }
 
@@ -362,8 +364,12 @@ def test_project_creator_admin_and_general_policy(org_engine):
         "canRename",
         "canDelete",
         "canEditInstructions",
+        "canRun",
+        "canWriteFiles",
         "directoryIsExternal",
     }
+    assert encoded_project["capabilities"]["canRun"] is True
+    assert encoded_project["capabilities"]["canWriteFiles"] is True
     linked = skills.get_skill(
         foreign_skill["id"],
         alice,
@@ -2549,7 +2555,7 @@ async def test_skill_upload_endpoint_offloads_the_owned_session_worker(monkeypat
     assert result == {"worker": True}
     assert captured["function"] is skills._upload_skill_in_new_session
     assert captured["args"] == (b"skill bytes", "worker.md", scope, principal)
-    assert captured["kwargs"] == {"shared": False}
+    assert captured["kwargs"] == {"shared": False, "viewer": None}
 
 
 @pytest.mark.asyncio

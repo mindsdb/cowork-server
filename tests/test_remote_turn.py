@@ -2,6 +2,7 @@
 ResponsesHandler is replaced wholesale per test; its helpers have coverage elsewhere."""
 from __future__ import annotations
 
+import asyncio
 import json
 from uuid import uuid4
 
@@ -12,7 +13,9 @@ from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
 from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import RemoteWorkspace
+from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
+from tests._logging_assertions import assert_log_fields
 
 
 class _FakeScope:
@@ -37,6 +40,7 @@ def _fake_handler(
         return ()
 
     monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
@@ -96,6 +100,48 @@ async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
     # Read in a unit of its own under the channel's scope, never on the
     # channel's shared session.
     assert reads == [(conv_id, session.scope)]
+
+
+@pytest.mark.asyncio
+async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypatch):
+    """The pod recalls only what the request's skills block names,
+    so a channel turn sends one too: the fail-closed set (no member behind
+    it), and {} when there is nothing to send."""
+    _fake_handler(monkeypatch)
+    built: list[tuple] = []
+    sent: list[dict] = []
+    block = {"policy": {"files": {"SKILL.md": "---\nname: policy\n---\nx"}, "always_on": True}}
+
+    def remote_turn_skills(session, conv_id, **kwargs):
+        built.append((conv_id, kwargs))
+        return block
+
+    async def fake_replies(**kwargs):
+        sent.append(kwargs["skills"])
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", remote_turn_skills)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+    conv_id = uuid4()
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=conv_id, org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+    assert built == [(conv_id, {})]
+    assert sent == [block]
+
+
+def test_the_skills_block_is_empty_when_it_cant_be_built(monkeypatch):
+    """A failure sends {} (no skills), never no block, which would let the
+    pod fall back to a mounted skills tree."""
+    import cowork.handlers.responses as responses_mod
+
+    class _Broken:
+        def __init__(self, session):
+            raise RuntimeError("no conversation")
+
+    monkeypatch.setattr(responses_mod, "ConversationService", _Broken)
+    assert responses_mod.remote_turn_skills(_FakeSession(), uuid4()) == {}
 
 
 @pytest.mark.asyncio
@@ -467,3 +513,141 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
     ))
     assert index.call_args.kwargs["attribute_by_provenance"] is True
     assert index.call_args.kwargs["completed_cleanly"] is (not failed)
+
+
+@pytest.fixture
+def controller_flags(monkeypatch):
+    """The Redis the controller's cancel flags are written to."""
+    import fakeredis.aioredis
+
+    from cowork.streaming import cancellation
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(cancellation, "get_redis", lambda: client)
+    return client
+
+
+def _replies_that_wait(sent: list[dict]):
+    """A controller that answers with one delta, then runs on with no terminal."""
+    started = asyncio.Event()
+
+    async def replies(**kwargs):
+        sent.append(kwargs)
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "partial"}
+        started.set()
+        await asyncio.Event().wait()
+
+    return replies, started
+
+
+@pytest.mark.parametrize("correlation_id", [None, "corr-given"], ids=["minted", "given"])
+async def test_a_cancelled_channel_turn_stops_its_controller_turn(monkeypatch, controller_flags, correlation_id):
+    """Shutdown's drain of channel tasks cancels a channel turn still running.
+    No registry handle covers it, so the turn itself writes the controller's
+    cancel flag, under the correlation id the job went out with."""
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, started = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    turn = asyncio.create_task(_drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[], correlation_id=correlation_id,
+    )))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    sent_id = sent[0]["correlation_id"]
+    assert sent_id, "the job went out with no correlation id"
+    if correlation_id is not None:
+        assert sent_id == correlation_id
+    assert await controller_flags.keys("*") == [cancel_flag_key(sent_id)]
+
+
+async def test_a_channel_turn_its_reader_abandons_stops_its_controller_turn(monkeypatch, controller_flags):
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, _ = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    events = remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    )
+    async for event in events:
+        if getattr(event, "text", None) == "partial":
+            break
+    await events.aclose()
+
+    assert await controller_flags.keys("*") == [cancel_flag_key(sent[0]["correlation_id"])]
+
+
+@pytest.mark.parametrize("terminal", ["turn_completed", "turn_failed"])
+async def test_a_channel_turn_that_reached_its_terminal_writes_no_cancel_flag(
+    monkeypatch, controller_flags, terminal,
+):
+    _fake_handler(monkeypatch)
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "done"}
+        yield terminal, {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert await controller_flags.keys("*") == []
+
+
+async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_written(
+    monkeypatch, caplog, owned_logger,
+):
+    """Redis down at shutdown: the controller cannot be told, which is logged,
+    and the channel task still ends cancelled rather than with the Redis
+    error, which drain_background_tasks would get in place of the cancel. The
+    hosted log line names the turn in fields, since its formatter drops a
+    message's arguments."""
+    import logging
+
+    from cowork.streaming import cancellation
+
+    def unreachable():
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(cancellation, "get_redis", unreachable)
+    logged = owned_logger(cancellation.logger.name, level=logging.WARNING)
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+    replies, started = _replies_that_wait(sent)
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+
+    turn = asyncio.create_task(_drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    )))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    records = [
+        r for r in caplog.records
+        if r.name == cancellation.logger.name and r.levelno == logging.WARNING
+    ]
+    correlation_id = sent[0]["correlation_id"]
+    fields = {
+        "event": "controller_turn_stop_failed",
+        "request_id": correlation_id,
+        "turn_id": correlation_id,
+        "reason": "channel_turn_ended",
+    }
+    assert [{name: getattr(r, name) for name in fields} for r in records] == [fields]
+    assert isinstance(records[0].exc_info[1], ConnectionError)
+    assert_log_fields(logged.output(), **fields)

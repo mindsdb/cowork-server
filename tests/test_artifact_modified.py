@@ -357,7 +357,10 @@ def test_update_preserves_password_access(tmp_path: Path):
     assert entry["access_password"] == "s3cret"
 
 
-def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Path):
+def test_update_leaves_the_state_write_to_publish(tmp_path: Path):
+    # publish_artifact saves the entry, published_mtime included, under its
+    # folder lock. A second write after it returns would save a map read
+    # outside that lock, so update leaves .published.json as publish left it.
     root = _make_static_html(tmp_path)
     published_json = root / ".published.json"
     published_json.write_text(
@@ -368,6 +371,7 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
         }}),
         encoding="utf-8",
     )
+    before = published_json.read_bytes()
 
     with ExitStack() as stack:
         stack.enter_context(_patch_scan(tmp_path))
@@ -378,10 +382,10 @@ def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Pa
         stack.enter_context(patch.object(
             publish_mod, "publish_artifact", lambda *args, **kwargs: {"status": "ok"}
         ))
-        publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
+        out = publish_mod.update_artifact(str(root), scope=LOCAL_SCOPE)
 
-    entry = json.loads(published_json.read_text(encoding="utf-8"))["index.html"]
-    assert entry["published_mtime"] == publish_mod._content_mtime(root)
+    assert out == {"status": "ok"}
+    assert published_json.read_bytes() == before
 
 
 def test_update_unpublished_raises(tmp_path: Path):
@@ -443,7 +447,12 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
 # Task 6: artifact_status — the preview viewer's live in-place refresh (ENG-468)
 # ---------------------------------------------------------------------------
 
-from cowork.services.artifacts import artifact_status
+from cowork.services.artifacts import artifact_status as _artifact_status
+
+
+def artifact_status(raw_path: str, *, scope) -> dict:
+    """The service's status as the wire carries it, under the app's names."""
+    return _artifact_status(raw_path, scope=scope).model_dump(by_alias=True, mode="json")
 
 
 def test_artifact_status_unpublished(tmp_path: Path):
@@ -482,6 +491,24 @@ def test_artifact_status_unknown_path_is_blank(tmp_path: Path):
     assert s["publishedUrl"] == ""
     assert s["modified"] is False
     assert s["accessMode"] == "public"
+
+
+def test_artifact_status_leaves_an_audience_the_card_does_not_know_null(tmp_path: Path, monkeypatch):
+    """In MindsHub mode a restricted artifact's card doesn't know who it is
+    shared with and answers null, so its status answers null too, never a
+    false that would say the artifact is shared with nobody."""
+    from cowork.services import artifacts
+
+    root = _make_static_html(tmp_path)
+    (root / ".published.json").write_text(json.dumps({"index.html": {
+        "report_id": "rid", "url": "https://4nton.ai/a/rid", "published": True,
+        "mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True,
+    }}), encoding="utf-8")
+    monkeypatch.setattr(artifacts, "_org_mode", lambda: True)
+    with _patch_scan(tmp_path):
+        s = artifact_status(str(root), scope=LOCAL_SCOPE)
+    assert (s["accessMode"], s["orgAllowed"], s["ownerOnly"]) == ("restricted", None, None)
+    assert "accessPassword" not in s
 
 
 def test_artifact_status_loose_file_never_leaks_password(tmp_path: Path):

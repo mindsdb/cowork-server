@@ -124,6 +124,8 @@ _ALLOWED_UNSCOPED_ROOT_READS: dict[str, str] = {
     "migrations.py": ".env->DB migration over the unkeyed root",
     "managed.py": "the operator's managed vault is deployment-wide, read unscoped by design",
     "ops/connections.py": "operator command over the managed vault",
+    "ops/connection_inventory.py": "read-only operator enumeration of managed, base and personal stores; "
+    "never used by requests or turns",
     "server.py": "startup reads of the managed vault and cowork_home, deployment-wide",
     "services/connectors/persist.py": "the managed vault is deployment-wide (own_vault_root scopes the person's own)",
     "services/connectors/probe.py": "cowork_home() for a desktop probe, not a partitioned store",
