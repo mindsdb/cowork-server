@@ -1252,7 +1252,7 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
     schedule and before the poll asks whether a run is active. The poll then
     sees the slot as used: a Stopped daily run does not start again, and
     neither does a one-off its failed run disabled."""
-    from cowork.scheduler import _finish_run, _poll, _record_turn_outcome
+    from cowork.scheduler import _classify, _finish_run, _poll, _record_turn_outcome, _TurnEvidence
 
     engine = _file_engine(tmp_path)
     with Session(engine) as session:
@@ -1272,7 +1272,8 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
             with Session(engine) as run_session:
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
                 outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, reason=reason, is_manual=False, conversation_id=None,
+                    scoped, schedule_id=schedule_id, end=_classify(_TurnEvidence(reason=reason, acted=True)),
+                    is_manual=False, conversation_id=None,
                 )
                 _finish_run(scoped, run_id=run_id, conversation_id=None, error=outcome.error, status=outcome.status)
         return has_active_run(self, asked_id)

@@ -27,11 +27,18 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 
+def _serialize_run(run) -> ScheduleRunResponse:
+    return ScheduleRunResponse.model_validate(run)
+
+
 def _serialize(schedule, scoped) -> ScheduleResponse:
-    """Typed schedule state plus the live running flag."""
+    run_service = ScheduleRunService(scoped)
     response = ScheduleResponse.model_validate(schedule)
-    response.running = ScheduleRunService(scoped).has_active_run(schedule.id)
+    response.running = run_service.has_active_run(schedule.id)
+    last = run_service.last_finished_run(schedule.id)
+    response.last_run = _serialize_run(last) if last is not None else None
     return response
+
 
 
 @router.get("/")
@@ -183,4 +190,4 @@ def list_schedule_runs(schedule_id: UUID, scoped: ScopedSessionDep, limit: int =
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     runs = ScheduleRunService(scoped).list_runs(schedule_id, limit=limit)
-    return {"runs": [ScheduleRunResponse.serialize(r) for r in runs]}
+    return {"runs": [_serialize_run(r) for r in runs]}

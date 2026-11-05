@@ -158,6 +158,9 @@ class ScheduleResponse(CamelResponse):
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
+    # Filled by the endpoints: the latest finished run (ScheduleRunResponse
+    # shape), so a failure shows on the schedule before any auto-pause.
+    last_run: dict | None = None
     created_at: datetime | None
     modified_at: datetime | None
 
@@ -178,4 +181,6 @@ class ScheduleRunResponse(CamelResponse):
     conversation_id: UUID | None
     is_manual: bool
     outcome: AttemptOutcome | None = None
+    # Filled by the endpoints: "manual" or "cron".
+    trigger: str | None = None
     created_at: datetime | None

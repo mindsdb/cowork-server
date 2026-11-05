@@ -95,6 +95,12 @@ def turns(monkeypatch):
             return stream()
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", CountingHandler)
+    # The stand-in streams through no registry buffer, so give its turn the
+    # ending its stream says: completed, and the agent acted.
+    async def _completed(conversation_id):
+        return scheduler._TurnEvidence(reason="completed", acted=True)
+
+    monkeypatch.setattr(scheduler, "_turn_evidence", _completed)
     return started, release
 
 

@@ -518,12 +518,12 @@ def test_a_turn_acted_when_its_stream_holds_more_than_its_start_and_failure(tmp_
 
     asyncio.run(fill())
     monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
-    assert asyncio.run(scheduler._turn_acted("c1")) is acted
+    assert asyncio.run(scheduler._turn_activity("c1"))[0] is acted
 
 
 def test_a_turn_with_no_buffer_counts_as_having_acted(monkeypatch):
     monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: None))
-    assert asyncio.run(scheduler._turn_acted("c1")) is True
+    assert asyncio.run(scheduler._turn_activity("c1")) == (True, None)
 
 
 # --- Migration ---------------------------------------------------------------
