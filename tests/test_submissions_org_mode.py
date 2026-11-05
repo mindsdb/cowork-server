@@ -350,8 +350,15 @@ def test_a_ca_left_in_the_box_under_a_mode_that_reads_none_is_refused(mysql_org_
 
 
 def test_mysql_no_longer_takes_the_certificate_checkbox(mysql_org_client, relay):
-    """The checkbox left MySQL's form; PostgreSQL keeps it (tested above)."""
+    """The checkbox left MySQL's form; PostgreSQL keeps it (tested above).
+
+    The same submission without the checkbox is accepted first, so the
+    refusal can only be the checkbox's.
+    """
     recorded, _ = relay
+    accepted = mysql_org_client.post(PATH, json=mysql_submission(tls_mode="prefer"), headers=AUTH_HEADERS)
+    assert accepted.status_code == 200
+    recorded.clear()
 
     res = mysql_org_client.post(
         PATH, json=mysql_submission(tls_mode="prefer", tls_verify=True), headers=AUTH_HEADERS

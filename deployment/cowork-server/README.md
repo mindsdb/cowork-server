@@ -117,7 +117,9 @@ Rollback removes both `datasourceTurnsEnabled` and `datasourceCapabilities`
 from the environment's values file, and drops the environment from both
 `ENABLED_ENVIRONMENTS` and `OFFERED_METHODS` in `tests/test_chart_values.py`
 in the same change; the test expects both keys absent, not `"false"`, outside
-enabled environments.
+enabled environments. Rolling back one engine instead drops only its pair
+(`mysql:host-password` or `postgres:host-port`) from `datasourceCapabilities`
+and from that environment's `OFFERED_METHODS` entry.
 Without grants no datasource block is queued, and without the capability list
 no new connection is accepted or edited through this server. Encrypted records
 stay in auth, where users can still delete them, and OAuth connections are
