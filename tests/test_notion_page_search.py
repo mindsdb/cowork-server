@@ -122,6 +122,23 @@ async def test_a_rejected_token_asks_for_a_reconnect(vault, notion_server, monke
     assert "reconnect" in exc.value.detail
 
 
+async def test_a_token_rejected_while_the_session_opens_asks_for_a_reconnect(vault, notion_server, monkeypatch):
+    """A 401 while the MCP session opens is not classified by anton: it arrives
+    as a raw httpx2 error inside an exception group."""
+    httpx2 = pytest.importorskip("httpx2")
+    request = httpx2.Request("POST", "https://mcp.notion.com/mcp")
+    unauthorized = httpx2.HTTPStatusError("401", request=request, response=httpx2.Response(401, request=request))
+
+    async def rejected(*args, **kwargs):
+        raise ExceptionGroup("task group", [unauthorized])
+
+    monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", rejected)
+    with pytest.raises(HTTPException) as exc:
+        await search_notion_pages(NotionSearchRequest(name="mcp-ws", query="x"), LOCAL_SCOPE, None)
+    assert exc.value.status_code == 409
+    assert "reconnect" in exc.value.detail
+
+
 async def test_other_failures_are_a_502(vault, notion_server, monkeypatch):
     async def broken(*args, **kwargs):
         raise RuntimeError("boom")

@@ -4,7 +4,6 @@ import json
 import logging
 from typing import Annotated, Any
 
-import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -13,6 +12,7 @@ from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, Open
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
+from cowork.services.connectors.notion_pages import is_token_rejection
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.oauth.google import (
@@ -262,12 +262,12 @@ def _parse_notion_self_user(result: Any) -> tuple[str, str]:
 def _is_rejection(exc: BaseException) -> bool:
     """A tool error or a 401/403 from the MCP server, looking through the
     exception groups and causes the MCP SDK wraps them in."""
+    if is_token_rejection(exc):
+        return True
     seen: list[BaseException] = [exc]
     while seen:
         e = seen.pop()
         if isinstance(e, RuntimeError) and "returned an error" in str(e):
-            return True
-        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
             return True
         seen.extend(getattr(e, "exceptions", ()))
         if e.__cause__ is not None:

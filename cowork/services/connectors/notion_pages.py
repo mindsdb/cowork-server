@@ -71,6 +71,35 @@ def parse_search_results(content: Any) -> list[dict[str, str]]:
     return pages
 
 
+def _http_status_error_types() -> tuple[type[BaseException], ...]:
+    import httpx
+
+    types: list[type[BaseException]] = [httpx.HTTPStatusError]
+    try:
+        import httpx2  # anton's MCP client; its errors are not httpx errors
+    except ImportError:
+        pass
+    else:
+        types.append(httpx2.HTTPStatusError)
+    return tuple(types)
+
+
+def is_token_rejection(exc: BaseException) -> bool:
+    """True when the MCP server answered 401/403, looking through the
+    exception groups and causes the MCP client wraps it in. A rejection while
+    the session opens arrives unclassified, not as McpPermanentError."""
+    status_errors = _http_status_error_types()
+    seen: list[BaseException] = [exc]
+    while seen:
+        e = seen.pop()
+        if isinstance(e, status_errors) and e.response.status_code in (401, 403):
+            return True
+        seen.extend(getattr(e, "exceptions", ()))
+        if e.__cause__ is not None:
+            seen.append(e.__cause__)
+    return False
+
+
 async def _call_notion(access_token: str, tool_name: str, **kwargs: Any) -> Any:
     try:
         from anton.core.mcp.errors import McpPermanentError
@@ -84,6 +113,10 @@ async def _call_notion(access_token: str, tool_name: str, **kwargs: Any) -> Any:
         return await call_mcp_tool("notion", access_token, tool_name, **kwargs)
     except McpPermanentError as exc:
         raise NotionReconnectRequired(str(exc)) from exc
+    except Exception as exc:
+        if is_token_rejection(exc):
+            raise NotionReconnectRequired(str(exc)) from exc
+        raise
 
 
 async def search_pages(access_token: str, query: str) -> list[dict[str, str]]:

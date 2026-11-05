@@ -159,8 +159,11 @@ class TestIdentityBridge:
         assert exc.value.detail == NOTION_ADMIN_APPROVAL_MESSAGE
 
     async def test_a_wrapped_403_returns_the_admin_approval_message(self, monkeypatch):
-        request = httpx.Request("POST", "https://mcp.notion.com/mcp")
-        forbidden = httpx.HTTPStatusError("403", request=request, response=httpx.Response(403, request=request))
+        # httpx2, not httpx: it is what anton's MCP client raises, and its
+        # errors are not httpx errors.
+        httpx2 = pytest.importorskip("httpx2")
+        request = httpx2.Request("POST", "https://mcp.notion.com/mcp")
+        forbidden = httpx2.HTTPStatusError("403", request=request, response=httpx2.Response(403, request=request))
         self._tool_returns(monkeypatch, ExceptionGroup("task group", [forbidden]))
         with pytest.raises(HTTPException) as exc:
             await oauth_endpoints.get_mcp_identity("notion", McpIdentityRequest(access_token="tok"))
