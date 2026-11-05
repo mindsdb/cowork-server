@@ -30,7 +30,11 @@ its own session (`router_session`), and its project a key for saved tabs
 (`project_key`); logins are per user on the pod and shared by every session.
 A turn that starts with the browser on warms the pod without waiting
 (`start_early`), so it is likely up by the time the agent reaches for it.
-Unset, the per-user instance path below is unchanged.
+Every warm-up carries the person's browser preferences (`router_prefs`):
+whether to browse through the residential proxy, from which city, and the
+time zone and language the browser should present. The router keeps them
+with the person's logins. Unset, the per-user instance path below is
+unchanged.
 """
 
 from __future__ import annotations
@@ -51,6 +55,12 @@ AGENT = "browser"
 PROFILE = "main"
 _TIMEOUT_S = 15.0
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_TIMEZONE = re.compile(r"^[A-Za-z_+\-/0-9]{1,64}$")
+#: A router city id; the same shape `browser_city` accepts.
+_CITY = re.compile(r"^[a-z]{2}-[a-z_]{1,40}$")
+_LOCALE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$")
+#: What GET /browse/locations answers when there is no router to ask.
+NO_LOCATIONS = {"proxy_available": False, "prefs": None, "cities": [], "effective_city": ""}
 # What a provisioned instance's endpoint must look like: the hosted agents'
 # Cloudflare-fronted host, nothing else. Guards the URL anton is handed.
 _ENDPOINT = re.compile(r"^https://br-[a-z0-9-]+\.(?:[a-z0-9-]+\.)*(?:4nton\.ai|mindshub\.ai)$")
@@ -277,9 +287,50 @@ async def router_status(bearer: str, router: str) -> dict:
     return _router_view(await _call("GET", f"{router}/_status", bearer), router)
 
 
-async def warm(bearer: str, router: str, *, quiet: bool = False) -> dict:
-    """Start or claim the caller's pod without waiting for it. Safe to repeat."""
-    return _router_view(await _call("POST", f"{router}/_warm", bearer, quiet=quiet), router)
+async def warm(bearer: str, router: str, *, quiet: bool = False, prefs: Optional[dict] = None) -> dict:
+    """Start or claim the caller's pod without waiting for it. Safe to repeat.
+    `prefs` (see `router_prefs`) updates what the router keeps for the caller."""
+    body = {"prefs": prefs} if prefs else None
+    return _router_view(await _call("POST", f"{router}/_warm", bearer, json=body, quiet=quiet), router)
+
+
+def router_prefs(user_settings: Any, timezone: Optional[str] = None, locale: Optional[str] = None) -> dict:
+    """The person's browser preferences, as the router's `_warm` takes them.
+
+    Proxy and city always; time zone and language only when the renderer sent
+    them and they look like an IANA zone and a BCP 47 tag (anything else is
+    dropped rather than refused: it only shapes how the browser presents).
+    """
+    prefs: dict[str, Any] = {
+        "proxy": bool(getattr(user_settings, "browser_proxy", True)),
+        "city": str(getattr(user_settings, "browser_city", "") or ""),
+    }
+    if timezone and _TIMEZONE.match(timezone):
+        prefs["timezone"] = timezone
+    if locale and _LOCALE.match(locale):
+        prefs["locale"] = locale
+    return prefs
+
+
+async def locations(bearer: str) -> dict:
+    """The router's cities and the caller's stored preferences, for Settings.
+    Without a router there is nothing to choose: `NO_LOCATIONS`."""
+    router = router_url()
+    if not router:
+        return dict(NO_LOCATIONS)
+    raw = await _call("GET", f"{router}/_prefs", bearer)
+    raw = raw if isinstance(raw, dict) else {}
+    cities = [
+        {"id": str(c["id"]), "label": str(c.get("label") or c["id"])}
+        for c in raw.get("cities") or [] if isinstance(c, dict) and _CITY.match(str(c.get("id") or ""))
+    ]
+    prefs = raw.get("prefs")
+    return {
+        "proxy_available": bool(raw.get("proxy_available")),
+        "prefs": prefs if isinstance(prefs, dict) else None,
+        "cities": cities,
+        "effective_city": str(raw.get("effective_city") or ""),
+    }
 
 
 async def status_for(bearer: str) -> dict:
@@ -289,11 +340,11 @@ async def status_for(bearer: str) -> dict:
     return await router_status(bearer, router) if router else await fetch_status(bearer)
 
 
-async def provision_for(bearer: str) -> dict:
-    """The MindsHub mode's provision: warm the router's pod, or create the
-    caller's instance."""
+async def provision_for(bearer: str, prefs: Optional[dict] = None) -> dict:
+    """The MindsHub mode's provision: warm the router's pod, with the caller's
+    `prefs`, or create the caller's instance."""
     router = router_url()
-    return await warm(bearer, router) if router else await provision(bearer)
+    return await warm(bearer, router, prefs=prefs) if router else await provision(bearer)
 
 
 #: Warm-ups in flight. asyncio keeps only a weak reference to a task, so one
@@ -301,9 +352,9 @@ async def provision_for(bearer: str) -> dict:
 _WARMING: set[asyncio.Task] = set()
 
 
-async def _warm_quietly(bearer: str, router: str) -> None:
+async def _warm_quietly(bearer: str, router: str, prefs: dict) -> None:
     try:
-        await warm(bearer, router, quiet=True)
+        await warm(bearer, router, quiet=True, prefs=prefs)
     except Exception as exc:
         # Only a head start: the router starts the pod on first use anyway.
         logger.debug("browser warm-up failed: %r", exc)
@@ -323,7 +374,7 @@ def start_early(user_settings: Any, bearer: Optional[str]) -> bool:
             return False
         if browser_mode(user_settings) != MINDSHUB:
             return False
-        task = asyncio.get_running_loop().create_task(_warm_quietly(bearer, router))
+        task = asyncio.get_running_loop().create_task(_warm_quietly(bearer, router, router_prefs(user_settings)))
     except Exception as exc:
         logger.debug("browser warm-up not started: %r", exc)
         return False

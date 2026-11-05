@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import json
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -25,6 +26,9 @@ from cowork.common.settings.app_settings import (
     get_app_settings,
 )
 from cowork.common.settings.runtime_credential import get_minds_credential
+
+#: A shared browser router city id (`browser_city`): country code, a dash, the city.
+_BROWSER_CITY = re.compile(r"[a-z]{2}-[a-z_]{1,40}")
 
 
 class Provider(str, Enum):
@@ -747,6 +751,24 @@ class UserSettings(Settings):
         title="Browser Enabled",
         description="Let the agent use your MindsHub browser, shown beside the chat.",
     )
+    # The shared browser router's residential proxy (ENG-3188). Per-user like
+    # the toggle above: where the person's browser appears to browse from is
+    # theirs to choose. The router stores both with the person's logins.
+    browser_proxy: bool = Field(
+        default=True,
+        title="Browse Through a Home Connection",
+        description=(
+            "The cloud browser reaches websites through a residential connection in your city, "
+            "so sites don't block it as a data center."
+        ),
+    )
+    # A router city id ("us-los_angeles"), or "" for the city that matches
+    # the person's time zone. The router lists the ids (GET /browse/locations).
+    browser_city: str = Field(
+        default="",
+        title="Browser City",
+        description="Which city the browser connects from. Empty picks one from your time zone.",
+    )
     # Written by POST /browse/provision from MindsHub's answer, never typed by
     # the user; `services.browser.valid_endpoint` refuses anything but a
     # hosted br- instance before it reaches anton.
@@ -1070,6 +1092,14 @@ class UserSettings(Settings):
                 raise ValueError(f"Unknown harness '{v}'. Available: {', '.join(options) or 'none'}")
             return v
         return _known_harness_or_anton(v, info.field_name)
+
+    @field_validator("browser_city")
+    @classmethod
+    def _browser_city_is_a_router_id(cls, value: str) -> str:
+        value = (value or "").strip()
+        if value and not _BROWSER_CITY.fullmatch(value):
+            raise ValueError("browser_city must be empty or a city id like us-los_angeles")
+        return value
 
     @field_validator("coding_agent_model")
     @classmethod

@@ -450,6 +450,8 @@ def test_the_harness_passes_anton_a_browser_only_when_enabled():
 # ── the shared router (ENG-3188) ───────────────────────────────────────────
 
 ROUTER = "https://cowork-pr-cowork-1146.dev.mindshub.ai/browser"
+#: What a turn's warm-up sends for someone who never touched the proxy settings.
+DEFAULT_PREFS = {"proxy": True, "city": ""}
 
 
 @pytest.fixture
@@ -471,6 +473,12 @@ def router(monkeypatch):
         if path == "/browser/_warm":
             state["status"] = "starting"
             return httpx.Response(200, json={"status": "starting"})
+        if path == "/browser/_prefs":
+            return httpx.Response(200, json=state.get("prefs_answer") or {
+                "proxy_available": True, "prefs": {"proxy": True, "city": ""},
+                "cities": [{"id": "us-los_angeles", "label": "Los Angeles, United States"}, {"id": "bad"}, "x"],
+                "effective_city": "us-los_angeles", "extra": "dropped",
+            })
         if path == "/browser/_embed":
             sid = body["session_id"]
             return httpx.Response(200, json={
@@ -592,7 +600,7 @@ def test_start_early_warms_without_waiting_or_failing(router):
         # Not awaited by the caller: nothing has gone out yet.
         assert router.calls == []
         await asyncio.gather(*list(svc._WARMING))
-        assert router.calls == [("POST", f"{ROUTER}/_warm", None, "Bearer turn-key")]
+        assert router.calls == [("POST", f"{ROUTER}/_warm", {"prefs": DEFAULT_PREFS}, "Bearer turn-key")]
         assert not svc._WARMING
 
         # A failing router is only logged.
@@ -657,4 +665,79 @@ def test_the_harness_threads_the_task_and_warms_with_the_held_credential(router,
         await asyncio.gather(*list(svc._WARMING))
 
     asyncio.run(scenario())
-    assert router.calls == [("POST", f"{ROUTER}/_warm", None, "Bearer desktop-jwt")]
+    assert router.calls == [("POST", f"{ROUTER}/_warm", {"prefs": DEFAULT_PREFS}, "Bearer desktop-jwt")]
+
+
+def test_proxy_settings_defaults_scope_and_city_check():
+    from pydantic import ValidationError
+
+    from cowork.common.settings.user_settings import UserSettings, setting_is_org_scoped
+
+    defaults = UserSettings()
+    assert (defaults.browser_proxy, defaults.browser_city) == (True, "")
+    for key in ("browser_proxy", "browser_city"):
+        assert setting_is_org_scoped(key) is False, key
+    assert UserSettings(browser_city=" us-new_york ").browser_city == "us-new_york"
+    for bad in ("US-new_york", "us", "us-new york", "us-../x", "usa-la"):
+        with pytest.raises(ValidationError):
+            UserSettings(browser_city=bad)
+
+
+def test_router_prefs_keep_only_sane_time_zones_and_locales():
+    user = SimpleNamespace(browser_proxy=False, browser_city="gb-london")
+    assert svc.router_prefs(user) == {"proxy": False, "city": "gb-london"}
+    assert svc.router_prefs(user, "Europe/London", "en-GB") == {
+        "proxy": False, "city": "gb-london", "timezone": "Europe/London", "locale": "en-GB",
+    }
+    assert svc.router_prefs(user, "Etc/GMT+5", "zh-Hant-TW")["timezone"] == "Etc/GMT+5"
+    assert svc.router_prefs(user, "Europe/London; rm", "en_GB<script>") == {"proxy": False, "city": "gb-london"}
+    # Settings objects from before the proxy existed read as the defaults.
+    assert svc.router_prefs(SimpleNamespace()) == DEFAULT_PREFS
+
+
+def test_start_early_sends_the_users_proxy_choice(router):
+    off = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_proxy=False, browser_city="fr-paris")
+
+    async def scenario():
+        assert svc.start_early(off, "turn-key") is True
+        await asyncio.gather(*list(svc._WARMING))
+
+    asyncio.run(scenario())
+    assert router.calls == [("POST", f"{ROUTER}/_warm", {"prefs": {"proxy": False, "city": "fr-paris"}}, "Bearer turn-key")]
+
+
+def test_provision_hands_the_router_the_prefs_and_locations_list_cities(client, router):
+    client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
+    client.put("/api/v1/settings/browser_city", json={"value": "us-los_angeles"})
+    # No body still works, as the renderer that doesn't send one expects.
+    assert client.post("/api/v1/browse/provision", headers=HUB).status_code == 200
+    answer = client.post(
+        "/api/v1/browse/provision", headers=HUB, json={"timezone": "America/Los_Angeles", "locale": "en-US"},
+    )
+    assert answer.status_code == 200
+    warms = [body for method, url, body, _ in router.calls if url.endswith("/_warm")]
+    assert warms == [
+        {"prefs": {"proxy": True, "city": "us-los_angeles"}},
+        {"prefs": {"proxy": True, "city": "us-los_angeles", "timezone": "America/Los_Angeles", "locale": "en-US"}},
+    ]
+
+    listed = client.get("/api/v1/browse/locations", headers=HUB)
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "proxy_available": True, "prefs": {"proxy": True, "city": ""},
+        "cities": [
+            # An id Settings couldn't save is dropped.
+            {"id": "us-los_angeles", "label": "Los Angeles, United States"},
+        ],
+        "effective_city": "us-los_angeles",
+    }
+    assert ("GET", f"{ROUTER}/_prefs", None, "Bearer user-jwt") in router.calls
+
+
+def test_locations_without_a_router_or_in_standalone(client, mindshub, monkeypatch):
+    assert client.get("/api/v1/browse/locations", headers=HUB).json() == svc.NO_LOCATIONS
+    assert mindshub.calls == []
+    monkeypatch.setattr(svc, "router_url", lambda: ROUTER)
+    client.put("/api/v1/settings/browser_mode", json={"value": "standalone"})
+    assert client.get("/api/v1/browse/locations", headers=HUB).json() == svc.NO_LOCATIONS
+    assert mindshub.calls == []
