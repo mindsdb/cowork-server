@@ -665,6 +665,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         yield "turn_failed", _setup_permission_failure()
         return
 
+    # The user's image model, resolved against what the wallet can pay for, rides
+    # on whichever block reaches the pod: Anton reads `llm["image_model"]` and,
+    # without it, falls back to the catalog's default image model.
+    from cowork.common.settings.user_settings import get_user_settings
+    image_model = getattr(get_user_settings(scope), "resolved_image_model", None)
+    if image_model and "image_model" not in llm_block:
+        llm_block = {**llm_block, "image_model": image_model}
+
     # Reuses the turn key already minted for llm_block — never mints a
     # second one. Org/cloud mode only: local-mode turns build in-process
     # and never reach this function at all.
