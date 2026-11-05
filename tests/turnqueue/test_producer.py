@@ -808,6 +808,10 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
     assert llm["api_key"] == "mdb_turnkey"
     assert llm["base_url"]
     assert llm["coding_model"]  # rides along so the pod's coding calls stay payable
+    # No image model rides along: nothing is picked and no cached catalog lists
+    # an image model yet (test_the_users_image_model_reaches_the_pod_... covers
+    # the block carrying one).
+    assert "image_model" not in llm
     # Only the internal shared secret authenticates the mint call; no
     # per-tenant credential is looked up or passed.
     assert "credential" not in captured
@@ -1730,3 +1734,57 @@ async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatc
         await asyncio.wait_for(_drain(prod.stream_remote_replies(
             conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
         )), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kept(monkeypatch):
+    """Anton reads `llm["image_model"]` on a cloud turn; the producer adds the user's resolved pick."""
+    from cowork.common.settings import user_settings
+
+    def replying_redis() -> FakeRedis:
+        # FakeRedis pops the replies it serves, so each turn gets its own: a turn
+        # that finds none waits out reply_idle_timeout_seconds.
+        fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+        monkeypatch.setattr(prod, "get_redis", lambda: fake)
+        return fake
+
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
+    monkeypatch.setattr(
+        user_settings.UserSettings,
+        "image_model_for_agent",
+        property(lambda self: "gpt-image-2.6-sunburst"),
+    )
+
+    fake = replying_redis()
+    await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    )), timeout=5)
+    assert json.loads(fake.added[0][1]["payload"])["params"]["llm"]["image_model"] == "gpt-image-2.6-sunburst"
+
+    fake = replying_redis()
+    block = {"provider": "minds-cloud", "api_key": "k", "base_url": "https://minds.internal/v1", "image_model": "x"}
+    await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        correlation_id="r", llm=block,
+    )), timeout=5)
+    assert json.loads(fake.added[0][1]["payload"])["params"]["llm"]["image_model"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_no_image_model_reaches_the_pod_before_mindshub_lists_one(monkeypatch):
+    """image_model_for_agent is None until the cached catalog lists an image model
+    (MindsHub can publish them after this release), and then the block has none."""
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
+    monkeypatch.setattr(user_settings.UserSettings, "image_model_for_agent", property(lambda self: None))
+
+    await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    )), timeout=5)
+
+    assert "image_model" not in json.loads(fake.added[0][1]["payload"])["params"]["llm"]

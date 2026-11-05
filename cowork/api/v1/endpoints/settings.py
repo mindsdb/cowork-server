@@ -48,6 +48,7 @@ from cowork.services.providers import (
     fetch_org_model_catalog,
     model_value_rejection,
     persist_enabled_model_map,
+    persist_image_model_map,
     persist_org_model_availability,
     persist_role_defaults_map,
     ping_providers,
@@ -59,7 +60,7 @@ from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 from cowork.common.settings.app_settings import (
-    AGENT_ROLE_NAMES,
+    CATALOG_ROLE_NAMES,
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
@@ -140,7 +141,7 @@ def _reject_malformed_role_defaults(updates: dict[str, Any]) -> None:
     bad = None
     if not isinstance(parsed, dict):
         bad = "must be a JSON object of agent role -> model id"
-    elif unknown := sorted(k for k in parsed if k not in AGENT_ROLE_NAMES):
+    elif unknown := sorted(k for k in parsed if k not in CATALOG_ROLE_NAMES):
         bad = f"names no agent role: {', '.join(unknown)}"
     elif empty := sorted(k for k, v in parsed.items() if not isinstance(v, str) or not v.strip()):
         bad = f"gives no model id for: {', '.join(empty)}"
@@ -615,7 +616,8 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
 # catalog read for an anonymous caller, and it should not read as one.
 @router.get("/recommended-models", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
-    """Per-provider model picker options for the Settings UI.
+    """Per-provider model picker options for the Settings UI, and the image
+    picker's (`imageModels`, `imageModelDefault`).
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
     the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
@@ -686,6 +688,13 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # endpoint overlay below reserves these ids for the grouping maps.
     minds_ids: set[str] = set()
 
+    # `imageModels` is MindsHub's image models (`kind: "image"`), in its order:
+    # the image picker's whole list, and never in `recommendedModels`, whose
+    # lists feed the chat pickers. Their lock state, reasons, labels and grouping
+    # ride the id-keyed maps above with the chat models'. Empty with no MindsHub
+    # key, or from a MindsHub that predates `kind`.
+    image_models: list[str] = []
+
     s = SettingService(session, scope).load()
     listing = None
     if scope.org_mode:
@@ -740,6 +749,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
                 persist_org_model_availability(session, scope, prior=s, listing=listing)
             else:
                 persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled, live)
+                persist_image_model_map(session, scope, s.minds_image_model_enabled, listing)
         # Cache the catalog's declared per-role defaults, so a default moved in
         # the config reaches this install on its next settings load with no client
         # release (UserSettings._minds_role_default_map).
@@ -774,11 +784,14 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_enabled.update(listing.image_models)
         model_disabled_reasons.update(listing.disabled_reasons)
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
         minds_ids.update(live or ())
+        minds_ids.update(listing.image_models)
+        image_models = list(listing.image_models)
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -873,6 +886,12 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
+        "imageModels": image_models,
+        # What an unset `image_model` resolves to, from the same reload as the
+        # gate below, so the picker's default is the model a turn would use.
+        # Left out while MindsHub lists no image model (a gateway that has not
+        # published them yet), so the picker has nothing to show.
+        **({"imageModelDefault": gate_settings._image_model_default()} if image_models else {}),
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelDisabledReasons": model_disabled_reasons,

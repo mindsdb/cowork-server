@@ -45,7 +45,7 @@ def _listing(*, restricted: bool, flags: bool = True) -> MindsModelListing:
     """The catalog one caller gets: ``PINNED`` restricted for them or not."""
     enabled = {MINDS_FREE_MODEL: True, PINNED: not restricted} if flags else {}
     reasons = {PINNED: "model_restricted"} if restricted and flags else {}
-    return MindsModelListing([MINDS_FREE_MODEL, PINNED], {}, enabled, {}, {}, {}, {}, reasons)
+    return MindsModelListing([MINDS_FREE_MODEL, PINNED], {}, enabled, {}, {}, {}, {}, reasons, {})
 
 
 def _mode(monkeypatch, mode: str) -> None:

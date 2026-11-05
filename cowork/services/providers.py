@@ -19,7 +19,7 @@ from pydantic import SecretStr
 from cowork.build_info import supported_kwargs, surface
 from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
-from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
+from cowork.common.settings.app_settings import CATALOG_ROLE_NAMES, IMAGE_ROLE, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
 from cowork.services.mindshub_client import sweep_cache
 
@@ -290,6 +290,10 @@ class MindsModelListing(NamedTuple):
     model id and are empty (never None) whenever the gateway doesn't publish that
     field — a plain OpenAI-compatible endpoint publishes none of
     ``labels``/``providers``/``families``.
+
+    ``ids`` and ``enabled`` are the chat models only. The image models are in
+    ``image_models``; the display maps (``labels``, ``providers``, ``families``,
+    ``disabled_reasons``) describe both, keyed by id.
     """
 
     ids: Optional[list[str]]
@@ -319,14 +323,24 @@ class MindsModelListing(NamedTuple):
     # hazard ``_empty_listing`` is a factory to avoid; a default would reintroduce
     # it for the sake of not touching three test fakes.
     role_defaults: dict[str, str]
-    # Why a model the ``enabled`` map marks false is unavailable, in the
-    # gateway's own reason words: "model_restricted" (an admin in the org
-    # restricted it), "wallet_empty" or "included_allowance_exhausted". Keyed
-    # only by ids that ``enabled`` marks false, so the two maps cannot
-    # disagree. Empty whenever the gateway publishes no reasons, which includes
-    # every MindsHub that predates the field and every plain OpenAI-compatible
-    # endpoint. Required for the same reason as ``role_defaults``.
+    # Why a model the ``enabled`` map (or ``image_models``) marks false is
+    # unavailable, in the gateway's own reason words: "model_restricted" (an
+    # admin in the org restricted it), "wallet_empty" or
+    # "included_allowance_exhausted". Keyed only by ids one of those marks
+    # false, so the maps cannot disagree. Empty whenever the gateway publishes no
+    # reasons, which includes every MindsHub that predates the field and every
+    # plain OpenAI-compatible endpoint. Required for the same reason as
+    # ``role_defaults``.
     disabled_reasons: dict[str, str]
+    # Every `kind: "image"` row, in the gateway's order -> whether the caller may
+    # use it (True when the row publishes no `enabled`, as for chat). Dense, unlike
+    # ``enabled``, so its keys are the image picker's list. Never in ``ids``: an
+    # image model offered to a chat role errors every turn, and the chat roles'
+    # first-enabled fallback must never land on one. Empty for every gateway that
+    # predates `kind` and every plain OpenAI-compatible endpoint, which is right:
+    # a row without `kind` is a chat model unless it is an embeddings one.
+    # Required for the same reason as ``role_defaults``.
+    image_models: dict[str, bool]
 
 
 def _empty_listing() -> MindsModelListing:
@@ -338,7 +352,11 @@ def _empty_listing() -> MindsModelListing:
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {}, {})
+
+
+# The `kind` a `/v1/models` row carries for an image-generation model.
+_IMAGE_KIND = "image"
 
 
 # The listing's ``disabled_reason`` for a model an admin's model rule restricts
@@ -485,7 +503,9 @@ async def fetch_minds_models(
     model id remains the value used everywhere else (selection, storage,
     resolution); a model missing from ``labels`` falls back to the client's
     id-derived label. Embedding and decision models are dropped entirely — they
-    share this listing but cannot serve planning/coding roles.
+    share this listing but cannot serve planning/coding roles. Image models
+    cannot either, so they are kept out of ``ids``/``enabled`` and listed in
+    ``image_models`` instead.
 
     ``force_refresh`` skips the cache *read* for a cached success (a fresh
     result is still cached for subsequent calls) — used when the caller knows
@@ -579,6 +599,7 @@ async def fetch_minds_models(
     families: dict[str, str] = {}
     role_defaults: dict[str, str] = {}
     disabled_reasons: dict[str, str] = {}
+    image_models: dict[str, bool] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -605,17 +626,25 @@ async def fetch_minds_models(
         # picker nor default-resolution ever sees them.
         if row.get("kind") == "decision" or _is_embedding_row(row, model_id):
             continue
-        ids.append(model_id)
+        # Image models share it too and stay out of the chat ids for the same
+        # reason. Unlike those they are recorded, in `image_models`: the image
+        # picker lists them and the image role resolves against them.
+        is_image = row.get("kind") == _IMAGE_KIND
         # A model the org's wallet can't currently pay for (or whose free
         # allowance is spent, or that an admin restricted) is listed with
         # enabled=false so the picker can show it as locked. Missing → available.
-        if "enabled" in row:
-            enabled[model_id] = bool(row.get("enabled"))
+        if is_image:
+            image_models[model_id] = bool(row.get("enabled")) if "enabled" in row else True
+        else:
+            ids.append(model_id)
+            if "enabled" in row:
+                enabled[model_id] = bool(row.get("enabled"))
         # Why it is locked, when the gateway says: an admin rule is not
         # something credits can lift, so the picker must not offer them for it.
         # Read only for a row the map marks false, so no reason outlives the
         # lock it explains.
-        if enabled.get(model_id) is False and (reason := _text(row, "disabled_reason")):
+        locked = (image_models if is_image else enabled).get(model_id) is False
+        if locked and (reason := _text(row, "disabled_reason")):
             disabled_reasons[model_id] = reason
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:
@@ -653,13 +682,18 @@ async def fetch_minds_models(
         # before it ships; this is what keeps a live one out of the settings row.
         # First declaration wins, which cannot arise against a validated catalog
         # and keeps the parse total when it does.
+        #
+        # Only an image model may claim the image role, and an image model may
+        # claim no other: the policy gate enforces both, and a claim that slipped
+        # past it would hand a chat role a model that cannot chat, or the
+        # reverse.
         for role in row.get("default_for") or ():
-            if isinstance(role, str) and role in AGENT_ROLE_NAMES:
+            if isinstance(role, str) and role in CATALOG_ROLE_NAMES and (role == IMAGE_ROLE) == is_image:
                 role_defaults.setdefault(role, model_id)
     return _remember(
         MindsModelListing(
             (ids or None), efforts, enabled, labels, providers, families, role_defaults,
-            disabled_reasons,
+            disabled_reasons, image_models,
         )
     )
 
@@ -737,8 +771,8 @@ async def fetch_org_model_catalog(
 #     4. cowork/migrations.py (first-boot .env→DB seed)
 #     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
 #   Two more write settings but only their own fixed keys: channels.py
-#   (`channels_harness`) and the `minds_model_enabled` / `minds_model_restricted`
-#   refresh in settings.py.
+#   (`channels_harness`) and the `minds_model_enabled` / `minds_image_model_enabled`
+#   / `minds_model_restricted` refresh in settings.py.
 #
 #   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
 #   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its
@@ -747,8 +781,9 @@ async def fetch_org_model_catalog(
 #: The settings whose VALUE names a model id. `UserSettings` types these as bare
 #: `str | None`, so the settings API validates the key and the type and nothing
 #: else — an id no provider can serve saves cleanly and only fails much later, at
-#: turn time. Router model is included: same field shape, same failure.
-MODEL_VALUE_SETTINGS = frozenset({"planning_model", "coding_model", "router_model"})
+#: turn time. Router model is included: same field shape, same failure. So is the
+#: image model, checked against the catalog's image models instead of its chat ones.
+MODEL_VALUE_SETTINGS = frozenset({"planning_model", "coding_model", "router_model", "image_model"})
 
 
 #: Deprecated-but-live alias namespace. MindsHub aliases are bare (``sonnet``),
@@ -809,16 +844,20 @@ async def model_value_rejection(
         return None
 
     # Which provider will actually serve this model. Only MindsHub has a catalog
-    # we can check; anything else is the user's own endpoint.
+    # we can check; anything else is the user's own endpoint. The image role has
+    # no provider setting: MindsHub is the only gateway serving image models, so
+    # its catalog is checked whenever there is one to fetch.
+    image = key == "image_model"
     provider_attr = {
         "planning_model": "resolved_planning_provider",
         "coding_model": "resolved_coding_provider",
         "router_model": "resolved_router_provider",
+        "image_model": None,
     }[key]
     try:
         from cowork.common.settings.user_settings import Provider
 
-        if getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
+        if provider_attr is not None and getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
             return None
         stored_key = settings.minds_api_key
         api_key = stored_key.get_secret_value() if stored_key is not None else ""
@@ -844,21 +883,25 @@ async def model_value_rejection(
         return None
 
     # ids is None on any failure and the list is empty for a gateway that serves
-    # no chat models; in both cases we hold no evidence, so we allow.
-    if not listing.ids:
+    # no chat models; in both cases we hold no evidence, so we allow. Same for a
+    # gateway that lists no image models, which includes every one predating `kind`.
+    served = list(listing.image_models) if image else listing.ids
+    if not served:
         return None
-    if value in listing.ids:
+    if value in served:
         return None
     if value.startswith(_LEGACY_MODEL_PREFIX) and (
-        value[len(_LEGACY_MODEL_PREFIX):] in listing.ids
+        value[len(_LEGACY_MODEL_PREFIX):] in served
     ):
         return None
 
     # Definitive: a real catalog that does not contain this id.
-    known = ", ".join(sorted(listing.ids)[:5])
+    known = ", ".join(sorted(served)[:5])
+    kind = "an image model" if image else "a model"
+    listed = "image model list" if image else "model list"
     return (
-        f"'{value}' is not a model this provider offers. "
-        f"Pick one from the model list in Settings (for example: {known})."
+        f"'{value}' is not {kind} this provider offers. "
+        f"Pick one from the {listed} in Settings (for example: {known})."
     )
 
 
@@ -870,8 +913,10 @@ def persist_enabled_model_map(
     live_ids: list[str] | None = None,
     *,
     member_restricted: Collection[str] = (),
+    key: str = "minds_model_enabled",
 ) -> bool:
-    """Guarded write of the `minds_model_enabled` availability map.
+    """Guarded write of an availability map, `minds_model_enabled` unless ``key``
+    names the image models' `minds_image_model_enabled` (persist_image_model_map).
 
     Shared by every writer (the recommended-models endpoint and the startup /
     credential-sync warm below) so the invariants can't drift between them:
@@ -955,7 +1000,7 @@ def persist_enabled_model_map(
     desired = json.dumps(live_enabled)
     if desired == json.dumps(prior):
         return False
-    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+    SettingService(session, scope).upsert_setting(key, desired)
     return True
 
 
@@ -973,7 +1018,8 @@ def persist_org_model_availability(
     restricted ids go to the map with the flag it already held for them
     (``persist_enabled_model_map``'s ``member_restricted``), and to this member's
     own ``minds_model_restricted`` row, which ``UserSettings._minds_enabled_map``
-    lays over the map as ``False``.
+    lays over the map as ``False``. The image models' map is an org row too and
+    is written the same way, and the one restriction list covers both.
 
     ``scope`` must name the caller: ``minds_model_restricted`` is a personal
     setting. ``prior`` is the caller's loaded settings. The restriction list
@@ -982,7 +1028,7 @@ def persist_org_model_availability(
     does is the whole answer, and an empty restriction set clears the list.
     Stored sorted and written only on a change, like ``persist_role_defaults_map``.
 
-    Returns True iff either row was updated.
+    Returns True iff any row was updated.
     """
     from cowork.services.settings import SettingService
 
@@ -993,12 +1039,29 @@ def persist_org_model_availability(
         session, scope, prior.minds_model_enabled, listing.enabled, listing.ids,
         member_restricted=restricted,
     )
+    changed = persist_image_model_map(
+        session, scope, prior.minds_image_model_enabled, listing, member_restricted=restricted,
+    ) or changed
     if not listing.enabled:
         return changed
     if restricted == sorted(prior._minds_restricted_ids()):
         return changed
     SettingService(session, scope).upsert_setting("minds_model_restricted", json.dumps(restricted))
     return True
+
+
+def persist_image_model_map(
+    session, scope, prior_json: str | None, listing: MindsModelListing, *, member_restricted: Collection[str] = (),
+) -> bool:
+    """``persist_enabled_model_map`` for the image models' own availability map.
+
+    A listing with no image models, which is what every gateway predating `kind`
+    returns, leaves the stored map alone, as a failed fetch leaves the chat one.
+    """
+    return persist_enabled_model_map(
+        session, scope, prior_json, listing.image_models, list(listing.image_models),
+        member_restricted=member_restricted, key="minds_image_model_enabled",
+    )
 
 
 def persist_role_defaults_map(session, scope, prior_json: str | None, live_role_defaults: dict) -> bool:
@@ -1067,8 +1130,9 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     on any error, bounded by a hard total budget (``_MINDS_MODELS_TIMEOUT_S``)
     so a degraded gateway can't stall the caller, and ``persist_enabled_model_map``
     never writes an empty map — so an unreachable MindsHub leaves the stored map
-    untouched and is never worse than today. Returns True iff the map was
-    updated.
+    untouched and is never worse than today. The image models' map is warmed
+    alongside, under the same rules, for a stored image pin. Returns True iff
+    either map was updated.
     """
     from cowork.db.scoped import LOCAL_SCOPE
     from cowork.services.settings import SettingService
@@ -1078,9 +1142,10 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     if s.minds_api_key is None or not s.minds_url:
         return False
     listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
-    return persist_enabled_model_map(
+    changed = persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
+    return persist_image_model_map(session, scope, s.minds_image_model_enabled, listing) or changed
 
 
 # ── Config readiness ─────────────────────────────────────────────────
