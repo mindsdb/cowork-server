@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from weakref import WeakValueDictionary
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from cowork.common.logger import log_context
 from cowork.streaming.buffer import StreamBuffer
@@ -159,6 +159,10 @@ class TurnLifecycle:
     a request that reads the history counts that row, so only a request that
     read it earlier can still name this turn's number; ``RunRegistry.start``
     refuses that request.
+
+    ``question_id`` is that row, once saved. A producer the turn is handed to
+    (a direct answer that delegates to the agent) reuses it rather than saving
+    the question a second time.
     """
 
     discarded: bool = False
@@ -167,6 +171,7 @@ class TurnLifecycle:
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
     timed_out: bool = False
     saved_question: bool = False
+    question_id: UUID | None = None
     stalled: bool = False
     cancel_requested: bool = False
     identity: RunIdentity = field(default_factory=RunIdentity)

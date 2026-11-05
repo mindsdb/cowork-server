@@ -37,6 +37,7 @@ from cowork.handlers.first_take import FirstTake, clears_take as first_take_clea
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    ANSWER_HISTORY_MESSAGES,
     DIRECT_HARNESS,
     _settings_binding,
     RouteDecision,
@@ -368,7 +369,7 @@ class _TurnStart:
     conversation_id: UUID
     turn_id: int
     # The gate's history: user and assistant rows, oldest first, at most
-    # direct_answer.MAX_HISTORY_MESSAGES. Empty when the turn's shape or an
+    # ANSWER_HISTORY_MESSAGES. Empty when the turn's shape or an
     # always-on skill skips the gate, and None when the history or always-on
     # read failed, which sends the turn to the agent.
     gate_rows: list[Message] | None
@@ -458,13 +459,17 @@ def _start_turn(
 ) -> _StartedTurn | None:
     """A streamed turn's first unit: load the conversation, then save the
     question as pending (ENG-1231), so a refresh mid-turn shows it while
-    replayed history (get_ordered_messages) leaves it out."""
+    replayed history (get_ordered_messages) leaves it out. A turn handed over
+    by a direct answer reuses the question that producer already saved."""
     if lifecycle.discarded:
         return None
     conversation = _conversation_for_harness(session, conversation_id=conversation_id)
+    if lifecycle.question_id is not None:
+        return _StartedTurn(conversation=conversation, question_id=lifecycle.question_id)
     question = ConversationService(session).save_user_message(
         conversation_id, content, created_at=sent_at, pending=True,
     )
+    lifecycle.question_id = question.id
     return _StartedTurn(conversation=conversation, question_id=question.id)
 
 
@@ -591,12 +596,16 @@ def _save_remote_question(
     so a refresh mid-turn shows it while replayed history
     (get_ordered_messages) leaves it out. None when the turn was deleted
     while this unit waited for a connection: its row would land in the
-    history the delete cut."""
+    history the delete cut. A turn handed over by a direct answer reuses the
+    question that producer already saved."""
     if lifecycle.discarded:
         return None
-    return ConversationService(session).save_user_message(
+    if lifecycle.question_id is not None:
+        return lifecycle.question_id
+    lifecycle.question_id = ConversationService(session).save_user_message(
         conversation_id, content, pending=True,
     ).id
+    return lifecycle.question_id
 
 
 def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
@@ -611,6 +620,22 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
             retry_after=retry_after, retry_at=retry_at_instant(retry_after), request_id=request_id,
         )
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
+
+
+def _allowed_web_tools(provider_kind: Provider) -> frozenset[str]:
+    """The native web tools a direct answer may use: the same switches the
+    agent's turns honor (`web_tool_switches`: the server's ANTON_WEB_* env,
+    and openai_compatible on the Responses flavor, where hosted search would
+    bypass the egress gateway)."""
+    from cowork.services.providers import web_tool_switches
+
+    switches = web_tool_switches(provider_kind)
+    if switches.get("internet_research_enabled") is False:
+        return frozenset()
+    return frozenset(
+        tool for tool, key in (("web_search", "web_search_enabled"), ("web_fetch", "web_fetch_enabled"))
+        if switches.get(key) is not False
+    )
 
 
 def _last_answer_harness(rows: list[Message]) -> str | None:
@@ -710,6 +735,8 @@ class ResponsesHandler:
         # The instant first take, started beside the gate by
         # _route_request and handed to the turn's producer if it delegates.
         self.first_take: FirstTake | None = None
+        # The gate's scrubbed history, set by _route_request for a direct answer.
+        self.routing_history: list[dict] | None = None
 
     def _get_harness(self):
         if self.harness is None:
@@ -838,7 +865,9 @@ class ResponsesHandler:
                 answer_binding = self._answer_binding(
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
                 )
-                answer_history = _routing_history(start.gate_rows or [], start.harness_input)
+                answer_history = self.routing_history or _routing_history(
+                    start.gate_rows or [], start.harness_input,
+                )
                 if answer_binding is not None and not request.stream:
                     text = await direct_answer.complete_answer(
                         answer_binding, history=answer_history, needs_search=route.needs_search,
@@ -1138,7 +1167,7 @@ class ResponsesHandler:
         try:
             return ConversationService(session).get_recent_messages(
                 conversation_id, roles=(Role.user, Role.assistant),
-                limit=direct_answer.MAX_HISTORY_MESSAGES,
+                limit=ANSWER_HISTORY_MESSAGES,
             )
         except PoolTimeoutError:
             raise
@@ -1197,6 +1226,8 @@ class ResponsesHandler:
             ), None
         try:
             history = _routing_history(gate_rows, harness_input)
+            # Kept for a direct answer, which reads the same scrubbed rows.
+            self.routing_history = history
             # The gate's LLM call is the only one a direct turn makes, and it
             # is made outside any ChatSession — so without a trace context it
             # reaches MindsHub anonymous, and a direct turn leaves no trace to
@@ -1215,9 +1246,9 @@ class ResponsesHandler:
                 with use_settings_scope(self.scope):
                     # Minted before the context goes in (it is an auth call, not
                     # an LLM call), so the context can carry the turn's
-                    # correlation_id: the gate's trace and the Jev shadow probe's
-                    # (which inherits this context) share it, making gate
-                    # decision <-> Jev answer an exact join. Never
+                    # correlation_id: the gate's trace and Jev's decision
+                    # (which inherits this context) share it, making the
+                    # decision <-> turn an exact join. Never
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
@@ -1380,7 +1411,8 @@ class ResponsesHandler:
             logger.warning("[direct] could not build the answer's provider; delegating", exc_info=True)
             return None
         return RouterBinding(
-            provider=provider, model=answer_model, label=provider_kind.value, reasoning_effort=reasoning_effort,
+            provider=provider, model=answer_model, label=provider_kind.value,
+            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind),
         )
 
     async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
@@ -1702,15 +1734,16 @@ class ResponsesHandler:
         """Stream the direct answer Jev routed, on the user's own model, or
         hand the turn to the agent on this same buffer.
 
-        Nothing is saved or shown until the answer starts with text
+        The question is saved pending first (`_start_turn`, ENG-1231), as on
+        the agent's producers, so a crash while the answer starts cannot lose
+        it. Nothing is shown until the answer starts with text
         (`direct_answer.start_answer`): a delegation, a timeout or a failure
-        before then runs `delegate`, which saves the question itself. Once
-        text has started the turn is a streamed one like the agent's: the
-        question is saved pending (`_start_turn`), the text streams, and the
-        answer is saved with the pending flag cleared in one commit
+        before then runs `delegate`, whose producer reuses that question
+        (`TurnLifecycle.question_id`). Once text has started the text streams,
+        and the answer is saved with the pending flag cleared in one commit
         (`_save_answer`), before the completed frame reports it. A Stop saves
         the answer as it stands; a failure saves it and reports the error.
-        A Stop before the answer starts saves the question with no answer,
+        A Stop before the answer starts leaves the question with no answer,
         as an agent turn stopped before its first output does.
         A turn the server ended (shutdown, duration bound) is saved and
         reported as interrupted, as the agent's are, and waits for its save
@@ -1721,15 +1754,6 @@ class ResponsesHandler:
         from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
 
         corr = lifecycle.identity.correlation_id
-
-        # Attributes the answer's model call to the conversation, as the gate's
-        # is; without it the call reaches MindsHub anonymous.
-        token = set_trace_context(TraceContext(
-            session_id=str(conv_id),
-            harness=self.harness_name,
-            tags=("cowork-direct",),
-            metadata={**trace_metadata, "correlation_id": corr},
-        ))
 
         scope = scope_from_principal(self.principal)
         item_id = f"msg-{conv_id.hex[:12]}"
@@ -1821,6 +1845,16 @@ class ResponsesHandler:
             await buffer.close(reason)
 
         try:
+            if await run_to_completion(start()) is None:
+                return
+            # Attributes the answer's model call to the conversation, as the
+            # gate's is; without it the call reaches MindsHub anonymous.
+            token = set_trace_context(TraceContext(
+                session_id=str(conv_id),
+                harness=self.harness_name,
+                tags=("cowork-direct",),
+                metadata={**trace_metadata, "correlation_id": corr},
+            ))
             try:
                 answer = await direct_answer.start_answer(
                     binding, history=history, needs_search=route.needs_search,
@@ -1845,8 +1879,6 @@ class ResponsesHandler:
                 return
 
             parts.append(answer.first_text)
-            if await run_to_completion(start()) is None:
-                return
             response = Response(status=ResponseStatus.created, model=binding.model)
             await buffer.append("sse", {"sse": sse_frame("response.created", {
                 "type": "response.created",
@@ -1922,12 +1954,10 @@ class ResponsesHandler:
             if delegated:
                 # The agent's producer ended the turn and saved the question.
                 return
-            if answer is None:
-                # Cancelled before the answer started: nothing is saved yet,
-                # so save the question; end_turn then saves no answer and
-                # clears its pending flag.
-                if await run_to_completion(start()) is None:
-                    return
+            if question_id is None:
+                # Cancelled while the question was being saved, and the turn
+                # was deleted: nothing to finalize.
+                return
             if lifecycle.shutting_down or lifecycle.timed_out:
                 # The server ended the turn, not the user: say so, as the
                 # agent's producers do, rather than reading as a Stop.

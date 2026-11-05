@@ -722,7 +722,7 @@ async def test_turn_start_counts_every_stored_row(monkeypatch):
     from cowork.db.scoped import LOCAL_SCOPE
     from cowork.db.session import get_engine
     from cowork.db.units import run_db
-    from cowork.handlers.direct_answer import MAX_HISTORY_MESSAGES
+    from cowork.handlers.response_routing import ANSWER_HISTORY_MESSAGES as MAX_HISTORY_MESSAGES
     from cowork.schemas.responses import ResponsesRequest
     from cowork.services.conversations import ConversationService
     from cowork.services.projects import GENERAL_PROJECT_ID

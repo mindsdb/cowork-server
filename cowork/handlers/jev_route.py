@@ -107,11 +107,15 @@ class JevTarget:
 
     url: str
     api_key: str
+    # MindsHub's own endpoint: only it reads the Langfuse trace headers, and
+    # they carry user, organization and conversation ids, so an organization's
+    # own decision endpoint never receives them.
+    mindshub_gateway: bool = False
 
     @classmethod
     def mindshub(cls, base_url: str, api_key: str) -> "JevTarget":
         """MindsHub's endpoint under its inference base URL (incl. /v1)."""
-        return cls(url=f"{base_url.rstrip('/')}/decisions", api_key=api_key)
+        return cls(url=f"{base_url.rstrip('/')}/decisions", api_key=api_key, mindshub_gateway=True)
 
 
 @dataclass(frozen=True)
@@ -297,11 +301,16 @@ async def decide(
         async with asyncio.timeout(timeout_seconds):
             response = await _http_client().post(
                 target.url,
-                headers={**_trace_headers(), "Authorization": f"Bearer {target.api_key}"},
+                headers={
+                    **(_trace_headers() if target.mindshub_gateway else {}),
+                    "Authorization": f"Bearer {target.api_key}",
+                },
                 json=payload,
                 timeout=timeout_seconds,
             )
-    except TimeoutError:
+    except (TimeoutError, httpx.TimeoutException):
+        # httpx's own timeouts fire at the same budget: the gate's time is
+        # spent either way, so both read as a timeout (no LLM gate after it).
         return JevRoute(ms=_elapsed_ms(started), error="timeout")
     except httpx.HTTPError:
         return JevRoute(ms=_elapsed_ms(started), error="transport_error")

@@ -1551,6 +1551,14 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     it would fail every turn.
     """
     from anton.core.session import ChatSessionConfig
+
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **web_tool_switches(planning_provider)))
+
+
+def web_tool_switches(planning_provider: Provider) -> WebToolKwargs:
+    """The web tools this server turns off for a session on `planning_provider`,
+    before `web_tool_kwargs_for` drops the fields the installed anton lacks.
+    For callers that apply them themselves, such as the direct answer."""
     from cowork.common.settings.user_settings import Provider
 
     if (
@@ -1563,7 +1571,7 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     for field, env_name in _WEB_TOOL_ENV.items():
         if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
             kwargs[field] = False
-    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **kwargs))
+    return kwargs
 
 
 def build_llm_client(

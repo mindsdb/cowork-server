@@ -36,6 +36,16 @@ DIRECT_HARNESS = "cowork-direct"
 # Keep the gate's context bounded.  It does not need Anton's full tool history.
 _MAX_HISTORY_MESSAGES = 16
 _MAX_MESSAGE_CHARS = 1_500
+# The direct answer's view (`direct_answer`), wider than the gate's: recalling
+# what an earlier reply said is the job that path is routed for, and a long
+# reply cut at 1,500 chars can lose exactly the numbers the user asks about.
+ANSWER_HISTORY_MESSAGES = 40
+ANSWER_MESSAGE_CHARS = 12_000
+# Jev judges whether the direct answer can reply from what it sees, so it reads
+# the same messages at the same length, newest first up to this budget: a long
+# conversation must not push one decision past the gate's time. A narrower view
+# than the answer's only errs toward the agent.
+JEV_HISTORY_CHARS = 24_000
 _DIRECT_MAX_TOKENS = 1_024
 # Three budgets, because the gate has two phases with different needs.
 #
@@ -401,6 +411,9 @@ class RouterBinding:
     # The reasoning effort the user picked in the composer, for the direct
     # answer on their own model. None leaves the provider's default.
     reasoning_effort: str | None = None
+    # The native web tools this deployment allows the direct answer
+    # (`providers.web_tool_kwargs_for`); None leaves the provider's own set.
+    web_tools: frozenset[str] | None = None
 
 
 _END = object()  # `anext` default: the stream ended without a StreamComplete
@@ -450,6 +463,38 @@ def _spawn_drain(events, *, deadline: float, model: str) -> None:
     task = asyncio.create_task(_drain(events, deadline=deadline, model=model))
     _drain_tasks.add(task)
     task.add_done_callback(_drain_tasks.discard)
+
+
+def answer_rejection(answer: str) -> "_RejectedAnswer | None":
+    """Why a direct answer must not ship, or None. Shared by the LLM gate and
+    the direct answer on the user's own model (`direct_answer`), so both
+    reject the same shapes under the same reasons.
+
+    - It names the gate's own tool.
+    - It names another AI product (ENG-2423). On a direct answer that is
+      overwhelmingly the model describing itself as that product, for example
+      telling a user to install the ChatGPT desktop app when they asked how to
+      install Cowork.
+    - It denies that our own product can be identified or exists.
+    - It imitates an approval card or claims a finished change (ENG-3896):
+      saved, it reads as an approval or as work that never ran, and a "yes"
+      typed under it reaches the router again.
+
+    The evidence is a slice of the model's answer for the last two, which no
+    scrubber has seen, so callers log only the reason.
+    """
+    if names_gate_tool(answer) is not None:
+        return _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
+    foreign = names_foreign_product(answer)
+    if foreign is not None:
+        return _RejectedAnswer("router_answer_named_foreign_product", foreign)
+    denial = denies_our_product(answer)
+    if denial is not None:
+        return _RejectedAnswer("router_answer_denied_product", denial)
+    imitation = imitates_approval(answer)
+    if imitation is not None:
+        return _RejectedAnswer("router_answer_imitated_approval", imitation)
+    return None
 
 
 async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
@@ -529,47 +574,10 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     answer = text.strip()
     if not answer:
         return None
-    if names_gate_tool(answer) is not None:
-        logger.info("[gate] discarding direct answer naming the gate's own tool; delegating")
-        raise _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
-    # An answer that names another AI
-    # product is, on this gate, overwhelmingly the model describing itself as
-    # that product — telling a user to install the ChatGPT desktop app when they
-    # asked how to install Cowork.  Discarding here rather than post-hoc is what
-    # also satisfies "a wrong gate answer cannot be carried forward": a
-    # delegated turn never reaches `_handle_direct_response`, so nothing is
-    # persisted and the main loop inherits no poisoned history.
-    # Raised rather than returned as None so the decision carries its own
-    # reason: `router_declined_direct_response` would say the model chose to
-    # delegate, when in fact it answered and we overrode it.  The reason is
-    # stamped onto the turn's trace metadata, so "how often does the guard
-    # fire?" stays a query instead of a log grep — and the two shapes stay
-    # countable apart, since they fail for different reasons and would be
-    # tuned separately.
-    foreign = names_foreign_product(answer)
-    if foreign is not None:
-        logger.info(
-            "[gate] discarding direct answer naming a foreign product (%s); delegating",
-            foreign,
-        )
-        raise _RejectedAnswer("router_answer_named_foreign_product", foreign)
-    denial = denies_our_product(answer)
-    if denial is not None:
-        # The matched span is a slice of the MODEL'S ANSWER, unlike the foreign
-        # branch above whose value comes from our own fixed vocabulary.  This
-        # gate sits upstream of every scrubber (ENG-2105 scrubs the history
-        # going *into* it, not its output), so logging the span would put
-        # unscrubbed model output in the logs.  The reason string on the
-        # decision is what makes this countable; the span adds nothing the
-        # trace does not already carry.
-        logger.info("[gate] discarding direct answer denying our own product; delegating")
-        raise _RejectedAnswer("router_answer_denied_product", denial)
-    imitation = imitates_approval(answer)
-    if imitation is not None:
-        # Saved, such an answer reads as an approval card or as finished work,
-        # and a "yes" typed under it reaches this gate again.
-        logger.info("[gate] discarding direct answer imitating an approval or a finished change; delegating")
-        raise _RejectedAnswer("router_answer_imitated_approval", imitation)
+    rejection = answer_rejection(answer)
+    if rejection is not None:
+        logger.info("[gate] discarding a direct answer; delegating", extra={"reason": rejection.reason})
+        raise rejection
     return answer
 
 
@@ -647,6 +655,7 @@ def _text_history(
     *,
     max_messages: int = _MAX_HISTORY_MESSAGES,
     max_chars: int = _MAX_MESSAGE_CHARS,
+    max_total_chars: int | None = None,
 ) -> list[dict]:
     """Return a bounded, text-only, role-alternating history for the gate.
 
@@ -670,9 +679,21 @@ def _text_history(
         else:
             result.append({"role": role, "content": content})
     result = result[-max_messages:]
+    if max_total_chars is not None:
+        # Oldest first, never the latest message.
+        while len(result) > 1 and sum(len(m["content"]) for m in result) > max_total_chars:
+            result.pop(0)
     while result and result[0]["role"] != "user":
         result.pop(0)
     return result
+
+
+def jev_history(history: list[dict]) -> list[dict]:
+    """What Jev reads: the direct answer's view, within `JEV_HISTORY_CHARS`."""
+    return _text_history(
+        history, max_messages=ANSWER_HISTORY_MESSAGES, max_chars=ANSWER_MESSAGE_CHARS,
+        max_total_chars=JEV_HISTORY_CHARS,
+    )
 
 
 def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_disabled_connections: bool) -> str | None:
@@ -800,7 +821,7 @@ async def decide_route(
         return RouteDecision(route=DELEGATED_AGENTIC, reason="no_routable_history")
 
     if jev is not None:
-        result = await jev(messages)
+        result = await jev(jev_history(history))
         if not result.error:
             return RouteDecision(
                 route=DIRECT_CONTEXT if result.direct else DELEGATED_AGENTIC,

@@ -6,9 +6,10 @@ Three strategies, each run on every case in `cases.py`:
   and the router model (mindshub_air by default), on the real budgets.
 - ``jev_current``: Jev swapped into today's gate unchanged. Today's code checks
   (including `prior_turn_ran_tools`) and the shadow probe's question and state.
-- ``jev_proposed``: the shipped Jev gate. The code checks without
-  `prior_turn_ran_tools`, and `jev_route.ROUTE_QUESTION`, which routes on
-  whether the reply's facts are in visible text.
+- ``jev_proposed``: the shipped Jev gate, run through the shipped code:
+  `decide_route(jev=...)` (its code checks, #815's included, and Jev's
+  history view) calling `jev_route.decide` (the production request, parse
+  and time budget).
 
 Jev is asked on every case even when a code check settles the route, so the
 per-case table shows its raw answer too. The headline number is
@@ -37,12 +38,14 @@ import httpx
 from dotenv import dotenv_values
 
 from cowork.handlers import jev_route
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.handlers.response_routing import (
     DIRECT_CONTEXT,
     RouterBinding,
     _text_history,
     decide_route,
     explicit_file_context,
+    jev_history,
     prior_turn_ran_tools,
 )
 from cowork.services.providers import minds_chat_base_url
@@ -96,15 +99,13 @@ def _credentials(env_file: Path) -> tuple[str, str]:
 
 
 async def _ask_jev(client: httpx.AsyncClient, *, base_url: str, key: str, model: str,
-                   state, question: dict, search: bool = False) -> dict:
+                   state, question: dict) -> dict:
     started = time.monotonic()
     try:
         response = await client.post(
             f"{base_url}/decisions",
             headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "state": state, "questions": {
-                "route": question, **({"search": jev_route.SEARCH_QUESTION} if search else {}),
-            }},
+            json={"model": model, "state": state, "questions": {"route": question}},
         )
     except httpx.HTTPError as exc:
         return {"ms": round((time.monotonic() - started) * 1000), "error": type(exc).__name__}
@@ -119,11 +120,7 @@ async def _ask_jev(client: httpx.AsyncClient, *, base_url: str, key: str, model:
         p_direct = probabilities.get("answer_directly")
         if p_direct is None:
             p_direct = 1.0 if choice == "answer_directly" else 0.0
-        result = {"ms": ms, "choice": choice, "p_direct": float(p_direct)}
-        if search:
-            # The production parse: only sets how long a direct answer may take to start.
-            result["needs_search"] = jev_route._needs_search(response.json())
-        return result
+        return {"ms": ms, "choice": choice, "p_direct": float(p_direct)}
     except Exception as exc:
         return {"ms": ms, "error": f"malformed:{type(exc).__name__}"}
 
@@ -168,12 +165,40 @@ async def _run_case(case: dict, *, args, key: str, base_url: str, client: httpx.
         result["jev_current"] = {"check": check, **jev}
 
     if "jev_proposed" in args.only:
-        check = _check_route(history, with_prior_tools=False)
-        jev = await _ask_jev(client, base_url=base_url, key=key, model=args.jev_model,
-                             state=jev_route.route_state(messages), question=jev_route.ROUTE_QUESTION,
-                             search=True)
-        result["jev_proposed"] = {"check": check, **jev}
+        result["jev_proposed"] = await _jev_proposed(
+            history, target=jev_route.JevTarget.mindshub(base_url, key), model=args.jev_model,
+        )
     return result
+
+
+async def _jev_proposed(history: list[dict], *, target: jev_route.JevTarget, model: str) -> dict:
+    """The shipped gate on one case. Jev is asked with min_p_direct 0 so the
+    report can sweep thresholds; on a case a code check settles, it is asked
+    on the same view anyway, for the per-case table."""
+    timeout = TurnQueueSettings().jev_route_timeout_seconds
+    asked: dict = {}
+
+    async def ask(messages: list[dict]) -> jev_route.JevRoute:
+        asked["view"] = messages
+        asked["route"] = await jev_route.decide(
+            target=target, messages=messages, model=model, timeout_seconds=timeout, min_p_direct=0.0,
+        )
+        return asked["route"]
+
+    decision = await decide_route(
+        history=history, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
+        jev=ask, binding_factory=lambda: None,
+    )
+    check = None if "route" in asked else decision.reason
+    route = asked.get("route") or await jev_route.decide(
+        target=target, messages=jev_history(history), model=model, timeout_seconds=timeout, min_p_direct=0.0,
+    )
+    entry: dict = {"check": check, "ms": route.ms, "needs_search": route.needs_search}
+    if route.error:
+        entry["error"] = route.error
+    else:
+        entry["p_direct"] = route.p_direct
+    return entry
 
 
 def _route_of(result: dict, strategy: str, threshold: float) -> str | None:

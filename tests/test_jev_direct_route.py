@@ -23,6 +23,7 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
+from cowork.streaming.registry import TurnLifecycle
 
 _TOOL_ROWS = [
     {"role": "user", "content": "Build me a dashboard of our 2025 sales."},
@@ -234,9 +235,9 @@ def test_jev_gate_without_a_key_falls_back_to_the_llm_gate(monkeypatch):
 @pytest.mark.parametrize(("turn_llm", "stored_key", "target"), [
     # A remote turn asks on the key the gate minted for it.
     ({"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}}, "stored",
-     jev_route.JevTarget(url="https://minds.example/v1/decisions", api_key="turn")),
+     jev_route.JevTarget(url="https://minds.example/v1/decisions", api_key="turn", mindshub_gateway=True)),
     # The desktop asks on the stored key, at the chat base URL.
-    (None, "stored", jev_route.JevTarget(url="https://api.mindshub.ai/v1/decisions", api_key="stored")),
+    (None, "stored", jev_route.JevTarget(url="https://api.mindshub.ai/v1/decisions", api_key="stored", mindshub_gateway=True)),
 ])
 async def test_jev_gate_asks_on_the_turns_key(monkeypatch, turn_llm, stored_key, target):
     seen = await _asked(monkeypatch, _gate(monkeypatch, _settings(), stored_key=stored_key), turn_llm)
@@ -333,10 +334,16 @@ def _text(text):
     return StreamTextDelta(text=text)
 
 
-def _complete(tool_calls=()):
+def _complete(tool_calls=(), stop_reason="end_turn"):
     from anton.core.llm.provider import StreamComplete
 
-    return StreamComplete(response=SimpleNamespace(content="", tool_calls=list(tool_calls), stop_reason="end_turn"))
+    return StreamComplete(response=SimpleNamespace(content="", tool_calls=list(tool_calls), stop_reason=stop_reason))
+
+
+def _tool_start():
+    from anton.core.llm.provider import StreamToolUseStart
+
+    return StreamToolUseStart(id="t1", name="delegate")
 
 
 def _binding(provider, model="opus-5-5"):
@@ -349,8 +356,10 @@ async def test_start_answer_streams_once_text_starts():
 
     answer = await direct_answer.start_answer(_binding(provider), history=_RECALL)
 
-    assert answer.first_text == "Revenue was "
-    assert [t async for t in answer.rest()] == ["$4.81M."]
+    # Shorter than the held opening: the whole answer, checked, at once.
+    assert answer.first_text == "Revenue was $4.81M."
+    assert answer.complete is True
+    assert [t async for t in answer.rest()] == []
     call = provider.calls[0]
     assert call["model"] == "opus-5-5"
     assert [t["name"] for t in call["tools"]] == ["delegate"]
@@ -572,6 +581,8 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
 async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None):
     from cowork.streaming.registry import TurnLifecycle
 
+    lifecycle = lifecycle or TurnLifecycle()
+
     async def fake_start(_binding, *, history, needs_search=True):
         if started is not None:
             # An answer that has not started yet: wait to be stopped.
@@ -584,7 +595,7 @@ async def _produce(monkeypatch, conversation_id, answer, *, delegate=None, lifec
     handler.harness_name = "anton"
     buffer = _Buffer()
     coro = handler._produce_answer(
-        lifecycle=lifecycle or TurnLifecycle(),
+        lifecycle=lifecycle,
         conv_id=conversation_id,
         original_content="what were those headline numbers again?",
         question="what were those headline numbers again?",
@@ -639,14 +650,19 @@ async def test_produce_answer_hands_a_delegated_turn_to_the_agent(monkeypatch):
     async def delegate():
         delegated.append(True)
 
-    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate)
+    lifecycle = TurnLifecycle()
+    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate, lifecycle=lifecycle)
 
     await coro
 
     assert delegated == [True]
-    # The agent saves the question itself; the direct path wrote nothing.
+    # Nothing shown; the question was saved pending before the answer
+    # started, and the agent's producer is handed that row to finish.
     assert buffer.frames == []
-    assert await _rows(conversation_id) == []
+    rows = await _rows(conversation_id)
+    assert rows == [("user", "what were those headline numbers again?", True, None)]
+    assert lifecycle.saved_question is True
+    assert lifecycle.question_id is not None
 
 
 @pytest.mark.asyncio
@@ -880,7 +896,8 @@ async def test_produce_answer_leaves_a_stop_after_delegation_to_the_agent(monkey
 
     assert buffer.status == "cancelled"
     assert buffer.frames == []
-    assert await _rows(conversation_id) == []
+    # Saved once, before delegation; the agent's producer finalizes it.
+    assert len(await _rows(conversation_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -901,3 +918,196 @@ async def test_write_approval_and_direct_follow_ups_reach_the_agent_before_jev(h
 
     assert (decision.route, decision.reason) == (DELEGATED_AGENTIC, reason)
     assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_the_question_is_saved_before_the_answer_starts(monkeypatch):
+    """A crash while the answer waits for its first text cannot lose the
+    question: it is saved pending first, as on the agent's producers."""
+    conversation_id = await _conversation()
+    started = asyncio.Event()
+    _handler, _buffer, coro = await _produce(monkeypatch, conversation_id, None, started=started)
+    task = asyncio.create_task(coro)
+    await started.wait()
+
+    assert await _rows(conversation_id) == [("user", "what were those headline numbers again?", True, None)]
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_delegated_turns_producers_reuse_the_saved_question():
+    """Both agent producers' first units take the row the direct producer
+    saved, so a delegated turn has its question once."""
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import run_db
+    from cowork.handlers.responses import _save_remote_question, _start_turn
+    from cowork.streaming.registry import TurnLifecycle
+    from datetime import datetime, timezone
+    from functools import partial
+
+    conversation_id = await _conversation()
+    lifecycle = TurnLifecycle()
+    first = await run_db(partial(
+        _start_turn, lifecycle=lifecycle, conversation_id=conversation_id,
+        content="what were those headline numbers again?", sent_at=datetime.now(timezone.utc),
+    ), scope=LOCAL_SCOPE)
+    again = await run_db(partial(
+        _start_turn, lifecycle=lifecycle, conversation_id=conversation_id,
+        content="what were those headline numbers again?", sent_at=datetime.now(timezone.utc),
+    ), scope=LOCAL_SCOPE)
+    remote = await run_db(partial(
+        _save_remote_question, lifecycle=lifecycle, conversation_id=conversation_id,
+        content="what were those headline numbers again?",
+    ), scope=LOCAL_SCOPE)
+
+    assert first.question_id == again.question_id == remote == lifecycle.question_id
+    assert len(await _rows(conversation_id)) == 1
+
+
+# ── the held opening ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_long_answer_is_held_until_its_opening_then_streams(monkeypatch):
+    monkeypatch.setattr(direct_answer, "_HOLD_CHARS", 20)
+    provider = _Provider([_text("Revenue was $4.81M "), _text("and churn 2.1%. "), _text("Margin 31%."), _complete()])
+
+    answer = await direct_answer.start_answer(_binding(provider), history=_RECALL)
+
+    assert answer.first_text == "Revenue was $4.81M and churn 2.1%. "
+    assert answer.complete is False
+    assert [t async for t in answer.rest()] == ["Margin 31%."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", [[_tool_start()], [_complete(tool_calls=[{"name": "delegate"}])]])
+async def test_a_preamble_then_delegate_never_reaches_the_user(ending):
+    """The model writes a preamble, then hands the turn to the agent: inside
+    the held opening, so nothing was shown and the agent runs."""
+    provider = _Provider([_text("Let me pull that from your data."), *ending])
+
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert provider.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "Done! I've created both records for you.",
+    "Shall I proceed? Please answer yes or no.",
+    "You can install the ChatGPT desktop app from openai.com.",
+])
+async def test_an_opening_the_gate_would_reject_delegates(text):
+    """The LLM gate's own checks (`answer_rejection`) hold on the direct answer."""
+    provider = _Provider([_text(text), _complete()])
+
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+
+
+@pytest.mark.asyncio
+async def test_a_cut_off_answer_delegates():
+    provider = _Provider([_text("Revenue was"), _complete(stop_reason="max_tokens")])
+
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+
+
+@pytest.mark.asyncio
+async def test_a_tool_call_after_the_opening_ends_the_answer_where_it_is(monkeypatch, caplog):
+    monkeypatch.setattr(direct_answer, "_HOLD_CHARS", 10)
+    provider = _Provider([_text("Revenue was $4.81M. "), _text("Also "), _tool_start()])
+
+    answer = await direct_answer.start_answer(_binding(provider), history=_RECALL)
+    with caplog.at_level("WARNING"):
+        rest = [t async for t in answer.rest()]
+
+    assert rest == ["Also "]
+    assert any(getattr(r, "event", None) == "direct_answer_ended_after_release" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_thinking_before_the_reply_earns_the_longer_wait(monkeypatch):
+    """A picked effort thinks before it writes: that is work, not a stall."""
+    from anton.core.llm.provider import StreamReasoningDelta
+
+    monkeypatch.setattr(direct_answer, "_FIRST_EVENT_NO_SEARCH_SECONDS", 0.05)
+    monkeypatch.setattr(direct_answer, "_FIRST_EVENT_SECONDS", 5.0)
+
+    class _Thinking(_Provider):
+        async def _events(self):
+            try:
+                yield StreamReasoningDelta(text="thinking")
+                await asyncio.sleep(0.1)
+                yield _text("Hi.")
+                yield _complete()
+            finally:
+                self.closed = True
+
+    answer = await direct_answer.start_answer(_binding(_Thinking()), history=_RECALL, needs_search=False)
+
+    assert answer.first_text == "Hi."
+
+
+@pytest.mark.asyncio
+async def test_the_answer_gets_room_to_think_at_a_picked_effort():
+    provider = _Provider([_text("Hi."), _complete()])
+
+    await direct_answer.start_answer(_binding(provider), history=_RECALL)
+
+    assert provider.calls[0]["max_tokens"] >= 16_384
+
+
+@pytest.mark.asyncio
+async def test_switched_off_web_tools_never_reach_the_direct_answer():
+    provider = _Provider([_text("Hi."), _complete()])
+    binding = RouterBinding(provider=provider, model="opus-5-5", label="minds_cloud", web_tools=frozenset())
+
+    await direct_answer.start_answer(binding, history=_RECALL)
+
+    call = provider.calls[0]
+    assert call["native_web_tools"] is None
+    assert "cannot search the web" in call["system"]
+
+
+@pytest.mark.parametrize(("env", "allowed"), [
+    ({}, {"web_search", "web_fetch"}),
+    ({"ANTON_WEB_SEARCH_ENABLED": "false"}, {"web_fetch"}),
+    ({"ANTON_WEB_FETCH_ENABLED": "0"}, {"web_search"}),
+    ({"ANTON_INTERNET_RESEARCH_ENABLED": "off"}, set()),
+])
+def test_the_direct_answer_honors_the_servers_web_tool_switches(monkeypatch, env, allowed):
+    from cowork.handlers.responses import _allowed_web_tools
+
+    for name in ("ANTON_WEB_SEARCH_ENABLED", "ANTON_WEB_FETCH_ENABLED", "ANTON_INTERNET_RESEARCH_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert _allowed_web_tools(Provider.MINDS_CLOUD) == allowed
+
+
+@pytest.mark.asyncio
+async def test_jev_reads_long_replies_whole_within_its_budget():
+    """The target case: headline numbers stated past the gate's 1,500 chars
+    reach Jev, so it can see they are in visible text."""
+    from cowork.handlers import response_routing
+
+    long_reply = "Your dashboard is ready. " + "Detail. " * 300 + "Total revenue was $4.81M."
+    history = [
+        {"role": "user", "content": "Build me a dashboard."},
+        {"role": "assistant", "content": long_reply},
+        {"role": "user", "content": "what were those headline numbers again?"},
+    ]
+    seen = []
+    await decide_route(**_route_kwargs(history, jev=_jev(jev_route.JevRoute(direct=True, p_direct=0.99), seen)))
+
+    assert "$4.81M" in seen[0][1]["content"]
+
+    # A conversation past the budget drops its oldest messages, never the latest.
+    many = [{"role": r, "content": "x" * 9_000} for r in ("user", "assistant") * 10]
+    many.append({"role": "user", "content": "and now?"})
+    seen.clear()
+    await decide_route(**_route_kwargs(many, jev=_jev(jev_route.JevRoute(direct=True, p_direct=0.99), seen)))
+
+    assert sum(len(m["content"]) for m in seen[0]) <= response_routing.JEV_HISTORY_CHARS
+    assert seen[0][-1]["content"] == "and now?"
+    assert seen[0][0]["role"] == "user"

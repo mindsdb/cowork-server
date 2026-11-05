@@ -57,10 +57,10 @@ def _body(choice="answer_directly", p_direct=0.97, p_search=0.1):
     return {"model": "jev-1.13.0", "answers": answers, "usage": {"input_tokens": 42, "output_tokens": 0}}
 
 
-async def _decide(monkeypatch, client, *, min_p_direct=0.5, timeout_seconds=1.0):
+async def _decide(monkeypatch, client, *, min_p_direct=0.5, timeout_seconds=1.0, target=TARGET):
     monkeypatch.setattr(jev_route, "_http_client", lambda: client)
     return await jev_route.decide(
-        target=TARGET, messages=MESSAGES, model="jev",
+        target=target, messages=MESSAGES, model="jev",
         timeout_seconds=timeout_seconds, min_p_direct=min_p_direct,
     )
 
@@ -179,6 +179,9 @@ async def test_decide_rejects_a_malformed_answer(monkeypatch, answer):
 @pytest.mark.parametrize(("client", "error"), [
     (_FakeAsyncClient(response=_FakeResponse(402, {})), "http_402"),
     (_FakeAsyncClient(exception=httpx.ConnectError("boom")), "transport_error"),
+    # httpx's own timeouts fire at the same budget: no LLM gate after them.
+    (_FakeAsyncClient(exception=httpx.ReadTimeout("slow")), "timeout"),
+    (_FakeAsyncClient(exception=httpx.ConnectTimeout("slow")), "timeout"),
     (_FakeAsyncClient(exception=RuntimeError("boom")), "RuntimeError"),
     (_FakeAsyncClient(response=_FakeResponse(200, {"unexpected": True})), "malformed_response"),
 ])
@@ -299,3 +302,24 @@ def test_own_decision_target_unwraps_the_key_and_trims_the_url():
     assert jev_route.own_decision_target(settings) == jev_route.JevTarget(
         url="https://api.typesafe.ai/v1/systemone", api_key="own-key",
     )
+
+
+@pytest.mark.asyncio
+async def test_an_own_decision_endpoint_never_receives_the_trace_headers(monkeypatch):
+    """They carry user, organization and conversation ids, and mean something
+    only to MindsHub's gateway."""
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
+    captured = {}
+    token = set_trace_context(TraceContext(
+        session_id="conv-1", harness="anton", metadata={"user_id": "u1", "organization_id": "o1"},
+    ))
+    try:
+        await _decide(
+            monkeypatch, _FakeAsyncClient(response=_FakeResponse(200, _body()), captured=captured),
+            target=jev_route.JevTarget(url="https://api.typesafe.ai/v1/systemone", api_key="own"),
+        )
+    finally:
+        reset_trace_context(token)
+
+    assert captured["headers"] == {"Authorization": "Bearer own"}
