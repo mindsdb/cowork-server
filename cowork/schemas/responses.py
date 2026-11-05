@@ -32,6 +32,8 @@ class Role(str, Enum):
     thought_tool_call_end = "thought.tool_call.end"
     # A tool's message to the user, rendered as an agent message between steps.
     thought_tool_call_message = "thought.tool_call.message"
+    # A tool's result the UI renders itself: generate_image's, shown inline.
+    thought_tool_call_result = "thought.tool_call.result"
 
 
 class ContentType(str, Enum):

@@ -12,6 +12,7 @@ during artifact creation.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from pathlib import Path
@@ -24,6 +25,13 @@ if TYPE_CHECKING:
 
 
 MAX_PADS = int(os.environ.get("ANTON_SERVER_MAX_PADS", "5"))
+
+# The variables a pad's image helper may read its model from: the name of
+# anton's own setting, and the pad-specific one that follows
+# ANTON_SCRATCHPAD_MODEL (the only one of the two the code sandbox's allowlist
+# passes when anton sets it). Laid in through the workspace overlay, which the
+# sandbox judges by its own rule, both reach the pad.
+IMAGE_MODEL_ENV_NAMES = ("ANTON_IMAGE_MODEL", "ANTON_SCRATCHPAD_IMAGE_MODEL")
 
 
 # Keyed by resolved workspace, then by pad name. An artifact's slug names its
@@ -124,6 +132,33 @@ def _resolve_coding(
     return provider, model, api_key, base_url
 
 
+def _resolve_image_model() -> str:
+    """The image model a pad's helper draws with: resolved, like the coding
+    model above, so a pin MindsHub no longer serves or the wallet cannot pay for
+    never reaches it."""
+    from cowork.common.settings.user_settings import get_user_settings
+
+    return get_user_settings().resolved_image_model
+
+
+def _image_model_kwargs(runtime_cls, image_model: str) -> dict:
+    """How to hand ``image_model`` to anton's LocalScratchpadRuntime, or {}.
+
+    Its own ``image_model`` keyword when the installed anton takes one, which
+    then sets the pad's variable itself. Otherwise the workspace overlay, which
+    lays the variables into the pad's environment. Neither on an anton that
+    takes neither: passing an unknown keyword would fail every pad.
+    """
+    if not image_model:
+        return {}
+    params = inspect.signature(runtime_cls).parameters
+    if "image_model" in params:
+        return {"image_model": image_model}
+    if "workspace_env_overlay" in params:
+        return {"workspace_env_overlay": dict.fromkeys(IMAGE_MODEL_ENV_NAMES, image_model)}
+    return {}
+
+
 def _make_runtime(
     name: str,
     *,
@@ -133,6 +168,7 @@ def _make_runtime(
     coding_api_key: str,
     coding_base_url: str,
     cell_sandbox: CellSandbox | None = None,
+    image_model: str = "",
 ):
     refuse_a_missing_policy(cell_sandbox, site="a backend pool's scratchpad")
     from anton.core.backends.local import LocalScratchpadRuntime
@@ -144,7 +180,9 @@ def _make_runtime(
         coding_api_key=coding_api_key,
         coding_base_url=coding_base_url,
         workspace_path=workspace,
-        # Passed only when set, so with the sandbox off the call is today's.
+        # Both passed only when set, so with the sandbox off and no image model
+        # the call is today's.
+        **_image_model_kwargs(LocalScratchpadRuntime, image_model),
         **({} if cell_sandbox is None else {"cell_sandbox": cell_sandbox}),
     )
 
@@ -196,6 +234,7 @@ def get_or_create(
         coding_api_key=api_key,
         coding_base_url=base_url,
         cell_sandbox=cell_sandbox,
+        image_model=_resolve_image_model(),
     )
     pads[name] = _CachedPad(pad, cell_sandbox)
     return pad

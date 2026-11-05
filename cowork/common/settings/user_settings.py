@@ -14,8 +14,10 @@ if TYPE_CHECKING:
 from pydantic import Field, PrivateAttr, SecretStr, ValidationInfo, field_validator, model_validator
 
 from cowork.common.settings.app_settings import (
-    AGENT_ROLE_NAMES,
+    CATALOG_ROLE_NAMES,
     CODING_MODEL_DEFAULTS,
+    IMAGE_MODEL_DEFAULT,
+    IMAGE_ROLE,
     MINDS_FREE_MODEL,
     PLANNING_MODEL_DEFAULTS,
     ROLE_MODEL_DEFAULTS,
@@ -221,6 +223,17 @@ def _enabled_aware_default(
             if served is not None:
                 return served
         return MINDS_FREE_MODEL
+    return _availability_adjusted(default, enabled_map)
+
+
+def _availability_adjusted(default: str | None, enabled_map: dict[str, bool]) -> str | None:
+    """``default``, moved off a model the availability map says cannot be used.
+
+    The desktop half of ``_enabled_aware_default``, and the whole rule for the
+    image role, which has no free model for org mode to fall back to: every
+    image alias bills the wallet, so a locked image default is kept (it is
+    refused with a top-up path) rather than swapped for a chat model.
+    """
     if not enabled_map:
         return default
     if default is None or enabled_map.get(default) is True:
@@ -445,9 +458,9 @@ def _coding_engine_options() -> list[str]:
 # dashboards and publish_url), which is exactly the class of bug ENG-941/ENG-1125
 # retires.
 #
-# planning_model / coding_model are DELIBERATELY absent (ENG-739): a model in
-# .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
-# token-refresh would re-pin a picker choice from a stale ``latest:`` line.
+# planning_model / coding_model / image_model are DELIBERATELY absent (ENG-739):
+# a model in .env is CLI-only and must never ride a bulk .env→DB sync, or a
+# login / token-refresh would re-pin a picker choice from a stale line.
 #
 # max_tool_rounds / max_continuations / max_turn_tokens are DELIBERATELY absent
 # too, for the
@@ -649,6 +662,18 @@ class UserSettings(Settings):
             "where this is the only model there is. Defaults to the recommended "
             "model for the selected provider (MindsHub → MindsHub Air; other "
             "providers → their smallest model)."
+        ),
+    )
+    # Image role: the model the agent's generate_image tool and the scratchpad's
+    # image helper draw with. No provider of its own, because MindsHub is the
+    # only gateway that serves image models; Anton calls it with the MindsHub key
+    # and URL it already holds.
+    image_model: Annotated[str | None, PINNED] = Field(
+        default=None,
+        title="Image Model",
+        description=(
+            "The model used to generate and edit images. Defaults to the image model "
+            "MindsHub recommends."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -1009,9 +1034,27 @@ class UserSettings(Settings):
         ),
     )
 
+    # The image models' own availability map, apart from `minds_model_enabled`:
+    # the chat roles fall back to the first enabled entry of theirs, which must
+    # never be an image model, and the image role must never fall back to a chat
+    # model. Org-wide like that map, with the member's restricted ids laid over
+    # it the same way.
+    minds_image_model_enabled: Annotated[str, ORG, PINNED] = Field(
+        default="{}",
+        title="MindsHub Image Model Availability",
+        description=(
+            "JSON-encoded map of MindsHub image model id → enabled flag, cached "
+            "from /v1/models whenever recommended-models fetches it live. Lets the "
+            "image model resolve off a locked or retired model without a network "
+            "call in the turn path."
+        ),
+    )
+
     # Memoized parse of `minds_model_enabled` (see `_minds_enabled_map`). Not a
     # settings field — never validated or serialized.
     _enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
+    # Same, for `minds_image_model_enabled` (see `_minds_image_enabled_map`).
+    _image_enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
     # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
     _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
 
@@ -1061,10 +1104,24 @@ class UserSettings(Settings):
         Parsed once per instance and memoized: this is called from
         ``apply_model_defaults`` and both ``resolved_*_model`` properties.
         """
-        if self._enabled_map_cache is not None:
-            return self._enabled_map_cache
+        if self._enabled_map_cache is None:
+            self._enabled_map_cache = self._parse_enabled_map(self.minds_model_enabled)
+        return self._enabled_map_cache
+
+    def _minds_image_enabled_map(self) -> dict[str, bool]:
+        """``_minds_enabled_map`` for the image models: id → enabled, or {}.
+
+        Sourced from ``minds_image_model_enabled``, refreshed the same way, with
+        this member's restricted ids laid over it the same way.
+        """
+        if self._image_enabled_map_cache is None:
+            self._image_enabled_map_cache = self._parse_enabled_map(self.minds_image_model_enabled)
+        return self._image_enabled_map_cache
+
+    def _parse_enabled_map(self, stored: str) -> dict[str, bool]:
+        """A stored availability map, with this member's restricted ids as ``False``."""
         try:
-            raw = json.loads(self.minds_model_enabled or "{}")
+            raw = json.loads(stored or "{}")
         except (ValueError, TypeError):
             raw = {}
         # Accept only real booleans. The map is written from real bools, but a
@@ -1082,7 +1139,6 @@ class UserSettings(Settings):
         restricted = self._minds_restricted_ids()
         if restricted:
             result = {k: (False if k in restricted else v) for k, v in result.items()}
-        self._enabled_map_cache = result
         return result
 
     def _minds_restricted_ids(self) -> frozenset[str]:
@@ -1127,7 +1183,7 @@ class UserSettings(Settings):
             {
                 k: v
                 for k, v in raw.items()
-                if isinstance(k, str) and isinstance(v, str) and k in AGENT_ROLE_NAMES and v
+                if isinstance(k, str) and isinstance(v, str) and k in CATALOG_ROLE_NAMES and v
             }
             if isinstance(raw, dict)
             else {}
@@ -1187,7 +1243,21 @@ class UserSettings(Settings):
                 self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
                 enabled_map,
             )
+        if self.image_model is None:
+            self.image_model = self._image_model_default()
         return self
+
+    def _image_model_default(self) -> str:
+        """The model the image role starts on: the catalog's declared default, else
+        the compiled one, adjusted for the image models' availability.
+
+        Never a chat model, in either tenancy mode. The chat roles' org-mode
+        fallback is the free chat model, and no image model is free, so the image
+        role keeps the desktop rule (``_availability_adjusted``): a locked default
+        stays and is refused with a top-up path.
+        """
+        declared = self._minds_role_default_map().get(IMAGE_ROLE) or IMAGE_MODEL_DEFAULT
+        return _availability_adjusted(declared, self._minds_image_enabled_map()) or declared
 
     def _has_key(self, p: Provider) -> bool:
         # Org mode mints a per-turn key, so minds-cloud is usable with nothing
@@ -1299,6 +1369,28 @@ class UserSettings(Settings):
             self._minds_enabled_map(),
             wallet_aware=True,
         )
+
+    @property
+    def resolved_image_model(self) -> str:
+        """The image model Anton is handed (``ANTON_IMAGE_MODEL``).
+
+        wallet_aware for the coding role's reason (ENG-1632): the image model runs
+        inside a tool call, where a pin the wallet cannot pay for, an admin
+        restricted, or MindsHub no longer serves fails every image with nothing
+        in Settings to explain it. Checked against the image models' own map, so
+        the fallback is always another image model. There is no provider switch
+        to honour, and the pick is never empty (``apply_model_defaults`` fills
+        it), so resolution never reaches the chat roles' default path.
+        """
+        default = self._image_model_default()
+        return _resolved_model(
+            Provider.MINDS_CLOUD,
+            Provider.MINDS_CLOUD,
+            self.image_model or default,
+            {Provider.MINDS_CLOUD.value: default},
+            self._minds_image_enabled_map(),
+            wallet_aware=True,
+        ) or default
 
     @property
     def resolved_gate_model(self) -> str | None:

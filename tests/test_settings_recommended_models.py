@@ -13,7 +13,7 @@ from _fakes import FakeRequest
 
 def _listing(
     ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None,
-    disabled_reasons=None,
+    disabled_reasons=None, image_models=None,
 ):
     """A MindsModelListing with everything a test doesn't care about left empty.
 
@@ -32,6 +32,7 @@ def _listing(
         families or {},
         role_defaults or {},
         disabled_reasons or {},
+        image_models or {},
     )
 
 

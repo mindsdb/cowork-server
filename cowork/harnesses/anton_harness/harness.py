@@ -210,8 +210,14 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     missing setting.
     """
     applied: list[str] = []
-    for attr in _OVERLAID_SETTINGS:
-        db_val = getattr(user, attr, None)
+    values = [(attr, getattr(user, attr, None)) for attr in _OVERLAID_SETTINGS]
+    # anton's `image_model` (ANTON_IMAGE_MODEL), which its generate_image tool
+    # and scratchpad helper draw with. Resolved rather than raw: the planning and
+    # coding pins are corrected afterwards from the built client
+    # (_apply_client_models), and nothing corrects this one, so a pin MindsHub no
+    # longer serves or the wallet cannot pay for is swapped here (ENG-1632).
+    values.append(("image_model", getattr(user, "resolved_image_model", None)))
+    for attr, db_val in values:
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):

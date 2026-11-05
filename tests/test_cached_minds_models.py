@@ -20,7 +20,7 @@ def _listing(ids):
     return providers.MindsModelListing(
         ids=ids, efforts={"gpt": {"efforts": ["low", "max"], "default": "low"}} if ids else {},
         enabled={}, labels={}, providers={}, families={}, role_defaults={},
-        disabled_reasons={},
+        disabled_reasons={}, image_models={},
     )
 
 
