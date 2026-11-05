@@ -45,6 +45,7 @@ from cowork.coding.contracts import (
     TurnRequest,
     GitIdentity,
     GitIdentityRequest,
+    InitializeGitRequest,
     WorkspaceModeOptions,
     WorkspaceUsagePage,
 )
@@ -312,6 +313,12 @@ async def inference_proxy(path: str, request: Request, session: SessionDep, scop
     _require_inference_client(request)
     credentials = _credentials(_settings(session, scope))
     return await proxy_inference(request, path, credentials)
+
+
+@router.post("/workspace/initialize-git", response_model=WorkspaceModeOptions)
+def initialize_git(body: InitializeGitRequest):
+    """Make a folder on this computer a Git repository so tasks on it can use a worktree."""
+    return _call(_service().initialize_git, body.path)
 
 
 @router.get("/workspace/inspect")

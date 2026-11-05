@@ -51,9 +51,19 @@ class WorkspaceModeOptions(BaseModel):
     """The modes a new task could run in, and the one it gets if it asks for none."""
 
     supported: list[WorkspaceMode]
-    default: WorkspaceMode
+    # ``None`` when no mode is possible for the folder, for example a folder
+    # without Git where working in place is not offered.
+    default: WorkspaceMode | None
     # Why working in the original folder is not offered, when it is not.
     in_place_unavailable_reason: str | None = None
+    # Why a worktree is not offered for the folder, when it is not.
+    worktree_unavailable_reason: str | None = None
+    # The folder isn't a Git repository and could be made one here.
+    can_initialize_git: bool = False
+
+
+class InitializeGitRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=32_768)
 
 
 class PermissionMode(str, Enum):

@@ -94,11 +94,24 @@ def without_in_place(options: WorkspaceModeOptions, reason: str) -> WorkspaceMod
     """``options`` for a folder that cannot be worked in directly."""
     if WorkspaceMode.in_place not in options.supported:
         return options
-    return WorkspaceModeOptions(
-        supported=[mode for mode in options.supported if mode != WorkspaceMode.in_place],
-        default=WorkspaceMode.worktree if options.default == WorkspaceMode.in_place else options.default,
-        in_place_unavailable_reason=reason,
+    return _without(options, WorkspaceMode.in_place, in_place_unavailable_reason=reason)
+
+
+def without_worktree(
+    options: WorkspaceModeOptions, reason: str, *, can_initialize_git: bool = False,
+) -> WorkspaceModeOptions:
+    """``options`` for a folder a worktree cannot be made from."""
+    if WorkspaceMode.worktree not in options.supported:
+        return options.model_copy(update={"can_initialize_git": can_initialize_git})
+    return _without(
+        options, WorkspaceMode.worktree, worktree_unavailable_reason=reason, can_initialize_git=can_initialize_git,
     )
+
+
+def _without(options: WorkspaceModeOptions, mode: WorkspaceMode, **update: object) -> WorkspaceModeOptions:
+    supported = [item for item in options.supported if item != mode]
+    default = options.default if options.default in supported else (supported[0] if supported else None)
+    return options.model_copy(update={"supported": supported, "default": default, **update})
 
 
 def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool, project_task: bool) -> str:
