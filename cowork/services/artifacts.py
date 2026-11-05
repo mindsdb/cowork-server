@@ -2300,10 +2300,24 @@ async def _launch_backend_locked(
             from cowork.services.connectors.persist import turn_vault_for_scope
 
             vault = turn_vault_for_scope(scope)
+            # The agent writes metadata.json, so a comparison side could name a
+            # connection its turn is kept from: its backend gets none of those.
+            from cowork.services.projects import path_in_comparison_sandbox
+
+            comparison_side = path_in_comparison_sandbox(project_root)
             for ds in datasources:
                 engine, name = ds.get("engine"), ds.get("name")
                 if not engine or not name:
                     continue
+                if comparison_side:
+                    from cowork.services.comparisons import _blocked
+
+                    if _blocked(engine):
+                        logger.info(
+                            "Comparison side's backend %s declared blocked connector %s; not passed",
+                            slug, engine,
+                        )
+                        continue
                 env = vault.env_for(engine, name)
                 if env is None:
                     logger.warning(
@@ -2372,6 +2386,19 @@ async def _launch_backend_locked(
         slug, new_port, result.get("pid"),
     )
     return BackendStatus(running=True, detail="launched", port=new_port)
+
+
+def stop_project_backends(project_root: str | Path) -> None:
+    """Stop the backends launched for one project, for a project going away."""
+    root = Path(project_root)
+    for key in {str(root), str(root.resolve())}:
+        for entry in list(_LAUNCHED_BACKENDS.pop(key, {}).values()):
+            backend = LaunchedBackend.from_entry(entry)
+            if backend.live:
+                try:
+                    backend.proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
 
 
 def shutdown_launched_backends() -> None:
