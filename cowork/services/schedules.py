@@ -581,6 +581,7 @@ class ScheduleRunService:
         release_slot: bool = False,
         outcome: AttemptOutcome | None = None,
         commit: bool = True,
+        unavailable_model: str | None = None,
     ) -> ScheduleRun | None:
         """Record how the run ended. ``release_slot`` gives its cron slot back,
         for a run that left the slot due: the next poll can then claim it."""
@@ -596,6 +597,7 @@ class ScheduleRunService:
         run.lease_expires_at = None
         if outcome is not None:
             run.outcome = outcome
+        run.unavailable_model = unavailable_model
         if release_slot:
             run.slot_at = None
         if conversation_id is not None:
@@ -613,6 +615,7 @@ class ScheduleRunService:
             self.session.rollback()
             return self.finish_run(
                 run_id, error=error, status=status, release_slot=release_slot, outcome=outcome,
+                unavailable_model=unavailable_model,
             )
         self.session.refresh(run)
         return run
