@@ -141,8 +141,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.4.1rc3.dev5+g0bb1a4926"
-source = { git = "https://github.com/mindsdb/anton.git?branch=jorge%2Feng-3296-browser-anton-browser-tool-skill-and-login-memory-anton#0bb1a492608fdbca009005111c0089923ac08c71" }
+version = "2.26.11.4.1rc3.dev7+geade86670"
+source = { git = "https://github.com/mindsdb/anton.git?branch=jorge%2Feng-3296-browser-anton-browser-tool-skill-and-login-memory-anton#eade8667072336439bc6d11135f1a49df1775fe9" }
 dependencies = [
     { name = "anthropic" },
     { name = "anyio" },
