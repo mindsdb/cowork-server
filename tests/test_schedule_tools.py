@@ -342,6 +342,41 @@ async def test_a_task_changed_while_its_card_is_open_is_left_alone(action, tc_in
         assert schedule.title == "Daily sales"
 
 
+async def test_an_edit_cannot_land_between_the_check_and_the_write(monkeypatch):
+    # The Scheduled Tasks page's edit route runs in its own session. Once the
+    # confirmed write has checked the task, that edit must wait for the write
+    # to commit, or the write would apply to details the card never showed.
+    import threading
+
+    from cowork.services.schedules import ScheduleService
+
+    task = await _create_confirmed()
+    await _call(MANAGE_TOOL_NAME, _Session(_Card(CONFIRM)), {"action": "pause", "schedule_id": task["schedule_id"]})
+    edit_done = threading.Event()
+
+    def edit_elsewhere() -> None:
+        with unit_session(scope=LOCAL_SCOPE) as session:
+            ScheduleService(session).update_schedule(UUID(task["schedule_id"]), prompt="Email every customer.")
+        edit_done.set()
+
+    held_off = []
+    lock = ScheduleService.lock_schedule
+
+    def lock_then_race(self, schedule_id):
+        locked = lock(self, schedule_id)
+        threading.Thread(target=edit_elsewhere, daemon=True).start()
+        held_off.append(not edit_done.wait(0.5))
+        return locked
+
+    monkeypatch.setattr(ScheduleService, "lock_schedule", lock_then_race)
+
+    result = await _call(MANAGE_TOOL_NAME, _Session(_Card(CONFIRM)), {"action": "resume", "schedule_id": task["schedule_id"]})
+
+    assert held_off == [True]
+    assert result["task"]["prompt"] == PROMPT
+    assert edit_done.wait(5)
+
+
 async def test_a_task_in_the_local_timezone_can_be_paused_from_chat():
     # The scheduler and the client accept "local"; the tool must at least show
     # and act on such a task, even though it doesn't accept "local" as input.

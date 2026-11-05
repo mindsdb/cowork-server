@@ -5,6 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import flag_modified
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
@@ -53,7 +54,18 @@ class ScheduleService:
 
     def lock_schedule(self, schedule_id: UUID) -> "Schedule | None":
         """The schedule as stored now, locked until the unit commits, so a
-        check made on it still holds when the unit writes."""
+        check made on it still holds when the unit writes.
+
+        SQLite ignores FOR UPDATE, so a write that changes nothing comes
+        first: it takes SQLite's database write lock (and the row lock on
+        Postgres), and the read after it sees whatever committed before.
+        """
+        schedule = self._owned(schedule_id)
+        if schedule is None:
+            return None
+        flag_modified(schedule, "title")
+        self.session.add(schedule)
+        self.session.flush()
         return self.session.exec(
             self._owned_select()
             .where(Schedule.id == schedule_id)
