@@ -443,7 +443,7 @@ class DatasourceTls(BaseModel):
     answered, `disabled` does neither, and `prefer` takes encryption where the
     server offers it. The default is `prefer`, because a self-hosted server
     usually has the certificate its installer generated for it, or none, and
-    the form no longer asks.
+    a form left at its default asks for nothing more.
     """
 
     model_config = ConfigDict(extra="forbid")

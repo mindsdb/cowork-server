@@ -344,6 +344,7 @@ def test_a_ca_left_in_the_box_under_a_mode_that_reads_none_is_refused(mysql_org_
     res = mysql_org_client.post(PATH, json=mysql_submission(tls_mode=mode, ca_pem=CA_PEM), headers=AUTH_HEADERS)
 
     assert res.status_code == 400
+    assert f"{mode} TLS cannot include a CA certificate" in res.text
     assert PASSWORD not in res.text
     assert recorded == []
 
@@ -352,10 +353,13 @@ def test_mysql_no_longer_takes_the_certificate_checkbox(mysql_org_client, relay)
     """The checkbox left MySQL's form; PostgreSQL keeps it (tested above)."""
     recorded, _ = relay
 
-    res = mysql_org_client.post(PATH, json=mysql_submission(tls_verify=True), headers=AUTH_HEADERS)
+    res = mysql_org_client.post(
+        PATH, json=mysql_submission(tls_mode="prefer", tls_verify=True), headers=AUTH_HEADERS
+    )
 
     assert res.status_code == 400
     assert res.json()["detail"]["code"] == "invalid_connection"
+    assert "accepts only its cloud connection fields" in res.text
     assert recorded == []
 
 

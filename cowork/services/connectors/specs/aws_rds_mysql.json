@@ -156,7 +156,7 @@
                   "label": "Signed by my own certificate authority"
                 }
               ],
-              "description": "How the server's certificate is checked. The default encrypts whenever the server offers it and checks nothing, so a self-signed server connects without setup. MySQL 8 sends the password itself when the account is not in its login cache, for example after a restart, and the gateway sends it only to a server whose certificate it checked. To make those logins work, choose a public authority or paste your server's certificate authority below."
+              "description": "How the server's certificate is checked. The default encrypts whenever the server offers it and checks nothing, so a self-signed server connects without setup. A MySQL 8 server asks for the password itself when the account is not in its login cache, for example after a restart, and the gateway sends it only to a server whose certificate it checked. To make those logins work, choose a public authority or paste your server's certificate authority below."
             },
             {
               "name": "ca_pem",
