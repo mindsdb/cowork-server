@@ -21,6 +21,7 @@ from cowork.channels.plugin import (
     VerifyResult,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.text import split_for_limit
 from cowork.channels.webhooks import SignatureError, WebhookAck, WebhookHandshake
 
@@ -207,6 +208,7 @@ class DiscordBridge:
             ),
         )
         event._dedupe_key = f"discord:interaction:{interaction_id}"  # type: ignore[attr-defined]
+        mark_shared(event, bool(data.get("guild_id")))
         return [event]
 
     def dedupe_key(self, event: InboundEvent) -> str | None:
@@ -318,6 +320,8 @@ class DiscordBridge:
             ),
         )
         event._dedupe_key = f"discord:message:{message_id}"  # type: ignore[attr-defined]
+        # A guild channel or thread is shared; a DM or group DM has no guild.
+        mark_shared(event, is_group)
         return event
 
     @staticmethod

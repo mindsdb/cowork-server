@@ -91,3 +91,12 @@ def test_the_answer_is_never_cached(monkeypatch):
     response = _client().get(PATH)
 
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_a_managed_service_reads_as_available_exactly_when_its_engine_does(monkeypatch, adapter_verified_datasources):
+    monkeypatch.setenv("COWORK_DATASOURCE_CAPABILITIES", '{"manifest_version": 1, "enabled": ["postgres:host-port"]}')
+
+    body = _client().get(PATH).json()
+
+    assert body["datasources"]["aws_rds_postgres"]["methods"]["connection-string"]["available"] is True
+    assert body["datasources"]["aws_rds_mysql"]["methods"]["direct-connection"]["available"] is False
