@@ -33,6 +33,7 @@ from cowork.services import org_branding
 from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 from cowork.services.skill_access import access_row
 from cowork.services.skill_sharing import SkillViewer
+from tests._org_sharing import MEMBER_BEARER
 from cowork.services.skills import (
     BRAND_GUIDELINES_REFUSAL,
     BRAND_GUIDELINES_SLUG,
@@ -73,7 +74,11 @@ def _viewer(user: str, *, admin: bool = False) -> SkillViewer:
     )
 
 
-def _request(bearer: str = "member-session") -> SimpleNamespace:
+# A second caller's credential, so the per-caller cache is told apart.
+OTHER_BEARER = f"{MEMBER_BEARER}-2"
+
+
+def _request(bearer: str = MEMBER_BEARER) -> SimpleNamespace:
     return SimpleNamespace(headers={"Authorization": f"Bearer {bearer}"}, state=SimpleNamespace())
 
 
@@ -196,9 +201,9 @@ def test_the_auth_read_is_cached_per_caller(org, monkeypatch):
     _get(org, ALICE)
     _get(org, ALICE)
     assert len(calls) == 2  # branding and the org's name, once
-    asyncio.run(ep.get_org_branding(_request("other-session"), org.as_(ADMIN), _principal(ADMIN)))
+    asyncio.run(ep.get_org_branding(_request(OTHER_BEARER), org.as_(ADMIN), _principal(ADMIN)))
     assert len(calls) == 4
-    assert {bearer for _path, bearer in calls} == {"member-session", "other-session"}
+    assert {bearer for _path, bearer in calls} == {MEMBER_BEARER, OTHER_BEARER}
 
 
 # ── the write ────────────────────────────────────────────────────────────────
