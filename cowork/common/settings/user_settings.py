@@ -1057,6 +1057,10 @@ class UserSettings(Settings):
     _image_enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
     # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
     _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
+    # Whether `apply_model_defaults` filled `image_model`, i.e. nothing chose it.
+    # The fill makes the field read like a pick, and `image_model_for_agent`
+    # needs to tell the two apart.
+    _image_model_defaulted: bool = PrivateAttr(default=False)
 
     @field_validator("harness", "channels_harness")
     @classmethod
@@ -1245,6 +1249,7 @@ class UserSettings(Settings):
             )
         if self.image_model is None:
             self.image_model = self._image_model_default()
+            self._image_model_defaulted = True
         return self
 
     def _image_model_default(self) -> str:
@@ -1391,6 +1396,32 @@ class UserSettings(Settings):
             self._minds_image_enabled_map(),
             wallet_aware=True,
         ) or default
+
+    @property
+    def image_model_for_agent(self) -> str | None:
+        """The image model to hand Anton and its scratchpads, or None to hand none.
+
+        Anton offers its generate_image tool on a generic OpenAI-compatible
+        endpoint only when it is given an image model, and the default here is a
+        MindsHub/OpenAI id, so handing it to everyone would give a Gemini-key-only
+        or self-hosted-endpoint user a tool that fails every call. So the model
+        goes over only where it can be served: when the user picked it, when
+        MindsHub is in play (a MindsHub key, org mode, or a role on minds-cloud),
+        or when a role runs on OpenAI's own API, which serves the default too.
+        """
+        roles = {
+            self.resolved_planning_provider,
+            self.resolved_coding_provider,
+            self.resolved_router_provider,
+        }
+        if (
+            not self._image_model_defaulted
+            or self._has_key(Provider.MINDS_CLOUD)
+            or Provider.MINDS_CLOUD in roles
+            or Provider.OPENAI in roles
+        ):
+            return self.resolved_image_model
+        return None
 
     @property
     def resolved_gate_model(self) -> str | None:

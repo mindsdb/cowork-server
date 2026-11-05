@@ -216,7 +216,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     # coding pins are corrected afterwards from the built client
     # (_apply_client_models), and nothing corrects this one, so a pin MindsHub no
     # longer serves or the wallet cannot pay for is swapped here (ENG-1632).
-    values.append(("image_model", getattr(user, "resolved_image_model", None)))
+    # None where no image model can be served, so anton offers no image tool
+    # (UserSettings.image_model_for_agent).
+    values.append(("image_model", getattr(user, "image_model_for_agent", None)))
     for attr, db_val in values:
         if db_val is None:
             continue

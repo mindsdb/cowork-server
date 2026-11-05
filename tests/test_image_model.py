@@ -491,6 +491,118 @@ def test_the_pool_hands_its_pads_the_resolved_image_model(sandbox_off, monkeypat
     assert call["workspace_env_overlay"]["ANTON_SCRATCHPAD_IMAGE_MODEL"] == FLARE
 
 
+# ── Only where an image model can be served ──────────────────────────
+
+
+def _settings(**kw) -> UserSettings:
+    return UserSettings(_env_file=None, **kw)
+
+
+def _gemini_only(**kw) -> UserSettings:
+    return _settings(
+        planning_provider=Provider.GEMINI, coding_provider=Provider.GEMINI, router_provider=Provider.GEMINI,
+        gemini_api_key=SecretStr("gm-test"), **kw,
+    )
+
+
+def _custom_endpoint_only(**kw) -> UserSettings:
+    return _settings(
+        planning_provider=Provider.OPENAI_COMPATIBLE, coding_provider=Provider.OPENAI_COMPATIBLE,
+        router_provider=Provider.OPENAI_COMPATIBLE, planning_model="llama3", coding_model="llama3",
+        router_model="llama3", openai_base_url="http://localhost:11434/v1", **kw,
+    )
+
+
+@pytest.mark.parametrize(
+    ("settings", "handed"),
+    [
+        pytest.param(lambda: _gemini_only(), None, id="gemini-key-only"),
+        pytest.param(lambda: _custom_endpoint_only(), None, id="custom-endpoint-only"),
+        pytest.param(
+            lambda: _settings(
+                planning_provider=Provider.ANTHROPIC, coding_provider=Provider.ANTHROPIC,
+                router_provider=Provider.ANTHROPIC, anthropic_api_key=SecretStr("sk-ant-test"),
+            ),
+            None, id="anthropic-key-only",
+        ),
+        pytest.param(lambda: _gemini_only(image_model=SUNBURST), SUNBURST, id="gemini-with-an-explicit-pick"),
+        pytest.param(
+            lambda: _custom_endpoint_only(minds_api_key=SecretStr("mdb_test")), FLARE,
+            id="custom-endpoint-with-a-mindshub-key",
+        ),
+        pytest.param(
+            lambda: _settings(
+                planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+                router_provider=Provider.OPENAI, openai_api_key=SecretStr("sk-test"),
+            ),
+            FLARE, id="openai-key",
+        ),
+        pytest.param(
+            lambda: _settings(
+                planning_provider=Provider.ANTHROPIC, coding_provider=Provider.OPENAI,
+                router_provider=Provider.ANTHROPIC, anthropic_api_key=SecretStr("sk-ant-test"),
+                openai_api_key=SecretStr("sk-test"),
+            ),
+            FLARE, id="one-role-on-openai",
+        ),
+        pytest.param(lambda: _minds(), FLARE, id="mindshub-key"),
+    ],
+)
+def test_the_image_model_is_handed_over_only_where_it_can_be_served(settings, handed):
+    s = settings()
+
+    assert s.image_model_for_agent == handed
+    # The turn's snapshot is a copy: it must not read a filled default as a pick.
+    assert s.model_copy().image_model_for_agent == handed
+
+
+def test_org_mode_always_hands_the_image_model_over(org_mode):
+    assert UserSettings().image_model_for_agent == FLARE
+
+
+def test_a_stored_pick_counts_as_a_pick(session):
+    from cowork.services.settings import SettingService
+
+    service = SettingService(session, LOCAL_SCOPE)
+    for key, value in (("planning_provider", "gemini"), ("coding_provider", "gemini"),
+                       ("router_provider", "gemini"), ("gemini_api_key", "gm-test")):
+        service.upsert_setting(key, value)
+    assert service.load().image_model_for_agent is None
+
+    service.upsert_setting("image_model", SUNBURST)
+
+    assert service.load().image_model_for_agent == SUNBURST
+
+
+def test_anton_gets_no_image_model_where_none_can_be_served():
+    from pydantic_settings import BaseSettings
+
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    class AntonWithImages(BaseSettings):
+        model_config = {"env_prefix": "ANTON_", "extra": "ignore"}
+        image_model: str | None = None
+
+    a = AntonWithImages()
+
+    assert "image_model" not in _overlay_user_settings(a, _gemini_only())
+    assert a.image_model is None
+
+
+def test_a_pad_gets_no_image_model_where_none_can_be_served(sandbox_off, monkeypatch, tmp_path):
+    from cowork.services import scratchpad_runtime
+
+    settings = _custom_endpoint_only()
+    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings", lambda: settings)
+    monkeypatch.setattr(_RuntimeWithOverlay, "calls", [])
+    monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RuntimeWithOverlay)
+    monkeypatch.setattr(scratchpad_runtime, "_pads", {})
+
+    scratchpad_runtime.get_or_create("app", workspace_path=str(tmp_path))
+
+    assert _RuntimeWithOverlay.calls == [{"workspace_env_overlay": None}]
+
+
 # ── Showing the images ────────────────────────────────────────────────
 
 
@@ -537,6 +649,100 @@ def test_a_cloud_pods_result_names_the_file_in_the_conversations_folder(tmp_path
     result = json.dumps({"path": "/workspace/images/cat.png"})
 
     assert generated_images(result, files) == [{"path": f"conversations/{conversation_id}/images/cat.png"}]
+
+
+def _artifact_image(root, slug="cat", name="cat.png"):
+    return _image(root, f".anton/artifacts/{slug}/{name}")
+
+
+def _anton_result(path, absolute_path=None):
+    """generate_image's result: `path` in the project's terms, `absolute_path`
+    where the agent's OS wrote it."""
+    result = {"status": "generated", "path": path, "mime_type": "image/png", "width": 1024, "height": 1024}
+    if absolute_path is not None:
+        result["absolute_path"] = absolute_path
+    return json.dumps(result)
+
+
+def _pod(tmp_path, conversation_id, *, workspace_rel_path="org-a/project-a"):
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+
+    return AgentFiles.in_cloud_pod(tmp_path, conversation_id=conversation_id, workspace_rel_path=workspace_rel_path)
+
+
+def test_a_desktop_image_artifact_names_its_project_file(tmp_path):
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+    from cowork.harnesses.anton_harness.stream_formatter import generated_images
+
+    saved = _artifact_image(tmp_path)
+    files = AgentFiles.on_this_server(tmp_path)
+    expected = [{"path": ".anton/artifacts/cat/cat.png"}]
+
+    assert generated_images(_anton_result(".anton/artifacts/cat/cat.png", str(saved)), files) == expected
+    assert generated_images(_anton_result(".anton/artifacts/cat/cat.png"), files) == expected
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        _anton_result(".anton/artifacts/cat/cat.png", "/project-artifacts/cat/cat.png"),
+        _anton_result(".anton/artifacts/cat/cat.png"),
+        _anton_result("/project-artifacts/cat/cat.png"),
+    ],
+    ids=["both", "path-only", "absolute-path-only"],
+)
+def test_a_cloud_image_artifact_names_the_projects_artifacts_folder(tmp_path, result):
+    """The default case on a pod: a new image artifact, written through the pod's
+    mount of the project's artifacts folder, not under the conversation's."""
+    from cowork.harnesses.anton_harness.stream_formatter import generated_images
+
+    _artifact_image(tmp_path)
+
+    assert generated_images(result, _pod(tmp_path, uuid.uuid4())) == [{"path": ".anton/artifacts/cat/cat.png"}]
+
+
+def test_a_cloud_workspace_image_names_the_conversations_folder(tmp_path):
+    from cowork.harnesses.anton_harness.stream_formatter import generated_images
+
+    conversation_id = uuid.uuid4()
+    _image(tmp_path)  # the same name at the project root must not be the answer
+    _image(tmp_path / "conversations" / str(conversation_id))
+    files = _pod(tmp_path, conversation_id)
+    expected = [{"path": f"conversations/{conversation_id}/images/cat.png"}]
+
+    assert generated_images(_anton_result("images/cat.png", "/workspace/images/cat.png"), files) == expected
+    assert generated_images(_anton_result("images/cat.png"), files) == expected
+
+
+def test_a_pod_whose_artifacts_are_not_this_projects_names_no_artifact(tmp_path):
+    """With the project's path unknown, the pod's artifacts mount is the default
+    project's, and its working directory's `.anton/artifacts` is not where the
+    image went either, so nothing is shown rather than a wrong picture."""
+    from cowork.harnesses.anton_harness.stream_formatter import generated_images
+
+    conversation_id = uuid.uuid4()
+    _artifact_image(tmp_path)
+    _artifact_image(tmp_path / "conversations" / str(conversation_id))
+    files = _pod(tmp_path, conversation_id, workspace_rel_path=None)
+
+    result = _anton_result(".anton/artifacts/cat/cat.png", "/project-artifacts/cat/cat.png")
+    assert generated_images(result, files) == []
+
+
+def test_an_artifact_path_cannot_climb_or_link_out_of_the_artifacts_folder(tmp_path):
+    from cowork.harnesses.anton_harness.stream_formatter import generated_images
+
+    _image(tmp_path, "secret.png")
+    artifact = _artifact_image(tmp_path)
+    (artifact.parent / "link.png").symlink_to(tmp_path / "secret.png")
+    files = _pod(tmp_path, uuid.uuid4())
+
+    for result in (
+        _anton_result(".anton/artifacts/../../secret.png"),
+        _anton_result("/project-artifacts/../secret.png"),
+        _anton_result(".anton/artifacts/cat/link.png", "/project-artifacts/cat/link.png"),
+    ):
+        assert generated_images(result, files) == [], result
 
 
 def test_a_refusal_names_no_image(tmp_path):

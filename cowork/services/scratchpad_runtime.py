@@ -135,10 +135,11 @@ def _resolve_coding(
 def _resolve_image_model() -> str:
     """The image model a pad's helper draws with: resolved, like the coding
     model above, so a pin MindsHub no longer serves or the wallet cannot pay for
-    never reaches it."""
+    never reaches it. Empty where no image model can be served
+    (UserSettings.image_model_for_agent), so the pad gets none."""
     from cowork.common.settings.user_settings import get_user_settings
 
-    return get_user_settings().resolved_image_model
+    return get_user_settings().image_model_for_agent or ""
 
 
 def _image_model_kwargs(runtime_cls, image_model: str) -> dict:

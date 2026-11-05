@@ -707,28 +707,35 @@ def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     return CellResult(code=arguments.code, stdout=stdout, description=arguments.one_line_description)
 
 
-# anton's image tool. Its result names the files it wrote, by the path the
-# agent's OS reads them at, never their bytes.
+# anton's image tool. Its result names the file it wrote by path, never by its
+# bytes.
 GENERATE_IMAGE_TOOL = "generate_image"
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 # Well past the per-turn image cap, so a result is never cut short by this.
 _MAX_IMAGES_PER_RESULT = 16
 
 
-def _named_paths(value: Any, *, depth: int = 0) -> list[str]:
-    """Every string under a ``path`` key in a parsed tool result, in order."""
+# The keys a generate_image result names a file under: `absolute_path` is the
+# path the agent's OS wrote it at, `path` the same file in the project's terms.
+_PATH_KEYS = ("absolute_path", "path")
+
+
+def _named_files(value: Any, *, depth: int = 0) -> list[tuple[str, ...]]:
+    """Each object in a parsed tool result that names a file, as the paths it
+    gives for it, in ``_PATH_KEYS`` order."""
     if depth > 4:
         return []
-    found: list[str] = []
+    found: list[tuple[str, ...]] = []
     if isinstance(value, dict):
+        names = tuple(name for key in _PATH_KEYS if isinstance(name := value.get(key), str) and name)
+        if names:
+            found.append(names)
         for key, item in value.items():
-            if key == "path" and isinstance(item, str):
-                found.append(item)
-            else:
-                found.extend(_named_paths(item, depth=depth + 1))
+            if key not in _PATH_KEYS:
+                found.extend(_named_files(item, depth=depth + 1))
     elif isinstance(value, list):
         for item in value:
-            found.extend(_named_paths(item, depth=depth + 1))
+            found.extend(_named_files(item, depth=depth + 1))
     return found
 
 
@@ -736,24 +743,30 @@ def generated_images(content: str, files: AgentFiles) -> list[dict[str, str]]:
     """The images a ``generate_image`` result names, as project files the UI
     can fetch (``GET /projects/{name}/files-raw/{path}``): ``[{"path": ...}]``.
 
-    The agent's path is the one its OS read, which on a cloud pod is a mount
-    the UI knows nothing of, so it is resolved here (AgentFiles.named_file)
-    to the file's place in the project. A path that names no image file in the
-    project, an attachment included, is left out, and a result that is not a
-    JSON object or list (a refusal, an error) names none.
+    Each image is read by the path the agent's OS wrote it at first, then by
+    its path in the project's terms (AgentFiles.reported_file), since on a
+    cloud pod neither is a project path: the working directory is the
+    conversation's folder, and a new image artifact is written to the
+    project's artifacts folder through the pod's own mount of it. An image
+    that resolves to no image file in the project, an attachment included, is
+    left out, and a result that is not a JSON object or list (a refusal, an
+    error) names none.
     """
     try:
         parsed = json.loads(content)
     except (TypeError, ValueError):
         return []
     images: list[dict[str, str]] = []
-    for literal in _named_paths(parsed):
-        if not literal.lower().endswith(_IMAGE_SUFFIXES):
-            continue
-        named = files.named_file(literal)
-        if named is None or named.path is None or {"path": named.path} in images:
-            continue
-        images.append({"path": named.path})
+    for names in _named_files(parsed):
+        for literal in names:
+            if not literal.lower().endswith(_IMAGE_SUFFIXES):
+                continue
+            named = files.reported_file(literal)
+            if named is None or named.path is None:
+                continue
+            if {"path": named.path} not in images:
+                images.append({"path": named.path})
+            break
         if len(images) >= _MAX_IMAGES_PER_RESULT:
             break
     return images

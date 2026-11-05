@@ -64,6 +64,8 @@ def test_codex_model_discovery_keeps_models_that_need_credits(monkeypatch) -> No
                     {"id": "jev", "kind": "decision", "enabled": True, "embedding": False},
                     {"id": "jev-1.13.0", "kind": "decision", "enabled": True},
                     {"id": "other-decision-model", "kind": "decision", "enabled": True},
+                    {"id": "gpt-image-2.6-flare", "kind": "image", "enabled": True},
+                    {"id": "gpt-image-2.6-sunburst", "kind": "image", "enabled": False},
                 ],
             }
 
