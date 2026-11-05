@@ -45,6 +45,8 @@ from cowork.coding.contracts import (
     TurnRequest,
     GitIdentity,
     GitIdentityRequest,
+    InitializeGitRequest,
+    WorkspaceModeOptions,
     WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
@@ -243,6 +245,16 @@ def workspace_usage(session_id: str | None = Query(default=None, min_length=1, m
     return _service().workspace_usage_page(session_id)
 
 
+@router.get("/workspace-modes", response_model=WorkspaceModeOptions)
+def workspace_modes(
+    project_id: str | None = Query(default=None, min_length=1, max_length=128),
+    computer_id: str | None = Query(default=None, min_length=1, max_length=128),
+    path: str | None = Query(default=None, min_length=1, max_length=32_768),
+):
+    """Which workspace modes the composer may offer for a new task, optionally for one folder."""
+    return _call(_service().workspace_mode_options, project_id, computer_id, path)
+
+
 @router.get("/models")
 def models(session: SessionDep, scope: ScopeDep, engine_id: str = Query(default="codex", alias="engineId")):
     settings = _settings(session, scope)
@@ -301,6 +313,12 @@ async def inference_proxy(path: str, request: Request, session: SessionDep, scop
     _require_inference_client(request)
     credentials = _credentials(_settings(session, scope))
     return await proxy_inference(request, path, credentials)
+
+
+@router.post("/workspace/initialize-git", response_model=WorkspaceModeOptions)
+def initialize_git(body: InitializeGitRequest):
+    """Make a folder on this computer a Git repository so tasks on it can use a worktree."""
+    return _call(_service().initialize_git, body.path)
 
 
 @router.get("/workspace/inspect")

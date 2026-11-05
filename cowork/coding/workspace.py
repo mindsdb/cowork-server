@@ -280,6 +280,20 @@ class WorkspaceManager:
         if self._head_revision(root) is None:
             raise WorkspaceError(NO_COMMITS)
 
+    def initialize_git(self, raw_path: str) -> None:
+        """Run ``git init`` in a folder that isn't in a Git repository yet.
+
+        Nothing is committed: the user decides what the first commit holds, and
+        a worktree is offered once there is one. Repositories already inside
+        the folder stay separate repositories.
+        """
+        path = self._resolve_existing(raw_path)
+        if path is None or not path.is_dir():
+            raise WorkspaceError("Choose an existing local folder")
+        if self._git_root(path) is not None:
+            raise WorkspaceError("This folder is already in a Git repository")
+        self.git.run(path, "init")
+
     def in_place_root(self, raw_path: str) -> Path:
         """Return the folder an in-place task on ``raw_path`` works in.
 
