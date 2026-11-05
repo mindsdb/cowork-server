@@ -1,10 +1,10 @@
 """Pending-question registry: where a blocked turn waits for an answer.
 
 A separate object rather than a field on ``RunHandle`` for a practical
-reason: ``registry.start()`` takes an already-constructed producer coroutine
-and the ``RunHandle`` only exists afterwards, so the coroutine cannot reach
-it. Keying by ``conversation_id`` sidesteps the ordering problem and keeps
-this testable on its own.
+reason: ``registry.start()`` builds the producer coroutine before the
+``RunHandle`` exists, so the coroutine cannot reach it. Keying by
+``conversation_id`` sidesteps the ordering problem and keeps this testable on
+its own.
 
 Single-instance by design, exactly like ``RunRegistry`` and the
 ``FileStreamBuffer`` next to it — one cowork-server process per user, so an

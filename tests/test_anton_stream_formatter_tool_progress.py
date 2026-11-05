@@ -80,19 +80,10 @@ class TestToolProgressRoleMapping:
         # handler exception), and with no verdict attached every consumer
         # has no choice but to treat "it fired" as "it succeeded"
         # (anton PR #304 review).
-        #
-        # Set post-construction, not via the constructor: the anton-agent
-        # version this repo's uv.lock resolves today predates the `ok`
-        # field (it's added on the anton side of this same fix and hasn't
-        # been promoted past `main` yet — see the design doc's rollout
-        # notes). `getattr(event, "ok", None)` in the formatter already
-        # handles an anton without the field at all; this only needs to
-        # simulate an anton new enough to *set* it.
         tool_done = StreamTaskProgress(
             phase="tool_done", message="streaming_probe",
-            eta_seconds=0.5, id="tc_1",
+            eta_seconds=0.5, id="tc_1", ok=False,
         )
-        tool_done.ok = False
         chunks = [
             c async for c in format_responses_stream(
                 _events(
@@ -218,3 +209,50 @@ class TestToolProgressRoleMapping:
         assert done[0]["thought_role"] == "thought.progress"
         assert done[0]["content"] == "tool_done: web_search"
         assert not [e for e in events if e.get("thought_role") == "thought.tool_call.end"]
+
+
+class TestModelWaitKeepAlive:
+    async def test_a_model_wait_frame_is_never_throttled_saved_or_made_the_anchor(self, monkeypatch):
+        # The cloud pod sends a model_wait progress line while a model call is
+        # quiet. It is the turn's only sign of life then, so the throttle must
+        # never drop it, even right after a reasoning_start. It is a live
+        # signal, so it stays out of the saved events. And it must not take
+        # the throttle window from the next ordinary phase either.
+        clock = {"t": 100.0}
+        monkeypatch.setattr(sf.time, "time", lambda: clock["t"])
+        sunk: list[tuple[str, dict]] = []
+
+        chunks = [
+            c async for c in format_responses_stream(
+                _timed(
+                    clock,
+                    (100.0, StreamTaskProgress(phase="reasoning_start", message="Thinking...")),
+                    (100.01, StreamTaskProgress(
+                        phase="model_wait", message="Waiting for the model (1m 0s)", eta_seconds=60.0,
+                    )),
+                    (100.3, StreamTaskProgress(
+                        phase="model_wait", message="Waiting for the model (1m 20s)", eta_seconds=80.0,
+                    )),
+                    (100.4, StreamTaskProgress(phase="reasoning_start", message="Thinking...")),
+                ),
+                model="claude-sonnet-4-6",
+                event_sink=lambda event_type, data: sunk.append((event_type, data)),
+            )
+        ]
+        events = _parse_sse(chunks)
+
+        waits = [e for e in events if e.get("phase") == "model_wait"]
+        assert [e["content"] for e in waits] == [
+            "Still working: Waiting for the model (1m 0s)",
+            "Still working: Waiting for the model (1m 20s)",
+        ]
+        assert [e["eta_seconds"] for e in waits] == [60.0, 80.0]
+        assert all(e["thought_role"] == "thought.progress" for e in waits)
+        assert all(e["type"] == "response.in_progress" for e in waits)
+        assert not [d for _, d in sunk if d.get("phase") == "model_wait"]
+        # 100.4 - 100.0 >= PROGRESS_THROTTLE: the second reasoning_start is
+        # emitted because neither model_wait frame became the anchor.
+        assert len([e for e in events if e.get("phase") == "reasoning_start"]) == 2
+        # Sequence numbers stay strictly increasing across the exempt frames.
+        seqs = [e["sequence_number"] for e in events]
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)

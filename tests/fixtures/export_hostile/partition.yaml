@@ -1,0 +1,192 @@
+# Another partition's file, beside the artifact folder, in every spelling a
+# path can take: relative, absolute, a file:// URL, percent-encoded, with
+# backslashes, with a drive or a UNC prefix, and housekeeping names.
+# Fields and placeholders: see tests/test_export_hostile.py.
+
+- id: partition-relative
+  html: |
+    <p>relative <img src="../other/secret.png" alt="a"></p>
+    <p><img src="./../other/secret.png" alt="b"></p>
+    <p><img src="sub/../../other/secret.png" alt="c"></p>
+  markdown: |
+    relative ![a](../other/secret.png)
+
+    ![b](./../other/secret.png)
+
+    ![c](sub/../../other/secret.png)
+  text: relative
+  omitted:
+    - [traversal, ../other/secret.png]
+    - [traversal, ./../other/secret.png]
+    - [traversal, sub/../../other/secret.png]
+
+# On Windows the absolute path starts with a drive letter, which reads as a
+# scheme before the leading-separator rule is reached.
+- id: partition-absolute-path
+  html: |
+    <p>absolute <img src="{sentinel_path}" alt="secret"></p>
+  markdown: |
+    absolute
+
+    <div><img src="{sentinel_path}" alt="secret"></div>
+  text: absolute
+  omitted:
+    - [absolute, "{sentinel_path}"]
+  windows_omitted:
+    - [scheme, "{sentinel_path}"]
+
+- id: partition-file-url
+  html: |
+    <p>file url <img src="{sentinel_file_url}" alt="secret"></p>
+  markdown: |
+    file url ![secret]({sentinel_file_url})
+  text: file url
+  omitted:
+    - [scheme, "{sentinel_file_url}"]
+
+- id: partition-percent-encoded
+  html: |
+    <p>encoded <img src="..%2Fother/secret.png" alt="a"></p>
+    <p><img src="..%2fother%2fsecret.png" alt="b"></p>
+    <p><img src="sub%2F..%2F..%2Fother%2Fsecret.png" alt="c"></p>
+  markdown: |
+    encoded ![a](..%2Fother/secret.png)
+
+    ![b](..%2fother%2fsecret.png)
+
+    ![c](sub%2F..%2F..%2Fother%2Fsecret.png)
+  text: encoded
+  omitted:
+    - [traversal, "..%2Fother/secret.png"]
+    - [traversal, "..%2fother%2fsecret.png"]
+    - [traversal, "sub%2F..%2F..%2Fother%2Fsecret.png"]
+
+# References are decoded once, so a double-encoded traversal names one
+# literal segment that isn't there.
+- id: encoded-traversal
+  html: |
+    <p>traversal <img src="%2e%2e%2fother%2fsecret.png" alt="a"></p>
+    <p><img src="%2E%2E/other/secret.png" alt="b"></p>
+    <p><img src=".%2e/other/secret.png" alt="c"></p>
+    <p><img src="..%5cother%5csecret.png" alt="d"></p>
+    <p><img src="..\other\secret.png" alt="e"></p>
+    <p><img src="%252e%252e%252fother%252fsecret.png" alt="f"></p>
+    <div style="background: url('%2e%2e/other/secret.png')">g</div>
+  markdown: |
+    traversal ![a](%2e%2e%2fother%2fsecret.png)
+
+    ![b](%2E%2E/other/secret.png)
+
+    ![c](.%2e/other/secret.png)
+
+    ![d](..%5cother%5csecret.png)
+
+    <div><img src="..\other\secret.png" alt="e"></div>
+
+    ![f](%252e%252e%252fother%252fsecret.png)
+
+    <div style="background: url('%2e%2e/other/secret.png')">g</div>
+  text: traversal
+  omitted:
+    - [traversal, "%2e%2e%2fother%2fsecret.png"]
+    - [traversal, "%2E%2E/other/secret.png"]
+    - [traversal, ".%2e/other/secret.png"]
+    - [traversal, "..%5cother%5csecret.png"]
+    - [traversal, '..\other\secret.png']
+    - [missing, "%252e%252e%252fother%252fsecret.png"]
+    - [traversal, "%2e%2e/other/secret.png"]
+
+# A drive letter before decoding reads as a scheme; after decoding it is a
+# traversal. A decoded leading pair of separators is a UNC path, and a raw
+# one is refused as absolute before decoding.
+- id: drive-and-unc-forms
+  html: |
+    <p>drives <img src="C%3A/Windows/win.ini" alt="a"></p>
+    <p><img src="C%3A%5CWindows%5Cwin.ini" alt="b"></p>
+    <p><img src="c%3a/Windows/win.ini" alt="c"></p>
+    <p><img src="C:/Windows/win.ini" alt="d"></p>
+    <p><img src="C:\Windows\win.ini" alt="e"></p>
+    <p><img src="C:secret.png" alt="f"></p>
+    <p><img src="sub/C:secret.png" alt="g"></p>
+    <p><img src="%5C%5Cserver%5Cshare%5Cx.png" alt="h"></p>
+    <p><img src="%2F%2Fserver/share/x.png" alt="i"></p>
+    <p><img src="\\server\share\x.png" alt="j"></p>
+    <p><img src="\\?\C:\Windows\win.ini" alt="k"></p>
+    <p><img src="%5C%5C%3F%5CC%3A%5CWindows%5Cwin.ini" alt="l"></p>
+  markdown: |
+    drives ![a](C%3A/Windows/win.ini)
+
+    ![b](C%3A%5CWindows%5Cwin.ini)
+
+    ![c](c%3a/Windows/win.ini)
+
+    ![d](C:/Windows/win.ini)
+
+    <div><img src="C:\Windows\win.ini" alt="e"></div>
+
+    ![f](C:secret.png)
+
+    ![g](sub/C:secret.png)
+
+    ![h](%5C%5Cserver%5Cshare%5Cx.png)
+
+    ![i](%2F%2Fserver/share/x.png)
+
+    <div><img src="\\server\share\x.png" alt="j"></div>
+
+    <div><img src="\\?\C:\Windows\win.ini" alt="k"></div>
+
+    ![l](%5C%5C%3F%5CC%3A%5CWindows%5Cwin.ini)
+  text: drives
+  omitted:
+    - [traversal, "C%3A/Windows/win.ini"]
+    - [traversal, "C%3A%5CWindows%5Cwin.ini"]
+    - [traversal, "c%3a/Windows/win.ini"]
+    - [scheme, "C:/Windows/win.ini"]
+    - [scheme, 'C:\Windows\win.ini']
+    - [scheme, "C:secret.png"]
+    - [traversal, "sub/C:secret.png"]
+    - [unc_path, "%5C%5Cserver%5Cshare%5Cx.png"]
+    - [unc_path, "%2F%2Fserver/share/x.png"]
+    - [absolute, '\\server\share\x.png']
+    - [absolute, '\\?\C:\Windows\win.ini']
+    - [unc_path, "%5C%5C%3F%5CC%3A%5CWindows%5Cwin.ini"]
+
+# The artifact's own housekeeping files exist and hold the housekeeping
+# marker; any spelling of their names is refused before a read.
+- id: housekeeping-names
+  html: |
+    <p>housekeeping <img src="Metadata.JSON" alt="a"></p>
+    <p><img src="sub/METADATA.json" alt="b"></p>
+    <p><img src="%4Detadata.json" alt="c"></p>
+    <p><img src=".REVISIONS/old.png" alt="d"></p>
+    <style>@import "sub/Metadata.JSON";</style>
+    <div style="background: url(METADATA.JSON)">e</div>
+    <p><img src="metadata.json" alt="f"></p>
+    <style>@import "sub/metadata.json";</style>
+  markdown: |
+    housekeeping ![a](Metadata.JSON)
+
+    ![b](sub/METADATA.json)
+
+    ![c](%4Detadata.json)
+
+    ![d](.REVISIONS/old.png)
+
+    <style>@import "sub/Metadata.JSON";</style>
+
+    <div style="background: url(METADATA.JSON)">e</div>
+
+    ![f](metadata.json)
+
+    <style>@import "sub/metadata.json";</style>
+  text: housekeeping
+  omitted:
+    - [housekeeping, Metadata.JSON]
+    - [housekeeping, sub/METADATA.json]
+    - [housekeeping, "%4Detadata.json"]
+    - [housekeeping, .REVISIONS/old.png]
+    - [housekeeping, sub/Metadata.JSON]
+    - [housekeeping, METADATA.JSON]
+    - [housekeeping, metadata.json]
+    - [housekeeping, sub/metadata.json]

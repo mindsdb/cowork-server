@@ -167,6 +167,7 @@ def _database_lock_engine(bind: Any) -> Any:
                 poolclass=NullPool,
                 pool_pre_ping=settings.database.pool_pre_ping,
                 isolation_level="AUTOCOMMIT",
+                hide_parameters=True,
                 connect_args={
                     "connect_timeout": max(
                         1,
@@ -342,7 +343,22 @@ class SharedResourceAccess:
         fallback_creator_id: str | None = None,
         fallback_modified_at: datetime | None = None,
     ) -> ResourceAttribution:
-        row = self._find(kind, key) if self.org_mode else None
+        if not self.org_mode:
+            # Nobody else's authorship to report. Outside org mode no claim row
+            # exists, and the only ids a fallback can carry are the caller's
+            # own (creator_id answers actor_id there, built-ins included) or
+            # the creator of a row in the caller's own partition. On a
+            # trusted-identity deployment Principal carries an email only
+            # where the live-apps overlay sends X-User-Email, and only
+            # cowork.services.live_apps reads it there, so nothing here names
+            # anyone outside org mode. The desktop has no actor at all, so it
+            # reports none either way.
+            return ResourceAttribution(
+                created_by=None,
+                last_modified_by=None,
+                last_modified_at=fallback_modified_at,
+            )
+        row = self._find(kind, key)
         if row is not None:
             if row.pending_claim_token:
                 return ResourceAttribution(
@@ -410,13 +426,16 @@ class SharedResourceAccess:
         key: str,
         *,
         resource_exists: Callable[[], bool],
+        on_finalize: Callable[[str], None] | None = None,
     ) -> bool:
         """Recover a crashed filesystem claim after its bounded lease expires.
 
         An empty resource releases the key for a new first writer. If bytes
         exist, finalize with the reserved actor snapshot and a recovery action.
         This preserves an actor for every surviving mutation even though the
-        originating process died before its audit commit.
+        originating process died before its audit commit. ``on_finalize``,
+        given that actor, stages what the create would have committed with
+        its claim, so it commits with the finalize.
         """
         if not self.org_mode:
             return False
@@ -464,6 +483,8 @@ class SharedResourceAccess:
                     "recover",
                     actor_id=current.created_by_id,
                 )
+                if on_finalize is not None:
+                    on_finalize(current.created_by_id)
             else:
                 self.session.delete(current)
             self.session.commit()

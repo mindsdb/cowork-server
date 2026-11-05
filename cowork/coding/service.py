@@ -7,7 +7,7 @@ from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 
-from cowork.coding.approvals import ApprovalBroker
+from cowork.coding.approvals import ApprovalBroker, read_only_refusal
 from cowork.coding.questions import QuestionBroker
 from cowork.coding.service_questions import CodingQuestionOperations
 from cowork.coding.service_planning import CodingPlanningOperations
@@ -23,12 +23,14 @@ from cowork.coding.contracts import (
     EventPage,
     EventType,
     PendingApproval,
+    PermissionMode,
     SessionPage,
     SessionStatus,
     SessionUpdateRequest,
     TaskCapabilities,
     TaskCapability,
     WorkspaceInspection,
+    WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import CodeTask, RunStatus
@@ -68,6 +70,7 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.coding.workspace_usage import WorkspaceUsage
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -97,6 +100,10 @@ class CodingService(
         self.registry = registry or engine_registry
         self.store = store or CodingStore(root)
         self.workspaces = workspaces or WorkspaceManager(root)
+        self.workspace_usage = WorkspaceUsage(
+            self.workspaces.usage_roots,
+            lambda: [session.id for session in self.store.list_sessions()],
+        )
         shell_options = [item.id.value for item in shell_inventory().items]
         available_engines = [item.id for item in self.registry.capabilities() if item.available]
         self.control = ControlPlaneService(
@@ -123,6 +130,10 @@ class CodingService(
         self.approvals = ApprovalBroker(
             self._approval_opened, self._approval_closed,
             lambda session_id: self.store.load_session(session_id).command_approval_grants,
+            is_read_only=lambda session_id: (
+                self.store.load_session(session_id).permission_mode == PermissionMode.read_only
+            ),
+            on_refuse=lambda session_id, pending: self._emit(session_id, read_only_refusal(pending)),
         )
         self.questions = QuestionBroker(self._question_opened, self._question_closed)
         self.runtimes = RuntimeManager(root, self.registry, self._engine_request)
@@ -159,6 +170,7 @@ class CodingService(
             self.project_workspaces,
             self._emit,
             self.control,
+            on_workspace_ready=self.workspace_usage.invalidate,
         )
         self.commands = CodingCommandHandler(
             self.registry,
@@ -247,6 +259,10 @@ class CodingService(
                 self.expire_stale_state()
             except Exception:
                 logger.exception("Could not expire stale coding control-plane state")
+
+    def workspace_usage_page(self, session_id: str | None = None) -> WorkspaceUsagePage:
+        """Approximate storage Cowork manages for each task, measured in the background."""
+        return self.workspace_usage.snapshot(session_id)
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
@@ -496,6 +512,9 @@ class CodingService(
                 if self.runtimes.terminal_is_running(session_id):
                     raise RuntimeError("Stop the task terminal before changing task controls")
                 values = updates.model_dump(exclude_none=True)
+                # None is a real effort (the model's own default), so an explicit null clears it.
+                if "reasoning_effort" in updates.model_fields_set and updates.reasoning_effort is None:
+                    values["reasoning_effort"] = None
                 if "additional_dirs" in values:
                     values["additional_dirs"] = validate_directories(values["additional_dirs"])
                 next_permission = values.get("permission_mode", session.permission_mode)

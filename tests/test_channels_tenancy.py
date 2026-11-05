@@ -367,7 +367,7 @@ async def test_get_or_refresh_returns_none_for_unregistered_channel_type(engine)
 
 # --- LiveAdapterRegistry.resolve_org_bridge: the real org_resolver server.py wires in ---
 
-async def test_resolve_org_bridge_finds_the_right_orgs_bridge(engine):
+async def test_resolve_org_bridge_finds_the_right_orgs_bridge(engine, org_deployment):
     registry = LiveAdapterRegistry(_live_fake_registry())
     _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
     _config_svc(engine, _org(ORG_A)).set_external_account_id("slack", "T-A")
@@ -385,6 +385,51 @@ async def test_resolve_org_bridge_returns_none_for_unknown_routing_key(engine):
     registry = LiveAdapterRegistry(_live_fake_registry())
     resolved = await registry.resolve_org_bridge("slack", "T-nope", session=Session(engine))
     assert resolved is None
+
+
+async def _routing_scope(engine, monkeypatch, routing_key: str) -> TenantScope:
+    """The scope resolve_org_bridge loads an installation's credentials under."""
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    seen: list[TenantScope] = []
+    original = registry.get_or_refresh
+
+    async def spy(channel_type, org_id, *, session=None):
+        seen.append(session.scope)
+        return await original(channel_type, org_id, session=session)
+
+    monkeypatch.setattr(registry, "get_or_refresh", spy)
+    assert await registry.resolve_org_bridge("slack", routing_key, session=Session(engine)) is not None
+    return seen[0]
+
+
+async def test_an_org_id_alone_never_routes_a_desktop_webhook_into_org_mode(engine, monkeypatch):
+    """Local tenancy: an installation row that carries an org_id still routes
+    under LOCAL_SCOPE. Only org tenancy turns org mode on."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    _config_svc(engine, _org(ORG_A)).set_external_account_id("slack", "T-copied")
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    get_app_settings.cache_clear()
+    try:
+        assert await _routing_scope(engine, monkeypatch, "T-copied") == LOCAL_SCOPE
+    finally:
+        get_app_settings.cache_clear()
+
+
+async def test_a_partition_stamped_installation_routes_into_its_partition(
+    engine, monkeypatch, personal_deployment
+):
+    _config_svc(engine, _org(ORG_A)).set_external_account_id("slack", "T-person")
+    scope = await _routing_scope(engine, monkeypatch, "T-person")
+    assert scope.org_mode is False
+    assert scope.personal is True
+    assert scope.org_id == ORG_A
+
+
+async def test_org_tenancy_routes_into_org_mode(engine, monkeypatch, org_deployment):
+    _config_svc(engine, _org(ORG_A)).set_external_account_id("slack", "T-hosted")
+    assert await _routing_scope(engine, monkeypatch, "T-hosted") == TenantScope(org_mode=True, org_id=ORG_A)
 
 
 async def test_resolve_org_bridge_resolves_the_local_installation_too(engine):
@@ -449,3 +494,48 @@ async def test_lifecycle_setup_and_teardown_hit_the_callers_own_org_slot(engine)
 
     await svc.teardown("slack")
     assert adapters.get("slack", ORG_A) is None
+
+
+# --- AntonChannelRuntime: the scope one inbound turn runs under ---
+
+class _ScopeSeen(Exception):
+    pass
+
+
+async def _turn_scope(monkeypatch, org_id: str | None) -> TenantScope:
+    """Stop _handle_locked at its first ScopedSession and return that scope."""
+    import cowork.channels.runtime as runtime_mod
+
+    seen: list[TenantScope] = []
+
+    def recording_session(session, scope):
+        seen.append(scope)
+        raise _ScopeSeen
+
+    monkeypatch.setattr(runtime_mod, "ScopedSession", recording_session)
+    runtime = runtime_mod.AntonChannelRuntime(LiveAdapterRegistry(_fake_registry()))
+    with pytest.raises(_ScopeSeen):
+        await runtime._handle_locked("slack", object(), org_id)
+    return seen[0]
+
+
+async def test_channel_turn_with_an_org_id_is_local_on_a_desktop(monkeypatch):
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    get_app_settings.cache_clear()
+    try:
+        assert await _turn_scope(monkeypatch, ORG_A) == LOCAL_SCOPE
+        assert await _turn_scope(monkeypatch, None) == LOCAL_SCOPE
+    finally:
+        get_app_settings.cache_clear()
+
+
+async def test_channel_turn_with_an_org_id_is_org_mode_in_org_tenancy(monkeypatch, org_deployment):
+    assert await _turn_scope(monkeypatch, ORG_A) == TenantScope(org_mode=True, org_id=ORG_A)
+
+
+async def test_channel_turn_with_a_partition_id_stays_in_the_partition(monkeypatch, personal_deployment):
+    scope = await _turn_scope(monkeypatch, ORG_A)
+    assert (scope.org_mode, scope.personal, scope.org_id) == (False, True, ORG_A)

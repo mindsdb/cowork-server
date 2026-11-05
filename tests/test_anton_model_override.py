@@ -35,9 +35,10 @@ def test_older_client_without_router_keeps_existing_router_setting():
 
 
 def test_skew_guard_skips_fields_the_pinned_anton_does_not_have():
-    """Version skew must degrade, never crash — anton is a git dep pinned to
-    branch="main" (see _overlay_user_settings's docstring for why); pydantic
-    raises ValueError on setattr of an unknown field."""
+    """Version skew must degrade, never crash — the installed anton can
+    predate a setting cowork-server ships (see _overlay_user_settings's
+    docstring for why); pydantic raises ValueError on setattr of an unknown
+    field."""
     from pydantic_settings import BaseSettings
 
     class PinnedAnton(BaseSettings):
@@ -99,7 +100,7 @@ async def test_session_model_selection_reaches_provider_and_stays_per_turn(monke
         other = service.create_conversation(topic="MODEL-2 defaults")
         try:
             for conv, model in ((conversation, "pick-A"), (conversation, "pick-B"), (other, None)):
-                config, _, _ = await harness.AntonHarness()._build_chat_session(conv, model=model)
+                config = (await harness.AntonHarness()._build_chat_session(conv, model=model)).session
                 configs.append(config)
                 for role in ("planning", "coding", "router"):
                     assert getattr(config.settings, f"{role}_model") == (

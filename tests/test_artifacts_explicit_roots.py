@@ -14,6 +14,7 @@ from uuid import UUID
 
 import pytest
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifacts as a
 from cowork.services import artifact_identity
 
@@ -271,10 +272,14 @@ def test_read_only_list_card_matches_the_canonical_card_shape(source, monkeypatc
     monkeypatch.setattr(a.time, "time", lambda: folder.stat().st_mtime + 1)
 
     listed = a.list_artifacts([source])[0]
+    # The list names each card's own root, so its serve URL is built from that
+    # root rather than found by a scan; the canonical card is given the same.
     canonical = a.card_for_folder(
         folder,
+        scope=LOCAL_SCOPE,
         project_id=source.project_id,
         project_name=source.project_name,
+        artifacts_base=source.base,
     )
 
     assert listed == canonical
@@ -285,7 +290,7 @@ def test_serve_url_is_empty_in_org_mode(source, monkeypatch):
                             meta={"slug": "dash", "type": "html-app"})
     monkeypatch.setattr(a, "_org_mode", lambda: True)
 
-    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj")
+    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj", scope=LOCAL_SCOPE)
 
     assert card["serveUrl"] == ""
 
@@ -301,7 +306,7 @@ def test_serve_url_still_built_in_desktop_mode(tmp_path, monkeypatch):
                             meta={"slug": "dash", "type": "html-app"})
     monkeypatch.setattr(a, "_org_mode", lambda: False)
 
-    assert a.serve_url_for(folder / "index.html").startswith("/api/v1/artifacts/serve/")
+    assert a.serve_url_for(folder / "index.html", scope=LOCAL_SCOPE).startswith("/api/v1/artifacts/serve/")
 
 
 def test_owner_side_access_fields_are_absent_in_org_mode(source, monkeypatch):
@@ -316,7 +321,7 @@ def test_owner_side_access_fields_are_absent_in_org_mode(source, monkeypatch):
     }))
     monkeypatch.setattr(a, "_org_mode", lambda: True)
 
-    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj")
+    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj", scope=LOCAL_SCOPE)
 
     assert "accessPassword" not in card
     assert "accessEmails" not in card
@@ -333,7 +338,7 @@ def test_owner_side_access_fields_remain_in_desktop_mode(source, monkeypatch):
     }))
     monkeypatch.setattr(a, "_org_mode", lambda: False)
 
-    card = a.card_for_folder(folder)
+    card = a.card_for_folder(folder, scope=LOCAL_SCOPE)
 
     assert card["accessPassword"] == "s3cret"
 

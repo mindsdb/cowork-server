@@ -19,6 +19,7 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
+          version: "0.11.30"
           python-version: "3.12"
 
       - name: Check uv.lock matches pyproject.toml
@@ -27,7 +28,49 @@ jobs:
         run: uv lock --check
 
       - name: Install dependencies
-        run: uv sync --group dev
+        run: uv sync --locked --group dev
+
+      - name: Check exported release dependencies
+        run: python scripts/release_contract.py --check
 
       - name: Run unit tests
         run: make test/unit/coverage
+
+  export-tests-windows:
+    # The desktop app runs on Windows, where a pinned folder has no directory
+    # descriptor and the export's path-segment checks are the only guard on
+    # which file it reads. The Windows lxml wheel also bundles a libxml2 that
+    # speaks HTTP and FTP. These tests prove, on Windows itself, that export
+    # reads only the artifact's own files and fetches nothing.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Keep line endings as committed
+        # Git on the Windows runner turns LF into CRLF at checkout, which
+        # would change the bytes of the export fixtures.
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run export tests
+        # -rs names every skipped test and its reason in the log. The export
+        # service tests place files through Windows' rename, which runs only
+        # here.
+        run: >-
+          uv run python -m pytest -rs
+          tests/test_artifact_files.py
+          tests/test_markdown_render.py
+          tests/test_artifact_inline.py
+          tests/test_docx_writer.py
+          tests/test_export_hostile.py
+          tests/test_no_fetch.py
+          tests/test_artifact_export_contracts.py
+          tests/test_artifact_export_service.py

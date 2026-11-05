@@ -27,6 +27,7 @@ from pathlib import Path
 import sqlalchemy as sa
 from sqlmodel import Session, select
 
+from cowork.common.logger import log_context
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
@@ -197,15 +198,17 @@ def _backfill_project(engine, project_id, project_path: str, org_id: str, summar
                 # fail, the same pass on every start.
                 session.rollback()
                 logger.error(
-                    "artifact_owner_backfill aborted project=%s slug=%s",
-                    project_id, slug, exc_info=True,
+                    "artifact_owner_backfill aborted",
+                    exc_info=True,
+                    extra=log_context(project_id=project_id, artifact_slug=slug),
                 )
                 raise
             except Exception:
                 session.rollback()
                 logger.warning(
-                    "artifact_owner_backfill failed project=%s slug=%s",
-                    project_id, slug, exc_info=True,
+                    "artifact_owner_backfill failed",
+                    exc_info=True,
+                    extra=log_context(project_id=project_id, artifact_slug=slug),
                 )
                 summary.unknown.append((str(project_id), slug))
 

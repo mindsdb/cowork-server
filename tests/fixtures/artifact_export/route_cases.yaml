@@ -1,0 +1,129 @@
+# One export of an artifact's primary file through the route, in local
+# tenancy. `files` are written into the artifact folder and `primary` into its
+# metadata.json. `written` is the new file's path inside the folder for a 200,
+# and `scripts_dropped` (default false) what the answer reports; every other
+# answer leaves the folder byte for byte as it was.
+cases:
+  - id: markdown-to-word
+    files:
+      report.md: "# Quarterly report\n\nRevenue grew.\n"
+    primary: report.md
+    format: docx
+    status: 200
+    written: report.docx
+  - id: markdown-to-html
+    files:
+      report.md: "# Quarterly report\n\nRevenue grew.\n"
+    primary: report.md
+    format: html
+    status: 200
+    written: report.html
+  - id: long-markdown-suffix-to-html
+    files:
+      report.markdown: "# Quarterly report\n"
+    primary: report.markdown
+    format: html
+    status: 200
+    written: report.html
+  - id: text-to-html
+    files:
+      notes.txt: "first line\n  indented <second> line\n"
+    primary: notes.txt
+    format: html
+    status: 200
+    written: notes.html
+  - id: text-to-word
+    files:
+      notes.txt: "first line\n"
+    primary: notes.txt
+    format: docx
+    status: 200
+    written: notes.docx
+  - id: html-to-word
+    files:
+      page.html: "<html><head><title>Page</title></head><body><h1>Page</h1></body></html>"
+    primary: page.html
+    format: docx
+    status: 200
+    written: page.docx
+  - id: html-with-a-script-to-word
+    files:
+      page.html: "<html><body><h1>Page</h1><script>document.title = 'x';</script></body></html>"
+    primary: page.html
+    format: docx
+    status: 200
+    written: page.docx
+    scripts_dropped: true
+  - id: htm-to-word
+    files:
+      page.htm: "<h1>Page</h1>"
+    primary: page.htm
+    format: docx
+    status: 200
+    written: page.docx
+  - id: markdown-in-a-subfolder-to-word
+    files:
+      docs/report.md: "# Nested\n"
+    primary: docs/report.md
+    format: docx
+    status: 200
+    written: docs/report.docx
+  - id: html-source-to-html
+    files:
+      page.html: "<h1>Page</h1>"
+    primary: page.html
+    format: html
+    status: 422
+  - id: pdf-without-a-render-service
+    files:
+      report.md: "# Quarterly report\n"
+    primary: report.md
+    format: pdf
+    status: 422
+  - id: spreadsheet-to-word
+    files:
+      data.csv: "a,b\n1,2\n"
+    primary: data.csv
+    format: docx
+    status: 422
+  - id: full-stack-app
+    type: fullstack-stateless-app
+    files:
+      static/index.html: "<h1>App</h1>"
+      backend.py: "app = None\n"
+    primary: static/index.html
+    format: docx
+    status: 422
+  - id: housekeeping-primary
+    files:
+      README.md: "# Readme\n"
+    primary: README.md
+    format: docx
+    status: 422
+  - id: readme-in-a-subfolder-to-word
+    files:
+      docs/README.md: "# Setup\n"
+    primary: docs/README.md
+    format: docx
+    status: 200
+    written: docs/README.docx
+  - id: readme-in-a-subfolder-to-html
+    files:
+      docs/README.md: "# Setup\n"
+    primary: docs/README.md
+    format: html
+    status: 200
+    written: docs/README.html
+  - id: primary-under-a-store-owned-name-in-a-subfolder
+    files:
+      docs/metadata.json/report.md: "# Report\n"
+    primary: docs/metadata.json/report.md
+    format: docx
+    status: 422
+  - id: primary-under-revisions
+    files:
+      .revisions/report.md: "# Old revision\n"
+      report.md: "# Current\n"
+    primary: .revisions/report.md
+    format: html
+    status: 422

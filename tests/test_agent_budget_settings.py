@@ -171,14 +171,7 @@ def test_turn_token_ceiling_default_matches_anton_rather_than_exceeding_it():
     """
     from anton.core.settings import CoreSettings
 
-    core = CoreSettings()
-    if not hasattr(core, "max_turn_tokens"):
-        pytest.skip(
-            "pinned anton predates ENG-1286's max_turn_tokens — this assertion "
-            "activates at the weekly release, and its passing is the signal "
-            "that the merge-order note in the PR body is satisfied"
-        )
-    assert UserSettings().max_turn_tokens == core.max_turn_tokens
+    assert UserSettings().max_turn_tokens == CoreSettings().max_turn_tokens
 
 
 def test_hosted_deployments_can_lower_the_ceiling_via_env(monkeypatch):
@@ -281,10 +274,6 @@ def test_overlay_applies_every_budget_to_a_real_anton_settings():
         _overlay_user_settings,
     )
 
-    # Asserted on the tuple, not only on the outcome: until anton's field
-    # reaches the pinned `main`, the outcome assertions below take their
-    # skew-guard branch, which is ALSO what dropping the key from the tuple
-    # produces. Without this line that mutation ships green.
     assert "max_turn_tokens" in _OVERLAID_SETTINGS
 
     a = AntonSettings(_env_file=None)
@@ -297,18 +286,15 @@ def test_overlay_applies_every_budget_to_a_real_anton_settings():
     assert a.max_tool_rounds == 80
     assert a.max_continuations == 2
     assert "max_tool_rounds" in applied and "max_continuations" in applied
-    if hasattr(AntonSettings(_env_file=None), "max_turn_tokens"):
-        assert a.max_turn_tokens == 900_000
-        assert "max_turn_tokens" in applied
-    else:  # pinned anton predates ENG-1286 — the skew guard must have skipped it
-        assert "max_turn_tokens" not in applied
+    assert a.max_turn_tokens == 900_000
+    assert "max_turn_tokens" in applied
 
 
 def test_overlay_survives_a_field_the_pinned_anton_does_not_have():
     """Version skew must degrade, never crash — through the real function.
 
-    anton is a git dep pinned to branch="main", so a setting can exist here
-    while the pinned anton predates it; the field reaches main at the weekly
+    The installed anton can predate a setting that exists here (see
+    _overlay_user_settings's docstring); the field reaches main at the weekly
     release, not when the anton PR merges. pydantic raises on setattr of an
     unknown field, and the overlay runs on EVERY session build, so an unguarded
     overlay turns a one-week ordering gap into a total agent outage.
@@ -338,15 +324,9 @@ def test_overlay_survives_a_field_the_pinned_anton_does_not_have():
 
 
 def test_anton_settings_accepts_the_ceiling_overlay():
-    """The live pinned anton — xfails until anton's ENG-1286 reaches main.
-
-    Not a soft assertion: when this starts passing, the merge-order note in the
-    PR body is satisfied and the guard above stops being load-bearing.
-    """
+    """The installed anton has ENG-1286's max_turn_tokens and takes the overlay."""
     from anton.config.settings import AntonSettings
 
     a = AntonSettings(_env_file=None)
-    if not hasattr(a, "max_turn_tokens"):
-        pytest.skip("pinned anton predates ENG-1286's max_turn_tokens")
     a.max_turn_tokens = 900_000
     assert a.max_turn_tokens == 900_000

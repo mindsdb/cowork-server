@@ -97,3 +97,18 @@ def require_local_tenancy() -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="not available in org deployments",
         )
+
+
+def refuse_code_mode_in_sandbox() -> None:
+    """Reject a Code mode request when agent code runs in the sandbox.
+
+    Code mode runs git, project commands and Codex with its terminals in this
+    server's own container, outside the Landlock launcher, so under
+    ``COWORK_CODE_SANDBOX=landlock`` every Code mode route answers 403. Declared
+    on the coding routers rather than called in a handler, so a route added
+    there inherits it.
+    """
+    from cowork.code_sandbox import NO_CODE_MODE_DETAIL, code_sandbox_on
+
+    if code_sandbox_on():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=NO_CODE_MODE_DETAIL)

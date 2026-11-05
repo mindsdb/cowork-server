@@ -97,7 +97,8 @@ class TestWebSearchFlavorRouting:
     ):
         # The real anton provider on the Responses flavor reports both web
         # tools as native, which is why the harness turns them off on this
-        # path (test_switched_path_web_tools.py). The router stays generic.
+        # path (test_switched_path_web_tools.py). Router callers offer only
+        # their own tools (test_router_responses.py).
         openai_compatible_api("responses")
         anton_responses_ready()
         settings = UserSettings(
@@ -116,4 +117,4 @@ class TestWebSearchFlavorRouting:
 
         assert client.planning_provider.native_web_tools() == WEB_TOOLS
         assert client.coding_provider.native_web_tools() == WEB_TOOLS
-        assert client.router_provider.native_web_tools() == set()
+        assert client.router_provider.native_web_tools() == WEB_TOOLS

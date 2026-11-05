@@ -13,9 +13,9 @@ makes sense for a server process: no console.print, no Live spinner,
 no webbrowser.open. Status flows back to the desktop UI through the
 normal SSE event stream and the response string the LLM renders.
 
-Right now we only override PUBLISH_TOOL — the only one users have hit.
-Add more here as needed (CONNECT_DATASOURCE_TOOL is the next likely
-candidate; same pattern).
+PUBLISH_TOOL is overridden here, and CONNECT_DATASOURCE_TOOL keeps anton's
+handler with a vault that matches only the asker's own connections. Add more
+here as needed; same pattern.
 """
 
 from __future__ import annotations
@@ -23,32 +23,66 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 import uuid
 
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import current_settings_scope
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, tenant_scope_required
+from cowork.db.units import run_db
+from cowork.deployment_identity import identity_for_turn
+from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.custom_connectors import (
+    UnstorableFormError,
+    check_handcrafted_form,
+    handcrafted_form_allowed,
+    scope_is_one_persons,
+)
+from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT
+from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
+
+
+if TYPE_CHECKING:
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def _published_state(raw_path: str) -> dict:
     """Delegate to the publish service so the tool and GUI agree on where
-    `.published.json` lives. Imported lazily to avoid a startup import cycle."""
+    `.published.json` lives. Imported lazily to avoid a startup import cycle.
+
+    Every helper here resolves paths in the turn's own scope, the one the
+    producer binds (use_settings_scope): a person's partition where projects
+    are personal. Unbound, the scan refuses on a partitioned deployment.
+    """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_state
-    return published_state(raw_path)
+    return published_state(raw_path, scope=current_settings_scope())
 
 
-def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
+def _publish_artifact(raw_path: str, access: ArtifactAccessRequest | None = None) -> dict:
     """Desktop publish for the agent's own `publish_or_preview` tool.
 
     Resolves the artifact, its root and the credential the same way the HTTP
     endpoints do — `publish_artifact` takes all three explicitly now.
     """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import desktop_publish_context, publish_artifact
 
-    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(raw_path)
+    scope = current_settings_scope()
+    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
+        raw_path, scope=scope
+    )
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
-        api_key=api_key, publish_url=publish_url, access=access,
+        api_key=api_key, publish_url=publish_url, access=access, scope=scope,
     )
 
 
@@ -56,42 +90,48 @@ def _published_owner_state(raw_path: str) -> dict:
     """Raw owner-side `.published.json` entry (mode/access_password/…) so the
     tool can preserve prior access on re-publish. Lazily imported to avoid a
     startup import cycle."""
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_owner_state
-    return published_owner_state(raw_path)
+    return published_owner_state(raw_path, scope=current_settings_scope())
 
 
-def _access_from_state(entry: dict) -> dict:
+def _access_from_state(entry: dict) -> ArtifactAccessRequest:
     """Rebuild input access from a stored .published.json entry.
 
     Single source of truth: anton.publish_access.access_from_owner_side."""
     from anton.publish_access import access_from_owner_side
-    return access_from_owner_side(entry)
+
+    from cowork.schemas.artifact_access import ArtifactAccessRequest
+    return ArtifactAccessRequest.of_publisher(access_from_owner_side(entry))
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
-# The CLI-flavoured copies inside anton-core's `tools.py` mention the
-# legacy `.anton/output/` artifacts dir and reference a `/publish`
-# slash command that doesn't exist in antontron — both confuse the
-# LLM in the desktop context, so we override them in `build_cowork_publish_tool`.
-COWORK_PUBLISH_DESCRIPTION = (
-    "Preview, check, or publish an HTML dashboard / report. Files live "
-    "under the project's `artifacts/<artifact-id>/<name>.html`. Actions: "
+# The CLI-flavoured copies inside anton-core's `tools.py` describe the
+# interactive CLI flow ('ask' prompts the user, 'preview' opens a
+# browser), which doesn't exist in the desktop process and confuses the
+# LLM there, so we override them in `build_cowork_publish_tool`.
+# Default hosts fill the placeholders with the desktop app and MindsHub
+# publishing. A self-hosted deployment runs in the browser and publishes to
+# its own publisher, so its text names neither.
+_PUBLISH_DESCRIPTION = (
+    "Preview, check, or publish an HTML dashboard / report. Pass as "
+    "`file_path` the artifact's slug or the absolute path that "
+    "`create_artifact` or `generate_artifact` returned. Actions: "
     "'ask' (default) and 'preview' check whether the file is already "
     "published and return the public URL if so — they DON'T publish; "
     "use them when generating a new file to confirm state. 'publish' "
     "actually publishes (or re-publishes if a report_id already exists) "
-    "and returns the public URL. In the desktop app the user can also "
-    "publish via the Live Artifacts panel — but you should call "
+    "and returns the public URL. {panel} — but you should call "
     "action='publish' directly whenever the user asks to publish, "
     "share, deploy, or make-public any artifact you generated. No "
     "slash command, no extra confirmation."
 )
-COWORK_PUBLISH_PROMPT = (
-    "CONTENT SHARING POLICY (desktop chat):\n"
+_PUBLISH_PROMPT = (
+    "{heading}\n"
     "- Publishing dashboards or reports to the web is done ONLY via the `publish_or_preview` tool.\n"
     "- When the user asks to publish / share / deploy / make-public a generated artifact, call this\n"
     "  tool with `action: 'publish'` directly. Don't ask the user to use a slash command or a UI\n"
-    "  panel — publishing works straight from chat when MindsHub is configured.\n"
+    "  panel — {from_chat}.\n"
     "- To check whether something is already published (e.g. the user asks 'is it live?'), call with\n"
     "  `action: 'ask'` or `action: 'preview'` — both return the public URL if one exists, without\n"
     "  publishing or re-publishing.\n"
@@ -121,6 +161,63 @@ COWORK_PUBLISH_PROMPT = (
     "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
     "  ask again)."
 )
+COWORK_PUBLISH_DESCRIPTION = _PUBLISH_DESCRIPTION.format(
+    panel="In the desktop app the user can also publish via the Live Artifacts panel",
+)
+COWORK_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
+    heading="CONTENT SHARING POLICY (desktop chat):",
+    from_chat="publishing works straight from chat when MindsHub is configured",
+)
+# A self-hosted deployment publishes to its own publisher, which takes HTML
+# and Markdown only: `publish_artifact` refuses a full-stack artifact there
+# (`FULLSTACK_PUBLISH_UNSUPPORTED`). The agent hears it before it builds one.
+_SELF_HOSTED_FULLSTACK_EXCEPTION = (
+    "Full-stack apps (a backend with its frontend) can't be published from this "
+    "deployment: publish an HTML page or a Markdown document."
+)
+SELF_HOSTED_PUBLISH_DESCRIPTION = (
+    _PUBLISH_DESCRIPTION.format(panel="The user can also publish from the Live Artifacts panel")
+    + " "
+    + _SELF_HOSTED_FULLSTACK_EXCEPTION
+)
+SELF_HOSTED_PUBLISH_PROMPT = _PUBLISH_PROMPT.format(
+    heading="CONTENT SHARING POLICY:",
+    from_chat="publishing works straight from chat",
+)
+
+
+def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
+    """The existing path `raw_path` names, or None when nothing matches.
+
+    A relative path is looked up in the session project's artifacts folder
+    first (`<slug>`, `<slug>/<file>`, `artifacts/<slug>/...`), then under the
+    project folder, where `.anton/artifacts/<slug>` resolves. `..` in a
+    relative path is refused: resolving collapses it even through a missing
+    folder, so `artifacts/../.anton/memory` would otherwise land in
+    `.anton/memory`.
+    """
+    from cowork.services.artifacts import _candidate_relative_artifacts
+
+    try:
+        path = Path(raw_path).expanduser()
+        workspace = getattr(session, "_workspace", None)
+        base = getattr(workspace, "base", None)
+        if not path.is_absolute() and base:
+            if ".." in path.parts:
+                return None
+            # `as_posix()` drops the `.` segments and doubled slashes that
+            # the helper would otherwise reject (`artifacts//<slug>`).
+            matches = _candidate_relative_artifacts(
+                path.as_posix(), [Path(workspace.artifacts_dir)]
+            )
+            if matches:
+                return matches[0]
+            path = Path(base) / path
+        path = path.resolve()
+        return path if path.exists() else None
+    except (OSError, RuntimeError, ValueError):
+        # NUL bytes, over-long names and unknown `~user` raise here.
+        return None
 
 
 async def _cowork_publish_or_preview(session: Any, tc_input: dict):
@@ -140,18 +237,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if not raw_path:
         return "publish_or_preview: missing file_path"
 
-    file_path = Path(raw_path).expanduser()
-    if not file_path.is_absolute():
-        # Anton's session carries the active workspace base.
-        workspace = getattr(session, "_workspace", None)
-        if workspace is not None:
-            base = getattr(workspace, "base", None)
-            if base:
-                file_path = Path(base) / raw_path
-    file_path = file_path.resolve()
-
-    if not file_path.exists():
-        return f"File not found: {file_path}"
+    file_path = _resolve_publish_path(session, raw_path)
+    if file_path is None:
+        # Echo only what the agent passed: the joined path could name a folder
+        # outside the artifacts (e.g. `.anton/memory`).
+        shown = raw_path if len(raw_path) <= 200 else raw_path[:200] + "…"
+        return (
+            f"Artifact not found: {shown!r}. Pass the artifact's slug "
+            "(list_artifacts shows it) or the absolute path that "
+            "create_artifact or generate_artifact returned."
+        )
 
     abs_path = str(file_path)
 
@@ -174,18 +269,27 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 f"If the user asks to re-publish, call this tool again with "
                 f"action='publish' — the same report_id is reused so the URL stays stable."
             )
+        from_chat = (
+            "MindsHub publishing works directly from chat in the desktop app"
+            if identity_for_turn() is None
+            else "publishing works directly from chat"
+        )
         return (
             f"{title} is at {file_path} and visible in the Live Artifacts "
             f"panel. It has NOT been published to the public web yet. If the "
             f"user asks to publish / share / make it public, call this tool "
-            f"again with action='publish' — MindsHub publishing works directly "
-            f"from chat in the desktop app, no slash command needed."
+            f"again with action='publish' — {from_chat}, no slash command needed."
         )
 
     if action != "publish":
         return f"publish_or_preview: unknown action '{action}'"
 
     # Resolve the access spec: explicit tool fields > preserve previous > public.
+    from pydantic import ValidationError
+
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.schemas.artifact_access import ArtifactAccessRequest, access_refusal
+
     access_mode = tc_input.get("access_mode")
     if access_mode == "password":
         pw = (tc_input.get("password") or "").strip()
@@ -195,7 +299,7 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 "from the publish panel (Access → Password) — do NOT ask for the "
                 "password in chat and never invent one."
             )
-        access = {"mode": "password", "password": pw}
+        access = ArtifactAccessRequest(mode=AccessMode.PASSWORD, password=pw)
     elif access_mode == "restricted":
         from anton.publish_access import parse_emails
         valid, invalid = parse_emails(tc_input.get("emails") or [])
@@ -206,18 +310,33 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
                 "INVALID: these are not valid email addresses: "
                 f"{', '.join(invalid)}. Fix them or omit them, then call the tool again."
             )
-        access = {"mode": "restricted",
-                  "emails": valid,
-                  "org_allowed": bool(tc_input.get("org_allowed")),
-                  "owner_only": bool(tc_input.get("owner_only"))}
+        access = ArtifactAccessRequest(
+            mode=AccessMode.RESTRICTED,
+            allowed_emails=valid,
+            org_allowed=bool(tc_input.get("org_allowed")),
+            owner_only=bool(tc_input.get("owner_only")),
+        )
     elif access_mode == "public":
-        access = {"mode": "public"}
+        access = ArtifactAccessRequest(mode=AccessMode.PUBLIC)
     else:
         # No access fields: preserve the artifact's previous access on re-publish.
-        # NOTE: _published_owner_state (not _published_state) — the latter drops
+        # NOTE: _published_owner_state (not _published_state): the latter drops
         # mode/access_password, which would silently reset to public.
         prev = _published_owner_state(abs_path)
-        access = _access_from_state(prev) if prev.get("report_id") else {"mode": "public"}
+        try:
+            access = (
+                _access_from_state(prev) if prev.get("report_id") else ArtifactAccessRequest(mode=AccessMode.PUBLIC)
+            )
+        except ValidationError as exc:
+            # The entry is a file the agent can write, so its access fields can
+            # hold any type; publishing without them would change who sees it.
+            reason = access_refusal(exc.errors(include_url=False))
+            logger.info("Cowork publish refused: the kept access can't be read")
+            return (
+                f"PUBLISH FAILED: The access saved with this artifact can't be read: {reason} "
+                "Tell the user to choose its access from the publish panel, and don't pick "
+                "one for them."
+            )
 
     # action == 'publish' — delegate to the service (single source of truth for
     # target resolution, fullstack bundling, vault secrets, access, history,
@@ -244,8 +363,56 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             return message
         return SideEffectResult.failed(message, reason=reason)
 
+    from fastapi import HTTPException
+
+    from cowork.services.publish import (
+        ARTIFACT_TOO_LARGE_MESSAGE,
+        OWNED_BY_OTHER_USER_MESSAGE,
+        PublishOwnedByOtherUser,
+        PublishRejected,
+        PublishTooLarge,
+        ShareOrgRequired,
+    )
+    from cowork.services.sharing_contract import SHARE_ORG_REQUIRED_INSTRUCTION
+
     try:
         result = _publish_artifact(abs_path, access=access)
+    except PublishOwnedByOtherUser:
+        # The model can edit files, so spell out that it must not work around
+        # the refusal (e.g. by dropping the stored report_id). Not a ban for the
+        # rest of the conversation: the user may fix the account and ask again.
+        logger.info("Cowork publish refused: %s", OWNED_BY_OTHER_USER_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {OWNED_BY_OTHER_USER_MESSAGE} The existing link belongs "
+            "to another account. Do not retry, and do not publish this artifact under "
+            "a new report on your own. Tell the user, and publish again only if they "
+            "ask after resolving it.",
+            reason="owned_by_other_user",
+        )
+    except PublishTooLarge:
+        # Retrying the same files cannot succeed; the model can shrink them. Kept
+        # before the generic HTTPException branch for this do-not-retry advice.
+        logger.info("Cowork publish refused: %s", ARTIFACT_TOO_LARGE_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {ARTIFACT_TOO_LARGE_MESSAGE} Do not retry with the same files. "
+            "Tell the user, or remove or shrink large files in the artifact "
+            "(PDFs, images) and publish again.",
+            reason="too_large",
+        )
+    except ShareOrgRequired as exc:
+        # The reason is MindsHub's, and classify_upload_error already logged
+        # the refusal. A PublishRejected, so kept before that branch, which
+        # would drop the code.
+        return _fail(f"PUBLISH FAILED: {exc} {SHARE_ORG_REQUIRED_INSTRUCTION}", reason=exc.code)
+    except HTTPException as exc:
+        # Typed refusals carry their text in `detail`; str(exc) would hand the
+        # model "503: {'code': ...}".
+        detail = exc.detail
+        info = detail if isinstance(detail, dict) else {}
+        message = info.get("message") or str(detail)
+        reason = info.get("code") or "http_error"
+        logger.info("Cowork publish refused: %s", message)
+        return _fail(f"PUBLISH FAILED: {message}", reason=reason)
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
@@ -262,6 +429,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             )
         logger.info("Cowork publish rejected: %s", exc)
         return _fail(f"PUBLISH FAILED: {exc}", reason="ValueError")
+    except PublishRejected as exc:
+        # publish_artifact has already logged the traceback.
+        logger.warning("Cowork publish rejected: %s", exc)
+        return _fail(f"PUBLISH FAILED: {exc}", reason="PublishRejected")
     except Exception as exc:
         logger.exception("Cowork publish tool failed")
         return _fail(f"PUBLISH FAILED: {exc}", reason=type(exc).__name__)
@@ -294,21 +465,23 @@ def build_cowork_publish_tool():
     can build the session config without paying the import cost twice.
 
     The description and prompt are replaced with cowork-flavoured copy
-    that names the right artifacts path (`artifacts/<id>/<file>.html`,
-    not the legacy `.anton/output/`) and tells the LLM publishing
+    that says what to pass as `file_path` and tells the LLM publishing
     works directly from chat — no slash command, no UI dance. Without
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
+    On a self-hosted deployment the copy names neither the desktop app
+    nor MindsHub publishing.
     """
     from anton.tools import PUBLISH_TOOL
     from anton.core.tools.tool_defs import ToolDef
 
+    self_hosted = identity_for_turn() is not None
     return ToolDef(
         name=PUBLISH_TOOL.name,
-        description=COWORK_PUBLISH_DESCRIPTION,
+        description=SELF_HOSTED_PUBLISH_DESCRIPTION if self_hosted else COWORK_PUBLISH_DESCRIPTION,
         input_schema=PUBLISH_TOOL.input_schema,
         handler=_cowork_publish_or_preview,
-        prompt=COWORK_PUBLISH_PROMPT,
+        prompt=SELF_HOSTED_PUBLISH_PROMPT if self_hosted else COWORK_PUBLISH_PROMPT,
     )
 
 
@@ -352,21 +525,36 @@ def _lookup_score(query: str, c: dict) -> float:
     return score
 
 
+def _sharepoint_instruction() -> str:
+    """What the agent tells a person who wants SharePoint, instead of collecting its key.
+
+    SharePoint is saved only by its own form in Customize, which checks the
+    key with Microsoft first, and that form exists only outside org mode.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return (
+            "Don't ask for SharePoint's key in chat. Tell the person SharePoint is "
+            "available in the desktop app."
+        )
+    return (
+        "Don't ask for SharePoint's key in chat and don't call request_credentials for it. "
+        "Tell the person to set it up in Customize, under Connections, where Cowork checks "
+        "the key with Microsoft. Once it is connected, they bring files into a project with "
+        "\"Add files from SharePoint\"."
+    )
+
+
 async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
     """Tool handler for `lookup_connector`.
 
-    Pulls a registry-backed connector spec by id (slug) or by
+    Pulls a connector spec, built-in or one of this scope's custom ones, by id (slug) or by
     natural-language query. The returned `form` blob is what the LLM
     should pass to `request_credentials` verbatim — methods, OAuth
     blocks, how_to markdown, and help_url all already filled in. We
     also stamp `_connector_id` onto the form so submissions land via
     the registry-aware save path (POST /v1/connectors/{id}/save).
     """
-    try:
-        from cowork.services.connectors.specs._registry import registry
-    except Exception as exc:
-        logger.exception("Cowork lookup_connector could not import registry")
-        return f"lookup_connector: registry unavailable ({exc})"
+    connectors = await _scope_connectors()
 
     cid = (tc_input.get("id") or "").strip()
     query = (tc_input.get("query") or "").strip()
@@ -375,6 +563,17 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
         return "lookup_connector: provide either `id` (a connector slug) or `query` (a natural-language name)."
 
     def _present(connector: dict, confidence: float, stage: str) -> str:
+        if connector.get("id") == SHAREPOINT:
+            # No form: there is nothing for request_credentials to render.
+            return json.dumps({
+                "id": connector.get("id"),
+                "label": connector.get("label"),
+                "description": connector.get("description"),
+                "category": connector.get("category"),
+                "confidence": confidence,
+                "stage": stage,
+                "next_step": _sharepoint_instruction(),
+            })
         # Stamp `_connector_id` into the form blob so the LLM doesn't
         # have to remember to copy it across. The vault save endpoint
         # uses this to route through POST /v1/connectors/{id}/save
@@ -394,6 +593,9 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
             "label": connector.get("label"),
             "description": connector.get("description"),
             "category": connector.get("category"),
+            # How to use the service once connected: base URL, auth header,
+            # endpoints. Saved with a custom connector when it was built.
+            "usage_notes": connector.get("usage_notes"),
             "confidence": confidence,
             "stage": stage,
             "form": form_blob,
@@ -407,28 +609,26 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
 
     # Stage 0 — explicit id always wins.
     if cid:
-        c = registry.get_connector(cid)
+        c = connectors.get(cid)
         if c:
-            return _present(c.model_dump(), 1.0, "id")
+            return _present(c, 1.0, "id")
         # Fall through to query-style lookup if the id didn't match.
         if not query:
             return json.dumps({
                 "id": None,
                 "match": "none",
                 "message": (
-                    f"No connector with id `{cid}` in the registry. "
-                    f"Either retry with a `query` (natural-language) or "
-                    f"handcraft the form spec — see the request_credentials "
-                    f"schema for the OAuth/how_to/help_url fields."
+                    f"No connector with id `{cid}`. Retry with a `query` "
+                    f"(natural-language), or: {_no_match_hint()}"
                 ),
-                "available_ids": sorted(registry.get_connectors().keys()),
+                "available_ids": sorted(connectors),
             })
         # If both were given and id missed, treat the id as part of the query.
         query = f"{cid} {query}".strip()
 
     # Stage 1 — exact match (id or alias) on the query.
     nq = _lookup_normalize(query)
-    for c in registry.get_connectors().values():
+    for c in connectors.values():
         if _lookup_normalize(c.get("id", "")) == nq:
             return _present(c, 1.0, "exact-id")
         for alias in c.get("aliases", []):
@@ -437,7 +637,7 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
 
     # Stage 2 — token-overlap. Return up to 3 candidates with confidence.
     scored: list[tuple[float, dict]] = []
-    for c in registry.get_connectors().values():
+    for c in connectors.values():
         s = _lookup_score(query, c)
         if s > 0:
             scored.append((s, c))
@@ -448,12 +648,10 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
             "id": None,
             "match": "none",
             "message": (
-                "No connector matched the query. Either ask the user to "
-                "clarify, or handcraft the form spec — see the "
-                "request_credentials schema for the OAuth/how_to/help_url "
-                "fields you should fill in when you know the auth shape."
+                "No connector matched the query. If the user may have meant a "
+                f"listed one, ask them to clarify. Otherwise: {_no_match_hint()}"
             ),
-            "available_ids": sorted(registry.get_connectors().keys()),
+            "available_ids": sorted(connectors),
         })
 
     top_score, top_c = scored[0]
@@ -535,9 +733,93 @@ def build_cowork_lookup_connector_tool():
     )
 
 
+_BUILD_CUSTOM_CONNECTOR = (
+    "No built-in or saved connector matches. Build a custom connector: ask the "
+    "user how the system is reached (a REST or GraphQL API, a database, or file "
+    "exports; reaching a website through the browser isn't available yet). Then "
+    "handcraft the form with `engine` set to the new connector's id and a "
+    "`connector` block (label, description, category, usage_notes), and pass it "
+    "to `request_credentials`. Credentials go only through that form, never chat. "
+    "Once its connection test passes it is saved for reuse."
+)
+_NO_CUSTOM_CONNECTOR = (
+    "No built-in or saved connector matches, and custom connectors can't be "
+    "saved for reuse on this deployment. Tell the user so. A handcrafted form "
+    "passed to `request_credentials` still saves this connection once its test "
+    "passes, but it won't be listed with the connectors."
+)
+
+
+def _no_match_hint() -> str:
+    """What lookup_connector tells the agent when nothing matches: build a
+    custom connector where one can be kept (scope_is_one_persons), else that
+    none can be."""
+    scope = current_settings_scope() or LOCAL_SCOPE
+    return _BUILD_CUSTOM_CONNECTOR if scope_is_one_persons(scope) else _NO_CUSTOM_CONNECTOR
+
+
+async def _read_scope_catalog(read: Callable[[ConnectorSpecRegistry], T]) -> T:
+    """Apply ``read`` to the connectors this turn's scope sees, off the event loop.
+
+    With no bound scope where one is required (org mode, or trusted identity
+    headers), ``read`` gets the built-ins only: LOCAL_SCOPE there is the
+    operator's view, not the caller's.
+    """
+    scope = current_settings_scope()
+    if scope is None:
+        if tenant_scope_required():
+            logger.warning("connectors: no tenant scope is bound; custom connectors skipped")
+            return read(registry)
+        scope = LOCAL_SCOPE
+    return await run_db(lambda session: read(ConnectorCatalog(session)), scope=scope)
+
+
+async def _scope_connectors() -> dict[str, dict]:
+    """Return built-in and custom connector specs visible to this turn's scope,
+    as raw specs keyed by connector id."""
+    return await _read_scope_catalog(lambda catalog: dict(catalog.get_connectors()))
+
+
+async def scope_usage_notes(engines: Iterable[str]) -> dict[str, str]:
+    """Return engine -> agent-facing usage notes for those of ``engines``
+    that declare some, custom connectors included, in this turn's scope."""
+    wanted = list(engines)
+    return await _read_scope_catalog(lambda catalog: catalog.usage_notes_for(wanted))
+
+
 # Request Credentials Tool
 # After the lookup_connector tool surfaces the canonical form spec, the agent calls
 # `request_credentials` to render the form for the user.
+
+def _extends_refusal(engine: str, name: str) -> str | None:
+    """Why a later step can't add fields to connection ``engine``/``name``, or
+    None when it can: this turn's vault must hold it, and the asker must be
+    able to change it (ConnectionsService.can_change), as submit_form checks.
+    A connection someone shares with the asker reads like their own, so
+    without the second check the form would render and its submission answer
+    403.
+
+    None when there is no tenant scope to read the vault with, so the form
+    still renders and submit_form makes the same checks.
+    """
+    scope = current_settings_scope()
+    try:
+        vault = vault_for_scope(scope)
+    except MissingTenantScopeError:
+        logger.warning("request_credentials: no tenant scope to check extends_connection against")
+        return None
+    if vault.read_record(engine, name) is None:
+        return (
+            f"request_credentials: there is no {engine} connection named "
+            f"{name!r} to extend. Use the name the first save reported."
+        )
+    if not ConnectionsService(scope).can_change(engine, name):
+        return (
+            f"request_credentials: the {engine} connection {name!r} is shared with the "
+            "user and can't be changed here, so no step can add fields to it."
+        )
+    return None
+
 
 def _ensure_form_id(spec: dict) -> dict:
     """Normalize a form spec — generate a form_id if missing, fall back
@@ -599,7 +881,60 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
     if not isinstance(spec, dict):
         return "request_credentials: invalid spec — must be a JSON object with `title` and `fields`"
 
+    connector_id = spec.get("_connector_id") or spec.get("engine")
+    if not connector_id:
+        return (
+            "request_credentials: invalid spec — set `engine` to the service's "
+            "connector id (e.g. 'linkedin'), or copy `_connector_id` from lookup_connector."
+        )
+    try:
+        validate_engine_id(connector_id)
+    except InvalidConnectorIdError as e:
+        return f"request_credentials: {e}"
+    if connector_id == SHAREPOINT:
+        return f"request_credentials: {_sharepoint_instruction()}"
+    known = (await _scope_connectors()).get(connector_id)
+    extends_name = spec.get("extends_connection")
+    handcrafted = handcrafted_form_allowed(
+        known=known is not None, custom=bool(known and known.get("custom")), extends=extends_name is not None,
+    )
+    if not spec.get("_connector_id") and not handcrafted:
+        return (
+            f"request_credentials: {connector_id!r} is already a connector. Call "
+            f"lookup_connector with id {connector_id!r} and pass its form, with "
+            "`_connector_id`, instead of a handcrafted spec."
+        )
+
+    spec = dict(spec)
+    if spec.get("_connector_id") and known is None:
+        # A stamped form saves an OAuth step through direct save, which only
+        # takes known connectors; an unknown id must route by `engine`.
+        spec["engine"] = spec.pop("_connector_id")
+    spec.pop("extends_connection", None)
+    if extends_name is not None:
+        if not isinstance(extends_name, str) or not extends_name.strip():
+            return "request_credentials: `extends_connection` must be the saved connection's name."
+        if known is not None and spec.get("_connector_id"):
+            return (
+                "request_credentials: `extends_connection` applies only to handcrafted "
+                "forms; a built-in connector's form saves its connection in one step."
+            )
+        refusal = _extends_refusal(connector_id, extends_name.strip())
+        if refusal is not None:
+            return refusal
+        # The renderer submits `_existing_name` as the record name; the server
+        # reads `_extends_connection` to merge instead of creating a sibling.
+        spec["_extends_connection"] = extends_name.strip()
+        spec["_existing_name"] = extends_name.strip()
+
     spec = _scrub_secret_values(_ensure_form_id(spec))
+    if handcrafted:
+        # Checked before the form renders, so the user never fills in a form
+        # the server would refuse.
+        try:
+            check_handcrafted_form(spec)
+        except UnstorableFormError as e:
+            return f"request_credentials: {e}"
     block = "```data-vault-form\n" + json.dumps(spec, indent=2) + "\n```"
     return (
         "Form ready. Include the following markdown block VERBATIM in your "
@@ -627,7 +962,21 @@ _REQUEST_CREDENTIALS_SCHEMA = {
         },
         "engine": {
             "type": "string",
-            "description": "REQUIRED. Connector slug (e.g. 'postgres', 'gmail'). Any value is accepted — unknown engines are saved as 'custom' connections.",
+            "description": "REQUIRED. Connector slug (e.g. 'postgres', 'gmail'): 2-64 lowercase letters, digits and underscores, starting with a letter, no hyphens. Unknown engines are saved as 'custom' connections under this id.",
+        },
+        "extends_connection": {
+            "type": "string",
+            "description": "Name of a connection saved earlier in this flow (the slug from 'Saved as `...`'). Set it on a follow-up step of a multi-step connect, e.g. tokens after an OAuth grant, so the new fields are added to that connection instead of creating a second one.",
+        },
+        "connector": {
+            "type": "object",
+            "description": "Only when building a new custom connector: how it is listed for reuse, where lookup_connector says one can be saved, once its connection test passes.",
+            "properties": {
+                "label": {"type": "string", "description": "Display name (e.g. 'Acme Planner')."},
+                "description": {"type": "string", "description": "One line on what it connects to."},
+                "category": {"type": "string", "description": "Picker category (e.g. 'database', 'crm', 'developer')."},
+                "usage_notes": {"type": "string", "description": "Short notes for using it later: base URL, auth header, key endpoints, quirks. Never credential values."},
+            },
         },
         "_connector_id": {
             "type": "string",
@@ -660,6 +1009,10 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                         "enum": ["text", "password", "url", "select", "textarea", "boolean"],
                     },
                     "required": {"type": "boolean"},
+                    "secret": {
+                        "type": "boolean",
+                        "description": "True for any credential (password, API key, token, secret). It is masked wherever the connection is shown.",
+                    },
                     "placeholder": {"type": "string"},
                     "default": {},
                     "value": {"description": "Pre-fill on re-render. NEVER for secrets — password values are scrubbed server-side."},
@@ -817,10 +1170,22 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     label = str(tc_input.get("label", "")).strip()
     if not engine or not name or not label:
         return "label_connection: `engine`, `name`, and `label` are all required."
-    try:
-        from cowork.services.connectors.persist import set_connection_label
+    from cowork.services.connectors.layered_vault import SharedConnectionError
 
-        stored = set_connection_label(engine, name, label)
+    try:
+        from cowork.common.settings.user_settings import current_settings_scope
+        from cowork.services.connectors.persist import set_connection_label, turn_vault_for_scope
+
+        # The turn's own vault: the label lands on the asker's connection, an
+        # unbound turn on a partitioned deployment is refused, and a turn with
+        # no person changes no connection already saved.
+        scope = current_settings_scope()
+        stored = set_connection_label(
+            engine, name, label, vault=turn_vault_for_scope(scope), scope=scope
+        )
+    except SharedConnectionError as exc:
+        # A connection the asker can't change, such as one shared with them.
+        return f"label_connection: {exc}"
     except Exception as exc:
         logger.exception("Cowork label_connection failed")
         return f"label_connection: could not set label ({exc})"
@@ -845,6 +1210,51 @@ def build_cowork_label_connection_tool():
         # `connect-datasource` SKILL.md (see lookup_connector above).
         unlock_skill="connect-datasource",
     )
+
+
+#########################
+# Connect Datasource Tool
+#########################
+
+
+async def _cowork_connect_datasource(session: Any, tc_input: dict) -> str:
+    """Tool handler for `connect_new_datasource`: anton's own
+    (anton.tools.handle_connect_datasource), matched only against the
+    connections the asker can change.
+
+    anton's handler updates the saved connection whose identity fields match
+    the new one's. The turn's vault also lists connections the asker can't
+    change, so it runs against that vault's ConnectingDataVault, where those
+    match nothing and a new connection is saved as the asker's own. A turn
+    with connections turned off reads a FilteredDataVault over it, whose
+    connecting view lists them by label alone, so a paste never matches or
+    relabels one.
+    """
+    from anton.tools import handle_connect_datasource
+
+    from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
+
+    vault = session._data_vault
+    if not isinstance(vault, (LayeredDataVault, FilteredDataVault)):
+        return await handle_connect_datasource(session, tc_input)
+    # anton's handler reads the vault off the session, and a session runs its
+    # tool calls one at a time, so the swap holds for this call alone.
+    session._data_vault = vault.for_connecting()
+    try:
+        return await handle_connect_datasource(session, tc_input)
+    finally:
+        session._data_vault = vault
+
+
+def build_cowork_connect_datasource_tool():
+    """anton's console-less connect_new_datasource, the one its ChatSession
+    swaps in where there is no console, as cowork's turns have none, with
+    _cowork_connect_datasource as its handler."""
+    import dataclasses
+
+    from anton.tools import CONNECT_DATASOURCE_TOOL_NO_CONSOLE
+
+    return dataclasses.replace(CONNECT_DATASOURCE_TOOL_NO_CONSOLE, handler=_cowork_connect_datasource)
 
 
 ##################
@@ -935,9 +1345,9 @@ _RECALL_HISTORY_LIMIT_MAX = 10
 async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
     """Tool handler for `recall_history` — search the archived earlier turns.
 
-    `load_archive` returns the archive as plain message dicts, so the handler
-    stays a presentation layer: it never touches the DB, and the hosted path
-    can supply the same archive off the shared mount instead.
+    `load_archive` is awaited for the archive as plain message dicts, so the
+    handler stays a presentation layer: it never touches the DB, and the
+    hosted path can supply the same archive off the shared mount instead.
     """
     from cowork.services.history_recall import format_turns, search_turns
 
@@ -951,7 +1361,7 @@ async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
     limit = max(1, min(limit, _RECALL_HISTORY_LIMIT_MAX))
 
     try:
-        messages = load_archive()
+        messages = await load_archive()
     except Exception as exc:
         logger.exception("Cowork recall_history failed")
         return f"recall_history: could not read the archive ({type(exc).__name__})."
@@ -974,7 +1384,8 @@ async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
 
 
 def build_cowork_recall_history_tool(load_archive):
-    """`load_archive` is called per tool call and returns the archived messages."""
+    """`load_archive` is an async callable, awaited per tool call for the
+    archived messages."""
     from anton.core.tools.tool_defs import ToolDef
 
     async def handler(_session, tc_input: dict) -> str:

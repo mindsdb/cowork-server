@@ -35,11 +35,19 @@ def get_streams_dir() -> Path:
     return Path(StreamSettings().dir)
 
 
-def new_buffer(conversation_id: str, turn_id: int) -> StreamBuffer:
-    """Construct the buffer for a new turn on the configured backend."""
+async def new_buffer(conversation_id: str, turn_id: int) -> StreamBuffer:
+    """Open the buffer for a new turn on the configured backend.
+
+    It starts without the records of an earlier turn that ended at the same
+    turn number, which happens when that turn saved no message (its question
+    was refused for a full pool, say). Called by RunRegistry.start once no
+    turn of the conversation is answering.
+    """
     backend = get_backend()
     if backend == "redis":
-        return RedisStreamBuffer(conversation_id=conversation_id, turn_id=turn_id)
+        buffer = RedisStreamBuffer(conversation_id=conversation_id, turn_id=turn_id)
+        await buffer.clear_if_ended()
+        return buffer
     return FileStreamBuffer(turn_buffer_path(get_streams_dir(), conversation_id, turn_id))
 
 

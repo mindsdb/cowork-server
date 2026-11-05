@@ -15,31 +15,42 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Literal
-from uuid import UUID
+from typing import TYPE_CHECKING, Literal
 
+from pydantic import ValidationError
+
+from cowork.models.artifact_owner_choice import AccessMode
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
-from cowork.services.publish import publish_artifact
+from cowork.services.publish import (
+    PublishOwnedByOtherUser,
+    PublishRejected,
+    PublishTooLarge,
+    kept_access,
+    publish_artifact,
+)
+
+if TYPE_CHECKING:
+    from cowork.services.artifact_ownership import OwnerResolution
 
 logger = logging.getLogger(__name__)
 
 # Owner-side publish access for a FIRST auto-publish. A re-publish preserves
-# whatever the owner has since chosen — see `_access_for`.
+# whatever the owner has since chosen (`_access_for`).
 #
 # `owner_only` is NOT decoration. `anton.publish_access.resolve_access` treats
 # "restricted with neither emails, nor an org, nor owner_only" as a caller
-# mistake and degrades it to `public`, so `{"mode": "restricted", "emails": []}`
-# would make every auto-published artifact world-readable. The flag is what
-# makes "only the owner" expressible instead of collapsing into that hole.
+# mistake and degrades it to `public`, so a restricted access with no emails
+# alone would make every auto-published artifact world-readable. The flag is
+# what makes "only the owner" expressible instead of collapsing into that hole.
 #
-# This used to be `org_allowed: True` — every auto-published artifact readable by
-# the whole organization. An artifact is now private until its owner shares it
-# (ENG-2316), which is the behaviour the Share control in the viewer exists to
-# change.
-AUTOPUBLISH_ACCESS: dict = {"mode": "restricted", "emails": [], "owner_only": True}
+# An auto-published artifact is private to its owner until they share it,
+# which is what the Share control in the viewer changes.
+AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_emails=[], owner_only=True)
 
 # Below this much remaining budget a publish is not started at all: entering
 # `wait_for` with a sliver of time only guarantees a timeout, an abandoned upload
@@ -67,23 +78,23 @@ class PublishDecision:
     published_entry: dict | None = None
 
 
-def _access_for(decision: PublishDecision) -> dict:
+def _access_for(decision: PublishDecision) -> ArtifactAccessRequest:
     """The access to publish this artifact with.
 
     A first publish gets the owner-only default. A re-publish MUST preserve what
-    the owner has since chosen — reapplying the default here would silently
-    revoke a share every time the agent touched the artifact, which is the whole
-    reason the Share control would otherwise be untrustworthy (ENG-2316).
+    the owner has since chosen: reapplying the default here would silently
+    revoke a share every time the agent touched the artifact, and the Share
+    control could not be trusted.
 
-    `access_from_owner_side` is the canonical reconstruction, and it carries
-    `owner_only` for exactly this reason: without that key an owner-only entry
-    rebuilds as an empty selection and degrades to public.
+    `kept_access` is the canonical reconstruction, and it carries `owner_only`
+    for exactly this reason: without that key an owner-only entry rebuilds as
+    an empty selection and degrades to public. This path is MindsHub mode
+    only, so a restricted artifact's audience comes from MindsHub's
+    rule, which publish_artifact reads; a failed read fails this publish.
     """
-    from anton.publish_access import access_from_owner_side
-
     if not decision.published_entry:
-        return dict(AUTOPUBLISH_ACCESS)
-    return access_from_owner_side(decision.published_entry)
+        return AUTOPUBLISH_ACCESS
+    return kept_access(decision.published_entry, org_mode=True)
 
 
 def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
@@ -94,9 +105,9 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     """
     from cowork.services.artifacts import _user_files, content_mtime, load_published_map
     from cowork.services.publish import (
-        PUBLISHABLE_STATIC_SUFFIXES,
         _resolve_publish_target,
         compute_publish_md5,
+        is_publishable_static,
     )
 
     if not _user_files(folder):
@@ -114,10 +125,11 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         # /upload is strict here: literally backend.py plus static/index.html.
         if not (folder / "backend.py").is_file() or not (folder / "static" / "index.html").is_file():
             return PublishDecision(None, REASON_NOT_PUBLISHABLE, True)
-    elif publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    elif not is_publishable_static(publish_target, artifacts_base):
         # Suffix, not the on-disk name: _zip_html renames a single file to
         # index.html inside the archive, so an artifact whose primary is
-        # `report.html` publishes normally.
+        # `report.html` publishes normally. A non-content primary (README,
+        # generation input) is refused by `publish_artifact`, so skip it here.
         return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     current_mtime = content_mtime(folder)
@@ -126,7 +138,10 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     if not isinstance(entry, dict) or not entry.get("report_id"):
         return PublishDecision("new", None, is_fullstack, current_mtime)
     if entry.get("published") is False:
-        # Explicitly unpublished — never resurrect it on our own.
+        # Explicitly unpublished: never resurrect it on our own. The pod can
+        # flip this flag back; publish_artifact refuses that re-publish while
+        # the owner's recorded choice says unpublished
+        # (cowork.services.artifact_owner_choice).
         return PublishDecision(None, REASON_UNPUBLISHED, is_fullstack, current_mtime)
 
     published_mtime = entry.get("published_mtime")
@@ -188,9 +203,37 @@ def _record(result: str, **fields: object) -> None:
     logger.warning("artifact_autopublish result=%s %s", result, tail)
 
 
-def _owned_slugs(
-    artifacts_base: Path, scope, project_id: str, slugs: list[str]
-) -> tuple[list[str], int, int]:
+def _artifact_owners(
+    session, *, artifacts_base: Path, project_id: str, slugs: list[str]
+) -> dict[str, OwnerResolution] | None:
+    """The owner of each slug under the project's root at ``artifacts_base``,
+    or None when no root of the project sits there. Read-only, one query; run
+    as a unit (cowork.db.units)."""
+    from cowork.services.artifact_ownership import (
+        artifact_root_for_base,
+        resolve_artifact_owners,
+    )
+
+    source = artifact_root_for_base(session, project_id, artifacts_base)
+    if source is None:
+        return None
+    return resolve_artifact_owners(session, source, slugs)
+
+
+@dataclass(frozen=True)
+class OwnedSlugs:
+    """What the owner filter kept, and how many slugs it dropped and why."""
+
+    owned: list[str]
+    # Slugs another member owns.
+    not_owner: int
+    # Slugs with no recorded owner, or every slug when the lookup failed.
+    owner_unknown: int
+
+
+async def _owned_slugs(
+    *, artifacts_base: Path, scope, project_id: str, slugs: list[str]
+) -> OwnedSlugs:
     """Filter ``slugs`` down to the ones this scope's user owns.
 
     The project root is shared by every member (ENG-2056), so `_candidate_slugs`
@@ -200,34 +243,30 @@ def _owned_slugs(
     with `ArtifactOwnerUnknown` or "Only the artifact owner can publish" — on
     every turn of every member, forever.
 
-    Read-only, one query. Fails closed: if the source cannot be found or
-    anything raises, nothing is treated as owned rather than risking a publish
-    attempt on someone else's artifact.
-
-    Returns (owned, not_owner_count, owner_unknown_count).
+    The lookup runs as one database unit in a worker thread, so a wait for a
+    connection never stalls the event loop. Fails closed: if the source cannot
+    be found or anything raises, a full pool included, nothing is treated as
+    owned rather than risking a publish attempt on someone else's artifact.
     """
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.scoped import ScopedSession
-    from cowork.db.session import get_open_session
-    from cowork.services.artifact_ownership import (
-        artifact_root_for_base,
-        resolve_artifact_owners,
-    )
+    from cowork.db.units import run_db
 
     try:
-        with get_open_session(get_app_settings().database.uri) as raw_session:
-            session = ScopedSession(raw_session, scope)
-            source = artifact_root_for_base(session, project_id, artifacts_base)
-            if source is None:
-                logger.warning(
-                    "artifact_autopublish owner filter: root not found for project=%s base=%s",
-                    project_id, artifacts_base,
-                )
-                return [], 0, len(slugs)
-            resolutions = resolve_artifact_owners(session, source, slugs)
+        resolutions = await run_db(
+            partial(
+                _artifact_owners,
+                artifacts_base=artifacts_base, project_id=project_id, slugs=slugs,
+            ),
+            scope=scope,
+        )
     except Exception:
         logger.warning("artifact_autopublish owner filter failed", exc_info=True)
-        return [], 0, len(slugs)
+        return OwnedSlugs(owned=[], not_owner=0, owner_unknown=len(slugs))
+    if resolutions is None:
+        logger.warning(
+            "artifact_autopublish owner filter: root not found for project=%s base=%s",
+            project_id, artifacts_base,
+        )
+        return OwnedSlugs(owned=[], not_owner=0, owner_unknown=len(slugs))
 
     owned: list[str] = []
     not_owner = 0
@@ -240,7 +279,7 @@ def _owned_slugs(
             owned.append(slug)
         else:
             not_owner += 1
-    return owned, not_owner, owner_unknown
+    return OwnedSlugs(owned=owned, not_owner=not_owner, owner_unknown=owner_unknown)
 
 
 def _candidate_slugs(artifacts_base: Path) -> list[str]:
@@ -291,7 +330,7 @@ async def _publish_one(
     publish_url: str,
     timeout_s: float,
     scope,
-    access: dict | None = None,
+    access: ArtifactAccessRequest | None = None,
     project_id: str | None = None,
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises.
@@ -308,7 +347,7 @@ async def _publish_one(
                 artifacts_base=Path(artifacts_base),
                 api_key=api_key,
                 publish_url=publish_url,
-                access=dict(access) if access else dict(AUTOPUBLISH_ACCESS),
+                access=access or AUTOPUBLISH_ACCESS,
                 # Required, not optional, on this path: the publisher reads
                 # datasource secrets from the org-keyed connector vault, and
                 # `vault_for_scope(None)` raises on an org deployment rather
@@ -326,6 +365,19 @@ async def _publish_one(
         # state. The TTL is what eventually frees the slug.
         _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}")
         return False
+    except PublishOwnedByOtherUser:
+        # The upload service holds this report_id for another account, so a
+        # retry cannot succeed and a fresh report_id would publish a copy. A
+        # skip like `not_owner`, not a failure; no thread is left running.
+        release(artifacts_base, slug)
+        _record("skipped", slug=slug, reason="owned_by_other_user")
+        return False
+    except PublishTooLarge:
+        # Every retry of the same bundle is refused again, and the 413 is
+        # already logged by the classifier: a skip, not a failure.
+        release(artifacts_base, slug)
+        _record("skipped", slug=slug, reason="too_large")
+        return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target
         # resolver, PublisherUnavailable) leaves NO running thread, so holding the
@@ -333,7 +385,12 @@ async def _publish_one(
         # "next turn retries" promise.
         release(artifacts_base, slug)
         _record("failed", slug=slug, error=type(exc).__name__)
-        logger.warning("artifact autopublish failed for %s", slug, exc_info=True)
+        # publish_artifact already logged every PublishRejected: an upload
+        # failure with its traceback, and an AccessModeChanged refusal as a
+        # warning with its reason, which needs none.
+        logger.warning(
+            "artifact autopublish failed for %s", slug, exc_info=not isinstance(exc, PublishRejected),
+        )
         return False
     release(artifacts_base, slug)
     _record("published", slug=slug)
@@ -363,11 +420,12 @@ async def autopublish_project_artifacts(
     is not. The one exception is CancelledError, which propagates.
 
     Every settings read goes through `scope` explicitly rather than the ambient
-    `use_settings_scope` binding. The remote-turn producer that drives this on an
-    org deployment (handlers/responses.py `_produce_remote`) is a DETACHED task
-    with no ambient scope bound, and an unscoped `get_user_settings()` silently
-    resolves LOCAL_SCOPE — which would read the global row for the org-scoped
-    enable flag and the wrong provider for the publish URL.
+    `use_settings_scope` binding, because an unscoped `get_user_settings()`
+    outside a bound scope silently resolves LOCAL_SCOPE, which would read the
+    global row for the org-scoped enable flag and the wrong provider for the
+    publish URL. Inside a turn (handlers/responses.py `_produce_remote` on an
+    org deployment), the turn's settings snapshot answers those reads
+    (use_turn_settings), so none of them opens a connection.
 
     `project_id` is required in org mode: publishing resolves the artifact's
     owner by it (ENG-2961).
@@ -388,9 +446,12 @@ async def autopublish_project_artifacts(
 
     base = Path(artifacts_base)
     all_slugs = _candidate_slugs(base)
-    all_slugs, not_owner, owner_unknown = _owned_slugs(base, scope, project_id, all_slugs)
-    if not_owner or owner_unknown:
-        _record("skipped", not_owner=not_owner or None, owner_unknown=owner_unknown or None)
+    owners = await _owned_slugs(
+        artifacts_base=base, scope=scope, project_id=project_id, slugs=all_slugs,
+    )
+    all_slugs = owners.owned
+    if owners.not_owner or owners.owner_unknown:
+        _record("skipped", not_owner=owners.not_owner or None, owner_unknown=owners.owner_unknown or None)
     phase_one = [s for s in all_slugs if s in touched]
     phase_two = [s for s in all_slugs if s not in touched]
 
@@ -424,6 +485,19 @@ async def autopublish_project_artifacts(
                 if remaining < _MIN_START_BUDGET_S:
                     _record("deferred", slug=slug, reason="budget")
                     continue
+                try:
+                    access = _access_for(decision)
+                except ValidationError:
+                    # The pod can write the entry, so its access fields can
+                    # hold any type: this artifact's re-publish fails, and the
+                    # rest of the pass goes on.
+                    _record("failed", slug=slug, error="ValidationError")
+                    logger.warning(
+                        "artifact autopublish could not read the kept access",
+                        extra={"artifact_slug": slug},
+                        exc_info=True,
+                    )
+                    continue
                 if not acquire(base, slug, ttl_s=lock_ttl):
                     _record("lock_busy", slug=slug)
                     continue
@@ -439,7 +513,7 @@ async def autopublish_project_artifacts(
                     return published
                 if await _publish_one(
                     base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
-                    _access_for(decision), project_id=project_id,
+                    access, project_id=project_id,
                 ):
                     published.add(slug)
     except asyncio.CancelledError:

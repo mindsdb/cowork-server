@@ -10,7 +10,8 @@ from pydantic import BaseModel
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
-from cowork.db.scoped import TenantScope, get_tenant_scope, scoped_storage_root
+from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_db, unit_session
 from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
@@ -18,6 +19,7 @@ from cowork.schemas.connectors import (
     DirectSaveResponse,
     PatchPickedFilesBody,
 )
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
@@ -25,10 +27,11 @@ from cowork.services.connectors.developer_validation import (
     validate_developer_connection,
 )
 from cowork.services.connectors.identity import oauth_default_label
+from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
-from cowork.services.connectors.persist import persist_connection
-from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.persist import persist_connection, vault_for_scope
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
 router = APIRouter()
@@ -37,6 +40,17 @@ router = APIRouter()
 # SkillService/skills.py, and must never be read/written through the unscoped
 # module-level `service` singleton on an org request.
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
+
+def _refuse_unchangeable(scope: TenantScope, engine: str, name: str) -> None:
+    """Refuse every change to a connection the caller can't change
+    (ConnectionsService.can_change): the operator's managed ones, one someone
+    else shares, and where connections are shared one the caller didn't
+    create. Before any other step: a delete's OAuth revoke would otherwise
+    reach the provider first. The vault refuses the write itself too
+    (LayeredDataVault), answered with the same 403 by create_app's handler."""
+    if not ConnectionsService(scope).can_change(engine, name):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_CONNECTION_REFUSAL)
 
 
 # AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue,
@@ -54,12 +68,21 @@ async def list_connections(scope: ScopeDep, request: Request):
         # data ConnectWorkflowView's org-mode connector list reads), so no
         # separate "list connections" endpoint is needed on auth's side.
         catalogue = await auth_proxy.proxy_catalogue(request, OAuthSettings())
+        # The card reads a missing status as healthy, like the local vault's
+        # list, so only the one actionable state is passed on; auth's
+        # "active" would otherwise render as an unknown status.
         return [
-            ConnectionSummaryResponse(engine=c["engine"], name=c["name"], user_label=c.get("user_label"))
+            ConnectionSummaryResponse(
+                engine=c["engine"],
+                name=c["name"],
+                user_label=c.get("user_label"),
+                status="needs_reconnect" if c.get("status") == "needs_reconnect" else None,
+            )
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
         ]
-    return ConnectionsService(scope).list()
+    specs = await run_db(lambda session: ConnectorCatalog(session).get_connectors(), scope=scope)
+    return ConnectionsService(scope).list(specs)
 
 
 # Non-secret fields surfaced from auth's connection-detail response —
@@ -139,6 +162,7 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     using ``/save``.  This route is for the personal-token fallback shown when
     a desktop build has no hosted OAuth client configured.
     """
+    _refuse_sharepoint(body.connector_id, scope)
     try:
         identity = validate_developer_connection(body.connector_id, body.method, body.values)
     except DeveloperCredentialError as exc:
@@ -150,22 +174,31 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     return _persist_direct_connection(body, scope, values)
 
 
+def _refuse_sharepoint(connector_id: str, scope: TenantScope) -> None:
+    """Refuse SharePoint here: only its own routes save it, after checking the key with Microsoft."""
+    if connector_id == SHAREPOINT:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=generic_setup_refusal(scope.org_mode))
+
+
 def _persist_direct_connection(
     body: DirectSaveRequest,
     scope: TenantScope,
     values: dict,
 ) -> dict[str, object]:
-    if registry.get_connector(body.connector_id) is None:
+    _refuse_sharepoint(body.connector_id, scope)
+    with unit_session(scope=scope) as session:
+        known = ConnectorCatalog(session).get_connector(body.connector_id)
+    if known is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
+    if body.name.strip():
+        _refuse_unchangeable(scope, body.connector_id, body.name.strip())
     if body.method in {"browser_oauth_builtin", "oauth"} or values.get("refresh_token"):
         values["auth_type"] = "oauth"
-    from pathlib import Path
-    from anton.core.datasources.data_vault import LocalDataVault
-    vault = LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
+    vault = vault_for_scope(scope)
     try:
         # default_label gives a brand-new OAuth connection's tile a
         # meaningful title (the account/org/workspace name the provider
-        # returned) instead of the generic engine-id default — but only for
+        # returned) instead of no label at all — but only for
         # a genuinely new connection; it can never clobber a label the user
         # already set on a reconnect (see persist_connection's default_label
         # docs). Mirrors the same wiring in oauth/google.py's callback(),
@@ -178,6 +211,7 @@ def _persist_direct_connection(
             body.name,
             values,
             replace_existing=body.replace_existing,
+            spec_form=known.form.model_dump() if known.custom else None,
             default_label=oauth_default_label(values, body.connector_id),
             # HubSpot's MCP connector has no connect-time read/write/none
             # picker (see the HubSpot blueprint tab, Stage 0) — every new
@@ -187,7 +221,12 @@ def _persist_direct_connection(
             # upgrade to "write" back to "read".
             default_fields={"_access_mode": "read"} if body.method == "mcp" else None,
             vault=vault,
+            scope=scope,
         )
+    except SharedConnectionError:
+        # A derived name that lands on a connection the caller can't change:
+        # create_app's handler answers it with 403, not the 500 below.
+        raise
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save connection.")
@@ -209,6 +248,7 @@ async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Re
         # credential proxy as the other OAuth Connector Lifecycle endpoints.
         await auth_proxy.proxy_delete(engine, name, request, OAuthSettings())
         return
+    _refuse_unchangeable(scope, engine, name)
     try:
         # revoke() makes a blocking provider HTTP call (up to its own 10s
         # timeout) - off the event loop, since this handler is now async for
@@ -259,6 +299,7 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail="Token refresh is not applicable in org mode; auth manages the token lifecycle server-side.",
         )
+    _refuse_unchangeable(scope, engine, name)
     updates = {
         k: v for k, v in body.model_dump().items()
         if v is not None and k in _PATCH_TOKEN_VAULT_FIELDS
@@ -293,6 +334,7 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     if scope.org_mode:
         merged = await auth_proxy.proxy_picked_files(engine, name, files, request, OAuthSettings())
         return {"ok": True, "files": merged}
+    _refuse_unchangeable(scope, engine, name)
     merged = ConnectionsService(scope).merge_picked_files(engine, name, files)
     if merged is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
@@ -320,6 +362,7 @@ def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope
     a Drive reference row. Only removes the file from `project`'s rail;
     if the file is tagged to other projects too, it stays visible there
     (see remove_picked_file's docstring)."""
+    _refuse_unchangeable(scope, engine, name)
     remaining = ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
     if remaining is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
@@ -359,6 +402,7 @@ async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, s
         )
     if scope.org_mode:
         return await auth_proxy.proxy_access_mode(engine, name, body.access_mode, request, OAuthSettings())
+    _refuse_unchangeable(scope, engine, name)
     if not ConnectionsService(scope).patch_token(engine, name, {"_access_mode": body.access_mode}):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "access_mode": body.access_mode}

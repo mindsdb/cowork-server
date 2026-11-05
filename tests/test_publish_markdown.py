@@ -8,6 +8,7 @@ These tests pin both the renderer and that wiring.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,9 +67,13 @@ def _wire_publish(monkeypatch, tmp_path, target: Path, key: str, *, is_fullstack
     )
     monkeypatch.setattr(
         publish, "get_app_settings",
-        lambda: SimpleNamespace(connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))),
+        lambda: SimpleNamespace(
+            tenancy_mode="local", connector=SimpleNamespace(vault_dir=str(tmp_path / "vault"))
+        ),
     )
-    monkeypatch.setattr(publish, "resolve_artifact_path", lambda raw, allow_dir=True: target)
+    monkeypatch.setattr(
+        publish, "resolve_artifact_path", lambda raw, *, scope, allow_dir=True: target
+    )
     monkeypatch.setattr(
         publish, "_resolve_publish_target",
         lambda a, container_dirs=None: (target, target.parent, key, is_fullstack),
@@ -105,6 +110,25 @@ def test_publish_markdown_uploads_rendered_html_and_keys_registry_on_md(tmp_path
     registry = json.loads((art / ".published.json").read_text())
     assert "report.md" in registry
     assert registry["report.md"]["report_id"] == "rid-1"
+
+
+def test_publish_refuses_an_artifact_holding_a_hard_link(tmp_path, monkeypatch):
+    """anton bundles an artifact's files by path, so a hard link there to the
+    project's `.anton/.env` would publish its current secrets on every publish."""
+    art = tmp_path / "art"
+    art.mkdir()
+    md = art / "report.md"
+    md.write_text("# Title\n\nbody text")
+    saved = tmp_path / ".env"
+    saved.write_text("SECRET_TOKEN=do-not-publish")
+    os.link(saved, art / "env.txt")
+
+    captured = _wire_publish(monkeypatch, tmp_path, md, "report.md")
+    with pytest.raises(ValueError, match="second name"):
+        publish.publish_artifact(md, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
+
+    assert captured == {}
+    assert not (art / ".published.json").exists()
 
 
 def test_republish_markdown_reuses_report_id(tmp_path, monkeypatch):

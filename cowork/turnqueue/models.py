@@ -109,13 +109,21 @@ class TurnJob(BaseModel):
         return v
 
 
+class TurnReplyHeader(BaseModel):
+    """The field of a reply the relay reads before anything else: the turn it
+    answers. Another turn's reply is skipped on this alone, whatever its kind."""
+
+    correlation_id: str
+
+
 class TurnReply(BaseModel):
     """Mirror of scratchpad-controller ScratchpadReplyPayload (reply cowork consumes)."""
 
     correlation_id: str
     # Must accept every kind the controller can publish: the reply loop validates
-    # each entry unguarded, so a missing kind fails the turn rather than being
-    # ignored. Kinds this build does nothing with are dropped further down.
+    # each of its own turn's entries unguarded, so a missing kind fails the turn
+    # rather than being ignored. Kinds this build does nothing with are dropped
+    # further down.
     kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
                   "turn_memory", "turn_skill", "turn_history", "turn_compaction",
                   "turn_completed", "turn_failed"]

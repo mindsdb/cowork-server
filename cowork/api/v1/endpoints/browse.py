@@ -24,7 +24,7 @@ from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
-from cowork.principal import hub_credential
+from cowork.principal import mindshub_credential
 from cowork.services import browser as browser_service
 from cowork.services.settings import SettingService
 
@@ -70,7 +70,7 @@ async def browse_status(request: Request, scope: ScopeDep, session: SessionDep) 
     try:
         if browser_service.browser_mode(user) == browser_service.STANDALONE:
             return _answer(await browser_service.service_status(user), user)
-        view = await browser_service.fetch_status(hub_credential(request))
+        view = await browser_service.fetch_status(mindshub_credential(request))
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
     _remember_endpoint(session, scope, view.get("endpoint", ""))
@@ -85,7 +85,7 @@ async def browse_provision(request: Request, scope: ScopeDep, session: SessionDe
             # Nothing to create on someone's own service, and `browser_url`
             # stays MindsHub's: answer as status does.
             return _answer(await browser_service.service_status(user), user)
-        view = await browser_service.provision(hub_credential(request))
+        view = await browser_service.provision(mindshub_credential(request))
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
     _remember_endpoint(session, scope, view.get("endpoint", ""))
@@ -96,7 +96,7 @@ async def browse_provision(request: Request, scope: ScopeDep, session: SessionDe
 async def browse_embed(body: EmbedRequest, request: Request, scope: ScopeDep) -> dict:
     try:
         return await browser_service.embed_for(
-            get_user_settings(scope), hub_credential(request), scope.user_id, body.session_id,
+            get_user_settings(scope), mindshub_credential(request), scope.user_id, body.session_id,
         )
     except browser_service.BrowserServiceError as exc:
         _raise(exc)

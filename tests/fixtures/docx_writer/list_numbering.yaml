@@ -1,0 +1,81 @@
+# One ordered list per case; {digits} in html stands for 5000 nines, more
+# than Python converts to an int. numbers: the number Word shows on each
+# item, worked out from the item's w:num start and the items before it on
+# that w:num. format: the number format every item shows. Word has no
+# negative list numbers, so those count from 0 or 1.
+- name: no_start
+  html: "<ol><li>a</li><li>b</li></ol>"
+  numbers: [1, 2]
+  format: decimal
+- name: start
+  html: '<ol start="4"><li>a</li><li>b</li></ol>'
+  numbers: [4, 5]
+  format: decimal
+- name: start_with_leading_zeros
+  html: '<ol start="0007"><li>a</li></ol>'
+  numbers: [7]
+  format: decimal
+- name: start_past_the_word_limit
+  html: '<ol start="{digits}"><li>a</li></ol>'
+  numbers: [32767]
+  format: decimal
+- name: unparsable_start
+  html: '<ol start="x"><li>a</li></ol>'
+  numbers: [1]
+  format: decimal
+- name: negative_start
+  html: '<ol start="-2"><li>a</li></ol>'
+  numbers: [1]
+  format: decimal
+- name: lower_letters
+  html: '<ol type="a"><li>a</li><li>b</li></ol>'
+  numbers: [1, 2]
+  format: lowerLetter
+- name: upper_letters
+  html: '<ol type="A"><li>a</li></ol>'
+  numbers: [1]
+  format: upperLetter
+- name: lower_roman
+  html: '<ol type="i"><li>a</li></ol>'
+  numbers: [1]
+  format: lowerRoman
+- name: upper_roman
+  html: '<ol type="I"><li>a</li></ol>'
+  numbers: [1]
+  format: upperRoman
+- name: decimal_type
+  html: '<ol type="1"><li>a</li></ol>'
+  numbers: [1]
+  format: decimal
+- name: unknown_type
+  html: '<ol type="z"><li>a</li></ol>'
+  numbers: [1]
+  format: decimal
+- name: item_value
+  html: '<ol><li>a</li><li value="7">b</li><li>c</li></ol>'
+  numbers: [1, 7, 8]
+  format: decimal
+- name: item_value_past_the_word_limit
+  html: '<ol><li value="{digits}">a</li></ol>'
+  numbers: [32767]
+  format: decimal
+- name: reversed
+  html: "<ol reversed><li>a</li><li>b</li><li>c</li></ol>"
+  numbers: [3, 2, 1]
+  format: decimal
+- name: reversed_from_start
+  html: '<ol reversed start="10"><li>a</li><li>b</li></ol>'
+  numbers: [10, 9]
+  format: decimal
+- name: reversed_past_zero
+  html: '<ol reversed start="1"><li>a</li><li>b</li><li>c</li></ol>'
+  numbers: [1, 0, 0]
+  format: decimal
+- name: reversed_with_item_value
+  html: '<ol reversed><li>a</li><li value="7">b</li><li>c</li></ol>'
+  numbers: [3, 7, 6]
+  format: decimal
+- name: reversed_letters_with_item_value
+  html: '<ol type="a" reversed><li>x</li><li value="7">y</li></ol>'
+  numbers: [2, 7]
+  format: lowerLetter

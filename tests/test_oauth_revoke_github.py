@@ -36,7 +36,7 @@ class _FakeResponse:
 
 
 def test_revoke_calls_github_grant_endpoint_with_basic_auth(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
     captured = {}
 
     def _fake_urlopen(request, timeout=10):
@@ -60,7 +60,7 @@ def test_revoke_calls_github_grant_endpoint_with_basic_auth(monkeypatch):
 
 
 def test_revoke_skips_network_call_without_oauth_settings(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
 
     def _boom(request, timeout=10):
         raise AssertionError("must not call GitHub without credentials to authenticate the request")
@@ -73,7 +73,7 @@ def test_revoke_skips_network_call_without_oauth_settings(monkeypatch):
 
 
 def test_revoke_still_uses_generic_path_for_providers_without_a_custom_handler(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
     captured = {}
 
     def _fake_urlopen(request, timeout=10):

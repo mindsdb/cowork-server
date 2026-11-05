@@ -137,7 +137,7 @@ def test_harness_never_passes_a_console_to_chat_session_config():
 
     from cowork.harnesses.anton_harness.harness import AntonHarness
 
-    source = inspect.getsource(AntonHarness._build_chat_session)
+    source = inspect.getsource(AntonHarness._build_turn_session)
     assert "console=" not in source, (
         "AntonHarness._build_chat_session must not pass console= to "
         "ChatSessionConfig: anton falls back to its own CLIElicitor "

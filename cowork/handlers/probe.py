@@ -6,19 +6,30 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlmodel import Session
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.code_sandbox import build_cell_sandbox, code_sandbox_on, probe_workspaces_dir
+from cowork.common.logger import log_context
+from cowork.common.settings.user_settings import UserSettings
+from cowork.handlers.turn_errors import server_busy_message
+from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
+from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, unsafe_unscoped_session
+from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
 from cowork.services.conversations import ConversationService
+from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +56,87 @@ def _extract_connection_label_fields(credentials: dict) -> tuple[str, str]:
     return label, user_label
 
 
+@dataclass(frozen=True)
+class _ProbeConversation:
+    """The conversation a probe's turn is saved into, and the project
+    directory its probe runs in."""
+
+    id: UUID
+    workspace_path: Path
+
+
+def _read_conversation(session: ScopedSession, *, conversation_id: UUID) -> _ProbeConversation:
+    conversation = ConversationService(session).get_conversation(conversation_id)
+    return _ProbeConversation(id=conversation.id, workspace_path=Path(conversation.project.path))
+
+
+def _read_probe_settings(session: ScopedSession) -> UserSettings:
+    """The settings the probe's model client is built from. They are read for
+    LOCAL_SCOPE, the install's global rows, which is what get_user_settings()
+    resolves when no tenant is bound for settings, as none is here.
+    SettingService routes each key to its row itself, so it reads through the
+    raw session."""
+    return SettingService(unsafe_unscoped_session(session), LOCAL_SCOPE).load()
+
+
+def _save_probe_turn(
+    session: ScopedSession, *, conversation_id: UUID, text: str, events: tuple[dict, ...],
+) -> UUID | None:
+    """The probe's narrative as an assistant turn: the saved row's id, or
+    None when nothing was saved."""
+    message = ConversationService(session).save_assistant_turn(conversation_id, text, list(events))
+    return message.id if message is not None else None
+
+
+def _is_oauth_grant(form_spec: dict, method: str | None, credentials: dict) -> bool:
+    """True when this submission is the result of an OAuth browser grant.
+
+    The form is model-written, so a flag alone is not enough: the selected
+    method must be an OAuth launch with an ``oauth`` block (the only shape the
+    renderer runs a grant for), and the values must carry a token from it.
+    """
+    if not (credentials.get("access_token") or credentials.get("refresh_token")):
+        return False
+    for m in form_spec.get("methods") or []:
+        if (
+            isinstance(m, dict) and m.get("id") == method
+            and m.get("submit_action") == "oauth_launch" and isinstance(m.get("oauth"), dict)
+        ):
+            return True
+    return False
+
+
+_GRANT_UNLISTED = (
+    "\n\nThe connection is saved, but it was not added to your connectors list "
+    "because its connection test did not pass: {reason}\n"
+)
+
+
+def _grant_saved_patch(form_id: str, slug: str) -> dict:
+    """The form patch for a connection saved from a provider's grant."""
+    return {
+        "form_id": form_id,
+        "title": f"Saved — {slug}",
+        "subtitle": "Stored in the vault after the provider's authorization.",
+        "status_text": None,
+        "_is_probing": False,
+        "_is_success": True,
+        "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
+    }
+
+
 class ProbeHandler:
-    def __init__(self, session: ScopedSession) -> None:
-        self.session = session
+    """The connector form's stream: an LLM-driven credential probe, narrated
+    as an assistant turn.
+
+    Its database work runs as units (cowork.db.units): the conversation read
+    and the settings read before the probe, and the assistant-turn write after
+    it. No connection is held while the probe waits on the model, and none is
+    checked out on the event loop.
+    """
+
+    def __init__(self, *, scope: TenantScope) -> None:
+        self.scope = scope
 
     async def run(
         self,
@@ -74,7 +163,7 @@ class ProbeHandler:
             recorded_events.append(payload)
             return _sse(event_type, payload)
 
-        def _persist_once(conversation_id: UUID | None):
+        async def _persist_once(conversation_id: UUID | None) -> UUID | None:
             # Idempotent — every response.completed below calls this so the
             # turn's real assistant message id can ride the SAME
             # frame the client's SSE reader stops at; a probe turn legitimately
@@ -85,11 +174,32 @@ class ProbeHandler:
             persisted = True
             if not conversation_id or not "".join(body_parts):
                 return None
-            return ConversationService(self.session).save_assistant_turn(
-                conversation_id, "".join(body_parts), recorded_events
+            save = partial(
+                _save_probe_turn,
+                conversation_id=conversation_id,
+                text="".join(body_parts),
+                events=tuple(recorded_events),
             )
+            try:
+                async with conversation_writes(conversation_id):
+                    return await run_db(save, scope=self.scope)
+            except PoolTimeoutError:
+                # The probe's outcome (a saved connection, or the reason it
+                # failed) still reaches the form in the frame below; only its
+                # narrative is missing from the conversation.
+                logger.warning(
+                    "No database connection freed in time to save the probe turn for conversation %s",
+                    conversation_id,
+                )
+                return None
+            except Exception:
+                # Same outcome as a refused save: the form keeps the probe's
+                # result, and only its narrative is missing from the
+                # conversation.
+                logger.exception("Could not save the probe turn", extra=log_context(conversation_id=conversation_id))
+                return None
 
-        def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
+        async def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
             # _push records the (id-less) event and bumps seq first, exactly
             # like every other event — persistence must see this completion
             # event in recorded_events, matching the ordering this replaced,
@@ -98,14 +208,14 @@ class ProbeHandler:
                 "response.completed",
                 {"type": "response.completed", "response": {"id": response_id, **response_fields}},
             )
-            msg = _persist_once(conversation_id)
-            if msg is None:
+            message_id = await _persist_once(conversation_id)
+            if message_id is None:
                 return wire
             # Same recorded payload, republished with the id added — the
             # persisted copy in recorded_events is deliberately left without
             # it, matching how response_failed_payload's persisted copy
             # doesn't carry it either.
-            wire_payload = {**recorded_events[-1], "assistant_message_id": str(msg.id)}
+            wire_payload = {**recorded_events[-1], "assistant_message_id": str(message_id)}
             return _sse("response.completed", wire_payload)
 
         def _delta(text: str) -> str:
@@ -135,12 +245,22 @@ class ProbeHandler:
             db_conversation_id: UUID | None = None
             workspace = None
             workspace_path: Path | None = None
+            conversation_busy = False
 
             if conversation_id:
                 try:
-                    conversation = ConversationService(self.session).get_conversation(UUID(conversation_id))
+                    conversation = await run_db(
+                        partial(_read_conversation, conversation_id=UUID(conversation_id)),
+                        scope=self.scope,
+                    )
                     db_conversation_id = conversation.id
-                    workspace_path = Path(conversation.project.path)
+                    workspace_path = conversation.workspace_path
+                except PoolTimeoutError:
+                    conversation_busy = True
+                    logger.warning(
+                        "No database connection freed in time to read conversation %s; "
+                        "the form is told Cowork is busy", conversation_id,
+                    )
                 except Exception:
                     logger.warning("Could not resolve conversation %s", conversation_id)
 
@@ -158,7 +278,7 @@ class ProbeHandler:
                     "The form submission expired before I could process it. "
                     "Please re-submit the form."
                 )
-                yield _completed(db_conversation_id, {"status": "failed"})
+                yield await _completed(db_conversation_id, {"status": "failed"})
                 return
 
             values = submission.get("values", {}) or {}
@@ -172,10 +292,14 @@ class ProbeHandler:
             # persist as the label/user_label.
             connection_label, connection_user_label = _extract_connection_label_fields(credentials)
 
-            # Connector spec — absent for agent-handcrafted (non-registry)
-            # connectors; those fall back to the form_spec staged with the
-            # submission and skip the probe below.
-            spec = registry.get_connector(connector_id)
+            # Mirrors submit_form: a handcrafted form keeps its own spec, and a
+            # custom connector's stored spec arrives staged with the submission.
+            # Only an explicit False from submit_form skips the stored spec, so
+            # a submission can never be validated as one connector and saved untested.
+            stamped = submission.get("checked_against_stored_spec") is not False
+            spec = registry.get_connector(connector_id) if stamped else None
+            if spec is None and submission.get("custom_spec"):
+                spec = ConnectorSpecResponse.model_validate(submission["custom_spec"])
             if spec is not None:
                 form_id = spec.form.form_id
                 form_spec = spec.form.model_dump()
@@ -185,66 +309,135 @@ class ProbeHandler:
             if method:
                 form_spec["selected_method"] = method
 
-            # Save without probe only when there is no registry spec —
-            # there is no engine to verify a handcrafted connector against.
-            # Missing conversation context is fine: a temp workspace is created below.
-            if spec is None:
+            if conversation_busy:
+                # Without its conversation the probe would run in a temp
+                # workspace and its turn would never be saved, so the form
+                # says Cowork is busy, with the wait, as a refused settings
+                # read does.
+                busy = server_busy_message(busy_retry_seconds())
+                yield _delta(busy)
+                yield _patch_delta({"form_id": form_id, "form_error": busy})
+                yield await _completed(None, {"status": "failed"})
+                return
+
+            extends_name = form_spec.get("_extends_connection") if spec is None else None
+            # A handcrafted OAuth method arrives after the browser grant. Its
+            # connection is saved first, so a probe failure never throws a
+            # working grant away; the token is only the client's word, though,
+            # so the shared definition waits for the probe below to pass.
+            grant_slug: str | None = None
+            grant_user_label: str | None = None
+            if spec is None and _is_oauth_grant(form_spec, method, credentials):
                 try:
-                    vault = vault_for_scope(self.session.scope)
+                    vault = vault_for_scope(self.scope)
                     slug = persist_connection(
-                        connector_id, method, name, credentials,
-                        label=connection_label, user_label=connection_user_label, vault=vault,
+                        connector_id, method, extends_name or name, credentials,
+                        label=connection_label, user_label=connection_user_label,
+                        extends=bool(extends_name), spec_form=form_spec, vault=vault,
+                        scope=self.scope,
                     )
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
-                    yield _completed(db_conversation_id, {"status": "failed"})
+                    yield await _completed(db_conversation_id, {"status": "failed"})
                     return
-                reason = "connector is not in the registry"
-                yield _delta(f"Saved as `{slug}` (no live probe — {reason}).\n\n")
-                yield _patch_delta({
-                    "form_id": form_id,
-                    "title": f"Saved — {slug}",
-                    "subtitle": "Stored in the vault. No live verification was performed.",
-                    "status_text": None,
-                    "_is_probing": False,
-                    "_is_success": True,
-                    "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
-                })
-                yield _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
-                return
+                yield _delta(f"Saved as `{slug}` (authorized with the provider).\n\n")
+                if extends_name:
+                    yield _patch_delta(_grant_saved_patch(form_id, slug))
+                    yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
+                    return
+                grant_slug, grant_user_label = slug, saved_user_label
+
+            # A follow-up step is probed with the fields of the connection it
+            # extends too; the save below still merges them once, under the vault lock.
+            probe_credentials = credentials
+            saved_only_fields: set[str] = set()
+            unpatchable_names: set[str] = set()
+            if extends_name:
+                try:
+                    target = vault_for_scope(self.scope).read_record(connector_id, extends_name)
+                except Exception as exc:
+                    logger.warning("Could not read connection %s to extend: %s", extends_name, exc)
+                    unreadable = f"Could not read `{extends_name}`: `{exc}`."
+                    yield _delta(unreadable)
+                    yield _patch_delta({"form_id": form_id, "form_error": unreadable})
+                    yield await _completed(db_conversation_id, {"status": "failed"})
+                    return
+                if target is None:
+                    missing = f"No {connector_id} connection named {extends_name!r} to add these fields to."
+                    yield _delta(missing)
+                    yield _patch_delta({"form_id": form_id, "form_error": missing})
+                    yield await _completed(db_conversation_id, {"status": "failed"})
+                    return
+                stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
+                probe_credentials = {**stored, **credentials}
+                step_field_names: set[str] = set()
+                field_lists = [form_spec.get("fields") or []]
+                field_lists += [m.get("fields") or [] for m in form_spec.get("methods") or [] if isinstance(m, dict)]
+                for fields in field_lists:
+                    step_field_names.update(f.get("name") for f in fields if isinstance(f, dict))
+                saved_only_fields = set(stored) - step_field_names
+                # The probe reads these as DS_<NAME> in its .env, so it may echo either form.
+                for saved_name in saved_only_fields:
+                    unpatchable_names.update({saved_name.lower(), f"ds_{saved_name.lower()}"})
 
             # Probe path: build workspace + LLM client
-            if workspace_path is None:
-                _temp_workspace_dir = tempfile.mkdtemp(prefix="cowork-probe-")
-                workspace_path = Path(_temp_workspace_dir)
-
+            cell_sandbox = None
             try:
+                if workspace_path is None:
+                    # Under the code sandbox, in the asker's own sandbox store:
+                    # the shared /tmp is denied to the cell, and every other
+                    # person's cell could read a folder there.
+                    _temp_workspace_dir = tempfile.mkdtemp(
+                        prefix="cowork-probe-",
+                        dir=probe_workspaces_dir(self.scope) if code_sandbox_on() else None,
+                    )
+                    workspace_path = Path(_temp_workspace_dir)
                 from anton.workspace import Workspace
                 workspace = Workspace(workspace_path)
+                # None with the sandbox off.
+                cell_sandbox = build_cell_sandbox(scope=self.scope, project_dir=workspace_path)
             except Exception:
+                workspace = None
                 logger.exception("Could not build workspace for probe")
 
             llm_client = None
+            init_error = "Could not initialize the probe (workspace or LLM client unavailable)."
+            settings_busy = False
             try:
-                from cowork.common.settings.user_settings import get_user_settings
                 from cowork.services.providers import web_tool_kwargs_for
 
                 # Capture the client and its web policy together, before the
                 # yields below let a settings update run ahead of the probe.
-                settings = get_user_settings()
+                settings = await run_db(_read_probe_settings, scope=self.scope)
                 web_tools = web_tool_kwargs_for(settings.resolved_planning_provider)
                 llm_client = self._build_llm_client(settings=settings)
+            except PoolTimeoutError:
+                # The form says so, with the wait, so the user submits it
+                # again rather than checking a model key that is fine.
+                init_error = server_busy_message(busy_retry_seconds())
+                settings_busy = True
+                logger.warning("No database connection freed in time to read the probe's settings")
             except Exception:
                 logger.exception("Could not build LLM client for probe")
 
             # Workspace / LLM client availability
+            if (workspace is None or llm_client is None) and grant_slug:
+                yield _delta(_GRANT_UNLISTED.format(reason=init_error))
+                yield _patch_delta(_grant_saved_patch(form_id, grant_slug))
+                yield await _completed(
+                    None if settings_busy else db_conversation_id,
+                    {"status": "success", "user_label": grant_user_label},
+                )
+                return
             if workspace is None or llm_client is None:
-                err = "Could not initialize the probe (workspace or LLM client unavailable)."
-                yield _delta(err)
-                yield _patch_delta({"form_id": form_id, "form_error": err})
-                yield _completed(db_conversation_id, {"status": "failed"})
+                yield _delta(init_error)
+                yield _patch_delta({"form_id": form_id, "form_error": init_error})
+                # A refused settings read ends here without saving, as a
+                # refused conversation read does: the save would wait for
+                # another unit, and the busy text is not part of the turn.
+                yield await _completed(None if settings_busy else db_conversation_id, {"status": "failed"})
                 return
 
             # Intro + initial probing patch
@@ -260,14 +453,19 @@ class ProbeHandler:
             final_outcome: ProbeOutcome | None = None
             pending_cell: dict = {}
 
+            usage_notes, notes_define_pass = await self._usage_notes(connector_id)
             probe = CredentialProbe(
                 engine=connector_id,
-                credentials=credentials,
+                credentials=probe_credentials,
                 llm_client=llm_client,
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
+                usage_notes=usage_notes,
+                notes_define_pass=notes_define_pass,
                 web_tool_kwargs=web_tools,
+                saved_fields=sorted(saved_only_fields),
+                cell_sandbox=cell_sandbox,
             )
             try:
                 async for kind, payload in probe.run():
@@ -281,13 +479,15 @@ class ProbeHandler:
                         })
                     elif kind == "field_status":
                         field_name = (payload or {}).get("name")
-                        if field_name:
+                        # A patch for a field the form doesn't hold would add it,
+                        # untyped, so a saved secret typed there would show.
+                        if field_name and field_name.lower() not in unpatchable_names:
                             status_val = (payload or {}).get("status")
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, {"status": status_val}))
                     elif kind == "remove_field":
                         field_name = (payload or {}).get("name")
-                        if field_name:
+                        if field_name and field_name.lower() not in unpatchable_names:
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, None))
                     elif kind == "switch_method":
@@ -345,12 +545,25 @@ class ProbeHandler:
             # Apply verdict
             saved_slug: str | None = None
             saved_user_label: str | None = None
-            if final_outcome.status == "success":
+            if grant_slug and final_outcome.status != "success":
+                reason = final_outcome.error or final_outcome.follow_up or "its test did not pass"
+                yield _delta(_GRANT_UNLISTED.format(reason=reason))
+                yield _patch_delta(_grant_saved_patch(form_id, grant_slug))
+                yield await _completed(db_conversation_id, {"status": "success", "user_label": grant_user_label})
+                return
+            if grant_slug:
+                saved_slug, saved_user_label = grant_slug, grant_user_label
+            elif final_outcome.status == "success":
+                # A connector the static registry lacks has only this form to
+                # say which fields are secret.
+                builtin = registry.get_connector(connector_id) is not None
                 try:
-                    vault = vault_for_scope(self.session.scope)
+                    vault = vault_for_scope(self.scope)
                     slug = persist_connection(
-                        connector_id, method, name, credentials,
-                        label=connection_label, user_label=connection_user_label, vault=vault,
+                        connector_id, method, extends_name or name, credentials,
+                        label=connection_label, user_label=connection_user_label,
+                        extends=bool(extends_name), spec_form=None if builtin else form_spec,
+                        vault=vault, scope=self.scope,
                     )
                     saved_slug = slug
                     saved_record = vault.read_record(connector_id, slug) or {}
@@ -362,7 +575,11 @@ class ProbeHandler:
 
             if final_outcome.status == "success":
                 summary = final_outcome.summary or "Connection works."
-                yield _delta(f"\n\n{summary}\n")
+                yield _delta(f"\n\n{summary}\n\nSaved as `{saved_slug}`.\n")
+                if spec is None and not extends_name:
+                    note = await self._save_definition(connector_id, form_spec)
+                    if note:
+                        yield _delta(note)
                 yield _patch_delta({
                     "form_id": form_id,
                     "title": f"Connected — {saved_slug}",
@@ -372,7 +589,7 @@ class ProbeHandler:
                     "_is_probing": False,
                     "_is_success": True,
                 })
-                yield _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
+                yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
             elif final_outcome.status == "needs_input":
                 reason = final_outcome.follow_up or "We need a few more details before we can connect."
                 yield _delta(f"\n\nI need a bit more info before I can finish: {reason}\n")
@@ -406,7 +623,7 @@ class ProbeHandler:
                         "form_error": None,
                         "fields": extra,
                     })
-                yield _completed(db_conversation_id, {"status": "needs_input"})
+                yield await _completed(db_conversation_id, {"status": "needs_input"})
             else:
                 err = final_outcome.error or "Connection failed."
                 hint = final_outcome.follow_up or "Update the form and try again."
@@ -419,11 +636,54 @@ class ProbeHandler:
                     "form_error": err,
                     "_is_success": False,
                 })
-                yield _completed(db_conversation_id, {"status": "retry"})
+                yield await _completed(db_conversation_id, {"status": "retry"})
 
         finally:
             if _temp_workspace_dir:
                 shutil.rmtree(_temp_workspace_dir, ignore_errors=True)
+
+    async def _save_definition(self, connector_id: str, form_spec: dict) -> str | None:
+        """Store a tested handcrafted form as the scope's custom connector.
+
+        Local installs only for now: who may publish a connector to a whole
+        organization is not decided yet.
+
+        Args:
+            connector_id: The engine id the connection was saved under.
+            form_spec: The handcrafted form that passed its test.
+
+        Returns:
+            None when saved or skipped, else a line telling the user the
+            connection is saved but the connector could not be.
+        """
+        if self.scope.org_mode:
+            return None
+        try:
+            await run_db(
+                lambda session: CustomConnectorService(session).upsert_from_form(connector_id, form_spec),
+                scope=self.scope,
+            )
+        except UnstorableFormError as e:
+            return f"\nThe connection is saved, but it was not added to your connectors list: {e}\n"
+        except Exception:
+            logger.exception("Could not save the custom connector definition for %s", connector_id)
+            return "\nThe connection is saved, but it could not be added to your connectors list.\n"
+        return None
+
+    async def _usage_notes(self, connector_id: str) -> tuple[str | None, bool]:
+        """The connector's agent-facing notes, or None when it has none or they
+        could not be read; the probe runs without them then. The flag is True
+        only for a built-in spec's notes, the ones reviewed like code, which
+        may tell the probe what counts as a pass."""
+        try:
+            notes = await run_db(
+                lambda session: ConnectorCatalog(session).usage_notes_for([connector_id]), scope=self.scope,
+            )
+        except Exception:
+            logger.exception("Could not read the usage notes for %s; probing without them", connector_id)
+            return None, False
+        text = notes.get(connector_id)
+        return text, text is not None and text == registry.usage_notes_for([connector_id]).get(connector_id)
 
     @staticmethod
     def _build_llm_client(settings=None):

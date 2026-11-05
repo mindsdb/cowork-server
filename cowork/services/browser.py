@@ -6,7 +6,7 @@ half of it: provisioning and status as the caller, a viewer embed URL for the
 renderer, and the block that tells anton where the browser is for one turn.
 
 Every call is made AS the caller, with their MindsHub credential
-(`hub_credential`). Nothing here holds a credential of its own, and anton
+(`mindshub_credential`). Nothing here holds a credential of its own, and anton
 reaches the instance with its own turn credential, not anything from here.
 
 That is the `mindshub` mode, the default. In `standalone` mode an admin points

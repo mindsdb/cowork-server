@@ -23,6 +23,7 @@
     "agent debugging"
   ],
   "description": "Connect to Langfuse to query LLM traces, observations, sessions, and evaluation scores from your projects.",
+  "usage_notes": "For totals over a time window (counts, cost, token usage per day or per model), call `GET {base_url}/api/public/v2/metrics` with a single JSON-encoded `query` parameter. Example:\n```\n{\"view\":\"observations\",\"metrics\":[{\"measure\":\"count\",\"aggregation\":\"count\"},{\"measure\":\"totalCost\",\"aggregation\":\"sum\"},{\"measure\":\"totalTokens\",\"aggregation\":\"sum\"}],\"dimensions\":[{\"field\":\"providedModelName\"}],\"timeDimension\":{\"granularity\":\"day\"},\"filters\":[],\"fromTimestamp\":\"2026-07-01T00:00:00Z\",\"toTimestamp\":\"2026-07-16T00:00:00Z\"}\n```\nTimestamps are ISO 8601. If that endpoint is unavailable (self-hosted Langfuse older than v4), fall back to the deprecated `GET {base_url}/api/public/metrics/daily?fromTimestamp=...&toTimestamp=...`, which returns daily `countTraces`, `totalCost` and per-model `usage`.\nNever page through `/api/public/traces` to sum costs: it needs many requests and loads the user's Langfuse instance. Use `/api/public/traces` only for individual traces, with a narrow time window.\nAuth: HTTP Basic, `public_key` as username and `secret_key` as password.",
   "category": "observability",
   "logo": "sparkle",
   "logo_color": "#0A60B5",

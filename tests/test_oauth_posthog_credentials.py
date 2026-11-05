@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 import pytest
 
 from cowork.common.settings.app_settings import OAuthSettings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.connectors.oauth import google as google_module
 from cowork.services.connectors.oauth.google import OAuthService, _credentials_complete, _fetch_userinfo_posthog
 
@@ -110,7 +111,7 @@ def test_callback_uses_cached_client_id_for_secret_less_provider(monkeypatch):
 
     monkeypatch.setattr(OAuthService, "_resolve_credentials", _boom)
 
-    html = svc.callback("posthog", code="auth-code", state="s-456", error="", settings=OAuthSettings(_env_file=None))
+    html = svc.callback("posthog", code="auth-code", state="s-456", error="", settings=OAuthSettings(_env_file=None), scope=LOCAL_SCOPE)
 
     assert captured["client_id"] == "https://example.com/cimd.json"
     assert "connected" in html.lower()

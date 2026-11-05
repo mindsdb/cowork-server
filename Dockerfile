@@ -4,9 +4,8 @@ FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd
 # uv binary (pinned to match the repo's lockfile tooling).
 COPY --from=ghcr.io/astral-sh/uv:0.6.14@sha256:3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664 /uv /uvx /bin/
 
-# git: pyproject sources anton-agent from GitHub, and hatch-vcs
-# reads git metadata for the version. build-essential is NOT needed — psycopg
-# is installed as psycopg[binary] (prebuilt wheels).
+# git: hatch-vcs reads git metadata for the version. build-essential is NOT
+# needed — psycopg is installed as psycopg[binary] (prebuilt wheels).
 RUN --mount=target=/var/lib/apt,type=cache,sharing=locked \
     --mount=target=/var/cache/apt,type=cache,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
@@ -23,7 +22,7 @@ WORKDIR /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --no-dev
+    uv sync --locked --no-install-project --no-dev
 
 # Then the project source and a full sync (installs cowork-server into the venv).
 #
@@ -45,7 +44,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Order matters: the sync must resolve the version before .git is gone.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev \
+    uv sync --locked --no-dev \
     && v="$(.venv/bin/python -c 'from importlib.metadata import version; print(version("cowork-server"))')" \
     && echo "cowork-server version: $v" \
     && case "$v" in 0.0.0*) \
@@ -108,4 +107,4 @@ USER app
 
 EXPOSE 9010
 
-CMD ["python", "-m", "uvicorn", "cowork.server:app", "--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "2"]
+CMD ["python", "-m", "uvicorn", "cowork.server:app", "--log-config", "/app/cowork/logging.json", "--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "2"]

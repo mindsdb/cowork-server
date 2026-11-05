@@ -3,19 +3,22 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import local_artifact_comments as comments
 
 
 def _service(tmp_path, monkeypatch):
     folder = tmp_path / "artifact"
     folder.mkdir()
-    monkeypatch.setattr(comments, "artifacts_sources_for_scan", lambda: [])
+    monkeypatch.setattr(comments, "artifacts_sources_for_scan", lambda *, scope: [])
     monkeypatch.setattr(
         comments,
         "resolve_artifact_folder",
         lambda _sources, _artifact_id: (object(), folder, {}),
     )
-    return comments.LocalArtifactComments("11111111-1111-1111-1111-111111111111")
+    return comments.LocalArtifactComments(
+        "11111111-1111-1111-1111-111111111111", scope=LOCAL_SCOPE
+    )
 
 
 def test_local_comment_lifecycle_is_atomic_and_revision_aware(tmp_path: Path, monkeypatch):

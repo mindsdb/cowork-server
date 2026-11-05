@@ -23,11 +23,11 @@ def artifact(tmp_path: Path, monkeypatch):
     folder.mkdir()
 
     state: dict = {"entry": {}}
-    monkeypatch.setattr(router, "artifacts_sources_for_scan", lambda: [])
+    monkeypatch.setattr(router, "artifacts_sources_for_scan", lambda *, scope: [])
     monkeypatch.setattr(
         router, "resolve_artifact_folder", lambda _sources, _aid: (object(), folder, {})
     )
-    monkeypatch.setattr(router, "published_owner_state", lambda _path: state["entry"])
+    monkeypatch.setattr(router, "published_owner_state", lambda _path, *, scope: state["entry"])
     monkeypatch.setattr(router, "_org_mode", lambda: False)
     return state
 
@@ -90,3 +90,11 @@ def test_org_mode_ignores_the_publication_record(artifact, monkeypatch):
     monkeypatch.setattr(router, "_org_mode", lambda: True)
     artifact["entry"] = _restricted()
     assert router.resolve_comments_route("artifact", UUID) == ("artifact", UUID)
+
+
+def test_restricted_publication_routes_a_local_id_to_a_different_lambda_echo(artifact):
+    # The renderer sends the card's key; the lambda may have bound the
+    # publication to another one, and that one holds the cloud threads.
+    echoed = "6671fe2e-9784-4402-a5d3-5edb2ac9dbac"
+    artifact["entry"] = _restricted(lambda_artifact_key=f"artifact/{echoed}")
+    assert router.resolve_comments_route("artifact", UUID) == ("artifact", echoed)

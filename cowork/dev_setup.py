@@ -36,17 +36,23 @@ def _migrate_env_to_db_if_local(session) -> None:
 def _distribute_skill_links() -> None:
     """Boot-time symlink fan-out of the skill store into project dirs.
 
-    Desktop-only: in org mode this reads the unkeyed root and scans every
-    project dir. Cloud turns read skills straight off the shared mount instead
-    (no payload); the pod's org gets seeded lazily, see
+    Desktop-only: in MindsHub mode this reads the unkeyed root and scans every
+    project dir. Cloud turns get their skills in the request instead
+    (cowork.handlers.responses.remote_turn_skills); the pod's org gets seeded lazily, see
     `_stage_remote_workspace_files` and `SkillService.ensure_builtin_skills`.
+    The base store is LOCAL_SCOPE's, named explicitly because a deployment that
+    trusts identity headers refuses a store with no scope. Wherever skills are
+    partitioned (MindsHub mode, or single-tenant mode keeping skills per
+    person) nothing is fanned out: each turn links its own skills.
     """
-    if get_app_settings().tenancy_mode == "org":
+    from cowork.services.skill_links import reconcile_all, skill_partitions_enabled
+
+    if skill_partitions_enabled():
         return
-    from cowork.services.skill_links import reconcile_all
+    from cowork.db.scoped import LOCAL_SCOPE
     from cowork.services.skills import SkillService
 
-    reconcile_all(SkillService().list_skills())
+    reconcile_all(SkillService(LOCAL_SCOPE).list_skills())
 
 
 def run_dev_setup() -> None:

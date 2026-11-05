@@ -145,7 +145,7 @@ def _delete_channel_events(*dedupe_keys: str) -> None:
         session.close()
 
 
-async def test_intake_events_stamps_the_resolved_org(monkeypatch):
+async def test_intake_events_stamps_the_resolved_org(monkeypatch, org_deployment):
     captured = []
     try:
         intake_events(
@@ -165,7 +165,7 @@ async def test_intake_events_stamps_the_resolved_org(monkeypatch):
         _delete_channel_events("evt-a")
 
 
-async def test_intake_events_isolates_dedupe_across_orgs():
+async def test_intake_events_isolates_dedupe_across_orgs(org_deployment):
     # The real signal isn't "is_duplicate_inbound returns True" — org B seeing
     # its OWN row and org B incorrectly seeing org A's leaked row both look
     # like that. The real proof is that org B's intake actually scheduled

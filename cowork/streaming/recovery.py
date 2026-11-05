@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from uuid import UUID
 
+from cowork.common.logger import log_context
 from cowork.streaming.buffer import read_records
 from cowork.streaming.records import TerminalReason, TurnRecord, now_iso
 
@@ -116,15 +117,15 @@ def _read_buffer_events(path: Path) -> Iterator[tuple[str, dict]]:
 
 def seal_orphan_turns_in_history(session, streams_root: Path) -> int:
     """Write each crash-orphaned turn's streamed text into its conversation's
-    history as an interrupted turn, so a reload shows it instead of nothing.
+    history as a lost turn, so a reload shows it instead of nothing.
 
     Idempotent: an existing reply must have a durable terminal event. Retry
     restart/interrupted buffers too, so a failed DB write can recover on the
     next boot even after the separate buffer sweep closes the replay stream.
     """
     from cowork.handlers.turn_errors import (
-        GENERIC_TURN_ERROR_CODE,
-        INTERRUPTED_TURN_MESSAGE,
+        TURN_LOST_CODE,
+        TURN_LOST_MESSAGE,
         response_failed_payload,
     )
     from cowork.services.conversations import ConversationService
@@ -158,9 +159,9 @@ def seal_orphan_turns_in_history(session, streams_root: Path) -> int:
                     if event_type in {"response.completed", "response.failed"}:
                         terminal_event = data
                 # A completed frame is evidence the entire answer was produced;
-                # otherwise an orphan must retain a visible interruption marker.
+                # otherwise an orphan must retain a visible turn-lost marker.
                 terminal_event = terminal_event or response_failed_payload(
-                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE,
+                    TURN_LOST_MESSAGE, TURN_LOST_CODE,
                 )
                 if svc.recover_interrupted_turn(
                     conversation_id, turn_id, "".join(collected), terminal_event,
@@ -172,8 +173,9 @@ def seal_orphan_turns_in_history(session, streams_root: Path) -> int:
             except Exception:
                 session.rollback()
                 logger.exception(
-                    "Could not seal orphan turn %d for conversation %s into history",
-                    turn_id, conversation_id,
+                    "Could not seal orphan turn %d into history",
+                    turn_id,
+                    extra=log_context(conversation_id=conversation_id),
                 )
     if sealed:
         logger.info("Sealed %d orphan turn(s) into conversation history on boot.", sealed)

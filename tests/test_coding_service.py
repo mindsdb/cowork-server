@@ -25,6 +25,7 @@ from coding_service_fakes import (
     wait_for_status,
     wait_for_turn_thread,
     wait_for_workspace,
+    wait_for_steerable_turn,
     wait_for_steers,
 )
 
@@ -1783,6 +1784,25 @@ def test_task_controls_persist_and_restart_idle_runtime(tmp_path: Path) -> None:
     assert config.web_search is True
 
 
+
+def test_task_controls_clear_the_effort_only_on_an_explicit_null(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    service.update_session_config(created.id, SessionUpdateRequest(reasoning_effort="max"))
+
+    kept = service.update_session_config(created.id, SessionUpdateRequest(model="other-model"))
+    assert kept.reasoning_effort == "max"
+
+    cleared = service.update_session_config(
+        created.id, SessionUpdateRequest(model="no-levels-model", reasoning_effort=None)
+    )
+    assert cleared.model == "no-levels-model"
+    assert cleared.reasoning_effort is None
+
 def test_steering_reaches_active_engine_and_is_recorded(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine(block_until_cancel=True)
@@ -2001,6 +2021,7 @@ def test_failed_queue_promotion_restores_the_instruction(tmp_path: Path) -> None
         SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
     )
     assert engine.started.wait(timeout=1)
+    wait_for_steerable_turn(service, created.id)
 
     queued = service.queue_turn(created.id, "Try this immediately")
     instruction_id = queued.queued_instructions[0].id

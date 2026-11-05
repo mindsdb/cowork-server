@@ -16,8 +16,8 @@ from pathlib import Path
 from anton.core.memory.skills import SkillStore
 
 import cowork.harnesses.anton_harness.harness as harness_mod
-from anton.tools import CONNECT_DATASOURCE_TOOL
 from cowork.harnesses.anton_harness.tools import (
+    build_cowork_connect_datasource_tool,
     build_cowork_label_connection_tool,
     build_cowork_lookup_connector_tool,
     build_cowork_publish_tool,
@@ -58,4 +58,4 @@ def test_unlock_skill_matches_a_shipped_skill(tmp_path):
 def test_reactive_tools_stay_eager():
     """Guard the deliberate exceptions: these must never gain an `unlock_skill`."""
     assert build_cowork_publish_tool().unlock_skill is None
-    assert CONNECT_DATASOURCE_TOOL.unlock_skill is None
+    assert build_cowork_connect_datasource_tool().unlock_skill is None

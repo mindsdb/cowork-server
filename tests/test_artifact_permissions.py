@@ -144,14 +144,6 @@ def test_cards_carry_per_artifact_capabilities(world):
     assert cards["orphan"]["capabilities"]["ownerUnknown"] is True
 
 
-@pytest.fixture
-def org_deployment(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    get_app_settings.cache_clear()
-    yield
-    get_app_settings.cache_clear()
-
-
 @pytest.mark.asyncio
 async def test_creator_can_open_the_workspace_of_a_project_root_artifact(
     world, org_deployment, granted_product_permissions
@@ -178,7 +170,7 @@ async def test_creator_can_open_the_workspace_of_a_project_root_artifact(
 
 
 from cowork.services import artifact_access
-from cowork.services.artifact_authorization_identity import ArtifactIdentity, _session as identity_session
+from cowork.services.artifact_authorization_identity import ArtifactIdentity, authorization_session as identity_session
 
 
 @pytest.fixture

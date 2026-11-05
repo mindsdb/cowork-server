@@ -1,4 +1,4 @@
-"""Request principal for org (multi-tenant) deployments.
+"""Request principal from trusted identity headers.
 
 When COWORK_TENANCY_MODE=org the server runs behind the MindsHub auth
 gateway, which validates the caller's JWT or API key and injects trusted
@@ -20,9 +20,21 @@ route to the pod, which is a network question this file cannot answer:
 enforce mode refuses a caller carrying no identity, not one carrying a
 well-formed forged pair.
 
-In local mode (the desktop sidecar, the default) the middleware is not
-registered and ``request.state.principal`` is absent; ``get_principal``
-returns None so shared code can branch on "no tenant context".
+A local deployment with COWORK_TRUST_IDENTITY_HEADERS on reads the same two
+headers, set by a proxy that verifies each person and strips client copies
+first, on a request that already passed the shared bearer token. There the
+middleware runs with ``personal_partitions=True``: the principal's ``org_id``
+is the person's partition id (``personal_partition_id``), not the header's
+organization, so each (organization, user) pair is its own partition, and
+``user_id`` is the header's user. No pair under audit means the operator view;
+a pair that is present but broken (one header, or a non-UUID id) answers 401
+whatever the mode. Paths outside ``/api/`` (the web UI's page shell) name no
+person there and are not logged.
+
+In local mode without that setting (the desktop sidecar, the default) the
+middleware is not registered and ``request.state.principal`` is absent;
+``get_principal`` returns None so shared code can branch on "no tenant
+context".
 """
 
 from __future__ import annotations
@@ -33,7 +45,7 @@ import logging
 from base64 import urlsafe_b64decode
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -69,10 +81,28 @@ class Principal:
     roles: frozenset[str] = field(default_factory=frozenset)
 
 
-class TrustedHeaderMiddleware(BaseHTTPMiddleware):
-    """Build a Principal from gateway-injected identity headers.
+def personal_partition_id(organization_id: str, user_id: str) -> str:
+    """The partition id of one person on a deployment that trusts identity headers.
 
-    Registered in create_app() only when COWORK_TENANCY_MODE=org.
+    uuid5 of the deployment's organization id and the person's ``sub``. Both are
+    parsed as UUIDs first, so letter case never changes the id. It is
+    deterministic, so an operator command computes the same id from a recorded
+    ``sub``. Rows store it as their ``org_id``; code that rebuilds a principal
+    from a stored row (cowork.db.scoped.service_principal_for) uses the stored id
+    as it is and never derives it a second time.
+    """
+    return str(uuid5(UUID(organization_id), str(UUID(user_id))))
+
+
+class TrustedHeaderMiddleware(BaseHTTPMiddleware):
+    """Build a Principal from trusted identity headers.
+
+    Registered in create_app() when COWORK_TENANCY_MODE=org, and in local
+    tenancy when COWORK_TRUST_IDENTITY_HEADERS is on, inside the bearer token
+    check, with ``personal_partitions=True``. That flag makes the principal's
+    org_id the person's partition id and skips the canonical-web organization
+    boundary, which compares the browser's organization claim with an org id
+    a partition id never equals.
     With enforce=True requests without valid identity are rejected with 401;
     with enforce=False (audit rollout) they are logged and allowed through.
     """
@@ -82,10 +112,12 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         app: ASGIApp,
         exempt_paths: Collection[str] = (),
         enforce: bool = True,
+        personal_partitions: bool = False,
     ) -> None:
         super().__init__(app)
         self._exempt_paths = exempt_paths
         self._enforce = enforce
+        self._personal_partitions = personal_partitions
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         # A genuine CORS preflight never carries identity headers — but
@@ -104,12 +136,32 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         if request.url.path in _EXEMPT_PATHS or request.url.path in self._exempt_paths:
             return await call_next(request)
 
+        # A decoded ``.`` or ``..`` segment is refused before the page-shell
+        # pass-through below: otherwise a path like ``/%2e%2e/api/...`` reads as
+        # the page shell here, names no person, and then normalizes onto an API
+        # route served as the operator view. The proxy already blocks this; this
+        # is the same guard on the server side.
+        if self._personal_partitions and any(
+            segment in (".", "..") for segment in request.url.path.split("/")
+        ):
+            return JSONResponse({"detail": "Bad Request"}, status_code=400)
+
+        # Every data route sits under /api/. The rest is the web UI's page
+        # shell, which a browser loads with no pair, so it names no person
+        # and logs nothing.
+        if self._personal_partitions and not request.url.path.startswith("/api/"):
+            return await call_next(request)
+
         # Both ids are Keycloak UUIDs — validate format, normalize case.
         try:
             user_id = str(UUID(request.headers.get(HEADER_USER_ID, "").strip()))
             org_id = str(UUID(request.headers.get(HEADER_ORG_ID, "").strip()))
         except ValueError:
-            if self._enforce:
+            # Audit's pass-through is for a request that names nobody, the
+            # operator's. A pair the proxy sent but broke must never become
+            # the operator view.
+            named = HEADER_USER_ID in request.headers or HEADER_ORG_ID in request.headers
+            if self._enforce or (self._personal_partitions and named):
                 return JSONResponse({"detail": "Unauthorized"}, status_code=401)
             logger.warning(
                 "identity: no principal on %s %s (audit mode)",
@@ -117,6 +169,9 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
                 request.url.path,
             )
             return await call_next(request)
+
+        if self._personal_partitions:
+            org_id = personal_partition_id(org_id, user_id)
 
         roles = frozenset(
             role.strip()
@@ -130,6 +185,8 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
             roles=roles,
         )
 
+        if self._personal_partitions:
+            return await call_next(request)
         boundary_response = self._organization_boundary_response(request, org_id)
         if boundary_response is not None:
             return boundary_response
@@ -153,27 +210,22 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         reason: str | None = None
         if supplied is None or not supplied.strip():
             status_code = 426
-            reason = "missing expected organization"
+            reason = "expected_organization_missing"
         else:
             try:
                 expected_org_id = str(UUID(supplied.strip()))
             except ValueError:
                 status_code = 409
-                reason = "malformed expected organization"
+                reason = "expected_organization_invalid"
             else:
                 if expected_org_id != trusted_org_id:
                     status_code = 409
-                    reason = "organization mismatch"
+                    reason = "organization_mismatch"
 
         if status_code is None or reason is None:
             return None
 
-        logger.warning(
-            "organization boundary: %s on %s %s",
-            reason,
-            request.method,
-            request.url.path,
-        )
+        request.state._request_log_reason = reason
         return JSONResponse(
             {
                 "code": "organization_reload_required",
@@ -227,11 +279,11 @@ def get_principal(request: Request) -> Principal | None:
 
 
 # Where the desktop shell puts the caller's MindsHub credential, because it
-# cannot use Authorization. See `hub_credential`.
+# cannot use Authorization. See `mindshub_credential`.
 HEADER_HUB_CREDENTIAL = "X-MindsHub-Authorization"
 
 
-def hub_credential(request: Request | None) -> str:
+def mindshub_credential(request: Request | None) -> str:
     """The caller's MindsHub credential, for a read this server makes as them.
 
     Prefers ``X-MindsHub-Authorization`` over ``Authorization``, and the reason is
@@ -247,17 +299,35 @@ def hub_credential(request: Request | None) -> str:
     accepting an identity from one would not be. A caller can present their own
     token or a useless one; neither buys them anything they did not already have.
 
+    **Never for skill or artifact sharing.** The caller can present a
+    credential from another organization of theirs, and the service answers
+    for that organization: its permissions, teams and members. Sharing's reads
+    (skill sharing's viewer, the people and teams a share may name) take
+    ``caller_bearer``, the Authorization the gateway validated and took the
+    request's scope from. Three routes still take this credential: the
+    workspace selector's ``GET /hub/workspaces/`` and ``PUT
+    /hub/workspaces/active`` (cowork.api.v1.endpoints.mindshub_workspaces), and
+    ``GET /hub/usage/``. ``PUT /active`` (set_active_mindshub_workspace) answers
+    403 for a workspace missing from the listing this credential returns,
+    so that listing decides what it stores. The pick it stores grants
+    nothing: the menu shows it only while the listing has it
+    (cowork.services.mindshub_workspaces.resolve_active), and every key mint
+    sends it for the gateway's user and organization, where MindsHub
+    refuses a workspace they hold no grant on and the mint falls back to the
+    default workspace and clears the pick
+    (cowork.turnqueue.auth_keys._request_turn_key).
+
     Deliberately separate from ``caller_bearer``. Folding the header preference
     into that one would let any client steer the credential on the org model
-    catalog fetch too, which reads ``Authorization`` because in org mode the
-    gateway put it there.
+    catalog fetch too, which reads ``Authorization`` because in MindsHub mode
+    the gateway put it there.
 
-    **The fallback is org mode only, and that is a containment rule rather than a
-    tidiness one.** In org mode the ingress put the caller's own JWT in
+    **The fallback is MindsHub mode only, and that is a containment rule rather
+    than a tidiness one.** In MindsHub mode the ingress put the caller's own JWT in
     ``Authorization``, so reading it is correct. On a desktop install nothing
     does: the Electron main process assigns THIS server's bearer to that header
     on every loopback request, so falling back there would forward our own
-    credential to auth. It would be refused, and it would still have left the
+    credential to MindsHub. It would be refused, and it would still have left the
     machine, which is exactly what the main process's own "scoped to our loopback
     origin so it can't leak elsewhere" is supposed to prevent. Empty is the right
     answer instead: the caller has no MindsHub credential, and the surfaces this

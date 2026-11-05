@@ -107,10 +107,15 @@ def test_stopping_a_task_while_it_prepares_never_starts_the_agent(
     started, release = hold_preparation(monkeypatch, service)
     created = create(service, repo)
     assert started.wait(timeout=3)
+    thread = service._running[created.id].thread
 
     service.cancel(created.id)
     assert service.get_session(created.id).run_status == RunStatus.preparing.value
     release.set()
+    # Session status is persisted before the Task Run status is synchronized.
+    # Wait for preparation to finish before reading both terminal states.
+    thread.join(timeout=5)
+    assert not thread.is_alive()
     stopped = wait_for_status(service, created.id, SessionStatus.cancelled)
 
     assert engine.prompts == []
@@ -130,8 +135,14 @@ def test_a_task_whose_workspace_cannot_be_prepared_stays_visible_as_failed(
         raise RuntimeError("disk is full")
 
     monkeypatch.setattr(service.session_factory.workspaces, "prepare", fail)
+    started, release = hold_preparation(monkeypatch, service)
 
     created = create(service, repo)
+    assert started.wait(timeout=3)
+    thread = service._running[created.id].thread
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
     failed = wait_for_status(service, created.id, SessionStatus.failed)
 
     assert engine.prompts == []
@@ -216,9 +227,14 @@ def test_a_command_sent_as_the_first_prompt_is_shown_once(tmp_path: Path) -> Non
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
     created = service.create_session(SessionCreateRequest(path=str(repo), prompt="/status"), CREDS, "fake", "fake-model")
-    wait_for_status(service, created.id, SessionStatus.ready)
+    # A new task is already "ready" before its first prompt runs, so wait for
+    # the command's own event rather than the status.
+    deadline = time.monotonic() + 3
+    titles: list[str] = []
+    while "Task status" not in titles and time.monotonic() < deadline:
+        titles = [event.title for event in service.events(created.id).items]
+        time.sleep(0.01)
 
-    titles = [event.title for event in service.events(created.id).items]
     assert titles.count("You") == 1
     assert "Task status" in titles
 

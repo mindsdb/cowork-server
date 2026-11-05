@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import HTTPException
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifacts
 from cowork.services import artifact_identity
@@ -74,8 +75,8 @@ async def test_desktop_route_selects_exact_source_from_complete_catalog(monkeypa
     )
     events = []
 
-    def discover():
-        events.append("roots")
+    def discover(*, scope):
+        events.append(("roots", scope))
         return [other, selected]
 
     def list_from_roots(sources):
@@ -87,14 +88,15 @@ async def test_desktop_route_selects_exact_source_from_complete_catalog(monkeypa
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(
-        SimpleNamespace(),
+        SimpleNamespace(scope=LOCAL_SCOPE),
         project_id=None,
         project_path="/server-owned/project",
     )
 
     assert cards == []
+    # The catalog is the caller's own scope's roots.
     assert events == [
-        "roots",
+        ("roots", LOCAL_SCOPE),
         ("sink", [selected]),
     ]
 
@@ -114,7 +116,7 @@ async def test_desktop_route_distinguishes_duplicate_project_basenames(monkeypat
 
     monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
     monkeypatch.setattr(
-        artifacts, "artifacts_sources_for_scan", lambda: [first, selected]
+        artifacts, "artifacts_sources_for_scan", lambda *, scope: [first, selected]
     )
 
     def list_from_roots(sources):
@@ -124,7 +126,7 @@ async def test_desktop_route_distinguishes_duplicate_project_basenames(monkeypat
     monkeypatch.setattr(artifacts, "_list_artifacts", list_from_roots)
 
     cards = await artifacts.list_artifacts(
-        SimpleNamespace(),
+        SimpleNamespace(scope=LOCAL_SCOPE),
         project_id=None,
         project_path="/root-b/project",
     )
@@ -142,7 +144,7 @@ async def test_desktop_route_rejects_unregistered_path_with_same_basename(
         project_name="project",
     )
     monkeypatch.setattr(artifacts, "_org_mode", lambda: False)
-    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda: [source])
+    monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda *, scope: [source])
     monkeypatch.setattr(
         artifacts,
         "_list_artifacts",
@@ -150,7 +152,7 @@ async def test_desktop_route_rejects_unregistered_path_with_same_basename(
     )
 
     cards = await artifacts.list_artifacts(
-        SimpleNamespace(),
+        SimpleNamespace(scope=LOCAL_SCOPE),
         project_id=None,
         project_path="/attacker-controlled/project",
     )

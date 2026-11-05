@@ -1,5 +1,6 @@
 import re
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -11,6 +12,43 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # underscores (browser_oauth_builtin is the one underscore holdout among
 # otherwise-hyphenated ids), so both are allowed.
 _METHOD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+# A connector id names vault records on disk and prefixes DS_* env vars, and
+# a handcrafted one is model-chosen, so it is checked and rejected, never
+# rewritten. No hyphen: the vault joins "{engine}-{name}" into one file name.
+_ENGINE_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{1,63}")
+_SYNTHESIZED_FORM_ID_PATTERN = re.compile(r"fm_[0-9a-f]+")
+
+
+class InvalidConnectorIdError(ValueError):
+    """A connector id that cannot be used as a vault engine."""
+
+
+def validate_engine_id(value: Any) -> str:
+    """Return ``value`` when it is a usable connector id, else raise.
+
+    Args:
+        value: The candidate connector id, as sent by a client or the model.
+
+    Returns:
+        The same string, unchanged.
+
+    Raises:
+        InvalidConnectorIdError: when ``value`` is not a lowercase
+        ``[a-z][a-z0-9_]`` id of 2 to 64 characters, or is a synthesized
+        ``fm_<hex>`` form id.
+    """
+    if not isinstance(value, str) or not _ENGINE_ID_PATTERN.fullmatch(value):
+        raise InvalidConnectorIdError(
+            f"Invalid connector id {value!r}: use 2 to 64 lowercase letters, "
+            "digits and underscores, starting with a letter (e.g. 'linkedin')."
+        )
+    if _SYNTHESIZED_FORM_ID_PATTERN.fullmatch(value):
+        raise InvalidConnectorIdError(
+            f"Invalid connector id {value!r}: that is a generated form id, not a "
+            "connector. Set `engine` to the service's name (e.g. 'linkedin')."
+        )
+    return value
 
 
 class ConnectorField(BaseModel):
@@ -100,6 +138,10 @@ class CloudMethod(BaseModel):
     # Two independent lists is what keeps the desktop form fixed while this
     # one changes.
     fields: list[ConnectorField] = []
+    # "connector:method" of the engine a managed service is underneath, such
+    # as "postgres:host-port". Its availability and the pair auth stores both
+    # come from that engine; None means the method is an engine itself.
+    engine: str | None = None
 
 
 class ConnectorMethod(BaseModel):
@@ -114,6 +156,9 @@ class ConnectorMethod(BaseModel):
     help_url: str | None = None
     fields: list[ConnectorField] = []
     cloud: CloudMethod | None = None
+    # Field(s) a saved connection is named after; read from the raw spec by
+    # cowork/services/connectors/identity.py.
+    name_from: str | list[str] | None = None
 
     @field_validator("id")
     @classmethod
@@ -154,11 +199,44 @@ class ConnectorMetadataResponse(BaseModel):
     # run yet, so the directory can list it under a desktop-only group instead
     # of hiding it. Always True on desktop, where the whole registry works.
     cloud_available: bool = True
+    # Built in Cowork and stored per org (or per local install), not shipped
+    # in the static registry.
+    custom: bool = False
+
+
+class CustomConnectorUpdate(BaseModel):
+    """Changes an admin makes to a custom connector; omitted fields stay as they are."""
+
+    label: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    category: str | None = Field(default=None, max_length=64)
+    featured: bool | None = None
+    spec: dict[str, Any] | None = None
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):
     keywords: list[str] = []
     form: ConnectorForm
+    # Agent-facing notes on using this connector's API once connected: traps,
+    # efficient endpoints, auth quirks. The chat agent sees them only when a
+    # connection of this engine exists; the credential prober sees them while
+    # testing one. Declared so specs validate; excluded from API responses, read
+    # them via ConnectorSpecRegistry.usage_notes_for.
+    #
+    # Writing rules: English, imperative, only what the agent cannot guess. No
+    # #/##/### headings outside code fences (the text sits under a ### heading).
+    # Written for both readers: no references to one reader's tools (e.g.
+    # report_success), and never explain where credentials live or how env var
+    # names are built, since each reader's own prompt does that and they differ.
+    # Describe per-method differences by field name (`app_password`,
+    # `access_token`), not by env var name.
+    usage_notes: str | None = Field(default=None, exclude=True)
+
+
+class CustomConnectorAvailability(BaseModel):
+    """Whether the caller can build a custom connector that is kept for reuse."""
+
+    can_build: bool
 
 
 class MatchRequest(BaseModel):
@@ -191,13 +269,26 @@ class SubmitFormRequest(BaseModel):
     form_spec: dict[str, Any] | None = None
 
     def resolve_connector_id(self) -> str:
-        if self.connector_id:
-            return self.connector_id
-        if self.form_spec and self.form_spec.get("_connector_id"):
-            return self.form_spec["_connector_id"]
-        if self.form_id:
-            return self.form_id.removesuffix("-connector")
-        raise ValueError("connector_id is required")
+        """Return the connector id this submission saves under.
+
+        Precedence: explicit ``connector_id``, the registry-stamped
+        ``form_spec._connector_id``, the spec's declared ``engine``, then the
+        legacy ``form_id`` fallthrough.
+
+        Raises:
+            InvalidConnectorIdError: when the resolved id is not a usable engine.
+            ValueError: when nothing names a connector.
+        """
+        spec = self.form_spec or {}
+        candidate = (
+            self.connector_id
+            or spec.get("_connector_id")
+            or spec.get("engine")
+            or (self.form_id.removesuffix("-connector") if self.form_id else None)
+        )
+        if not candidate:
+            raise ValueError("connector_id is required")
+        return validate_engine_id(candidate)
 
     def resolve_method(self) -> str | None:
         if self.method:
@@ -231,6 +322,16 @@ class ConnectionSummaryResponse(BaseModel):
     # when healthy. Lets the catalogue card show a warning without requiring
     # the client to fetch each connection's full detail first.
     status: str | None = None
+    # The connection's connector is a custom one built in Cowork.
+    custom: bool = False
+    # The caller can't change it: the operator's own, or one someone else
+    # shares (ConnectionsService.can_change).
+    managed: bool = False
+    # Shared with the caller rather than theirs to change: in the
+    # shared-connection registry (its creator sees it shared too), or, where
+    # connections are left shared, another person's base-vault entry the caller
+    # didn't create (LayeredDataVault.is_shared).
+    shared: bool = False
 
 
 class ConnectionDetailResponse(BaseModel):
@@ -248,6 +349,14 @@ class ConnectionDetailResponse(BaseModel):
     # Names of fields in `fields` that were masked with VAULT_KEEP_SENTINEL —
     # lets the client show a "saved" indicator instead of the raw sentinel.
     secure_keys: list[str] = Field(default_factory=list, serialization_alias="secureKeys")
+    # The caller can't change it: the operator's own, or one someone else
+    # shares (ConnectionsService.can_change).
+    managed: bool = False
+    # Shared with the caller rather than theirs to change: in the
+    # shared-connection registry (its creator sees it shared too), or, where
+    # connections are left shared, another person's base-vault entry the caller
+    # didn't create (LayeredDataVault.is_shared).
+    shared: bool = False
 
 
 class DirectSaveRequest(BaseModel):
@@ -324,3 +433,87 @@ class OAuthStartResponse(BaseModel):
 class DisabledConnection(BaseModel):
     engine: str
     name: str
+
+
+class DatasourceTls(BaseModel):
+    """Transport security for a cloud datasource connection.
+
+    `system` and `custom_ca` verify the chain and the hostname and differ only
+    in which authorities they trust. `encrypted` encrypts without checking who
+    answered, `disabled` does neither, and `prefer` takes encryption where the
+    server offers it. The default is `prefer`, because a self-hosted server
+    usually has the certificate its installer generated for it, or none, and
+    the form no longer asks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["system", "custom_ca", "encrypted", "disabled", "prefer"] = "prefer"
+    ca_pem: str | None = None
+
+
+class DatasourceCreateRequest(BaseModel):
+    """A cloud datasource connection as the client submits it.
+
+    Either structured fields or a DSN, never both; the normalizer in
+    services/connectors/datasources.py turns it into auth's payload.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_id: str
+    method: str
+    name: str = Field(min_length=1, max_length=128)
+    input_mode: Literal["structured", "dsn"] = "structured"
+    dsn: str | None = None
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    # `schema` on the wire, since that is what the engine calls it; the field
+    # is renamed here only because the name shadows an attribute of BaseModel.
+    db_schema: str | None = Field(default=None, alias="schema")
+    username: str | None = None
+    password: str | None = None
+    tls: DatasourceTls | None = None
+
+
+class DatasourceEditRequest(DatasourceCreateRequest):
+    """An edit, guarded by the connection revision the client read.
+
+    Auth moves the revision on every edit, a rename included, so an edit made
+    from a stale read is refused; the credential version is not the guard.
+    """
+
+    expected_revision: int = Field(ge=1)
+
+
+class DatasourceConnectionResponse(BaseModel):
+    """Auth's connection metadata, allowlisted.
+
+    extra="ignore" so a field auth adds later is dropped here rather than
+    forwarded to a client this server never vetted it for.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    connector_id: str
+    method: str
+    name: str
+    status: str
+    credential_version: int
+    revision: int
+    host_masked: str
+    port: int | None = None
+    database: str
+    db_schema: str | None = Field(default=None, alias="schema")
+    username: str
+    tls_mode: str
+    validation_error: str | None = None
+    # The gateway's own word for a refusal, on the three routes that run a
+    # validation attempt. Auth stores a verdict and not a cause, so without
+    # this a failed connection can say nothing a caller could act on. Absent
+    # everywhere no attempt was made.
+    validation_code: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

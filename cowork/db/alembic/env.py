@@ -11,16 +11,19 @@ import cowork.models.artifact_identity  # noqa: F401
 
 # Import models so SQLModel.metadata is fully populated for autogenerate.
 import cowork.models.conversation  # noqa: F401
+import cowork.models.custom_connector  # noqa: F401
 import cowork.models.file  # noqa: F401
 import cowork.models.message  # noqa: F401
 import cowork.models.message_event  # noqa: F401
 import cowork.models.pin  # noqa: F401
+import cowork.models.published_page  # noqa: F401
 import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
 import cowork.models.shared_resource  # noqa: F401
 import cowork.models.skill  # noqa: F401
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.migrations import lock_migrations
 
 
 def _ensure_sqlite_dir(url: str) -> None:
@@ -65,17 +68,19 @@ def run_migrations_online() -> None:
     if connection is not None:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
         with context.begin_transaction():
+            lock_migrations(connection)
             context.run_migrations()
         return
 
     url = _database_url()
     _ensure_sqlite_dir(url)
-    connectable = create_engine(url, poolclass=pool.NullPool)
+    connectable = create_engine(url, poolclass=pool.NullPool, hide_parameters=True)
 
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
 
         with context.begin_transaction():
+            lock_migrations(connection)
             context.run_migrations()
 
 

@@ -1,8 +1,12 @@
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import AsyncIterator, Literal, Protocol
+from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
 
 from cowork.models.conversation import Conversation
+
+if TYPE_CHECKING:
+    from cowork.streaming.liveness import ModelWaitTicker
 
 
 class TextInputBlock(TypedDict):
@@ -14,6 +18,12 @@ class FileInputBlock(TypedDict):
     type: Literal["file"]
     path: str
     filename: str
+
+
+def prompt_text(blocks: Iterable[Mapping[str, Any]]) -> str:
+    """The text of a turn's input blocks: what the user sent, with any
+    context the client appended to it."""
+    return " ".join(block["text"] for block in blocks if block.get("type") == "text")
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,8 @@ class ChannelContext:
 class HarnessProvider(Protocol):
     id: str
     label: str
+    # Called as formatter(stream, model, event_sink, form_blocks=...); the
+    # in-process UI turn passes form_blocks=True (format_responses_stream).
     formatter: AsyncIterator[str]
     # Whether this harness is offered in org (multi-tenant) deployments.
     # Defaults True for implementers that don't set it (see _harness_options).
@@ -67,6 +79,11 @@ class HarnessProvider(Protocol):
         # as an agent message (the cowork UI). A channel bot or the
         # non-streaming API gets only the answer text.
         tool_messages: bool = False,
+        # Liveness hook for silent model calls (cowork/streaming/liveness.py).
+        # A harness with an anton session attaches it so the producer can keep
+        # the turn alive while a model call is quiet; other harnesses accept
+        # and ignore it.
+        model_wait: "ModelWaitTicker | None" = None,
     ) -> AsyncIterator[str]:
         ...
 

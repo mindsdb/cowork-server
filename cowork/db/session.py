@@ -1,13 +1,21 @@
 """Database connection and session management using SQLAlchemy"""
 
-from sqlalchemy import create_engine
+import hashlib
+import re
+import time
+
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy import create_engine, event
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
+from starlette.exceptions import HTTPException
 
-from cowork.common.logger import setup_logging
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.logger import get_logger, setup_logging
+from cowork.common.settings.app_settings import DatabaseSettings, get_app_settings
 
 logger = setup_logging()
+statement_logger = get_logger("cowork.db.statements")
 settings = get_app_settings()
 
 # Global cache for engines and session factories
@@ -16,10 +24,79 @@ _session_factories = {}
 
 
 
-def _is_client_error(exc: BaseException) -> bool:
-    """True for HTTP exceptions answered as 4xx; those are expected outcomes."""
-    status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and 400 <= status < 500
+def _is_expected_refusal(exc: BaseException) -> bool:
+    """True for an answer the request was meant to get: a 4xx HTTPException, the
+    422 for a body that failed validation, or the 503 for a pool that freed no
+    connection in time (cowork.server answers it). Another error's status_code,
+    such as a provider SDK's, is not one."""
+    if isinstance(exc, PoolTimeoutError):
+        return True
+    # Its str() and traceback carry the submitted body, a password or a DSN on
+    # a connector form; FastAPI answers it with 422.
+    if isinstance(exc, RequestValidationError):
+        return True
+    if not isinstance(exc, HTTPException):
+        return False
+    status = exc.status_code
+    return type(status) is int and 400 <= status < 500
+
+def postgres_session_options(database: DatabaseSettings) -> str:
+    """The libpq ``options`` that set each app connection's session timeouts,
+    or "" when both are off."""
+    options = []
+    if database.statement_timeout_ms:
+        options.append(f"-c statement_timeout={database.statement_timeout_ms}")
+    if database.idle_in_transaction_timeout_ms:
+        options.append(f"-c idle_in_transaction_session_timeout={database.idle_in_transaction_timeout_ms}")
+    return " ".join(options)
+
+
+_OPERATION_TABLE = re.compile(r"\b(?:FROM|INTO|UPDATE|JOIN)\s+\"?([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def statement_operation(statement: str) -> str:
+    """The statement's verb and first table, such as ``SELECT schedule_runs``.
+    Built from the SQL text alone, so no bound value reaches the log."""
+    words = statement.split(None, 1)
+    verb = words[0].upper() if words else "UNKNOWN"
+    table = _OPERATION_TABLE.search(statement)
+    return f"{verb} {table.group(1)}" if table else verb
+
+
+def statement_fingerprint(statement: str) -> str:
+    """A short, stable name for one statement's SQL text, so its slow runs
+    can be counted together."""
+    return hashlib.sha256(" ".join(statement.split()).encode()).hexdigest()[:12]
+
+
+def log_slow_statements(engine, *, threshold_ms: int) -> None:
+    """Log each statement on ``engine`` that takes at least ``threshold_ms``.
+
+    The line carries the statement's verb and first table and a fingerprint
+    of its SQL text, never the SQL or its parameters.
+    """
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _started(conn, cursor, statement, parameters, context, executemany):
+        conn.info["statement_started"] = time.perf_counter()
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def _finished(conn, cursor, statement, parameters, context, executemany):
+        started = conn.info.pop("statement_started", None)
+        if started is None:
+            return
+        duration_ms = (time.perf_counter() - started) * 1000
+        if duration_ms >= threshold_ms:
+            statement_logger.warning(
+                "Database statement was slow",
+                extra={
+                    "event": "db_statement_slow",
+                    "duration_ms": round(duration_ms),
+                    "operation": statement_operation(statement),
+                    "statement_fingerprint": statement_fingerprint(statement),
+                },
+            )
+
 
 def _create_engine(db_uri: str):
     is_sqlite = db_uri.startswith("sqlite")
@@ -28,20 +105,26 @@ def _create_engine(db_uri: str):
             engine = create_engine(
                 db_uri,
                 connect_args={"check_same_thread": False},
+                hide_parameters=True,
             )
         else:
+            options = postgres_session_options(settings.database)
             engine = create_engine(
                 db_uri,
+                connect_args={"options": options} if options else {},
+                hide_parameters=True,
                 pool_size=settings.database.pool_size,
                 max_overflow=settings.database.max_overflow,
                 pool_timeout=settings.database.pool_timeout,
                 pool_recycle=settings.database.pool_recycle,
                 pool_pre_ping=settings.database.pool_pre_ping,
             )
+            if settings.database.slow_statement_log_ms:
+                log_slow_statements(engine, threshold_ms=settings.database.slow_statement_log_ms)
         return engine
     except Exception as e:
         error_msg = str(e).lower()
-        logger.error(f"Failed to create engine: {error_msg}")
+        logger.error("Failed to create engine: error_type=%s", type(e).__name__)
         raise RuntimeError(f"Engine creation failed: {error_msg}") from e
 
 
@@ -80,12 +163,15 @@ def get_session_factory(engine):
     return _session_factories[engine_id]
 
 
-def get_session(db_uri: str = settings.database.uri):
+def get_session():
     """
     FastAPI dependency that provides a database session with automatic cleanup.
 
     This is a generator-based dependency that ensures sessions are always closed
     after the request completes, preventing database connection leaks.
+
+    It takes no parameters: FastAPI reads a dependency's parameters from the
+    request, so the database URI comes from settings only.
 
     Usage:
         @router.get("/example")
@@ -93,14 +179,11 @@ def get_session(db_uri: str = settings.database.uri):
             # Session will be automatically closed after this function completes
             pass
 
-    Args:
-         db_uri: Database connection URI (defaults to settings value)
-
     Yields:
         SQLModelSession: Database session that will be automatically closed
     """
 
-    engine = get_engine(db_uri=db_uri)
+    engine = get_engine(db_uri=settings.database.uri)
     session_factory = get_session_factory(engine)
 
     db = session_factory()
@@ -109,12 +192,38 @@ def get_session(db_uri: str = settings.database.uri):
         yield db
     except Exception as e:
         # A 4xx HTTPException is the endpoint's intended answer (a 409 for a
-        # steer during an approval, a 404 for a missing task); it still rolls
-        # the transaction back, but it is not an error worth a traceback.
-        if _is_client_error(e):
-            logger.debug(f"Session rolled back after a client error: {e}")
+        # steer during an approval, a 404 for a missing task), and so is the
+        # 503 for a full pool. Each still rolls the transaction back, but none
+        # is an error worth an error-level log. A plain pool timeout carries no
+        # status_code; cowork.server answers it with a 503.
+        # Exception text and tracebacks can expose SQL, credentials or database
+        # error details, even when create_engine hides bound parameters.
+        if _is_expected_refusal(e):
+            logger.debug(
+                "Session rolled back after an expected refusal: error_type=%s status=%s",
+                type(e).__name__,
+                422 if isinstance(e, RequestValidationError) else getattr(e, "status_code", 503),
+            )
+        elif isinstance(e, HTTPException):
+            # Starlette answers an HTTPException (FastAPI's subclasses it)
+            # itself and logs nothing, so this line is the only record of what
+            # caused a 5xx. The cause's traceback goes through the handler
+            # filters, which replace a database or provider chain; the
+            # exception's own detail is the client's answer and stays out.
+            cause = e.__cause__ or (None if e.__suppress_context__ else e.__context__)
+            logger.error(
+                "Session error: error_type=%s status=%d cause=%s",
+                type(e).__name__,
+                e.status_code,
+                type(cause).__name__ if cause is not None else "none",
+                exc_info=cause,
+            )
         else:
-            logger.exception(f"❌ Session error: {str(e)}")
+            # Any other exception goes on to Uvicorn, which logs its traceback
+            # through the same filters, or to an app exception handler that
+            # answers it. That includes an error that carries a status_code
+            # without being an HTTPException, such as a provider SDK's.
+            logger.error("Session error: error_type=%s", type(e).__name__)
         db.rollback()
         raise
     finally:

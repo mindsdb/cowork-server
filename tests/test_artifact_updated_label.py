@@ -6,6 +6,7 @@ import os
 import time
 from pathlib import Path
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.artifacts import _human_mtime, card_for_folder
 
 
@@ -45,14 +46,14 @@ def test_updated_changes_after_content_rewrite_without_touching_metadata(tmp_pat
     old = time.time() - 90_000
     _touch(meta, old)
     _touch(content, old)
-    before = card_for_folder(root)["updated"]
+    before = card_for_folder(root, scope=LOCAL_SCOPE)["updated"]
 
     # Rewrite content only, bumping it to "now"; metadata.json's mtime is
     # untouched — this is exactly the Bug 2 scenario ("updated" used to be
     # stuck on metadata's clock and never moved after a content-only
     # rewrite).
     _touch(content, time.time())
-    after = card_for_folder(root)["updated"]
+    after = card_for_folder(root, scope=LOCAL_SCOPE)["updated"]
 
     assert before != after
     assert after == "updated just now"
@@ -65,4 +66,4 @@ def test_updated_is_empty_for_freshly_created_empty_artifact(tmp_path: Path):
     (root / "metadata.json").write_text(
         json.dumps({"id": "empty-art", "type": "document"}), encoding="utf-8"
     )
-    assert card_for_folder(root)["updated"] == ""
+    assert card_for_folder(root, scope=LOCAL_SCOPE)["updated"] == ""

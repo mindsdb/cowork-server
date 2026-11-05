@@ -10,8 +10,10 @@ import pytest
 from cowork.handlers._turn_history import (
     _MAX_RESULT_BYTES,
     _MAX_TURN_BYTES,
+    remote_turn_history,
     sanitize_turn_history_rows,
 )
+from cowork.harnesses.anton_harness.stream_formatter import TurnHistory
 
 
 def _pair(uid="t1", result="BODY"):
@@ -299,3 +301,28 @@ def test_a_rejection_logs_at_warning_not_info(monkeypatch):
     assert len(warnings) == 1
     assert "do not pair" in warnings[0]
     assert infos == []
+
+
+# --- a pod's history frame as the formatter takes it ------------------------
+
+def test_an_uncompacted_frame_stores_its_sanitized_rows_and_is_read_as_sent():
+    rows = _pair(result="x" * (_MAX_RESULT_BYTES + 1))
+
+    history = remote_turn_history(pod_rows=rows, compacted=False)
+
+    assert history == TurnHistory(rows=sanitize_turn_history_rows(rows), read=rows)
+    assert history.rows[1]["content"][0]["content"].startswith("[tool output omitted")
+
+
+def test_an_uncompacted_frame_whose_rows_are_not_a_list_stores_and_reads_none():
+    assert remote_turn_history(pod_rows="junk", compacted=False) == TurnHistory(rows=[], read=None)
+
+
+def test_a_compacted_frame_stores_no_rows_and_is_read_as_sent():
+    rows = _pair()
+
+    assert remote_turn_history(pod_rows=rows, compacted=True) == TurnHistory(rows=[], read=rows)
+
+
+def test_a_compacted_frame_whose_rows_are_not_a_list_is_not_passed_on():
+    assert remote_turn_history(pod_rows={"rows": "junk"}, compacted=True) is None

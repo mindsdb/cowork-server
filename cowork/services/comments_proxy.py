@@ -47,11 +47,23 @@ def _secret_str(val: SecretStr | str | None) -> str:
     return val.get_secret_value() if isinstance(val, SecretStr) else str(val)
 
 
+def _v1_base(url: str | None) -> str:
+    """``url`` ending in exactly one ``/v1`` ("" stays "", so the caller answers 503).
+
+    No ``mdb.ai`` -> ``/api/v1`` rule as in ``minds_chat_base_url``: comments
+    live under ``/v1`` only.
+    """
+    base = (url or "").strip().rstrip("/")
+    if not base or base.endswith("/v1"):
+        return base
+    return f"{base}/v1"
+
+
 def resolve_inference_endpoint(settings=None) -> tuple[str, str]:
     """(base_url, api_key) for the active provider's env — mirrors publish's resolver.
 
     A custom OpenAI-compatible MindsHub endpoint (dev/staging) wins over the default
-    minds_url (prod); the base already includes `/v1`.
+    minds_url (prod). Either base is returned ending in `/v1`.
     """
     settings = settings or get_user_settings()
     oai = settings.openai_base_url or ""
@@ -59,8 +71,8 @@ def resolve_inference_endpoint(settings=None) -> tuple[str, str]:
     # Any MindsHub host counts — dev/staging use hyphenated subdomains
     # (e.g. api-gitlab.dev.mindshub.ai), not just the prod `api.` prefix.
     if host == "mindshub.ai" or host.endswith(".mindshub.ai"):
-        return oai.rstrip("/"), _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
-    return (settings.minds_url or "").rstrip("/"), _secret_str(settings.minds_api_key)
+        return _v1_base(oai), _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
+    return _v1_base(settings.minds_url), _secret_str(settings.minds_api_key)
 
 
 def _org_mode() -> bool:

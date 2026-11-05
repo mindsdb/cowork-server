@@ -54,7 +54,7 @@ class _FakeResponse:
 
 
 def test_revoke_calls_supabase_with_json_body_and_refresh_token(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
     captured = {}
 
     def _fake_urlopen(request, timeout=10):
@@ -81,7 +81,7 @@ def test_revoke_calls_supabase_with_json_body_and_refresh_token(monkeypatch):
 
 
 def test_revoke_skips_network_call_without_oauth_settings(monkeypatch):
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVault)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
 
     def _boom(request, timeout=10):
         raise AssertionError("must not call Supabase without credentials to authenticate the request")
@@ -98,7 +98,7 @@ def test_revoke_skips_network_call_without_refresh_token(monkeypatch):
     # access_token and send it to Supabase under the "refresh_token" label.
     # Supabase rejects it, and the failure was only logged as a warning —
     # disconnect looked like it worked while the grant stayed live.
-    monkeypatch.setattr(google_module, "LocalDataVault", _FakeVaultNoRefreshToken)
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVaultNoRefreshToken(None))
 
     def _boom(request, timeout=10):
         raise AssertionError("must not call Supabase's revoke endpoint without a refresh_token")

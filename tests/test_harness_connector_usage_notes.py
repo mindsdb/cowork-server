@@ -1,0 +1,211 @@
+"""Connector usage notes reach anton's ChatSessionConfig, and the general Drive
+API rules moved out of the Picker block into google_drive's spec, so they
+appear once and for every Drive connection."""
+import json
+import shutil
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import pytest
+from pydantic import SecretStr
+
+from cowork.common.settings.user_settings import Provider, UserSettings
+from cowork.harnesses.anton_harness import harness
+from cowork.services.connectors.specs._registry import registry
+
+
+def test_google_drive_spec_carries_the_drive_api_rules():
+    notes = registry.usage_notes_for(["google_drive"])["google_drive"]
+
+    assert "supportsAllDrives=true" in notes
+    assert "includeItemsFromAllDrives=true" in notes
+    assert "corpora='allDrives'" in notes
+
+
+def test_google_drive_spec_explains_the_picker_instead_of_broader_access():
+    notes = registry.usage_notes_for(["google_drive"])["google_drive"]
+
+    assert "Add files from Google Drive" in notes
+    assert "files.export" in notes
+    assert "alt=media" in notes
+    assert "never suggest reconnecting with broader permissions" in notes
+
+
+def test_roam_research_spec_carries_the_redirect_rule():
+    notes = registry.usage_notes_for(["roam_research"])["roam_research"]
+
+    assert "308" in notes
+    assert "Location" in notes
+    assert "re-attached" in notes
+    # The token may only follow the redirect to Roam's own peer hosts.
+    assert "`.api.roamresearch.com`" in notes
+    assert "case-sensitive" in notes
+
+
+def test_roam_research_spec_supports_append_only_tokens():
+    notes = registry.usage_notes_for(["roam_research"])["roam_research"]
+
+    assert "append-api.roamresearch.com/api/graph/{graph_name}/append-blocks" in notes
+    # The connection check tells an append-only token apart without writing,
+    # and must take the 400 as a pass instead of hunting for data.
+    assert '"append-data": []' in notes
+    assert "`Invalid request`" in notes
+    assert "call `report_success` now" in notes
+
+
+def test_roam_research_notes_send_a_refused_write_to_the_append_api():
+    # Roam refuses `/write` from read-only and append-only tokens alike, and a
+    # token can be swapped after the agent learned its scope, so a refusal must
+    # lead to append-blocks rather than to "read-only, reconnect".
+    notes = registry.usage_notes_for(["roam_research"])["roam_research"]
+
+    assert "never judge its access from memory" in notes
+    assert "`write access`, before telling the user, call append-blocks" in notes
+    assert "to add blocks, the real call" in notes
+
+
+def test_picker_guidance_lists_files_but_no_longer_the_drive_api_rules():
+    text = harness._picked_files_guidance({
+        "work": [{"id": "f1", "name": "Roadmap.gdoc", "resourceKey": "rk1"}],
+    })
+
+    assert "Roadmap.gdoc" in text
+    assert "resourceKey: rk1" in text
+    assert "corpora" not in text
+    assert "supportsAllDrives" not in text
+
+
+def test_no_picked_files_no_picker_guidance():
+    assert harness._picked_files_guidance({}) == ""
+
+
+def _drive_vault(tmp_path, **extra_fields):
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("google_drive", "work", {"auth_type": "oauth", "access_token": "tok", **extra_fields})
+    return vault
+
+
+@asynccontextmanager
+async def _session_config(monkeypatch, vault, *, vault_factory=None, **build_kwargs):
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.services.conversations import ConversationService
+
+    saved = UserSettings(
+        _env_file=None,
+        planning_provider=Provider.OPENAI,
+        coding_provider=Provider.OPENAI,
+        router_provider=Provider.OPENAI,
+        planning_model="p", coding_model="c", router_model="r",
+        openai_api_key=SecretStr("test-only-key"),
+        episodic_memory=False,
+    )
+    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings", lambda: saved)
+    # Capture the config instead of starting scratchpad processes.
+    monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
+    monkeypatch.setattr(
+        "anton.core.datasources.data_vault.LocalDataVault",
+        vault_factory or (lambda *_a, **_k: vault),
+    )
+    monkeypatch.setenv("ANTON_SCRATCHPAD_PERSIST_SESSION", "false")
+
+    with get_open_session() as db:
+        conversation = ConversationService(ScopedSession(db, LOCAL_SCOPE)).create_conversation(
+            topic="usage-notes"
+        )
+        built = await harness.AntonHarness()._build_chat_session(conversation, **build_kwargs)
+        config, temp_vault_dir = built.session, built.turn_scratch_dir
+        try:
+            yield config
+        finally:
+            if temp_vault_dir:
+                shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            client = config.llm_client
+            for provider in (client.planning_provider, client.coding_provider, client.router_provider):
+                await provider._client.close()
+
+
+async def test_usage_notes_reach_the_session_config(monkeypatch, tmp_path):
+    vault = _drive_vault(tmp_path, _picked_files=json.dumps([{"id": "f1", "name": "Roadmap.gdoc"}]))
+    async with _session_config(monkeypatch, vault) as config:
+        assert config.connector_usage_notes == registry.usage_notes_for(["google_drive"])
+        suffix = config.system_prompt_context.suffix
+        assert "Roadmap.gdoc" in suffix  # the Picker block still renders
+        assert "corpora" not in suffix   # ...without the moved Drive API rules
+
+
+async def test_a_custom_connectors_notes_reach_the_session_config(monkeypatch, tmp_path):
+    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.models.custom_connector import CustomConnector
+
+    with get_open_session() as db:
+        row = ScopedSession(db, LOCAL_SCOPE).add(CustomConnector(
+            connector_id="usage_notes_api", label="Usage notes API", spec={"form_id": "x", "fields": []},
+            usage_notes="Page with ?cursor=.",
+        ))
+        db.commit()
+        row_id = row.id
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("usage_notes_api", "main", {"token": "t"})
+
+    try:
+        async with _session_config(monkeypatch, vault) as config:
+            assert config.connector_usage_notes == {"usage_notes_api": "Page with ?cursor=."}
+    finally:
+        with get_open_session() as db:
+            db.delete(db.get(CustomConnector, row_id))
+            db.commit()
+
+
+async def test_drive_notes_reach_the_session_config_without_picked_files(monkeypatch, tmp_path):
+    async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
+        notes = config.connector_usage_notes["google_drive"]
+        assert "corpora='allDrives'" in notes
+        # A fresh connection has no picked files, so the Picker block is empty;
+        # the usage notes alone must tell the agent how to reach an existing file.
+        assert "Google Picker" not in config.system_prompt_context.suffix
+        assert "Add files from Google Drive" in notes
+
+
+@pytest.mark.parametrize(
+    ("disabled", "expect_notes"),
+    [
+        ([{"engine": "google_drive", "name": "work"}], False),
+        # Control: the same setup without the disable still yields the notes,
+        # so the disabled case cannot pass because the fake vault is broken.
+        ([], True),
+    ],
+    ids=["disabled", "enabled"],
+)
+async def test_disabled_connection_gets_no_notes(monkeypatch, tmp_path, disabled, expect_notes):
+    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.common.settings.app_settings import get_app_settings
+
+    source_vault = _drive_vault(tmp_path)
+    source_dir = Path(get_app_settings().connector.vault_dir)
+
+    # The harness reads the source vault, then copies the enabled connections
+    # into a fresh temp vault; only the source path may map to the fake.
+    def vault_for(path):
+        return source_vault if Path(path) == source_dir else LocalDataVault(path)
+
+    async with _session_config(
+        monkeypatch,
+        source_vault,
+        vault_factory=vault_for,
+        disabled_connections=disabled,
+    ) as config:
+        assert ("google_drive" in config.connector_usage_notes) is expect_notes
+
+
+async def test_roam_research_notes_reach_the_session_config(monkeypatch, tmp_path):
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("roam_research", "mygraph", {"api_token": "tok", "graph_name": "MyGraph"})
+    async with _session_config(monkeypatch, vault) as config:
+        assert "308" in config.connector_usage_notes["roam_research"]

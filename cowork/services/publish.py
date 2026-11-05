@@ -10,34 +10,73 @@ import html as _html
 import json
 import logging
 import os
+import stat
 import tempfile
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from urllib.parse import urlparse
 
+from fastapi import HTTPException
 from pydantic import SecretStr
 
+from cowork.code_sandbox import refuse_planted_links
+from cowork.common.logger import log_context
 from cowork.common.paths import cowork_home, pod_local_only
 # Imported for its side effect on the module namespace as well as its use:
 # tests monkeypatch `publish.get_app_settings`, so removing it because a
 # linter sees no local call breaks them. noqa keeps that from recurring.
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
+from cowork.models.artifact_owner_choice import AccessMode
+from cowork.schemas.artifact_access import (
+    PUBLISHER_EMAILS_FIELD,
+    ArtifactAccessRequest,
+    ArtifactAudienceView,
+    ArtifactPublishResult,
+    UnpublishResult,
+)
+from cowork.schemas.refusals import Refusal
+from cowork.services.artifact_audience import (
+    ENTRY_AUDIENCE_FIELDS,
+    ORG_AUDIENCE_FIELDS,
+    PUBLISHER_OWNER_ONLY_FIELD,
+    AudienceChanges,
+    ShareNotify,
+    for_publisher,
+    notify_within,
+    share_notice,
+    sync_team_audience,
+)
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.providers import is_mindshub_publish_url, publish_url_for_endpoint
+from cowork.services.sharing_contract import (
+    ARTIFACTS_SHARE_ORG,
+    LEGACY_RULE_USER_DIR_CHARS,
+    MAX_ARTIFACT_ID_CHARS,
+    REPORT_ID_PATTERN,
+    SHARE_ORG_REQUIRED_CODE,
+    AudienceField,
+    mindshub_artifact_id,
+)
+from cowork.services.providers import (
+    is_mindshub_publish_url,
+    normalize_publish_url,
+    publish_url_for_endpoint,
+)
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
+from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
 from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
-from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
+    PUBLISHABLE_STATIC_SUFFIXES,
     _scan_artifact_dirs,
     html_artifacts,
+    is_non_content_path,
     resolve_artifact_path,
 )
 
@@ -46,6 +85,8 @@ from cowork.services.artifacts import (
 # from the harness turn path where that is dead weight.
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+    from cowork.services.artifact_access import ArtifactRule
+    from cowork.services.artifact_owner_choice import Narrowing
 
 logger = logging.getLogger(__name__)
 
@@ -60,26 +101,295 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
-def raise_publish_permission_error(exc: Exception) -> None:
-    """Preserve the artifact consumer's explicit authority result through wrappers."""
+class _CodedRefusal(HTTPException):
+    """An HTTPException whose detail is `{"code", "message"}`: clients match on the code."""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(status_code, detail={"code": code, "message": message})
+
+
+# A local ownership check or the upload service refuses another account's page; the
+# renderer matches on the code.
+OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
+OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
+
+
+class PublishOwnedByOtherUser(_CodedRefusal):
+    """A local check or the upload service refused another account's report.
+
+    An HTTPException, like ProductPermissionDenied, so any route that lets it
+    through answers 409 with the code. Nobody retries it with a fresh
+    report_id, which would publish a copy under a new URL.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(409, OWNED_BY_OTHER_USER_CODE, OWNED_BY_OTHER_USER_MESSAGE)
+
+
+# The upload service's 413: the bundle is over its request size limit.
+ARTIFACT_TOO_LARGE_CODE = "artifact_too_large"
+ARTIFACT_TOO_LARGE_MESSAGE = (
+    "This artifact is too large to publish. "
+    "Remove or shrink large files in it, such as PDFs or images."
+)
+# Any 503 from the upload service other than an auth outage.
+UPLOAD_UNAVAILABLE_CODE = "publish_unavailable"
+UPLOAD_UNAVAILABLE_MESSAGE = "The publishing service is temporarily unavailable. Try again in a moment."
+
+
+class PublishTooLarge(_CodedRefusal):
+    """The upload service refused the bundle as too large.
+
+    The same files are refused on every retry, so callers report it instead
+    of retrying.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(413, ARTIFACT_TOO_LARGE_CODE, ARTIFACT_TOO_LARGE_MESSAGE)
+
+
+class UploadServiceUnavailable(_CodedRefusal):
+    """The upload service answered 503 without marking it as an auth outage."""
+
+    def __init__(self) -> None:
+        super().__init__(503, UPLOAD_UNAVAILABLE_CODE, UPLOAD_UNAVAILABLE_MESSAGE)
+
+
+class PublishRejected(RuntimeError):
+    """A publish failure whose text is safe to show the user.
+
+    A plain RuntimeError from `publish_artifact` can carry local detail such as
+    a shared-storage path, so org routes show this type's text and hide the
+    other's.
+    """
+
+
+# Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
+# which MindsHub also checks when the rule is written.
+ARTIFACT_ORG_REFUSAL = (
+    f"Sharing an artifact with everyone in the organization requires the {ARTIFACTS_SHARE_ORG} "
+    "permission or an organization admin."
+)
+
+
+class ShareOrgRequired(PublishRejected):
+    """Sharing an artifact with everyone in its organization was refused to
+    someone without MindsHub's artifacts.share_org. MindsHub refuses a
+    publish whose rule newly shares with everyone, and the upload service
+    passes on its reason, which is this error's text, clipped as any upload
+    service text is (classify_upload_error, _clip); the access route's own
+    check refuses the same before anything publishes, with
+    ARTIFACT_ORG_REFUSAL. Nothing was published either way.
+
+    ``status_code`` and ``code`` are what a route answers: 403 with
+    refusal(), never the 502 of a failed publish. The agent's publish tool
+    tells the model not to publish wider instead
+    (cowork.services.sharing_contract.SHARE_ORG_REQUIRED_INSTRUCTION)."""
+
+    status_code: int = 403
+    code: str = SHARE_ORG_REQUIRED_CODE
+
+    def __init__(self, reason: str = ARTIFACT_ORG_REFUSAL) -> None:
+        super().__init__(reason)
+
+    def refusal(self) -> Refusal:
+        """The body a route answers: the reason as ``detail``, and ``code``."""
+        return Refusal(detail=str(self), code=self.code)
+
+
+class AccessModeChanged(PublishRejected):
+    """A re-publish in MindsHub mode that isn't a person's save (live
+    sync, autopublish) found a .published.json entry that isn't restricted
+    while MindsHub still holds a restricted rule for the artifact,
+    under its identity or under a key the entry recorded. Only a restricted
+    publish leaves a rule there, and a public or password one deletes it, so
+    the entry's mode changed after the owner's last save: the pod can write
+    that file, and metadata.json too. A re-publish of a page the entry names
+    no key for is refused the same way, since no rule can be read for it.
+    Refused before anything is uploaded, so the artifact never goes public
+    or password-protected over the rule (_access_mode_refusal).
+
+    Also a re-publish that would open the artifact wider than the sharing its
+    owner last chose, as recorded where the pod can't write
+    (cowork.services.artifact_owner_choice): a password artifact whose entry
+    the pod rewrote to public, or one the record says is unpublished.
+
+    No route shows its text. Live sync and autopublish log the refusal and
+    report a failed publish, and the owner's own save (``owner_save``)
+    never raises it; that save is what ends it."""
+
+    def __init__(self) -> None:
+        super().__init__("The artifact's sharing changed outside the Share dialog")
+
+
+class UploadError(NamedTuple):
+    """An upload-service answer `classify_upload_error` left to its caller."""
+
+    status: int
+    code: str | None
+    error: str | None
+
+
+def _read_http_error_body(exc: Exception) -> tuple[str, str | None, str | None]:
+    """(body, code, error) of an HTTPError, from a single read.
+
+    A second `read()` returns nothing, so every consumer goes through here once.
+    Any failure to read gives an empty body rather than replacing `exc`.
+    """
+    try:
+        body = exc.read(65_536).decode("utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        return "", None, None
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return body, None, None
+    if not isinstance(payload, dict):
+        return body, None, None
+    code = payload.get("code")
+    error = payload.get("error")
+    if not isinstance(error, str) and getattr(exc, "code", None) == 429:
+        # API Gateway's throttling text. Its other `message` answers, such as
+        # "Missing Authentication Token" for a wrong URL, would mislead.
+        error = payload.get("message")
+    return (
+        body,
+        code if isinstance(code, str) else None,
+        error if isinstance(error, str) else None,
+    )
+
+
+def classify_upload_error(exc: Exception) -> UploadError | None:
+    """Raise the typed error for an upload-service refusal, or return it for wording.
+
+    413 is too large. A 503 is an auth outage only when the service says so
+    (`auth_unavailable`); any other 503 is the upload service itself. A 403 is
+    a denial with `permission_denied`, and MindsHub's refusal of a share with
+    everyone with SHARE_ORG_REQUIRED_CODE (ShareOrgRequired, its reason,
+    clipped, as the text). Every other HTTP answer comes back as an
+    UploadError; a failure that got no HTTP answer returns None.
+    """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
-    if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
+    if isinstance(
+        exc,
+        (
+            ProductPermissionDenied,
+            ProductPermissionUnavailable,
+            PublishTooLarge,
+            UploadServiceUnavailable,
+            ShareOrgRequired,
+        ),
+    ):
         raise exc
     if not isinstance(exc, urllib.error.HTTPError):
+        return None
+    status = exc.code
+    body, code, error = _read_http_error_body(exc)
+    typed: HTTPException | ShareOrgRequired | None = None
+    if status == 413:
+        typed = PublishTooLarge()
+    elif status == 503:
+        typed = ProductPermissionUnavailable() if code == "auth_unavailable" else UploadServiceUnavailable()
+    elif status == 403 and code == "permission_denied":
+        typed = ProductPermissionDenied()
+    elif status == 403 and code == SHARE_ORG_REQUIRED_CODE:
+        typed = ShareOrgRequired(_clip(error)) if error else ShareOrgRequired()
+    if typed is None:
+        return UploadError(status, code, error)
+    # A typed refusal leaves publish_artifact before its own failure log. The
+    # deployments' log keeps only this template, so the status and code go in
+    # fields it keeps too.
+    logger.warning(
+        "Publish service answered HTTP %s code=%s body=%r", status, code, body[:200],
+        extra={"status_code": status, "reason": code},
+    )
+    raise typed from exc
+
+
+# The answers of MindsHub's upload service that come before it writes the
+# artifact's rule, its access gate or its files. 401, 402 and 403 come from
+# its first step, which authorizes the caller, or from the edge (Cloudflare
+# or API Gateway) before the upload service runs. A 403 share_org_required
+# and a 409 with no code can also be MindsHub refusing the rule's write,
+# which rolls that write back. Every other 409 is a check of the report, its
+# key or its owner, made before the rule's write. 410 says the publish host
+# moved, which it checks first. 413 and 429 are the edge's size limit and
+# throttling, answered before the upload service runs. A 400 is not here: a
+# full-stack bundle can be refused with one after its files are uploaded.
+# Another publisher can answer any of these after it writes, so only
+# MindsHub's own service is judged by them (_restore_after_refused_save).
+_REFUSED_BEFORE_WRITING = frozenset({401, 402, 403, 409, 410, 413, 429})
+
+
+def _refused_before_writing(exc: Exception) -> bool:
+    """Whether a publish that raised ``exc`` ended before MindsHub's upload
+    service changed who can open the artifact or what it serves. By status
+    alone, never the code in the answer's body: anton raises the service's
+    409 for another owner's artifact as ArtifactOwnedByOtherUserError, and
+    every other answer as an HTTPError with the service's status. anton's
+    own refusal of a state schema change comes before the request."""
+    from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked
+
+    if isinstance(exc, (ArtifactOwnedByOtherUserError, StatePublishBlocked)):
+        return True
+    return isinstance(exc, urllib.error.HTTPError) and exc.code in _REFUSED_BEFORE_WRITING
+
+
+def _restore_after_refused_save(
+    *,
+    narrowing: Narrowing | None,
+    exc: Exception,
+    publish_url: str,
+    scope: TenantScope | None,
+    project_id: str | None,
+    artifact_slug: str,
+) -> None:
+    """After the owner's save narrowed the record (``narrowing``) and
+    MindsHub's upload service refused it before writing anything (``exc``),
+    put the record back (artifact_owner_choice.restore_after_refused_save).
+    Any other ending leaves it narrowed, and so does any refusal from a
+    publisher that isn't MindsHub's (is_mindshub_publish_url), whose order
+    of writes this can't know. A restore that fails leaves it narrowed too,
+    which only refuses wider re-publishes, and is logged: the save answers
+    with the upload's refusal either way."""
+    if (
+        narrowing is None
+        or scope is None
+        or not is_mindshub_publish_url(publish_url)
+        or not _refused_before_writing(exc)
+    ):
         return
-    if exc.code == 503:
-        raise ProductPermissionUnavailable() from exc
-    if exc.code == 403:
-        try:
-            body = json.loads(exc.read(65_536))
-        except (OSError, ValueError):
-            return
-        if isinstance(body, dict) and body.get("code") == "permission_denied":
-            raise ProductPermissionDenied() from exc
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
+    from cowork.services.artifact_owner_choice import restore_after_refused_save
+
+    try:
+        restore_after_refused_save(narrowing=narrowing, scope=scope)
+    except ArtifactAccessUnavailable:
+        logger.warning(
+            "Could not restore the sharing an artifact's owner chose after the upload service refused their save",
+            exc_info=True,
+            extra={
+                "event": "artifact_owner_choice_restore_failed",
+                **log_context(project_id=project_id, artifact_slug=artifact_slug),
+            },
+        )
 
 
-def _cowork_state_dir() -> Path:
+def _clip(text: str) -> str:
+    """Server text short enough to show, keeping the end where pip names the cause."""
+    head, tail, gap = 100, 400, " … "
+    if len(text) <= head + len(gap) + tail:
+        return text
+    return f"{text[:head]}{gap}{text[-tail:]}"
+
+
+#: The files the publish store holds: its state, and the temporary file a
+#: save writes and moves over it.
+_STATE_FILES = ("state.json", "state.json.tmp")
+
+
+def _cowork_state_dir(*, scope: TenantScope | None) -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
         path = Path(base).expanduser()
@@ -91,16 +401,29 @@ def _cowork_state_dir() -> Path:
         # no org_id segment, so left on cowork_home() every organization
         # would read every other organization's publish history.
         path = pod_local_only(cowork_home(), "publish")
+    if get_app_settings().tenancy_mode != "org":
+        # Publish history is part of the projects resource: a person whose
+        # projects are personal reads and writes `<shared>/<partition>/publish`,
+        # and LOCAL_SCOPE keeps the path above. scoped_storage_root refuses
+        # `scope=None` on a deployment that trusts identity headers.
+        from cowork.db.scoped import scoped_storage_root
+
+        path = scoped_storage_root(path, scope, store="publish")
+    # Under the code sandbox, a link or hard-linked file that agent code left
+    # on the way to state.json, or at it, fails the read or write instead of
+    # being followed. Only the store's own files are checked: the operator
+    # view's store is cowork-home itself.
+    refuse_planted_links(path, only=_STATE_FILES)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _state_path() -> Path:
-    return _cowork_state_dir() / "state.json"
+def _state_path(*, scope: TenantScope | None) -> Path:
+    return _cowork_state_dir(scope=scope) / "state.json"
 
 
-def _load_state() -> dict[str, Any]:
-    path = _state_path()
+def _load_state(*, scope: TenantScope | None) -> dict[str, Any]:
+    path = _state_path(scope=scope)
     if not path.exists():
         return {}
     try:
@@ -110,8 +433,8 @@ def _load_state() -> dict[str, Any]:
         return {}
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    path = _state_path()
+def _save_state(state: dict[str, Any], *, scope: TenantScope | None) -> None:
+    path = _state_path(scope=scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
@@ -167,8 +490,26 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             pass
 
 
-def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
-    """(artifact, artifacts_base) for a desktop request path.
+class DesktopArtifact(NamedTuple):
+    """An artifact and the artifacts root it sits under (desktop_artifact_and_base)."""
+
+    artifact: Path
+    artifacts_base: Path
+
+
+class ResolvedReport(NamedTuple):
+    """A published artifact's state file, its key, and its report id (_resolve_report_id)."""
+
+    published_json: Path
+    published_key: str
+    report_id: str
+
+
+def desktop_artifact_and_base(
+    raw_path: str, *, scope: TenantScope | None
+) -> DesktopArtifact:
+    """(artifact, artifacts_base) for a desktop request path, resolved only
+    inside ``scope``'s artifacts roots.
 
     Split from credential resolution so callers can validate cheap, local things
     first: `update_artifact` must still answer "no published version to update"
@@ -177,15 +518,15 @@ def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
     The loop only IDENTIFIES which root the artifact sits under;
     `resolve_artifact_path` has already rejected anything outside them.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     if artifact is None:
         raise FileNotFoundError("Artifact not found")
-    for root in _scan_artifact_dirs():
+    for root in _scan_artifact_dirs(scope=scope):
         try:
             artifact.resolve().relative_to(root.resolve())
         except (ValueError, OSError):
             continue
-        return artifact, root
+        return DesktopArtifact(artifact, root)
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
@@ -197,21 +538,55 @@ def desktop_publish_credential() -> tuple[str, str]:
     return api_key, publish_url
 
 
-def desktop_publish_context(raw_path: str) -> tuple[Path, Path, str, str]:
-    """(artifact, artifacts_base, api_key, publish_url) for the desktop path.
+class PublishContext(NamedTuple):
+    """What a desktop publish needs (desktop_publish_context)."""
+
+    artifact: Path
+    artifacts_base: Path
+    api_key: str
+    publish_url: str
+
+
+def desktop_publish_context(
+    raw_path: str, *, scope: TenantScope | None
+) -> PublishContext:
+    """The artifact, its artifacts root and the credential, for the desktop path.
 
     Keeps the pre-existing behavior - path resolution against the registered
-    artifact roots, credential resolution from the active provider - in one
-    place, so the publish functions themselves stay free of both. The org path
-    supplies these four values from the DB and a minted turn key instead.
+    artifact roots of ``scope``, credential resolution from the active
+    provider - in one place, so the publish functions themselves stay free of
+    both. The org path supplies these four values from the DB and a minted turn
+    key instead.
     """
-    artifact, root = desktop_artifact_and_base(raw_path)
+    found = desktop_artifact_and_base(raw_path, scope=scope)
     api_key, publish_url = desktop_publish_credential()
-    return artifact, root, api_key, publish_url
+    return PublishContext(
+        artifact=found.artifact,
+        artifacts_base=found.artifacts_base,
+        api_key=api_key,
+        publish_url=publish_url,
+    )
+
+
+def _a_hard_linked_file(folder: Path) -> Path | None:
+    """The first regular file below ``folder`` with more than one name, or
+    None. Links are not followed, and the revision journal, which anton never
+    bundles, is left out."""
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = [name for name in dirs if name.casefold() != REVISIONS_DIRNAME.casefold()]
+        for name in names:
+            path = Path(root) / name
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                return path
+    return None
 
 
 def _resolve_publish_target(
-    artifact: Path, container_dirs: list[Path] | None = None
+    artifact: Path, *, container_dirs: list[Path]
 ) -> tuple[Path, Path, str, bool]:
     """Decide what to publish + where `.published.json` lives + its key.
 
@@ -219,16 +594,13 @@ def _resolve_publish_target(
     (`anton.publish_access.resolve_publish_target`); cowork supplies its own
     container dirs so the metadata-climb is bounded to `.anton/artifacts/` roots.
 
-    `container_dirs` MUST be passed on the org path: the default
-    (`_scan_artifact_dirs()`) only sees the desktop layout, because org projects
-    live one level deeper under `<root>/<org_id>/`, and it would return nothing
-    there. Omitting it keeps the desktop behavior unchanged.
+    `container_dirs` is required: the org path passes the artifact's own root,
+    and a desktop path passes the scan of its scope
+    (`_scan_artifact_dirs(scope=...)`), which only sees the desktop layout.
 
     Returns (publish_target, published_dir, published_key, is_fullstack).
     """
-    return _anton_resolve_publish_target(
-        artifact, container_dirs if container_dirs is not None else _scan_artifact_dirs()
-    )
+    return _anton_resolve_publish_target(artifact, container_dirs)
 
 
 def _resolve_publish_endpoint(settings) -> tuple[str, str]:
@@ -239,12 +611,22 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     authenticates with that provider's own key — so pointing the provider at
     dev/staging publishes there too. api key is "" when the chosen provider has none.
 
+    A non-blank ``COWORK_PUBLISH_TOKEN`` (AppSettings.publish_token) replaces
+    that key on every provider. A self-hosted publisher then never takes the
+    model key, which the agent's code holds as its own OPENAI_API_KEY on a
+    MindsHub endpoint. Under COWORK_CODE_SANDBOX=landlock, anton's launcher
+    passes no COWORK_* name to the agent's code (`anton.core.backends.sandbox`),
+    so the token stays out of it too.
+
     Resolution order for the publish base URL (first non-empty wins):
       1. ``ANTON_PUBLISH_URL`` env var — an operator/dev override that trumps
          the stored setting (the DB row would otherwise shadow env; see
          SettingService, which passes DB rows as init kwargs);
       2. the ``publish_url`` setting;
       3. the host derived from the active provider endpoint.
+
+    A result on the retired 4nton.ai host becomes the prod publish host
+    (`normalize_publish_url`): a saved setting may still name it.
     """
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
@@ -252,17 +634,20 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
         api_key = _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
+    api_key = _secret_str(get_app_settings().publish_token).strip() or api_key
     env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
-    publish_url = env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    publish_url = normalize_publish_url(
+        env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    )
     return publish_url, api_key
 
 
-def list_publishable() -> dict:
+def list_publishable(*, scope: TenantScope | None) -> dict:
     settings = get_user_settings()
-    state = _load_state()
+    state = _load_state(scope=scope)
     publish_url, api_key = _resolve_publish_endpoint(settings)
     return {
-        "artifacts": html_artifacts(),
+        "artifacts": html_artifacts(scope=scope),
         "publishReady": bool(api_key),
         "publishUrl": publish_url,
         "history": state.get("publish_history", [])[:40],
@@ -273,11 +658,12 @@ def list_publishable() -> dict:
 # source of truth) and are imported at the top of this module.
 
 
-# Static artifact extensions a user can publish to a MindsHub web page.
-# `.html` is served as-is; `.md` is rendered to a styled HTML page first
-# (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
-# publish their directory regardless of the primary file's suffix.
-PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+def is_publishable_static(target: Path, artifacts_base: Path) -> bool:
+    """A non-fullstack target publishes only when it is an HTML/Markdown file
+    that is artifact content (not README, a generation input or a revision copy)."""
+    return target.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES and not is_non_content_path(
+        target, artifacts_base
+    )
 
 # What Share and the agent's publish tool report for a full-stack artifact when
 # the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
@@ -380,6 +766,321 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
+def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
+    """The access a re-publish that isn't a person's save keeps (live sync,
+    autopublish, an update): the entry's mode and password. In MindsHub mode
+    a restricted entry doesn't say who the rule shares with, so this names
+    nobody and publish_artifact takes all of it from MindsHub's rule
+    (_plan_access); ``owner_only`` keeps a rule that names nobody restricted
+    to its owner, never public. The pod can write the entry, so in MindsHub
+    mode publish_artifact checks the mode this builds before anything
+    uploads: one that isn't restricted while MindsHub still holds a rule, or
+    one wider than the sharing the owner last chose
+    (cowork.services.artifact_owner_choice), is refused (AccessModeChanged).
+    Elsewhere the entry is the record (anton's access_from_owner_side)."""
+    publisher_access = access_from_owner_side(entry)
+    if org_mode and publisher_access.get("mode") == AccessMode.RESTRICTED:
+        # The entry's audience fields aren't the record here, so they are
+        # neither kept nor read.
+        return ArtifactAccessRequest(mode=AccessMode.RESTRICTED, owner_only=True)
+    return ArtifactAccessRequest.of_publisher(publisher_access)
+
+
+class AccessPlan(NamedTuple):
+    """One publish's access (_plan_access)."""
+
+    # What anton's publisher is given, as anton's resolve_access answers it,
+    # and the versions it sends.
+    effective_access: dict[str, Any]
+    pwd_version: int
+    access_version: int
+    # What the entry stores: the mode, the password and the versions, and
+    # outside MindsHub mode who a restricted rule shares with.
+    owner_side: dict
+    # Who the restricted rule shares with after this publish, as far as this
+    # server knows; None for a publish that isn't restricted.
+    audience: ArtifactRule | None
+    # The team and people lists this publish changes, for
+    # sync_team_audience to write.
+    changes: AudienceChanges
+
+
+def _plan_access(
+    password: str | None,
+    access: ArtifactAccessRequest | None,
+    previous: Any,
+    *,
+    stored: ArtifactRule | None,
+) -> AccessPlan:
+    """anton's resolve_access, with the org audience around it. ``access``
+    reaches anton in its publisher's shape here, once (for_publisher).
+
+    In MindsHub mode ``stored`` is the artifact's rule as MindsHub stores it,
+    read for every restricted publish (publish_artifact): the one record of
+    who the artifact is shared with. A restricted publish takes each of the
+    emails, the org flag, the teams and the people from ``access`` when it
+    names it, else from ``stored``. So a re-publish that isn't a person's save
+    (kept_access) sends what the rule holds and writes no team or person, and
+    a team MindsHub dropped from the rule when it was deleted is never sent
+    back. Only a team or people list that differs from the stored one is
+    written (``changes``), and that bumps the version, as a changed email
+    list does. The version is judged against what the rule holds, never
+    against the entry, which keeps the mode, the password and the versions
+    only.
+
+    Outside MindsHub mode, and for a publish that isn't restricted,
+    ``stored`` is None: the entry is the record anton's publisher keeps, and
+    teams and people don't apply. Teams or people alone are restricted to
+    them, never public (for_publisher).
+    """
+    from cowork.services.artifact_access import ArtifactRule
+
+    prev_restricted = isinstance(previous, dict) and previous.get("mode") == AccessMode.RESTRICTED
+    if stored is not None and access is not None and access.restricted:
+        # Each audience field the access leaves out (None) is the rule's.
+        access = access.model_copy(update={
+            field.value: getattr(stored, field) for field in AudienceField if getattr(access, field) is None
+        })
+        if prev_restricted:
+            previous = {
+                **previous,
+                PUBLISHER_EMAILS_FIELD: stored.allowed_emails,
+                AudienceField.ORG_ALLOWED: stored.org_allowed,
+                PUBLISHER_OWNER_ONLY_FIELD: not stored.allowed_emails and not stored.org_allowed,
+            }
+    effective_access, pwd_version, access_version, owner_side = _resolve_access(
+        password, for_publisher(access), previous
+    )
+    if owner_side.get("mode") != AccessMode.RESTRICTED:
+        return AccessPlan(
+            effective_access, pwd_version, access_version, owner_side, None, AudienceChanges()
+        )
+    if stored is None or access is None:
+        audience = ArtifactRule(
+            org_allowed=bool(owner_side.get(AudienceField.ORG_ALLOWED)),
+            allowed_emails=list(owner_side.get(PUBLISHER_EMAILS_FIELD) or []),
+            allowed_team_ids=[],
+            allowed_user_ids=[],
+        )
+        return AccessPlan(
+            effective_access, pwd_version, access_version, owner_side, audience, AudienceChanges()
+        )
+    named = {field.value: [str(v) for v in getattr(access, field) or []] for field in ORG_AUDIENCE_FIELDS}
+    changes = AudienceChanges(**{
+        field: values for field, values in named.items() if set(values) != set(getattr(stored, field))
+    })
+    if changes and prev_restricted:
+        # A changed audience invalidates the viewer grants already issued, as
+        # a changed email list does.
+        access_version = max(access_version, (previous.get("access_version", 0) or 0) + 1)
+    audience = ArtifactRule(
+        org_allowed=bool(owner_side.get(AudienceField.ORG_ALLOWED)),
+        allowed_emails=list(owner_side.get(PUBLISHER_EMAILS_FIELD) or []),
+        **named,
+    )
+    owner_side = {
+        **{k: v for k, v in owner_side.items() if k not in ENTRY_AUDIENCE_FIELDS},
+        "access_version": access_version,
+    }
+    return AccessPlan(effective_access, pwd_version, access_version, owner_side, audience, changes)
+
+
+def _rule_key(canonical_key: str | None, entry: Any) -> str:
+    """The key an artifact's rule is stored under: its identity, else, for a
+    legacy loose file with none, the key the upload service gave the publish
+    ``entry`` records. The one source of that key, for the first key a
+    re-publish checks (_prior_rule_keys) and for every write after it. A
+    read of who a loose file is shared with never asks the entry's key
+    (_audience_rule_keys), since the pod can write the entry."""
+    if canonical_key:
+        return canonical_key
+    return str(entry.get("artifact_key") or "") if isinstance(entry, dict) else ""
+
+
+def _prior_rule_keys(canonical_key: str | None, entry: Any) -> list[str]:
+    """Every key a rule the last publish left could sit under: _rule_key's
+    pick, then each key ``entry`` recorded for that publish (``artifact_key``
+    and the lambda's ``lambda_artifact_key``) when it differs. The pod can
+    write metadata.json, which moves _rule_key's pick, but not the rule the
+    MindsHub already holds. Empty when none is known."""
+    recorded = (
+        [str(entry.get(field) or "") for field in ("artifact_key", "lambda_artifact_key")]
+        if isinstance(entry, dict)
+        else []
+    )
+    return [key for key in dict.fromkeys([_rule_key(canonical_key, entry), *recorded]) if key]
+
+
+def _report_rule_key(entry: Any, *, owner_user_id: str | None) -> str:
+    """The id the rule of the report ``entry`` records was stored under
+    before the report had a stable id: ``<user_dir>/<report_id>``, with
+    ``user_dir`` the upload service's folder for the owner
+    (LEGACY_RULE_USER_DIR_CHARS). A report published restricted then, and
+    not published since, still has its rule there, and an entry written
+    then records no key for it. "" when the owner's id isn't a UUID, or the
+    entry names no report in the upload service's form
+    (REPORT_ID_PATTERN), or the id is longer than MindsHub takes
+    (MAX_ARTIFACT_ID_CHARS). The upload service refuses to publish a report
+    of another form, MindsHub holds no rule under an id that long, and the
+    pod can write the report_id, so asking about one gains nothing and can
+    fail the read."""
+    from cowork.services.mindshub_client import canonical_uuid
+
+    report_id = entry.get("report_id") if isinstance(entry, dict) else None
+    owner = canonical_uuid(owner_user_id) if owner_user_id else None
+    if not isinstance(report_id, str) or not REPORT_ID_PATTERN.fullmatch(report_id) or owner is None:
+        return ""
+    key = f"{hashlib.md5(owner.encode()).hexdigest()[:LEGACY_RULE_USER_DIR_CHARS]}/{report_id}"
+    return key if len(key) <= MAX_ARTIFACT_ID_CHARS else ""
+
+
+def _audience_rule_keys(canonical_key: str | None, entry: Any, *, owner_user_id: str | None) -> list[str]:
+    """The keys a read of who the artifact is shared with asks MindsHub
+    about, in order: the artifact's identity, then the report's id from
+    before stable ids (_report_rule_key). The first rule held under them is
+    the one the artifact is shared with, so a report whose rule hasn't moved
+    off its old id yet is read as shared with that rule's audience. A loose
+    file has no identity, and this server sends the upload service no key
+    for it, so the upload service keeps its rule under the report's id. The
+    old id names the report this publish uploads to, and MindsHub moves that
+    rule's audience only to the stable id first published as that report.
+    Never a key the entry recorded, a loose file's ``artifact_key``
+    included: the pod can write those, and a rule under one may be another
+    artifact's, whose audience would then be sent as this one's."""
+    keys = [canonical_key or "", _report_rule_key(entry, owner_user_id=owner_user_id)]
+    return [key for key in dict.fromkeys(keys) if key]
+
+
+def _held_rule_keys(canonical_key: str | None, entry: Any, *, owner_user_id: str | None) -> list[str]:
+    """Every key a rule could sit under that a re-publish checks before it
+    goes ahead, in order: _prior_rule_keys, then the report's id from before
+    stable ids (_report_rule_key). Any rule held under them refuses a
+    re-publish that isn't restricted (_access_mode_refusal), and the access
+    route shows it for such an entry (rule_held_over_entry), so a key an
+    agent writes here adds a refusal, never an audience a publish sends.
+    The old id never makes a page the entry names no key for checkable,
+    because an agent can write the entry's report_id."""
+    keys = [*_prior_rule_keys(canonical_key, entry), _report_rule_key(entry, owner_user_id=owner_user_id)]
+    return [key for key in dict.fromkeys(keys) if key]
+
+
+def _access_mode_refusal(
+    canonical_key: str | None, entry: Any, *, reuses_report: bool, scope: TenantScope
+) -> Literal["rule_held", "no_rule_key"] | None:
+    """Why a re-publish in MindsHub mode that isn't a person's save and
+    isn't restricted must not go ahead (AccessModeChanged), or None. The
+    MindsHub holds a rule under one of the keys it checks
+    (_held_rule_keys), the keys the last publish could have left it under
+    and the report's id from before stable ids: ``rule_held``. Or the
+    publish reuses a page the entry names no key for (_prior_rule_keys), so
+    no rule can be read: ``no_rule_key``. A failed read raises."""
+    if not _prior_rule_keys(canonical_key, entry):
+        return "no_rule_key" if reuses_report else None
+    if _held_rule(_held_rule_keys(canonical_key, entry, owner_user_id=scope.user_id), scope) is not None:
+        return "rule_held"
+    return None
+
+
+def _held_rule(keys: list[str], scope: TenantScope) -> ArtifactRule | None:
+    """The first rule MindsHub holds under ``keys``, in order, or
+    None when it holds none. A failed read raises, a 409 for a key
+    MindsHub binds to another owner or holds for repair included: the
+    rule there may be this artifact's."""
+    for key in keys:
+        rule = _read_rule(key, scope)
+        if rule is not None:
+            return rule
+    return None
+
+
+def _authorization_key(
+    published_dir: Path, artifacts_base: Path, project_id: str | None, scope: TenantScope | None
+) -> str | None:
+    """One identity spans private drafts, published versions, and comments:
+    the artifact's, from its metadata. A legacy loose file has no metadata
+    and keeps the service-generated key (None)."""
+    if not (published_dir / "metadata.json").is_file():
+        return None
+    from cowork.services.artifact_identity import artifact_key, ensure_full_id
+
+    artifact_id, _metadata = ensure_full_id(published_dir)
+    if scope is not None and scope.org_mode:
+        from cowork.services.artifact_authorization_identity import publish_authorization_key
+
+        return publish_authorization_key(
+            artifact_id, artifacts_base, published_dir.name, project_id, scope
+        )
+    return artifact_key(artifact_id)
+
+
+def _read_rule(rule_key: str, scope: TenantScope) -> ArtifactRule | None:
+    """The artifact's rule as MindsHub stores it under ``rule_key``
+    (read_artifact_access), or None when it holds none, as for an artifact
+    with no key yet or a key MindsHub refuses as an artifact id
+    (mindshub_artifact_id): the pod can write the keys an entry records,
+    and MindsHub holds no rule under such a key but answers its read with a
+    400. A failed read raises, so a publish never guesses who it shares
+    with."""
+    from cowork.services.artifact_access import read_artifact_access
+
+    artifact_id = mindshub_artifact_id(rule_key)
+    if not artifact_id:
+        return None
+    return read_artifact_access(
+        artifact_id=artifact_id, scope=scope, owner_user_id=str(scope.user_id or "")
+    )
+
+
+def _stored_rule(keys: list[str], scope: TenantScope) -> ArtifactRule:
+    """Who the artifact is shared with: the first rule MindsHub holds under
+    ``keys`` (_held_rule), else nobody but the owner."""
+    from cowork.services.artifact_access import ArtifactRule
+
+    rule = _held_rule(keys, scope)
+    return ArtifactRule.nobody() if rule is None else rule
+
+
+def stored_artifact_rule(
+    artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
+) -> ArtifactRule:
+    """Who ``artifact`` is shared with, as MindsHub's rule stores it, read
+    under the artifact's identity and then its report's id from before
+    stable ids (_audience_rule_keys), the keys the publish plans against.
+    So a report whose rule still sits under its old id is checked and shown
+    with that rule's audience, and a member re-saving their own artifact
+    already shared with everyone keeps it so. What the access route checks
+    a save against and shows; .published.json never says it in MindsHub
+    mode."""
+    _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
+    previous = _load_published_map(published_dir).get(published_key)
+    canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+    return _stored_rule(_audience_rule_keys(canonical_key, previous, owner_user_id=scope.user_id), scope)
+
+
+def rule_held_over_entry(
+    artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
+) -> ArtifactRule | None:
+    """The rule MindsHub holds for ``artifact`` under a key its live
+    .published.json entry's last publish could have left it under, or the
+    report's id from before stable ids (_held_rule_keys, the keys
+    _access_mode_refusal reads before a re-publish), or None: for no live
+    entry, or no rule. The access route
+    reads it for an entry that isn't restricted. Only a restricted publish
+    leaves a rule in MindsHub mode, so a rule held there means the pod
+    rewrote the entry's mode after the owner's last save, and the rule, not
+    the entry, says who the artifact is shared with. A failed read raises."""
+    _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
+    entry = _load_published_map(published_dir).get(published_key)
+    if not isinstance(entry, dict) or not entry.get("published", True):
+        return None
+    canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+    return _held_rule(_held_rule_keys(canonical_key, entry, owner_user_id=scope.user_id), scope)
+
+
 def publish_artifact(
     artifact: Path,
     *,
@@ -387,9 +1088,12 @@ def publish_artifact(
     api_key: str,
     publish_url: str,
     password: str | None = None,
-    access: dict | None = None,
+    access: ArtifactAccessRequest | None = None,
     scope: TenantScope | None = None,
     project_id: str | None = None,
+    notify: ShareNotify | None = None,
+    stored: ArtifactRule | None = None,
+    owner_save: bool = False,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -413,6 +1117,46 @@ def publish_artifact(
 
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
+
+    `access` is who the publish opens the artifact for, under MindsHub's
+    names (ArtifactAccessRequest): a person's save of the Share dialog as
+    they chose it, what the desktop publish route or the agent's publish
+    tool was asked for, or what kept_access rebuilds from the entry for a
+    live sync, an autopublish or an update. It becomes anton's publisher's
+    shape once, at the call into anton's resolve_access (_plan_access).
+
+    `notify` is set only for a person's own save of the Share dialog with
+    "Notify people" chosen: the individuals it added, by id and by address.
+    MindsHub emails them (those the saved rule names); the write that carries
+    the list is this server's post-publish write of the rule
+    (sync_team_audience), made for a restricted MindsHub-mode share even
+    without teams or people by id, so people added by address alone are
+    emailed too. Every other publish (live sync, autopublish, a retry) leaves
+    it None.
+
+    `stored` is the artifact's rule the access route already read under the
+    publish lock to check this save, so the save reads the rule once and is
+    planned against the rule it was checked against. Every other caller
+    leaves it None, and a restricted publish in MindsHub mode reads the rule
+    itself.
+
+    `owner_save` is True only for a person's own save of the Share dialog
+    (PUT /access), whose access is what they chose. Any other publish in
+    MindsHub mode (live sync, autopublish) takes its mode from the
+    .published.json entry, which the pod can write. One that isn't
+    restricted reads the rule first, under the artifact's identity and under
+    each key the entry recorded. While MindsHub still holds one, the entry's
+    mode changed after the owner's last save, and a re-publish of a page the
+    entry names no key for can't be checked: either is refused
+    (AccessModeChanged) and logged before anything is uploaded.
+
+    In MindsHub mode the owner's save also records the mode it publishes in
+    (cowork.services.artifact_owner_choice), where the pod can't write, and
+    every other publish is checked against that record before anything
+    uploads: one wider than the owner's choice is refused the same way. The
+    save narrows the record before its upload, and puts back what it
+    narrowed when MindsHub's upload service refuses it before writing
+    anything (_refused_before_writing).
     """
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
@@ -422,8 +1166,17 @@ def publish_artifact(
     publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
-        raise ValueError("Only HTML and Markdown artifacts can be published")
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
+        raise ValueError("Only HTML and Markdown artifact content can be published")
+    # anton bundles files from this folder by path. A file there with a second
+    # name, such as a hard link a cell made to the project's `.anton/.env`,
+    # would publish that file's current content on every publish.
+    hard_linked = _a_hard_linked_file(published_dir)
+    if hard_linked is not None:
+        raise ValueError(
+            "Can't publish an artifact holding a file with a second name (a hard link): "
+            f"{hard_linked.relative_to(published_dir)}"
+        )
     # Refuse before anything is built: `anton.publisher.publish` puts the
     # artifact's datasource credentials, in plaintext, in the body of a
     # full-stack upload, and a service that can't run the app would receive
@@ -432,140 +1185,319 @@ def publish_artifact(
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
-        from anton.publisher import publish
+        from anton.publisher import ArtifactOwnedByOtherUserError, StatePublishBlocked, publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    published_json = published_dir / ".published.json"
-    published_map: dict[str, Any] = {}
-    if published_json.is_file():
-        try:
-            published_map = json.loads(published_json.read_text(encoding="utf-8"))
-        except Exception:
-            published_map = {}
-    previous = published_map.get(published_key)
-    report_id = previous.get("report_id") if isinstance(previous, dict) else None
+    from cowork.services.artifact_owner_choice import (
+        OwnerChoice,
+        narrow_before_save,
+        record_owner_choice,
+        republish_widening,
+    )
+    from cowork.services.published_page_ownership import PageClaim, publication_owner
 
-    # Resolve the effective access (mode + version) from the request and the
-    # prior publish. Versions bump only when the password / restricted list
-    # changed so previously issued viewer grants invalidate.
-    effective_access, pwd_version, access_version, owner_side = _resolve_access(password, access, previous)
+    with publication_owner(
+        publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
+    ) as ownership:
+        published_json = published_dir / ".published.json"
+        published_map: dict[str, Any] = {}
+        if published_json.is_file():
+            try:
+                published_map = json.loads(published_json.read_text(encoding="utf-8"))
+            except Exception:
+                published_map = {}
+        previous = published_map.get(published_key)
+        report_id = previous.get("report_id") if isinstance(previous, dict) else None
+        # The link this publish replaces with a new one, when no owner record
+        # names its page: that page stays live with the old content.
+        replaced_link: str | None = None
+        if ownership is not None:
+            previous_url = previous.get("url", "") if isinstance(previous, dict) else ""
+            claim = ownership.claim(report_id, url=previous_url)
+            if claim is not PageClaim.OWNED:
+                if claim is PageClaim.NO_OWNER_RECORD and previous_url and previous.get("published", True):
+                    replaced_link = previous_url
+                report_id = None
+                previous = None
 
-    # One identity spans private drafts, published versions, and comments. A
-    # legacy loose file has no metadata and keeps the service-generated key.
-    canonical_artifact_key: str | None = None
-    if (published_dir / "metadata.json").is_file():
-        from cowork.services.artifact_identity import artifact_key, ensure_full_id
-
-        artifact_id, _metadata = ensure_full_id(published_dir)
-        if scope is not None and scope.org_mode:
-            from cowork.services.artifact_authorization_identity import publish_authorization_key
-
-            canonical_artifact_key = publish_authorization_key(
-                artifact_id, artifacts_base, published_dir.name, project_id, scope
+        canonical_artifact_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+        org_scope = scope if scope is not None and scope.org_mode else None
+        restricted = access is not None and access.restricted
+        refusal = (
+            _access_mode_refusal(
+                canonical_artifact_key, previous, reuses_report=report_id is not None, scope=org_scope
             )
-        else:
-            canonical_artifact_key = artifact_key(artifact_id)
-
-    # Markdown is rendered to a throwaway index.html that we hand to the
-    # publisher; `.html` and fullstack publish their real target directly.
-    # `publish_target` stays the original artifact so the registry, history,
-    # and unpublish all key off the file the user actually sees.
-    publish_source = publish_target
-    md_tmp_dir: tempfile.TemporaryDirectory | None = None
-    if not is_fullstack and publish_target.suffix.lower() == ".md":
-        md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
-        publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
-
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
-    try:
-        result = publish(
-            publish_source,
-            api_key=api_key,
-            report_id=report_id,
-            publish_url=publish_url,
-            ssl_verify=ssl_verify,
-            access=effective_access,
-            access_version=access_version,
-            pwd_version=pwd_version,
-            artifact_key=canonical_artifact_key,
-            # Resolve datasource secrets from cowork's own vault
-            # (`~/.cowork/data-vault`), not anton's default
-            # (`~/.anton/data_vault`) — otherwise secrets are missed and
-            # the published artifact has no DB connection in the cloud.
-            # Org-keyed: the persisted vault is per organization, and an
-            # unscoped lookup would resolve to the shared namespace root.
-            vault=vault_for_scope(scope),
+            if org_scope is not None and not owner_save and not restricted
+            else None
         )
-    except Exception as exc:
-        raise_publish_permission_error(exc)
-        logger.exception("Publishing failed")
-        # Only network/HTTP failures get the "Connection failed" framing — a
-        # gateway timeout (e.g. a fullstack artifact whose deps take too long
-        # to install remotely, ENG-1547/ENG-1580) or a server-side 5xx reads
-        # very differently to the user than an auth rejection, but neither
-        # applies to a local failure (e.g. reading the artifact's files to
-        # zip it) that happened before any request went out. urllib.error
-        # HTTPError is a URLError subclass, so this covers both.
-        if isinstance(exc, urllib.error.URLError):
-            headline, advice = describe_minds_connection_error(exc)
-            raise RuntimeError(f"Publishing failed. {headline} {advice}") from exc
-        raise RuntimeError(f"Publishing failed: {exc}") from exc
-    finally:
-        if md_tmp_dir is not None:
-            md_tmp_dir.cleanup()
+        if refusal is not None:
+            logger.warning(
+                "Refused a re-publish whose .published.json entry isn't restricted: "
+                "MindsHub still holds a restricted rule for the artifact, "
+                "or the entry names no key to read one under",
+                extra={
+                    "event": "artifact_access_mode_changed",
+                    "reason": refusal,
+                    **log_context(project_id=project_id, artifact_slug=published_dir.name),
+                },
+            )
+            raise AccessModeChanged()
 
-    view_url = result.get("view_url", "")
-    returned_report_id = result.get("report_id", "")
-    if returned_report_id:
-        history_item = {
-            "artifact": str(publish_target),
-            "artifactName": published_key,
-            "url": view_url,
-            "reportId": returned_report_id,
-            "publishedAt": _utc_now_iso(),
-        }
-        # Owner-side only — .published.json never enters the bundle. `owner_side`
-        # carries `mode` (+ `access_password`/`pwd_version` for password, or
-        # `emails`/`org_allowed`/`access_version` for restricted), and always
-        # `requires_password` for back-compat with older readers.
-        entry: dict[str, Any] = {
-            "report_id": returned_report_id,
-            "url": view_url,
-            # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
-            # so the comments panel can key threads after an app restart.
-            "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
-            # The lambda's raw echo, or "" from an older lambda that sends none.
-            # Decides which scope the published page uses for comments; see
-            # services/comments_scope. Deliberately NOT merged with the field
-            # above, whose canonical fallback would read as an echo.
-            "lambda_artifact_key": _lambda_artifact_key(result),
-            "last_md5": result.get("md5", ""),
-            # Snapshot of the artifact's content mtime at publish time — the
-            # cheap gate for the `modified` badge (see card_for_folder). Uses
-            # the SAME basis as the card's `mtime` so the comparison is exact.
-            "published_mtime": _content_mtime(published_dir),
-            "published": True,
-            **owner_side,
-        }
-        published_map[published_key] = entry
-        _write_published_map(published_json, published_map)
-        state = _load_state()
-        state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
-        _save_state(state)
+        # Resolve the effective access (mode + version) from the request and the
+        # prior publish. Versions bump only when the password / restricted list
+        # changed so previously issued viewer grants invalidate. In MindsHub
+        # mode who a restricted publish shares with starts from the artifact's
+        # rule as MindsHub stores it: the one the caller read for this
+        # save, else read here. A failed read fails the publish.
+        if org_scope is None or not restricted:
+            stored = None
+        elif stored is None:
+            stored = _stored_rule(
+                _audience_rule_keys(canonical_artifact_key, previous, owner_user_id=org_scope.user_id), org_scope
+            )
+        plan = _plan_access(password, access, previous, stored=stored)
+        owner_side = plan.owner_side
+        # Who the rule shares with: the plan's, then MindsHub's answer
+        # to this publish's write, if it makes one.
+        audience = plan.audience
+        # The sharing the owner chose, recorded where the pod can't write
+        # (cowork.services.artifact_owner_choice). Any other re-publish is
+        # judged by the mode it resolved to, against the narrowest choice
+        # recorded under a key its rule could sit under, and refused before
+        # anything is uploaded when it would open the artifact wider. The
+        # owner's own save narrows the record before the upload, records its
+        # choice once the upload is live, and puts back what it narrowed when
+        # MindsHub's upload service refuses it before writing anything.
+        chosen = (
+            OwnerChoice(
+                access_mode=AccessMode(owner_side.get("mode", AccessMode.PUBLIC)), published=True
+            )
+            if org_scope is not None
+            else None
+        )
+        if chosen is not None and not owner_save:
+            widened = republish_widening(
+                keys=_prior_rule_keys(canonical_artifact_key, previous),
+                mode=chosen.access_mode,
+                scope=org_scope,
+            )
+            if widened is not None:
+                logger.warning(
+                    "Refused a re-publish that would open the artifact wider than its owner chose",
+                    extra={
+                        "event": "artifact_access_mode_changed",
+                        "reason": widened.value,
+                        **log_context(project_id=project_id, artifact_slug=published_dir.name),
+                    },
+                )
+                raise AccessModeChanged()
+        # Markdown is rendered to a throwaway index.html that we hand to the
+        # publisher; `.html` and fullstack publish their real target directly.
+        # `publish_target` stays the original artifact so the registry, history,
+        # and unpublish all key off the file the user actually sees.
+        publish_source = publish_target
+        md_tmp_dir: tempfile.TemporaryDirectory | None = None
+        try:
+            if not is_fullstack and publish_target.suffix.lower() == ".md":
+                md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
+                publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
 
-    return {
-        "status": "ok",
-        "url": view_url,
-        "accessMode": owner_side.get("mode", "public"),
-        "accessProtected": bool(owner_side.get("requires_password")),
-        "accessEmails": owner_side.get("emails", []),
-        "orgAllowed": bool(owner_side.get("org_allowed")),
-        "ownerOnly": bool(owner_side.get("owner_only")),
-        # Composite comments scope for the panel (Plan 5).
-        "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
-        "result": {k: v for k, v in result.items() if k != "file_payload"},
-    }
+            # Narrowed after the render, so a render that fails leaves the
+            # record as it was.
+            narrowing = (
+                narrow_before_save(
+                    key=_rule_key(canonical_artifact_key, previous), chosen=chosen, scope=org_scope
+                )
+                if chosen is not None and owner_save
+                else None
+            )
+        except BaseException:
+            # From the upload on, the finally below removes the rendered page.
+            if md_tmp_dir is not None:
+                md_tmp_dir.cleanup()
+            raise
+
+        ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+        try:
+            result = publish(
+                publish_source,
+                api_key=api_key,
+                report_id=report_id,
+                publish_url=publish_url,
+                ssl_verify=ssl_verify,
+                access=plan.effective_access,
+                access_version=plan.access_version,
+                pwd_version=plan.pwd_version,
+                artifact_key=canonical_artifact_key,
+                # Resolve datasource secrets from cowork's own vault
+                # (`~/.cowork/data-vault`), not anton's default
+                # (`~/.anton/data_vault`) — otherwise secrets are missed and
+                # the published artifact has no DB connection in the cloud.
+                # Org-keyed: the persisted vault is per organization, and an
+                # unscoped lookup would resolve to the shared namespace root.
+                vault=vault_for_scope(scope),
+                # While the password is unchanged anton re-sends the hash stored
+                # here, so a content-only re-publish keeps viewers' password grants.
+                previous_access=previous if isinstance(previous, dict) else None,
+            )
+        except ArtifactOwnedByOtherUserError as exc:
+            # Not a failure to log or wrap: the upload service holds this
+            # report_id for another account.
+            _restore_after_refused_save(
+                narrowing=narrowing, exc=exc, publish_url=publish_url, scope=org_scope,
+                project_id=project_id, artifact_slug=published_dir.name,
+            )
+            raise PublishOwnedByOtherUser() from exc
+        except Exception as exc:
+            # Before classify_upload_error, which raises the typed refusal.
+            _restore_after_refused_save(
+                narrowing=narrowing, exc=exc, publish_url=publish_url, scope=org_scope,
+                project_id=project_id, artifact_slug=published_dir.name,
+            )
+            upload_error = classify_upload_error(exc)
+            logger.exception("Publishing failed")
+            # A 401's text ("Invalid token") says less than the credentials advice below.
+            if (
+                upload_error is not None
+                and upload_error.error
+                and 400 <= upload_error.status < 500
+                and upload_error.status != 401
+            ):
+                raise PublishRejected(f"Publishing failed: {_clip(upload_error.error)}") from exc
+            # Only network/HTTP failures get the "Connection failed" framing — a
+            # gateway timeout (e.g. a fullstack artifact whose deps take too long
+            # to install remotely) or a server-side 5xx reads very differently to
+            # the user than an auth rejection, but neither applies to a local
+            # failure (e.g. reading the artifact's files to zip it) that happened
+            # before any request went out. urllib.error HTTPError is a URLError
+            # subclass, so this covers both.
+            if isinstance(exc, urllib.error.URLError):
+                headline, advice = describe_minds_connection_error(exc)
+                raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
+            if isinstance(exc, StatePublishBlocked):
+                raise PublishRejected(f"Publishing failed: {exc}") from exc
+            raise RuntimeError(f"Publishing failed: {exc}") from exc
+        finally:
+            if md_tmp_dir is not None:
+                md_tmp_dir.cleanup()
+
+        # Owner-side state for the next publish, stored in the entry below and
+        # never part of the response.
+        password_hash = result.pop("password_hash", None)
+        view_url = result.get("view_url", "")
+        returned_report_id = result.get("report_id", "")
+        if ownership is not None:
+            try:
+                ownership.record(returned_report_id)
+            except Exception:
+                if report_id is None:
+                    # A new page went live with no record and no local entry;
+                    # keep the orphaned_publish prefix.
+                    logger.warning(
+                        "orphaned_publish identifier=%s url=%s reason=owner_record_failed",
+                        returned_report_id, view_url,
+                    )
+                raise
+        echoed_key = _lambda_artifact_key(result)
+        if returned_report_id:
+            history_item = {
+                "artifact": str(publish_target),
+                "artifactName": published_key,
+                "url": view_url,
+                "reportId": returned_report_id,
+                "publishedAt": _utc_now_iso(),
+            }
+            # Owner-side only: .published.json never enters the bundle. `owner_side`
+            # carries `mode` (+ `access_password`/`pwd_version` for password, or
+            # `emails`/`org_allowed`/`access_version` for restricted; in
+            # MindsHub mode `access_version` alone, since who a restricted rule shares
+            # with is MindsHub's rule's to say), and always
+            # `requires_password` for back-compat with older readers. Password mode
+            # also keeps the `password_hash` anton sent, handed back as
+            # `previous_access` on the next publish.
+            entry: dict[str, Any] = {
+                "report_id": returned_report_id,
+                "url": view_url,
+                # The lambda's echo, else the key cowork sent. Comment routing reads
+                # `lambda_artifact_key` below, not this field.
+                "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
+                # The lambda's raw echo, or "" from an older lambda that sends none.
+                # Decides which scope the published page uses for comments; see
+                # services/comments_scope. Deliberately NOT merged with the field
+                # above, whose canonical fallback would read as an echo.
+                "lambda_artifact_key": echoed_key,
+                "last_md5": result.get("md5", ""),
+                # Snapshot of the artifact's content mtime at publish time — the
+                # cheap gate for the `modified` badge (see card_for_folder). Uses
+                # the SAME basis as the card's `mtime` so the comparison is exact.
+                "published_mtime": _content_mtime(published_dir),
+                "published": True,
+                **owner_side,
+            }
+            if password_hash:
+                entry["password_hash"] = password_hash
+            published_map[published_key] = entry
+            _write_published_map(published_json, published_map)
+            if chosen is not None and owner_save:
+                record_owner_choice(
+                    key=_rule_key(canonical_artifact_key, entry), choice=chosen, scope=org_scope
+                )
+            recipients = (
+                notify_within(notify, audience)
+                if notify and org_scope is not None and audience is not None
+                else ShareNotify()
+            )
+            notice = (
+                share_notice(published_dir, published_key, view_url, recipients=recipients)
+                if recipients
+                else None
+            )
+            if plan.changes:
+                # Only a restricted publish in MindsHub mode plans changes.
+                assert org_scope is not None and audience is not None
+                echoed = sync_team_audience(
+                    artifact_id=_rule_key(canonical_artifact_key, entry), scope=org_scope,
+                    access_version=plan.access_version, changes=plan.changes, notice=notice,
+                )
+                audience = audience.model_copy(update=echoed.model_dump())
+            elif notice is not None:
+                # No teams or people changed, so the lambda's write was the
+                # whole change; this one only asks MindsHub to email the
+                # people the save added. Best effort: the share itself
+                # already stands.
+                assert org_scope is not None and audience is not None
+                try:
+                    echoed = sync_team_audience(
+                        artifact_id=_rule_key(canonical_artifact_key, entry), scope=org_scope,
+                        access_version=plan.access_version, changes=AudienceChanges(), notice=notice,
+                    )
+                    audience = audience.model_copy(update=echoed.model_dump())
+                except Exception:
+                    logger.warning(
+                        "Could not ask MindsHub to notify the people an artifact was shared with",
+                        exc_info=True,
+                    )
+            state = _load_state(scope=scope)
+            state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
+            _save_state(state, scope=scope)
+
+        if scope is not None and scope.org_mode:
+            # Org comment routing never reads the record, so only the echo can
+            # point the renderer at the scope the published page uses.
+            response_key = echoed_key or canonical_artifact_key or ""
+        else:
+            # The card's key: desktop routing finds the cloud scope in the record.
+            response_key = canonical_artifact_key or echoed_key
+        return ArtifactPublishResult(
+            url=view_url,
+            access_mode=AccessMode(owner_side.get("mode", AccessMode.PUBLIC)),
+            access_protected=bool(owner_side.get("requires_password")),
+            artifact_key=response_key or "",
+            replaced_link=replaced_link,
+            result={k: v for k, v in result.items() if k != "file_payload"},
+            **ArtifactAudienceView.of(audience).model_dump(),
+        ).model_dump(by_alias=True, mode="json")
 
 
 def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
@@ -592,7 +1524,7 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
         )
     except Exception:
         return None
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
         return None
     try:
         from anton.publisher import _zip_fullstack, _zip_html
@@ -618,7 +1550,8 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
 
 
 def unpublish_artifact(
-    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str,
+    scope: TenantScope | None = None,
 ) -> dict:
     """Soft-delete a published artifact: drop it upstream, keep `report_id`.
 
@@ -636,65 +1569,86 @@ def unpublish_artifact(
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    published_json = published_dir / ".published.json"
-    if not published_json.is_file():
-        raise FileNotFoundError("Artifact has no publish record")
+    from cowork.services.published_page_ownership import PageClaim, publication_owner
 
-    try:
-        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError("Could not read publish record") from exc
+    with publication_owner(
+        _publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
+    ) as ownership:
+        published_json = published_dir / ".published.json"
+        if not published_json.is_file():
+            raise FileNotFoundError("Artifact has no publish record")
 
-    entry = published_map.get(published_key)
-    identifier = None
-    if isinstance(entry, dict):
-        identifier = entry.get("report_id") or entry.get("last_md5") or None
-    if not identifier:
-        raise FileNotFoundError("No published version on file")
+        try:
+            published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError("Could not read publish record") from exc
 
-    try:
-        from anton.publisher import unpublish
-    except Exception as exc:
-        raise PublisherUnavailable("Anton publisher is unavailable") from exc
+        entry = published_map.get(published_key)
+        identifier = None
+        if isinstance(entry, dict):
+            identifier = entry.get("report_id") or entry.get("last_md5") or None
+        if ownership is not None:
+            url = entry.get("url", "") if isinstance(entry, dict) else ""
+            claim = ownership.claim(entry.get("report_id") if isinstance(entry, dict) else None, url=url)
+            if claim is not PageClaim.OWNED:
+                # Cowork never sends a page id no owner record ties to this
+                # artifact, so the page, if any, stays live; say so.
+                published_map.pop(published_key, None)
+                _write_published_map(published_json, published_map)
+                live = isinstance(entry, dict) and entry.get("published", True) is not False and bool(url)
+                return UnpublishResult(
+                    taken_down=False, live_link=url if live else None, reason=claim if live else None,
+                ).model_dump(by_alias=True, mode="json")
+            identifier = entry.get("report_id")
+        if not identifier:
+            raise FileNotFoundError("No published version on file")
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
-    try:
-        unpublish(
-            identifier,
-            api_key=api_key,
-            publish_url=publish_url,
-            ssl_verify=ssl_verify,
-        )
-    except Exception as exc:
-        raise_publish_permission_error(exc)
-        msg = str(exc) or "Unpublishing failed."
-        if "404" in msg or "not found" in msg.lower():
-            # Already gone upstream, OR still alive under another owner's prefix
-            # and now unreachable — see the docstring. cowork-server has no
-            # metrics backend, so this structured log line IS the metric; keep
-            # the `orphaned_publish` prefix stable.
-            logger.warning(
-                "orphaned_publish identifier=%s url=%s reason=unpublish_404",
+        try:
+            from anton.publisher import unpublish
+        except Exception as exc:
+            raise PublisherUnavailable("Anton publisher is unavailable") from exc
+
+        ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+        try:
+            unpublish(
                 identifier,
-                entry.get("url", "") if isinstance(entry, dict) else "",
+                api_key=api_key,
+                publish_url=publish_url,
+                ssl_verify=ssl_verify,
             )
-        else:
-            logger.exception("Unpublishing failed (identifier=%s)", identifier)
-            raise RuntimeError(f"Unpublishing failed: {msg}") from exc
+        except Exception as exc:
+            classify_upload_error(exc)
+            msg = str(exc) or "Unpublishing failed."
+            if "404" in msg or "not found" in msg.lower():
+                # Already gone upstream, OR still alive under another owner's prefix
+                # and now unreachable — see the docstring. cowork-server has no
+                # metrics backend, so this structured log line IS the metric; keep
+                # the `orphaned_publish` prefix stable.
+                logger.warning(
+                    "orphaned_publish identifier=%s url=%s reason=unpublish_404",
+                    identifier,
+                    entry.get("url", "") if isinstance(entry, dict) else "",
+                )
+            else:
+                logger.exception("Unpublishing failed (identifier=%s)", identifier)
+                raise RuntimeError(f"Unpublishing failed: {msg}") from exc
 
-    # Soft-delete: keep report_id (and url) so a later re-publish reuses the
-    # same public URL. Only flip `published` off so readers stop showing it as
-    # live. The backend object is gone, but lambda re-mints at the same id when
-    # we resend report_id on the next publish.
-    if isinstance(entry, dict):
-        entry["published"] = False
-        published_map[published_key] = entry
-        _write_published_map(published_json, published_map)
-    return {"status": "ok"}
+        # Soft-delete: keep report_id (and url) so a later re-publish reuses the
+        # same public URL. Only flip `published` off so readers stop showing it as
+        # live. The backend object is gone, but lambda re-mints at the same id when
+        # we resend report_id on the next publish.
+        if isinstance(entry, dict):
+            entry["published"] = False
+            published_map[published_key] = entry
+            _write_published_map(published_json, published_map)
+        return UnpublishResult(taken_down=True).model_dump(by_alias=True, mode="json")
 
 
-def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
-    """Return the stored access for a live artifact, or raise when it is not live.
+def published_artifact_access(
+    artifact: Path, *, artifacts_base: Path, org_mode: bool
+) -> ArtifactAccessRequest:
+    """Return the access a re-publish of a live artifact keeps (kept_access),
+    or raise when it is not live.
 
     Credential resolution deliberately lives outside this helper. Callers can
     therefore distinguish an unpublished draft from a publish failure before
@@ -714,55 +1668,44 @@ def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
     entry = published_map.get(published_key)
     if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
         raise FileNotFoundError("No published version to update")
-    return access_from_owner_side(entry)
+    return kept_access(entry, org_mode=org_mode)
 
 
-def update_artifact(raw_path: str) -> dict:
+def update_artifact(raw_path: str, *, scope: TenantScope | None) -> dict:
     """Re-publish an already-published artifact, preserving its URL and access.
 
     `publish_artifact` reuses the stored report_id (→ the lambda mints a new
     version at the same URL), but it would reset access to public if handed no
     access object. So reconstruct the prior access from `.published.json` and
-    pass it through. After republish, refresh `published_mtime` so the badge
-    clears. Raises FileNotFoundError when there's nothing published to update.
+    pass it through. The publish also refreshes `published_mtime` under its
+    folder lock. Raises FileNotFoundError when there's nothing published to update.
     """
     # Path first, credential later: an artifact with nothing published must
     # report that, not "configure your API key".
-    artifact, artifacts_base = desktop_artifact_and_base(raw_path)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
-        artifact, container_dirs=[artifacts_base]
+    found = desktop_artifact_and_base(raw_path, scope=scope)
+    artifact, artifacts_base = found.artifact, found.artifacts_base
+    access = published_artifact_access(
+        artifact, artifacts_base=artifacts_base, org_mode=scope is not None and scope.org_mode
     )
-    published_json = published_dir / ".published.json"
-    access = published_artifact_access(artifact, artifacts_base=artifacts_base)
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
     api_key, publish_url = desktop_publish_credential()
-    result = publish_artifact(
+    return publish_artifact(
         artifact, artifacts_base=artifacts_base, api_key=api_key,
-        publish_url=publish_url, access=access,
+        publish_url=publish_url, access=access, scope=scope,
     )
 
-    # Refresh the mtime snapshot so the cheap gate clears the `modified` badge.
-    try:
-        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
-        fresh_entry = fresh_map.get(published_key)
-        if isinstance(fresh_entry, dict):
-            fresh_entry["published_mtime"] = _content_mtime(published_dir)
-            fresh_map[published_key] = fresh_entry
-            _write_published_map(published_json, fresh_map)
-    except Exception:
-        logger.warning("Could not refresh publish mtime for %s", published_dir, exc_info=True)
 
-    return result
-
-
-def _resolve_report_id(raw_path: str) -> tuple[Path, str, str]:
-    """Resolve (published_json_path, published_key, report_id) for an artifact.
+def _resolve_report_id(raw_path: str, *, scope: TenantScope | None) -> ResolvedReport:
+    """Resolve (published_json_path, published_key, report_id) for an artifact
+    of ``scope``.
 
     Raises FileNotFoundError when the artifact has no live publish record.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
     published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError("Artifact has no publish record")
@@ -774,20 +1717,16 @@ def _resolve_report_id(raw_path: str) -> tuple[Path, str, str]:
     report_id = entry.get("report_id") if isinstance(entry, dict) else None
     if not report_id:
         raise FileNotFoundError("Artifact is not published")
-    return published_json, published_key, report_id
+    return ResolvedReport(published_json, published_key, report_id)
 
 
 def _publisher_http_detail(exc: Exception) -> str:
     """Best-effort human message from an upstream HTTPError JSON body."""
-    body = ""
-    try:
-        body = exc.read().decode()  # type: ignore[attr-defined]
-        return json.loads(body).get("error") or body or str(exc)
-    except Exception:
-        return body or str(exc)
+    body, _code, error = _read_http_error_body(exc)
+    return error or body or str(exc)
 
 
-def list_versions(raw_path: str) -> dict:
+def list_versions(raw_path: str, *, scope: TenantScope | None) -> dict:
     """List the publish history (versions) of a live artifact.
 
     Returns {reportId, currentMd5, artifactType, versions: [...]} with versions
@@ -798,7 +1737,7 @@ def list_versions(raw_path: str) -> dict:
     if not api_key:
         raise ValueError("Configure your provider API key in Settings to view versions")
 
-    _published_json, _key, report_id = _resolve_report_id(raw_path)
+    report_id = _resolve_report_id(raw_path, scope=scope).report_id
 
     try:
         from anton.publisher import list_versions as _list_versions
@@ -837,7 +1776,7 @@ def list_versions(raw_path: str) -> dict:
     }
 
 
-def activate_version(raw_path: str, md5: str) -> dict:
+def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> dict:
     """Roll the live URL back to an existing version (flips current_md5).
 
     On success, rewrites `.published.json` so the `modified` badge reflects the
@@ -854,7 +1793,8 @@ def activate_version(raw_path: str, md5: str) -> dict:
     if not api_key:
         raise ValueError("Configure your provider API key in Settings before rolling back")
 
-    published_json, published_key, report_id = _resolve_report_id(raw_path)
+    report = _resolve_report_id(raw_path, scope=scope)
+    published_json, published_key, report_id = report.published_json, report.published_key, report.report_id
 
     try:
         from anton.publisher import activate_version as _activate_version
@@ -896,7 +1836,7 @@ def activate_version(raw_path: str, md5: str) -> dict:
     }
 
 
-def published_state(raw_path: str) -> dict:
+def published_state(raw_path: str, *, scope: TenantScope | None) -> dict:
     """Owner-side publish state for an artifact path, resolved exactly the way
     `publish_artifact` resolves it (so the chat tool and the GUI never disagree
     on where `.published.json` lives).
@@ -910,12 +1850,14 @@ def published_state(raw_path: str) -> dict:
     # artifacts dir, so guard the whole resolution — the documented contract is
     # to return the blank default for any unresolvable path, never to raise.
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     except Exception:
         return dict(blank)
     if artifact is None:
         return dict(blank)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
     entry = _load_published_map(published_dir).get(published_key)
     if not isinstance(entry, dict):
         return dict(blank)
@@ -927,17 +1869,38 @@ def published_state(raw_path: str) -> dict:
     }
 
 
-def published_owner_state(raw_path: str) -> dict:
+def published_link_owner_recorded(raw_path: str, *, scope: TenantScope | None) -> bool | None:
+    """Whether Cowork can still update or take down the artifact's live page,
+    resolved exactly like `published_state`. True with no live page; False
+    when no owner record ties the page to this artifact; None when that can't
+    be read."""
+    from cowork.services.published_page_ownership import link_owner_recorded
+
+    state = published_state(raw_path, scope=scope)
+    if not state["published"]:
+        return True
+    try:
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+        publish_target, *_rest = _resolve_publish_target(artifact, container_dirs=_scan_artifact_dirs(scope=scope))
+        publish_url, _api_key = _resolve_publish_endpoint(get_user_settings())
+    except Exception:
+        return None
+    return link_owner_recorded(publish_target, state["report_id"], publish_url=publish_url)
+
+
+def published_owner_state(raw_path: str, *, scope: TenantScope | None) -> dict:
     """Raw owner-side `.published.json` entry, resolved exactly like
     `publish_artifact`. Returns {} for any unresolvable/absent record. Unlike
     `published_state`, exposes the access fields (mode/access_password/emails/
     org_allowed) needed to preserve access on re-publish."""
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     except Exception:
         return {}
     if artifact is None:
         return {}
-    _t, published_dir, published_key, _fs = _resolve_publish_target(artifact)
+    _t, published_dir, published_key, _fs = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
     entry = _load_published_map(published_dir).get(published_key)
     return entry if isinstance(entry, dict) else {}

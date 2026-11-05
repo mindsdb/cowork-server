@@ -1,0 +1,40 @@
+# What structure.html becomes. List labels name each <ul> and <ol>; every
+# label gets its own numId, cloned from its style's numbering. start is the
+# clone's start override, which bulleted lists don't need.
+title: Quarterly Report
+headings:
+  - {level: 1, text: Heading one}
+  - {level: 2, text: Heading two}
+  - {level: 3, text: Heading three}
+  - {level: 4, text: Heading four}
+  - {level: 5, text: Heading five}
+  - {level: 6, text: Heading six}
+pre: "def main():\n    return  1\n\n\ttabbed"
+monospace_font: Courier New
+list_items:
+  - {text: Bullet one, style: List Bullet, list: outer bullets, start: null}
+  - {text: Bullet two, style: List Bullet 2, list: second level bullets, start: null}
+  - {text: Bullet three, style: List Bullet 3, list: third level bullets, start: null}
+  - {text: Bullet four, style: List Bullet 3, list: fourth level bullets, start: null}
+  - {text: Bullet five, style: List Bullet, list: outer bullets, start: null}
+  - {text: First list one, style: List Number, list: first, start: 1}
+  - {text: First list two, style: List Number, list: first, start: 1}
+  - {text: Nested numbered, style: List Number 2, list: nested, start: 1}
+  - {text: Deepest numbered, style: List Number 3, list: deepest, start: 1}
+  - {text: Second list one, style: List Number, list: second, start: 1}
+  - {text: Second list two, style: List Number, list: second, start: 1}
+table:
+  style: Table Grid
+  rows: 3
+  columns: 3
+  cells:
+    - [Merged header, Merged header, Third]
+    - [Tall cell, B2, C2]
+    - [Tall cell, B3, C3]
+  merged:
+    - {from: [0, 0], to: [0, 1]}
+    - {from: [1, 0], to: [2, 0]}
+hyperlink:
+  url: https://example.com/report?q=1
+  text: full report
+  paragraph: Read the full report online.
