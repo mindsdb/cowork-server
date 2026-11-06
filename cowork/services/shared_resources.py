@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 from threading import Lock, RLock
@@ -53,6 +54,54 @@ class ResourceDeletion(NamedTuple):
     kind: str
     key: str
     action: str
+
+
+@dataclass(frozen=True)
+class AttributionSnapshot:
+    """One attribution row's values, copied out of the ORM row.
+
+    A listing reads every row of a kind at once and keeps these values, not
+    the rows, so no row it holds stays in the session's identity map. A held
+    row would keep its stale claim token through a recovery's reads under the
+    lock (production sessions don't expire rows on commit).
+    """
+
+    created_by_id: str | None
+    updated_by_id: str | None
+    modified_at: datetime | None
+    pending_claim_token: str | None
+    pending_claim_expires_at: datetime | None
+
+    @classmethod
+    def of(cls, row: SharedResourceAttribution) -> AttributionSnapshot:
+        return cls(
+            created_by_id=row.created_by_id,
+            updated_by_id=row.updated_by_id,
+            modified_at=row.modified_at,
+            pending_claim_token=row.pending_claim_token,
+            pending_claim_expires_at=row.pending_claim_expires_at,
+        )
+
+    @property
+    def pending(self) -> bool:
+        return bool(self.pending_claim_token)
+
+    def may_be_recoverable(self) -> bool:
+        """Whether this row might hold an expired claim.
+
+        A false answer is authoritative: no pending claim, or a lease that has
+        not run out yet, means there is nothing to recover. A true answer is
+        only a hint, and ``recover_stale_claim`` re-decides under the
+        coordination lock.
+        """
+        if not self.pending_claim_token:
+            return False
+        expires_at = self.pending_claim_expires_at
+        if expires_at is None:
+            return True
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return expires_at <= datetime.now(timezone.utc)
 
 
 class _KeyedProcessLock:
@@ -343,6 +392,20 @@ class SharedResourceAccess:
         fallback_creator_id: str | None = None,
         fallback_modified_at: datetime | None = None,
     ) -> ResourceAttribution:
+        return self.attribution_of(
+            self.snapshot(kind, key) if self.org_mode else None,
+            fallback_creator_id=fallback_creator_id,
+            fallback_modified_at=fallback_modified_at,
+        )
+
+    def attribution_of(
+        self,
+        snapshot: AttributionSnapshot | None,
+        *,
+        fallback_creator_id: str | None = None,
+        fallback_modified_at: datetime | None = None,
+    ) -> ResourceAttribution:
+        """``attribution`` for a row already read, as ``snapshots`` returns it."""
         if not self.org_mode:
             # Nobody else's authorship to report. Outside org mode no claim row
             # exists, and the only ids a fallback can carry are the caller's
@@ -358,9 +421,8 @@ class SharedResourceAccess:
                 last_modified_by=None,
                 last_modified_at=fallback_modified_at,
             )
-        row = self._find(kind, key)
-        if row is not None:
-            if row.pending_claim_token:
+        if snapshot is not None:
+            if snapshot.pending:
                 return ResourceAttribution(
                     created_by=None,
                     last_modified_by=None,
@@ -368,12 +430,12 @@ class SharedResourceAccess:
                 )
             return ResourceAttribution(
                 created_by=actor_payload(
-                    row.created_by_id, self._email_if_self(row.created_by_id)
+                    snapshot.created_by_id, self._email_if_self(snapshot.created_by_id)
                 ),
                 last_modified_by=actor_payload(
-                    row.updated_by_id, self._email_if_self(row.updated_by_id)
+                    snapshot.updated_by_id, self._email_if_self(snapshot.updated_by_id)
                 ),
-                last_modified_at=row.modified_at,
+                last_modified_at=snapshot.modified_at,
             )
         return ResourceAttribution(
             created_by=actor_payload(
@@ -390,35 +452,55 @@ class SharedResourceAccess:
         *,
         fallback: str | None = None,
     ) -> str | None:
+        return self.creator_id_of(
+            self.snapshot(kind, key) if self.org_mode else None, fallback=fallback
+        )
+
+    def creator_id_of(
+        self,
+        snapshot: AttributionSnapshot | None,
+        *,
+        fallback: str | None = None,
+    ) -> str | None:
+        """``creator_id`` for a row already read, as ``snapshots`` returns it."""
         if not self.org_mode:
             return self.actor_id or fallback
-        row = self._find(kind, key)
-        return row.created_by_id if row is not None else fallback
+        return snapshot.created_by_id if snapshot is not None else fallback
 
     def has_attribution(self, kind: str, key: str) -> bool:
         return self.org_mode and self._find(kind, key) is not None
 
     def claim_is_pending(self, kind: str, key: str) -> bool:
-        row = self._find(kind, key) if self.org_mode else None
-        return bool(row is not None and row.pending_claim_token)
+        snapshot = self.snapshot(kind, key) if self.org_mode else None
+        return snapshot is not None and snapshot.pending
+
+    def snapshot(self, kind: str, key: str) -> AttributionSnapshot | None:
+        """The attribution row of ``key``, copied out of the session."""
+        row = self._find(kind, key)
+        return AttributionSnapshot.of(row) if row is not None else None
+
+    def snapshots(self, kind: str) -> dict[str, AttributionSnapshot]:
+        """Every attribution row of ``kind`` in the org, by key, in one query.
+
+        A listing reads these once instead of one row per resource. Empty
+        outside org mode, where no attribution row exists.
+        """
+        if not self.org_mode:
+            return {}
+        rows = self.session.exec(
+            self.session.select(SharedResourceAttribution).where(
+                SharedResourceAttribution.resource_kind == kind
+            )
+        ).all()
+        return {row.resource_key: AttributionSnapshot.of(row) for row in rows}
 
     def _claim_may_be_recoverable(self, kind: str, key: str) -> bool:
         """Whether ``key`` might hold an expired claim, read without locking.
 
-        A false answer is authoritative: no row, no pending claim, or a lease
-        that has not run out yet all mean there is nothing to recover. A true
-        answer is only a hint, and ``recover_stale_claim`` re-decides under the
-        coordination lock.
+        No row is as final as AttributionSnapshot.may_be_recoverable's false.
         """
-        row = self._find(kind, key)
-        if row is None or not row.pending_claim_token:
-            return False
-        expires_at = row.pending_claim_expires_at
-        if expires_at is None:
-            return True
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        return expires_at <= datetime.now(timezone.utc)
+        snapshot = self.snapshot(kind, key)
+        return snapshot is not None and snapshot.may_be_recoverable()
 
     def recover_stale_claim(
         self,
@@ -455,19 +537,22 @@ class SharedResourceAccess:
         # writer, otherwise an expired empty claim can be released from a stale
         # pre-lock snapshot while its original writer is still finalizing bytes.
         with self.coordination_lock(kind, key):
-            row = self._find(kind, key)
+            # Both reads refresh from the database. A row this session loaded
+            # before the lock (a listing's own read, or the hint above) stays in
+            # the identity map with its old claim, since production sessions
+            # don't expire rows on commit, and another replica may have
+            # recovered or replaced that claim meanwhile.
+            row = self._find(kind, key, refresh=True)
             if row is None or not row.pending_claim_token:
                 return False
+            claim_token = row.pending_claim_token
             expires_at = row.pending_claim_expires_at
             if expires_at is not None and expires_at.tzinfo is None:
                 expires_at = expires_at.replace(tzinfo=timezone.utc)
             if expires_at is not None and expires_at > datetime.now(timezone.utc):
                 return False
             current = self._find_for_update(row.id)
-            if (
-                current is None
-                or current.pending_claim_token != row.pending_claim_token
-            ):
+            if current is None or current.pending_claim_token != claim_token:
                 self.session.rollback()
                 return False
             if resource_exists():
@@ -1065,13 +1150,16 @@ class SharedResourceAccess:
             self.session.delete(row)
         self.session.flush()
 
-    def _find(self, kind: str, key: str) -> SharedResourceAttribution | None:
-        return self.session.exec(
-            self.session.select(SharedResourceAttribution).where(
-                SharedResourceAttribution.resource_kind == kind,
-                SharedResourceAttribution.resource_key == key,
-            )
-        ).first()
+    def _find(
+        self, kind: str, key: str, *, refresh: bool = False
+    ) -> SharedResourceAttribution | None:
+        statement = self.session.select(SharedResourceAttribution).where(
+            SharedResourceAttribution.resource_kind == kind,
+            SharedResourceAttribution.resource_key == key,
+        )
+        if refresh:
+            statement = statement.execution_options(populate_existing=True)
+        return self.session.exec(statement).first()
 
     def _find_for_update(
         self,
@@ -1081,6 +1169,7 @@ class SharedResourceAccess:
             self.session.select(SharedResourceAttribution)
             .where(SharedResourceAttribution.id == attribution_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         ).first()
 
     def _require_actor(self) -> str:

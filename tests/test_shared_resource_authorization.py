@@ -2008,6 +2008,72 @@ def test_stale_memory_claim_releases_empty_or_recovers_surviving_bytes(org_engin
     ]
 
 
+def test_a_claim_another_replica_recovered_is_not_recovered_again(org_engine):
+    """A listing that read an expired claim must not recover it after another replica did.
+
+    Production sessions keep loaded rows past a commit (``expire_on_commit=False``,
+    cowork.db.session.get_session_factory), so a row this session read before
+    the lock stays in its identity map with the old claim token. The decision
+    under the lock has to come from the database, not from that copy.
+    """
+    from cowork.db.session import get_session_factory
+
+    def production_session(user_id: str) -> ScopedSession:
+        return ScopedSession(
+            get_session_factory(org_engine)(),
+            TenantScope(org_mode=True, org_id=ORG, user_id=user_id),
+        )
+
+    key = project_resource_key(uuid4())
+    writer = production_session(ALICE)
+    claim, token = SharedResourceAccess(writer, _principal(ALICE)).reserve_claim(
+        PROJECT, key
+    )
+    assert claim is not None and token is not None
+    claim.pending_claim_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    writer.add(claim)
+    writer.commit()
+
+    listing = production_session(ALICE)
+    listing_access = SharedResourceAccess(listing, _principal(ALICE))
+    held = listing_access._find(PROJECT, key)
+    assert held is not None and held.pending_claim_token == token
+
+    replica = production_session(ALICE)
+    assert (
+        SharedResourceAccess(replica, _principal(ALICE)).recover_stale_claim(
+            PROJECT, key, resource_exists=lambda: True
+        )
+        is True
+    )
+    edited = replica.exec(
+        replica.select(SharedResourceAttribution).where(
+            SharedResourceAttribution.resource_key == key
+        )
+    ).one()
+    edited.updated_by_id = BOB
+    replica.add(edited)
+    replica.commit()
+
+    assert (
+        listing_access.recover_stale_claim(PROJECT, key, resource_exists=lambda: True)
+        is False
+    )
+
+    check = production_session(ALICE)
+    row = check.exec(
+        check.select(SharedResourceAttribution).where(
+            SharedResourceAttribution.resource_key == key
+        )
+    ).one()
+    assert row.pending_claim_token is None
+    assert row.updated_by_id == BOB
+    events = check.exec(check.select(SharedResourceMutation)).all()
+    assert [(event.action, event.actor_id) for event in events] == [("recover", ALICE)]
+    for session in (writer, listing, replica, check):
+        session.close()
+
+
 @pytest.mark.asyncio
 async def test_first_memory_finalize_failure_restores_bytes_and_metadata(
     org_engine,

@@ -15,6 +15,7 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy import Text, case, cast, func, or_, tuple_
 from sqlalchemy import select as sa_select
+from sqlalchemy.orm import load_only, selectinload
 
 from cowork.common.logger import log_context
 from cowork.common.paths import (
@@ -493,6 +494,9 @@ class ConversationService:
         stmt = stmt.order_by(
             last_activity.desc(), Conversation.created_at.desc(), Conversation.id
         ).limit(limit)
+        # Every caller shows each row's project: loaded in one query for the
+        # page, not one lazy load per row.
+        stmt = stmt.options(selectinload(Conversation.project))
         return list(self.session.exec(stmt).all())
 
     def list_conversations_with_activity(
@@ -502,16 +506,41 @@ class ConversationService:
         all_projects: bool = False,
     ) -> list[tuple[Conversation, datetime]]:
         """`list_conversations` paired with each row's last-activity timestamp
-        for serialization. The value reuses `last_message_at` (an index seek on
-        the ENG-961 composite index); callers that don't need the value (e.g.
-        search indexing) use `list_conversations` and skip the per-row lookup.
+        for serialization: `last_message_at` for the whole page in one grouped
+        query on `ix_messages_conversation_created`. Callers that don't need the
+        value (e.g. search indexing) use `list_conversations` and skip it.
         """
         convs = self.list_conversations(
             project_id=project_id, limit=limit, all_projects=all_projects
         )
-        return [
-            (conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs
-        ]
+        last = self.last_messages_at([conv.id for conv in convs])
+        return [(conv, last.get(conv.id) or conv.created_at) for conv in convs]
+
+    def last_messages_at(self, conversation_ids: list[UUID]) -> dict[UUID, datetime]:
+        """`last_message_at` for many conversations in one query; a
+        conversation with no message has no entry."""
+        if not conversation_ids:
+            return {}
+        latest = (
+            sa_select(
+                Message.conversation_id,
+                func.max(Message.created_at).label("created_at"),
+            )
+            .where(Message.conversation_id.in_(conversation_ids))
+            .group_by(Message.conversation_id)
+            .subquery()
+        )
+        # Each conversation's newest message, with only the two columns read.
+        rows = self.session.exec(
+            self.session.select(Message)
+            .join(
+                latest,
+                (Message.conversation_id == latest.c.conversation_id)
+                & (Message.created_at == latest.c.created_at),
+            )
+            .options(load_only(Message.conversation_id, Message.created_at))
+        ).all()
+        return {row.conversation_id: row.created_at for row in rows}
 
     def _owned(self, conversation_id: UUID) -> Conversation | None:
         """Fetch a conversation only if it belongs to the caller.
@@ -530,20 +559,18 @@ class ConversationService:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         return self.session.exec(stmt).first()
 
-    def owned_ids(self, conversation_ids: Iterable[UUID]) -> set[UUID]:
-        """The subset of `conversation_ids` the caller owns, in one query.
+    def owned_ids(self) -> set[UUID]:
+        """Every conversation the caller owns, in one query that reads only
+        the ids.
 
-        Same rule as `_owned`, batched. The artifact roots resolver walks one
-        directory per conversation and holds every id at once, so without this
-        a plain list request would issue a SELECT per directory.
+        Same rule as `_owned`, batched. The artifact roots resolver reads it
+        once per request, before it walks any project's workspaces, so a
+        listing over every project runs one query, not one per project.
         """
-        ids = list(conversation_ids)
-        if not ids:
-            return set()
-        stmt = self.session.select(Conversation).where(Conversation.id.in_(ids))
+        stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
-        return {row.id for row in self.session.exec(stmt).all()}
+        return set(self.session.exec(stmt).all())
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)
