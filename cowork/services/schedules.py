@@ -651,11 +651,17 @@ class ScheduleRunService:
         return kept
 
     def last_finished_run(self, schedule_id: UUID) -> ScheduleRun | None:
-        """The schedule's latest finished run, manual or cron."""
+        """Latest finished manual run or cron run that retained its occurrence."""
+        parent = self.session.select(Schedule).where(Schedule.id == schedule_id)
+        if self.session.scope.org_mode:
+            parent = parent.where(Schedule.created_by == self.session.scope.user_id)
+        if self.session.exec(parent).first() is None:
+            return None
         return self.session.exec(
             self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status != RunStatus.running)
+            .where(sa.or_(ScheduleRun.is_manual == sa.true(), ScheduleRun.slot_at.is_not(None)))
             .order_by(ScheduleRun.finished_at.desc(), ScheduleRun.started_at.desc())  # type: ignore[union-attr]
             .limit(1)
         ).first()

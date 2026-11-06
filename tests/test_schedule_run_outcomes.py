@@ -602,3 +602,30 @@ def test_the_migration_keeps_one_running_run_per_schedule(tmp_path, monkeypatch)
             "SELECT count(*) FROM schedule_runs WHERE execution_claimed_at = started_at"
         )).scalar_one() == 2
 
+
+
+def test_latest_run_index_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
+    from alembic import command
+    from cowork.db.migrations import _alembic_config
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    uri = f"sqlite:///{tmp_path / 'lookup.db'}"
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    name = "ix_schedule_runs_schedule_finished"
+    assert name in {i["name"] for i in inspect(engine).get_indexes("schedule_runs")}
+    config = _alembic_config(uri)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.downgrade(config, "8c3e1f6a2b47")
+    assert name not in {i["name"] for i in inspect(engine).get_indexes("schedule_runs")}
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
+        plan = connection.execute(text(
+            "EXPLAIN QUERY PLAN SELECT * FROM schedule_runs WHERE schedule_id = 'example' "
+            "AND status != 'running' AND (is_manual = 1 OR slot_at IS NOT NULL) "
+            "ORDER BY finished_at DESC, started_at DESC LIMIT 1"
+        )).all()
+    assert name in str(plan)

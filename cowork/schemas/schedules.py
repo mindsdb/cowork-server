@@ -160,7 +160,7 @@ class ScheduleResponse(CamelResponse):
     running: bool = False
     # Filled by the endpoints: the latest finished run (ScheduleRunResponse
     # shape), so a failure shows on the schedule before any auto-pause.
-    last_run: dict | None = None
+    last_run: ScheduleRunResponse | None = None
     created_at: datetime | None
     modified_at: datetime | None
 
@@ -168,6 +168,11 @@ class ScheduleResponse(CamelResponse):
     @property
     def state(self) -> ScheduleState:
         return schedule_state(self)
+
+
+class RunTrigger(str, Enum):
+    manual = "manual"
+    cron = "cron"
 
 
 class ScheduleRunResponse(CamelResponse):
@@ -181,6 +186,9 @@ class ScheduleRunResponse(CamelResponse):
     conversation_id: UUID | None
     is_manual: bool
     outcome: AttemptOutcome | None = None
-    # Filled by the endpoints: "manual" or "cron".
-    trigger: str | None = None
     created_at: datetime | None
+
+    @computed_field
+    @property
+    def trigger(self) -> RunTrigger:
+        return RunTrigger.manual if self.is_manual else RunTrigger.cron

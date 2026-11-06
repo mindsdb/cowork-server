@@ -164,7 +164,7 @@ def test_the_failure_frame_is_read_with_whether_the_turn_acted(tmp_path, monkeyp
     ])
     acted, failure = asyncio.run(scheduler._turn_activity("c1"))
     assert acted is False
-    assert failure == scheduler._TurnFailure(message="The model isn't available.")
+    assert failure == "The model isn't available."
 
 
 def test_a_turn_that_acted_still_reports_its_failure(tmp_path, monkeypatch):
@@ -175,12 +175,12 @@ def test_a_turn_that_acted_still_reports_its_failure(tmp_path, monkeypatch):
     ])
     acted, failure = asyncio.run(scheduler._turn_activity("c1"))
     assert acted is True
-    assert failure.message == "The provider timed out."
+    assert failure == "The provider timed out."
 
 
 def test_a_blank_failure_text_falls_back_to_the_generic_one():
     end = scheduler._classify(scheduler._TurnEvidence(
-        reason="error", acted=False, failure=scheduler._TurnFailure(message="  "),
+        reason="error", acted=False, failure=scheduler._failure_from_frame({"error": "  "}),
     ))
     assert end.outcome == AttemptOutcome.failed_before_execution
     assert end.error == scheduler._FAILED_BEFORE_ERROR
@@ -188,7 +188,7 @@ def test_a_blank_failure_text_falls_back_to_the_generic_one():
 
 async def test_a_run_records_the_turns_own_failure_text(schedule_id, turns):
     turns.ending.reason, turns.ending.acted = "error", True
-    turns.ending.failure = scheduler._TurnFailure(message="The Linear connection needs reconnecting.")
+    turns.ending.failure = "The Linear connection needs reconnecting."
     (slot,) = _poll(schedule_id)
     await _run(slot)
 
@@ -201,7 +201,7 @@ async def test_a_run_records_the_turns_own_failure_text(schedule_id, turns):
 
 async def test_a_failure_before_acting_uses_its_slot_up(schedule_id, turns):
     turns.ending.reason, turns.ending.acted = "error", False
-    turns.ending.failure = scheduler._TurnFailure(message="That model isn't available.")
+    turns.ending.failure = "That model isn't available."
     (slot,) = _poll(schedule_id)
     await _run(slot)
 
@@ -268,7 +268,7 @@ async def test_a_schedule_reports_its_last_finished_run(schedule_id, turns):
         assert (await client.get(f"/api/v1/schedules/{schedule_id}")).json()["lastRun"] is None
 
     turns.ending.reason, turns.ending.acted = "error", True
-    turns.ending.failure = scheduler._TurnFailure(message="The sheet was not found.")
+    turns.ending.failure = "The sheet was not found."
     (slot,) = _poll(schedule_id)
     await _run(slot)
 
@@ -279,3 +279,116 @@ async def test_a_schedule_reports_its_last_finished_run(schedule_id, turns):
     assert last["error"] == "The sheet was not found."
     assert last["trigger"] == "cron"
     assert last["conversationId"] is not None
+
+
+async def test_published_terminal_is_read_before_the_producer_sets_closed(monkeypatch):
+    from cowork.streaming.buffer import RedisStreamBuffer
+    import cowork.streaming.buffer as buffers
+
+    # Redis has committed the terminal record, but close() is still awaiting
+    # its acknowledgement and has not set the local closed flag.
+    class Redis:
+        async def xrange(self, _key):
+            return [("1-0", {"seq": "0", "ts": "", "type": "Done", "data": '{"reason":"completed"}'})]
+
+    buffer = RedisStreamBuffer("race", 1)
+    buffer._next_seq = 1
+    monkeypatch.setattr(buffers, "get_redis", lambda: Redis())
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _: SimpleNamespace(buffer=buffer)))
+    assert not buffer.is_closed
+    end = scheduler._classify(await scheduler._turn_evidence("race"))
+    assert end.outcome == AttemptOutcome.completed
+
+
+async def test_missing_terminal_does_not_wait_for_a_stuck_producer(monkeypatch):
+    class StuckBuffer:
+        latest_seq = 0
+        is_closed = False
+
+        async def tail(self, _seq):
+            await asyncio.Event().wait()
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(scheduler, "_EVIDENCE_READ_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _: SimpleNamespace(buffer=StuckBuffer())))
+    evidence = await asyncio.wait_for(scheduler._turn_evidence("stuck"), timeout=1)
+    assert scheduler._classify(evidence).outcome == AttemptOutcome.uncertain
+    assert evidence.acted
+
+
+@pytest.mark.parametrize("after_handoff", [False, True])
+async def test_exception_details_never_reach_run_responses(schedule_id, turns, monkeypatch, after_handoff):
+    import cowork.handlers.responses as responses
+    from sqlalchemy.exc import OperationalError
+
+    secret = "private-prompt-and-connection-details"
+
+    async def broken_handle(self, request):
+        async def stream():
+            raise OperationalError("SELECT private_value", {"prompt": secret}, RuntimeError(secret))
+            yield
+        if after_handoff:
+            return stream()
+        raise OperationalError("SELECT private_value", {"prompt": secret}, RuntimeError(secret))
+
+    monkeypatch.setattr(responses.ResponsesHandler, "handle", broken_handle)
+    session, scoped = _scoped()
+    try:
+        schedule = ScheduleService(scoped).get_schedule(schedule_id)
+        schedule.consecutive_failures = 2
+        session.add(schedule)
+        session.commit()
+    finally:
+        session.close()
+    await _run(_poll(schedule_id)[0])
+    run = _runs(schedule_id)[0]
+    expected = scheduler._UNCERTAIN_ERROR if after_handoff else scheduler._FAILED_BEFORE_ERROR
+    assert run.error == expected
+    assert _schedule(schedule_id).last_error == expected
+    assert _schedule(schedule_id).consecutive_failures == (2 if after_handoff else 3)
+    async with _client() as client:
+        response = await client.get(f"/api/v1/schedules/{schedule_id}")
+        assert secret not in response.text
+        assert response.json()["lastRun"]["error"] == expected
+
+
+@pytest.mark.parametrize("reason", ["error", "completed"])
+async def test_bookkeeping_exception_preserves_confirmed_failures_only(schedule_id, turns, monkeypatch, reason):
+    turns.ending.reason = reason
+    turns.ending.failure = "The sheet was not found." if reason == "error" else None
+
+    def broken_record(*args, **kwargs):
+        raise RuntimeError("private database diagnostics")
+
+    monkeypatch.setattr(scheduler, "_record_turn_outcome", broken_record)
+    await _run(_poll(schedule_id)[0])
+    run = _runs(schedule_id)[0]
+    assert run.outcome == (AttemptOutcome.failed_during_execution if reason == "error" else AttemptOutcome.uncertain)
+    assert run.error == (turns.ending.failure if reason == "error" else scheduler._UNCERTAIN_ERROR)
+    assert _schedule(schedule_id).consecutive_failures == (1 if reason == "error" else 0)
+
+
+def test_last_run_skips_released_cron_attempts_but_keeps_manual_failures(schedule_id):
+    session, scoped = _scoped()
+    try:
+        service = ScheduleRunService(scoped)
+        retained = ScheduleRun(schedule_id=schedule_id, started_at=SLOT, slot_at=SLOT, status="success", finished_at=SLOT)
+        released = ScheduleRun(schedule_id=schedule_id, started_at=SLOT, status="failed", finished_at=SLOT + timedelta(seconds=1))
+        session.add_all([retained, released])
+        session.commit()
+        assert service.last_finished_run(schedule_id).id == retained.id
+        manual = ScheduleRun(schedule_id=schedule_id, started_at=SLOT, is_manual=True, status="failed", finished_at=SLOT + timedelta(seconds=2))
+        session.add(manual)
+        session.commit()
+        assert service.last_finished_run(schedule_id).id == manual.id
+        assert len(service.list_runs(schedule_id)) == 3
+    finally:
+        session.close()
+
+
+def test_last_run_and_trigger_are_described_in_openapi():
+    from cowork.server import create_app
+
+    schemas = create_app().openapi()["components"]["schemas"]
+    assert "ScheduleRunResponse" in str(schemas["ScheduleResponse"]["properties"]["lastRun"])
+    assert schemas["RunTrigger"]["enum"] == ["manual", "cron"]

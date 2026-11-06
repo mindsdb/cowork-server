@@ -342,13 +342,6 @@ class _RunOutcome:
 
 
 @dataclass(frozen=True)
-class _TurnFailure:
-    """What a turn's failure frame told the user."""
-
-    message: str | None = None
-
-
-@dataclass(frozen=True)
 class _TurnEvidence:
     """How the turn that just ended went: its terminal reason, whether its
     stream shows anything the agent did, and what its last failure frame told
@@ -357,7 +350,7 @@ class _TurnEvidence:
     reason: str | None
     acted: bool
     shutdown_interrupted: bool = False
-    failure: _TurnFailure | None = None
+    failure: str | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +368,8 @@ _INTERRUPTED_TURN_ERROR = (
 )
 _FAILED_DURING_ERROR = "Run did not complete — open the run's task for details."
 _FAILED_BEFORE_ERROR = "Run failed before it started work — open the run's task for details."
+_EVIDENCE_READ_TIMEOUT_SECONDS = 5
+
 _UNCERTAIN_ERROR = (
     "Run ended without a record of how it finished. Open the run to check what it did "
     "before running it again."
@@ -394,7 +389,7 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
         return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_INTERRUPTED_TURN_ERROR)
     if reason is None:
         return _AttemptEnd(outcome=AttemptOutcome.uncertain, error=_UNCERTAIN_ERROR)
-    told = ((evidence.failure or _TurnFailure()).message or "").strip() or None
+    told = evidence.failure
     if not evidence.acted:
         return _AttemptEnd(outcome=AttemptOutcome.failed_before_execution, error=told or _FAILED_BEFORE_ERROR)
     return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=told or _FAILED_DURING_ERROR)
@@ -712,6 +707,8 @@ async def execute_schedule(
     created_conversation = conversation_id is None
     turn_started = False
     timed_out = False
+    end: _AttemptEnd | None = None
+    shutdown_interrupted = False
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -799,6 +796,7 @@ async def execute_schedule(
         # and whether its agent acted — without them every run is recorded as
         # success.
         evidence = await _turn_evidence(str(conversation_id))
+        shutdown_interrupted = evidence.shutdown_interrupted
         end = _classify(evidence)
         outcome = end.outcome
         recorded = await _until_it_lands(
@@ -830,14 +828,16 @@ async def execute_schedule(
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
         raise
     except Exception as exc:
-        error = str(exc)
         # The ids travel as record attributes: a database error's sanitized
         # line keeps those and drops the message.
         logger.exception(
-            "Schedule run failed: %s", error,
+            "Schedule run failed: %s", str(exc),
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
-        if timed_out:
+        if end is not None and end.outcome not in {AttemptOutcome.completed, AttemptOutcome.cancelled}:
+            # A bookkeeping failure must not erase an already observed failure.
+            outcome = end.outcome
+        elif timed_out:
             outcome = AttemptOutcome.interrupted
         elif not turn_started:
             outcome = AttemptOutcome.failed_before_execution
@@ -845,6 +845,13 @@ async def execute_schedule(
             # The turn was handed off and something failed around it: it may
             # have acted.
             outcome = AttemptOutcome.uncertain
+        error = {
+            AttemptOutcome.failed_before_execution: _FAILED_BEFORE_ERROR,
+            AttemptOutcome.failed_during_execution: _FAILED_DURING_ERROR,
+            AttemptOutcome.interrupted: _INTERRUPTED_TURN_ERROR,
+        }.get(outcome, _UNCERTAIN_ERROR)
+        if end is not None and end.error:
+            error = end.error
         # A run that raised consumes its cron slot like one that failed inside
         # its turn. Left due, the next poll starts it again, and a failure that
         # repeats (a timeout, a revoked permission) re-fires every poll. A busy
@@ -857,7 +864,14 @@ async def execute_schedule(
                 partial(
                     _record_schedule_error, schedule_id=schedule_id, error=error,
                     consume_slot=not is_manual and not transient,
-                    counts_toward_streak=outcome != AttemptOutcome.uncertain,
+                    counts_toward_streak=(
+                        outcome in {
+                            AttemptOutcome.failed_before_execution,
+                            AttemptOutcome.failed_during_execution,
+                            AttemptOutcome.interrupted,
+                        }
+                        and not shutdown_interrupted
+                    ),
                 ),
                 schedule_id=schedule_id,
             )
@@ -919,16 +933,17 @@ async def _turn_terminal_reason(conversation_id: str) -> str | None:
     """Terminal reason ("completed" | "cancelled" | "error" | …) of the turn
     that just ended on this conversation, or None when unavailable.
 
-    Only call after the turn's stream has been fully drained: the buffer is
-    closed then, so tailing from the last record returns immediately."""
+    Only call after the turn's stream has been fully drained. The terminal
+    record is authoritative; the local is_closed flag can lag its publication."""
     handle = registry.get(conversation_id)
-    if handle is None or not handle.buffer.is_closed:
+    if handle is None:
         return None
     try:
         buffer = handle.buffer
-        async for rec in buffer.tail(max(buffer.latest_seq - 1, 0)):
-            if rec.is_terminal:
-                return str(rec.data.get("reason") or "") or None
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in buffer.tail(max(buffer.latest_seq - 1, 0)):
+                if rec.is_terminal:
+                    return str(rec.data.get("reason") or "") or None
     except Exception:
         logger.exception(
             "Could not read conversation terminal state",
@@ -966,10 +981,10 @@ def _frame_shows_action(event: str, data: dict) -> bool:
     return not (event == "response.in_progress" and data.get("phase") == MODEL_WAIT_PHASE)
 
 
-def _failure_from_frame(data: dict) -> _TurnFailure:
+def _failure_from_frame(data: dict) -> str | None:
     """What a response.failed frame told the user."""
     message = data.get("error")
-    return _TurnFailure(message=message if isinstance(message, str) and message.strip() else None)
+    return message.strip() or None if isinstance(message, str) else None
 
 
 async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
@@ -985,15 +1000,16 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         and bool(getattr(lifecycle, "shutting_down", False))
         and not bool(getattr(lifecycle, "timed_out", False))
     )
+    acted, failure = await _turn_activity(conversation_id)
     return _TurnEvidence(
         reason=reason,
-        acted=(await _turn_activity(conversation_id))[0],
-        failure=(await _turn_activity(conversation_id))[1],
+        acted=acted,
+        failure=failure,
         shutdown_interrupted=shutdown_interrupted,
     )
 
 
-async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | None]:
+async def _turn_activity(conversation_id: str) -> tuple[bool, str | None]:
     """Whether the turn's buffer holds anything beyond its start, its memory
     read, a wait for the model and its failure, and the last failure frame it
     holds. Acted when the buffer is unavailable, and a record that is not a
@@ -1001,25 +1017,26 @@ async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | Non
     done nothing. The failure is read in the same pass, to the terminal
     record, whether or not the turn acted.
 
-    Only call after the turn's stream has been fully drained: the buffer is
-    closed then, so reading it returns at the terminal record."""
+    Only call after the turn's stream has been fully drained. Read through the
+    terminal record even if the local seal flag has not caught up yet."""
     handle = registry.get(conversation_id)
-    if handle is None or not handle.buffer.is_closed:
+    if handle is None:
         return True, None
     acted = False
-    failure: _TurnFailure | None = None
+    failure: str | None = None
     try:
-        async for rec in handle.buffer.tail(0):
-            if rec.is_terminal:
-                return acted, failure
-            frames = _sse_frames(rec)
-            if not frames:
-                acted = True
-            for event, data in frames:
-                if event == "response.failed":
-                    failure = _failure_from_frame(data)
-                elif _frame_shows_action(event, data):
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    return acted, failure
+                frames = _sse_frames(rec)
+                if not frames:
                     acted = True
+                for event, data in frames:
+                    if event == "response.failed":
+                        failure = _failure_from_frame(data)
+                    elif _frame_shows_action(event, data):
+                        acted = True
     except Exception:
         logger.exception(
             "Could not read the turn's records",

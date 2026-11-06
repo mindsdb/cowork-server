@@ -81,6 +81,7 @@ class ScheduleRun(BaseSQLModel, table=True):
     # insert that names a slot is the claim: a second replica's insert for
     # that slot fails here, so the slot starts one run (cowork.scheduler).
     __table_args__ = (
+        sa.Index("ix_schedule_runs_schedule_finished", "schedule_id", "finished_at", "started_at"),
         sa.Index(
             "uq_schedule_runs_slot",
             "schedule_id",
