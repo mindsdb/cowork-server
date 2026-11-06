@@ -73,6 +73,8 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # created_by only: a message's partition is its conversation's, and the
     # flush hook stamps its author only where conversations are personal.
     "messages": PersonalResource.CONVERSATIONS,
+    # A chat's working folders belong to it and go when it is deleted.
+    "conversation_folders": PersonalResource.CONVERSATIONS,
     # A channel installation and its bindings and events route an external chat
     # into conversations, so they follow conversations.
     "channel_installations": PersonalResource.CONVERSATIONS,

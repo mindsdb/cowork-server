@@ -18,7 +18,7 @@ import uuid
 import pytest
 from sqlmodel import Session
 
-import cowork.api.v1.endpoints.project_files as pf
+import cowork.services.folder_listing as listing
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
@@ -103,7 +103,7 @@ def tree(tmp_path_factory):
 def test_a_peers_private_workspace_does_not_spend_the_peers_listing(
     client, tree, monkeypatch
 ):
-    monkeypatch.setattr(pf, "_MAX_LISTED_FILES", CAP)
+    monkeypatch.setattr(listing, "MAX_LISTED_FILES", CAP)
 
     res = client.get(f"/api/v1/projects/{PROJECT}/files", headers=PEER_HEADERS)
 
