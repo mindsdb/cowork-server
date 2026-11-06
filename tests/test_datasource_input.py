@@ -172,6 +172,51 @@ def test_custom_ca_is_carried_through_and_system_mode_rejects_a_ca():
         normalize_datasource_input(_structured(tls={"mode": "system", "ca_pem": CA_PEM}))
 
 
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        pytest.param(f"{CA_PEM}\n\n{CA_PEM}\n", id="chain"),
+        pytest.param(CA_PEM.replace("\n", "\r\n"), id="crlf"),
+        pytest.param(f"  \n{CA_PEM}\n  ", id="surrounding-whitespace"),
+    ],
+)
+def test_a_bundle_of_certificates_is_accepted(bundle):
+    payload = normalize_datasource_input(
+        _structured(tls={"mode": "custom_ca", "ca_pem": bundle})
+    )
+
+    assert payload["tls"] == {"mode": "custom_ca", "ca_pem": bundle.strip()}
+
+
+_KEY_BLOCK = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        pytest.param(_KEY_BLOCK, id="private-key-only"),
+        pytest.param(f"{CA_PEM}\n{_KEY_BLOCK}", id="certificate-then-private-key"),
+        pytest.param(f"subject=CN=example\n{CA_PEM}", id="text-before"),
+        pytest.param(f"{CA_PEM}\ntrailing text", id="text-after"),
+        pytest.param("-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAJ5s\n", id="begin-without-end"),
+        pytest.param("MIIBkTCB+wIJAJ5s\n-----END CERTIFICATE-----", id="end-without-begin"),
+        pytest.param(
+            "-----BEGIN CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+            id="begin-inside-a-body",
+        ),
+        pytest.param(
+            "-----BEGIN CERTIFICATE-----" * (64 * 1024 // len("-----BEGIN CERTIFICATE-----")),
+            id="begin-markers-up-to-the-cap",
+        ),
+    ],
+)
+def test_anything_but_certificate_blocks_is_refused(bundle):
+    with pytest.raises(InvalidDatasourceInput) as caught:
+        normalize_datasource_input(_structured(tls={"mode": "custom_ca", "ca_pem": bundle}))
+
+    assert caught.value.detail["message"] == "the CA certificate must contain only X.509 certificate blocks"
+
+
 def test_a_connection_with_no_trust_block_prefers_encryption():
     """The form stops asking, so this is what nearly every connection carries:
     encryption where the server offers it, and no check on who answered."""

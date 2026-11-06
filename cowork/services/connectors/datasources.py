@@ -44,7 +44,12 @@ _STRUCTURED_FIELDS = ("host", "port", "database", "username", "password", "tls")
 #: What a DSN replaces. The schema is spelled `schema` on the wire and carries
 #: its model attribute's name here.
 _STRUCTURED_ATTRIBUTES = (*_STRUCTURED_FIELDS, "db_schema")
-_CERTIFICATE_RE = re.compile(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.DOTALL)
+#: A bundle of one or more PEM certificates and nothing else. A block's body
+#: holds only base64 and whitespace, which never contain the "-" that starts
+#: the END marker, so a fullmatch runs in linear time on any input.
+_CA_BUNDLE_RE = re.compile(
+    r"(?:-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+"
+)
 
 
 class InvalidDatasourceInput(HTTPException):
@@ -183,8 +188,7 @@ def _canonical_tls(tls: Any) -> dict[str, Any]:
     ca_pem = ca_pem.strip()
     if len(ca_pem.encode()) > MAX_CA_PEM_BYTES:
         raise InvalidDatasourceInput("the CA certificate exceeds the 64 KiB limit")
-    blocks = _CERTIFICATE_RE.findall(ca_pem)
-    if not blocks or re.sub(r"\s+", "", ca_pem) != "".join(re.sub(r"\s+", "", block) for block in blocks):
+    if _CA_BUNDLE_RE.fullmatch(ca_pem) is None:
         raise InvalidDatasourceInput("the CA certificate must contain only X.509 certificate blocks")
     return {"mode": "custom_ca", "ca_pem": ca_pem}
 
