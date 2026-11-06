@@ -757,11 +757,18 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     last_id = tail[0][0] if tail else "0-0"
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
-    await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
+    registry_key = f"{settings.jobs_stream}:queues"
+    await r.sadd(registry_key, conversation_id)
     # Sent at most once: an XADD resent after its reply was lost would queue
     # the turn twice, and the controller would run it twice.
     with send_once():
         await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
+    # Registered again: the controller retires a drained queue by deleting its
+    # stream and its registry entry in one script. One that ran between the
+    # SADD and the XADD above left this job in a new stream nobody reads. The
+    # new stream has no consumer group, so the script never retires it, and
+    # the controller creates the group when it next reads.
+    await r.sadd(registry_key, conversation_id)
     # Any replica can now find this turn: its turn_id to open the buffer, its
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator

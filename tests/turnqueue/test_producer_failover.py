@@ -117,6 +117,34 @@ async def test_the_job_that_queues_a_turn_is_sent_at_most_once(monkeypatch):
     assert not any(once for command, once in fake.writes if command != "xadd")
 
 
+class _RetiringRedis(_Redis):
+    """Retires the conversation's queue right after its first registration,
+    as a controller's retirement script can between the SADD and the XADD."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.registered: set[str] = set()
+        self._retired = False
+
+    async def sadd(self, key, member):
+        await super().sadd(key, member)
+        if key.endswith(":queues"):
+            self.registered.add(member)
+            if not self._retired:
+                self._retired = True
+                self.registered.discard(member)
+        return 1
+
+
+async def test_a_queue_retired_between_registering_and_queueing_is_registered_again(monkeypatch):
+    """A job XADD into a stream the registry no longer names is read by no controller."""
+    fake = _RetiringRedis(replies=[_authorized(), _reply(kind="turn_completed", data={})])
+
+    await _turn(monkeypatch=monkeypatch, fake=fake)
+
+    assert fake.registered == {"conv-1"}
+
+
 async def test_a_reply_whose_number_is_not_above_the_last_applied_is_dropped(monkeypatch):
     """The controller resends a reply whose XADD reply it lost, and a doubled
     turn_delta would double its text in the answer."""
