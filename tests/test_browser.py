@@ -113,13 +113,21 @@ def nothing_goes_out(monkeypatch):
 
 
 @pytest.fixture
-def web(monkeypatch):
+def scope_key_file(tmp_path):
+    """The router's scope key, mounted as the chart mounts it."""
+    path = tmp_path / "scope_key"
+    path.write_text(SCOPE_KEY + "\n")
+    return path
+
+
+@pytest.fixture
+def web(monkeypatch, scope_key_file):
     """The web app: org tenancy, with the browser router configured."""
     from cowork.common.settings.app_settings import get_app_settings
 
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", ROUTER + "/")
-    monkeypatch.setenv("COWORK_BROWSER_SCOPE_KEY", SCOPE_KEY)
+    monkeypatch.setenv("COWORK_BROWSER_SCOPE_KEY_FILE", str(scope_key_file))
     get_app_settings.cache_clear()
     yield
     get_app_settings.cache_clear()
@@ -829,6 +837,17 @@ def test_a_refused_scope_raises_with_the_routers_code(router):
     with pytest.raises(svc.BrowserServiceError) as err:
         asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=config))
     assert (err.value.status, err.value.detail.code) == (svc.UPSTREAM_FAILED, "scope_conflict")
+
+
+def test_the_scope_key_is_read_on_every_scope_so_a_late_or_rotated_secret_lands(router, scope_key_file):
+    """The kubelet fills the mounted Secret after a pod that started first, and
+    rewrites it on rotation; neither needs a restart."""
+    scope_key_file.unlink()
+    asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=None))
+    scope_key_file.write_text("rotated-" + "r" * 32)
+    asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=None))
+    # No file: no header at all, and the router answers scope_key_invalid.
+    assert [c.scope_key for c in router.calls] == ["", "rotated-" + "r" * 32]
 
 
 def test_the_scope_key_never_reaches_a_log_line(router, caplog):

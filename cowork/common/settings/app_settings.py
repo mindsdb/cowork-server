@@ -1152,16 +1152,18 @@ class AppSettings(Settings):
             )
         return normalized
 
-    browser_scope_key: SecretStr = Field(
-        default=SecretStr(""),
-        validation_alias=AliasChoices("COWORK_BROWSER_SCOPE_KEY"),
+    browser_scope_key_file: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_SCOPE_KEY_FILE"),
         description=(
-            "The browser router's scope key, sent beside each web turn's key on "
-            "the router's _scope, so only this server can scope a turn key "
-            "(cowork.services.browser.scope_turn). MindsHub mode only. The chart "
-            "reads it from the router's own Secret, browser-proxy, key "
-            "scope_key, so the two never differ. Blank: the router refuses "
-            "every scope and web turns run without a browser."
+            "A file holding the browser router's scope key, sent beside each web "
+            "turn's key on the router's _scope, so only this server can scope a "
+            "turn key (cowork.services.browser.scope_turn). MindsHub mode only. "
+            "The chart mounts the router's own Secret, browser-proxy, key "
+            "scope_key, here, so the two never differ. Read on every scope, so a "
+            "Secret that appears or rotates after start is picked up without a "
+            "restart. Blank, missing or empty: the router refuses every scope and "
+            "web turns run without a browser."
         ),
     )
 

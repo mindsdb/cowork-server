@@ -52,6 +52,7 @@ import asyncio
 import hashlib
 import logging
 import re
+from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import httpx
@@ -384,8 +385,23 @@ async def scope_turn(*, turn_key: str, router: str, config: BrowserConfig | None
         session_id=config.profile if config is not None else None,
         project=(config.project or None) if config is not None else None,
     )
-    scope_key = get_app_settings().browser_scope_key.get_secret_value()
-    await _call("POST", f"{router}/_scope", turn_key, json=body.body(), headers={SCOPE_KEY_HEADER: scope_key})
+    scope_key = _scope_key()
+    headers = {SCOPE_KEY_HEADER: scope_key} if scope_key else None
+    await _call("POST", f"{router}/_scope", turn_key, json=body.body(), headers=headers)
+
+
+def _scope_key() -> str:
+    """The router's scope key, read from its file on every call: the kubelet
+    fills the mounted Secret when it first appears and rewrites it on rotation,
+    and an environment variable would keep whatever the pod started with. ""
+    when there is no file or it is empty; the router then refuses the scope."""
+    path = get_app_settings().browser_scope_key_file
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 async def browser_entitlement(*, bearer: str, org_id: str, user_id: str) -> BrowserEntitlement:

@@ -193,12 +193,14 @@ web frontend. PR environments get theirs from where they are deployed.
 `tests/test_chart_values.py` pins each value to its environment's host. What
 the router does with it is in the top-level README ("The agent's browser").
 
-`COWORK_BROWSER_SCOPE_KEY` comes from the router's own Secret, `browser-proxy`,
-key `scope_key`, in the same namespace (`values.yaml`). The router takes a
-turn key's scope only with that key beside it, so the two must match, and
-reading one Secret keeps them so. The reference is optional: an environment
-with no router has no such Secret and scopes no turn. cowork-server reads the
-value at start, so restart it once the Secret first appears.
+The router's scope key is the `browser-scope-key` volume: the router's own
+Secret, `browser-proxy`, key `scope_key`, in the same namespace, mounted at
+`/etc/cowork/browser-scope/scope_key` (`COWORK_BROWSER_SCOPE_KEY_FILE`,
+`values.yaml`). The router takes a turn key's scope only with that key beside
+it, so the two must match, and reading one Secret keeps them so. cowork-server
+reads the file on every scope, and the kubelet fills it when the Secret first
+appears and rewrites it on rotation, so no restart is needed. The volume is
+optional: a namespace with no router has no such Secret and scopes no turn.
 
 ## Browser organization boundary
 

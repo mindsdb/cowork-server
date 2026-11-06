@@ -336,10 +336,25 @@ deployment:
     - name: cowork-shared
       persistentVolumeClaim:
         claimName: cowork-shared
+    # The browser router's scope key, from the router's own Secret in this
+    # namespace. A file rather than an environment variable: the kubelet fills
+    # it when the Secret first appears and rewrites it on rotation, so a pod
+    # that started first still scopes once it syncs. Optional, so a namespace
+    # with no router (and so no Secret) starts as usual and scopes no turn.
+    - name: browser-scope-key
+      secret:
+        secretName: browser-proxy
+        optional: true
+        items:
+          - key: scope_key
+            path: scope_key
 
   volumeMounts:
     - name: cowork-shared
       mountPath: /mnt/cowork-shared
+    - name: browser-scope-key
+      mountPath: /etc/cowork/browser-scope
+      readOnly: true
 
   globalEnvs:
 
@@ -439,16 +454,10 @@ deployment:
       value: "1200"
 
     # The browser router's scope key, sent beside each web turn's key when the
-    # producer scopes it, so only this server can scope a turn key. Read from
-    # the router's own Secret in this namespace, so the two never differ.
-    # Optional: where no router runs, the Secret doesn't exist and no web turn
-    # is scoped. A pod started before the Secret existed needs a restart.
-    - name: COWORK_BROWSER_SCOPE_KEY
-      valueFrom:
-        secretKeyRef:
-          name: browser-proxy
-          key: scope_key
-          optional: true
+    # producer scopes it, so only this server can scope a turn key. The file
+    # is the browser-scope-key volume below, read on every scope.
+    - name: COWORK_BROWSER_SCOPE_KEY_FILE
+      value: /etc/cowork/browser-scope/scope_key
 
     # Cloud datasource grants for hosted turns. Off until the release gate; on,
     # the producer lists the user's verified connections and registers grants
