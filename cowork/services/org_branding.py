@@ -107,20 +107,21 @@ def appearance_view(row: OrgAppearance | None) -> OrgAppearanceView:
 def save_appearance(session: ScopedSession, update: OrgAppearanceUpdate) -> OrgAppearance:
     """Apply ``update`` to the org's row, creating it, and commit. A field the
     body left out keeps its value; ``members_can_choose`` sent as null is
-    the default, true."""
-    row = appearance_row(session) or OrgAppearance()
-    for name in update.model_fields_set:
-        value = getattr(update, name)
-        if name == "members_can_choose" and value is None:
-            value = True
-        setattr(row, name, value)
+    the default, true. Any failure, the read included, rolls the session
+    back before it propagates."""
     try:
+        row = appearance_row(session) or OrgAppearance()
+        for name in update.model_fields_set:
+            value = getattr(update, name)
+            if name == "members_can_choose" and value is None:
+                value = True
+            setattr(row, name, value)
         session.add(row)
         session.commit()
+        session.refresh(row)
     except Exception:
         session.rollback()
         raise
-    session.refresh(row)
     return row
 
 

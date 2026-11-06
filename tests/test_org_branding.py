@@ -122,6 +122,50 @@ def org(org_deployment, monkeypatch, tmp_path):
         get_app_settings.cache_clear()
 
 
+@pytest.fixture
+def migrated_org(org, monkeypatch, tmp_path):
+    """``org``, but over a SQLite file the real Alembic migrations built,
+    as a deployed database is, rather than over SQLModel's create_all.
+    ``build(drop_sidebar_title=True)`` gives the schema a deployed
+    environment had after running d4b7e2a9c1f3 before it gained the column;
+    ``migrate()`` then runs every pending revision."""
+    import sqlite3
+
+    from alembic import command
+    from sqlalchemy import create_engine as create_sa_engine
+
+    from cowork.db.migrations import _alembic_config, run_schema_migrations
+
+    path = tmp_path / "migrated.db"
+    uri = f"sqlite:///{path}"
+    engine = create_sa_engine(uri)
+    sessions: list[ScopedSession] = []
+
+    def build(*, drop_sidebar_title: bool = False, migrate: bool = True) -> None:
+        config = _alembic_config(uri)
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "d4b7e2a9c1f3")
+        if drop_sidebar_title:
+            with sqlite3.connect(path) as connection:
+                connection.execute("alter table org_appearance drop column sidebar_title")
+                connection.commit()
+        if migrate:
+            run_schema_migrations(engine, uri)
+
+    def as_(user: str) -> ScopedSession:
+        session = ScopedSession(Session(engine), TenantScope(org_mode=True, org_id=ORG_ID, user_id=user))
+        sessions.append(session)
+        return session
+
+    try:
+        yield SimpleNamespace(as_=as_, build=build, set_auth=org.set_auth)
+    finally:
+        for session in sessions:
+            session.close()
+        engine.dispose()
+
+
 def _get(org, user: str, *, admin: bool = False) -> dict:
     return asyncio.run(ep.get_org_branding(_request(), org.as_(user), _principal(user, admin=admin)))
 
@@ -481,3 +525,39 @@ def test_auths_json_route_ends_with_a_slash():
 def test_fixed_image_url_drops_the_version():
     assert org_branding.fixed_image_url(f"{AUTH}/logo?v=abc") == f"{AUTH}/logo"
     assert org_branding.fixed_image_url(None) is None
+
+
+# ── against the migrated schema ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("drop_sidebar_title", [False, True], ids=["fresh", "deployed-before-sidebar-title"])
+def test_a_put_round_trips_on_the_migrated_schema(migrated_org, drop_sidebar_title):
+    migrated_org.build(drop_sidebar_title=drop_sidebar_title)
+    out = _put(migrated_org, ADMIN, accent="#0055ff", sidebar_title="Acme AI", members_can_choose=False)
+    assert (out["sidebarTitle"], out["appearance"]["accent"]) == ("Acme AI", "#0055ff")
+    read = _get(migrated_org, ALICE)
+    assert read["appearance"] == {
+        **out["appearance"], "accent": "#0055ff", "sidebarTitle": "Acme AI", "membersCanChoose": False,
+    }
+    assert read["sidebarTitle"] == "Acme AI"
+
+
+def test_a_database_error_on_put_is_a_generic_500_and_a_named_log(migrated_org, caplog):
+    # The deployed schema before 3e78d31dc845 ran: no sidebar_title column.
+    migrated_org.build(drop_sidebar_title=True, migrate=False)
+    with caplog.at_level("ERROR", logger=ep.logger.name):
+        _refused(lambda: _put(migrated_org, ADMIN, accent="#0055ff"), 500, ep.SAVE_FAILED)
+    with pytest.raises(HTTPException) as caught:
+        _put(migrated_org, ADMIN, accent="#0055ff")
+    assert caught.value.detail == ep.SAVE_FAILED
+    assert "sidebar_title" not in caught.value.detail
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "org_branding_appearance_save_failed" in events
+
+
+def test_a_database_error_on_get_is_a_generic_500(migrated_org, caplog):
+    migrated_org.build(drop_sidebar_title=True, migrate=False)
+    with caplog.at_level("ERROR", logger=ep.logger.name):
+        _refused(lambda: _get(migrated_org, ALICE), 500, ep.READ_FAILED)
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "org_branding_appearance_read_failed" in events

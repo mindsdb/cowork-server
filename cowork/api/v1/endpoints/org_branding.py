@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, require
@@ -42,6 +43,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 NOT_IN_ORG_MODE = "Organization branding is only available in a hosted organization."
+# What a caller sees when the database fails: nothing of the error itself.
+SAVE_FAILED = "Could not save the organization's branding. Try again."
+READ_FAILED = "Could not read the organization's branding. Try again."
 
 
 def _in_org(scoped: ScopedSession) -> bool:
@@ -64,7 +68,10 @@ def _sync_skill(scoped: ScopedSession, images: AuthBranding, row: OrgAppearance 
     try:
         sync_brand_skill(scoped, images, row)
     except Exception:
-        logger.exception("Could not update the organization's Brand guidelines skill")
+        logger.exception(
+            "Could not update the organization's Brand guidelines skill",
+            extra={"event": "org_branding_skill_sync_failed"},
+        )
 
 
 def _view(images: AuthBranding, row: OrgAppearance | None, principal: Principal | None) -> dict:
@@ -91,7 +98,15 @@ async def get_org_branding(
     images = await _images(request, scoped)
 
     def read() -> dict:
-        row = appearance_row(scoped)
+        try:
+            row = appearance_row(scoped)
+        except SQLAlchemyError:
+            scoped.rollback()
+            logger.exception(
+                "Could not read the organization's appearance",
+                extra={"event": "org_branding_appearance_read_failed"},
+            )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=READ_FAILED)
         _sync_skill(scoped, images, row)
         return _view(images, row, principal)
 
@@ -115,7 +130,14 @@ async def put_org_appearance(
     images = await _images(request, scoped)
 
     def write() -> dict:
-        row = save_appearance(scoped, body)
+        try:
+            row = save_appearance(scoped, body)
+        except SQLAlchemyError:
+            logger.exception(
+                "Could not save the organization's appearance",
+                extra={"event": "org_branding_appearance_save_failed"},
+            )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=SAVE_FAILED)
         _sync_skill(scoped, images, row)
         return _view(images, row, principal)
 

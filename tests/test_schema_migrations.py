@@ -1173,3 +1173,49 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
         assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
     engine.dispose()
+
+
+def _org_appearance_columns(path) -> list[str]:
+    with sqlite3.connect(path) as connection:
+        return [row[1] for row in connection.execute("pragma table_info(org_appearance)")]
+
+
+def test_sidebar_title_is_added_where_the_first_org_appearance_revision_lacked_it(tmp_path, monkeypatch):
+    # A deployed environment ran d4b7e2a9c1f3 before it gained sidebar_title,
+    # so its org_appearance has no such column; 3e78d31dc845 adds it there.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-missing.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "d4b7e2a9c1f3")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("alter table org_appearance drop column sidebar_title")
+        connection.commit()
+    assert "sidebar_title" not in _org_appearance_columns(db_path)
+
+    run_schema_migrations(engine, uri)
+
+    assert _org_appearance_columns(db_path).count("sidebar_title") == 1
+    assert _alembic_version(db_path) == expected_head()
+
+
+def test_sidebar_title_revision_is_a_no_op_where_the_column_already_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-present.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "d4b7e2a9c1f3")
+    assert "sidebar_title" in _org_appearance_columns(db_path)
+
+    run_schema_migrations(engine, uri)
+    assert _org_appearance_columns(db_path).count("sidebar_title") == 1
+
+    # Downgrade leaves the column to d4b7e2a9c1f3, whose downgrade drops the table.
+    _downgrade_to(engine, uri, "d4b7e2a9c1f3")
+    assert "sidebar_title" in _org_appearance_columns(db_path)
+    _downgrade_to(engine, uri, "c69488788ac7")
+    assert not _has_table(db_path, "org_appearance")
