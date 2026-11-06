@@ -34,9 +34,15 @@ SLOT = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0
 
 @pytest.fixture(autouse=True)
 def _fresh_scheduler(monkeypatch):
+    from cowork.common.settings.app_settings import get_app_settings
+    monkeypatch.setenv("COWORK_SCHEDULED_RUNS_PER_ORG", "3")
+    get_app_settings.cache_clear()
+    monkeypatch.setattr(scheduler, "_active_run_ids", set())
     monkeypatch.setattr(scheduler, "_scheduler_task", None)
     monkeypatch.setattr(scheduler, "_scheduled_runs", set())
     monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._runs_per_process))
+    yield
+    get_app_settings.cache_clear()
 
 
 def _make_schedule(*, org_id: str | None = None) -> UUID:
@@ -171,6 +177,7 @@ def _left_running_with_a_turn(schedule_id: UUID) -> UUID:
         run = ScheduleRunService(scoped).create_run(schedule_id, slot_at=SLOT, lease_seconds=3600)
         row = session.get(ScheduleRun, run.id)
         row.conversation_id = conversation.id
+        row.execution_claimed_at = row.started_at
         row.lease_expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
         session.add(row)
         session.commit()
@@ -304,7 +311,9 @@ async def test_a_run_reaped_while_its_turn_goes_on_stops_the_turn_and_keeps_the_
     # Another replica's poll, an hour on, finds the lease lapsed and reaps it.
     session = get_open_session()
     try:
-        scheduler._reap_lapsed_runs(ScopedSession(session, SYSTEM_SCOPE), datetime.now(timezone.utc) + timedelta(hours=1))
+        with monkeypatch.context() as replica:
+            replica.setattr(scheduler, "_active_run_ids", set())
+            scheduler._reap_lapsed_runs(ScopedSession(session, SYSTEM_SCOPE), datetime.now(timezone.utc) + timedelta(hours=1))
     finally:
         session.close()
     await asyncio.wait_for(run, timeout=10)
@@ -354,7 +363,7 @@ async def test_a_slot_over_its_organizations_limit_stays_due(schedules, turns):
 
     assert _runs(waiting) == [], "nothing was claimed"
     assert ensure_utc(_schedule(waiting).next_run_at) == SLOT
-    assert waiting in [slot.schedule_id for slot in _poll()], "a later poll finds it due again"
+    assert waiting not in [slot.schedule_id for slot in _poll()], "full orgs do not reserve process capacity"
 
 
 async def test_other_organizations_and_desktop_schedules_are_not_held_back(schedules, turns):
@@ -401,6 +410,9 @@ def test_org_runs_full_counts_only_runs_going(schedules):
     try:
         scoped = ScopedSession(session, SYSTEM_SCOPE)
         schedule = ScheduleService(scoped).get_schedule(schedule_id)
+        for _ in range(5):
+            finished = _running(schedules(org_id="org-a"))
+            ScheduleRunService(scoped).finish_run(finished.id, status=RunStatus.success)
         assert not scheduler.org_runs_full(scoped, schedule)
         for _ in range(scheduler._org_run_limit()):
             _running(schedules(org_id="org-a"))
@@ -421,7 +433,7 @@ async def test_run_now_is_refused_when_the_organization_is_at_its_limit(schedule
         answer = await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
 
     assert answer.status_code == 409
-    assert "organization" in answer.json()["detail"]
+    assert "account" in answer.json()["detail"]
     assert scheduler._admission.held == 0
 
 
@@ -440,7 +452,7 @@ async def test_run_now_taking_the_organizations_last_place_is_counted_in_its_cla
         answer = await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
 
     assert answer.status_code == 409
-    assert "organization" in answer.json()["detail"]
+    assert "account" in answer.json()["detail"]
     assert _runs(schedule_id) == []
     assert scheduler._admission.held == 0
 
@@ -468,7 +480,7 @@ def test_the_run_limits_default_by_where_turns_run_within_their_bounds(monkeypat
     monkeypatch.delenv("COWORK_SCHEDULED_RUNS_PER_ORG", raising=False)
     settings = AppSettings()
     assert settings.scheduled_runs_per_process is None
-    assert settings.scheduled_runs_per_org == 8
+    assert settings.scheduled_runs_per_org is None
     monkeypatch.setenv("COWORK_SCHEDULED_RUNS_PER_PROCESS", "24")
     monkeypatch.setenv("COWORK_SCHEDULED_RUNS_PER_ORG", "12")
     settings = AppSettings()
@@ -543,3 +555,153 @@ def test_a_pod_turn_gets_at_least_the_controllers_own_bound(monkeypatch):
 def test_the_timeout_message_names_the_limit():
     assert scheduler._duration_error(1800) == "Run exceeded the 30-minute limit and was stopped."
     assert scheduler._duration_error(5400) == "Run exceeded the 90-minute limit and was stopped."
+
+
+async def test_waking_process_does_not_reap_its_own_live_run(schedules, turns):
+    schedule_id = schedules()
+    task = asyncio.create_task(scheduler.execute_schedule(schedule_id, slot_at=SLOT))
+    try:
+        async with asyncio.timeout(5):
+            while not turns.started:
+                await asyncio.sleep(0)
+        with get_open_session() as session:
+            scheduler._reap_lapsed_runs(ScopedSession(session, SYSTEM_SCOPE),
+                                      datetime.now(timezone.utc) + timedelta(hours=1))
+        assert _runs(schedule_id)[0].status == RunStatus.running
+    finally:
+        turns.release.set()
+        await task
+    assert _runs(schedule_id)[0].status == RunStatus.success
+    assert not scheduler._active_run_ids
+
+
+async def test_deleting_task_stops_its_turn_and_logs_deletion(schedules, turns, monkeypatch, caplog):
+    import logging
+    schedule_id = schedules()
+    monkeypatch.setattr(scheduler, "_LEASE_RENEW_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler.logger, "disabled", False)
+    caplog.set_level(logging.WARNING, logger=scheduler.logger.name)
+    stopped = []
+
+    async def stop(conversation_id):
+        stopped.append(conversation_id)
+        turns.release.set()
+
+    monkeypatch.setattr(scheduler, "_stop_reaped_turn", stop)
+    task = asyncio.create_task(scheduler.execute_schedule(schedule_id, slot_at=SLOT))
+    async with asyncio.timeout(5):
+        while not turns.started:
+            await asyncio.sleep(0)
+    with get_open_session() as session:
+        ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+    await asyncio.wait_for(task, 5)
+    assert stopped == turns.started
+    assert any("task was deleted" in r.getMessage() for r in caplog.records)
+    assert not scheduler._active_run_ids
+    # Deleting a task intentionally leaves its conversation; clean it up here.
+    from cowork.services.conversations import ConversationService
+    with get_open_session() as session:
+        ConversationService(ScopedSession(session, SYSTEM_SCOPE)).delete_conversation(UUID(stopped[0]))
+
+
+def test_poll_reserves_only_available_org_capacity_before_process_admission(schedules, monkeypatch):
+    monkeypatch.setattr(scheduler, "_org_run_limit", lambda: 2)
+    _running(schedules(org_id="a"))
+    a_due = [schedules(org_id="a") for _ in range(20)]
+    b_due = [schedules(org_id="b") for _ in range(3)]
+    with get_open_session() as session:
+        scoped = ScopedSession(session, SYSTEM_SCOPE)
+        ordered = [session.get(Schedule, id) for id in a_due + b_due]
+        monkeypatch.setattr(scheduler, "_due_schedules", lambda *_: ordered)
+        ids = [slot.schedule_id for slot in scheduler._poll(scoped)]
+    assert ids == [a_due[0], *b_due[:2]]
+
+
+def test_unset_org_limit_does_not_count_or_refuse_runs(schedules, monkeypatch):
+    monkeypatch.setattr(scheduler, "_org_run_limit", lambda: None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unset org limit must not count running rows")
+
+    monkeypatch.setattr(ScheduleRunService, "org_runs_in_flight", forbidden)
+    ids = [schedules(org_id="a") for _ in range(4)]
+    assert set(ids) <= {slot.schedule_id for slot in _poll()}
+    with get_open_session() as session:
+        scoped = ScopedSession(session, SYSTEM_SCOPE)
+        assert not scheduler.org_runs_full(scoped, session.get(Schedule, ids[0]))
+        scheduler.claim_manual_run(scoped, ids[0])
+
+
+@pytest.mark.parametrize("write", ["outcome", "error", "finish"])
+def test_late_writes_leave_reaped_result_and_streak_untouched(schedules, write):
+    from cowork.schemas.schedules import AttemptOutcome
+    schedule_id = schedules()
+    _left_running_with_a_turn(schedule_id)
+    _poll()
+    before = _runs(schedule_id)[0]
+    assert before.status == RunStatus.failed
+    streak = _schedule(schedule_id).consecutive_failures
+    next_run = _schedule(schedule_id).next_run_at
+    with get_open_session() as session:
+        scoped = ScopedSession(session, SYSTEM_SCOPE)
+        if write == "finish":
+            scheduler._finish_run(scoped, run_id=before.id, conversation_id=None, error=None, status=RunStatus.success)
+        else:
+            with pytest.raises(scheduler._LeaseLost):
+                if write == "outcome":
+                    scheduler._record_turn_outcome(
+                        scoped, schedule_id=schedule_id, run_id=before.id,
+                        end=scheduler._AttemptEnd(AttemptOutcome.failed_during_execution, "late failure"),
+                        is_manual=False, conversation_id=None,
+                    )
+                else:
+                    scheduler._record_schedule_error(scoped, schedule_id=schedule_id, run_id=before.id,
+                                                     error="late failure", consume_slot=True)
+    after = _runs(schedule_id)[0]
+    assert (after.status, after.error, after.finished_at) == (before.status, before.error, before.finished_at)
+    assert _schedule(schedule_id).consecutive_failures == streak == 1
+    assert _schedule(schedule_id).next_run_at == next_run
+
+
+def test_outcome_settlement_and_finish_are_one_commit(schedules):
+    from cowork.schemas.schedules import AttemptOutcome
+    schedule_id = schedules()
+    _left_running_with_a_turn(schedule_id)
+    run = _runs(schedule_id)[0]
+    with get_open_session() as session:
+        scheduler._record_turn_outcome(
+            ScopedSession(session, SYSTEM_SCOPE), schedule_id=schedule_id, run_id=run.id,
+            end=scheduler._AttemptEnd(AttemptOutcome.failed_during_execution, "failed"),
+            is_manual=False, conversation_id=run.conversation_id,
+        )
+    assert _runs(schedule_id)[0].status == RunStatus.failed
+    _poll()  # Its expired lease must not settle the already finalized failure again.
+    assert _schedule(schedule_id).consecutive_failures == 1
+    assert _runs(schedule_id)[0].error == "failed"
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_committed_reaps_are_cancelled_even_if_poll_does_not_return(schedules, monkeypatch, cancelled):
+    schedule_id = schedules()
+    conversation_id = _left_running_with_a_turn(schedule_id)
+    called = asyncio.Event()
+    seen = []
+
+    def fail(*_):
+        raise asyncio.CancelledError() if cancelled else RuntimeError("later poll read failed")
+
+    async def cancel(turn):
+        seen.append(turn.conversation_id)
+        called.set()
+
+    monkeypatch.setattr(scheduler, "_handle_missed_runs", fail)
+    monkeypatch.setattr(scheduler, "_cancel_abandoned_turn", cancel)
+    monkeypatch.setattr(scheduler, "_POLL_INTERVAL_SECONDS", 0)
+    loop = asyncio.create_task(scheduler._scheduler_loop())
+    try:
+        await asyncio.wait_for(called.wait(), 5)
+    finally:
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+    assert seen == [str(conversation_id)]
+    assert _runs(schedule_id)[0].status == RunStatus.failed

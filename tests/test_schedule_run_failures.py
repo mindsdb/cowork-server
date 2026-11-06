@@ -391,4 +391,4 @@ def test_last_run_and_trigger_are_described_in_openapi():
 
     schemas = create_app().openapi()["components"]["schemas"]
     assert "ScheduleRunResponse" in str(schemas["ScheduleResponse"]["properties"]["lastRun"])
-    assert schemas["RunTrigger"]["enum"] == ["manual", "cron"]
+    assert schemas["RunTrigger"]["enum"] == ["trial", "manual", "cron"]

@@ -6,13 +6,13 @@ neither the freshness guard nor the failure streak counts it, so trying a task
 out never costs it a scheduled run. Existing runs are not trials.
 
 Revision ID: 6f1b8d3a5c27
-Revises: 8c3e1f6a2b47
+Revises: a9e2b6c4d810
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "6f1b8d3a5c27"
-down_revision = "8c3e1f6a2b47"
+down_revision = "a9e2b6c4d810"
 branch_labels = None
 depends_on = None
 

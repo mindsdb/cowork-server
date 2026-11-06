@@ -1380,10 +1380,11 @@ class AppSettings(Settings):
         description="Scheduled runs one server process drives at once; unset follows the backend.",
     )  # COWORK_SCHEDULED_RUNS_PER_PROCESS
     # Scheduled runs one organization may have going at once, counted across
-    # every replica, so one organization's burst can't take every place. A
+    # every replica, only when explicitly configured. Hosted policy will come
+    # from auth; no deployment-wide default is imposed. A
     # desktop schedule has no organization, so this doesn't apply there.
-    scheduled_runs_per_org: int = Field(
-        default=8,
+    scheduled_runs_per_org: int | None = Field(
+        default=None,
         ge=1,
         le=256,
         validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_ORG"),

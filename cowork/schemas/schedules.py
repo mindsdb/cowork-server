@@ -171,6 +171,7 @@ class ScheduleResponse(CamelResponse):
 
 
 class RunTrigger(str, Enum):
+    trial = "trial"
     manual = "manual"
     cron = "cron"
 
@@ -193,4 +194,4 @@ class ScheduleRunResponse(CamelResponse):
     @computed_field
     @property
     def trigger(self) -> RunTrigger:
-        return RunTrigger.manual if self.is_manual else RunTrigger.cron
+        return RunTrigger.trial if self.trial else (RunTrigger.manual if self.is_manual else RunTrigger.cron)

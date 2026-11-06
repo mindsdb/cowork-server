@@ -9,6 +9,9 @@ before.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import pytest
+
 from sqlalchemy import create_engine, inspect
 
 from cowork import scheduler
@@ -17,19 +20,39 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import run_schema_migrations
 from cowork.schemas.schedules import RunStatus
 from cowork.services.schedules import ScheduleRunService, ScheduleService
+from tests import test_schedule_run_failures as failures
+
 from tests.test_schedule_run_failures import (  # noqa: F401  (fixtures)
-    SLOT,
     _client,
     _delete_schedule,
     _fresh_scheduler,
-    _make_schedule,
+    _make_schedule as _original_make_schedule,
     _poll,
     _runs,
     _schedule,
     _scoped,
-    schedule_id,
-    turns,
 )
+
+
+turns = failures.turns
+
+
+@pytest.fixture(autouse=True)
+def fresh_slot():
+    global SLOT
+    SLOT = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0)
+
+
+def _make_schedule(**kwargs):
+    kwargs.setdefault("next_run_at", SLOT)
+    return _original_make_schedule(**kwargs)
+
+
+@pytest.fixture
+def schedule_id():
+    created = _make_schedule()
+    yield created
+    _delete_schedule(created)
 
 
 def _set_streak(schedule_id, count: int) -> None:
@@ -146,14 +169,14 @@ async def test_run_now_passes_trial_through_and_the_run_reports_it(schedule_id, 
         runs = (await client.get(f"/api/v1/schedules/{schedule_id}/runs")).json()["runs"]
     assert [kwargs["trial"] for kwargs in started] == [True, False]
     assert sorted(run["trial"] for run in runs) == [False, True], "the claimed run row carries the flag"
+    assert {(run["trial"], run["trigger"]) for run in runs} == {(False, "manual"), (True, "trial")}
 
 
 async def test_a_cron_run_is_never_a_trial(schedule_id, turns):
     (slot,) = _poll(schedule_id)
-    await scheduler.execute_schedule(slot.schedule_id, slot_at=slot.slot_at, trial=True)
-
-    (run,) = _runs(schedule_id)
-    assert not run.trial
+    with pytest.raises(ValueError, match="cron run cannot be a trial"):
+        await scheduler.execute_schedule(slot.schedule_id, slot_at=slot.slot_at, trial=True)
+    assert _runs(schedule_id) == []
 
 
 # --- Migration -----------------------------------------------------------------

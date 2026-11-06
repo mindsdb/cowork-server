@@ -562,6 +562,16 @@ class ScheduleRunService:
             return self.set_run_conversation(run_id, None)
         return True
 
+    def lock_running_run(self, run_id: UUID) -> ScheduleRun | None:
+        """Read the claim under lock; finalized or deleted runs cannot write again."""
+        run = self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        return run if run is not None and run.status == RunStatus.running else None
+
     def finish_run(
         self,
         run_id: UUID,
@@ -570,12 +580,13 @@ class ScheduleRunService:
         status: RunStatus | None = None,
         release_slot: bool = False,
         outcome: AttemptOutcome | None = None,
-    ) -> ScheduleRun:
+        commit: bool = True,
+    ) -> ScheduleRun | None:
         """Record how the run ended. ``release_slot`` gives its cron slot back,
         for a run that left the slot due: the next poll can then claim it."""
-        run = self.session.get(ScheduleRun, run_id)
+        run = self.lock_running_run(run_id)
         if run is None:
-            raise ValueError("ScheduleRun not found")
+            return None
         now = datetime.now(timezone.utc)
         run.finished_at = now
         started_at = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=timezone.utc)
@@ -590,6 +601,8 @@ class ScheduleRunService:
         if conversation_id is not None:
             run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
+        if not commit:
+            return run
         try:
             self.session.commit()
         except IntegrityError:
@@ -674,6 +687,7 @@ class ScheduleRunService:
 
     def reap_lapsed_runs(
         self, *, now: datetime, error: str, abandoned: list[AbandonedTurn] | None = None,
+        exclude_run_ids: frozenset[UUID] = frozenset(),
     ) -> list[ScheduleRun]:
         """Fail every running run whose lease ran out: its process stopped
         renewing it, so it died without recording how the run ended.
@@ -697,6 +711,7 @@ class ScheduleRunService:
             .where(ScheduleRun.status == RunStatus.running)
             .where(ScheduleRun.lease_expires_at.is_not(None))  # type: ignore[union-attr]
             .where(ScheduleRun.lease_expires_at < now)  # type: ignore[operator]
+            .where(ScheduleRun.id.not_in(exclude_run_ids))
             .with_for_update(skip_locked=True)
         ).all()
         kept: list[ScheduleRun] = []

@@ -464,7 +464,7 @@ async def test_a_run_another_replica_reaped_stops_renewing_and_says_so_once(sche
         record for record in caplog.records
         if record.name == scheduler.logger.name
         and record.levelno == logging.WARNING
-        and record.getMessage() == "A scheduled run lost its lease to another replica"
+        and record.getMessage() == "A scheduled run was finalized by another replica; stopping its turn"
     ]
     assert len(lost) == 1
 
@@ -767,3 +767,59 @@ def test_replicas_claiming_one_organizations_slots_at_once_stay_within_its_limit
             .where(Schedule.org_id == org_id, ScheduleRun.status == RunStatus.running)
         ).all()
     assert len(running) == limit
+
+
+@pytest.mark.postgres_service
+@pytest.mark.parametrize("ending", ["outcome", "exception"])
+def test_postgres_reaper_cannot_split_settlement_from_finalization(postgres, monkeypatch, ending):
+    """Hold the finalizer between its schedule update and run finish. The
+    reaper must skip its lock, then see a terminal run after the commit."""
+    from concurrent.futures import ThreadPoolExecutor
+    from cowork.schemas.schedules import AttemptOutcome
+
+    claim = _lapsed_run_and_conversation(postgres)
+    with Session(postgres.engine) as session:
+        assert ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).set_run_conversation(
+            claim.run_id, claim.conversation_id,
+        )
+    held, release = threading.Event(), threading.Event()
+    original = ScheduleRunService.finish_run
+
+    def pause_before_finish(self, *args, **kwargs):
+        if kwargs.get("commit") is False:
+            held.set()
+            assert release.wait(5)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ScheduleRunService, "finish_run", pause_before_finish)
+
+    def finalize():
+        with Session(postgres.engine) as session:
+            scoped = ScopedSession(session, SYSTEM_SCOPE)
+            if ending == "outcome":
+                scheduler._record_turn_outcome(
+                    scoped, schedule_id=postgres.schedule_id, run_id=claim.run_id,
+                    end=scheduler._AttemptEnd(AttemptOutcome.failed_during_execution, "task failed"),
+                    is_manual=False, conversation_id=claim.conversation_id,
+                )
+            else:
+                scheduler._record_schedule_error(
+                    scoped, schedule_id=postgres.schedule_id, run_id=claim.run_id,
+                    error="task failed", consume_slot=True, outcome=AttemptOutcome.failed_during_execution,
+                )
+                session.commit()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(finalize)
+        try:
+            assert held.wait(5)
+            assert _reap(postgres) == []
+            assert _run_row(postgres, claim.run_id).status == RunStatus.running
+        finally:
+            release.set()
+        future.result(timeout=5)
+    assert _reap(postgres) == []
+    assert _run_row(postgres, claim.run_id).error == "task failed"
+    assert _run_row(postgres, claim.run_id).status == RunStatus.failed
+    with Session(postgres.engine) as session:
+        assert session.get(Schedule, postgres.schedule_id).consecutive_failures == 1

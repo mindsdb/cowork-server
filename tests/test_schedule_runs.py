@@ -1009,7 +1009,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     for record in errors:
         assert record.getMessage() == (
             "Database operation failed: error_type=OperationalError sqlstate=unknown "
-            f"site=scheduler.execute_schedule:{record.lineno}"
+            f"site=scheduler._execute_schedule:{record.lineno}"
         )
         assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
         assert record.exc_info is None
@@ -1273,7 +1273,7 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
             with Session(engine) as run_session:
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
                 outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, end=_classify(_TurnEvidence(reason=reason, acted=True)),
+                    scoped, schedule_id=schedule_id, run_id=run_id, end=_classify(_TurnEvidence(reason=reason, acted=True)),
                     is_manual=False, conversation_id=None,
                 )
                 _finish_run(scoped, run_id=run_id, conversation_id=None, error=outcome.error, status=outcome.status)

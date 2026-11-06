@@ -286,7 +286,7 @@ async def test_admission_warning_counts_only_slots_left(monkeypatch, caplog):
     monkeypatch.setattr(scheduler, "_POLL_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(scheduler, "run_db", poll)
     monkeypatch.setattr(scheduler, "execute_schedule", execute)
-    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(1))
+    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(lambda: 1))
     with caplog.at_level(logging.WARNING, logger="cowork.scheduler"):
         scheduler.start_scheduler()
         try:
