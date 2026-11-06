@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import time
 from uuid import uuid4
 
 import fakeredis
@@ -131,7 +132,9 @@ async def test_a_start_the_turn_index_shows_is_stale_is_refused_and_deletes_noth
     that save: it takes no claim and leaves that turn's stream alone. A start
     at 3 read it after, and is admitted."""
     await turn_index.record_turn("c", turn_id=2, correlation_id="corr-a", org_id=None, user_id=None, run_id="run-a")
-    assert await turn_index.stamp_question(conversation_id="c", run_id="run-a", question_id=None) is True
+    assert await turn_index.stamp_question(
+        conversation_id="c", run_id="run-a", question_id=None, released=True,
+    ) is True
     ended = RedisStreamBuffer(conversation_id="c", turn_id=2)
     await ended.append("sse", COMPLETED)
     await ended.close("completed")
@@ -287,6 +290,55 @@ async def test_an_acquire_cut_short_after_redis_applied_it_leaves_no_claim(redis
     assert retried.acquired
 
 
+async def test_an_admission_whose_undo_redis_does_not_answer_is_undone_once_redis_answers(redis, monkeypatch):
+    """Redis applied the acquire and then stalled, so the acquire timed out,
+    the client got 503, and the undo timed out in the same stall. The claim
+    used to stay for its whole TTL: the client's retry, on any replica, met
+    its own refused attempt's claim over an empty stream and was refused 409
+    while nothing ran."""
+    monkeypatch.setattr(turn_claim, "REDIS_CALL_SECONDS", 0.05)
+    monkeypatch.setattr(turn_claim, "RELEASE_RETRY_SECONDS", 0.01)
+    real_acquire, real_release = turn_claim.acquire, turn_claim.release
+    stalled = True
+
+    async def applied_then_hung(*, claim, conversation_id):
+        await real_acquire(claim=claim, conversation_id=conversation_id)
+        await asyncio.sleep(10)
+
+    async def release_unless_stalled(**kwargs):
+        if stalled:
+            await asyncio.sleep(10)
+        return await real_release(**kwargs)
+
+    async def answered(buffer):
+        await buffer.append("sse", COMPLETED)
+        await buffer.close("completed")
+
+    monkeypatch.setattr(turn_claim, "acquire", applied_then_hung)
+    monkeypatch.setattr(turn_claim, "release", release_unless_stalled)
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    with pytest.raises(TurnClaimUnavailable):
+        await replica_a.start(
+            conversation_id="c", turn_id=4, open_buffer=lambda: backend_mod.new_buffer("c", 4), produce=answered,
+        )
+    assert (await _stored(redis)).turn_id == 4
+
+    # Redis answers again.
+    monkeypatch.setattr(turn_claim, "acquire", real_acquire)
+    stalled = False
+
+    async def undone() -> bool:
+        return await redis.exists(claim_key("c"), CLAIMS_KEY) == 0
+
+    await _until(undone)
+    assert await turn_claim.live_holder(conversation_id="c") is None
+    for runs in (replica_b, replica_a):
+        handle = await runs.start(
+            conversation_id="c", turn_id=4, open_buffer=lambda: backend_mod.new_buffer("c", 4), produce=answered,
+        )
+        await asyncio.wait_for(handle.task, timeout=2)
+
+
 async def test_a_cancelled_admission_leaves_no_claim(redis, monkeypatch):
     real_acquire = turn_claim.acquire
     applied, release = asyncio.Event(), asyncio.Event()
@@ -383,35 +435,61 @@ async def test_a_kept_claim_carries_the_saved_question_and_stops_once_the_stream
     await buffer.append("sse", COMPLETED)
     await asyncio.wait_for(keeper, timeout=2)
 
-    assert lifecycle.claim_lost is False
     # Released by the registry after the terminal record, never by the keeper.
     assert await _stored(redis) is not None
 
 
-async def test_a_claim_another_run_took_marks_the_turn_lost_not_deleted(
-    redis, quick_renewals, caplog, owned_logger,
+async def test_a_claim_another_run_took_is_logged_once_and_taken_back_once_that_run_lets_it_go(
+    redis, quick_renewals, monkeypatch, caplog, owned_logger,
 ):
+    """Run A's key lapsed, and run B's start took the claim and then let it go
+    again (its buffer failed to open, say). A's keeper used to stop at its
+    first lost renewal, so A answered the rest of its turn holding no claim,
+    and a send on any replica was admitted beside it."""
     logged = owned_logger(CLAIM_LOGGER, level=logging.WARNING)
     buffer = RedisStreamBuffer(conversation_id="c", turn_id=1)
+    await buffer.append("sse", {"sse": "partial"})
     lifecycle = TurnLifecycle()
     await turn_claim.acquire(claim=_claim("run-a"), conversation_id="c")
+    outcomes: list[RenewOutcome] = []
+    real_renew = turn_claim.renew
+
+    async def recorded_renew(*, claim, conversation_id):
+        result = await real_renew(claim=claim, conversation_id=conversation_id)
+        outcomes.append(result.outcome)
+        return result
+
+    monkeypatch.setattr(turn_claim, "renew", recorded_renew)
     keeper = asyncio.create_task(turn_claim.keep_claim(
         claim=_claim("run-a"), conversation_id="c", buffer=buffer, lifecycle=lifecycle,
     ))
     await redis.set(claim_key("c"), _claim("run-b", pod="pod-b").model_dump_json())
 
+    async def lost_three_times() -> bool:
+        return outcomes.count(RenewOutcome.LOST) >= 3
+
+    await _until(lost_three_times)
+    assert not keeper.done()
+    assert await _stored(redis) == _claim("run-b", pod="pod-b")
+    assert await turn_claim.release(conversation_id="c", run_id="run-b") is True
+
+    async def taken_back() -> bool:
+        return await _stored(redis) == _claim("run-a")
+
+    await _until(taken_back)
+    assert outcomes[-1] in (RenewOutcome.REACQUIRED, RenewOutcome.RENEWED)
+    await buffer.close("completed")
     await asyncio.wait_for(keeper, timeout=2)
 
-    assert lifecycle.claim_lost is True
     assert lifecycle.discarded is False
     records = _warnings(caplog, CLAIM_LOGGER)
     fields = {
         "event": "turn_claim_lost", "conversation_id": "c", "run_id": "run-a",
         "holder_run_id": "run-b", "holder_pod": "pod-b",
     }
+    # Once for the loss, not once per renewal that found B holding it.
     assert [{name: getattr(r, name) for name in fields} for r in records] == [fields]
     assert_log_fields(logged.output(), **fields)
-    assert await _stored(redis) == _claim("run-b", pod="pod-b")
 
 
 async def test_a_redis_outage_while_keeping_a_claim_does_not_lose_it(redis, quick_renewals, monkeypatch):
@@ -450,7 +528,6 @@ async def test_a_redis_outage_while_keeping_a_claim_does_not_lose_it(redis, quic
     await buffer.close("completed")
     await asyncio.wait_for(keeper, timeout=2)
 
-    assert lifecycle.claim_lost is False
     assert not keeper.cancelled()
     assert await _stored(redis) == _claim("run-a")
 
@@ -483,7 +560,6 @@ async def test_a_renewal_that_takes_back_a_deleted_turns_claim_releases_it(redis
 
     assert outcomes == [RenewOutcome.REACQUIRED]
     assert await redis.exists(claim_key("c"), CLAIMS_KEY) == 0
-    assert lifecycle.claim_lost is False
 
 
 # ── the registry's release ───────────────────────────────────────────
@@ -559,6 +635,91 @@ async def test_a_turn_ended_at_shutdown_with_its_stream_open_is_released_only_af
     entries = await redis.xrange(stream_key("c", 1))
     assert entries[-1][1]["type"] == "Interrupted"
     assert await _stored(redis) is None
+
+
+async def test_a_stop_that_lands_while_a_finished_turns_watchers_unwind_still_releases_its_claim(
+    redis, monkeypatch,
+):
+    """A second Stop, or a shutdown, cancels the turn's task while it waits
+    for its claim keeper to unwind, after its terminal record. That cancel
+    used to skip the release, so the next send on every replica waited for a
+    lingering claim."""
+    unwinding = asyncio.Event()
+
+    async def keeper_mid_renewal(**_kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            unwinding.set()
+            await asyncio.sleep(0.05)
+            raise
+
+    async def answered(buffer):
+        await buffer.append("sse", COMPLETED)
+        await buffer.close("completed")
+
+    monkeypatch.setattr(turn_claim, "keep_claim", keeper_mid_renewal)
+    handle = await RunRegistry().start(
+        conversation_id="c", turn_id=2, open_buffer=lambda: backend_mod.new_buffer("c", 2), produce=answered,
+    )
+    await asyncio.wait_for(unwinding.wait(), timeout=2)
+
+    handle.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handle.task
+
+    assert handle.buffer.is_closed
+    assert await redis.exists(claim_key("c"), CLAIMS_KEY) == 0
+
+
+@pytest.mark.parametrize("last_record", ["streaming", "finishing"])
+async def test_a_turn_that_ended_with_its_stream_open_holds_off_only_other_replicas(
+    redis, monkeypatch, last_record,
+):
+    """Its terminal record and the seal after it both failed, so its task
+    ended with its stream open and it kept its claim. The replica that ran it
+    used to refuse the next send too, until the claim lapsed, where it had
+    admitted it before claims existed. That replica knows nothing of the run
+    writes any more and admits at once; another one cannot tell, and still
+    refuses."""
+    from cowork.api.v1.endpoints import responses as responses_ep
+    from cowork.db.scoped import TenantScope
+
+    monkeypatch.setattr(turn_claim, "ENDING_HOLDER_WAIT_SECONDS", 0.2)
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    monkeypatch.setattr(responses_ep, "registry", replica_a)
+    conversation_id = str(uuid4())
+    record = {"sse": "partial"} if last_record == "streaming" else COMPLETED
+
+    async def ends_open(buffer):
+        await buffer.append("sse", record)
+        raise RuntimeError("the terminal record could not be written")
+
+    async def answered(buffer):
+        await buffer.append("sse", COMPLETED)
+        await buffer.close("completed")
+
+    ended = await replica_a.start(
+        conversation_id=conversation_id, turn_id=1,
+        open_buffer=lambda: backend_mod.new_buffer(conversation_id, 1), produce=ends_open,
+    )
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(ended.task, timeout=2)
+    assert not ended.buffer.is_closed
+    assert await _stored(redis, conversation_id) == ended.claim
+
+    with pytest.raises(TurnInProgress):
+        await replica_b.start(
+            conversation_id=conversation_id, turn_id=3,
+            open_buffer=lambda: backend_mod.new_buffer(conversation_id, 3), produce=answered,
+        )
+    await responses_ep._refuse_while_answering(conversation=conversation_id, scope=TenantScope(org_mode=False))
+    admitted = await replica_a.start(
+        conversation_id=conversation_id, turn_id=3,
+        open_buffer=lambda: backend_mod.new_buffer(conversation_id, 3), produce=answered,
+    )
+    await asyncio.wait_for(admitted.task, timeout=2)
+    assert await redis.exists(claim_key(conversation_id)) == 0
 
 
 async def test_a_deleted_conversations_turn_releases_its_claim(redis, monkeypatch):
@@ -650,13 +811,47 @@ async def test_a_delete_whose_buffer_removal_fails_still_admits_the_next_send(
         await turn_claim.release(conversation_id="d", run_id=admitted.run_id)
 
 
+async def test_a_delete_whose_index_forget_fails_refuses_the_resend_only_within_the_stale_window(
+    redis, monkeypatch,
+):
+    """Turn 3 saved its question and ended, and the user deleted it, so the
+    next send is turn 3 again. The delete could not forget the turn's index
+    entry. Its stamp used to refuse that send on every replica until the
+    entry expired, an hour after the turn started; it now refuses it only
+    until STALE_START_WINDOW_SECONDS after the turn released its claim."""
+    registry_mod = importlib.import_module("cowork.streaming.registry")
+    monkeypatch.setattr(turn_index, "STALE_START_WINDOW_SECONDS", 0.5)
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    monkeypatch.setattr(registry_mod, "registry", replica_a)
+    await _saved_turn(replica_a, conversation_id="d", turn_id=3)
+    monkeypatch.setattr(turn_index, "get_sync_redis", lambda: _Unreachable())
+
+    await asyncio.to_thread(registry_mod.discard_conversation, "d")
+
+    async def answered(buffer):
+        await buffer.append("sse", COMPLETED)
+        await buffer.close("completed")
+
+    entry = turn_index.TurnIndexEntry.from_index(await turn_index.get_turn("d"))
+    with pytest.raises(TurnInProgress):
+        await replica_b.start(
+            conversation_id="d", turn_id=3, open_buffer=lambda: backend_mod.new_buffer("d", 3), produce=answered,
+        )
+    await asyncio.sleep(entry.released_at + turn_index.STALE_START_WINDOW_SECONDS - time.time() + 0.05)
+    for runs in (replica_a, replica_b):
+        admitted = await runs.start(
+            conversation_id="d", turn_id=3, open_buffer=lambda: backend_mod.new_buffer("d", 3), produce=answered,
+        )
+        await asyncio.wait_for(admitted.task, timeout=2)
+
+
 async def test_a_delete_whose_index_forget_fails_logs_it_and_still_releases(
     redis, monkeypatch, caplog, owned_logger,
 ):
     """A forget that cannot reach Redis leaves a stamp that refuses sends at
-    or below the deleted turn's number until the entry expires, so it is
-    logged with an event an operator can find. The buffers and the claim are
-    still removed."""
+    or below the deleted turn's number until the stale window after its
+    turn's release ends, so it is logged with an event an operator can find.
+    The buffers and the claim are still removed."""
     registry_mod = importlib.import_module("cowork.streaming.registry")
     logged = owned_logger(turn_index.logger.name, level=logging.WARNING)
     runs = RunRegistry()
@@ -788,7 +983,7 @@ def test_the_claim_outlasts_the_stall_the_liveness_probe_forgives():
 async def test_the_file_backend_never_reaches_redis(monkeypatch, tmp_path):
     """Desktop and the self-hosted container run the file backend with no
     Redis. Admission, the turn, its release, a delete and the boot pass
-    reach none of the claim's code there."""
+    reach no Redis there."""
     from cowork import server
     from cowork.api.v1.endpoints import responses as responses_ep
     from cowork.db.scoped import TenantScope
@@ -804,10 +999,8 @@ async def test_the_file_backend_never_reaches_redis(monkeypatch, tmp_path):
 
     for module in (turn_claim, turn_index, buffer_mod, cancellation, redis_client, responses_ep):
         monkeypatch.setattr(module, "get_redis", no_redis(f"{module.__name__}.get_redis"))
-    monkeypatch.setattr(turn_claim, "get_sync_redis", no_redis("turn_claim.get_sync_redis"))
-    # discard_conversation's turn index cleanup reaches Redis on every backend
-    # today and logs its own failure; it is not the claim's, so not counted.
-    monkeypatch.setattr(turn_index, "get_sync_redis", lambda: fakeredis.FakeRedis(decode_responses=True))
+    for module in (turn_claim, turn_index, backend_mod):
+        monkeypatch.setattr(module, "get_sync_redis", no_redis(f"{module.__name__}.get_sync_redis"))
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "file")
     runs = RunRegistry()
     monkeypatch.setattr(registry_mod, "registry", runs)

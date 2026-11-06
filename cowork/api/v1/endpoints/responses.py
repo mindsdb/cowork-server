@@ -39,6 +39,7 @@ from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, request_cancel
 from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 from cowork.streaming.buffer import RedisStreamBuffer
+from cowork.streaming.registry import claim_held_refusal
 from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, TurnClaimUnavailable, live_holder
 from cowork.streaming.turn_index import TurnIndexEntry, TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
@@ -222,8 +223,10 @@ async def _refuse_while_answering(*, conversation: str | None, scope: TenantScop
     On the Redis backend a turn another replica runs counts too, read from the
     conversation's turn claim (turn_claim.live_holder). Its owner comes from
     the turn index entry its run wrote, so where conversations are partitioned
-    a claim whose entry does not name that run yet is left to start(). Raises
-    TurnClaimUnavailable when Redis cannot answer.
+    a claim whose entry does not name that run yet is left to start(). So is
+    a claim this process's own last turn still holds after its task ended,
+    which start() releases. Raises TurnClaimUnavailable when Redis cannot
+    answer.
     """
     if not conversation:
         return
@@ -232,13 +235,14 @@ async def _refuse_while_answering(*, conversation: str | None, scope: TenantScop
     except ValueError:
         return  # not a conversation id: handle() starts a new conversation
     _require_streaming_scope(scope)
-    handle = _authorized_handle(registry.get(conversation_id), scope)
+    local = registry.get(conversation_id)
+    handle = _authorized_handle(local, scope)
     if handle is not None and handle.is_answering:
         raise TurnInProgress(conversation_id=conversation_id, turn_id=handle.turn_id)
     if get_backend() != "redis":
         return
     holder = await live_holder(conversation_id=conversation_id)
-    if holder is None:
+    if holder is None or (local is not None and local.run_id == holder.run_id and not local.is_running):
         return
     if scope.partitioned_for(PersonalResource.CONVERSATIONS):
         try:
@@ -251,7 +255,7 @@ async def _refuse_while_answering(*, conversation: str | None, scope: TenantScop
             or not _owner_matches(TurnOwner.from_index(turn), scope)
         ):
             return
-    raise TurnInProgress(conversation_id=conversation_id, turn_id=holder.turn_id)
+    raise claim_held_refusal(conversation_id=conversation_id, holder=holder)
 
 
 @router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])

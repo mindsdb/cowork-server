@@ -1,4 +1,6 @@
 """The turn index: which turn is current for a conversation, readable anywhere."""
+import time
+
 import fakeredis.aioredis
 import pytest
 
@@ -281,22 +283,64 @@ async def test_a_stamp_lands_only_on_its_own_runs_entry(fake_redis):
     await turn_index.record_turn(
         "c1", turn_id=6, correlation_id="corr-b", org_id=None, user_id=None, run_id="run-b")
 
-    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-a", question_id=uuid4()) is False
+    assert await turn_index.stamp_question(
+        conversation_id="c1", run_id="run-a", question_id=uuid4(), released=True,
+    ) is False
     entry = await turn_index.get_turn("c1")
-    assert "saved_question" not in entry and "question_id" not in entry
-    assert turn_index.TurnIndexEntry.from_index(entry).makes_stale(turn_id=6) is False
+    assert "saved_question" not in entry and "question_id" not in entry and "released_at" not in entry
+    assert turn_index.TurnIndexEntry.from_index(entry).makes_stale(turn_id=6, now=time.time()) is False
 
     question_id = uuid4()
-    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-b", question_id=question_id) is True
+    assert await turn_index.stamp_question(
+        conversation_id="c1", run_id="run-b", question_id=question_id, released=False,
+    ) is True
     entry = await turn_index.get_turn("c1")
     assert (entry["saved_question"], entry["question_id"]) == ("1", str(question_id))
-    assert turn_index.TurnIndexEntry.from_index(entry).makes_stale(turn_id=6) is True
+    assert "released_at" not in entry
+    assert turn_index.TurnIndexEntry.from_index(entry).makes_stale(turn_id=6, now=time.time()) is True
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_written_at_the_release_notes_its_time_and_no_stamp_recreates_a_forgotten_entry(fake_redis):
+    from uuid import uuid4
+
+    await turn_index.record_turn(
+        "c1", turn_id=6, correlation_id="corr-b", org_id=None, user_id=None, run_id="run-b")
+    before = time.time()
+
+    assert await turn_index.stamp_question(
+        conversation_id="c1", run_id="run-b", question_id=uuid4(), released=True,
+    ) is True
+
+    released_at = turn_index.TurnIndexEntry.from_index(await turn_index.get_turn("c1")).released_at
+    assert before <= released_at <= time.time()
+    await turn_index.forget_turn("c1")
+    assert await turn_index.stamp_question(
+        conversation_id="c1", run_id="run-b", question_id=None, released=True,
+    ) is False
+    assert await fake_redis.exists(turn_index.turn_key("c1")) == 0
 
 
 def test_only_a_run_that_saved_its_question_makes_a_start_at_or_below_its_number_stale():
     entry = turn_index.TurnIndexEntry(turn_id=3, run_id="run-a", saved_question=True, question_id=None)
 
-    assert [entry.makes_stale(turn_id=n) for n in (2, 3, 4)] == [True, True, False]
-    assert entry.model_copy(update={"saved_question": False}).makes_stale(turn_id=3) is False
+    assert [entry.makes_stale(turn_id=n, now=1.0) for n in (2, 3, 4)] == [True, True, False]
+    assert entry.model_copy(update={"saved_question": False}).makes_stale(turn_id=3, now=1.0) is False
     # A channel turn's entry names no run.
-    assert entry.model_copy(update={"run_id": None}).makes_stale(turn_id=3) is False
+    assert entry.model_copy(update={"run_id": None}).makes_stale(turn_id=3, now=1.0) is False
+
+
+def test_a_stamp_stops_refusing_a_window_after_its_run_released_its_claim():
+    """A stale start reaches RunRegistry.start within a request's routing
+    gate. Past the window, the only send at that number is one after a
+    truncation whose forget of this entry failed, which used to be refused
+    until the entry expired."""
+    window = turn_index.STALE_START_WINDOW_SECONDS
+    released = turn_index.TurnIndexEntry(
+        turn_id=3, run_id="run-a", saved_question=True, question_id=None, released_at=1000.0,
+    )
+
+    assert released.makes_stale(turn_id=3, now=1000.0 + window - 1) is True
+    assert released.makes_stale(turn_id=3, now=1000.0 + window) is False
+    # A run that has not released its claim (or never did) keeps refusing.
+    assert released.model_copy(update={"released_at": None}).makes_stale(turn_id=3, now=1e12) is True

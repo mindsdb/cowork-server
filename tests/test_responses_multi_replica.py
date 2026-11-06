@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 from uuid import uuid4
 
 import fakeredis.aioredis
@@ -24,8 +25,10 @@ from cowork.streaming import buffer as buffer_mod
 from cowork.streaming import cancellation, turn_claim, turn_index
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.registry import RunRegistry, TurnInProgress, TurnLifecycle, mark_question_saved, registry
-from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable, claim_key
+from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable, claim_key, pod_name
+from tests._logging_assertions import assert_log_fields
 
+REGISTRY_LOGGER = "cowork.streaming.registry"
 REFUSAL = {
     "detail": (
         "Another question is still being answered in this conversation. "
@@ -357,11 +360,22 @@ def _foreign_claim(*, turn_id: int, run_id: str = "run-elsewhere") -> str:
     ).model_dump_json()
 
 
+def _refusal_records(caplog, event: str) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.name == REGISTRY_LOGGER and r.levelno == logging.WARNING and getattr(r, "event", None) == event
+    ]
+
+
 @pytest.mark.asyncio
-async def test_a_duplicate_send_on_another_replica_is_refused(fake_redis):
+async def test_a_duplicate_send_on_another_replica_is_refused(fake_redis, caplog, owned_logger):
     """Replica B used to admit it: its own memory held no turn. It then wrote
     into replica A's stream from seq 0 and replaced A's run in the turn index,
-    so Stop and answers reached B's run instead of A's."""
+    so Stop and answers reached B's run instead of A's.
+
+    The refusal logs one WARNING naming the run and pod that hold the claim,
+    which the hosted deployment prints."""
+    logged = owned_logger(REGISTRY_LOGGER, level=logging.WARNING)
     replica_a, replica_b = RunRegistry(), RunRegistry()
     started, release = asyncio.Event(), asyncio.Event()
     first = await replica_a.start(
@@ -376,6 +390,13 @@ async def test_a_duplicate_send_on_another_replica_is_refused(fake_redis):
         )
 
     assert (refused.value.conversation_id, refused.value.turn_id) == ("dup", 1)
+    fields = {
+        "event": "turn_claim_held", "conversation_id": "dup", "turn_id": 1,
+        "holder_run_id": first.run_id, "holder_pod": pod_name(),
+    }
+    records = _refusal_records(caplog, "turn_claim_held")
+    assert [{name: getattr(r, name) for name in fields} for r in records] == [fields]
+    assert_log_fields(logged.output(), **fields)
     assert opened == []
     assert replica_b.get("dup") is None
     assert (await turn_index.get_turn("dup"))["run_id"] == first.run_id
@@ -523,10 +544,12 @@ def _built_handlers(monkeypatch) -> list[object]:
 
 @pytest.mark.asyncio
 async def test_a_send_into_a_turn_another_replica_runs_is_refused_before_the_routing_gate(
-    client, fake_redis, monkeypatch,
+    client, fake_redis, monkeypatch, caplog, owned_logger,
 ):
     """Refused before any database read or model call, with the 409 body the
-    web UI already handles for a turn on the same replica."""
+    web UI already handles for a turn on the same replica, and one WARNING
+    naming the run and pod that hold the claim."""
+    logged = owned_logger(REGISTRY_LOGGER, level=logging.WARNING)
     conversation_id = str(uuid4())
     await fake_redis.set(claim_key(conversation_id), _foreign_claim(turn_id=2), px=70_000)
     await _running_turn(conversation_id, 2, "corr-elsewhere")
@@ -539,6 +562,13 @@ async def test_a_send_into_a_turn_another_replica_runs_is_refused_before_the_rou
     assert resp.status_code == 409
     assert resp.json() == REFUSAL
     assert built == []
+    fields = {
+        "event": "turn_claim_held", "conversation_id": conversation_id, "turn_id": 2,
+        "holder_run_id": "run-elsewhere", "holder_pod": "other-pod",
+    }
+    records = _refusal_records(caplog, "turn_claim_held")
+    assert [{name: getattr(r, name) for name in fields} for r in records] == [fields]
+    assert_log_fields(logged.output(), **fields)
 
 
 @pytest.mark.asyncio
@@ -813,10 +843,12 @@ async def test_a_stale_send_over_another_replicas_ended_turn_waits_for_its_relea
 
 
 @pytest.mark.asyncio
-async def test_a_turn_stamps_its_saved_question_when_it_saves_it(fake_redis, monkeypatch):
+async def test_a_turn_stamps_its_saved_question_when_it_saves_it(fake_redis, monkeypatch, caplog, owned_logger):
     """The stamp lands with the save, while the turn still answers, so a
     release whose own stamp fails still leaves the conversation refusing a
-    stale send at that turn's number on every replica."""
+    stale send at that turn's number on every replica, each with one WARNING
+    naming the turn whose saved question refused it."""
+    logged = owned_logger(REGISTRY_LOGGER, level=logging.WARNING)
     replica_a, replica_b = RunRegistry(), RunRegistry()
     lifecycle = TurnLifecycle(question_id=uuid4())
     final_written, release = asyncio.Event(), asyncio.Event()
@@ -846,6 +878,10 @@ async def test_a_turn_stamps_its_saved_question_when_it_saves_it(fake_redis, mon
                 conversation_id="early", turn_id=2, open_buffer=_opens("early", 2), produce=_answered,
             )
         assert refused.value.turn_id == 2
+    fields = {"event": "turn_stale_refused", "conversation_id": "early", "turn_id": 2, "saved_turn_id": 2}
+    records = _refusal_records(caplog, "turn_stale_refused")
+    assert [{name: getattr(r, name) for name in fields} for r in records] == [fields, fields]
+    assert_log_fields(logged.output(), **fields)
 
 
 @pytest.mark.asyncio

@@ -9,13 +9,14 @@ This exists so a replica that did not start a turn can still find its turn_id,
 to open the right buffer, its correlation_id, to cancel it, and its org, to
 authorize the caller. ``saved_question`` and ``question_id`` say the turn saved
 its question, and which row. The run stamps them as soon as it saves the
-question (registry.mark_question_saved) and again before it releases its
-claim. RunRegistry.start and turn_claim.acquire read the stamp to refuse a
-start whose history read predates that save (TurnIndexEntry.makes_stale).
+question (registry.mark_question_saved) and again, with ``released_at``,
+before it releases its claim. RunRegistry.start and turn_claim.acquire read
+the stamp to refuse a start whose history read predates that save
+(TurnIndexEntry.makes_stale).
 
 Keys:
     cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at,
-                                         saved_question, question_id
+                                         saved_question, question_id, released_at
     cowork:turns                    SET of conversation ids with a recorded turn
 """
 from __future__ import annotations
@@ -38,6 +39,17 @@ logger = logging.getLogger(__name__)
 # Outlives the buffer TTL, so a conversation whose buffer expired reads as
 # "no current turn" rather than as a turn with a missing buffer.
 TURN_INDEX_TTL_SECONDS = 3600
+
+# How long after a turn released its claim its saved-question stamp still
+# refuses a start at its number (TurnIndexEntry.makes_stale). Such a start's
+# request read the history before the save and has not reached
+# RunRegistry.start since. What runs between the two is its routing gate,
+# whose model calls are bounded at seconds (response_routing._GATE_TOTAL_SECONDS,
+# TurnQueueSettings.jev_route_timeout_seconds). A request slower than this
+# past the release is admitted at the stale number. Bounded so that an entry
+# a conversation delete could not forget refuses sends at its number for this
+# long after its turn ended, not until the entry expires.
+STALE_START_WINDOW_SECONDS = 300
 
 _TURNS_SET = "cowork:turns"
 
@@ -75,6 +87,10 @@ class TurnIndexEntry(BaseModel):
     run_id: str | None
     saved_question: bool
     question_id: UUID | None
+    # When the run released its claim, as a Unix time. None while it holds
+    # it, and when its release wrote no stamp (its process died, or Redis
+    # did not answer).
+    released_at: float | None = None
 
     @classmethod
     def from_index(cls, turn: Mapping[str, str]) -> TurnIndexEntry:
@@ -83,14 +99,20 @@ class TurnIndexEntry(BaseModel):
             run_id=turn.get("run_id") or None,
             saved_question=turn.get("saved_question") == "1",
             question_id=turn.get("question_id") or None,
+            released_at=turn.get("released_at") or None,
         )
 
-    def makes_stale(self, *, turn_id: int) -> bool:
+    def makes_stale(self, *, turn_id: int, now: float) -> bool:
         """Whether a start at ``turn_id`` read the history before this
         entry's run saved its question: the run saved it at this entry's
-        number, and the start names that number or an earlier one. A channel
-        turn's entry names no run, so it never does."""
-        return self.run_id is not None and self.saved_question and turn_id <= self.turn_id
+        number, and the start names that number or an earlier one. Only
+        until STALE_START_WINDOW_SECONDS after the run released its claim,
+        with ``now`` the caller's Unix time. A channel turn's entry names no
+        run, so it never does."""
+        return (
+            self.run_id is not None and self.saved_question and turn_id <= self.turn_id
+            and (self.released_at is None or now < self.released_at + STALE_START_WINDOW_SECONDS)
+        )
 
 
 def _queue_record(
@@ -183,13 +205,19 @@ async def record_channel_turn(
 
 
 async def stamp_question(
-    *, conversation_id: str, run_id: str, question_id: UUID | None, client=None,
+    *, conversation_id: str, run_id: str, question_id: UUID | None, released: bool, client=None,
 ) -> bool:
     """Note in ``run_id``'s entry that its turn saved its question, and which
-    row when known. Leaves another run's entry alone. True when it wrote."""
+    row when known. ``released`` also notes the time as ``released_at``, for
+    a run about to release its claim. Leaves another run's entry alone, and
+    writes no entry that is gone. True when it wrote."""
     r = client or get_redis()
     key = turn_key(conversation_id)
-    fields = {"saved_question": "1", **({"question_id": str(question_id)} if question_id is not None else {})}
+    fields = {
+        "saved_question": "1",
+        **({"question_id": str(question_id)} if question_id is not None else {}),
+        **({"released_at": str(time.time())} if released else {}),
+    }
     for _attempt in range(3):
         try:
             async with r.pipeline(transaction=True) as pipe:
@@ -246,7 +274,8 @@ def forget_turn_sync(conversation_id: str) -> None:
         r.srem(_TURNS_SET, conversation_id)
     except Exception:
         # The entry stays until its TTL. One its turn stamped with a saved
-        # question refuses sends at or below its turn number until then
+        # question refuses sends at or below its turn number until
+        # STALE_START_WINDOW_SECONDS after that turn released its claim
         # (TurnIndexEntry.makes_stale); deleting the key clears it.
         logger.warning(
             "Could not forget a deleted conversation's turn index entry.",

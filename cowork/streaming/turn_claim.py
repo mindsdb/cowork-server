@@ -86,6 +86,9 @@ ENDING_HOLDER_WAIT_SECONDS = 10
 _ENDING_HOLDER_POLL_SECONDS = 0.1
 # Tries of one compare-and-set after another client changed a watched key.
 _WATCH_ATTEMPTS = 3
+# How long a release Redis did not answer waits before release_quietly tries
+# it again.
+RELEASE_RETRY_SECONDS = 1
 
 CLAIMS_KEY = "cowork:turn_claims"
 
@@ -287,7 +290,7 @@ async def acquire(*, claim: TurnClaim, conversation_id: str) -> AcquireResult:
                     return AcquireResult(held, holder)
                 turn = await pipe.hgetall(index)
                 entry = TurnIndexEntry.from_index(turn) if turn else None
-                if entry is not None and entry.makes_stale(turn_id=claim.turn_id):
+                if entry is not None and entry.makes_stale(turn_id=claim.turn_id, now=time.time()):
                     return AcquireResult(AcquireOutcome.STALE, saved_turn_id=entry.turn_id)
                 ended = _state_of(await pipe.xrevrange(stream, count=1)) is StreamState.ENDED
                 pipe.multi()
@@ -413,24 +416,57 @@ def release_sync(*, conversation_id: str, run_id: str) -> bool:
     raise WatchError(f"the turn claim of {conversation_id} kept changing while it was released")
 
 
+# Releases release_quietly is trying again. Held here because the event loop
+# keeps only a weak reference to a task.
+_releases_retrying: set[asyncio.Task] = set()
+
+
 async def release_quietly(*, conversation_id: str, run_id: str) -> None:
     """``release``, bounded, for a caller that is already ending its turn or
-    its admission. A failure is logged as a WARNING; the claim then lapses
-    with its TTL."""
+    its admission.
+
+    A failure is logged as a WARNING, and a task then tries the release again
+    every RELEASE_RETRY_SECONDS until Redis answers or CLAIM_TTL_SECONDS
+    pass, by when the claim has lapsed. Left behind, the claim would refuse
+    every send into the conversation on every replica until it lapsed,
+    though no run answers there: the client's own retry of an admission
+    whose undo failed here among them.
+    """
     try:
         await _bounded(release(conversation_id=conversation_id, run_id=run_id))
+        return
     except Exception:
         logger.warning(
-            "Could not release a turn claim; it lapses with its TTL.",
+            "Could not release a turn claim; it is tried again until it lapses with its TTL.",
             exc_info=True,
             extra={
                 "event": "turn_claim_release_failed", "run_id": run_id,
                 **log_context(conversation_id=conversation_id),
             },
         )
+    retry = asyncio.create_task(_release_until_answered(conversation_id=conversation_id, run_id=run_id))
+    _releases_retrying.add(retry)
+    retry.add_done_callback(_releases_retrying.discard)
 
 
-async def claim_turn(*, claim: TurnClaim, conversation_id: str) -> AcquireResult:
+async def _release_until_answered(*, conversation_id: str, run_id: str) -> None:
+    """Try ``release`` every RELEASE_RETRY_SECONDS until a call completes or
+    CLAIM_TTL_SECONDS pass. release_quietly logged the first failure; the
+    later ones are the same outage, so they are not logged again."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CLAIM_TTL_SECONDS
+    while loop.time() < deadline:
+        await asyncio.sleep(RELEASE_RETRY_SECONDS)
+        try:
+            await _bounded(release(conversation_id=conversation_id, run_id=run_id))
+        except Exception:
+            continue
+        return
+
+
+async def claim_turn(
+    *, claim: TurnClaim, conversation_id: str, ended_here: str | None = None,
+) -> AcquireResult:
     """Admission's claim: take it, or find whether the run holding it still
     answers.
 
@@ -446,15 +482,28 @@ async def claim_turn(*, claim: TurnClaim, conversation_id: str) -> AcquireResult
     deleted by compare-and-delete, and this run tries once more. Nothing here
     writes to another run's stream.
 
+    ``ended_here`` is the run id of this process's own last turn of the
+    conversation when that turn's task has ended. A claim it still holds was
+    kept over a stream with no terminal record (its last writes failed), or
+    its release failed; nothing of that run writes any more, so the claim is
+    deleted by compare-and-delete at once, with no wait. Another replica
+    cannot tell that run ended, and waits for its claim's TTL.
+
     Raises TurnClaimUnavailable when Redis does not answer. An acquire cut
-    short first has this run's claim removed, since Redis may have applied it,
-    so a client's retry does not meet the claim of its own refused attempt.
+    short first has this run's claim removed, since Redis may have applied
+    it, and a removal Redis does not answer either is tried again every
+    RELEASE_RETRY_SECONDS in the background (release_quietly). So the claim
+    of a refused attempt is gone about a second after Redis answers again,
+    and the client's retry does not meet it from then on.
     """
     result = await _acquire_or_undo(claim=claim, conversation_id=conversation_id)
     if result.outcome is not AcquireOutcome.HELD:
         return result
     try:
-        waited = await _wait_for_ending_holder(holder=result.holder, conversation_id=conversation_id)
+        if result.holder.run_id == ended_here:
+            waited = _HolderWait.LINGERING
+        else:
+            waited = await _wait_for_ending_holder(holder=result.holder, conversation_id=conversation_id)
         if waited is _HolderWait.ANSWERING:
             return result
         if waited is _HolderWait.LINGERING:
@@ -558,14 +607,17 @@ async def keep_claim(
     running when the delete landed can find the key gone and the stream
     gone with it, and take the claim back; the keeper then releases it
     again. A renewal that finds another run holding the claim, or the stream
-    ended by someone else, sets ``lifecycle.claim_lost``, logs
-    turn_claim_lost and stops. A Redis error is tried again at the next
+    ended by someone else, logs turn_claim_lost, once until a renewal holds
+    the claim again, and the keeper goes on renewing: once the other run
+    releases the claim while this turn's stream has no terminal record, the
+    next renewal takes it back. A Redis error is tried again at the next
     interval.
 
     Once the producer has saved the question, each renewal writes the claim
     with its id.
     """
     current = claim
+    lost = False
     while True:
         await asyncio.sleep(RENEW_INTERVAL_SECONDS)
         if buffer.is_closed or buffer.is_finishing or lifecycle.discarded:
@@ -577,12 +629,17 @@ async def keep_claim(
             if result.outcome in (RenewOutcome.RENEWED, RenewOutcome.REACQUIRED):
                 await release_quietly(conversation_id=conversation_id, run_id=current.run_id)
             return
+        if result.outcome is RenewOutcome.ERROR:
+            continue
         if result.outcome is not RenewOutcome.LOST:
+            lost = False
             continue
         if buffer.is_closed or buffer.is_finishing:
             # The run's own terminal record landed while the renewal read it.
             return
-        lifecycle.claim_lost = True
+        if lost:
+            continue
+        lost = True
         logger.warning(
             "A running turn lost its claim on the conversation to another run or reader.",
             extra={
@@ -595,7 +652,6 @@ async def keep_claim(
                 ),
             },
         )
-        return
 
 
 class BootPassResult(NamedTuple):
