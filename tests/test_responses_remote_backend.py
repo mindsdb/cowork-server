@@ -2403,11 +2403,11 @@ def test_remote_workspace_is_the_project_relative_to_the_org_root(monkeypatch):
     from cowork.db.scoped import LOCAL_SCOPE
 
     root = Path(get_app_settings().project.root_dir)
-    project = SimpleNamespace(path=str(root / "proj"), id=uuid4())
+    project = SimpleNamespace(path=str(root / "proj"), id=uuid4(), name="proj")
     _patch_conversation_service(monkeypatch, SimpleNamespace(project=project))
 
     assert ResponsesHandler._remote_workspace(SimpleNamespace(scope=LOCAL_SCOPE), uuid4()) == RemoteWorkspace(
-        project_id=str(project.id), workspace_rel_path=f"{root.name}/proj",
+        project_id=str(project.id), workspace_rel_path=f"{root.name}/proj", project_name="proj",
     )
 
 

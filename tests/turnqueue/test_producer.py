@@ -542,6 +542,50 @@ async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch)
     assert params["connectors"] == {"google_drive": {"usage_notes": "NOTE-google_drive"}}
 
 
+_NOTION_PAGES = [
+    {"id": "p1", "name": "Roadmap", "url": "https://www.notion.so/p1", "projects": ["alpha"]},
+    {"id": "p2", "name": "Budget", "url": "https://www.notion.so/p2", "projects": ["beta"]},
+]
+
+
+async def _notion_turn_params(monkeypatch, workspace):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return [{"engine": "notion", "name": "ws-a", "picked_files": _NOTION_PAGES}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+        workspace=workspace,
+    ))
+    return json.loads(fake.added[0][1]["payload"])["params"]
+
+
+@pytest.mark.asyncio
+async def test_a_web_turn_names_the_notion_pages_added_to_its_project(monkeypatch):
+    workspace = prod.RemoteWorkspace(project_id="1", workspace_rel_path="projects/alpha", project_name="alpha")
+    params = await _notion_turn_params(monkeypatch, workspace)
+
+    notes = params["connectors"]["notion"]["usage_notes"]
+    assert "notion__notion-fetch" in notes  # the spec's own notes stay first
+    assert "- Roadmap (url: https://www.notion.so/p1, connection: ws-a)" in notes
+    assert "Budget" not in notes
+    # The pod's vault gets engine and name only.
+    assert params["oauth"]["connections"] == [{"engine": "notion", "name": "ws-a"}]
+
+
+@pytest.mark.asyncio
+async def test_a_web_turn_in_another_project_names_none_of_them(monkeypatch):
+    workspace = prod.RemoteWorkspace(project_id="3", workspace_rel_path="projects/gamma", project_name="gamma")
+    params = await _notion_turn_params(monkeypatch, workspace)
+
+    notes = params["connectors"]["notion"]["usage_notes"]
+    assert "Roadmap" not in notes and "Budget" not in notes
+
+
 def test_connectors_block_is_none_when_nothing_has_notes(monkeypatch):
     from cowork.services.connectors.specs._registry import registry
 
