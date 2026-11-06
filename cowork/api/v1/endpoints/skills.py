@@ -15,8 +15,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
-from cowork.db.units import run_efs, run_efs_unit
-from cowork.db.session import get_open_session
+from cowork.db.units import run_efs_unit
 from cowork.models.skill import Skill
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, caller_bearer, get_principal
@@ -678,37 +677,16 @@ def _upload_skill_bytes(
 )
 async def upload_skill(
     file: UploadFile,
-    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     shared: Annotated[bool, Form()] = False,
     viewer: SkillViewerDep = None,
 ):
     raw = await file.read()
-    return await run_efs(
-        partial(
-            _upload_skill_in_new_session, raw, file.filename, scope, principal, shared=shared, viewer=viewer
-        ),
+    return await run_efs_unit(
+        lambda session: _upload_skill_bytes(raw, file.filename, session, principal, shared=shared, viewer=viewer),
         scope=scope,
     )
-
-
-def _upload_skill_in_new_session(
-    raw: bytes,
-    filename: str | None,
-    scope: TenantScope,
-    principal: Principal | None,
-    *,
-    shared: bool = False,
-    viewer: SkillViewer | None = None,
-) -> dict:
-    raw_session = get_open_session()
-    try:
-        scoped = ScopedSession(raw_session, scope)
-        return _upload_skill_bytes(
-            raw, filename, scoped, principal, shared=shared, viewer=viewer
-        )
-    finally:
-        raw_session.close()
 
 
 @router.get("/{skill_id}", response_model=SkillResponse)

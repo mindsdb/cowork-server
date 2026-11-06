@@ -731,6 +731,37 @@ def test_a_message_whose_binding_unit_finds_no_connection_hears_the_busy_notice(
     assert adapter.delivered == ([(str(chat_id), BUSY_NOTICE)] if told else [])
 
 
+@pytest.mark.parametrize(("step", "chat_id"), [("read", 607), ("make", 608)])
+def test_a_refusal_at_either_step_of_a_binding_tells_a_direct_sender(monkeypatch, step, chat_id):
+    """A thread's binding is read as a row in a database unit, and only a new
+    one is made on the file store's threads (run_efs_unit), since it may
+    start in the general project. The pool refusing the read, or the file
+    store refusing the make, tells a sender who wrote to the bot directly."""
+    from cowork.channels.runtime import BUSY_NOTICE
+    from cowork.db.units import DatabaseBusy, FilesystemBusy
+
+    if step == "read":
+        refusal = DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+        def refused_read(scoped, *, channel_type, event):
+            raise refusal
+
+        monkeypatch.setattr(AntonChannelRuntime, "_find_binding", staticmethod(refused_read))
+    else:
+        refusal = FilesystemBusy("no shared file store slot freed within POOL_TIMEOUT")
+
+        async def refused_make(fn, *, scope, deadline=True):
+            raise refusal
+
+        monkeypatch.setattr(runtime_mod, "run_efs_unit", refused_make)
+    adapter = FakeAdapter()
+
+    with pytest.raises(type(refusal)):
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(606, chat_id, "hello")))
+
+    assert adapter.delivered == [(str(chat_id), BUSY_NOTICE)]
+
+
 def test_a_new_command_whose_detach_finds_no_connection_hears_the_busy_notice(monkeypatch):
     """/new runs no turn: it detaches the route's conversation in a unit of
     its own. A pool that refuses that unit tells the sender, who would

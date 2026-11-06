@@ -45,6 +45,7 @@ from cowork.db.units import (
     busy_retry_seconds,
     drain_turn_end_records,
     loop_limiters,
+    run_efs,
 )
 from cowork.common.loop_watchdog import LoopWatchdog
 from cowork.draft_host.listener import start_draft_listener, stop_draft_listener
@@ -446,6 +447,14 @@ async def lifespan(app: FastAPI):
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    clock.begin("shared_root")
+    # Once, before the port binds: a database unit that checks which partition
+    # of the shared root a project's folder sits in then reads this answer
+    # rather than resolving the root on the file store.
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.services.projects import resolve_shared_root
+
+    await run_efs(resolve_shared_root, scope=SYSTEM_SCOPE, deadline=False)
     clock.begin("published_page_backfill")
     # Ownership recovery runs before the first request can mint a page. A pass
     # that cannot read publish history or verify the publisher does not stop

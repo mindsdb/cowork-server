@@ -27,6 +27,7 @@ import anyio
 import anyio.to_thread
 import httpx
 import pytest
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.applications import Starlette
 from starlette.responses import FileResponse
 from starlette.routing import Route
@@ -64,6 +65,21 @@ def _default_threads() -> anyio.CapacityLimiter:
     return anyio.to_thread.current_default_thread_limiter()
 
 
+def _receive_from_a_client_that_stays():
+    """An ASGI ``receive`` as a server gives one: the request, then a wait for
+    the next message, which never comes while the client stays."""
+    requested = False
+
+    async def receive():
+        nonlocal requested
+        if not requested:
+            requested = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await asyncio.Event().wait()
+
+    return receive
+
+
 def _client(app) -> httpx.AsyncClient:
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
@@ -78,6 +94,27 @@ async def test_an_org_member_lists_projects_while_every_default_thread_is_held(o
 
     assert response.status_code == 200, response.text
     assert [project["name"] for project in response.json()] == ["general"]
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/v1/connectors/datasources/", "/api/v1/skills/sharing-capabilities"],
+    ids=["list datasource connections", "read skill sharing capabilities"],
+)
+async def test_a_route_that_does_no_io_answers_while_every_default_thread_is_held(org_deployment, monkeypatch, path):
+    """Neither the route nor its dependencies, such as the datasources
+    router's org check, do I/O, so each is a coroutine and takes no default
+    thread. MindsHub's answer is stubbed: the list proxies it."""
+    from cowork.services.connectors.oauth import auth_proxy
+
+    async def no_connections(_request, _settings):
+        return []
+
+    monkeypatch.setattr(auth_proxy, "proxy_datasource_list", no_connections)
+    async with _client(create_app()) as client:
+        async with _all_tokens_held(_default_threads()):
+            response = await asyncio.wait_for(client.get(path, headers=IDENTITY), BUDGET_SECONDS)
+
+    assert response.status_code == 200, response.text
 
 
 async def test_an_artifact_review_answers_while_every_default_thread_is_held(seeded_artifact):  # noqa: F811
@@ -136,16 +173,38 @@ async def test_a_download_reads_its_file_off_the_default_threads(org_deployment,
 
 @pytest.mark.parametrize("stored", _DOWNLOADS)
 async def test_a_download_with_every_file_store_slot_held_answers_503(org_deployment, monkeypatch, stored):
+    """Every default thread is held too, so work that runs only on the
+    refusal path, such as a sync exception handler, hangs the request past
+    the budget instead of passing unseen."""
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
     async with _client(create_app()) as client:
         url = await _DOWNLOADS[stored](client, b"hello")
-        async with _all_tokens_held(units._efs_slots()):
+        async with _all_tokens_held(units._efs_slots()), _all_tokens_held(_default_threads()):
             response = await asyncio.wait_for(client.get(url, headers=IDENTITY), BUDGET_SECONDS)
-            default_threads_taken = _default_threads().borrowed_tokens
 
     assert response.status_code == 503, response.text
     assert response.json()["code"] == "server_busy"
-    assert default_threads_taken == 0
+
+
+async def test_a_download_whose_file_is_deleted_before_the_response_opens_it_answers_404(
+    org_deployment, monkeypatch
+):
+    """The route reads the file's row, and the response opens the file. A
+    delete that lands between the two leaves a row whose bytes are gone, which
+    answers as a missing file does, not with a 500."""
+    real_open = efs_file_response._open_regular_file
+
+    def deleted_first(target):
+        os.unlink(target)
+        return real_open(target)
+
+    monkeypatch.setattr(efs_file_response, "_open_regular_file", deleted_first)
+    async with _client(create_app()) as client:
+        url = await _uploaded_file_url(client, b"hello")
+        response = await asyncio.wait_for(client.get(url, headers=IDENTITY), BUDGET_SECONDS)
+
+    assert response.status_code == 404, response.text
+    assert response.json() == {"detail": "File not found"}
 
 
 async def _every_slot_held_for(seconds: float) -> None:
@@ -198,8 +257,7 @@ async def test_an_efs_file_response_refused_before_its_headers_sends_nothing(tmp
     path.write_bytes(b"0123456789")
     sent = []
 
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+    receive = _receive_from_a_client_that_stays()
 
     async def send(message):
         sent.append(message["type"])
@@ -247,8 +305,7 @@ async def test_an_efs_file_response_closes_its_file_on_the_file_store_threads_wh
     monkeypatch.setattr(efs_file_response, "_open_regular_file", recorded_open)
     bodies = 0
 
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+    receive = _receive_from_a_client_that_stays()
 
     async def send(message):
         nonlocal bodies
@@ -288,8 +345,7 @@ async def test_an_efs_file_response_cancelled_while_it_opens_closes_the_file_on_
     monkeypatch.setattr(efs_file_response, "_open_regular_file", slow_open)
     sent: list[str] = []
 
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+    receive = _receive_from_a_client_that_stays()
 
     async def send(message):
         sent.append(message["type"])
@@ -320,8 +376,7 @@ async def test_an_efs_file_response_ends_a_range_whose_file_shrank_after_its_sta
     monkeypatch.setattr(efs_file_response, "_open_regular_file", open_then_shrink)
     messages: list[dict] = []
 
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+    receive = _receive_from_a_client_that_stays()
 
     async def send(message):
         messages.append(message)
@@ -335,13 +390,51 @@ async def test_an_efs_file_response_ends_a_range_whose_file_shrank_after_its_sta
     assert bodies[-1]["more_body"] is False
 
 
+async def test_an_efs_file_response_stops_reading_when_the_client_leaves(tmp_path, monkeypatch):
+    """Below ASGI 2.4, as uvicorn reports, a send after a disconnect returns
+    silently. The response listens for the disconnect and stops its reads
+    there, so chunks nobody receives take no file store slots."""
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"x" * (50 * FileResponse.chunk_size))
+    reads = 0
+    real_read = EfsFileResponse._read
+
+    async def counted_read(self, file, *, start, size):
+        nonlocal reads
+        reads += 1
+        return await real_read(self, file, start=start, size=size)
+
+    monkeypatch.setattr(EfsFileResponse, "_read", counted_read)
+    first_body = asyncio.Event()
+    requested = False
+
+    async def receive():
+        nonlocal requested
+        if not requested:
+            requested = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await first_body.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_body.set()
+            await asyncio.sleep(0.05)
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "method": "GET", "headers": []}
+    await asyncio.wait_for(EfsFileResponse(path, scope=LOCAL_SCOPE)(scope, receive, send), BUDGET_SECONDS)
+
+    assert first_body.is_set()
+    assert reads == 1
+
+
 async def test_an_efs_file_response_serves_a_file_where_os_has_no_nonblocking_flag(tmp_path, monkeypatch):
     """Windows, where the desktop runs, has no ``os.O_NONBLOCK``. The open
     uses the portable flag from cowork.common.paths, so a download still
     answers there."""
     path = tmp_path / "notes.txt"
     path.write_bytes(b"0123456789")
-    monkeypatch.delattr(os, "O_NONBLOCK")
+    monkeypatch.setattr(efs_file_response, "O_NONBLOCK", 0)
     app = Starlette(routes=[Route("/efs", lambda _request: EfsFileResponse(path, scope=LOCAL_SCOPE))])
 
     async with _client(app) as client:
@@ -532,6 +625,7 @@ async def org_workspace(org_deployment) -> _OrgWorkspace:
 
 
 _FILE_STORE_ROUTES = [
+    ("create a project", "POST", "/api/v1/projects/", {"name": "threads-created"}, 201),
     ("list conversations in the default project", "GET", "/api/v1/conversations/", None, 200),
     ("create a conversation in the default project", "POST", "/api/v1/conversations/", {"title": "t"}, 201),
     ("move a conversation to the general project by name", "PATCH",
@@ -610,6 +704,37 @@ async def test_a_request_that_names_its_project_by_id_answers_while_every_file_s
             )
 
     assert response.status_code == expected, response.text
+
+
+async def test_a_skill_upload_with_every_connection_held_is_refused_as_a_busy_unit(org_deployment, one_connection_pool):
+    """The upload runs as a unit on the file store's threads, so its wait for
+    a connection is a unit's: refused with DatabaseBusy within POOL_TIMEOUT.
+    A session of its own would wait in the pool outside the units' accounting,
+    holding its file store slot, and surface the pool's raw timeout."""
+    app = create_app()
+    refusals: list[type[BaseException]] = []
+    answer_busy = app.exception_handlers[PoolTimeoutError]
+
+    async def recorded(request, exc):
+        refusals.append(type(exc))
+        return await answer_busy(request, exc)
+
+    app.exception_handlers[PoolTimeoutError] = recorded
+    skill = b"---\nname: busy-upload\ndescription: Uploaded while the pool is full.\n---\n\nBody.\n"
+    held = await asyncio.to_thread(one_connection_pool.connect)
+    try:
+        async with _client(app) as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    "/api/v1/skills/upload", files={"file": ("SKILL.md", skill, "text/markdown")}, headers=IDENTITY
+                ),
+                BUDGET_SECONDS,
+            )
+    finally:
+        held.close()
+
+    assert response.status_code == 503, response.text
+    assert refusals == [units.DatabaseBusy]
 
 
 async def test_a_project_upload_reads_each_file_only_once_its_project_is_found(org_deployment, monkeypatch):

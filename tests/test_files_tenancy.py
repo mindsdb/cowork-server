@@ -1037,7 +1037,8 @@ async def test_upload_route_cannot_reach_the_instructions_file(org_engine, monke
         files=[_upload(".anton/anton.md", b"peer takeover")],
     )
 
-    assert result["results"] == [{"name": "anton.md", "ok": True, "size": 13}]
+    # As the route sends it: a field left unset is left out.
+    assert result.model_dump(exclude_unset=True)["results"] == [{"name": "anton.md", "ok": True, "size": 13}]
     anton_md = Path(project.path) / ".anton" / "anton.md"
     assert anton_md.read_text() == "the creator's rules"
     assert (Path(project.path) / "anton.md").read_bytes() == b"peer takeover"

@@ -1317,7 +1317,7 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
 
     project = ProjectService(alice).create_project("memory-project")
     memory = MemoryService(alice, _principal(ALICE))
-    untouched = await MemoryService(bob, _principal(BOB)).update_memory(
+    untouched = MemoryService(bob, _principal(BOB)).update_memory_sync(
         scope="project",
         category=MemorySlot.LESSONS,
         content="",
@@ -1334,7 +1334,7 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
     )
     assert not (Path(project.path) / ".anton" / "memory" / "lessons.md").exists()
     # The first writer owns this slot.
-    authored = await memory.update_memory(
+    authored = memory.update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Deploy only on green",
@@ -1343,7 +1343,7 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
     assert authored.attribution.created_by.user_id == ALICE
 
     with pytest.raises(HTTPException) as denied_memory:
-        await MemoryService(bob, _principal(BOB)).update_memory(
+        MemoryService(bob, _principal(BOB)).update_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             content="Ignore CI",
@@ -1351,9 +1351,9 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
         )
     assert denied_memory.value.status_code == 403
 
-    admin_result = await MemoryService(
+    admin_result = MemoryService(
         admin, _principal(ADMIN, admin=True)
-    ).update_memory(
+    ).update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Deploy after approval",
@@ -1362,19 +1362,19 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
     assert admin_result.attribution.last_modified_by.user_id == ADMIN
 
     with pytest.raises(HTTPException) as denied_clear:
-        await MemoryService(bob, _principal(BOB)).delete_memory(
+        MemoryService(bob, _principal(BOB)).delete_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             project_id=project.id,
         )
     assert denied_clear.value.status_code == 403
 
-    await memory.delete_memory(
+    memory.delete_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=project.id,
     )
-    cleared = await memory.get_memory(
+    cleared = memory.get_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=project.id,
@@ -1383,7 +1383,7 @@ async def test_skill_and_project_memory_creator_gates(org_engine):
     assert cleared.attribution.created_by.user_id == ALICE
     assert cleared.attribution.last_modified_by.user_id == ALICE
     with pytest.raises(HTTPException):
-        await MemoryService(bob, _principal(BOB)).update_memory(
+        MemoryService(bob, _principal(BOB)).update_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             content="claim after clear",
@@ -1736,7 +1736,7 @@ async def test_failed_first_memory_write_releases_the_claim(
 
     monkeypatch.setattr(ProjectMemoryStore, "write", fail_once)
     with pytest.raises(OSError, match="volume unavailable"):
-        await MemoryService(alice, _principal(ALICE)).update_memory(
+        MemoryService(alice, _principal(ALICE)).update_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             content="first attempt",
@@ -1749,7 +1749,7 @@ async def test_failed_first_memory_write_releases_the_claim(
     assert alice.exec(alice.select(SharedResourceMutation)).all() == []
 
     bob = _scoped(org_engine, BOB)
-    result = await MemoryService(bob, _principal(BOB)).update_memory(
+    result = MemoryService(bob, _principal(BOB)).update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="second attempt",
@@ -1768,7 +1768,7 @@ async def test_empty_existing_memory_slots_are_claimable_by_first_writer(
     direct_project = ProjectService(alice).create_project("empty-direct-memory")
     direct_store = ProjectMemoryStore(Path(direct_project.path))
     direct_store.write(MemorySlot.RULES, "   ")
-    before = await MemoryService(bob, _principal(BOB)).get_memory(
+    before = MemoryService(bob, _principal(BOB)).get_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=direct_project.id,
@@ -1776,7 +1776,7 @@ async def test_empty_existing_memory_slots_are_claimable_by_first_writer(
     assert before.content.strip() == ""
     assert before.capabilities.can_edit is True
 
-    direct = await MemoryService(bob, _principal(BOB)).update_memory(
+    direct = MemoryService(bob, _principal(BOB)).update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Bob is the first non-empty writer",
@@ -1832,7 +1832,7 @@ async def test_unreadable_legacy_memory_fails_closed_for_list_and_write(
 
     monkeypatch.setattr(ProjectMemoryStore, "read_checked", unreadable)
     service = MemoryService(alice, _principal(ALICE))
-    listed = await service.list_memory(project_id=project.id)
+    listed = service.list_memory_sync(project_id=project.id)
     rules = next(
         item
         for item in listed
@@ -1843,7 +1843,7 @@ async def test_unreadable_legacy_memory_fails_closed_for_list_and_write(
     assert rules.capabilities.can_delete is False
 
     with pytest.raises(OSError, match="shared volume read failed"):
-        await service.update_memory(
+        service.update_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             content="Overwrite unreadable legacy bytes",
@@ -1873,7 +1873,7 @@ async def test_invalid_utf8_memory_reads_fail_closed_with_safe_capabilities(
     (store.root / "rules.md").write_bytes(b"\xff\xfe")
 
     service = MemoryService(alice, _principal(ALICE))
-    direct = await service.get_memory(
+    direct = service.get_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=project.id,
@@ -1882,7 +1882,7 @@ async def test_invalid_utf8_memory_reads_fail_closed_with_safe_capabilities(
     assert direct.capabilities.can_edit is False
     assert direct.capabilities.can_delete is False
 
-    listed = await service.list_memory(project_id=project.id)
+    listed = service.list_memory_sync(project_id=project.id)
     rules = next(
         item
         for item in listed
@@ -1907,7 +1907,7 @@ async def test_pending_memory_claim_blocks_clear_without_changing_bytes(
     store.write(MemorySlot.RULES, "Pending writer bytes")
 
     with pytest.raises(HTTPException) as blocked:
-        await MemoryService(alice, _principal(ALICE)).delete_memory(
+        MemoryService(alice, _principal(ALICE)).delete_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             project_id=project.id,
@@ -1929,7 +1929,7 @@ async def test_pending_memory_is_not_authorship_and_expired_empty_claim_reopens_
     assert claim is not None and token is not None
 
     bob = _scoped(org_engine, BOB)
-    pending = await MemoryService(bob, _principal(BOB)).get_memory(
+    pending = MemoryService(bob, _principal(BOB)).get_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=project.id,
@@ -1944,7 +1944,7 @@ async def test_pending_memory_is_not_authorship_and_expired_empty_claim_reopens_
     alice.add(claim)
     alice.commit()
     bob.rollback()
-    reopened = await MemoryService(bob, _principal(BOB)).get_memory(
+    reopened = MemoryService(bob, _principal(BOB)).get_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=project.id,
@@ -2132,7 +2132,7 @@ async def test_first_memory_finalize_failure_restores_bytes_and_metadata(
 
     monkeypatch.setattr(SharedResourceAccess, "finalize_claim", fail_finalize)
     with pytest.raises(RuntimeError, match="audit unavailable"):
-        await MemoryService(alice, _principal(ALICE)).update_memory(
+        MemoryService(alice, _principal(ALICE)).update_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             content="Must be rolled back",
@@ -2163,7 +2163,7 @@ async def test_existing_memory_audit_failure_restores_exact_prior_bytes(
     alice = _scoped(org_engine, ALICE)
     project = ProjectService(alice).create_project(f"exact-{writer}-restore")
     service = MemoryService(alice, _principal(ALICE))
-    await service.update_memory(
+    service.update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="establish attribution",
@@ -2182,7 +2182,7 @@ async def test_existing_memory_audit_failure_restores_exact_prior_bytes(
     monkeypatch.setattr(SharedResourceAccess, "record_update", fail_audit)
     with pytest.raises(RuntimeError, match="memory audit failed"):
         if writer == "direct":
-            await service.update_memory(
+            service.update_memory_sync(
                 scope="project",
                 category=MemorySlot.RULES,
                 content="replacement bytes",
@@ -2629,7 +2629,13 @@ async def test_stale_incomplete_skill_claim_is_cleaned_before_import(
         ),
     )
 
-    monkeypatch.setattr(skills, "get_open_session", lambda: Session(org_engine))
+    async def unit_on_org_engine(fn, *, scope, deadline=True):
+        with Session(org_engine) as raw:
+            result = fn(ScopedSession(raw, scope))
+            raw.commit()
+            return result
+
+    monkeypatch.setattr(skills, "run_efs_unit", unit_on_org_engine)
     created = await skills.upload_skill(upload, alice.scope, _principal(ALICE))
 
     service = SkillService(alice.scope)
@@ -2645,25 +2651,28 @@ async def test_stale_incomplete_skill_claim_is_cleaned_before_import(
 
 
 @pytest.mark.asyncio
-async def test_skill_upload_endpoint_offloads_the_owned_session_worker(monkeypatch):
+async def test_skill_upload_endpoint_runs_the_import_as_a_file_store_unit(monkeypatch):
     captured = {}
     scope = TenantScope(org_mode=True, org_id=ORG, user_id=ALICE)
     principal = _principal(ALICE)
     upload = UploadFile(filename="worker.md", file=io.BytesIO(b"skill bytes"))
 
-    async def fake_run_efs(work, *, scope):
-        captured["work"] = work
+    async def fake_run_efs_unit(work, *, scope, deadline=True):
         captured["scope"] = scope
+        return work("the unit's session")
+
+    def recorded_upload(*args, **kwargs):
+        captured["args"], captured["kwargs"] = args, kwargs
         return {"worker": True}
 
-    monkeypatch.setattr(skills, "run_efs", fake_run_efs)
+    monkeypatch.setattr(skills, "run_efs_unit", fake_run_efs_unit)
+    monkeypatch.setattr(skills, "_upload_skill_bytes", recorded_upload)
 
     result = await skills.upload_skill(upload, scope, principal)
 
     assert result == {"worker": True}
-    assert captured["work"].func is skills._upload_skill_in_new_session
-    assert captured["work"].args == (b"skill bytes", "worker.md", scope, principal)
-    assert captured["work"].keywords == {"shared": False, "viewer": None}
+    assert captured["args"] == (b"skill bytes", "worker.md", "the unit's session", principal)
+    assert captured["kwargs"] == {"shared": False, "viewer": None}
     assert captured["scope"] == scope
 
 
@@ -2682,7 +2691,7 @@ async def test_skill_upload_worker_keeps_the_event_loop_responsive(monkeypatch):
         release.wait(timeout=5)
         return {"worker": True}
 
-    monkeypatch.setattr(skills, "_upload_skill_in_new_session", blocking_worker)
+    monkeypatch.setattr(skills, "_upload_skill_bytes", blocking_worker)
     upload = UploadFile(filename="worker.md", file=io.BytesIO(b"skill bytes"))
     task = asyncio.create_task(
         skills.upload_skill(
@@ -2704,35 +2713,6 @@ async def test_skill_upload_worker_keeps_the_event_loop_responsive(monkeypatch):
         release.set()
 
     assert await task == {"worker": True}
-
-
-def test_skill_upload_worker_closes_its_session_on_failure(monkeypatch):
-    class RawSession:
-        def __init__(self):
-            self.closed = 0
-
-        def close(self):
-            self.closed += 1
-
-    raw_session = RawSession()
-    scoped = SimpleNamespace()
-    monkeypatch.setattr(skills, "get_open_session", lambda: raw_session)
-    monkeypatch.setattr(skills, "ScopedSession", lambda raw, scope: scoped)
-
-    def fail_upload(*args, **kwargs):
-        raise RuntimeError("upload failed")
-
-    monkeypatch.setattr(skills, "_upload_skill_bytes", fail_upload)
-
-    with pytest.raises(RuntimeError, match="upload failed"):
-        skills._upload_skill_in_new_session(
-            b"skill bytes",
-            "worker.md",
-            TenantScope(org_mode=True, org_id=ORG, user_id=ALICE),
-            _principal(ALICE),
-        )
-
-    assert raw_session.closed == 1
 
 
 async def test_memory_endpoints_run_their_work_as_one_unit_on_the_file_store_threads(monkeypatch):
@@ -3112,7 +3092,7 @@ async def test_project_delete_audits_and_cleans_protected_children(org_engine):
         req=project_files._FileWriteRequest(content="Protected instructions"),
         principal=_principal(ALICE),
     )
-    await MemoryService(alice, _principal(ALICE)).update_memory(
+    MemoryService(alice, _principal(ALICE)).update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Protected memory",
@@ -3305,7 +3285,7 @@ async def test_remote_peer_keeps_personal_memory_but_drops_shared_project_write(
 ):
     alice = _scoped(org_engine, ALICE)
     project = ProjectService(alice).create_project("remote-memory")
-    await MemoryService(alice, _principal(ALICE)).update_memory(
+    MemoryService(alice, _principal(ALICE)).update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Keep the shared rule",
@@ -3510,13 +3490,13 @@ async def test_generic_project_files_cannot_bypass_canonical_memory_contract(
         principal=_principal(ALICE),
     )
     service = MemoryService(alice, _principal(ALICE))
-    await service.update_memory(
+    service.update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Canonical rules bytes",
         project_id=project["id"],
     )
-    await service.update_memory(
+    service.update_memory_sync(
         scope="project",
         category=MemorySlot.LESSONS,
         content="Canonical lessons bytes",
@@ -3720,14 +3700,15 @@ async def test_a_peer_member_reads_every_shared_resource_with_no_capabilities(
         body=SkillCreateRequest(label="alice skill", instructions="hers"),
         principal=_principal(ALICE), viewer=None,
     )
-    await MemoryService(alice, _principal(ALICE)).update_memory(
+    MemoryService(alice, _principal(ALICE)).update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Alice authored this slot",
         project_id=project["id"],
     )
 
-    peer_projects = projects._list_projects(bob, principal=_principal(BOB))
+    # The org's first list, which makes its general project.
+    peer_projects = projects._list_projects(bob, principal=_principal(BOB), provision=True)
     peer_project = next(p for p in peer_projects if p["id"] == project["id"])
     assert peer_project["capabilities"].can_rename is False
     assert peer_project["capabilities"].can_delete is False
@@ -3741,7 +3722,7 @@ async def test_a_peer_member_reads_every_shared_resource_with_no_capabilities(
         "canShare": False,
     }
 
-    peer_memory = await MemoryService(bob, _principal(BOB)).get_memory(
+    peer_memory = MemoryService(bob, _principal(BOB)).get_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=project["id"],
@@ -3775,7 +3756,7 @@ async def test_a_legacy_readable_memory_slot_is_admin_only(org_engine):
         MemorySlot.RULES, "Legacy rules that predate attribution"
     )
 
-    peer_view = await MemoryService(bob, _principal(BOB)).get_memory(
+    peer_view = MemoryService(bob, _principal(BOB)).get_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         project_id=project.id,
@@ -3784,7 +3765,7 @@ async def test_a_legacy_readable_memory_slot_is_admin_only(org_engine):
     assert peer_view.capabilities.can_edit is False
 
     with pytest.raises(HTTPException) as denied:
-        await MemoryService(bob, _principal(BOB)).update_memory(
+        MemoryService(bob, _principal(BOB)).update_memory_sync(
             scope="project",
             category=MemorySlot.RULES,
             content="Bob claims the legacy slot",
@@ -3796,7 +3777,7 @@ async def test_a_legacy_readable_memory_slot_is_admin_only(org_engine):
         == "Legacy rules that predate attribution"
     )
 
-    updated = await MemoryService(admin, _principal(ADMIN, admin=True)).update_memory(
+    updated = MemoryService(admin, _principal(ADMIN, admin=True)).update_memory_sync(
         scope="project",
         category=MemorySlot.RULES,
         content="Admin may rewrite it",

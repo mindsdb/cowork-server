@@ -162,7 +162,8 @@ async def test_upload_writes_through_the_same_pinned_boundary(tmp_path, monkeypa
 
     result = await project_files.upload_project_files("project", LOCAL_SCOPE, [upload])
 
-    assert result == {
+    # As the route sends it: a field left unset is left out.
+    assert result.model_dump(exclude_unset=True) == {
         "results": [{"name": "notes.txt", "ok": True, "size": 8}]
     }
     assert (base / "notes.txt").read_bytes() == b"uploaded"
@@ -190,7 +191,8 @@ async def test_upload_refuses_a_symlinked_final_file(tmp_path, monkeypatch):
 
     result = await project_files.upload_project_files("project", LOCAL_SCOPE, [upload])
 
-    assert result == {
+    # As the route sends it: a field left unset is left out.
+    assert result.model_dump(exclude_unset=True) == {
         "results": [
             {"name": "notes.txt", "ok": False, "error": "File write failed"}
         ]

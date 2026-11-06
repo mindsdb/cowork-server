@@ -30,6 +30,7 @@ from cowork.common.settings.user_settings import (
     use_turn_settings,
 )
 from cowork.db.units import (
+    FilesystemBusy,
     TurnEndRecord,
     busy_retry_seconds,
     conversation_writes,
@@ -836,9 +837,11 @@ class ResponsesHandler:
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
         # call, and a wait for one never stalls the event loop. Attachments are
-        # read from the file store, so a turn that carries them waits for a
-        # file store slot.
-        read_unit = run_efs_unit if _carries_attachments(request) else run_db
+        # read from the file store, and a turn that names no project by id may
+        # start its conversation in the general project, whose folder is
+        # checked there, so either waits for a file store slot, as a
+        # conversation create without a project id does.
+        read_unit = run_efs_unit if _carries_attachments(request) or request.project_id is None else run_db
         start = await read_unit(
             partial(self._read_turn_start, request=request, has_disabled_connections=bool(disabled)),
             scope=self.scope,
@@ -1261,13 +1264,13 @@ class ResponsesHandler:
 
     def _reads_always_on_rows(self, session: ScopedSession, *, conversation_id: UUID) -> bool | None:
         """Whether any skill_access row of the org is always on in MindsHub
-        mode, for the viewer handle() resolved (has_always_on_rows): the
-        database half of the always-on read, which parses no SKILL.md. None
-        when the read fails, as _reads_always_on_skills."""
+        mode (has_always_on_rows): the database half of the always-on read,
+        which parses no SKILL.md and lists no skill store. None when the read
+        fails, as _reads_always_on_skills."""
         if not sharing_applies(session.scope):
             return False
         try:
-            return has_always_on_rows(session.scope, viewer=self._skill_viewer, session=session)
+            return has_always_on_rows(session=session)
         except PoolTimeoutError:
             raise
         except Exception:
@@ -2481,9 +2484,11 @@ class ResponsesHandler:
         question is saved: the scrubbed history, where the project's artifacts
         live and who created the conversation, the project's memory when
         ``with_memory``, its workspace, and when the conversation started. A
-        browser turn reads memory; a channel turn never sends it. Its skills
-        block reads skill folders, so each turn reads it in a unit of its own
-        on the file store's threads (_produce_remote, remote_turn_events)."""
+        browser turn reads memory, which lives on the file store, so it reads
+        this on the file store's threads (run_efs_unit); a channel turn never
+        sends memory, and reads only rows here. Its skills block reads skill
+        folders, so each turn reads it in a unit of its own on the file
+        store's threads (_produce_remote, remote_turn_events)."""
         history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
         workspace = ResponsesHandler._remote_workspace(session, conv_id)
         return _RemoteTurnInputs(
@@ -2914,7 +2919,9 @@ class ResponsesHandler:
             # The caller's teams and permissions, read from MindsHub (cached
             # per caller) before the seed, which selects the skills they see.
             await self._resolve_skill_viewer(scope)
-            seed = await run_db(
+            # The project's memory it reads lives on the file store, so the
+            # seed is read in a unit on the file store's threads.
+            seed = await run_efs_unit(
                 partial(self._read_remote_turn_inputs, conv_id=conv_id, with_memory=True), scope=scope
             )
             # The skills the caller sees, the pod's whole recallable set
@@ -3198,10 +3205,10 @@ class ResponsesHandler:
         except Exception as exc:
             if isinstance(exc, PoolTimeoutError):
                 # No database connection freed in time. The frame says so with
-                # the wait, as a refused request's 503 does.
-                # Off the loop: the classification reads settings, and the
-                # pool is full right now.
-                code, message = await run_on_unit_threads(partial(friendly_turn_error, exc))
+                # the wait, as a refused request's 503 does. friendly_turn_error
+                # answers a pool timeout at its first check, from the cached
+                # POOL_TIMEOUT alone, so it runs inline.
+                code, message = friendly_turn_error(exc)
                 retry_after = busy_retry_seconds()
                 extra: dict = {"retry_after": retry_after, "retry_at": retry_at_instant(retry_after)}
                 logger.warning(
@@ -3897,17 +3904,17 @@ class ResponsesHandler:
             file_svc = FileService(session)
             for aid in request.attachment_ids:
                 try:
-                    content_type, filename, filepath = file_svc.get_file_content(UUID(aid))
+                    stored = file_svc.get_file_content(UUID(aid))
                 except PoolTimeoutError:
                     # A full pool is not a missing attachment: dropping it would
                     # run the turn without the file the user sent.
                     raise
                 except Exception:
                     continue
-                if content_type and content_type.startswith("image/"):
-                    blocks.append(self._image_block(filepath, content_type))
+                if stored.content_type and stored.content_type.startswith("image/"):
+                    blocks.append(self._image_block(stored.path, stored.content_type))
                 else:
-                    blocks.append({"type": "file", "path": str(filepath), "filename": filename})
+                    blocks.append({"type": "file", "path": str(stored.path), "filename": stored.filename})
 
         # Extract text input
         if isinstance(request.input, str):
@@ -3924,13 +3931,13 @@ class ResponsesHandler:
                                     blocks.append({"type": "text", "text": item.text})
                                 elif item.type == ContentType.file and item.file_id:
                                     try:
-                                        content_type, filename, filepath = FileService(session).get_file_content(UUID(item.file_id))
+                                        stored = FileService(session).get_file_content(UUID(item.file_id))
                                     except ValueError:
                                         raise HTTPException(status_code=404, detail=f"File {item.file_id!r} not found")
-                                    if content_type and content_type.startswith("image/"):
-                                        blocks.append(self._image_block(filepath, content_type))
+                                    if stored.content_type and stored.content_type.startswith("image/"):
+                                        blocks.append(self._image_block(stored.path, stored.content_type))
                                     else:
-                                        blocks.append({"type": "file", "path": str(filepath), "filename": filename})
+                                        blocks.append({"type": "file", "path": str(stored.path), "filename": stored.filename})
                     break
 
         return blocks or [{"type": "text", "text": ""}]
@@ -4018,20 +4025,24 @@ class ResponsesHandler:
 
 async def stage_remote_workspace(*, conv_id: UUID, scope: TenantScope) -> None:
     """Stage what a remote turn's pod reads from the shared mount
-    (ResponsesHandler._stage_remote_workspace_files), in a unit, before the
-    pod runs. The browser and the channel producers both stage here.
+    (ResponsesHandler._stage_remote_workspace_files), in a unit on the file
+    store's threads (run_efs_unit), before the pod runs. The browser and the
+    channel producers both stage here. Staging stuck on a slow file store
+    holds a file store slot from the caller's share, and file units together
+    hold at most EFS_UNIT_SLOTS of the database unit slots, so database units
+    keep the rest.
 
-    A full pool is not a missing file: PoolTimeoutError propagates, so the
-    turn is refused (server_busy) rather than run without what the user sent.
-    Staging itself degrades on its own, so any other failure is the unit's
-    own connect or commit; it is logged, and the turn runs without the
-    staged files.
+    A full pool or a busy file store is not a missing file: PoolTimeoutError
+    and FilesystemBusy propagate, so the turn is refused rather than run
+    without what the user sent. Staging itself degrades on its own, so any
+    other failure is the unit's own connect or commit; it is logged, and the
+    turn runs without the staged files.
     """
     try:
-        await run_db(
+        await run_efs_unit(
             partial(ResponsesHandler._stage_remote_workspace_files, conv_id=conv_id), scope=scope,
         )
-    except PoolTimeoutError:
+    except (PoolTimeoutError, FilesystemBusy):
         raise
     except Exception:
         logger.exception(
@@ -4047,26 +4058,29 @@ async def save_turn_memory(
     scope: TenantScope,
     request_id: str | None,
 ) -> None:
-    """Apply what a remote turn's pod asked to remember, in a unit, as it
-    arrives. The browser and the channel producers both save memory here.
+    """Apply what a remote turn's pod asked to remember, in a unit on the
+    file store's threads (run_efs_unit), as it arrives: the memory store
+    lives on the file store. The browser and the channel producers both save
+    memory here.
 
     Never fails the turn: a lost memory is recoverable, a lost reply isn't.
-    A pool that frees no connection within POOL_TIMEOUT drops the entries
-    with a WARNING, and any other failure with an ERROR.
+    A pool that frees no connection, or a file store that frees no slot,
+    within POOL_TIMEOUT drops the entries with a WARNING, and any other
+    failure with an ERROR.
     """
     if not entries:
         return
     try:
-        await run_db(
+        await run_efs_unit(
             partial(
                 ResponsesHandler._persist_turn_memory,
                 conv_id=conv_id, entries=entries, principal=principal,
             ),
             scope=scope,
         )
-    except PoolTimeoutError:
+    except (PoolTimeoutError, FilesystemBusy):
         logger.warning(
-            "[responses] no database connection freed in time to apply a turn's memory",
+            "[responses] no database connection or file store slot freed in time to apply a turn's memory",
             extra=log_context(request_id=request_id, conversation_id=conv_id),
         )
     except Exception:

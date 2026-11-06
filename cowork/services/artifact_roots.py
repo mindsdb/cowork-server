@@ -164,8 +164,8 @@ class RootsPlan:
     legacy conversation roots of `owned`, the conversations the caller owns,
     which the same database unit reads. `partition` is the caller's partition
     of the shared root (`projects.partition_of`): a project whose folder sits
-    in another one is left out when the plan is expanded, since that check
-    resolves the shared root.
+    in another one is left out of `projects` when the plan is built, so no
+    reader of the plan reaches it, and again when the plan is expanded.
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -226,6 +226,22 @@ def _project_row(service, project) -> ProjectRow:
 
 
 
+def _rows_in_partition(*, service, projects, partition: str | None) -> tuple[ProjectRow, ...]:
+    """`projects`' rows, less one that names a folder in another partition
+    (`_sits_in_another_partition`). Compares paths against the shared root
+    resolved at startup, read once for every project, so a database unit may
+    run it."""
+    from cowork.services.projects import resolved_shared_root
+
+    shared_root = resolved_shared_root() if partition is not None else None
+    rows = (_project_row(service, project) for project in projects)
+    return tuple(
+        row
+        for row in rows
+        if not _sits_in_another_partition(row, partition=partition, shared_root=shared_root)
+    )
+
+
 def plan_project_roots(
     session: ScopedSession, project_id: UUID, *, include_other_members: bool = False
 ) -> RootsPlan:
@@ -258,9 +274,10 @@ def plan_project_roots(
 
     service = ProjectService(session)
     owner_filter = not include_other_members and session.scope.org_mode
+    partition = partition_of(session.scope)
     return RootsPlan(
-        projects=(_project_row(service, service.get_project(project_id)),),
-        partition=partition_of(session.scope),
+        projects=_rows_in_partition(service=service, projects=(service.get_project(project_id),), partition=partition),
+        partition=partition,
         owner_filter=owner_filter,
         owned=owned_conversation_ids(session) if owner_filter else frozenset(),
     )
@@ -294,9 +311,10 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
                 if service.directory_is_external(project)
             ),
         )
+    partition = partition_of(session.scope)
     return RootsPlan(
-        projects=tuple(_project_row(service, project) for project in service.list_projects()),
-        partition=partition_of(session.scope),
+        projects=_rows_in_partition(service=service, projects=service.list_projects(), partition=partition),
+        partition=partition,
         owner_filter=session.scope.org_mode,
         owned=owned_conversation_ids(session) if session.scope.org_mode else frozenset(),
     )
@@ -438,7 +456,7 @@ def discover_roots(plan: RootsPlan, *, own_only: bool = False) -> DiscoveredRoot
     from cowork.services.projects import resolved_shared_root
 
     owned = plan.owned if own_only and plan.owner_filter else None
-    # Resolved once for every project the plan names, not once per project.
+    # Read once for every project the plan names, not once per project.
     shared_root = resolved_shared_root() if plan.partition is not None and plan.projects else None
     roots: list[_FoundRoot] = []
     if plan.scan:

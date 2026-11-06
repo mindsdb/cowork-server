@@ -21,6 +21,10 @@ Only the wait for a slot has a deadline: a started call keeps its slot until
 it returns. One person holds at most EFS_SHARE of the slots, so one heavy
 client is refused with ``FilesystemBusy`` before anyone else waits. Both come
 from the environment (StorageSettings in cowork.common.settings.app_settings).
+A unit that also works on the file store (``run_efs_unit``) holds a pooled
+connection while the store answers, so those units together hold at most
+EFS_UNIT_SLOTS of the database unit slots (DatabaseSettings), and units stuck
+on the store never hold every connection.
 """
 from __future__ import annotations
 
@@ -461,12 +465,12 @@ async def _efs_task(
     fn: Callable[[], T],
     *,
     share: anyio.CapacityLimiter | None,
-    unit_slots: anyio.CapacityLimiter | None,
+    unit_slots: tuple[anyio.CapacityLimiter, ...],
     deadline: float,
     start: _EfsStart,
 ) -> T:
     """Take the caller's share, then a slot, by ``deadline``; for a database
-    unit, then a unit slot (``unit_slots``) by the same deadline; then run
+    unit, then each of ``unit_slots`` in order by the same deadline; then run
     ``fn`` in a worker thread, holding them all until the thread ends.
 
     The file store slot comes first: a caller queued behind a stuck file store
@@ -481,10 +485,11 @@ async def _efs_task(
                     held.append(limiter)
         if slot_wait.cancelled_caught:
             raise FilesystemBusy("no shared file store slot freed within POOL_TIMEOUT")
-        if unit_slots is not None:
+        if unit_slots:
             with anyio.CancelScope(deadline=deadline) as unit_wait:
-                await unit_slots.acquire()
-                held.append(unit_slots)
+                for limiter in unit_slots:
+                    await limiter.acquire()
+                    held.append(limiter)
             if unit_wait.cancelled_caught:
                 raise DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")
         start.started = True
@@ -495,10 +500,11 @@ async def _efs_task(
 
 
 async def _run_on_efs(
-    fn: Callable[[], T], *, scope: TenantScope, deadline: bool, unit_slots: anyio.CapacityLimiter | None,
+    fn: Callable[[], T], *, scope: TenantScope, deadline: bool, unit_slots: tuple[anyio.CapacityLimiter, ...],
 ) -> T:
-    """``run_efs`` for both of its callers: ``unit_slots`` is the unit slots a
-    database unit (``run_efs_unit``) takes after its file store slot, or None."""
+    """``run_efs`` for both of its callers: ``unit_slots`` is what a database
+    unit (``run_efs_unit``) takes after its file store slot, in order, or
+    nothing."""
     loop = asyncio.get_running_loop()
     until = loop.time() + db_session.settings.database.pool_timeout if deadline else math.inf
     start = _EfsStart()
@@ -527,7 +533,7 @@ async def run_efs(fn: Callable[[], T], *, scope: TenantScope, deadline: bool = T
     for it to return before it propagates, as ``run_db`` does, so a lock it
     holds is released before the caller unwinds.
     """
-    return await _run_on_efs(fn, scope=scope, deadline=deadline, unit_slots=None)
+    return await _run_on_efs(fn, scope=scope, deadline=deadline, unit_slots=())
 
 
 async def run_efs_cleanup(fn: Callable[[], T], *, scope: TenantScope) -> T:
@@ -541,6 +547,24 @@ async def run_efs_cleanup(fn: Callable[[], T], *, scope: TenantScope) -> T:
     ``Task.cancel()``, waits for it before it propagates (``run_to_completion``).
     """
     return await run_to_completion(run_efs(fn, scope=scope, deadline=False))
+
+
+_EFS_UNIT_SLOTS: RunVar[anyio.CapacityLimiter] = RunVar("cowork_efs_unit_slots")
+
+
+def _efs_unit_slots() -> anyio.CapacityLimiter:
+    """This event loop's cap on the database unit slots file units hold at
+    once: EFS_UNIT_SLOTS (``DatabaseSettings.efs_unit_slots``). A file unit
+    takes it after its file store slot and before ``run_db``'s unit slot, so
+    file units stuck on the file store hold at most that many connections and
+    database units keep the rest."""
+    try:
+        return _EFS_UNIT_SLOTS.get()
+    except LookupError:
+        pass
+    limiter = anyio.CapacityLimiter(db_session.settings.database.efs_unit_slots)
+    _EFS_UNIT_SLOTS.set(limiter)
+    return limiter
 
 
 def _file_unit_slots(engine: Engine) -> anyio.CapacityLimiter | None:
@@ -565,8 +589,9 @@ async def run_efs_unit(
     connection while the file store answers, as a sync route did, but it takes
     none of anyio's default threads and never runs on the event loop.
 
-    After its file store slot it takes a unit slot, as ``run_db`` does, by the
-    same deadline: the wait for both gives up POOL_TIMEOUT after the call,
+    After its file store slot it takes one of the file units' own slots
+    (``_efs_unit_slots``), then a unit slot, as ``run_db`` does, by the same
+    deadline: the wait for all of them gives up POOL_TIMEOUT after the call,
     with ``FilesystemBusy`` or ``DatabaseBusy``, and its thread never waits
     inside a full pool. A connection that a checkout outside the units still
     holds can keep it waiting for the pool's own timeout, which refuses it
@@ -578,7 +603,9 @@ async def run_efs_unit(
         with unit_session(scope=scope) as session:
             return fn(session)
 
-    return await _run_on_efs(unit, scope=scope, deadline=deadline, unit_slots=_file_unit_slots(_engine()))
+    database_slots = _file_unit_slots(_engine())
+    unit_slots = () if database_slots is None else (_efs_unit_slots(), database_slots)
+    return await _run_on_efs(unit, scope=scope, deadline=deadline, unit_slots=unit_slots)
 
 
 def loop_limiters() -> dict[str, anyio.CapacityLimiter]:
@@ -588,6 +615,7 @@ def loop_limiters() -> dict[str, anyio.CapacityLimiter]:
         "anyio_default": anyio.to_thread.current_default_thread_limiter(),
         "run_db": _slots(_engine()),
         "run_efs": _efs_slots(),
+        "run_efs_unit": _efs_unit_slots(),
     }
 
 

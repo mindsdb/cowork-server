@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -326,6 +329,73 @@ async def test_an_unexpected_failure_logs_its_type_without_exception_text(
     assert len(records) == 1
     assert records[0].getMessage() == "Session error: error_type=RuntimeError"
     _assert_safe(records)
+
+
+def _recording_close(*, db, monkeypatch, seconds: float = 0.0) -> list[str]:
+    """Make ``db.close`` record where it ran, and take ``seconds`` first."""
+    loop_thread = threading.get_ident()
+    events: list[str] = []
+    real_close = db.close
+
+    def close():
+        events.append("close on the loop" if threading.get_ident() == loop_thread else "close off the loop")
+        time.sleep(seconds)
+        real_close()
+        events.append("closed")
+
+    monkeypatch.setattr(db, "close", close)
+    return events
+
+
+async def test_a_session_that_ran_a_query_closes_off_the_event_loop(database_uri: str, monkeypatch) -> None:
+    """The close rolls the transaction back and checks the connection in,
+    database round trips that would stop every request on a stalled database,
+    so it runs on the units' threads."""
+    generator = db_session.get_session()
+    db = await anext(generator)
+    events = _recording_close(db=db, monkeypatch=monkeypatch)
+    db.execute(sa.text("SELECT 1"))
+
+    await generator.aclose()
+
+    assert events == ["close off the loop", "closed"]
+
+
+async def test_a_session_that_never_ran_a_query_closes_on_the_event_loop(database_uri: str, monkeypatch) -> None:
+    """With no connection to give back the close does no I/O, so it runs
+    inline and takes no thread."""
+    generator = db_session.get_session()
+    db = await anext(generator)
+    events = _recording_close(db=db, monkeypatch=monkeypatch)
+
+    await generator.aclose()
+
+    assert events == ["close on the loop", "closed"]
+
+
+async def test_a_request_cancelled_during_a_slow_close_unwinds_after_the_close(database_uri: str, monkeypatch) -> None:
+    """A Stop or a disconnect that cancels the request while its session
+    closes waits for the close, so the request never unwinds while the
+    connection is still being given back."""
+    generator = db_session.get_session()
+    db = await anext(generator)
+    events = _recording_close(db=db, monkeypatch=monkeypatch, seconds=0.3)
+    db.execute(sa.text("SELECT 1"))
+
+    async def request() -> None:
+        try:
+            await generator.aclose()
+        finally:
+            events.append("unwound")
+
+    task = asyncio.create_task(request())
+    while not events:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == ["close off the loop", "closed", "unwound"]
 
 
 def test_alembic_online_engine_hides_parameters_without_a_supplied_connection(

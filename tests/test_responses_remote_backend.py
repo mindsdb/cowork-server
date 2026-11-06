@@ -802,6 +802,7 @@ def _units_on_the_test_database(monkeypatch, *, scope=None):
 
     turn_scope = scope if scope is not None else LOCAL_SCOPE
     monkeypatch.setattr(responses_mod, "run_db", units.run_db)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", units.run_efs_unit)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: turn_scope)
 
 

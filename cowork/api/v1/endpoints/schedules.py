@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScopeDep
 from cowork.db.units import run_db, run_efs_unit
 from cowork.schemas.schedules import (
     DEFAULT_MODEL_SENTINEL,
@@ -51,7 +50,7 @@ def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=ScheduleResponse)
-async def create_schedule(body: ScheduleCreateRequest, scope: Annotated[TenantScope, Depends(get_tenant_scope)]):
+async def create_schedule(body: ScheduleCreateRequest, scope: TenantScopeDep):
     # A schedule with no project runs in the caller's default project, which
     # checks the general project's folder on the file store.
     unit = run_db if body.project_id is not None else run_efs_unit

@@ -1,16 +1,16 @@
 from functools import partial
-from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScopeDep
 from cowork.db.units import run_db, run_efs_unit
 from cowork.models.project import Project
 from cowork.schemas.conversations import (
     ConversationCreateRequest,
     ConversationListItem,
+    ConversationListResponse,
     ConversationMoveRequest,
     ConversationUpdateRequest,
 )
@@ -23,7 +23,6 @@ from cowork.services.task_objects import TaskObjectService
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
-ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 # A route below that works on the file store runs that work as one unit on the
 # file store's threads (run_efs_unit), never on anyio's default threads. A
@@ -34,12 +33,12 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 # run_db unit.
 
 
-def _serialize_conversation(c, updated_at=None):
+def _serialize_conversation(c, updated_at=None) -> ConversationListItem:
     # `updated_at` is the conversation's last-activity time, derived from its
     # messages (ENG-961) — the stored `modified_at` only moves on rename/move,
     # so it can't be trusted as "recent". Callers pass the derived value;
     # falling back to `created_at` keeps a message-less conversation stable.
-    return ConversationListItem.serialize({
+    return ConversationListItem.model_validate({
         "id": c.id,
         "title": c.topic,
         "preview": c.topic,
@@ -53,9 +52,9 @@ def _serialize_conversation(c, updated_at=None):
     })
 
 
-@router.get("/")
+@router.get("/", response_model=ConversationListResponse)
 async def list_conversations(
-    scope: ScopeDep,
+    scope: TenantScopeDep,
     project_id: UUID | None = None,
     project: str | None = None,
     limit: int = 50,
@@ -68,7 +67,7 @@ async def list_conversations(
 
 def _list_conversations(
     scoped: ScopedSession, *, project_id: UUID | None, project: str | None, limit: int
-) -> dict:
+) -> ConversationListResponse:
     all_projects = project == "all"
     resolved_project_id = project_id
     if not all_projects and resolved_project_id is None and project:
@@ -79,16 +78,18 @@ def _list_conversations(
     convs = ConversationService(scoped).list_conversations_with_activity(
         project_id=resolved_project_id, limit=limit, all_projects=all_projects,
     )
-    return {"conversations": [_serialize_conversation(c, updated_at=activity) for c, activity in convs]}
+    return ConversationListResponse(
+        conversations=[_serialize_conversation(c, updated_at=activity) for c, activity in convs]
+    )
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
-async def create_conversation(body: ConversationCreateRequest, scope: ScopeDep):
+@router.post("/", status_code=status.HTTP_201_CREATED, response_model=ConversationListItem)
+async def create_conversation(body: ConversationCreateRequest, scope: TenantScopeDep):
     unit = run_db if body.project_id is not None else run_efs_unit
     return await unit(partial(_create_conversation, body=body), scope=scope)
 
 
-def _create_conversation(scoped: ScopedSession, *, body: ConversationCreateRequest) -> dict:
+def _create_conversation(scoped: ScopedSession, *, body: ConversationCreateRequest) -> ConversationListItem:
     svc = ConversationService(scoped)
     project_id = body.project_id
     if project_id is None and body.project:
@@ -119,8 +120,8 @@ def get_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
     return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
 
 
-@router.patch("/{conversation_id}")
-async def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, scope: ScopeDep):
+@router.patch("/{conversation_id}", response_model=ConversationListItem)
+async def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, scope: TenantScopeDep):
     # A project named by name may be the general one, provisioned on first use.
     unit = run_efs_unit if body.project_id is None and body.project else run_db
     return await unit(partial(_update_conversation, conversation_id=conversation_id, body=body), scope=scope)
@@ -128,7 +129,7 @@ async def update_conversation(conversation_id: UUID, body: ConversationUpdateReq
 
 def _update_conversation(
     scoped: ScopedSession, *, conversation_id: UUID, body: ConversationUpdateRequest
-) -> dict:
+) -> ConversationListItem:
     svc = ConversationService(scoped)
     project_id = body.project_id
     if project_id is None and body.project:
@@ -145,8 +146,8 @@ def _update_conversation(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{conversation_id}/move")
-async def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, scope: ScopeDep):
+@router.post("/{conversation_id}/move", response_model=ConversationListItem)
+async def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, scope: TenantScopeDep):
     """Move a task to another project. With `move_objects` (default), the
     artifacts the task created are relocated into the destination project;
     otherwise only the task's project pointer changes. Attachment files
@@ -157,7 +158,9 @@ async def move_conversation(conversation_id: UUID, body: ConversationMoveRequest
     return await run_efs_unit(partial(_move_conversation, conversation_id=conversation_id, body=body), scope=scope)
 
 
-def _move_conversation(scoped: ScopedSession, *, conversation_id: UUID, body: ConversationMoveRequest) -> dict:
+def _move_conversation(
+    scoped: ScopedSession, *, conversation_id: UUID, body: ConversationMoveRequest
+) -> ConversationListItem:
     svc = ConversationService(scoped)
     try:
         conversation = svc.get_conversation(conversation_id)
@@ -208,7 +211,7 @@ def get_messages(
 
 
 @router.delete("/{conversation_id}")
-async def delete_conversation(conversation_id: UUID, scope: ScopeDep):
+async def delete_conversation(conversation_id: UUID, scope: TenantScopeDep):
     found = await run_efs_unit(
         lambda session: ConversationService(session).delete_conversation(conversation_id), scope=scope
     )
@@ -218,7 +221,7 @@ async def delete_conversation(conversation_id: UUID, scope: ScopeDep):
 
 
 @router.delete("/{conversation_id}/turns/{message_id}")
-async def delete_conversation_turn(conversation_id: UUID, message_id: UUID, scope: ScopeDep):
+async def delete_conversation_turn(conversation_id: UUID, message_id: UUID, scope: TenantScopeDep):
     """Delete a turn (user+assistant exchange) and everything after it.
 
     message_id anchors the turn: the visible assistant message it produced,

@@ -5,7 +5,6 @@ import os
 import stat
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Iterator, Literal, NamedTuple
 from uuid import UUID
@@ -22,7 +21,6 @@ from pydantic import (
 from cowork.common.paths import dir_lstat, dir_rmtree, dir_unlink, opened_subdir_nofollow, pinned_dir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.units import run_efs
 from cowork.db.scoped import (
     ScopedSession,
     TenantScope,
@@ -708,14 +706,6 @@ class MemoryService:
         # Org mode → per-(org, user); the store keys itself (see GlobalMemoryStore).
         self._global_store = GlobalMemoryStore(scope=session.scope)
 
-    async def get_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        project_id: UUID | None = None,
-    ) -> MemoryResponse:
-        return await self._off_the_loop(self.get_memory_sync, scope, category, project_id)
-
     def get_memory_sync(
         self,
         scope: MemoryScope,
@@ -734,15 +724,6 @@ class MemoryService:
             read_verified=state.readable,
         )
 
-    async def update_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        content: str,
-        project_id: UUID | None = None,
-    ) -> MemoryResponse:
-        return await self._off_the_loop(self.update_memory_sync, scope, category, content, project_id)
-
     def update_memory_sync(
         self,
         scope: MemoryScope,
@@ -755,14 +736,6 @@ class MemoryService:
         self._refuse_while_memory_off(refused="Changing it is refused.")
         self._write(scope, category, content, project_id)
         return self._response(scope, category, content, project_id)
-
-    async def delete_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        project_id: UUID | None = None,
-    ) -> None:
-        await self._off_the_loop(self.delete_memory_sync, scope, category, project_id)
 
     def delete_memory_sync(
         self,
@@ -789,14 +762,6 @@ class MemoryService:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=OWN_RESET_REFUSED)
         self._refuse_while_memory_off(refused="Resetting it is refused.")
         return reset_person_memory(self.session.scope)
-
-    async def list_memory(self, project_id: UUID | None = None) -> list[MemoryResponse]:
-        return await self._off_the_loop(self.list_memory_sync, project_id)
-
-    async def _off_the_loop(self, method, *args):
-        """Run a sync method on the file store's threads: each one reads the
-        project row and the memory files."""
-        return await run_efs(partial(method, *args), scope=self.session.scope)
 
     def list_memory_sync(
         self,

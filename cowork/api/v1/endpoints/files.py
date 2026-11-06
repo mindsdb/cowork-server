@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.api.v1.efs_file_response import EfsFileResponse
-from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
-from cowork.db.units import run_efs_unit
+from cowork.db.scoped import ScopedSessionDep, TenantScopeDep
+from cowork.db.units import run_db, run_efs_unit
 from cowork.schemas.files import FileListResponse, FileResponse
 from cowork.services.files import FileService, file_response, save_upload
 
@@ -23,7 +23,7 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def upload_file(
     file: UploadFile,
     purpose: Annotated[str, Form()],
-    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+    scope: TenantScopeDep,
 ):
     # The "attachment:" namespace is server-owned: conversation attachments
     # are tagged "attachment:{conversation_id}" by the compat routes, and the
@@ -54,7 +54,7 @@ def retrieve_file(file_id: UUID, scoped: ScopedSessionDep):
 
 
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_file(file_id: UUID, scope: Annotated[TenantScope, Depends(get_tenant_scope)]):
+async def delete_file(file_id: UUID, scope: TenantScopeDep):
     # The row and the stored bytes go together, on the file store's threads.
     found = await run_efs_unit(lambda session: FileService(session).delete_file(file_id), scope=scope)
     if not found:
@@ -62,11 +62,11 @@ async def delete_file(file_id: UUID, scope: Annotated[TenantScope, Depends(get_t
 
 
 @router.get("/{file_id}/content")
-async def retrieve_file_content(file_id: UUID, scope: Annotated[TenantScope, Depends(get_tenant_scope)]):
+async def retrieve_file_content(file_id: UUID, scope: TenantScopeDep):
+    # The row only: the response opens the file itself on the file store's
+    # threads, and answers 404 when its bytes are gone.
     try:
-        content_type, filename, path = await run_efs_unit(
-            lambda session: FileService(session).get_file_content(file_id), scope=scope
-        )
+        stored = await run_db(lambda session: FileService(session).stored_file(file_id=file_id), scope=scope)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return EfsFileResponse(path, scope=scope, media_type=content_type, filename=filename)
+    return EfsFileResponse(stored.path, scope=scope, media_type=stored.content_type, filename=stored.filename)

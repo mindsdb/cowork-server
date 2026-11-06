@@ -275,6 +275,39 @@ async def test_a_file_unit_queued_on_a_stuck_file_store_holds_no_database_slot(f
     assert all(isinstance(outcome, FilesystemBusy) for outcome in outcomes)
 
 
+async def test_file_units_at_their_cap_leave_a_database_unit_its_slot(monkeypatch):
+    """Three database unit slots, as Postgres's pool would give, and file
+    units capped at two (EFS_UNIT_SLOTS). Two file units stuck on the file
+    store hold their cap, and a third waits on the cap rather than for the
+    last unit slot, so a database unit still gets that slot and answers.
+    Without the cap the third took it."""
+    monkeypatch.setattr(db_session.settings.database, "efs_unit_slots", 2)
+    slots = anyio.CapacityLimiter(3)
+    monkeypatch.setattr(units, "_slots", lambda _engine: slots)
+    monkeypatch.setattr(units, "_file_unit_slots", lambda _engine: slots)
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    def stuck(session):
+        started.release()
+        release.wait(timeout=30)
+        return "file"
+
+    files = [asyncio.create_task(units.run_efs_unit(stuck, scope=LOCAL_SCOPE)) for _ in range(3)]
+    try:
+        for _ in range(2):
+            assert await asyncio.to_thread(started.acquire, True, 5), "a file unit never started"
+        await asyncio.sleep(0.1)
+        waiting_on_the_cap = units._efs_unit_slots().statistics().tasks_waiting
+        answered = await asyncio.wait_for(run_db(lambda session: "database", scope=LOCAL_SCOPE), timeout=0.5)
+    finally:
+        release.set()
+        await asyncio.gather(*files, return_exceptions=True)
+
+    assert waiting_on_the_cap == 1
+    assert answered == "database"
+
+
 @pytest.mark.parametrize("cancel", ["anyio scope", "two native cancels"])
 async def test_a_release_step_runs_on_the_file_store_threads_when_its_caller_is_cancelled(cancel):
     """A ``finally`` that closes a file through ``run_efs_cleanup`` still

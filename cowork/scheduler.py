@@ -571,13 +571,17 @@ def _delete_unstarted_conversation(
 ) -> None:
     """Delete the conversation _link_conversation made for a run whose turn
     never started, so it is not left empty in its owner's list. Under the
-    schedule's own scope, as it was created."""
+    schedule's own scope, as it was created.
+
+    Rows only: create_conversation makes no folder for it and the run attached
+    nothing, and this runs in a database unit, where a call to a stalled file
+    store would hold its connection and unit slot with no time limit."""
     from cowork.services.conversations import ConversationService
 
     conv_session = ScopedSession(
         unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
     )
-    ConversationService(conv_session).delete_conversation(conversation_id)
+    ConversationService(conv_session).delete_conversation(conversation_id, cleanup_project_files=False)
 
 
 async def _discard_unstarted_conversation(

@@ -89,3 +89,22 @@ def test_alias_supports_the_full_request_lifecycle(client):
     deleted = client.delete(f"/api/v1/tasks/{task_id}")
     assert deleted.status_code in (200, 204)
     assert client.get(f"/api/v1/tasks/{task_id}").status_code == 404
+
+
+def test_every_conversation_route_sends_its_timestamps_as_isoformat(client):
+    """The routes that name a response model send each timestamp as a route
+    that returns a plain dict does, Python's isoformat ("+00:00"), not
+    pydantic's "Z": a client that compares them as text sees one format."""
+    created = client.post(
+        "/api/v1/conversations/", json={"topic": "times", "project_id": client.project_id}
+    ).json()
+    listed = next(
+        c for c in client.get("/api/v1/conversations/", params={"project": "all"}).json()["conversations"]
+        if c["id"] == created["id"]
+    )
+    renamed = client.patch(f"/api/v1/conversations/{created['id']}", json={"title": "renamed"}).json()
+
+    for answer in (created, listed, renamed):
+        assert answer["createdAt"] == created["createdAt"]
+        assert answer["createdAt"].endswith("+00:00"), answer["createdAt"]
+        assert answer["updatedAt"].endswith("+00:00"), answer["updatedAt"]

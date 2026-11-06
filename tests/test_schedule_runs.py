@@ -16,6 +16,9 @@ from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 
+#: The member a schedule in an organization belongs to (_execute_with_terminal).
+ORG_SCHEDULE_OWNER = "u-schedule-owner"
+
 
 def _session():
     engine = create_engine("sqlite:///:memory:")
@@ -678,20 +681,25 @@ def test_turn_terminal_reason_none_without_handle(monkeypatch):
 
 
 def _execute_with_terminal(
-    monkeypatch, reason, *, is_manual=False, turn=None, title="terminal mapping test", refusal=None
+    monkeypatch, reason, *, is_manual=False, turn=None, title="terminal mapping test", refusal=None, org_id=None,
 ):
     """Run execute_schedule with a no-op turn and a forced terminal reason;
     return the resulting run/schedule state as plain values. ``turn``, when
     given, is awaited inside the turn's stream in place of the no-op.
     ``refusal``, when given, is raised by the handler before it returns the
-    turn's stream, as ResponsesHandler.handle refuses a turn at its start."""
+    turn's stream, as ResponsesHandler.handle refuses a turn at its start.
+    ``org_id``, when given, runs a schedule ORG_SCHEDULE_OWNER made in that
+    organization's own project, as org tenancy needs; the caller sets the
+    tenancy."""
     import asyncio
 
     import cowork.handlers.responses as responses_mod
     import cowork.scheduler as scheduler_mod
     from cowork.common.datetime_utils import ensure_utc
+    from cowork.db.scoped import TenantScope
     from cowork.db.session import get_open_session
     from cowork.scheduler import execute_schedule
+    from cowork.services.projects import projects_root
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
@@ -718,6 +726,17 @@ def _execute_with_terminal(
     monkeypatch.setattr(scheduler_mod, "_turn_terminal_reason", _terminal)
 
     session = get_open_session()
+    project_id = GENERAL_PROJECT_ID
+    org_project_id = None
+    if org_id is not None:
+        # SYSTEM_SCOPE never stamps or filters, so it plants the rows an org
+        # member's own requests would have made.
+        owner_scope = TenantScope(org_mode=True, org_id=org_id, user_id=ORG_SCHEDULE_OWNER)
+        path = projects_root(scope=owner_scope) / "scheduled"
+        project = Project(name="scheduled", path=str(path), org_id=org_id)
+        ScopedSession(session, SYSTEM_SCOPE).add(project)
+        session.commit()
+        project_id = org_project_id = project.id
     schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
         title=title,
         prompt="do the thing",
@@ -725,9 +744,13 @@ def _execute_with_terminal(
         next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
         model="default",
         timezone="UTC",
-        project_id=GENERAL_PROJECT_ID,
+        project_id=project_id,
         enabled=True,
     )
+    if org_id is not None:
+        schedule.org_id, schedule.created_by = org_id, ORG_SCHEDULE_OWNER
+        ScopedSession(session, SYSTEM_SCOPE).add(schedule)
+        session.commit()
     schedule_id = schedule.id
     original_next = ensure_utc(schedule.next_run_at)
     session.close()
@@ -752,6 +775,11 @@ def _execute_with_terminal(
     finally:
         s = get_open_session()
         ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        if org_project_id is not None:
+            project_row = ScopedSession(s, SYSTEM_SCOPE).get(Project, org_project_id)
+            if project_row is not None:
+                s.delete(project_row)
+                s.commit()
         s.close()
 
 
@@ -971,18 +999,34 @@ def test_pool_timeout_before_the_turn_keeps_the_slot_due(monkeypatch):
     assert state["next_advanced"] is False
 
 
+@pytest.mark.parametrize("tenancy", ["local", "org"])
 @pytest.mark.parametrize("busy", ["file store", "database"])
-def test_a_busy_refusal_at_the_turns_start_keeps_the_slot_due_and_no_empty_conversation(monkeypatch, busy):
+def test_a_busy_refusal_at_the_turns_start_keeps_the_slot_due_and_no_empty_conversation(monkeypatch, request, busy, tenancy):
     """The handler refuses before it starts the turn's producer: its vault
     restore finds no file store slot, or its turn start's read finds the pool
     full. The agent has done nothing, so the occurrence stays due for the next
     poll, and the conversation the run made for the turn is deleted rather
-    than left empty in the owner's list, since the next poll makes its own."""
+    than left empty in the owner's list, since the next poll makes its own.
+
+    The delete runs in a database unit, so it removes rows only: the run made
+    no folder for the conversation, and in org tenancy, where those folders
+    sit on the shared file store, a call there would hold the unit's
+    connection while the store that just refused the run stays slow."""
     import cowork.scheduler as scheduler_mod
+    import cowork.services.conversations as conversations_mod
+    import cowork.services.files as files_mod
     from cowork.db.session import get_open_session
     from cowork.db.units import DatabaseBusy, FilesystemBusy
     from cowork.services.conversations import ConversationService
 
+    org_id = None
+    if tenancy == "org":
+        request.getfixturevalue("org_deployment")
+        request.getfixturevalue("granted_product_permissions")
+        # As the hosted chart sets it: turn buffers live in Redis there, not
+        # under COWORK_HOME, so their discard is no file store work.
+        monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+        org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c9"
     linked: list = []
     real_link = scheduler_mod._link_conversation
 
@@ -990,14 +1034,22 @@ def test_a_busy_refusal_at_the_turns_start_keeps_the_slot_due_and_no_empty_conve
         linked.append(real_link(*args, **kwargs))
         return linked[-1]
 
+    folder_removals: list[str] = []
     monkeypatch.setattr(scheduler_mod, "_link_conversation", recorded_link)
+    monkeypatch.setattr(
+        conversations_mod, "remove_conversation_sessions", lambda *_a: folder_removals.append("sessions")
+    )
+    monkeypatch.setattr(
+        files_mod, "remove_conversation_workspace_dir", lambda *_a: folder_removals.append("workspace")
+    )
     refusal = FilesystemBusy("no file store slot") if busy == "file store" else DatabaseBusy("no unit slot")
-    state = _execute_with_terminal(monkeypatch, None, refusal=refusal)
+    state = _execute_with_terminal(monkeypatch, None, refusal=refusal, org_id=org_id)
 
     assert state["run_status"] == RunStatus.failed
     assert state["next_advanced"] is False
     assert state["run_conversation_id"] is None
     assert len(linked) == 1
+    assert folder_removals == []
     session = get_open_session()
     try:
         with pytest.raises(ValueError):

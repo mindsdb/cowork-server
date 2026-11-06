@@ -6,7 +6,7 @@ rule names (``org_allowed``, ``allowed_team_ids``, ``allowed_user_ids``),
 plus ``always_on``: only its owner (a new skill's row), people by user id,
 teams, or everyone at the org. A skill from before sharing gets a row
 shared with everyone once, owned by its attribution's creator, the first
-time its org's rows are read; a folder with no row after that is its
+time SkillService reads its org's rows; a folder with no row after that is its
 recorded creator's alone, or nobody's with none. Skills shared with
 everyone or a team are recalled on demand like any other unless marked
 always on, which puts them in every turn's prompt of the org or the team
@@ -1968,7 +1968,7 @@ def test_local_deployments_are_unchanged(monkeypatch, tmp_path):
             "desk": TurnSkillEntry(files={"SKILL.md": (service.root / "desk" / "SKILL.md").read_text()})
         }
         # Nothing to ask outside MindsHub mode, so nothing is unknown.
-        assert sharing_ep.skill_sharing_capabilities(None) == {
+        assert asyncio.run(sharing_ep.skill_sharing_capabilities(None)) == {
             "enabled": False, "canShareSkillsOrg": False, "canWriteSkillsOrg": False,
             "canShareArtifactsOrg": False, "permissionsKnown": True, "teamsKnown": True,
         }
@@ -1977,15 +1977,15 @@ def test_local_deployments_are_unchanged(monkeypatch, tmp_path):
 
 
 def test_sharing_capabilities_report_the_viewer():
-    assert sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_org=True)) == {
+    assert asyncio.run(sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_org=True))) == {
         "enabled": True, "canShareSkillsOrg": True, "canWriteSkillsOrg": False,
         "canShareArtifactsOrg": False, "permissionsKnown": True, "teamsKnown": True,
     }
-    admin = sharing_ep.skill_sharing_capabilities(_viewer(ADMIN, admin=True))
+    admin = asyncio.run(sharing_ep.skill_sharing_capabilities(_viewer(ADMIN, admin=True)))
     assert (admin["canShareSkillsOrg"], admin["canWriteSkillsOrg"], admin["canShareArtifactsOrg"]) == (
         True, True, True,
     )
-    artifacts_only = sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_artifacts_org=True))
+    artifacts_only = asyncio.run(sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_artifacts_org=True)))
     assert (artifacts_only["canShareSkillsOrg"], artifacts_only["canShareArtifactsOrg"]) == (False, True)
 
 
@@ -1996,13 +1996,13 @@ def test_sharing_capabilities_say_when_mindshub_could_not_be_asked(monkeypatch):
     mindshub_sharing_answers(monkeypatch, teams=None, permissions=None)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
     viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token=MEMBER_BEARER))
-    answer = sharing_ep.skill_sharing_capabilities(viewer)
+    answer = asyncio.run(sharing_ep.skill_sharing_capabilities(viewer))
     assert (answer["enabled"], answer["canShareSkillsOrg"], answer["permissionsKnown"], answer["teamsKnown"]) == (
         True, False, False, False,
     )
     mindshub_sharing_answers(monkeypatch, permissions=("skills.share_org",))
     viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token=MEMBER_BEARER))
-    answer = sharing_ep.skill_sharing_capabilities(viewer)
+    answer = asyncio.run(sharing_ep.skill_sharing_capabilities(viewer))
     assert (answer["canShareSkillsOrg"], answer["permissionsKnown"], answer["teamsKnown"]) == (True, True, True)
     mindshub_teams.reset_caches_for_tests()
 
@@ -2103,7 +2103,7 @@ def test_the_route_lookup_asks_mindshub_by_id(monkeypatch):
         return {"results": [{"id": BOB.upper(), "name": "Bob", "email": "bob@x.com"}]}
 
     monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
-    lookup = get_org_member_lookup(member_request())
+    lookup = asyncio.run(get_org_member_lookup(member_request()))
     assert asyncio.run(lookup([BOB, EVE])) == frozenset({BOB})
     # With the gateway's credential, never the client-set one.
     assert calls == [(f"/me/org-members/?ids={BOB}%2C{EVE}", MEMBER_BEARER)]

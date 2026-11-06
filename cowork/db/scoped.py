@@ -32,7 +32,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import sqlalchemy as sa
-from fastapi import Depends, Request
+from fastapi import Depends
 from sqlalchemy import event, inspect
 from sqlalchemy.sql import Select
 from sqlmodel import Session, select
@@ -40,7 +40,7 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import MODEL_RESOURCE, STORE_RESOURCE, PersonalResource
 from cowork.db.session import get_session
-from cowork.principal import Principal
+from cowork.principal import Principal, get_principal
 
 
 class MissingTenantScopeError(RuntimeError):
@@ -146,10 +146,14 @@ def scope_for_org(org_id: str | None) -> TenantScope:
     return LOCAL_SCOPE if org_id is None else scope_for_identity(org_id=org_id, user_id=None)
 
 
-async def get_tenant_scope(request: Request) -> TenantScope:
-    """FastAPI dependency: the request's tenant scope. A coroutine for the
-    reason get_principal is one."""
-    return scope_from_principal(getattr(request.state, "principal", None))
+async def get_tenant_scope(principal: Principal | None = Depends(get_principal)) -> TenantScope:
+    """FastAPI dependency: the request's tenant scope, built from the principal
+    ``get_principal`` gives, so the scope and the authorization checks read one
+    identity. A coroutine for the reason get_principal is one."""
+    return scope_from_principal(principal)
+
+
+TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 def scope_for_background_context() -> TenantScope:

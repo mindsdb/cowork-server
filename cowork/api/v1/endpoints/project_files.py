@@ -40,6 +40,7 @@ from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
 from cowork.common.paths import (
     O_NOFOLLOW,
+    O_NONBLOCK,
     PinnedDir,
     dir_lstat,
     dir_mkdir,
@@ -73,6 +74,8 @@ from cowork.schemas.project_files import (
     ProjectFileReadResponse,
     ProjectFileWriteResponse,
     ProjectInstructionsResponse,
+    ProjectUploadResponse,
+    ProjectUploadResult,
 )
 from cowork.schemas.shared_resources import MutableResourceCapabilities
 from cowork.schemas.sharepoint import (
@@ -822,11 +825,16 @@ def _pinned_fd(target: Path, base: Path, flags: int) -> Iterator[int]:
 
     A planted link raises `OSError` (ELOOP), which callers map to the same 404 a
     genuine miss returns rather than letting it surface as a 500.
+
+    The open never waits: `O_NONBLOCK` returns at once on a FIFO a pod made at
+    the path, which no writer on this node would ever open, so the caller's
+    file type check refuses it rather than the open holding its thread for
+    good. A regular file ignores the flag.
     """
     rel = target.relative_to(base.resolve())
     *dirs, name = rel.parts
     with opened_subdir_nofollow(base, *dirs) as pinned:
-        fd = dir_open(pinned, name, flags | O_NOFOLLOW)
+        fd = dir_open(pinned, name, flags | O_NOFOLLOW | O_NONBLOCK)
         try:
             yield fd
         finally:
@@ -1879,7 +1887,9 @@ def _write_project_file(
     return response
 
 
-@router.post("/{project_name}/files/upload")
+# Unset fields stay out of each result: a written file has no error, a refused
+# one no size.
+@router.post("/{project_name}/files/upload", response_model=ProjectUploadResponse, response_model_exclude_unset=True)
 async def upload_project_files(
     project_name: str,
     scope: ScopeDep,
@@ -1892,8 +1902,8 @@ async def upload_project_files(
     return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
 
 
-def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[UploadFile]) -> dict[str, Any]:
-    results: list[dict[str, Any]] = []
+def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[UploadFile]) -> ProjectUploadResponse:
+    results: list[ProjectUploadResult] = []
     with _opened_project_directory_inventory(scoped) as inventory:
         selected_project_name = os.path.basename(project_name)
         if (
@@ -1917,26 +1927,22 @@ def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[Up
 
         for upload in uploads:
             if not upload.filename:
-                results.append({"name": "", "ok": False, "error": "filename missing"})
+                results.append(ProjectUploadResult(name="", ok=False, error="filename missing"))
                 continue
             safe_name = os.path.basename(upload.filename).strip()
             if not safe_name or safe_name.startswith("."):
-                results.append(
-                    {"name": upload.filename, "ok": False, "error": "invalid filename"}
-                )
+                results.append(ProjectUploadResult(name=upload.filename, ok=False, error="invalid filename"))
                 continue
             try:
                 data = upload.file.read()
                 _write_bytes_at_project_root(
                     directory, _ValidatedProjectPath((safe_name,)), data
                 )
-                results.append({"name": safe_name, "ok": True, "size": len(data)})
+                results.append(ProjectUploadResult(name=safe_name, ok=True, size=len(data)))
             except Exception as exc:
                 logger.error("Failed to write file %s: %s", safe_name, exc)
-                results.append(
-                    {"name": safe_name, "ok": False, "error": "File write failed"}
-                )
-    return {"results": results}
+                results.append(ProjectUploadResult(name=safe_name, ok=False, error="File write failed"))
+    return ProjectUploadResponse(results=results)
 
 
 _SHAREPOINT_IMPORT_FIELDS = frozenset({"connection", "site", "drive_id", "folder", "item_ids"})

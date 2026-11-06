@@ -203,24 +203,6 @@ ALLOWLIST: tuple[Allowed, ...] = (
     Allowed('cowork/api/v1/endpoints/settings.py', 'write_raw_settings', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (LoopbackDesktopOnly)'),
     Allowed('cowork/services/providers.py', 'warm_enabled_model_map', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only: the boot warm and POST /api/v1/settings/raw, which org tenancy skips and refuses'),
     Allowed('cowork/services/artifacts.py', 'mount_preview', LOOP_FILE_STORE, (ANY_LEAF,), 'desktop only (DesktopOnly on POST /api/v1/artifacts/preview-mount)'),
-    Allowed('cowork/api/v1/endpoints/projects.py', '_list_projects', THREAD_FILE_STORE, (
-        'cowork/services/projects.py:ProjectService._in_scoped_root',
-        'cowork/services/projects.py:ProjectService._mkdir_in_root',
-        'cowork/services/projects.py:ProjectService._project_path',
-        'cowork/services/projects.py:ProjectService._root_fd',
-        'cowork/services/projects.py:ProjectService.ensure_dir_exists',
-    ), "a run_db unit that checks the general project's folder; file store slots held by stuck artifact lookups must not refuse the project list"),
-    Allowed('cowork/channels/runtime.py', 'AntonChannelRuntime._resolve_or_create_binding', THREAD_FILE_STORE, (
-        'cowork/services/projects.py:ProjectService._in_scoped_root',
-        'cowork/services/projects.py:ProjectService._mkdir_in_root',
-        'cowork/services/projects.py:ProjectService._project_path',
-        'cowork/services/projects.py:ProjectService._root_fd',
-        'cowork/services/projects.py:ProjectService.ensure_dir_exists',
-    ), "a run_db unit that checks the general project's folder, once per new channel thread"),
-    Allowed('cowork/handlers/responses.py', 'ResponsesHandler._read_turn_start', THREAD_FILE_STORE, (
-        'cowork/services/projects.py:ProjectService._in_scoped_root',
-        'cowork/services/projects.py:ProjectService.ensure_dir_exists',
-    ), "a run_db unit that checks the general project's folder when a turn starts a conversation with no project; a turn with attachments runs it on run_efs"),
     Allowed('cowork/services/publish.py', 'publish_artifact', THREAD_FILE_STORE, (ANY_LEAF,), "the three publish uploads (live sync, publish after an access change, autopublish) run it on the loop's default executor threads through asyncio.to_thread: mostly network time, and a burst of turn-end uploads must not take the file store slots (EFS_SLOTS)"),
 )
 

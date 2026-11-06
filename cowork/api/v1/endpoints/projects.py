@@ -3,13 +3,12 @@ from collections.abc import Mapping
 from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
-from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
+from cowork.db.scoped import ScopedSession, TenantScopeDep
 from cowork.db.units import run_db, run_efs_unit
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import PROJECT_SLOTS, ProjectMemoryStore
@@ -52,8 +51,6 @@ from cowork.services.shared_projects import SharedProjectFiles
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
-
-ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 def _project_memory_slot_has_content(
@@ -266,24 +263,36 @@ def _project_response(
 
 @router.get("/", response_model=list[ProjectResponse])
 async def list_projects(
-    scope: ScopeDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    # A database unit, not a file store one: the listing is rows plus one
-    # check of the general project's folder, and file store slots held by
-    # stuck artifact lookups must not refuse it.
-    return await run_db(partial(_list_projects, principal=principal), scope=scope)
+    # In org tenancy, once the org's general row exists, the listing reads rows
+    # only: a database unit, which file store slots held by stuck artifact
+    # lookups cannot refuse, and which a stuck mount cannot hold. The org's
+    # first listing makes the general folder, which is file store work.
+    listed = await run_db(partial(_list_projects, principal=principal), scope=scope)
+    if listed is None:
+        listed = await run_efs_unit(partial(_list_projects, principal=principal, provision=True), scope=scope)
+    return listed
 
 
 def _list_projects(
     session: ScopedSession,
     *,
     principal: Principal | None,
-):
+    provision: bool = False,
+) -> list[dict | ProjectResponse] | None:
+    # None in org tenancy when the org has no general project yet and
+    # `provision` is off: making it is file store work, which a database unit
+    # must not do. Outside org tenancy the general project's folder is on a
+    # local disk, so it is checked here as before.
     service = ProjectService(session)
-    # Bootstrap site: adopt the seeded GENERAL project into this org before
-    # the first listing (no-op in local mode / once claimed).
-    service.ensure_general_for_scope()
+    if provision or not session.scope.org_mode:
+        # Bootstrap site: adopt the seeded GENERAL project into this org before
+        # the first listing (no-op in local mode / once claimed).
+        service.ensure_general_for_scope()
+    elif service.get_project_by_name_or_none(GENERAL_PROJECT) is None:
+        return None
     access = SharedResourceAccess(session, principal)
     projects = service.list_visible_projects()
     # Read after the projects: create_project commits its claim
@@ -307,7 +316,7 @@ def _is_loopback_address(host: str | None) -> bool:
         return False
 
 
-def require_local_for_chosen_folder(
+async def require_local_for_chosen_folder(
     body: ProjectCreateRequest, request: Request
 ) -> None:
     """A caller-chosen project folder is only accepted over loopback.
@@ -349,7 +358,7 @@ def require_local_for_chosen_folder(
 )
 async def create_project(
     body: ProjectCreateRequest,
-    scope: ScopeDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
     return await run_efs_unit(partial(_create_project, body=body, principal=principal), scope=scope)
@@ -429,7 +438,7 @@ def _create_project(
 async def update_project(
     project_id: UUID,
     body: ProjectUpdateRequest,
-    scope: ScopeDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
     return await run_efs_unit(
@@ -683,7 +692,7 @@ def _update_project(
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_project(
     project_id: UUID,
-    scope: ScopeDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
     return await run_efs_unit(partial(_delete_project, project_id=project_id, principal=principal), scope=scope)

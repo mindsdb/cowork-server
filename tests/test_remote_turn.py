@@ -68,8 +68,9 @@ def _fake_handler(
         monkeypatch.setattr(responses_mod.ResponsesHandler, name, staticmethod(read))
     # The pod's memory and compaction go through the helpers the browser
     # producer shares (save_turn_memory, save_turn_compaction), which run
-    # their units with cowork.handlers.responses's own run_db.
+    # their units with cowork.handlers.responses's own run_efs_unit and run_db.
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeSession()))
+    monkeypatch.setattr(responses_mod, "run_efs_unit", inline_run_db(_FakeSession()))
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_persist_turn_memory", staticmethod(persist_turn_memory or _no_memory),
     )
@@ -486,15 +487,21 @@ async def test_an_org_channel_turn_saves_no_memory_and_says_so_at_info(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("kind", "data"),
+    ("kind", "data", "warning"),
     [
-        ("turn_memory", {"entries": [{"key": "likes", "value": "pizza"}]}),
-        ("turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}),
+        (
+            "turn_memory", {"entries": [{"key": "likes", "value": "pizza"}]},
+            "[responses] no database connection or file store slot freed in time to apply a turn's memory",
+        ),
+        (
+            "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1},
+            "[responses] no database connection freed in time to save a turn's compaction",
+        ),
     ],
     ids=["memory", "compaction"],
 )
 async def test_a_busy_pool_on_a_memory_or_compaction_frame_keeps_the_channel_turn(
-    monkeypatch, controller_flags, one_connection_pool, caplog, kind, data,
+    monkeypatch, controller_flags, one_connection_pool, caplog, kind, data, warning,
 ):
     """The pod sends a memory or a compaction frame while the pool frees no
     connection within POOL_TIMEOUT. The write is dropped with one WARNING,
@@ -506,8 +513,10 @@ async def test_a_busy_pool_on_a_memory_or_compaction_frame_keeps_the_channel_tur
     from cowork.db.scoped import LOCAL_SCOPE
 
     _fake_handler(monkeypatch)
-    # The write's unit waits for the app's pool, which the test holds.
+    # The write's unit waits for the app's pool, which the test holds: the
+    # memory's on the file store's threads, the compaction's on run_db's.
     monkeypatch.setattr(responses_mod, "run_db", units.run_db)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", units.run_efs_unit)
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "before "}
@@ -529,7 +538,7 @@ async def test_a_busy_pool_on_a_memory_or_compaction_frame_keeps_the_channel_tur
     assert await controller_flags.keys("*") == []
     warned = [r for r in caplog.records if r.name == responses_mod.logger.name and r.levelno >= logging.WARNING]
     assert [r.levelname for r in warned] == ["WARNING"]
-    assert warned[0].getMessage().startswith("[responses] no database connection freed in time")
+    assert warned[0].getMessage() == warning
     assert warned[0].conversation_id == str(conv_id)
 
 

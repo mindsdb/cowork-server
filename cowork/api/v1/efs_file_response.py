@@ -10,20 +10,28 @@ requests are answered the way Starlette answers them.
 
 The open and its ``fstat`` run in one call before any header goes out, so a
 busy file store refuses the download there with ``FilesystemBusy``, which the
-app answers with 503. Once the headers are out a refusal could only cut the
-body short of its ``Content-Length``, so each read waits for a slot as long as
-it takes, and the close runs even when the response is cancelled
-(``run_efs_cleanup``), including a cancel that lands while the open runs.
+app answers with 503, and a file that is gone by then answers 404. Once the
+headers are out a refusal could only cut the body short of its
+``Content-Length``, so each read waits for a slot as long as it takes, and the
+close runs even when the response is cancelled (``run_efs_cleanup``),
+including a cancel that lands while the open runs. A client that leaves stops
+the reads: a send after a disconnect raises on an ASGI 2.4 server, and below
+2.4, where it is dropped silently, a listener for ``http.disconnect`` cancels
+the body, as Starlette's ``StreamingResponse`` does.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import stat
+from collections.abc import Awaitable, Callable
+from functools import partial
 from secrets import token_hex
 from typing import IO, Any, NamedTuple
 
+from starlette._utils import create_collapsing_task_group
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.exceptions import HTTPException
 from starlette.responses import (
     FileResponse,
     MalformedRangeHeader,
@@ -57,6 +65,33 @@ def _open_regular_file(path: str | os.PathLike[str]) -> _OpenedFile:
         raise
 
 
+async def _until_the_client_leaves(*, body: Callable[[], Awaitable[None]], scope: Scope, receive: Receive) -> None:
+    """Send ``body``, and cancel it when the client disconnects.
+
+    An ASGI 2.4 server raises from a send after a disconnect, which ends the
+    body at its next chunk. Below 2.4 the send returns silently, so without a
+    listener the reads would go on to the end of the file, each taking a file
+    store slot for bytes nobody receives.
+    """
+    spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+    if spec_version >= (2, 4):
+        await body()
+        return
+
+    async def listen_for_disconnect() -> None:
+        while (await receive())["type"] != "http.disconnect":
+            pass
+
+    async with create_collapsing_task_group() as task_group:
+
+        async def then_stop(func: Callable[[], Awaitable[None]]) -> None:
+            await func()
+            task_group.cancel_scope.cancel()
+
+        task_group.start_soon(then_stop, body)
+        await then_stop(listen_for_disconnect)
+
+
 class EfsFileResponse(FileResponse):
     def __init__(self, path: str | os.PathLike[str], *, scope: TenantScope, **kwargs: Any) -> None:
         super().__init__(path, **kwargs)
@@ -66,8 +101,11 @@ class EfsFileResponse(FileResponse):
         send_header_only = scope["type"] == "http" and scope["method"].upper() == "HEAD"
         try:
             opened = await self._open()
-        except FileNotFoundError:
-            raise RuntimeError(f"File at path {self.path} does not exist.")
+        except FileNotFoundError as exc:
+            # Before any header, so the app's handler answers it. The row that
+            # named the file can outlive its bytes by a delete that lands
+            # between the two.
+            raise HTTPException(status_code=404, detail="File not found") from exc
         file = opened.file
         try:
             stat_result = self.stat_result
@@ -79,7 +117,7 @@ class EfsFileResponse(FileResponse):
             http_range = headers.get("range")
             http_if_range = headers.get("if-range")
             if http_range is None or (http_if_range is not None and not self._should_use_range(http_if_range)):
-                await self._send_whole(send, file, send_header_only=send_header_only)
+                body = partial(self._send_whole, send, file, send_header_only=send_header_only)
             else:
                 try:
                     ranges = self._parse_range_header(http_range, stat_result.st_size)
@@ -88,9 +126,11 @@ class EfsFileResponse(FileResponse):
                 except RangeNotSatisfiable as exc:
                     response = PlainTextResponse(status_code=416, headers={"Content-Range": f"bytes */{exc.max_size}"})
                     return await response(scope, receive, send)
-                await self._send_ranges(
-                    send, file, ranges=ranges, file_size=stat_result.st_size, send_header_only=send_header_only
+                body = partial(
+                    self._send_ranges,
+                    send, file, ranges=ranges, file_size=stat_result.st_size, send_header_only=send_header_only,
                 )
+            await _until_the_client_leaves(body=body, scope=scope, receive=receive)
         finally:
             await run_efs_cleanup(file.close, scope=self._tenant_scope)
 

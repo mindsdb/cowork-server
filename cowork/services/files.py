@@ -30,7 +30,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope, scoped_storage_root
 from cowork.db.units import run_db, run_efs
 from cowork.models.file import File
-from cowork.schemas.files import FileResponse
+from cowork.schemas.files import FileResponse, StoredFileContent
 
 logger = logging.getLogger(__name__)
 
@@ -524,12 +524,17 @@ class FileService:
             self.session.delete(row)
         return dirs
 
-    def get_file_content(self, file_id: UUID) -> tuple[str, str, Path]:
+    def stored_file(self, *, file_id: UUID) -> StoredFileContent:
+        """The file's row: where its bytes are, read from the database only."""
         file = self._get_file_model(file_id)
-        path = Path(file.path)
-        if not path.exists():
+        return StoredFileContent(content_type=file.content_type, filename=file.filename, path=Path(file.path))
+
+    def get_file_content(self, file_id: UUID) -> StoredFileContent:
+        """``stored_file``, refused with ValueError when its bytes are gone."""
+        stored = self.stored_file(file_id=file_id)
+        if not stored.path.exists():
             raise ValueError("File content not found on disk")
-        return file.content_type, file.filename, path
+        return stored
 
     def stage_conversation_attachments(
         self, conversation_id: UUID | str, project_path: str | Path

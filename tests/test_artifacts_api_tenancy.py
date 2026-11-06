@@ -399,6 +399,22 @@ async def test_org_source_read_cannot_cross_org(session, tmp_path, org_mode):
         assert err.value.status_code == 404
 
 
+async def _sent_body(response) -> bytes:
+    """The body ``response`` sends when the server runs it over ASGI, which
+    is where a response that owns descriptors releases them."""
+    sent: list[bytes] = []
+
+    async def receive():
+        raise AssertionError("an ASGI 2.4 response does not listen for a disconnect")
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            sent.append(message.get("body", b""))
+
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+    return b"".join(sent)
+
+
 async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", org_id=ORG_A):
     """Own an artifact and open it for same-org review, the way the owner does.
 
@@ -559,9 +575,10 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
             str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer.scope
         )
         assert asset.status_code == 200
-        # Read the body as the server sends it: its end closes the pinned file
-        # and folders the response holds, rather than leaving them to the GC.
-        assert b"".join([chunk async for chunk in asset.body_iterator]) == b"console.log('safe')"
+        # Send the body as the server does: the response's own end closes the
+        # pinned file and folders it holds (PinnedStreamingResponse), rather
+        # than leaving them to the GC on whichever thread drops them.
+        assert await _sent_body(asset) == b"console.log('safe')"
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(

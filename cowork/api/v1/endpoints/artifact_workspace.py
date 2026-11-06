@@ -1130,7 +1130,7 @@ async def _checked_team_audience(
             me = (scope.user_id or "").lower()
             asked = [u for u in user_ids if u != me]
             members = await members_checked(
-                get_org_member_lookup(request),
+                await get_org_member_lookup(request),
                 added=[u for u in asked if u not in stored_people],
                 kept=[u for u in asked if u in stored_people],
                 refusal=NOT_A_MEMBER_REFUSAL,

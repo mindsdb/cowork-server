@@ -486,7 +486,10 @@ async def test_handle_resolves_the_skill_viewer_before_the_turn_start_unit(monke
         raise _StopHere
 
     monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+    # A question that names no project by id reads on the file store's
+    # threads, one that names it in a database unit: either is the first unit.
     monkeypatch.setattr(responses, "run_db", first_unit)
+    monkeypatch.setattr(responses, "run_efs_unit", first_unit)
     handler._resolve_skill_viewer = resolve_viewer
 
     with pytest.raises(_StopHere):

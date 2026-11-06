@@ -6,13 +6,22 @@ and the helper's authorization depends on the principal the route passes it.
 """
 from __future__ import annotations
 
+import importlib
 import inspect
+import pkgutil
 
 import pytest
 from fastapi.routing import APIRoute
 
-from cowork.api.v1.endpoints import project_files, skills
+from cowork.api.v1 import endpoints
 from cowork.server import create_app
+
+#: Every module under cowork/api/v1/endpoints, so a helper added to any of
+#: them is checked too.
+ENDPOINT_MODULES = [
+    importlib.import_module(found.name)
+    for found in pkgutil.walk_packages(endpoints.__path__, f"{endpoints.__name__}.")
+]
 
 
 def test_a_route_whose_work_moved_into_its_helper_keeps_its_description():
@@ -35,7 +44,7 @@ def test_a_route_whose_work_moved_into_its_helper_keeps_its_description():
     assert undocumented == []
 
 
-@pytest.mark.parametrize("module", [project_files, skills], ids=lambda module: module.__name__)
+@pytest.mark.parametrize("module", ENDPOINT_MODULES, ids=lambda module: module.__name__)
 def test_a_helper_that_authorizes_by_principal_is_always_handed_one(module):
     """A default would let a caller that forgets the argument run with no
     principal, the weakest one, and nothing would fail."""

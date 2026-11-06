@@ -5,14 +5,13 @@ on the shared file store where hosted, so each route reads them as one unit on
 the file store's threads (run_efs_unit).
 """
 from contextlib import contextmanager
-from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.scoped import TenantScopeDep
 from cowork.db.units import run_efs_unit
 from cowork.schemas.project_files import ProjectFileListResponse, ProjectFileReadResponse
 from cowork.services.shared_projects import DOWNLOAD_MAX_BYTES, TEXT_MAX_BYTES, UNREADABLE_ERRNOS, SharedProjectFiles
@@ -24,7 +23,6 @@ async def _no_cache(response: Response):
 
 
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(_no_cache)])
-ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 @contextmanager
@@ -42,13 +40,13 @@ def _file_errors():
 
 
 @router.get("/{project_id}/files", response_model=ProjectFileListResponse, response_model_exclude_none=True)
-async def list_files(project_id: UUID, scope: ScopeDep):
+async def list_files(project_id: UUID, scope: TenantScopeDep):
     with _file_errors():
         return await run_efs_unit(lambda session: SharedProjectFiles(session).list_files(project_id), scope=scope)
 
 
 @router.get("/{project_id}/files/{path:path}", response_model=ProjectFileReadResponse, response_model_exclude_none=True)
-async def read_file(project_id: UUID, path: str, scope: ScopeDep):
+async def read_file(project_id: UUID, path: str, scope: TenantScopeDep):
     with _file_errors():
         content, info = await run_efs_unit(
             lambda session: SharedProjectFiles(session).read_file(project_id, path, limit=TEXT_MAX_BYTES), scope=scope
@@ -57,7 +55,7 @@ async def read_file(project_id: UUID, path: str, scope: ScopeDep):
 
 
 @router.get("/{project_id}/files-raw/{path:path}")
-async def download_file(project_id: UUID, path: str, scope: ScopeDep):
+async def download_file(project_id: UUID, path: str, scope: TenantScopeDep):
     with _file_errors():
         content, _ = await run_efs_unit(
             lambda session: SharedProjectFiles(session).read_file(project_id, path, limit=DOWNLOAD_MAX_BYTES), scope=scope

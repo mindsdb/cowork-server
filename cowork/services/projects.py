@@ -206,12 +206,29 @@ def partition_of(scope: TenantScope) -> str | None:
     return str(scope.org_id)
 
 
+#: The shared root with its links resolved, by the value configured for it.
+_RESOLVED_SHARED_ROOTS: dict[str, Path] = {}
+
+
+def resolve_shared_root() -> Path:
+    """Resolve the configured shared root's links and keep the answer for
+    `resolved_shared_root`. File store work: the lifespan runs it once on the
+    file store's threads, before the port binds, so a database unit that
+    checks a project's partition makes no file store call. A shared root
+    whose link changes while the server runs keeps its startup answer."""
+    configured = get_app_settings().storage.shared_root
+    resolved = Path(os.path.realpath(configured))
+    _RESOLVED_SHARED_ROOTS[configured] = resolved
+    return resolved
+
+
 def resolved_shared_root() -> Path:
-    """The shared root as `sits_in_another_partition` compares against it.
-    Resolving its links is file store work, so this runs on a file store
-    thread (cowork.db.units.run_efs). A check over every project resolves it
-    once and passes it in."""
-    return Path(os.path.realpath(get_app_settings().storage.shared_root))
+    """The shared root `resolve_shared_root` resolved at startup, as
+    `sits_in_another_partition` compares against it. Resolved here only when
+    the configured value changed since, as a test's does. A check over every
+    project reads it once and passes it in."""
+    resolved = _RESOLVED_SHARED_ROOTS.get(get_app_settings().storage.shared_root)
+    return resolved if resolved is not None else resolve_shared_root()
 
 
 def sits_in_another_partition(
@@ -225,8 +242,10 @@ def sits_in_another_partition(
     code from before the code sandbox could leave, names that person's
     folder, and still names it once the link is gone. No folder on that path
     is a link any more, so a walk that refuses links can't tell it apart.
-    Without `shared_root` it resolves the shared root itself
-    (`resolved_shared_root`), so it runs on a file store thread.
+    It compares against the shared root resolved at startup
+    (`resolved_shared_root`), or `shared_root` when a check over every
+    project passes it in, so it does no file store work and a database unit
+    may run it.
     """
     if partition is None:
         return False

@@ -72,7 +72,7 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 @router.get("/sharing-capabilities", response_model=SkillSharingCapabilities)
-def skill_sharing_capabilities(viewer: SkillViewerDep = None):
+async def skill_sharing_capabilities(viewer: SkillViewerDep = None):
     """What the caller may do with sharing in MindsHub mode.
 
     ``enabled`` is MindsHub mode. The three capabilities are MindsHub's

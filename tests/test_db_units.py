@@ -273,6 +273,19 @@ def test_a_pool_timeout_under_one_second_is_rejected(monkeypatch):
         DatabaseSettings(_env_file=None)
 
 
+def test_the_file_units_cap_reads_its_bare_name_and_refuses_zero(monkeypatch):
+    """EFS_UNIT_SLOTS reads its bare name, as the pool's settings do. A zero
+    cap would refuse every unit that also works on the file store."""
+    monkeypatch.delenv("EFS_UNIT_SLOTS", raising=False)
+    assert DatabaseSettings(_env_file=None).efs_unit_slots == 16
+    monkeypatch.setenv("EFS_UNIT_SLOTS", "8")
+    assert DatabaseSettings(_env_file=None).efs_unit_slots == 8
+
+    monkeypatch.setenv("EFS_UNIT_SLOTS", "0")
+    with pytest.raises(ValidationError):
+        DatabaseSettings(_env_file=None)
+
+
 async def test_a_native_cancel_waits_for_work_on_the_unit_threads():
     """Stop cancels a turn's task natively, and anyio's shield holds off only
     anyio's own cancel scopes. The caller still waits for work handed to the
