@@ -228,3 +228,92 @@ async def test_any_other_error_reply_is_raised():
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
         await redis_client.xread_blocking(r=client, streams={"s": "0-0"})
+
+
+def _pipeline_on_a_pooled_connection(*, client_kind: str):
+    """A transaction pipeline holding a connection taken from its pool, never connected."""
+    url = "redis://localhost:6379/0"
+    if client_kind == "async":
+        client = redis_client.build_async_redis(url=url, call_budget_s=2)
+        connection = client.connection_pool.get_available_connection()
+    else:
+        client = redis_client.build_sync_redis(url=url, call_budget_s=2)
+        connection = client.connection_pool.make_connection()
+        client.connection_pool._in_use_connections.add(connection)
+    pipe = client.pipeline(transaction=True)
+    pipe.connection = connection
+    pipe.watching = True
+    return pipe, connection
+
+
+async def _reset(pipe) -> None:
+    if isinstance(pipe, redis_client._AsyncPipeline):
+        await pipe.reset()
+    else:
+        pipe.reset()
+
+
+@pytest.mark.parametrize("client_kind", ["async", "sync"])
+async def test_a_pipeline_whose_connection_closed_while_it_watched_resets_without_reconnecting(
+    monkeypatch, client_kind,
+):
+    """A WATCH ends with the connection that sent it. redis-py 5's reset sends
+    UNWATCH anyway, and on a closed connection it reconnects first, under the
+    connection's retry. The reset that runs when a pipeline's ``with`` block
+    exits is outside the call's deadline, so that reconnect retries for a
+    whole budget after the caller's own bound has passed."""
+    pipe, connection = _pipeline_on_a_pooled_connection(client_kind=client_kind)
+    connects: list[str] = []
+
+    async def connect_async():
+        connects.append("connect")
+        raise RedisConnectionError("Connection refused")
+
+    def connect_sync():
+        connects.append("connect")
+        raise RedisConnectionError("Connection refused")
+
+    monkeypatch.setattr(connection, "connect", connect_async if client_kind == "async" else connect_sync)
+
+    await _reset(pipe)
+
+    assert connects == []
+    assert pipe.watching is False
+    assert pipe.connection is None
+    assert connection in pipe.connection_pool._available_connections
+
+
+@pytest.mark.parametrize("client_kind", ["async", "sync"])
+async def test_a_pipeline_whose_connection_is_open_still_unwatches_on_reset(monkeypatch, client_kind):
+    """The everyday case: a WATCH transaction that returns before its EXEC
+    hands its connection back to the pool, so the WATCH must end first."""
+    pipe, connection = _pipeline_on_a_pooled_connection(client_kind=client_kind)
+    sent: list[tuple] = []
+
+    async def send_command_async(*args, **_kwargs):
+        sent.append(args)
+
+    async def read_response_async(*_args, **_kwargs):
+        return "OK"
+
+    def send_command_sync(*args, **_kwargs):
+        sent.append(args)
+
+    def read_response_sync(*_args, **_kwargs):
+        return "OK"
+
+    if client_kind == "async":
+        monkeypatch.setattr(connection, "_reader", object())
+        monkeypatch.setattr(connection, "_writer", object())
+        monkeypatch.setattr(connection, "send_command", send_command_async)
+        monkeypatch.setattr(connection, "read_response", read_response_async)
+    else:
+        monkeypatch.setattr(connection, "_sock", object())
+        monkeypatch.setattr(connection, "send_command", send_command_sync)
+        monkeypatch.setattr(connection, "read_response", read_response_sync)
+
+    await _reset(pipe)
+
+    assert sent == [("UNWATCH",)]
+    assert pipe.watching is False
+    assert pipe.connection is None

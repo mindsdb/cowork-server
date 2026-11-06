@@ -24,6 +24,9 @@ failover without failing the call in flight:
   replaced instead of failing the call.
 - The async pool connects outside its lock, so callers that need a connection
   do not queue behind one caller's connect retries.
+- A pipeline whose connection closed while it watched keys is reset without
+  sending UNWATCH. The watch ended with the connection, and redis-py 5 would
+  reconnect to send it, after the call and outside its deadline.
 - ``send_once`` sends a command at most once, for the writes that duplicate
   when resent after a lost reply.
 - Blocking reads use ``REDIS_BLOCK_MS``, below ``SOCKET_TIMEOUT_S``, so a block
@@ -46,6 +49,7 @@ import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline as AsyncPipeline
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import ExponentialWithJitterBackoff
+from redis.client import Pipeline as SyncPipeline
 from redis.exceptions import (
     AuthenticationError,
     AuthorizationError,
@@ -339,7 +343,18 @@ class _SyncPool(syncredis.ConnectionPool):
 
 
 class _AsyncPipeline(AsyncPipeline):
-    """A pipeline that runs each execute under one deadline and honors ``send_once``."""
+    """A pipeline that runs each execute under one deadline, honors ``send_once``,
+    and resets a closed connection without reconnecting.
+
+    redis-py 5's reset sends UNWATCH whenever the pipeline watched keys, and
+    on a closed connection it reconnects first, under the connection's retry.
+    A command that fails while the pipeline watches resets it before raising
+    WatchError, and the ``async with`` resets it again on exit. A cancel, such
+    as a caller's timeout, that cuts the first reconnect short leaves the
+    pipeline watching, so the second reconnects outside the call's deadline
+    and spends a whole budget of its own. A WATCH ends with the connection
+    that sent it, so a closed connection has nothing to unwatch.
+    """
 
     connection_pool: _AsyncPool
 
@@ -350,6 +365,11 @@ class _AsyncPipeline(AsyncPipeline):
     async def immediate_execute_command(self, *args, **options):
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return await super().immediate_execute_command(*args, **options)
+
+    async def reset(self):
+        if self.watching and self.connection is not None and not self.connection.is_connected:
+            self.watching = False
+        await super().reset()
 
     async def _disconnect_raise_reset(self, conn, error):
         await super()._disconnect_raise_reset(conn, error)
@@ -380,18 +400,40 @@ class _AsyncRedis(aioredis.Redis):
         return _AsyncPipeline(self.connection_pool, self.response_callbacks, transaction, shard_hint)
 
 
-class _SyncRedis(syncredis.Redis):
-    """A blocking client that runs each call under one deadline.
+class _SyncPipeline(SyncPipeline):
+    """The blocking client's ``_AsyncPipeline``, without ``send_once``, which
+    no blocking caller uses. ``turn_claim.release_sync`` runs its WATCH
+    transaction on it."""
 
-    Nothing uses its pipelines, which get no call-wide deadline: their connect
-    and command retry loops each start one.
-    """
+    connection_pool: _SyncPool
+
+    def execute(self, raise_on_error: bool = True):
+        with redis_deadline(budget_s=self.connection_pool.call_budget_s):
+            return super().execute(raise_on_error)
+
+    def immediate_execute_command(self, *args, **options):
+        with redis_deadline(budget_s=self.connection_pool.call_budget_s):
+            return super().immediate_execute_command(*args, **options)
+
+    def reset(self) -> None:
+        # redis-py's blocking connection marks a closed connection by its socket.
+        if self.watching and self.connection is not None and self.connection._sock is None:
+            self.watching = False
+        super().reset()
+
+
+class _SyncRedis(syncredis.Redis):
+    """A blocking client that runs each call, and each pipeline execute or
+    immediate command, under one deadline."""
 
     connection_pool: _SyncPool
 
     def execute_command(self, *args, **options):
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return super().execute_command(*args, **options)
+
+    def pipeline(self, transaction: bool = True, shard_hint: str | None = None) -> _SyncPipeline:
+        return _SyncPipeline(self.connection_pool, self.response_callbacks, transaction, shard_hint)
 
 
 def _client_options() -> dict[str, Any]:

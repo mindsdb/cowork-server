@@ -75,7 +75,15 @@ T = TypeVar("T")
 # was force-killed is refused for up to this long.
 CLAIM_TTL_SECONDS = 90
 RENEW_INTERVAL_SECONDS = 10
-# Bound on each Redis call here: get_redis() sets no socket timeout.
+# Bound on each Redis call here, well under get_redis()'s own call budget
+# (redis_client.ASYNC_CALL_BUDGET_S, 30 s): admission answers 503 with
+# Retry-After rather than hold a send that long, and CLAIM_TTL_SECONDS counts
+# one renewal's Redis time as this. So the claim does not ride through a
+# failover the way the client's plain calls do. A dropped connection or a
+# READONLY reply inside a WATCH transaction ends the transaction with
+# WatchError, a compare-and-set runs it at most _WATCH_ATTEMPTS times with no
+# backoff, and then admission raises TurnClaimUnavailable and a renewal
+# answers ERROR, for the next renewal to try again.
 REDIS_CALL_SECONDS = 5
 # How long admission waits for a holder that is writing its final client
 # frame, or whose stream has ended while it still holds the claim, to release

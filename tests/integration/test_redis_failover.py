@@ -421,24 +421,42 @@ async def test_a_call_whose_connect_retried_spends_the_same_deadline_on_its_comm
     await client.aclose()
 
 
+@pytest.mark.parametrize("client_kind", ["async", "sync"])
 @pytest.mark.parametrize("send", ["execute", "watch"])
-async def test_a_pipeline_whose_connect_retried_spends_the_same_deadline_on_its_commands(proxy, send):
+async def test_a_pipeline_whose_connect_retried_spends_the_same_deadline_on_its_commands(proxy, send, client_kind):
     """A pipeline takes its connection from the pool before its own retry
     loop starts, on execute and on an immediate command such as WATCH. With a
     deadline per loop, a pipeline that connected late gets a new budget for
-    its commands."""
+    its commands. The blocking client's pipeline is the one a conversation
+    delete releases a turn claim on (turn_claim.release_sync)."""
     budget_s = 2.0
-    client = build_async_redis(url=proxy.url, call_budget_s=budget_s)
     proxy.refuse()
     proxy.drop_marker = b"deadline:pipeline"
 
-    async def run():
-        async with client.pipeline(transaction=True) as pipe:
-            if send == "watch":
-                await pipe.watch("deadline:pipeline")
-            else:
-                pipe.get("deadline:pipeline")
-                await pipe.execute()
+    if client_kind == "async":
+        client = build_async_redis(url=proxy.url, call_budget_s=budget_s)
+
+        async def run():
+            async with client.pipeline(transaction=True) as pipe:
+                if send == "watch":
+                    await pipe.watch("deadline:pipeline")
+                else:
+                    pipe.get("deadline:pipeline")
+                    await pipe.execute()
+    else:
+        client = build_sync_redis(url=proxy.url, call_budget_s=budget_s)
+
+        def run_blocking():
+            with client.pipeline(transaction=True) as pipe:
+                if send == "watch":
+                    pipe.watch("deadline:pipeline")
+                else:
+                    pipe.get("deadline:pipeline")
+                    pipe.execute()
+
+        async def run():
+            # In a thread: the proxy runs on this event loop.
+            await asyncio.to_thread(run_blocking)
 
     started = time.monotonic()
     call = asyncio.create_task(run())
@@ -449,7 +467,36 @@ async def test_a_pipeline_whose_connect_retried_spends_the_same_deadline_on_its_
 
     assert proxy.connections == 1
     assert time.monotonic() - started < budget_s + 0.4
-    await client.aclose()
+    if client_kind == "async":
+        await client.aclose()
+    else:
+        client.close()
+
+
+async def test_a_turn_claim_whose_connection_drops_inside_its_watch_stops_at_its_bound(redis_url, proxy, monkeypatch):
+    """The connection drops on the GET after the claim's WATCH, and Redis then
+    refuses every connect, as when the primary's pod dies mid-transaction.
+    redis-py resets the pipeline and its reset reconnects to send UNWATCH. The
+    claim's bound cancels that reconnect, which leaves the pipeline watching,
+    so the ``async with`` exit reconnects again, outside the call's deadline,
+    for a whole client budget past the bound."""
+    from cowork.streaming import turn_claim
+
+    monkeypatch.setattr(turn_claim, "REDIS_CALL_SECONDS", 1)
+    monkeypatch.setenv("COWORK_TURN_REDIS_URL", proxy.url)
+    redis_client.reset_redis()
+    await redis_client.get_redis().ping()
+    claim = turn_claim.new_claim(run_id="drop-run", turn_id=1, correlation_id=None, question_id=None)
+    proxy.drop_marker = b"$3\r\nGET\r\n"
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            turn_claim._bounded(turn_claim.acquire(claim=claim, conversation_id="claim-drop")), timeout=10,
+        )
+
+    assert proxy.drop_marker is None
+    assert time.monotonic() - started < turn_claim.REDIS_CALL_SECONDS + 0.5
 
 
 async def test_callers_that_need_a_connection_do_not_wait_for_each_others_connect(proxy):
