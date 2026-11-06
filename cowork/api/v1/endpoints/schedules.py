@@ -13,7 +13,6 @@ from cowork.schemas.schedules import (
     ScheduleResponse,
     ScheduleRunResponse,
     ScheduleUpdateRequest,
-    schedule_state,
 )
 from cowork.services.schedules import ScheduleConflict, ScheduleRunService, ScheduleService
 
@@ -28,13 +27,11 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 
-def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live state: `running` (any in-flight run)
-    and `state` (what the schedule will do next)."""
-    data = ScheduleResponse.serialize(schedule)
-    data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
-    data["state"] = schedule_state(schedule).value
-    return data
+def _serialize(schedule, scoped) -> ScheduleResponse:
+    """Typed schedule state plus the live running flag."""
+    response = ScheduleResponse.model_validate(schedule)
+    response.running = ScheduleRunService(scoped).has_active_run(schedule.id)
+    return response
 
 
 @router.get("/")

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from uuid import UUID
 
-from pydantic import BaseModel, field_validator
+from pydantic import computed_field, field_validator
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
@@ -155,13 +155,16 @@ class ScheduleResponse(CamelResponse):
     auto_paused_at: datetime | None = None
     paused_at: datetime | None = None
     missed_at: datetime | None = None
-    # Filled by the endpoints: the derived ScheduleState.
-    state: ScheduleState = ScheduleState.active
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
     created_at: datetime | None
     modified_at: datetime | None
+
+    @computed_field
+    @property
+    def state(self) -> ScheduleState:
+        return schedule_state(self)
 
 
 class ScheduleRunResponse(CamelResponse):

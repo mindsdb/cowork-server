@@ -3,7 +3,8 @@
 A recurring schedule that fell behind runs its latest missed slot once, if
 that slot is no more than seven days old, and the slots it passed over are
 counted. A one-off runs up to an hour late; from an hour on it is marked
-missed and runs only on Run now, which uses a one-off up. Pause stops what
+missed and runs only on Run now, which uses a one-off up on successful
+completion. Pause stops what
 would start on its own, and resume clears the pause and the failure streak.
 A resumed schedule waits for its next slot, unless a run gave its due slot
 back before its agent acted and no later slot has come due: that slot runs
@@ -130,9 +131,10 @@ def turns(monkeypatch):
     async def evidence(_conversation_id):
         return scheduler._TurnEvidence(reason=ending.reason, acted=ending.acted)
 
+    read_evidence = scheduler._turn_evidence
     monkeypatch.setattr(responses_mod, "ResponsesHandler", CountingHandler)
     monkeypatch.setattr(scheduler, "_turn_evidence", evidence)
-    return SimpleNamespace(started=started, ending=ending, during=during)
+    return SimpleNamespace(started=started, ending=ending, during=during, read_evidence=read_evidence)
 
 
 def _schedule(schedule_id: UUID) -> Schedule:
@@ -248,6 +250,24 @@ def test_a_daily_schedule_days_behind_runs_its_latest_slot_once_and_counts_the_r
     assert schedule.missed_runs == 3
 
 
+@pytest.mark.parametrize("previously_missed", [0, 4])
+async def test_successful_catch_up_preserves_skipped_occurrence_count(made, turns, previously_missed):
+    schedule_id = made(next_run_at=SLOT - timedelta(days=2))
+    _set(schedule_id, missed_runs=previously_missed)
+    (due,) = _poll(schedule_id)
+    assert due.slot_at == SLOT
+    assert _schedule(schedule_id).missed_runs == previously_missed + 2
+
+    await _run(due)
+
+    (run,) = _runs(schedule_id)
+    assert run.status == RunStatus.success
+    assert len(turns.started) == 1
+    assert _schedule(schedule_id).missed_runs == previously_missed + 2
+    assert ensure_utc(_schedule(schedule_id).next_run_at) > SLOT
+    assert _poll(schedule_id) == []
+
+
 def test_an_hourly_schedule_a_month_behind_runs_its_latest_slot_once(made, turns):
     start = SLOT - timedelta(days=30)
     schedule_id = made(cadence="hourly", next_run_at=start)
@@ -320,6 +340,57 @@ async def test_run_now_uses_up_a_missed_one_off(made, turns):
     assert len(turns.started) == 1
 
 
+@pytest.mark.parametrize("prior_state", [ScheduleState.active, ScheduleState.paused, ScheduleState.missed])
+@pytest.mark.parametrize(
+    ("reason", "acted"),
+    [("completed", True), ("cancelled", True), ("error", False), ("error", True), ("interrupted", True), (None, True)],
+)
+async def test_only_completed_run_now_finishes_a_one_off(made, turns, prior_state, reason, acted):
+    schedule_id = made(cadence="once", next_run_at=NOW + timedelta(days=1))
+    if prior_state == ScheduleState.paused:
+        _service(lambda s: s.pause_schedule(schedule_id))
+    elif prior_state == ScheduleState.missed:
+        _set(schedule_id, next_run_at=NOW - timedelta(hours=2))
+        _poll(schedule_id)
+    before = _schedule(schedule_id)
+    assert schedule_state(before) == prior_state
+    turns.ending.reason, turns.ending.acted = reason, acted
+
+    await scheduler.execute_schedule(schedule_id, is_manual=True)
+
+    after = _schedule(schedule_id)
+    assert len(turns.started) == 1
+    if reason == "completed":
+        assert schedule_state(after) == ScheduleState.done
+        assert after.enabled is False
+        assert after.paused_at is None and after.missed_at is None
+    else:
+        assert schedule_state(after) == prior_state
+        assert after.enabled == before.enabled
+        assert after.paused_at == before.paused_at
+        assert after.missed_at == before.missed_at
+        assert after.next_run_at == before.next_run_at
+
+
+async def test_a_one_off_paused_during_its_cron_run_is_done_after_completion(made, turns):
+    schedule_id = made(cadence="once", next_run_at=SLOT)
+    (due,) = _poll(schedule_id)
+    turns.during.append(lambda: _service(lambda s: s.pause_schedule(schedule_id)))
+
+    await _run(due)
+
+    (run,) = _runs(schedule_id)
+    assert run.status == RunStatus.success
+    assert run.is_manual is False
+    schedule = _schedule(schedule_id)
+    assert schedule_state(schedule) == ScheduleState.done
+    assert schedule.paused_at is None
+    assert schedule.missed_at is None
+    assert schedule.enabled is False
+    assert _poll(schedule_id) == []
+    assert len(turns.started) == 1
+
+
 async def test_run_now_uses_up_a_one_off_that_has_not_come_due(made, turns):
     schedule_id = made(cadence="once", next_run_at=NOW + timedelta(days=1))
 
@@ -340,6 +411,50 @@ def test_a_missed_one_off_given_a_new_time_is_scheduled_again(made, turns):
 
 
 # --- Pause and resume -------------------------------------------------------
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_a_missed_one_off_changed_to_daily_clears_missed_state_and_preserves_pause(made, paused):
+    schedule_id = made(cadence="once", next_run_at=NOW - timedelta(days=1))
+    assert _poll(schedule_id) == []
+    assert schedule_state(_schedule(schedule_id)) == ScheduleState.missed
+    if paused:
+        _service(lambda s: s.pause_schedule(schedule_id))
+    paused_at = _schedule(schedule_id).paused_at
+    tomorrow = NOW + timedelta(days=1)
+
+    # The editor changes cadence and time without sending enabled.
+    _service(lambda s: s.update_schedule(schedule_id, cadence="daily", next_run_at=tomorrow))
+
+    schedule = _schedule(schedule_id)
+    assert schedule.cadence == Cadence.daily
+    assert ensure_utc(schedule.next_run_at) == tomorrow
+    assert schedule.missed_at is None
+    assert schedule.paused_at == paused_at
+    assert schedule.enabled is (not paused)
+    assert schedule_state(schedule) == (ScheduleState.paused if paused else ScheduleState.active)
+
+
+@pytest.mark.parametrize("cadence", ["daily", "once"])
+async def test_resume_of_an_active_task_preserves_its_due_slot(made, turns, cadence):
+    schedule_id = made(cadence=cadence, next_run_at=SLOT)
+    _set(schedule_id, consecutive_failures=2, missed_runs=4)
+
+    async with _client() as client:
+        for _ in range(2):
+            answer = await client.post(f"/api/v1/schedules/{schedule_id}/resume")
+            assert answer.status_code == 200, answer.text
+
+    schedule = _schedule(schedule_id)
+    assert schedule_state(schedule) == ScheduleState.active
+    assert ensure_utc(schedule.next_run_at) == SLOT
+    assert schedule.consecutive_failures == 2
+    assert schedule.missed_runs == 4
+    (due,) = _poll(schedule_id)
+    assert due.slot_at == SLOT
+    await _run(due)
+    assert len(turns.started) == 1
+    assert _runs(schedule_id)[0].status == RunStatus.success
 
 
 def test_pause_records_when_and_resume_waits_for_the_next_slot(made, turns):
@@ -463,6 +578,47 @@ async def _fail_a_slot(schedule_id: UUID, turns, *, acted: bool = True) -> None:
     turns.ending.reason, turns.ending.acted = "error", acted
     (due,) = _poll(schedule_id)
     await _run(due)
+
+
+@pytest.mark.parametrize(
+    ("reason", "shutting_down", "timed_out", "expected_streak"),
+    [
+        ("interrupted", True, False, 2),
+        ("restart", True, False, 2),
+        ("interrupted", False, False, 3),
+        ("interrupted", True, True, 3),
+        ("error", True, False, 3),
+        ("completed", True, False, 0),
+    ],
+)
+async def test_only_known_shutdown_interruptions_leave_failure_streak_unchanged(
+    made, turns, monkeypatch, reason, shutting_down, timed_out, expected_streak,
+):
+    schedule_id = made(next_run_at=SLOT)
+    _set(schedule_id, consecutive_failures=2)
+    handle = SimpleNamespace(lifecycle=SimpleNamespace(shutting_down=shutting_down, timed_out=timed_out))
+    monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _id: handle))
+
+    async def terminal(_id):
+        return reason
+
+    async def acted(_id):
+        return True
+
+    monkeypatch.setattr(scheduler, "_turn_terminal_reason", terminal)
+    monkeypatch.setattr(scheduler, "_turn_acted", acted)
+    monkeypatch.setattr(scheduler, "_turn_evidence", turns.read_evidence)
+    (due,) = _poll(schedule_id)
+    await _run(due)
+
+    schedule = _schedule(schedule_id)
+    assert schedule.consecutive_failures == expected_streak
+    assert (schedule.auto_paused_at is not None) == (expected_streak == 3)
+    assert ensure_utc(schedule.next_run_at) > SLOT
+    (run,) = _runs(schedule_id)
+    assert run.status == (RunStatus.success if reason == "completed" else RunStatus.failed)
+    if reason in {"interrupted", "restart"}:
+        assert run.outcome == "interrupted"
 
 
 async def test_three_slots_in_a_row_that_fail_pause_the_schedule(made, turns):
@@ -605,6 +761,34 @@ async def test_resuming_a_one_off_whose_time_passed_answers_409(made, turns):
     assert "time has passed" in answer.json()["detail"]
 
 
+# --- State reporting --------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", list(ScheduleState))
+async def test_api_and_chat_report_the_same_schedule_state(made, state):
+    from cowork.harnesses.anton_harness.schedule_tools import _summary
+    from cowork.schemas.schedules import ScheduleResponse
+
+    schedule_id = made(cadence="once", next_run_at=NOW + timedelta(days=1))
+    _set(
+        schedule_id,
+        enabled=state == ScheduleState.active,
+        paused_at=NOW if state == ScheduleState.paused else None,
+        auto_paused_at=NOW if state == ScheduleState.auto_paused else None,
+        missed_at=NOW if state == ScheduleState.missed else None,
+    )
+    schedule = _schedule(schedule_id)
+    summary = _summary(schedule)
+    assert summary["state"] == state.value
+    assert summary["paused"] is (state in {ScheduleState.paused, ScheduleState.auto_paused})
+    assert ScheduleResponse.serialize(schedule)["state"] == state
+    async with _client() as client:
+        answer = await client.get(f"/api/v1/schedules/{schedule_id}")
+    assert answer.status_code == 200
+    assert answer.json()["state"] == summary["state"]
+    assert answer.json()["running"] is False
+
+
 # --- Migration --------------------------------------------------------------
 
 
@@ -632,6 +816,10 @@ def test_the_pause_migration_upgrades_sorts_disabled_schedules_and_downgrades(tm
         "one_off_missed": ("once", 0, 1),
         "one_off_paused": ("once", 0, 0),
         "one_off_on": ("once", 1, 0),
+        "one_off_manual_paused": ("once", 0, 0),
+        "one_off_manual_missed": ("once", 0, 1),
+        "one_off_cron_done": ("once", 0, 0),
+        "one_off_manual_and_cron_done": ("once", 0, 0),
     }
     ids = {}
     with engine.begin() as connection:
@@ -650,6 +838,18 @@ def test_the_pause_migration_upgrades_sorts_disabled_schedules_and_downgrades(tm
                 {"id": ids[name], "t": name, "c": cadence, "e": enabled, "p": project_id, "m": missed},
             )
 
+        for name, manual_runs in {
+            "one_off_manual_paused": [True],
+            "one_off_manual_missed": [True],
+            "one_off_cron_done": [False],
+            "one_off_manual_and_cron_done": [True, False],
+        }.items():
+            for is_manual in manual_runs:
+                connection.execute(text(
+                    "INSERT INTO schedule_runs (id, schedule_id, started_at, finished_at, status, is_manual) "
+                    "VALUES (:id, :schedule, '2025-12-31 09:00:00', '2025-12-31 09:01:00', 'success', :manual)"
+                ), {"id": uuid4().hex, "schedule": ids[name], "manual": is_manual})
+
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         command.upgrade(config, "head")
@@ -665,3 +865,7 @@ def test_the_pause_migration_upgrades_sorts_disabled_schedules_and_downgrades(tm
     assert got["one_off_missed"] == (False, True, 0)
     assert got["one_off_paused"] == (True, False, 0)
     assert got["one_off_on"] == (False, False, 0)
+    assert got["one_off_manual_paused"] == (True, False, 0)
+    assert got["one_off_manual_missed"] == (False, True, 0)
+    assert got["one_off_cron_done"] == (False, False, 0)
+    assert got["one_off_manual_and_cron_done"] == (False, False, 0)

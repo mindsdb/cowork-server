@@ -34,6 +34,8 @@ from cowork.schemas.schedules import (
     DEFAULT_MODEL_SENTINEL,
     Cadence,
     ScheduleCreateRequest,
+    ScheduleResponse,
+    ScheduleState,
     ScheduleUpdateRequest,
 )
 from cowork.services.schedules import ScheduleService
@@ -123,6 +125,7 @@ def _units_scope():
 
 
 def _summary(schedule) -> dict:
+    schedule = ScheduleResponse.model_validate(schedule)
     return {
         "schedule_id": str(schedule.id),
         "title": schedule.title,
@@ -130,7 +133,8 @@ def _summary(schedule) -> dict:
         "cadence": str(getattr(schedule.cadence, "value", schedule.cadence)),
         "timezone": schedule.timezone,
         "next_run_at": ensure_utc(schedule.next_run_at).isoformat(),
-        "paused": not schedule.enabled,
+        "state": schedule.state.value,
+        "paused": schedule.state in {ScheduleState.paused, ScheduleState.auto_paused},
     }
 
 
@@ -582,7 +586,7 @@ def build_schedule_tools(*, project_id: UUID | None) -> list:
     return [
         ToolDef(
             name=LIST_TOOL_NAME,
-            description="List the user's scheduled tasks: id, title, prompt, cadence, timezone, next run, and whether it's paused.",
+            description="List the user's scheduled tasks: id, title, prompt, cadence, timezone, next run, and state (active, paused, auto_paused, missed, or done).",
             input_schema=_LIST_SCHEMA,
             handler=_list_tasks,
         ),

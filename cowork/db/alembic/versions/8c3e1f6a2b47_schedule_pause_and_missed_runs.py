@@ -7,8 +7,9 @@ slots in a row that settled failed, and auto_paused_at records when that
 streak paused the schedule.
 
 Existing disabled schedules are sorted into those states: a recurring one
-was paused by the user; a one-off with runs has run; a one-off counted as
-missed, with no runs, was missed; any other one-off was paused.
+was paused by the user; a one-off with cron runs has run; a one-off counted as
+missed, with no cron runs, was missed; any other one-off was paused. Manual
+runs did not disable one-offs on the old server, so they do not establish done.
 
 Revision ID: 8c3e1f6a2b47
 Revises: 5b7c2d9e4f10
@@ -37,7 +38,9 @@ def upgrade() -> None:
             batch.add_column(sa.Column("missed_at", sa.DateTime(timezone=True), nullable=True))
 
     when = sa.func.coalesce(sa.column("modified_at"), sa.func.now())
-    no_runs = sa.text("NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id = schedules.id)")
+    no_cron_runs = sa.text(
+        "NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id = schedules.id AND NOT r.is_manual)"
+    )
     schedules = sa.table(
         "schedules",
         sa.column("enabled", sa.Boolean()),
@@ -59,12 +62,12 @@ def upgrade() -> None:
     )
     op.execute(
         schedules.update()
-        .where(disabled, schedules.c.cadence == "once", no_runs, schedules.c.missed_runs > 0)
+        .where(disabled, schedules.c.cadence == "once", no_cron_runs, schedules.c.missed_runs > 0)
         .values(missed_at=when)
     )
     op.execute(
         schedules.update()
-        .where(disabled, schedules.c.cadence == "once", no_runs, schedules.c.missed_runs == 0)
+        .where(disabled, schedules.c.cadence == "once", no_cron_runs, schedules.c.missed_runs == 0)
         .values(paused_at=when)
     )
 

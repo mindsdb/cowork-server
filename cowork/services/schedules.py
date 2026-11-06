@@ -143,11 +143,11 @@ class ScheduleService:
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
         if (
-            schedule.cadence == Cadence.once
-            and schedule.missed_at is not None
+            schedule.missed_at is not None
             and _utc(schedule.next_run_at) > datetime.now(timezone.utc)
         ):
-            # A missed one-off given a new time is scheduled again.
+            # Only one-offs are marked missed. A future time schedules one
+            # again, including when this edit changes it to a recurring task.
             schedule.missed_at = None
             schedule.enabled = schedule.paused_at is None and schedule.auto_paused_at is None
         self.session.add(schedule)
@@ -222,7 +222,10 @@ class ScheduleService:
         return schedule
 
     def resume_schedule(self, schedule_id: UUID) -> Schedule:
-        return self._resume(self.get_schedule(schedule_id))
+        schedule = self.get_schedule(schedule_id)
+        # A stale tab may repeat Resume after another request resumed it.
+        # Leave its due slot and failure history untouched.
+        return schedule if _runs_on_its_own(schedule) else self._resume(schedule)
 
     def _resume(self, schedule: Schedule) -> Schedule:
         """Turn the schedule back on, clearing a pause, an auto-pause and its

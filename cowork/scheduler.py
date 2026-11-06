@@ -173,7 +173,6 @@ def _apply_success_write_back(
     schedule.last_run_at = datetime.now(timezone.utc)
     schedule.last_result_conversation_id = run_service.still_exists(conversation_id)
     schedule.last_error = None
-    schedule.missed_runs = 0
     session.add(schedule)
 
 
@@ -349,6 +348,7 @@ class _TurnEvidence:
 
     reason: str | None
     acted: bool
+    shutdown_interrupted: bool = False
 
 
 def _classify(evidence: _TurnEvidence) -> AttemptOutcome:
@@ -499,6 +499,7 @@ def _delete_unstarted_conversation(
 
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
+    shutdown_interrupted: bool = False,
 ) -> _RunOutcome:
     schedule_service = ScheduleService(session)
     run_service = ScheduleRunService(session)
@@ -525,13 +526,14 @@ def _record_turn_outcome(
         # wouldn't block the restart).
         if not is_manual:
             _advance_next_run_at(schedule, session)
-            if outcome.status == RunStatus.failed:
+            if outcome.status == RunStatus.failed and not shutdown_interrupted:
                 count_settled_slot(session, schedule_id, failed=True)
         if outcome.status is None:
             # A success of either kind ends the failure streak.
             count_settled_slot(session, schedule_id, failed=False)
-        if is_manual and schedule.cadence == Cadence.once:
-            # Run now uses a one-off up, missed or paused, since its turn ran.
+        if schedule.cadence == Cadence.once and (not is_manual or reason == "completed"):
+            # Cron consumes its slot, but Run now uses a one-off up only on
+            # confirmed completion. Other endings preserve its prior state.
             schedule.enabled = False
             schedule.missed_at = None
             schedule.paused_at = None
@@ -762,6 +764,7 @@ async def execute_schedule(
         recorded = await _until_it_lands(
             partial(
                 _record_turn_outcome, schedule_id=schedule_id, reason=evidence.reason,
+                shutdown_interrupted=evidence.shutdown_interrupted,
                 is_manual=is_manual, conversation_id=conversation_id,
             ),
             schedule_id=schedule_id,
@@ -925,9 +928,20 @@ def _frame_shows_action(event: str, data: dict) -> bool:
 async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
     """How the turn that just ended on this conversation went: its terminal
     reason (_turn_terminal_reason), and whether its agent acted."""
+    reason = await _turn_terminal_reason(conversation_id)
+    handle = registry.get(conversation_id)
+    lifecycle = getattr(handle, "lifecycle", None)
+    # Only an explicit shutdown marker excuses an interruption. A timeout
+    # still counts even if shutdown began before we read the result.
+    shutdown_interrupted = (
+        reason in ("interrupted", "restart")
+        and bool(getattr(lifecycle, "shutting_down", False))
+        and not bool(getattr(lifecycle, "timed_out", False))
+    )
     return _TurnEvidence(
-        reason=await _turn_terminal_reason(conversation_id),
+        reason=reason,
         acted=await _turn_acted(conversation_id),
+        shutdown_interrupted=shutdown_interrupted,
     )
 
 
