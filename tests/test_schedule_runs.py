@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlmodel import Session, SQLModel
 
+from cowork import scheduler
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
 from cowork.schemas.schedules import RunStatus
@@ -791,7 +792,7 @@ async def _turn_raises():
 def test_execute_schedule_that_raises_consumes_its_slot(monkeypatch):
     state = _execute_with_terminal(monkeypatch, None, turn=_turn_raises)
     assert state["run_status"] == RunStatus.failed
-    assert state["last_error"] == "turn blew up"
+    assert state["last_error"] == scheduler._UNCERTAIN_ERROR
     # Left due, the next poll would start the failing run again.
     assert state["next_advanced"] is True
 
@@ -815,7 +816,7 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
 
     state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
     assert state["run_status"] == RunStatus.failed
-    assert "max duration" in state["last_error"]
+    assert state["last_error"] == scheduler._INTERRUPTED_TURN_ERROR
     assert state["run_outcome"] == "interrupted"
     assert state["next_advanced"] is True
     # The turn runs detached from the drain the timeout cancels, so it is
@@ -1252,7 +1253,7 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
     schedule and before the poll asks whether a run is active. The poll then
     sees the slot as used: a Stopped daily run does not start again, and
     neither does a one-off its failed run disabled."""
-    from cowork.scheduler import _finish_run, _poll, _record_turn_outcome
+    from cowork.scheduler import _classify, _finish_run, _poll, _record_turn_outcome, _TurnEvidence
 
     engine = _file_engine(tmp_path)
     with Session(engine) as session:
@@ -1272,7 +1273,8 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
             with Session(engine) as run_session:
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
                 outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, reason=reason, is_manual=False, conversation_id=None,
+                    scoped, schedule_id=schedule_id, end=_classify(_TurnEvidence(reason=reason, acted=True)),
+                    is_manual=False, conversation_id=None,
                 )
                 _finish_run(scoped, run_id=run_id, conversation_id=None, error=outcome.error, status=outcome.status)
         return has_active_run(self, asked_id)

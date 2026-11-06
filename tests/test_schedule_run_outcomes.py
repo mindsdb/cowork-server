@@ -518,12 +518,12 @@ def test_a_turn_acted_when_its_stream_holds_more_than_its_start_and_failure(tmp_
 
     asyncio.run(fill())
     monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: SimpleNamespace(buffer=buffer)))
-    assert asyncio.run(scheduler._turn_acted("c1")) is acted
+    assert asyncio.run(scheduler._turn_activity("c1"))[0] is acted
 
 
 def test_a_turn_with_no_buffer_counts_as_having_acted(monkeypatch):
     monkeypatch.setattr(scheduler, "registry", SimpleNamespace(get=lambda _cid: None))
-    assert asyncio.run(scheduler._turn_acted("c1")) is True
+    assert asyncio.run(scheduler._turn_activity("c1")) == (True, None)
 
 
 # --- Migration ---------------------------------------------------------------
@@ -602,3 +602,30 @@ def test_the_migration_keeps_one_running_run_per_schedule(tmp_path, monkeypatch)
             "SELECT count(*) FROM schedule_runs WHERE execution_claimed_at = started_at"
         )).scalar_one() == 2
 
+
+
+def test_latest_run_index_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
+    from alembic import command
+    from cowork.db.migrations import _alembic_config
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    uri = f"sqlite:///{tmp_path / 'lookup.db'}"
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    name = "ix_schedule_runs_schedule_finished"
+    assert name in {i["name"] for i in inspect(engine).get_indexes("schedule_runs")}
+    config = _alembic_config(uri)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.downgrade(config, "8c3e1f6a2b47")
+    assert name not in {i["name"] for i in inspect(engine).get_indexes("schedule_runs")}
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
+        plan = connection.execute(text(
+            "EXPLAIN QUERY PLAN SELECT * FROM schedule_runs WHERE schedule_id = 'example' "
+            "AND status != 'running' AND (is_manual = 1 OR slot_at IS NOT NULL) "
+            "ORDER BY finished_at DESC, started_at DESC LIMIT 1"
+        )).all()
+    assert name in str(plan)

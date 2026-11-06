@@ -27,20 +27,27 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 
+def _serialize_run(run) -> ScheduleRunResponse:
+    return ScheduleRunResponse.model_validate(run)
+
+
 def _serialize(schedule, scoped) -> ScheduleResponse:
-    """Typed schedule state plus the live running flag."""
+    run_service = ScheduleRunService(scoped)
     response = ScheduleResponse.model_validate(schedule)
-    response.running = ScheduleRunService(scoped).has_active_run(schedule.id)
+    response.running = run_service.has_active_run(schedule.id)
+    last = run_service.last_finished_run(schedule.id)
+    response.last_run = _serialize_run(last) if last is not None else None
     return response
 
 
-@router.get("/")
+
+@router.get("/", response_model=dict[str, list[ScheduleResponse]])
 def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
     schedules = ScheduleService(scoped).list_schedules(project_id=project_id)
     return {"schedules": [_serialize(s, scoped) for s in schedules]}
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("/", status_code=status.HTTP_201_CREATED, response_model=ScheduleResponse)
 def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
     try:
         schedule = ScheduleService(scoped).create_schedule(
@@ -59,7 +66,7 @@ def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
     return _serialize(schedule, scoped)
 
 
-@router.get("/{schedule_id}")
+@router.get("/{schedule_id}", response_model=ScheduleResponse)
 def get_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).get_schedule(schedule_id), scoped)
@@ -67,8 +74,8 @@ def get_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.put("/{schedule_id}")
-@router.patch("/{schedule_id}")
+@router.put("/{schedule_id}", response_model=ScheduleResponse)
+@router.patch("/{schedule_id}", response_model=ScheduleResponse)
 def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scoped: ScopedSessionDep):
     changes = body.model_dump(exclude_none=True)
     # "No project" arrives as an explicit null, which exclude_none drops.
@@ -90,7 +97,7 @@ def delete_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
 
 
-@router.post("/{schedule_id}/pause")
+@router.post("/{schedule_id}/pause", response_model=ScheduleResponse)
 def pause_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).pause_schedule(schedule_id), scoped)
@@ -98,7 +105,7 @@ def pause_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{schedule_id}/resume")
+@router.post("/{schedule_id}/resume", response_model=ScheduleResponse)
 def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).resume_schedule(schedule_id), scoped)
@@ -176,11 +183,11 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
 
 
-@router.get("/{schedule_id}/runs")
+@router.get("/{schedule_id}/runs", response_model=dict[str, list[ScheduleRunResponse]])
 def list_schedule_runs(schedule_id: UUID, scoped: ScopedSessionDep, limit: int = 100):
     try:
         ScheduleService(scoped).get_schedule(schedule_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     runs = ScheduleRunService(scoped).list_runs(schedule_id, limit=limit)
-    return {"runs": [ScheduleRunResponse.serialize(r) for r in runs]}
+    return {"runs": [_serialize_run(r) for r in runs]}

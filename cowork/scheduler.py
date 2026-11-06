@@ -343,29 +343,56 @@ class _RunOutcome:
 
 @dataclass(frozen=True)
 class _TurnEvidence:
-    """How the turn that just ended went: its terminal reason, and whether its
-    stream shows anything the agent did."""
+    """How the turn that just ended went: its terminal reason, whether its
+    stream shows anything the agent did, and what its last failure frame told
+    the user."""
 
     reason: str | None
     acted: bool
     shutdown_interrupted: bool = False
+    failure: str | None = None
 
 
-def _classify(evidence: _TurnEvidence) -> AttemptOutcome:
-    """What the turn's ending says about whether its agent acted. When in
-    doubt it says the agent may have."""
+@dataclass(frozen=True)
+class _AttemptEnd:
+    """How a run's turn ended, by what is known of its execution, and what to
+    tell the user about it."""
+
+    outcome: AttemptOutcome
+    error: str | None = None
+
+
+_INTERRUPTED_TURN_ERROR = (
+    "Run was interrupted before it finished. Some of its actions may have completed — "
+    "open the run to check before running it again."
+)
+_FAILED_DURING_ERROR = "Run did not complete — open the run's task for details."
+_FAILED_BEFORE_ERROR = "Run failed before it started work — open the run's task for details."
+_EVIDENCE_READ_TIMEOUT_SECONDS = 5
+
+_UNCERTAIN_ERROR = (
+    "Run ended without a record of how it finished. Open the run to check what it did "
+    "before running it again."
+)
+
+
+def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
+    """What the turn's ending says about whether its agent acted, and what to
+    tell the user: the turn's own failure text when it gave one. When in doubt
+    it says the agent may have acted."""
     reason = evidence.reason
     if reason == "completed":
-        return AttemptOutcome.completed
+        return _AttemptEnd(outcome=AttemptOutcome.completed)
     if reason == "cancelled":
-        return AttemptOutcome.cancelled
+        return _AttemptEnd(outcome=AttemptOutcome.cancelled)
     if reason in ("interrupted", "restart"):
-        return AttemptOutcome.interrupted
+        return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_INTERRUPTED_TURN_ERROR)
     if reason is None:
-        return AttemptOutcome.uncertain
+        return _AttemptEnd(outcome=AttemptOutcome.uncertain, error=_UNCERTAIN_ERROR)
+    told = evidence.failure
     if not evidence.acted:
-        return AttemptOutcome.failed_before_execution
-    return AttemptOutcome.failed_during_execution
+        return _AttemptEnd(outcome=AttemptOutcome.failed_before_execution, error=told or _FAILED_BEFORE_ERROR)
+    return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=told or _FAILED_DURING_ERROR)
 
 
 def _create_run(
@@ -498,7 +525,7 @@ def _delete_unstarted_conversation(
 
 
 def _record_turn_outcome(
-    session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
+    session: ScopedSession, *, schedule_id: UUID, end: _AttemptEnd, is_manual: bool, conversation_id: UUID,
     shutdown_interrupted: bool = False,
 ) -> _RunOutcome:
     schedule_service = ScheduleService(session)
@@ -506,14 +533,17 @@ def _record_turn_outcome(
     # Read again: the schedule may have changed while the turn ran.
     schedule = schedule_service.get_schedule(schedule_id)
     outcome = _RunOutcome()
-    if reason == "cancelled":
+    if end.outcome == AttemptOutcome.cancelled:
         outcome = _RunOutcome(status=RunStatus.cancelled)
         logger.info("Schedule run cancelled", extra={"event": "schedule_cancelled", "schedule_id": schedule_id})
-    elif reason is not None and reason != "completed":
-        outcome = _RunOutcome(
-            status=RunStatus.failed,
-            error="Run did not complete — open the run's task for details.",
-        )
+    elif end.outcome != AttemptOutcome.completed:
+        # Any other ending is a failure, an uncertain one included: a turn
+        # with no record of how it ended is not a success anyone can vouch
+        # for, so it neither suppresses the next slot nor ends a failure
+        # streak. It doesn't extend the streak either: an unreadable record
+        # says nothing about the task, and auto-pause is for tasks that keep
+        # failing.
+        outcome = _RunOutcome(status=RunStatus.failed, error=end.error or _FAILED_DURING_ERROR)
         schedule.last_error = outcome.error
         session.add(schedule)
     else:
@@ -526,12 +556,12 @@ def _record_turn_outcome(
         # wouldn't block the restart).
         if not is_manual:
             _advance_next_run_at(schedule, session)
-            if outcome.status == RunStatus.failed and not shutdown_interrupted:
+            if outcome.status == RunStatus.failed and end.outcome != AttemptOutcome.uncertain and not shutdown_interrupted:
                 count_settled_slot(session, schedule_id, failed=True)
         if outcome.status is None:
             # A success of either kind ends the failure streak.
             count_settled_slot(session, schedule_id, failed=False)
-        if schedule.cadence == Cadence.once and (not is_manual or reason == "completed"):
+        if schedule.cadence == Cadence.once and (not is_manual or end.outcome == AttemptOutcome.completed):
             # Cron consumes its slot, but Run now uses a one-off up only on
             # confirmed completion. Other endings preserve its prior state.
             schedule.enabled = False
@@ -556,9 +586,12 @@ def _record_turn_outcome(
     return outcome
 
 
-def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool) -> bool:
+def _record_schedule_error(
+    session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool, counts_toward_streak: bool = True,
+) -> bool:
     """Record a run's error on its schedule. Returns whether it consumed the
-    cron slot."""
+    cron slot. ``counts_toward_streak`` False (an uncertain ending) uses the
+    slot up without extending the failure streak."""
     schedule = ScheduleService(session).get_schedule(schedule_id)
     schedule.last_error = error
     session.add(schedule)
@@ -570,7 +603,8 @@ def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: 
         _advance_next_run_at(schedule, session)
         # Only a cron run consumes its slot, so this is a cron slot settling
         # failed.
-        count_settled_slot(session, schedule_id, failed=True)
+        if counts_toward_streak:
+            count_settled_slot(session, schedule_id, failed=True)
     return consumed
 
 
@@ -673,6 +707,8 @@ async def execute_schedule(
     created_conversation = conversation_id is None
     turn_started = False
     timed_out = False
+    end: _AttemptEnd | None = None
+    shutdown_interrupted = False
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -760,10 +796,12 @@ async def execute_schedule(
         # and whether its agent acted — without them every run is recorded as
         # success.
         evidence = await _turn_evidence(str(conversation_id))
-        outcome = _classify(evidence)
+        shutdown_interrupted = evidence.shutdown_interrupted
+        end = _classify(evidence)
+        outcome = end.outcome
         recorded = await _until_it_lands(
             partial(
-                _record_turn_outcome, schedule_id=schedule_id, reason=evidence.reason,
+                _record_turn_outcome, schedule_id=schedule_id, end=end,
                 shutdown_interrupted=evidence.shutdown_interrupted,
                 is_manual=is_manual, conversation_id=conversation_id,
             ),
@@ -790,14 +828,16 @@ async def execute_schedule(
         outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
         raise
     except Exception as exc:
-        error = str(exc)
         # The ids travel as record attributes: a database error's sanitized
         # line keeps those and drops the message.
         logger.exception(
-            "Schedule run failed: %s", error,
+            "Schedule run failed: %s", str(exc),
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
-        if timed_out:
+        if end is not None and end.outcome not in {AttemptOutcome.completed, AttemptOutcome.cancelled}:
+            # A bookkeeping failure must not erase an already observed failure.
+            outcome = end.outcome
+        elif timed_out:
             outcome = AttemptOutcome.interrupted
         elif not turn_started:
             outcome = AttemptOutcome.failed_before_execution
@@ -805,6 +845,13 @@ async def execute_schedule(
             # The turn was handed off and something failed around it: it may
             # have acted.
             outcome = AttemptOutcome.uncertain
+        error = {
+            AttemptOutcome.failed_before_execution: _FAILED_BEFORE_ERROR,
+            AttemptOutcome.failed_during_execution: _FAILED_DURING_ERROR,
+            AttemptOutcome.interrupted: _INTERRUPTED_TURN_ERROR,
+        }.get(outcome, _UNCERTAIN_ERROR)
+        if end is not None and end.error:
+            error = end.error
         # A run that raised consumes its cron slot like one that failed inside
         # its turn. Left due, the next poll starts it again, and a failure that
         # repeats (a timeout, a revoked permission) re-fires every poll. A busy
@@ -817,6 +864,14 @@ async def execute_schedule(
                 partial(
                     _record_schedule_error, schedule_id=schedule_id, error=error,
                     consume_slot=not is_manual and not transient,
+                    counts_toward_streak=(
+                        outcome in {
+                            AttemptOutcome.failed_before_execution,
+                            AttemptOutcome.failed_during_execution,
+                            AttemptOutcome.interrupted,
+                        }
+                        and not shutdown_interrupted
+                    ),
                 ),
                 schedule_id=schedule_id,
             )
@@ -878,16 +933,17 @@ async def _turn_terminal_reason(conversation_id: str) -> str | None:
     """Terminal reason ("completed" | "cancelled" | "error" | …) of the turn
     that just ended on this conversation, or None when unavailable.
 
-    Only call after the turn's stream has been fully drained: the buffer is
-    closed then, so tailing from the last record returns immediately."""
+    Only call after the turn's stream has been fully drained. The terminal
+    record is authoritative; the local is_closed flag can lag its publication."""
     handle = registry.get(conversation_id)
-    if handle is None or not handle.buffer.is_closed:
+    if handle is None:
         return None
     try:
         buffer = handle.buffer
-        async for rec in buffer.tail(max(buffer.latest_seq - 1, 0)):
-            if rec.is_terminal:
-                return str(rec.data.get("reason") or "") or None
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in buffer.tail(max(buffer.latest_seq - 1, 0)):
+                if rec.is_terminal:
+                    return str(rec.data.get("reason") or "") or None
     except Exception:
         logger.exception(
             "Could not read conversation terminal state",
@@ -925,6 +981,12 @@ def _frame_shows_action(event: str, data: dict) -> bool:
     return not (event == "response.in_progress" and data.get("phase") == MODEL_WAIT_PHASE)
 
 
+def _failure_from_frame(data: dict) -> str | None:
+    """What a response.failed frame told the user."""
+    message = data.get("error")
+    return message.strip() or None if isinstance(message, str) else None
+
+
 async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
     """How the turn that just ended on this conversation went: its terminal
     reason (_turn_terminal_reason), and whether its agent acted."""
@@ -938,37 +1000,49 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         and bool(getattr(lifecycle, "shutting_down", False))
         and not bool(getattr(lifecycle, "timed_out", False))
     )
+    acted, failure = await _turn_activity(conversation_id)
     return _TurnEvidence(
         reason=reason,
-        acted=await _turn_acted(conversation_id),
+        acted=acted,
+        failure=failure,
         shutdown_interrupted=shutdown_interrupted,
     )
 
 
-async def _turn_acted(conversation_id: str) -> bool:
+async def _turn_activity(conversation_id: str) -> tuple[bool, str | None]:
     """Whether the turn's buffer holds anything beyond its start, its memory
-    read, a wait for the model and its failure. True when the buffer is
-    unavailable, and a record that is not a stream frame counts as action, so
-    a doubt never reads as the agent having done nothing.
+    read, a wait for the model and its failure, and the last failure frame it
+    holds. Acted when the buffer is unavailable, and a record that is not a
+    stream frame counts as action, so a doubt never reads as the agent having
+    done nothing. The failure is read in the same pass, to the terminal
+    record, whether or not the turn acted.
 
-    Only call after the turn's stream has been fully drained: the buffer is
-    closed then, so reading it returns at the terminal record."""
+    Only call after the turn's stream has been fully drained. Read through the
+    terminal record even if the local seal flag has not caught up yet."""
     handle = registry.get(conversation_id)
-    if handle is None or not handle.buffer.is_closed:
-        return True
+    if handle is None:
+        return True, None
+    acted = False
+    failure: str | None = None
     try:
-        async for rec in handle.buffer.tail(0):
-            if rec.is_terminal:
-                return False
-            frames = _sse_frames(rec)
-            if not frames or any(_frame_shows_action(event, data) for event, data in frames):
-                return True
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    return acted, failure
+                frames = _sse_frames(rec)
+                if not frames:
+                    acted = True
+                for event, data in frames:
+                    if event == "response.failed":
+                        failure = _failure_from_frame(data)
+                    elif _frame_shows_action(event, data):
+                        acted = True
     except Exception:
         logger.exception(
             "Could not read the turn's records",
             extra=log_context(conversation_id=conversation_id)
         )
-    return True
+    return True, failure
 
 
 def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: datetime) -> bool:

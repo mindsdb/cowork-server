@@ -603,10 +603,10 @@ async def test_only_known_shutdown_interruptions_leave_failure_streak_unchanged(
         return reason
 
     async def acted(_id):
-        return True
+        return True, None
 
     monkeypatch.setattr(scheduler, "_turn_terminal_reason", terminal)
-    monkeypatch.setattr(scheduler, "_turn_acted", acted)
+    monkeypatch.setattr(scheduler, "_turn_activity", acted)
     monkeypatch.setattr(scheduler, "_turn_evidence", turns.read_evidence)
     (due,) = _poll(schedule_id)
     await _run(due)
