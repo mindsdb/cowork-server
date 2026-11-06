@@ -2,7 +2,7 @@
 
 A project is shared by the organization but a conversation workspace under it is
 private to whoever created it, and artifact bytes live inside that workspace
-(`artifact_roots._project_artifact_bases`, ENG-1910). So org membership alone
+(`artifact_roots.plan_project_roots`, ENG-1910). So org membership alone
 cannot be what lets a co-member read a draft — otherwise every artifact of every
 chat would be readable by the whole organization, which is the case that fix
 closed.

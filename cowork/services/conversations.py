@@ -566,8 +566,10 @@ class ConversationService:
         the ids.
 
         Same rule as `_owned`, batched. The artifact roots resolver reads it
-        once per request, before it walks any project's workspaces, so a
-        listing over every project runs one query, not one per project.
+        once per request, before it walks the file store, so a listing over
+        every project runs one query, not one per project. The query can name
+        neither the directories it will find nor their project: a task moved
+        to another project keeps its workspace directory under the old one.
         """
         stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:

@@ -5,9 +5,12 @@ installation — so plugins that don't participate (today: everyone but Slack)
 are completely unaffected."""
 from __future__ import annotations
 
+import asyncio
+import gc
 import hashlib
 import hmac
 import json
+import logging
 import time
 
 import pytest
@@ -15,14 +18,19 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
+from cowork.channels import webhooks
 from cowork.channels.plugin import ChannelPlugin, CredentialSchema
 from cowork.channels.registry import PluginRegistry
 from cowork.channels.runtime import LiveAdapterRegistry
 from cowork.channels.webhooks import build_channel_webhook_router, intake_events, resolve_bridge
+from cowork.common import chat_session
+from cowork.common.chat_session import close_session_scratchpads, drain_scratchpad_closes
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
+from cowork.db.units import run_efs, run_to_completion
 from cowork.services.channel_events import ChannelEventService
 from cowork.services.channels import ChannelConfigService
+from tests._logging_assertions import assert_log_fields
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -319,3 +327,138 @@ async def test_local_mode_webhook_falls_through_to_local_bridge_end_to_end():
         finally:
             session.close()
         _delete_channel_events("slack:event:Ev0001")
+
+
+def test_the_shutdown_drain_lets_a_cancelled_turn_unwind_before_the_event_loop_closes(
+    monkeypatch, caplog,
+):
+    """A channel turn cancelled at the drain's timeout still writes the
+    controller's cancel flag, records its artifacts on the file store and
+    queues its scratchpad close. The teardown after the drain can end at once,
+    and the event loop's close then cancels anything still running a second
+    time, so the drain waits for that unwind rather than returning at the
+    cancel."""
+    monkeypatch.setattr(webhooks, "_background_tasks", set())
+    monkeypatch.setattr(chat_session, "_scratchpad_closes", set())
+    happened: list[str] = []
+
+    class _Scratchpads:
+        async def close_all(self):
+            await asyncio.sleep(0.01)
+            happened.append("scratchpads closed")
+
+    class _ChatSession:
+        _scratchpads = _Scratchpads()
+
+    async def channel_turn():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.01)
+            happened.append("cancel flag written")
+            raise
+        finally:
+            close_session_scratchpads(_ChatSession(), owner="a channel turn")
+            await run_to_completion(run_efs(
+                lambda: happened.append("artifacts recorded"), scope=LOCAL_SCOPE, deadline=False,
+            ))
+
+    async def lifespan_teardown():
+        webhooks._default_scheduler(channel_turn())
+        await asyncio.sleep(0)
+        await webhooks.drain_background_tasks(timeout=0.05)
+        await drain_scratchpad_closes()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(lifespan_teardown())
+
+    assert sorted(happened) == ["artifacts recorded", "cancel flag written", "scratchpads closed"]
+    assert [
+        (r.event, r.count) for r in caplog.records if r.name == webhooks.log.name
+    ] == [("shutdown_channel_tasks_cancelled", 1)]
+    assert not [r for r in caplog.records if r.name == chat_session.logger.name]
+
+
+async def test_the_shutdown_drain_gives_up_on_a_task_that_waits_out_its_cancel(
+    monkeypatch, caplog, owned_logger,
+):
+    """A channel turn's end-of-turn bookkeeping runs under run_to_completion,
+    so a cancel waits until that work ends, which a file store stall can hold
+    off with no bound. The drain cancels the turn at its timeout, waits
+    cancel_timeout for it to end, then returns without it, so the teardown
+    steps after the drain still run: the drain takes timeout plus
+    cancel_timeout, never more."""
+    logged = owned_logger(webhooks.log.name, level=logging.WARNING)
+    monkeypatch.setattr(webhooks, "_background_tasks", set())
+    bookkeeping_may_end = asyncio.Event()
+
+    async def channel_turn():
+        await run_to_completion(bookkeeping_may_end.wait())
+
+    webhooks._default_scheduler(channel_turn())
+    (turn,) = webhooks._background_tasks
+    timeout, cancel_timeout = 0.2, 0.3
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    drain = asyncio.create_task(
+        webhooks.drain_background_tasks(timeout=timeout, cancel_timeout=cancel_timeout)
+    )
+    try:
+        await asyncio.wait([drain], timeout=2)
+        assert drain.done(), "the drain waited for a task that waits out its cancel"
+        waited = loop.time() - started
+        assert timeout + cancel_timeout - 0.02 <= waited < timeout + cancel_timeout + 0.5, (
+            f"the drain returned after {waited:.2f}s"
+        )
+        assert turn.cancelling(), "the drain left the task running without cancelling it"
+        assert not turn.done()
+    finally:
+        bookkeeping_may_end.set()
+        await asyncio.wait([drain, turn], timeout=5)
+
+    assert turn.cancelled(), "the task did not end cancelled once its bookkeeping ended"
+    records = [
+        r for r in caplog.records
+        if r.name == webhooks.log.name and r.levelno == logging.WARNING
+    ]
+    assert [(r.event, r.count) for r in records] == [
+        ("shutdown_channel_tasks_cancelled", 1),
+        ("shutdown_channel_tasks_unfinished", 1),
+    ]
+    assert_log_fields(logged.output(), event="shutdown_channel_tasks_cancelled", count=1)
+    assert_log_fields(logged.output(), event="shutdown_channel_tasks_unfinished", count=1)
+
+
+async def test_the_shutdown_drain_waits_for_tasks_that_finish_and_raises_none_of_their_failures(
+    monkeypatch, caplog,
+):
+    """A task that ends within the timeout is waited for. One that raised
+    neither fails the drain nor logs a cancel, and the drain retrieves its
+    failure, so asyncio does not log it as never retrieved once the task is
+    collected."""
+    monkeypatch.setattr(webhooks, "_background_tasks", set())
+    finished: list[str] = []
+
+    async def quick_turn():
+        await asyncio.sleep(0.05)
+        finished.append("quick")
+
+    async def failing_turn():
+        await asyncio.sleep(0.05)
+        raise RuntimeError("adapter send failed")
+
+    webhooks._default_scheduler(quick_turn())
+    webhooks._default_scheduler(failing_turn())
+    tasks = list(webhooks._background_tasks)
+    with caplog.at_level(logging.WARNING, logger=webhooks.log.name):
+        await webhooks.drain_background_tasks(timeout=2)
+
+    assert finished == ["quick"]
+    assert all(task.done() for task in tasks)
+    assert not [r for r in caplog.records if r.name == webhooks.log.name]
+    del tasks
+    gc.collect()
+    assert not [
+        r for r in caplog.records
+        if r.name == "asyncio" and "Task exception was never retrieved" in r.getMessage()
+    ]

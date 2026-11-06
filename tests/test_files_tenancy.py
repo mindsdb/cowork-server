@@ -317,10 +317,38 @@ def _upload(name: str, data: bytes = b"x") -> UploadFile:
     return UploadFile(file=io.BytesIO(data), filename=name)
 
 
+@pytest.mark.parametrize("busy", ["file_store", "database"])
+async def test_compat_upload_leaves_a_busy_store_to_the_503_handlers(units_read_engine, monkeypatch, busy):
+    # A busy file store or database must reach the app-level handlers, which
+    # answer 503 with Retry-After, not the upload's generic 500.
+    import cowork.db.session as db_session
+    from cowork.api.v1.endpoints.compat import stubs
+    from cowork.db import units
+    from cowork.db.units import DatabaseBusy, FilesystemBusy
+    from test_run_efs import holding
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    scoped = ScopedSession(Session(units_read_engine), _scope(ORG_A))
+
+    def upload():
+        return stubs.upload_attachment("general", str(uuid4()), scoped=scoped, files=[_upload("notes.txt")])
+
+    if busy == "file_store":
+        async with holding(units.EFS_SLOTS, LOCAL_SCOPE):
+            with pytest.raises(FilesystemBusy):
+                await upload()
+    else:
+        # The bytes are written, then the row's unit waits for SQLite's one slot.
+        async with units._slots(units_read_engine):
+            with pytest.raises(DatabaseBusy):
+                await upload()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["../../../../etc/pwned", "/etc/cron.d/pwned", ".."])
-async def test_upload_filename_cannot_escape_root(engine, tmp_path, name):
-    svc = _svc(engine, _scope(ORG_A))
+async def test_upload_filename_cannot_escape_root(units_read_engine, tmp_path, name):
+    # The upload's row is written in a database unit, on the app's engine.
+    svc = _svc(units_read_engine, _scope(ORG_A))
     res = await svc.create_file(_upload(name), purpose="assistants")
     stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
     # org-first layout: bytes contained under <shared>/<org>/files

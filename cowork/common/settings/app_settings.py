@@ -314,7 +314,17 @@ def _env_file_chain() -> list[str]:
 
     COWORK_HOME is read at import; the desktop app sets it before the server
     process starts, so an isolated build reads its own .env.
+
+    Org tenancy reads no ``<COWORK_HOME>/.env``. There COWORK_HOME is the
+    shared file store, an NFS mount, the pod's environment carries the whole
+    configuration, and the file does not exist. pydantic-settings stats each
+    file in the chain on every construction, before any source hook runs, so
+    each ``Settings()`` and ``UserSettings(**data)`` would otherwise ask the
+    file server about a missing file, and a slow file server would slow every
+    one of them.
     """
+    if os.environ.get("COWORK_TENANCY_MODE") == "org":
+        return [".env"]
     files = [str(cowork_home() / ".env"), ".env"]
     if not os.environ.get("COWORK_HOME"):
         # Prod (default home) still consults the legacy file, ordered BEFORE

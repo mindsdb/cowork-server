@@ -171,10 +171,16 @@ deployment:
   #           own drain when COWORK_DRAFT_PORT is set (2 s,
   #           cowork/draft_host/listener.py), another pass over turns (5 s),
   #           channel tasks (3 s, then up to 5 s more while each one
-  #           cancelled writes its sandbox turn's cancel flag) and scratchpad
-  #           closes (5 s).
+  #           cancelled writes its sandbox turn's cancel flag and records its
+  #           artifacts) and scratchpad closes (5 s).
   # About 42 s in all, so 60 s leaves room for the unbounded closes at the end
-  # of teardown before the kubelet's SIGKILL.
+  # of teardown before the kubelet's SIGKILL. During a file store stall the
+  # teardown waits for no turn past those bounds. The event loop's close then
+  # cuts an artifact diff that has not returned, so that turn's artifact rows
+  # are lost. A web answer still streaming at SIGTERM is saved anyway,
+  # marked turn_lost; one whose pod had finished starts its save only as the loop
+  # closes, and that save may not finish. A file store call already running
+  # on the stuck mount keeps the process alive until the SIGKILL.
   terminationGracePeriodSeconds: 60
 
   lifecycle:
@@ -218,9 +224,17 @@ deployment:
   # Liveness restarts the pod if it fails. Kept tolerant (failureThreshold * periodSeconds = 60s)
   # so a transient stall doesn't take the pod down. Points at the zero-I/O /live
   # route so a database outage can't be misread as "this process is dead".
+  # The delay covers the boot: the lifespan does file store and database work
+  # before uvicorn binds, and on 28 Oct staging pods booting under load served
+  # their first request about 120s after start, the moment the old 60s delay
+  # plus 60s of failures killed them. With 180s a boot of up to about 230s
+  # survives: the first probe lands in [180, 190)s and the sixth failure 50s
+  # later. startup_finished logs each boot's length from process start. The
+  # deployment subchart renders no startupProbe, so the delay is the one
+  # setting that holds a slow boot.
   livenessProbe:
     enabled: true
-    initialDelaySeconds: 60
+    initialDelaySeconds: 180
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 6
@@ -228,13 +242,16 @@ deployment:
 
   # Readiness gates traffic. Polls quickly so the pod returns to service fast after a hiccup.
   # failureThreshold * periodSeconds = 15s before the pod is pulled from endpoints.
+  # Points at /ready, which reads no database, file store or settings: a full
+  # pool or a slow file store would otherwise fail readiness on every replica
+  # at once and leave nginx with no upstream.
   readinessProbe:
     enabled: true
     initialDelaySeconds: 15
     periodSeconds: 5
     timeoutSeconds: 4
     failureThreshold: 3
-    path: /api/v1/health/
+    path: /api/v1/health/ready
 
   # deployment container resource requests/limits
   # Limits are HARD limits; Requests are "soft" and drive HPA aggressiveness when enabled.

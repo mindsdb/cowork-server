@@ -128,7 +128,7 @@ def publish_key(monkeypatch):
 async def test_list_returns_own_org_artifacts(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A))
+    cards = await ep.list_artifacts(_scoped(session, ORG_A), project_id=None, project_path=None)
 
     assert "dash" in [c["slug"] for c in cards]
 
@@ -137,13 +137,14 @@ async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="theirs", org_id=ORG_B, slug="secret")
 
-    slugs = [c["slug"] for c in ep.artifacts_for_request(_scoped(session, ORG_A))]
+    cards = await ep.list_artifacts(_scoped(session, ORG_A), project_id=None, project_path=None)
+    slugs = [c["slug"] for c in cards]
 
     assert "dash" in slugs          # not vacuously empty
     assert "secret" not in slugs
 
 
-def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode):
+async def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode):
     """Same org, different chat, LEGACY layout. Artifacts written before
     ENG-2056 live inside a conversation workspace, so they inherit that
     conversation's privacy. New artifacts land in the shared project base and
@@ -162,17 +163,20 @@ def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode
         session, tmp_path, name="also-mine", org_id=ORG_A, slug="mine", owner=USER_A
     )
 
-    slugs = [c["slug"] for c in ep.artifacts_for_request(_scoped(session, ORG_A, USER_A))]
+    cards = await ep.list_artifacts(
+        _scoped(session, ORG_A, USER_A), project_id=None, project_path=None
+    )
+    slugs = [c["slug"] for c in cards]
 
     assert "mine" in slugs
     assert "theirs" not in slugs
 
 
-def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
+async def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
     row, _ = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="other", org_id=ORG_A, slug="second")
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)
+    cards = await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None)
 
     assert [c["slug"] for c in cards] == ["dash"]
 
@@ -181,7 +185,7 @@ async def test_list_by_foreign_project_id_is_404(session, tmp_path, org_mode):
     row, _ = _project_with_artifact(session, tmp_path, name="theirs", org_id=ORG_B, slug="secret")
 
     with pytest.raises(HTTPException) as err:
-        ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)
+        await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None)
 
     assert err.value.status_code == 404
 
@@ -190,7 +194,7 @@ async def test_list_rejects_project_path_in_org_mode(session, tmp_path, org_mode
     row, _ = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
     with pytest.raises(HTTPException) as err:
-        ep.artifacts_for_request(_scoped(session, ORG_A), project_path=row.path)
+        await ep.list_artifacts(_scoped(session, ORG_A), project_id=None, project_path=row.path)
 
     assert err.value.status_code == 400
 
@@ -199,7 +203,7 @@ async def test_list_merges_projects_and_labels_them(session, tmp_path, org_mode)
     _project_with_artifact(session, tmp_path, name="alpha", org_id=ORG_A, slug="one")
     _project_with_artifact(session, tmp_path, name="beta", org_id=ORG_A, slug="two")
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A))
+    cards = await ep.list_artifacts(_scoped(session, ORG_A), project_id=None, project_path=None)
     labels = {c["slug"]: c["projectName"] for c in cards}
 
     assert labels["one"] == "alpha"
@@ -220,7 +224,7 @@ async def test_list_is_capped_at_eighty(session, tmp_path, org_mode):
             json.dumps({"slug": f"a-{i:03d}", "type": "html-app"})
         )
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)
+    cards = await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None)
 
     assert len(cards) == 80
 
@@ -228,7 +232,7 @@ async def test_list_is_capped_at_eighty(session, tmp_path, org_mode):
 async def test_card_omits_owner_side_access_fields_in_org_mode(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
-    card = (ep.artifacts_for_request(_scoped(session, ORG_A)))[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A), project_id=None, project_path=None))[0]
 
     assert "accessPassword" not in card
     assert "accessEmails" not in card
@@ -293,7 +297,9 @@ async def test_a_desktop_card_says_who_a_restricted_artifact_reaches(session, tm
     row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="draft")
     _published(folder, **_OWNER_ONLY)
 
-    [card] = ep.artifacts_for_request(ScopedSession(session, LOCAL_SCOPE), project_id=row.id)
+    [card] = await ep.list_artifacts(
+        ScopedSession(session, LOCAL_SCOPE), project_id=row.id, project_path=None
+    )
 
     assert (card["accessMode"], card["accessEmails"], _audience(card)) == (
         "restricted", [], (False, True, [], []),
@@ -332,7 +338,7 @@ async def test_card_has_one_identity_for_draft_and_comments(session, tmp_path, o
         session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
     )
 
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None))[0]
     artifact_id = card["id"]
 
     assert UUID(artifact_id).hex == artifact_id
@@ -355,7 +361,7 @@ async def test_org_source_read_and_manual_edit_are_project_scoped(
     row, folder = _project_with_artifact(
         session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
     )
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None))[0]
 
     source = await workspace_ep.artifact_source(
         str(row.id), card["id"], _scoped(session, ORG_A), path="index.html"
@@ -380,7 +386,7 @@ async def test_org_source_read_cannot_cross_org(session, tmp_path, org_mode):
     row, _folder = _project_with_artifact(
         session, tmp_path, name="theirs", org_id=ORG_B, slug="secret"
     )
-    card = ep.artifacts_for_request(_scoped(session, ORG_B), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_B), project_id=row.id, project_path=None))[0]
 
     # A raw SQLAlchemy session is intentionally single-tenant once wrapped.
     # Use another request-like session for the foreign caller.
@@ -403,7 +409,7 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
     row, folder = _project_with_artifact(
         session, tmp_path, name="mine", org_id=org_id, slug=slug
     )
-    card = ep.artifacts_for_request(_scoped(session, org_id), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, org_id), project_id=row.id, project_path=None))[0]
 
     async def fake_provision(*_args, **_kwargs):
         return card["artifactKey"]
@@ -487,7 +493,7 @@ async def test_a_comparison_sides_draft_is_never_opened_to_the_org(session, tmp_
     row, folder = _project_with_artifact(
         session, tmp_path, name=f"{COMPARISON_SANDBOX_PREFIX}{'c' * 32}", org_id=ORG_A, slug="dash"
     )
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None))[0]
     provisioned = []
 
     async def fake_provision(*args, **kwargs):
@@ -546,7 +552,7 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
         "type": "fullstack-stateless-app",
         "primary": "static/index.html",
     }))
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None))[0]
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         asset = await workspace_ep.serve_private_draft(
@@ -574,7 +580,7 @@ async def test_fullstack_draft_preview_refuses_a_root_level_primary(
         "type": "fullstack-stateless-app",
         "primary": "index.html",
     }))
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A), project_id=row.id, project_path=None))[0]
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         with pytest.raises(HTTPException) as err:
@@ -947,9 +953,9 @@ async def test_desktop_project_id_filter_keeps_project_addressed_cards(
         session, tmp_path, name="mine", org_id=None, slug="dash"
     )
 
-    card = ep.artifacts_for_request(
-        ScopedSession(session, LOCAL_SCOPE), project_id=row.id
-    )[0]
+    card = (await ep.list_artifacts(
+        ScopedSession(session, LOCAL_SCOPE), project_id=row.id, project_path=None
+    ))[0]
 
     assert card["projectId"] == str(row.id)
     assert card["draftUrl"].startswith(
@@ -980,8 +986,8 @@ async def test_desktop_project_path_narrows_to_that_project(
         ],
     )
 
-    cards = ep.artifacts_for_request(
-        ScopedSession(session, LOCAL_SCOPE), project_path=str(mine_project_dir),
+    cards = await ep.list_artifacts(
+        ScopedSession(session, LOCAL_SCOPE), project_id=None, project_path=str(mine_project_dir)
     )
 
     assert [c["slug"] for c in cards] == ["dash"]
@@ -1001,8 +1007,8 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
         ],
     )
 
-    cards = ep.artifacts_for_request(
-        ScopedSession(session, LOCAL_SCOPE), project_path="/nowhere/at/all",
+    cards = await ep.list_artifacts(
+        ScopedSession(session, LOCAL_SCOPE), project_id=None, project_path="/nowhere/at/all"
     )
 
     assert cards == []
