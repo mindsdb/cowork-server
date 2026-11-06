@@ -113,9 +113,17 @@ inference Service by name, and the same in every environment.
 Turn the switches on only after auth serves the datasource endpoints with the
 bundle above, mindshub_inference serves `/v1/datasources/`, and a scratchpad
 image with the datasource helper is deployed and older pods are recycled.
-Rollback is `datasourceTurnsEnabled` off: no new grants are registered and no
-datasource block is queued; encrypted records stay in auth and OAuth
-connections are unaffected.
+Rollback removes both `datasourceTurnsEnabled` and `datasourceCapabilities`
+from the environment's values file, and drops the environment from both
+`ENABLED_ENVIRONMENTS` and `OFFERED_METHODS` in `tests/test_chart_values.py`
+in the same change; the test expects both keys absent, not `"false"`, outside
+enabled environments. Rolling back one engine instead drops only its pair
+(`mysql:host-password` or `postgres:host-port`) from `datasourceCapabilities`
+and from that environment's `OFFERED_METHODS` entry.
+Without grants no datasource block is queued, and without the capability list
+no new connection is accepted or edited through this server. Encrypted records
+stay in auth, where users can still delete them, and OAuth connections are
+unaffected.
 
 ## Required cluster permissions
 
@@ -172,6 +180,25 @@ Desktop and other non-hosted deployments are unchanged. They run turns in the
 server's own process, keep uvicorn's SIGTERM handling, and end their turns in
 the lifespan teardown, as before. A single-replica PR environment renders these
 values too, and they change only how its pod stops.
+
+## The agent's browser
+
+`COWORK_BROWSER_ROUTER_URL` turns on the agent's browser for the web app: it
+names the browser router, served on the same host under `/browser`.
+`values-dev.yaml` and `values-staging.yaml` set it to their own host.
+`values-prod.yaml` sets none, so production offers no browser and makes no
+browser call; add the entry there only once the production router answers on
+`https://cowork.mindshub.ai/browser`, since until then that path reaches the
+web frontend. PR environments get theirs from where they are deployed.
+`tests/test_chart_values.py` pins each value to its environment's host. What
+the router does with it is in the top-level README ("The agent's browser").
+
+`COWORK_BROWSER_SCOPE_KEY` comes from the router's own Secret, `browser-proxy`,
+key `scope_key`, in the same namespace (`values.yaml`). The router takes a
+turn key's scope only with that key beside it, so the two must match, and
+reading one Secret keeps them so. The reference is optional: an environment
+with no router has no such Secret and scopes no turn. cowork-server reads the
+value at start, so restart it once the Secret first appears.
 
 ## Browser organization boundary
 

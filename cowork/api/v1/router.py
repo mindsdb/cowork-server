@@ -14,6 +14,7 @@ from cowork.api.v1.endpoints import (
     capabilities,
     channels,
     comments,
+    comparisons,
     coding,
     coding_personal_skills,
     coding_runtime,
@@ -89,6 +90,7 @@ api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
 # The sharing routes first: GET /skills/sharing-capabilities must match before
 # the skills router's GET /skills/{skill_id} reads it as a skill's id.
 api_router.include_router(skill_sharing.router, prefix="/skills", tags=["skills"])
+api_router.include_router(comparisons.router, prefix="/comparisons", tags=["comparisons"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])

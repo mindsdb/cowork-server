@@ -36,6 +36,7 @@ from cowork.turnqueue.auth_keys import (
     mint_turn_key,
     mint_turn_key_details,
     register_datasource_grants,
+    revoke_turn_key,
 )
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
@@ -469,6 +470,7 @@ def step_stream_events(data: dict) -> list:
         LLMResponse,
         StreamAskUser,
         StreamAskUserAnswered,
+        StreamBrowserSession,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -512,23 +514,15 @@ def step_stream_events(data: dict) -> list:
     if step == "compacted":
         return [StreamContextCompacted(message=data.get("message") or "")]
     if step == "browser":
-        # The agent opened the user's browser (ENG-3298). Guarded: an anton
-        # without the browser tool has no such event and never sends one.
-        try:
-            from anton.core.llm.provider import StreamBrowserSession
-        except ImportError:
+        # The agent opened the person's browser session. Its id only: any
+        # other field the line carries, a viewer link included, is dropped,
+        # so nothing that opens the browser is ever stored with the turn.
+        from cowork.services.browser_contract import SESSION_ID
+
+        session_id = data.get("session_id")
+        if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
             return []
-        view_url = data.get("view_url")
-        # https only, standalone mode included: an http service is a
-        # localhost one, which a pod can't reach anyway.
-        if not isinstance(view_url, str) or not view_url.startswith("https://"):
-            return []
-        expires_at = data.get("expires_at")
-        return [StreamBrowserSession(
-            session_id=str(data.get("session_id") or ""),
-            view_url=view_url,
-            expires_at=expires_at if isinstance(expires_at, int) and not isinstance(expires_at, bool) else 0,
-        )]
+        return [StreamBrowserSession(session_id=session_id)]
     if step == "round_end":
         # Only stop_reason and tool_calls truthiness drive the formatter's
         # round-break decision; a placeholder call carries the truthiness.
@@ -574,6 +568,43 @@ def step_stream_events(data: dict) -> list:
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
+
+
+async def _scoped_browser_block(
+    *, scope, conversation_id: str, turn_key: str, project_id: str | None,
+) -> dict | None:
+    """The job's browser block, or None when the turn gets no browser.
+
+    Wherever the web has a router, every turn's key is scoped with it before
+    the job is queued, since the router turns a key it hasn't scoped away and
+    takes only one scope per key. A turn with a browser is scoped to the
+    task's session and the project's saved tabs, which also starts the
+    person's browser, so it is likely up by the time the agent reaches for
+    it. A turn without one (the person switched the browser off, or no person
+    stands behind the turn) is scoped to no session, so code in the turn that
+    holds its key can't scope it to a session of its own. A refused or failed
+    scope leaves the turn without a browser rather than failing it, and logs
+    ``browser_scope_failed``, the event the scope-failure alert counts.
+    """
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.services import browser
+
+    router = browser.router_url()
+    if not router or not turn_key:
+        return None
+    config = browser.turn_block(
+        get_user_settings(scope), user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id,
+    )
+    try:
+        await browser.scope_turn(turn_key=turn_key, router=router, config=config)
+    except browser.BrowserServiceError as exc:
+        logger.warning(
+            "[producer] the browser router did not scope the turn; it runs without a browser",
+            extra={"event": "browser_scope_failed", "conversation_id": conversation_id,
+                   "status_code": exc.status, "reason": exc.detail.code, "with_browser": config is not None},
+        )
+        return None
+    return config.to_dict() if config is not None else None
 
 
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
@@ -688,6 +719,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # and never reach this function at all.
     oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
     connectors_block = _connectors_block(oauth_connections)
+    browser_block = await _scoped_browser_block(
+        scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
+        project_id=workspace.project_id if workspace is not None else None,
+    )
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
@@ -698,27 +733,6 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # outside the conversation-scoped workspace mount, so send only that tier on
     # the wire. Filtering here as well as in ResponsesHandler keeps a future
     # caller from accidentally serializing private global memory into the job.
-    from cowork.common.settings.user_settings import get_user_settings
-    from cowork.services.browser import start_early, turn_block
-
-    try:
-        # One session per task, and the project's saved tabs, both keyed on
-        # the user too (their own profiles on a shared standalone service).
-        browser_settings = get_user_settings(scope)
-        browser_block = turn_block(
-            browser_settings, scope.user_id, conversation_id,
-            workspace.project_id if workspace is not None else None,
-        )
-        if browser_block:
-            # With the shared router, start the user's pod now so it is up by
-            # the time the agent reaches for it. As the caller: the router
-            # takes the turn key and resolves it to them. Not awaited.
-            start_early(browser_settings, llm_block.get("api_key", ""))
-    except Exception:
-        # A turn must not fail over the browser; it just runs without one.
-        logger.warning("[producer] could not resolve the browser block", exc_info=True)
-        browser_block = None
-
     project_memory = memory.get("project") if isinstance(memory, dict) else None
     memory_block = (
         {"project": project_memory}
@@ -726,6 +740,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         else None
     )
     workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
+    from cowork.common.settings.user_settings import get_user_settings
+    # The organization's Jev opt-out, read here so every remote turn carries
+    # it: web UI, scheduled and channel turns alike.
+    jev_decisions = getattr(get_user_settings(scope), "jev_decisions_enabled", True) is not False
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -735,6 +753,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              # False when the organization opted out of Jev: the pod's
+              # completion check then never asks it. A controller that
+              # predates the field drops it, and the pod keeps Jev on.
+              "jev_decisions": jev_decisions,
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
@@ -750,11 +772,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
-              # The user's browser, when they turned it on (ENG-3298). MindsHub
-              # mode has no credential: the pod reaches it with the `llm` turn
-              # key. Standalone mode carries the service's key as `token`, the
-              # same way `llm.api_key` and the oauth tokens ride the job, and
-              # the controller relays the block whole. Never log params.
+              # The browser router, the task's session and the project's
+              # saved-tabs key, with no credential: the pod reaches the router
+              # with the `llm` turn key, which _scoped_browser_block scoped to
+              # this session and project. Absent when the turn has no browser.
               **({"browser": browser_block} if browser_block else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
@@ -801,80 +822,111 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
-    while True:
-        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
-        if not resp:
-            # Unbounded, this loop spun forever whenever the worker was down:
-            # only a terminal reply ends the turn, so the SSE response never
-            # ended. Bound the wait and fail the turn.
-            if idle_timeout > 0 and time.monotonic() - last_reply_at > idle_timeout:
-                code, message = remote_turn_error(UNRESPONSIVE_WORKER_ERROR)
-                logger.warning(
-                    "Remote turn abandoned: no reply for %.0fs conversation=%s correlation_id=%s",
-                    idle_timeout, conversation_id, corr,
-                )
-                yield "turn_failed", {"error": UNRESPONSIVE_WORKER_ERROR,
-                                      "code": code, "message": message}
-                return
-            continue
-        for _stream, entries in resp:
-            for entry_id, fields in entries:
-                last_id = entry_id
-                if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
-                    # Skipped before its kind is validated: an earlier turn
-                    # still finishing after Stop or the idle timeout can write
-                    # a kind this build does not know, and that must not fail
-                    # this turn. Deliberately does NOT refresh the idle clock:
-                    # liveness means "this turn is progressing", and another
-                    # turn's replies say nothing about ours.
-                    continue
-                reply = TurnReply.model_validate_json(fields["payload"])
-                last_reply_at = time.monotonic()
-                kind = reply.kind
-                data = reply.data or {}
-                if kind == "progress" and data.get("phase") == "workspace_authorized":
-                    resolved_mode = data.get("workspace_mode")
-                    if (
-                        resolved_mode not in ("persistent", "ephemeral")
-                        or (workspace_mode == "ephemeral" and resolved_mode != "ephemeral")
-                        or (authorized_workspace_mode is not None and resolved_mode != authorized_workspace_mode)
-                    ):
-                        yield "turn_failed", _workspace_permission_failure()
-                        return
-                    authorized_workspace_mode = resolved_mode
-                    yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
-                    continue
-                if kind == "error" or (
-                    kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",
-                             "turn_compaction", "turn_completed")
-                    and authorized_workspace_mode is None
-                ):
-                    # Unsupported v2 operations and missing mount-policy
-                    # acknowledgements are terminal, never a fallback turn.
-                    yield "turn_failed", _workspace_permission_failure()
-                    return
-                if kind == "turn_failed":
-                    if data.get("code") == "permission_unavailable":
-                        yield "turn_failed", _workspace_permission_failure()
-                        return
-                    # Classify once; the SSE frame and the persisted events
-                    # log must carry the same (code, message), and the same
-                    # reset_at. An older worker sends no reset_at, and its
-                    # frame stays as it was.
-                    code, message = remote_turn_error(data.get("error"))
-                    data = {**data, "code": code, "message": message}
-                    reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
-                    if reset_at is not None:
-                        data["reset_at"] = reset_at
+    # Set once the turn has ended: finished, failed, stopped or abandoned. A
+    # generator closed before then (the client went away) leaves the turn
+    # running on the worker, and its key with it.
+    ended = False
+    try:
+        while True:
+            resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
+            if not resp:
+                # Unbounded, this loop spun forever whenever the worker was down:
+                # only a terminal reply ends the turn, so the SSE response never
+                # ended. Bound the wait and fail the turn.
+                if idle_timeout > 0 and time.monotonic() - last_reply_at > idle_timeout:
+                    code, message = remote_turn_error(UNRESPONSIVE_WORKER_ERROR)
                     logger.warning(
-                        "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
-                        conversation_id, corr, remote_error_label(error=data.get("error")), code,
+                        "Remote turn abandoned: no reply for %.0fs conversation=%s correlation_id=%s",
+                        idle_timeout, conversation_id, corr,
                     )
-                if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
-                            "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
-                    yield kind, data
-                if kind in ("turn_completed", "turn_failed"):
+                    ended = True
+                    yield "turn_failed", {"error": UNRESPONSIVE_WORKER_ERROR,
+                                          "code": code, "message": message}
                     return
+                continue
+            for _stream, entries in resp:
+                for entry_id, fields in entries:
+                    last_id = entry_id
+                    if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
+                        # Skipped before its kind is validated: an earlier turn
+                        # still finishing after Stop or the idle timeout can write
+                        # a kind this build does not know, and that must not fail
+                        # this turn. Deliberately does NOT refresh the idle clock:
+                        # liveness means "this turn is progressing", and another
+                        # turn's replies say nothing about ours.
+                        continue
+                    reply = TurnReply.model_validate_json(fields["payload"])
+                    last_reply_at = time.monotonic()
+                    kind = reply.kind
+                    data = reply.data or {}
+                    if kind == "progress" and data.get("phase") == "workspace_authorized":
+                        resolved_mode = data.get("workspace_mode")
+                        if (
+                            resolved_mode not in ("persistent", "ephemeral")
+                            or (workspace_mode == "ephemeral" and resolved_mode != "ephemeral")
+                            or (authorized_workspace_mode is not None and resolved_mode != authorized_workspace_mode)
+                        ):
+                            ended = True
+                            yield "turn_failed", _workspace_permission_failure()
+                            return
+                        authorized_workspace_mode = resolved_mode
+                        yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
+                        continue
+                    if kind == "error" or (
+                        kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",
+                                 "turn_compaction", "turn_completed")
+                        and authorized_workspace_mode is None
+                    ):
+                        # Unsupported v2 operations and missing mount-policy
+                        # acknowledgements are terminal, never a fallback turn.
+                        ended = True
+                        yield "turn_failed", _workspace_permission_failure()
+                        return
+                    if kind == "turn_failed":
+                        if data.get("code") == "permission_unavailable":
+                            ended = True
+                            yield "turn_failed", _workspace_permission_failure()
+                            return
+                        # Classify once; the SSE frame and the persisted events
+                        # log must carry the same (code, message), and the same
+                        # reset_at. An older worker sends no reset_at, and its
+                        # frame stays as it was.
+                        code, message = remote_turn_error(data.get("error"))
+                        data = {**data, "code": code, "message": message}
+                        reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
+                        if reset_at is not None:
+                            data["reset_at"] = reset_at
+                        logger.warning(
+                            "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
+                            conversation_id, corr, remote_error_label(error=data.get("error")), code,
+                        )
+                    if kind in ("turn_completed", "turn_failed"):
+                        ended = True
+                    if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
+                                "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
+                        yield kind, data
+                    if kind in ("turn_completed", "turn_failed"):
+                        return
+    finally:
+        if ended and llm_block.get("api_key"):
+            await _revoke_turn_key_at_turn_end(corr, settings)
+
+
+async def _revoke_turn_key_at_turn_end(corr: str, settings: TurnQueueSettings) -> None:
+    """The turn key dies with its turn, so code that ran in the turn can't use
+    it afterwards, at the browser router or anywhere else. Best effort: a
+    failed revoke leaves the key to its own expiry, and the turn's answer is
+    already out. With no internal auth configured, no key was minted here
+    either (mint refuses without it), so there is nothing to revoke."""
+    if not settings.auth_internal_base_url or not settings.auth_internal_secret:
+        return
+    try:
+        await revoke_turn_key(instance_id=corr, settings=settings)
+    except Exception as exc:
+        logger.warning(
+            "[producer] could not revoke the turn key at turn end; it lives to its expiry",
+            extra={"event": "turn_key_revoke_failed", "correlation_id": corr, "error_type": type(exc).__name__},
+        )
 
 
 def _setup_permission_failure() -> dict:

@@ -447,6 +447,7 @@ async def lifespan(app: FastAPI):
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
         from cowork.coding.inference_proxy import close_inference_client
+        from cowork.handlers.jev_route import close_client as close_jev_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
@@ -477,6 +478,7 @@ async def lifespan(app: FastAPI):
         await close_scratchpads()
         await close_proxy_client()
         await close_inference_client()
+        await close_jev_client()
 
 
 @asynccontextmanager

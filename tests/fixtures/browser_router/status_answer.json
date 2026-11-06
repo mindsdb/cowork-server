@@ -1,0 +1,40 @@
+{
+  "description": "The router's GET {router}/_status and POST {router}/_warm answer: the state of the caller's own browser.",
+  "examples": {
+    "not started": {
+      "where": "GET /_status",
+      "kind": "response",
+      "status": 200,
+      "body": {
+        "status": "none"
+      }
+    },
+    "starting": {
+      "where": "POST /_warm",
+      "kind": "response",
+      "status": 200,
+      "body": {
+        "status": "starting"
+      }
+    },
+    "running": {
+      "where": "GET /_status",
+      "kind": "response",
+      "status": 200,
+      "body": {
+        "status": "running"
+      }
+    },
+    "a warm-up with a key the router doesn't know": {
+      "where": "POST /_warm",
+      "kind": "response",
+      "status": 200,
+      "body": {
+        "status": "starting",
+        "ignored_prefs": [
+          "city"
+        ]
+      }
+    }
+  }
+}

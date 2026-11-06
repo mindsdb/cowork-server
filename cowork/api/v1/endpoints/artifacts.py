@@ -278,8 +278,19 @@ def _scoped_project_cards(session, project_ref: str) -> list[dict]:
 
 
 def _all_artifact_cards(session) -> list[dict]:
-    """Build the unfiltered scoped list without accepting any HTTP selector."""
-    sources = artifact_sources_for_request(session, None, None)
+    """Build the unfiltered scoped list without accepting any HTTP selector.
+
+    Unfiltered means every project a person browses, so the model-comparison
+    sides are left out here -- and only here: the same sources also resolve
+    artifacts by id, and a comparison's own artifacts must keep resolving.
+    """
+    from cowork.services.projects import is_comparison_sandbox
+
+    sources = [
+        source
+        for source in artifact_sources_for_request(session, None, None)
+        if not is_comparison_sandbox(source.project_name)
+    ]
     return _artifact_cards(session, sources)
 
 
@@ -932,7 +943,8 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     _refuse_a_second_name(artifact)
     try:
-        return _preview_artifact(artifact)
+        # Reading and counting a large file would stall every other request.
+        return await run_in_threadpool(_preview_artifact, artifact)
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
     except Exception as e:

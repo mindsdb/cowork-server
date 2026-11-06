@@ -1,40 +1,49 @@
-"""The user's MindsHub browser instance (ENG-3298).
+"""The agent's browser: the browser router on the web, and the desktop app's
+own browser on the desktop.
 
-MindsHub provisions a per-user browser (`br-<hash>`) through the same
-`/instance` lambda as every other hosted agent. This module is the server's
-half of it: provisioning and status as the caller, a viewer embed URL for the
-renderer, and the block that tells anton where the browser is for one turn.
+Two hosts serve anton's browser tool the same API, and this module is the
+server's half of both. Which one a deployment has follows its tenancy: org
+tenancy is the web app, anything else the desktop app (``on_web``).
 
-Every call is made AS the caller, with their MindsHub credential
-(`mindshub_credential`). Nothing here holds a credential of its own, and anton
-reaches the instance with its own turn credential, not anything from here.
+On the web the host is the browser router (``COWORK_BROWSER_ROUTER_URL``,
+``router_url``), served on the cowork host under ``/browser``. It starts one
+browser per person and routes each caller to their own by the credential they
+present, so nothing here holds a credential of its own:
 
-That is the `mindshub` mode, the default. In `standalone` mode an admin points
-cowork at a browser service they run themselves (the same Node service with a
-static bearer token, `browser_service_url` + `browser_service_api_key`): there
-is nothing to provision, every call carries that key instead of the caller's
-MindsHub credential, and anton is handed the key in its turn block. The service
-is shared by the org, so each user gets their own profile on it
-(`standalone_profile`). One per user rather than per task: the service has no
-login store of its own, so a profile is the only thing that keeps a user
-signed in from one task to the next.
+- Settings and the chat call it as the caller, with their MindsHub credential
+  (``mindshub_credential``): the browser's state (``router_status``), a warm-up
+  that carries the person's time zone and language (``warm``,
+  ``RouterPrefs``), a viewer link for one session (``embed``), the person's
+  approval of a step the browser held (``approve``) and signing out of every
+  site (``clear_logins``). A viewer link opens once; the app mints a new one
+  whenever it shows the viewer, and nothing here stores one.
+- A web turn gets a router block with no credential (``turn_block``), which
+  anton reaches with the turn's own key. Before the producer queues the turn,
+  it scopes that key with the router (``scope_turn``): to the task's session
+  and the project's saved tabs, which also starts the person's browser, or to
+  no session at all for a turn with no browser, so no code holding the key
+  can scope it later. The router takes a scope only beside ``scope_key``,
+  which only this server and the router hold. A key the router hasn't scoped
+  reaches nothing.
+- Whether the person may use the browser at all is their MindsHub entitlement
+  (``browser_entitlement``), which the router enforces on every call and
+  ``/browse/status`` reports, an organization admin's switch included.
 
-The shared browser router (ENG-3188) replaces the per-user instance in
-`mindshub` mode when `COWORK_BROWSER_ROUTER_URL` is set (`router_url`). It is
-one URL for everyone, on the cowork host under `/browser`: the router finds or
-starts the caller's own browser pod from the credential they present, so
-nothing is provisioned, nothing per user is stored (`browser_url` is left
-alone), and a session id can't reach anyone else's pod. Status, warm-up and
-viewer URLs go to it as the caller, like the instance calls do. Each task gets
-its own session (`router_session`), and its project a key for saved tabs
-(`project_key`); logins are per user on the pod and shared by every session.
-A turn that starts with the browser on warms the pod without waiting
-(`start_early`), so it is likely up by the time the agent reaches for it.
-Every warm-up carries the person's browser preferences (`router_prefs`):
-whether to browse through the residential proxy, from which city, and the
-time zone and language the browser should present. The router keeps them
-with the person's logins. Unset, the per-user instance path below is
-unchanged.
+Sites see the browser's traffic come from MindsDB's own addresses.
+
+On the desktop the browser runs inside the Cowork app. The app registers its
+loopback address and per-launch key with this server
+(``PUT /runtime-credential/browser``, held in memory by
+``cowork.common.settings.runtime_credential``), and an in-process turn's anton
+is handed a config for it (``desktop_browser_config``). Nothing here calls it,
+and the router setting is ignored there. A desktop signed in to MindsHub asks
+MindsHub only whether its organization turned the browser off
+(``desktop_organization_off``); one with the person's own model key asks
+nothing.
+
+Each task drives a session of its own (``task_session``), and a project's saved
+tabs live under a key of their own (``project_key``). Both are hashes, so
+neither host sees a person, conversation or project id.
 """
 
 from __future__ import annotations
@@ -43,466 +52,465 @@ import asyncio
 import hashlib
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Literal, TypeVar
 
 import httpx
+from anton.core.browser.config import BrowserConfig
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.runtime_credential import get_browser_host, get_minds_credential
+from cowork.services.browser_contract import (
+    ORGANIZATION_OFF,
+    SCOPE_KEY_HEADER,
+    SESSION_ID,
+    BrowserDisabledReason,
+    BrowserEntitlement,
+)
 
 logger = logging.getLogger(__name__)
 
-AGENT = "browser"
-#: One browser profile per user, shared across conversations so a login made
-#: in one is there in the next. Mirrors anton's BrowserConfig default.
-PROFILE = "main"
 _TIMEOUT_S = 15.0
-_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_TIMEZONE = re.compile(r"^[A-Za-z_+\-/0-9]{1,64}$")
-#: A router city id; the same shape `browser_city` accepts.
-_CITY = re.compile(r"^[a-z]{2}-[a-z_]{1,40}$")
-_LOCALE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$")
-#: What GET /browse/locations answers when there is no router to ask.
-NO_LOCATIONS = {"proxy_available": False, "prefs": None, "cities": [], "effective_city": ""}
-# What a provisioned instance's endpoint must look like: the hosted agents'
-# Cloudflare-fronted host, nothing else. Guards the URL anton is handed.
-_ENDPOINT = re.compile(r"^https://br-[a-z0-9-]+\.(?:[a-z0-9-]+\.)*(?:4nton\.ai|mindshub\.ai)$")
 
-MINDSHUB = "mindshub"
-STANDALONE = "standalone"
-# Plain http only for a service on this machine, for local testing; anything
-# that crosses a network carries the key, so it must be https.
-_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
-_NOT_CONFIGURED = "Set the browser service URL and API key in Settings to use the browser."
-
-
-#: Status for "MindsHub failed us". Not 502: the cluster's ingress swaps a 5xx
-#: body for its own page, and the reason is what the user needs to see.
+#: Status for "the browser router failed us". Not 502: the cluster's ingress
+#: swaps a 5xx body for its own page, and the reason is what the person needs
+#: to see.
 UPSTREAM_FAILED = 424
+
+#: What a warm-up sends for a time zone and a language: an IANA zone and a
+#: BCP 47 tag. Anything else is left out rather than refused, since it only
+#: shapes how the browser presents.
+_TIMEZONE = re.compile(r"[A-Za-z_+\-/0-9]{1,64}")
+_LOCALE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}")
+
+_NO_BROWSER = "The browser isn't available here."
+
+
+# ── Errors ──────────────────────────────────────────────────────────────────
+
+
+class BrowserErrorDetail(BaseModel):
+    """The ``detail`` of a ``/browse`` error: a code the app can branch on, and
+    a sentence it can show. A refusal from the router keeps the router's code
+    (``not_entitled``, ``daily_limit``)."""
+
+    code: str
+    message: str
 
 
 class BrowserServiceError(Exception):
-    def __init__(self, status: int, detail: str) -> None:
-        super().__init__(detail)
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
         self.status = status
-        self.detail = detail
+        self.detail = BrowserErrorDetail(code=code, message=message)
 
 
-class _KeyRejected(BrowserServiceError):
-    """The standalone service refused its API key: a config error to show,
-    unlike an unreachable service, which status reports as a state."""
+class _RouterRefusal(BaseModel):
+    """The router's error body."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    error: str = ""
+    message: str = ""
 
 
-def instance_api_base() -> str:
-    """Where `/instance` is served for this deployment.
+# ── What the routes and the router exchange ─────────────────────────────────
 
-    The provisioning lambdas sit behind the API Gateway custom domain: the
-    legacy `4nton.ai` in prod, and each non-prod MindsHub api host (dev,
-    staging, a PR env's own `api-pr-…`) through the Cloudflare worker's SAM
-    dispatch. Same split as the publish API (`publish_url_for_endpoint`),
-    derived from the turn host so a PR env provisions in its own stack.
-    """
-    from cowork.common.settings.app_settings import default_turn_minds_api_host
+#: A browser's state. ``none``, ``starting`` and ``running`` are the router's
+#: answer for the caller's own browser; ``unavailable`` means this deployment
+#: offers no browser to the caller (no router on the web, or no browser the
+#: desktop app registered), ``not_entitled`` that the caller's account may
+#: not use it, and ``organization_off`` that an admin of the caller's
+#: organization turned it off.
+BrowseState = Literal["none", "starting", "running", "unavailable", "not_entitled", "organization_off"]
 
-    host = default_turn_minds_api_host().rstrip("/")
-    return "https://4nton.ai" if host == "https://api.mindshub.ai" else host
+
+class BrowseStatus(BaseModel):
+    """``GET /browse/status``. ``enabled`` is the person's own switch.
+    ``available`` is whether this deployment offers the browser to them,
+    whatever the switch says, so a person who turned it off can turn it back
+    on."""
+
+    enabled: bool
+    available: bool
+    status: BrowseState
+
+
+class RouterStatus(BaseModel):
+    """The router's ``_status`` and ``_warm`` answer."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["none", "starting", "running"]
+
+
+class RouterPrefs(BaseModel):
+    """The person's browser preferences, as the router's ``_warm`` takes them:
+    the page clock and language follow the person's own. A key a warm-up
+    leaves out keeps what the router holds."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    timezone: str | None = None
+    locale: str | None = None
+
+
+class BrowserEmbed(BaseModel):
+    """A viewer link for one session, as the router mints it for the caller.
+    The link opens the viewer once, by ``ticket_expires_at``; the viewer it
+    opens closes at ``lease_expires_at``, and the app mints a new link to go
+    on. Both are Unix seconds."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_id: str
+    view_url: str
+    ticket_expires_at: int
+    lease_expires_at: int
+
+
+class ScopeRequest(BaseModel):
+    """The router's ``_scope`` body: the one session and project a turn's key
+    may reach, or ``session_id`` null for a turn with no browser, which binds
+    the key to nothing. ``project`` is left out for a turn with no project."""
+
+    session_id: str | None = Field(pattern=SESSION_ID.pattern)
+    project: str | None = Field(default=None, pattern=SESSION_ID.pattern)
+
+    def body(self) -> dict:
+        """The JSON the router takes: ``session_id`` always, null included."""
+        return self.model_dump(exclude={"project"} if self.project is None else set())
+
+
+class ApproveRequest(BaseModel):
+    """``POST /browse/approve``: the person approves one step the browser held
+    in one of their sessions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(pattern=SESSION_ID.pattern)
+    pending_id: str = Field(pattern=SESSION_ID.pattern)
+
+
+class BrowserApproval(BaseModel):
+    """The router's answer to an approval: the held step may now run once,
+    until ``expires_at`` (Unix seconds)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    pending_id: str
+    approved: Literal[True]
+    expires_at: int
+
+
+class LoginsCleared(BaseModel):
+    """The router's answer to signing out of every site."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cleared: Literal[True]
+
+
+# ── Where the browser is ───────────────────────────────────────────────────
+
+
+def on_web() -> bool:
+    """Org tenancy: the web app, whose browser is the router. Everywhere else
+    the browser is the desktop app's own."""
+    return get_app_settings().tenancy_mode == "org"
 
 
 def router_url() -> str:
-    """The shared browser router's base URL, or "" when this deployment has
-    none. Validated and stripped of its trailing slash by the app setting."""
-    from cowork.common.settings.app_settings import get_app_settings
+    """The browser router's base URL, or "" when this deployment has none.
+    Only on the web: the desktop app has its own browser. Validated and
+    stripped of its trailing slash by the app setting."""
+    return get_app_settings().browser_router_url if on_web() else ""
 
-    return str(getattr(get_app_settings(), "browser_router_url", "") or "")
 
-
-def valid_endpoint(url: str) -> bool:
-    """A MindsHub browser endpoint anton may be handed and a viewer URL may
-    point under: a provisioned instance, or this deployment's router."""
-    if not url:
-        return False
+def _require_router() -> str:
     router = router_url()
-    if router and url.rstrip("/") == router:
-        return True
-    return _ENDPOINT.match(url.rstrip("/")) is not None
-
-
-def browser_mode(user_settings: Any) -> str:
-    """`standalone` only when set so; anything else is the MindsHub default."""
-    return STANDALONE if getattr(user_settings, "browser_mode", MINDSHUB) == STANDALONE else MINDSHUB
-
-
-def normalize_service_url(url: str) -> str:
-    """A standalone service origin without its trailing slash, or "" if it
-    isn't one: https to any host, http only to loopback, and nothing past the
-    origin (no path, query or fragment) so `/_embed` lands where we expect."""
-    raw = (url or "").strip()
-    try:
-        parsed = httpx.URL(raw)
-    except Exception:
-        return ""
-    if parsed.scheme == "https":
-        ok_scheme = True
-    else:
-        ok_scheme = parsed.scheme == "http" and parsed.host in _LOOPBACK
-    if not ok_scheme or not parsed.host or parsed.userinfo:
-        return ""
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment or "?" in raw or "#" in raw:
-        return ""
-    return raw.rstrip("/")
-
-
-def standalone_service(user_settings: Any) -> Optional[tuple[str, str]]:
-    """(url, api key) of the standalone browser service, or None when the mode
-    isn't standalone or the config is incomplete or invalid."""
-    if browser_mode(user_settings) != STANDALONE:
-        return None
-    url = normalize_service_url(str(getattr(user_settings, "browser_service_url", "") or ""))
-    secret = getattr(user_settings, "browser_service_api_key", None)
-    key = secret.get_secret_value() if hasattr(secret, "get_secret_value") else str(secret or "")
-    if not url or not key.strip():
-        return None
-    return url, key.strip()
-
-
-def standalone_profile(user_id: Optional[str]) -> str:
-    """This user's profile on a shared standalone service.
-
-    Deterministic, so a login made in one turn is there in the next, and a
-    hash, so the service never sees the user id itself. No user id (desktop,
-    local scope) means one person, who gets `PROFILE` like on MindsHub.
-    """
-    if not user_id:
-        return PROFILE
-    return "u-" + hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:24]
+    if not router:
+        raise BrowserServiceError(409, "unavailable", _NO_BROWSER)
+    return router
 
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def router_session(user_id: Optional[str], conversation_id: str) -> str:
-    """The router session for one task: a context of its own on the user's
-    pod, so two tasks never share tabs. Hashed, so the pod never sees the ids;
-    the user id is in it so the name means nothing outside that user."""
+def task_session(user_id: str | None, conversation_id: str) -> str:
+    """The browser session for one task: tabs of its own in the person's
+    browser, so two tasks never share tabs. Hashed, so the host never sees the
+    ids; the person is in it so the name means nothing outside their browser."""
     return "t-" + _digest(f"{user_id or ''}:{conversation_id}")[:24]
 
 
-def project_key(user_id: Optional[str], project_id: Any) -> str:
+def project_key(user_id: str | None, project_id: Any) -> str:
     """The opaque key a project's saved tabs live under, or "" without a project."""
     if project_id is None or str(project_id) == "":
         return ""
     return "p-" + _digest(f"{user_id or ''}:{project_id}")[:24]
 
 
+# ── Calls to the router ────────────────────────────────────────────────────
+
+
 async def _call(
-    method: str, url: str, bearer: str, *,
-    json: Optional[dict] = None, params: Optional[dict] = None, standalone: bool = False, quiet: bool = False,
+    method: str, url: str, bearer: str, *, json: dict | None = None, headers: dict[str, str] | None = None,
 ) -> Any:
-    # Messages name what failed: MindsHub, or the admin's own service. Never
-    # the bearer, which in standalone mode is the service's shared key.
-    # `quiet` logs failures at debug: a warm-up nobody waits for.
-    log = logger.debug if quiet else logger.warning
+    """One router call as ``bearer``, with any extra ``headers``. Never logs or
+    echoes the bearer or a header's value.
+
+    A 401, 403 or 429 passes on with the router's code and sentence: they are
+    its answer about the caller (a stale sign-in, ``not_entitled``,
+    ``daily_limit``). Any other failure is UPSTREAM_FAILED with the router's
+    code, since the ingress would swap a 5xx body for its own page.
+    """
     if not bearer:
-        raise BrowserServiceError(401, _NOT_CONFIGURED if standalone else "Sign in to MindsHub to use the browser.")
+        raise BrowserServiceError(401, "unauthorized", "Sign in to MindsHub to use the browser.")
 
     async def _send() -> httpx.Response:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_TIMEOUT_S)) as client:
             return await client.request(
-                method, url, json=json, params=params, headers={"Authorization": f"Bearer {bearer}"},
+                method, url, json=json, headers={**(headers or {}), "Authorization": f"Bearer {bearer}"},
             )
 
     try:
         response = await asyncio.wait_for(_send(), _TIMEOUT_S)
     except Exception as exc:
-        log("browser %s %s failed: %r", method, url, exc)
-        what = (
-            f"The browser service at {_host(url)} did not answer" if standalone
-            else f"MindsHub did not answer at {_host(url)}"
+        logger.warning(
+            "browser router call failed",
+            extra={"event": "browser_router_unreachable", "method": method, "route": httpx.URL(url).path,
+                   "error_type": type(exc).__name__},
         )
-        raise BrowserServiceError(UPSTREAM_FAILED, f"{what} ({type(exc).__name__}). Try again in a moment.") from exc
-    if response.status_code in (401, 403):
-        if standalone:
-            # Not passed through as a 401: the caller's own sign-in is fine,
-            # and a renderer treating it as an expired session would be wrong.
-            raise _KeyRejected(UPSTREAM_FAILED, f"The browser service at {_host(url)} rejected the API key.")
-        raise BrowserServiceError(response.status_code, _message(response) or "MindsHub refused this request.")
-    where = f"The browser service at {_host(url)}" if standalone else _host(url)
+        raise BrowserServiceError(
+            UPSTREAM_FAILED, "browser_unreachable", "The browser didn't answer. Try again in a moment.",
+        ) from exc
     if response.status_code >= 400:
-        log("browser %s %s returned HTTP %s: %s", method, url, response.status_code, response.text[:300])
-        reason = _message(response) or "no reason given"
-        raise BrowserServiceError(UPSTREAM_FAILED, f"{where} returned HTTP {response.status_code}: {reason}")
+        try:
+            refusal = _RouterRefusal.model_validate_json(response.content)
+        except ValidationError:
+            refusal = _RouterRefusal()
+        status = response.status_code if response.status_code in (401, 403, 429) else UPSTREAM_FAILED
+        if status == UPSTREAM_FAILED:
+            logger.warning(
+                "browser router refused a call",
+                extra={"event": "browser_router_refused", "method": method, "route": httpx.URL(url).path,
+                       "status_code": response.status_code, "reason": refusal.error},
+            )
+        raise BrowserServiceError(
+            status,
+            refusal.error or "browser_error",
+            refusal.message or f"The browser answered HTTP {response.status_code}.",
+        )
     try:
         return response.json()
     except ValueError as exc:
-        raise BrowserServiceError(UPSTREAM_FAILED, f"{where} returned an unreadable answer.") from exc
+        raise BrowserServiceError(UPSTREAM_FAILED, "bad_response", "The browser returned an unreadable answer.") from exc
 
 
-def _host(url: str) -> str:
-    return httpx.URL(url).host
+_Answer = TypeVar("_Answer", bound=BaseModel)
 
 
-def _message(response: httpx.Response) -> str:
+def _parsed(model: type[_Answer], raw: Any) -> _Answer:
     try:
-        body = response.json()
-    except ValueError:
-        return ""
-    if isinstance(body, dict):
-        return str(body.get("message") or body.get("error") or body.get("detail") or "")
-    return ""
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        raise BrowserServiceError(UPSTREAM_FAILED, "bad_response", "The browser returned an unexpected answer.") from exc
 
 
-def _view(raw: dict) -> dict:
-    """The lambda's status/provision answer, narrowed to what the renderer needs."""
-    endpoint = str(raw.get("endpoint") or "")
-    return {
-        "provisioned": bool(raw.get("provisioned", raw.get("status") not in (None, "none", "not_found"))),
-        "status": str(raw.get("status") or "none"),
-        "endpoint": endpoint if valid_endpoint(endpoint) else "",
-    }
+async def router_status(bearer: str) -> RouterStatus:
+    """The caller's own browser's state, from the router."""
+    return _parsed(RouterStatus, await _call("GET", f"{_require_router()}/_status", bearer))
 
 
-async def fetch_status(bearer: str) -> dict:
-    raw = await _call("GET", f"{instance_api_base()}/instance", bearer, params={"agent": AGENT})
-    return _view(raw if isinstance(raw, dict) else {})
-
-
-async def provision(bearer: str) -> dict:
-    """Create (or wake) the caller's browser instance. Safe to call again."""
-    raw = await _call("POST", f"{instance_api_base()}/instance", bearer, json={"agent": AGENT})
-    view = _view(raw if isinstance(raw, dict) else {})
-    view["provisioned"] = True
-    return view
-
-
-def _router_view(raw: Any, router: str) -> dict:
-    """The router's `/_status` or `/_warm` answer in `fetch_status`'s shape.
-
-    `starting` passes through as is: the renderer shows it while the pod
-    comes up. The endpoint is always the router, the one URL every caller
-    uses; whether this user's pod is up is what `status` says.
-    """
-    status = str(raw.get("status") or "none") if isinstance(raw, dict) else "none"
-    return {"provisioned": status != "none", "status": status, "endpoint": router}
-
-
-async def router_status(bearer: str, router: str) -> dict:
-    return _router_view(await _call("GET", f"{router}/_status", bearer), router)
-
-
-async def warm(bearer: str, router: str, *, quiet: bool = False, prefs: Optional[dict] = None) -> dict:
-    """Start or claim the caller's pod without waiting for it. Safe to repeat.
-    `prefs` (see `router_prefs`) updates what the router keeps for the caller."""
-    body = {"prefs": prefs} if prefs else None
-    return _router_view(await _call("POST", f"{router}/_warm", bearer, json=body, quiet=quiet), router)
-
-
-def router_prefs(user_settings: Any, timezone: Optional[str] = None, locale: Optional[str] = None) -> dict:
-    """The person's browser preferences, as the router's `_warm` takes them.
-
-    Proxy and city always; time zone and language only when the renderer sent
-    them and they look like an IANA zone and a BCP 47 tag (anything else is
-    dropped rather than refused: it only shapes how the browser presents).
-    """
-    prefs: dict[str, Any] = {
-        "proxy": bool(getattr(user_settings, "browser_proxy", True)),
-        "city": str(getattr(user_settings, "browser_city", "") or ""),
-    }
-    if timezone and _TIMEZONE.match(timezone):
-        prefs["timezone"] = timezone
-    if locale and _LOCALE.match(locale):
-        prefs["locale"] = locale
-    return prefs
-
-
-async def locations(bearer: str) -> dict:
-    """The router's cities and the caller's stored preferences, for Settings.
-    Without a router there is nothing to choose: `NO_LOCATIONS`."""
-    router = router_url()
-    if not router:
-        return dict(NO_LOCATIONS)
-    raw = await _call("GET", f"{router}/_prefs", bearer)
-    raw = raw if isinstance(raw, dict) else {}
-    cities = [
-        {"id": str(c["id"]), "label": str(c.get("label") or c["id"])}
-        for c in raw.get("cities") or [] if isinstance(c, dict) and _CITY.match(str(c.get("id") or ""))
-    ]
-    prefs = raw.get("prefs")
-    return {
-        "proxy_available": bool(raw.get("proxy_available")),
-        "prefs": prefs if isinstance(prefs, dict) else None,
-        "cities": cities,
-        "effective_city": str(raw.get("effective_city") or ""),
-    }
-
-
-async def status_for(bearer: str) -> dict:
-    """The MindsHub mode's status: the router's when there is one, else the
-    caller's instance."""
-    router = router_url()
-    return await router_status(bearer, router) if router else await fetch_status(bearer)
-
-
-async def provision_for(bearer: str, prefs: Optional[dict] = None) -> dict:
-    """The MindsHub mode's provision: warm the router's pod, with the caller's
-    `prefs`, or create the caller's instance."""
-    router = router_url()
-    return await warm(bearer, router, prefs=prefs) if router else await provision(bearer)
-
-
-#: Warm-ups in flight. asyncio keeps only a weak reference to a task, so one
-#: nobody holds can be collected before it runs.
-_WARMING: set[asyncio.Task] = set()
-
-
-async def _warm_quietly(bearer: str, router: str, prefs: dict) -> None:
-    try:
-        await warm(bearer, router, quiet=True, prefs=prefs)
-    except Exception as exc:
-        # Only a head start: the router starts the pod on first use anyway.
-        logger.debug("browser warm-up failed: %r", exc)
-
-
-def start_early(user_settings: Any, bearer: Optional[str]) -> bool:
-    """Warm the caller's pod as a turn starts, without waiting or failing.
-
-    Only in MindsHub mode with a router, with the browser on and a credential
-    to warm it as; the router starts the pod on the agent's first call
-    anyway, this just takes the minute of startup off it. Needs a running
-    loop (every turn has one). True when a warm-up was started. Never raises.
-    """
-    try:
-        router = router_url()
-        if not (router and bearer and getattr(user_settings, "browser_enabled", False)):
-            return False
-        if browser_mode(user_settings) != MINDSHUB:
-            return False
-        task = asyncio.get_running_loop().create_task(_warm_quietly(bearer, router, router_prefs(user_settings)))
-    except Exception as exc:
-        logger.debug("browser warm-up not started: %r", exc)
-        return False
-    _WARMING.add(task)
-    task.add_done_callback(_WARMING.discard)
-    return True
-
-
-async def service_status(user_settings: Any) -> dict:
-    """The standalone service's health, in the same shape as `fetch_status`.
-
-    Always "provisioned": there is nothing to create. A service that doesn't
-    answer is a state the renderer shows ("unreachable"), not an error; a
-    rejected key is an error, since only fixing the config helps.
-    """
-    service = standalone_service(user_settings)
-    if service is None:
-        return {"provisioned": False, "status": "not_configured", "endpoint": ""}
-    url, key = service
-    try:
-        raw = await _call("GET", f"{url}/healthz", key, standalone=True)
-    except _KeyRejected:
-        raise
-    except BrowserServiceError:
-        return {"provisioned": True, "status": "unreachable", "endpoint": url}
-    ok = isinstance(raw, dict) and bool(raw.get("ok"))
-    return {"provisioned": True, "status": "running" if ok else "unreachable", "endpoint": url}
-
-
-async def embed(
-    bearer: str, endpoint: str, session_id: str = PROFILE, *, standalone: bool = False,
-) -> dict:
-    """A fresh viewer URL for one browser session, to put in an iframe.
-
-    The worker mints it (`POST /_embed`, mindshub_services ENG-3295): a token
-    good for that session's viewer and event stream only, for an hour. The
-    router answers the same route for the caller's pod, with a viewer URL
-    under the router itself (`valid_endpoint` accepts it). A
-    standalone service serves the same route itself, with its API key as the
-    bearer; its endpoint was checked by `standalone_service`, not
-    `valid_endpoint`, which stays MindsHub-only.
-    """
-    if standalone and not endpoint:
-        raise BrowserServiceError(409, _NOT_CONFIGURED)
-    if not standalone and not valid_endpoint(endpoint):
-        raise BrowserServiceError(409, "The browser isn't set up yet.")
-    if not _SESSION_ID.match(session_id or ""):
-        raise BrowserServiceError(400, "session_id must be 1-64 letters, digits, '-' or '_'.")
-    raw = await _call(
-        "POST", f"{endpoint.rstrip('/')}/_embed", bearer, json={"session_id": session_id}, standalone=standalone,
+def router_prefs(*, timezone: str | None = None, locale: str | None = None) -> RouterPrefs:
+    """The person's browser preferences for a warm-up: the time zone and
+    language the app sent, when they look like an IANA zone and a BCP 47 tag."""
+    return RouterPrefs(
+        timezone=timezone if timezone and _TIMEZONE.fullmatch(timezone) else None,
+        locale=locale if locale and _LOCALE.fullmatch(locale) else None,
     )
-    if not isinstance(raw, dict) or not str(raw.get("view_url") or "").startswith(endpoint.rstrip("/") + "/"):
-        raise BrowserServiceError(UPSTREAM_FAILED, "The browser returned an unexpected viewer URL.")
-    return {"session_id": session_id, "view_url": raw["view_url"], "expires_at": int(raw.get("expires_at") or 0)}
 
 
-async def embed_for(user_settings: Any, bearer: str, user_id: Optional[str], session_id: Optional[str] = None) -> dict:
-    """`embed` for the configured mode: the router or the caller's MindsHub
-    instance with their credential, or the standalone service with its key.
+async def warm(bearer: str, prefs: RouterPrefs) -> RouterStatus:
+    """Start or claim the caller's browser without waiting for it, and update
+    the preferences the router keeps for them. Safe to repeat."""
+    body = {"prefs": prefs.model_dump(exclude_none=True)}
+    return _parsed(RouterStatus, await _call("POST", f"{_require_router()}/_warm", bearer, json=body))
 
-    The session defaults to the user's own profile. On a standalone service it
-    can't be anything else. The router routes by the caller's credential to
-    their own pod, so any well-formed session id is passed through: it can
-    only name their own."""
-    if browser_mode(user_settings) == STANDALONE:
-        service = standalone_service(user_settings)
-        if service is None:
-            raise BrowserServiceError(409, _NOT_CONFIGURED)
-        url, key = service
-        profile = standalone_profile(user_id)
-        # The service is shared and its key opens every session on it, so a
-        # caller only ever gets a viewer for their own profile, not one named
-        # in the request.
-        if session_id and session_id != profile:
-            raise BrowserServiceError(403, "That browser session belongs to someone else.")
-        return await embed(key, url, profile, standalone=True)
-    endpoint = router_url() or str(getattr(user_settings, "browser_url", "") or "")
-    return await embed(bearer, endpoint, session_id or PROFILE)
+
+async def embed(bearer: str, session_id: str) -> BrowserEmbed:
+    """A viewer link for one of the caller's sessions, minted by the router
+    with their own credential. The router routes by that credential, so a
+    session id can only name the caller's own. A link the router answers
+    outside that session's viewer page is refused."""
+    router = _require_router()
+    answer = _parsed(BrowserEmbed, await _call("POST", f"{router}/_embed", bearer, json={"session_id": session_id}))
+    page = answer.view_url.split("?", 1)[0]
+    if answer.session_id != session_id or page != f"{router}/sessions/{session_id}/view":
+        raise BrowserServiceError(UPSTREAM_FAILED, "bad_response", "The browser returned an unexpected viewer link.")
+    return answer
+
+
+async def approve(bearer: str, request: ApproveRequest) -> BrowserApproval:
+    """Record the caller's approval of a step the browser held in one of their
+    sessions, so anton's one resend of it runs. The router takes it only with
+    the person's own credential; it never runs the step itself."""
+    router = _require_router()
+    answer = _parsed(BrowserApproval, await _call(
+        "POST", f"{router}/sessions/{request.session_id}/approve", bearer,
+        json={"pending_id": request.pending_id},
+    ))
+    if answer.pending_id != request.pending_id:
+        raise BrowserServiceError(UPSTREAM_FAILED, "bad_response", "The browser approved a different step.")
+    return answer
+
+
+async def clear_logins(bearer: str) -> LoginsCleared:
+    """Sign the caller out of every site: the router empties their running
+    browser's cookies and deletes their saved sign-ins."""
+    return _parsed(LoginsCleared, await _call("DELETE", f"{_require_router()}/logins", bearer))
+
+
+async def scope_turn(*, turn_key: str, router: str, config: BrowserConfig | None) -> None:
+    """Bind a web turn's key with the router before the producer queues the
+    turn: to the turn's session and project, which also starts the person's
+    browser, or, with no ``config``, to no session, so the key reaches nothing
+    and no code holding it can scope it later. The router refuses an unscoped
+    key everything. It takes the scope only with ``scope_key`` beside the key.
+    Raises BrowserServiceError."""
+    body = ScopeRequest(
+        session_id=config.profile if config is not None else None,
+        project=(config.project or None) if config is not None else None,
+    )
+    scope_key = get_app_settings().browser_scope_key.get_secret_value()
+    await _call("POST", f"{router}/_scope", turn_key, json=body.body(), headers={SCOPE_KEY_HEADER: scope_key})
+
+
+async def browser_entitlement(*, bearer: str, org_id: str, user_id: str) -> BrowserEntitlement:
+    """Whether the caller may use the browser on the web: the ``browser``
+    block of their MindsHub entitlements, through the same cached read as
+    their permissions (cowork.services.mindshub_teams.fetch_mindshub_permissions).
+
+    Raises MindsHubUnreachable when MindsHub couldn't be asked or answered
+    without the block, so an outage is never reported as a refusal."""
+    from cowork.services.mindshub_client import MindsHubUnreachable
+    from cowork.services.mindshub_teams import fetch_mindshub_permissions
+
+    if not bearer:
+        raise BrowserServiceError(401, "unauthorized", "Sign in to MindsHub to use the browser.")
+    permissions = await fetch_mindshub_permissions(bearer_token=bearer, org_id=org_id, user_id=user_id)
+    if not permissions.reachable or permissions.browser is None:
+        raise MindsHubUnreachable("Couldn't reach MindsHub to confirm your browser access. Try again in a moment.")
+    return permissions.browser
+
+
+#: The last answer a MindsHub-signed-in desktop read: whether its
+#: organization turned the browser off. Kept through an outage, since the
+#: desktop browser runs on the person's own machine and connection.
+_desktop_organization_off = False
+
+
+async def desktop_organization_off() -> bool:
+    """Whether the organization a signed-in desktop belongs to turned the
+    browser off, read from MindsHub with the credential the app handed over,
+    before each turn and on each status read. A desktop with no MindsHub
+    credential (the person's own model key) has no organization and asks
+    nothing. ``not_permitted`` doesn't apply here: ``browser.use`` governs
+    the web only. When MindsHub can't answer, the last answer stands."""
+    global _desktop_organization_off
+    from cowork.services.mindshub_teams import fetch_mindshub_permissions
+
+    credential = get_minds_credential()
+    if not credential:
+        _desktop_organization_off = False
+        return False
+    try:
+        permissions = await fetch_mindshub_permissions(bearer_token=credential, org_id="", user_id="")
+    except Exception as exc:
+        logger.warning(
+            "could not read the desktop's organization browser switch; the last answer stands",
+            extra={"event": "desktop_browser_switch_unread", "error_type": type(exc).__name__},
+        )
+        return _desktop_organization_off
+    if permissions.reachable and permissions.browser is not None:
+        _desktop_organization_off = permissions.browser.disabled_reason == BrowserDisabledReason.ORGANIZATION_OFF
+    return _desktop_organization_off
+
+
+async def browse_status(user_settings: Any, *, bearer: str, org_id: str, user_id: str) -> BrowseStatus:
+    """``GET /browse/status`` for the caller.
+
+    The desktop answers from the browser the app registered, and a signed-in
+    desktop also from its organization's switch (``desktop_organization_off``).
+    On the web without a router there is no browser, and nothing is asked. An
+    account whose organization turned the browser off is ``organization_off``,
+    and one whose entitlement is otherwise off ``not_entitled``, both read from
+    MindsHub before the router is asked. Otherwise the router says how the
+    caller's browser is.
+    """
+    enabled = bool(getattr(user_settings, "browser_enabled", False))
+    if not on_web():
+        if get_browser_host() is None:
+            return BrowseStatus(enabled=enabled, available=False, status="unavailable")
+        if await desktop_organization_off():
+            return BrowseStatus(enabled=enabled, available=False, status=ORGANIZATION_OFF)
+        return BrowseStatus(enabled=enabled, available=True, status="running")
+    if not router_url():
+        return BrowseStatus(enabled=enabled, available=False, status="unavailable")
+    entitlement = await browser_entitlement(bearer=bearer, org_id=org_id, user_id=user_id)
+    if entitlement.disabled_reason == BrowserDisabledReason.ORGANIZATION_OFF:
+        return BrowseStatus(enabled=enabled, available=False, status=ORGANIZATION_OFF)
+    if not entitlement.enabled:
+        return BrowseStatus(enabled=enabled, available=False, status="not_entitled")
+    return BrowseStatus(enabled=enabled, available=True, status=(await router_status(bearer)).status)
+
+
+# ── A turn's browser ───────────────────────────────────────────────────────
 
 
 def turn_block(
-    user_settings: Any, user_id: Optional[str] = None,
-    conversation_id: Optional[str] = None, project_id: Any = None,
-) -> Optional[dict]:
-    """Where the browser is, for one anton turn; None when it isn't on.
+    user_settings: Any, *, user_id: str | None, conversation_id: str, project_id: Any,
+) -> BrowserConfig | None:
+    """A web turn's browser: the router, the task's own session, and the
+    project's saved-tabs key. No credential: anton reaches the router with the
+    turn's own key, once ``scope_turn`` has scoped it. The producer puts
+    ``to_dict()`` in the job, which anton reads back with ``from_dict``.
 
-    The same shape anton's ``BrowserConfig.from_dict`` reads, both in-process
-    (desktop) and in a cloud pod's ``TurnRequestV1.browser``. With the router,
-    the task's own session and the project's saved-tabs key (absent without a
-    project); anton reaches the router with its own MindsHub credential. In
-    standalone mode it carries the service's key as ``token`` (anton has no
-    other way to authenticate there) and the user's one profile; an anton
-    that predates ``token`` or ``project`` ignores it. Holds a secret then:
-    never log the block. Without a conversation id, the router gives the
-    user's one profile, as before tasks had their own. The per-user instance
-    keeps its one profile either way.
+    None when this deployment has no router, when the person turned the
+    browser off, and for a turn with no person behind it: an organization's
+    channel turn, which comes from a chat anyone in it can write to, while the
+    browser holds one person's sign-ins.
     """
-    if not getattr(user_settings, "browser_enabled", False):
-        return None
-    project = project_key(user_id, project_id)
-    if browser_mode(user_settings) == STANDALONE:
-        service = standalone_service(user_settings)
-        if service is None:
-            return None
-        url, key = service
-        block = {"base_url": url, "profile": standalone_profile(user_id), "token": key}
-        return {**block, "project": project} if project else block
     router = router_url()
-    if router:
-        profile = router_session(user_id, conversation_id) if conversation_id else PROFILE
-        return {"base_url": router, "profile": profile, **({"project": project} if project else {})}
-    endpoint = str(getattr(user_settings, "browser_url", "") or "").rstrip("/")
-    if not valid_endpoint(endpoint):
+    if not router or not user_id or not getattr(user_settings, "browser_enabled", False):
         return None
-    return {"base_url": endpoint, "profile": PROFILE}
+    return BrowserConfig(
+        base_url=router,
+        profile=task_session(user_id, conversation_id),
+        project=project_key(user_id, project_id),
+    )
 
 
-def anton_browser_config(
-    user_settings: Any, user_id: Optional[str] = None,
-    conversation_id: Optional[str] = None, project_id: Any = None,
-):
-    """`turn_block` as anton's BrowserConfig, or None when it's off or anton
-    predates the browser tool (cowork-server and anton deploy independently)."""
-    block = turn_block(user_settings, user_id, conversation_id, project_id)
-    if block is None:
+def desktop_browser_config(*, conversation_id: str, project_id: Any) -> BrowserConfig | None:
+    """An in-process turn's browser: the one the desktop app registered, with
+    the task's own session. None when the app registered none. anton's own
+    check refuses a malformed address or key; that is logged without either
+    and the turn runs without a browser."""
+    host = get_browser_host()
+    if host is None:
         return None
     try:
-        from anton.core.browser.config import BrowserConfig
-    except ImportError:
+        return BrowserConfig(
+            base_url=host.url,
+            profile=task_session(None, conversation_id),
+            project=project_key(None, project_id),
+            token=host.token,
+        )
+    except ValidationError:
+        logger.warning(
+            "the desktop app's browser was refused by the agent's browser config",
+            extra={"event": "desktop_browser_refused"},
+        )
         return None
-    return BrowserConfig.from_dict(block)

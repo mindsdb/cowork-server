@@ -3,7 +3,9 @@
 Two reads of MindsHub for sharing in MindsHub mode: ``GET /v1/me/teams/``
 for the teams the caller belongs to, and ``GET /v1/entitlements/me/`` for
 ``permissions[]``, where it reports ``skills.share_org``,
-``skills.write_org`` and ``artifacts.share_org``. A
+``skills.write_org`` and ``artifacts.share_org``. The same entitlements read
+carries the ``browser`` block, which says whether the caller may use the
+browser on the web (cowork.services.browser.browser_entitlement). A
 third, ``GET /v1/organizations/current/teams/``, lists every team of the
 caller's organization, uncached, for the check an artifact save makes before
 it publishes when an admin adds a team they aren't in (org_team_ids). An
@@ -37,8 +39,9 @@ import logging
 from collections.abc import Callable
 from typing import Any, NamedTuple, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from cowork.services.browser_contract import BROWSER_ENTITLEMENT_KEY, BrowserEntitlement
 from cowork.services.mindshub_client import (
     ENTITLEMENTS_PATH,
     MINDSHUB_TTL_OK_S,
@@ -90,10 +93,24 @@ class MindsHubTeamListing(BaseModel):
 
 
 class MindsHubPermissions(BaseModel):
-    """The caller's resolved permissions in the active organization."""
+    """The caller's resolved permissions in the active organization.
+
+    ``browser`` is the same answer's browser block. None when MindsHub couldn't
+    be asked, and when it answered without a valid block, which a reader
+    treats as unknown rather than as a refusal. A read MindsHub refused holds
+    a block that grants nothing, like the empty ``permissions``.
+    """
 
     permissions: frozenset[str] = frozenset()
     reachable: bool = False
+    browser: BrowserEntitlement | None = None
+
+
+def _refused_permissions() -> MindsHubPermissions:
+    """What a refused entitlements read grants: nothing, the browser included."""
+    return MindsHubPermissions(
+        reachable=True, browser=BrowserEntitlement.for_caller(permitted=False, daily_bytes=0),
+    )
 
 
 class TeamsAndPermissions(NamedTuple):
@@ -133,9 +150,14 @@ def _parse_teams(payload: Any) -> MindsHubTeamListing:
 def _parse_permissions(payload: Any) -> MindsHubPermissions:
     if not isinstance(payload, dict) or not isinstance(payload.get("permissions"), list):
         return MindsHubPermissions()
+    try:
+        browser = BrowserEntitlement.model_validate(payload.get(BROWSER_ENTITLEMENT_KEY))
+    except ValidationError:
+        browser = None
     return MindsHubPermissions(
         permissions=frozenset(str(p) for p in payload["permissions"] if isinstance(p, str)),
         reachable=True,
+        browser=browser,
     )
 
 
@@ -251,7 +273,7 @@ async def fetch_mindshub_permissions(*, bearer_token: str, org_id: str, user_id:
     return await _cached_read(
         _permissions_cache, path=ENTITLEMENTS_PATH, bearer_token=bearer_token, org_id=org_id,
         user_id=user_id, parse=_parse_permissions, unknown=MindsHubPermissions,
-        none_granted=lambda: MindsHubPermissions(reachable=True),
+        none_granted=_refused_permissions,
     )
 
 

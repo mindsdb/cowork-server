@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from cowork.handlers import turn_errors as te
@@ -1732,37 +1733,188 @@ async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatc
         )), timeout=5)
 
 
-@pytest.mark.asyncio
-async def test_stream_remote_replies_gives_the_task_its_router_session_and_warms_it(monkeypatch, org_deployment):
-    """With the shared browser router (ENG-3188): the block names this task's
-    session and project, and the pod is warmed as the caller with the turn
-    key, without waiting for it."""
+ROUTER = "https://app.example.test/browser"
+
+
+@pytest.fixture
+def browser_router(monkeypatch, org_deployment):
+    """A web deployment with the browser router, and a person whose browser is
+    on. ``scoped`` records each _scope call with how many jobs were queued
+    when it was made; ``refuse`` makes the next one fail."""
     from cowork.common.settings import user_settings
+    from cowork.common.settings.app_settings import get_app_settings
     from cowork.services import browser
 
-    router = "https://cowork.example.com/browser"
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", ROUTER)
+    get_app_settings.cache_clear()
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
-    settings = SimpleNamespace(
-        browser_enabled=True, browser_mode="mindshub", browser_url="",
-        resolved_planning_model="m", hub_workspace_id="",
-    )
+    settings = SimpleNamespace(browser_enabled=True, resolved_planning_model="m", hub_workspace_id="")
     monkeypatch.setattr(user_settings, "get_user_settings", lambda scope=None: settings)
-    monkeypatch.setattr(browser, "router_url", lambda: router)
-    warmed = []
-    monkeypatch.setattr(browser, "start_early", lambda s, bearer: warmed.append((s, bearer)) or True)
+    state = SimpleNamespace(fake=fake, settings=settings, scoped=[], refuse=None)
 
+    async def scope_turn(*, turn_key, router, config):
+        assert router == ROUTER
+        state.scoped.append((turn_key, config, len(fake.added)))
+        if state.refuse is not None:
+            raise state.refuse
+
+    monkeypatch.setattr(browser, "scope_turn", scope_turn)
+    yield state
+    get_app_settings.cache_clear()
+
+
+async def _web_turn(*, user_id="u1", project_id="proj-1"):
+    workspace = prod.RemoteWorkspace(project_id=project_id, workspace_rel_path="projects/p") if project_id else None
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
-        workspace=prod.RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/p"),
+        conversation_id="conv-1", org_id="o1", user_id=user_id, input_text="hi", model="mindshub_air",
+        workspace=workspace,
     ))
 
-    params = json.loads(fake.added[0][1]["payload"])["params"]
+
+@pytest.mark.asyncio
+async def test_a_web_turn_scopes_its_key_before_it_queues(browser_router):
+    """The router refuses a turn key it hasn't scoped, so the producer awaits
+    the scope, with the turn's own key, before the job is queued. The job's
+    block is the router, the task's session and the project, with no
+    credential, and anton reads it back as the config that was scoped."""
+    from anton.core.browser.config import BrowserConfig
+
+    from cowork.services import browser
+
+    await _web_turn()
+
+    [(turn_key, config, queued_before)] = browser_router.scoped
+    assert (turn_key, queued_before) == ("mdb_turnkey", 0)
+    params = json.loads(browser_router.fake.added[0][1]["payload"])["params"]
     assert params["browser"] == {
-        "base_url": router,
-        "profile": browser.router_session("u1", "conv-1"),
+        "base_url": ROUTER,
+        "profile": browser.task_session("u1", "conv-1"),
         "project": browser.project_key("u1", "proj-1"),
     }
-    assert warmed == [(settings, "mdb_turnkey")]
+    assert BrowserConfig.from_dict(params["browser"]) == config
+
+
+@pytest.mark.asyncio
+async def test_a_refused_scope_queues_the_turn_without_a_browser(browser_router):
+    from cowork.services import browser
+
+    browser_router.refuse = browser.BrowserServiceError(403, "scope_key_invalid", "This server can't scope a turn's key.")
+    await _web_turn()
+
+    assert len(browser_router.scoped) == 1
+    params = json.loads(browser_router.fake.added[0][1]["payload"])["params"]
+    assert "browser" not in params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["no person", "browser off"])
+async def test_a_turn_without_a_browser_scopes_its_key_to_nothing(browser_router, case):
+    """A channel turn has no person behind it, and a person can turn the
+    browser off: neither carries a block, and each still binds its key to no
+    session first, so code in the turn holding the key can't scope it to a
+    session of its own."""
+    if case == "browser off":
+        browser_router.settings.browser_enabled = False
+    await _web_turn(user_id=None if case == "no person" else "u1")
+
+    assert browser_router.scoped == [("mdb_turnkey", None, 0)]
+    params = json.loads(browser_router.fake.added[0][1]["payload"])["params"]
+    assert "browser" not in params
+
+
+@pytest.mark.asyncio
+async def test_a_web_deployment_with_no_router_scopes_nothing(browser_router, monkeypatch):
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", "")
+    get_app_settings.cache_clear()
+    await _web_turn()
+
+    assert browser_router.scoped == []
+    params = json.loads(browser_router.fake.added[0][1]["payload"])["params"]
+    assert "browser" not in params
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enabled):
+    """Every remote turn carries the switch, so the pod's completion check
+    honors the opt-out whichever caller queued the turn."""
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="", jev_decisions_enabled=enabled),
+    )
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+
+    assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
+
+
+@pytest.fixture
+def revokes(monkeypatch):
+    """Internal auth configured, as in every hosted deployment; records each
+    turn-key revoke the producer asks for."""
+    monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_BASE_URL", "http://auth:80")
+    monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_SECRET", "internal-secret")
+    revoked: list[str] = []
+
+    async def revoke_turn_key(*, instance_id, settings):
+        revoked.append(instance_id)
+
+    monkeypatch.setattr(prod, "revoke_turn_key", revoke_turn_key)
+    return revoked
+
+
+def _turn_with_key(monkeypatch, replies):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", reply) for reply in replies])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    return prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["turn_completed", "turn_failed"])
+async def test_the_turn_key_is_revoked_once_when_the_turn_ends(monkeypatch, revokes, kind):
+    """Code that ran in the turn holds its key; once the turn is over the key
+    opens nothing, at the browser router or anywhere else."""
+    items = await _drain(_turn_with_key(monkeypatch, [_reply(kind, {})]))
+    assert items[-1][0] == kind
+    assert revokes == ["r"]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_left_before_it_ends_keeps_its_key(monkeypatch, revokes):
+    """A client that goes away mid-turn leaves the turn running on the worker,
+    so its key must keep working."""
+    gen = _turn_with_key(monkeypatch, [_reply("turn_delta", {"text": "hi"}), _reply("turn_completed", {})])
+    async for kind, _ in gen:
+        if kind == "turn_delta":
+            break
+    await gen.aclose()
+    assert revokes == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_revoke_is_logged_and_the_turn_still_ends(monkeypatch, revokes):
+    async def refuse(*, instance_id, settings):
+        raise httpx.ConnectError("auth is down")
+
+    monkeypatch.setattr(prod, "revoke_turn_key", refuse)
+    # Captured at the module logger, not through caplog: another test in the
+    # suite reconfigures logging, and caplog then records nothing.
+    warnings: list[tuple[str, dict]] = []
+    monkeypatch.setattr(prod.logger, "warning", lambda msg, *args, **kw: warnings.append((msg, kw.get("extra", {}))))
+    items = await _drain(_turn_with_key(monkeypatch, [_reply("turn_completed", {})]))
+    assert items[-1][0] == "turn_completed"
+    assert [extra.get("event") for _, extra in warnings] == ["turn_key_revoke_failed"]
+    assert "mdb_turnkey" not in repr(warnings)

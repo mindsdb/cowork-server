@@ -139,8 +139,18 @@ def _external_project_dirs() -> dict[str, Path]:
 
 
 def _all_projects() -> list[_ProjectDir]:
-    """Every project skills can be distributed into, scanned and adopted."""
-    projects = [_ProjectDir(name=path.name, path=path) for path in _project_dirs()]
+    """Every project skills can be distributed into, scanned and adopted.
+
+    Never a model-comparison sandbox: a link there would let a side's code
+    write into the person's own skills (comparisons copy them instead).
+    """
+    from cowork.services.projects import is_comparison_sandbox
+
+    projects = [
+        _ProjectDir(name=path.name, path=path)
+        for path in _project_dirs()
+        if not is_comparison_sandbox(path.name)
+    ]
     seen = {project.name for project in projects}
     for name, path in _external_project_dirs().items():
         if name not in seen:
@@ -315,9 +325,18 @@ def reconcile_project(
     selected_project = _select_project(project_dir, project_name)
     if selected_project is None:
         return
+    for name, canon in project_skill_dirs(skills, project_name=selected_project.name):
+        _ensure_symlink(safe_join_lexical(selected_project.path / "skills", name), canon)
+
+
+def project_skill_dirs(skills: list[Skill], *, project_name: str) -> list[tuple[str, Path]]:
+    """The skills a new project named ``project_name`` works with, as
+    (slug, store directory) pairs: enabled, not held by the managed folder,
+    and not restricted to other projects."""
     canon_root = _canon_root()
     managed = managed_folder()
     managed_slugs = frozenset() if managed is None else managed.skill_slugs()
+    found: list[tuple[str, Path]] = []
     for skill in skills:
         if not skill.enabled:
             continue
@@ -325,7 +344,7 @@ def reconcile_project(
         # store skill must never link into the new project.
         if skill.name in managed_slugs:
             continue
-        if skill.projects and selected_project.name not in skill.projects:
+        if skill.projects and project_name not in skill.projects:
             continue
         safe_skill_name = os.path.basename(skill.name)
         if (
@@ -337,10 +356,8 @@ def reconcile_project(
             raise ValueError("Skill link target must be a direct-child name")
         canon = safe_join_lexical(canon_root, safe_skill_name)
         if canon.exists():
-            _ensure_symlink(
-                safe_join_lexical(selected_project.path / "skills", safe_skill_name),
-                canon,
-            )
+            found.append((safe_skill_name, canon))
+    return found
 
 
 def sync_turn_skill_links(*, skills_dir: Path, wanted: dict[str, Path]) -> None:

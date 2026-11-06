@@ -479,6 +479,42 @@ async def test_reviewer_cannot_provision_draft_review(session, tmp_path, org_mod
     assert err.value.status_code == 403
 
 
+async def test_a_comparison_sides_draft_is_never_opened_to_the_org(session, tmp_path, org_mode, monkeypatch):
+    """Turning review on opens the draft to the organization, and nothing
+    leaves a model comparison until the user continues with a side."""
+    from cowork.services.projects import COMPARISON_SANDBOX_PREFIX
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name=f"{COMPARISON_SANDBOX_PREFIX}{'c' * 32}", org_id=ORG_A, slug="dash"
+    )
+    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    provisioned = []
+
+    async def fake_provision(*args, **kwargs):
+        provisioned.append(args)
+        return card["artifactKey"]
+
+    monkeypatch.setattr("cowork.services.artifact_access.provision_draft_review_access", fake_provision)
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity._allocate_or_adopt",
+        lambda *_args: card["artifactKey"],
+    )
+
+    with pytest.raises(HTTPException) as err:
+        await workspace_ep.enable_artifact_comments(str(row.id), card["id"], _scoped(session, ORG_A))
+
+    assert err.value.status_code == 409
+    assert "Continue with this side" in err.value.detail
+    assert provisioned == []
+    assert not (folder / ".revisions" / "draft-review.json").exists()
+    with Session(session.get_bind()) as reviewer_session:
+        with pytest.raises(HTTPException) as err:
+            await workspace_ep.artifact_review_entry(
+                str(row.id), card["id"], _scoped(reviewer_session, ORG_A, user_id=USER_A2)
+            )
+        assert err.value.status_code == 404
+
+
 async def test_same_org_reviewer_receives_the_current_revision_for_comments(
     session, tmp_path, org_mode, monkeypatch
 ):

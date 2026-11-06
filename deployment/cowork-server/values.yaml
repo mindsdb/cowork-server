@@ -438,6 +438,18 @@ deployment:
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
 
+    # The browser router's scope key, sent beside each web turn's key when the
+    # producer scopes it, so only this server can scope a turn key. Read from
+    # the router's own Secret in this namespace, so the two never differ.
+    # Optional: where no router runs, the Secret doesn't exist and no web turn
+    # is scoped. A pod started before the Secret existed needs a restart.
+    - name: COWORK_BROWSER_SCOPE_KEY
+      valueFrom:
+        secretKeyRef:
+          name: browser-proxy
+          key: scope_key
+          optional: true
+
     # Cloud datasource grants for hosted turns. Off until the release gate; on,
     # the producer lists the user's verified connections and registers grants
     # under the producer role of the datasource-service-keys bundle, an identity
