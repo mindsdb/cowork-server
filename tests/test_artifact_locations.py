@@ -13,7 +13,9 @@ only its own folders, writes no row.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
+import importlib
 import json
 import logging
 import os
@@ -26,7 +28,8 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DataError, IntegrityError, OperationalError
+from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, select
 
 import cowork.services.task_objects as task_objects
@@ -58,6 +61,7 @@ from cowork.services.task_objects import record_new_artifacts, turn_artifact_cha
 from test_artifact_ownership import legacy_root, make_conversation, make_project, project_root, scoped
 from test_artifact_permissions import no_publish_side_effects  # noqa: F401  (a fixture)
 from test_artifact_relocation_ownership import _index, _relocate
+from test_artifact_roots import _count_hops
 from test_harness_scratchpad_teardown import _completes, _drain, turns  # noqa: F401  (turns is a fixture)
 from test_router_probe_lifespan import boot  # noqa: F401  (a fixture)
 
@@ -102,7 +106,7 @@ def _no_lock(_engine, _key):
 
 
 def _sentinel_present() -> bool:
-    return artifact_location_backfill._sentinel_present(
+    return artifact_location_backfill.sentinel_present(
         get_engine(get_app_settings().database.uri), artifact_location_backfill.SENTINEL_KEY
     )
 
@@ -110,11 +114,13 @@ def _sentinel_present() -> bool:
 @pytest.fixture
 def backfill_pending():
     """No backfill has written its sentinel; a test that runs the pass gets
-    its sentinel removed after."""
+    its sentinel and its kept progress removed after, so one test's progress
+    never skips the next test's projects."""
     yield
+    keys = (artifact_location_backfill.SENTINEL_KEY, artifact_location_backfill.PROGRESS_KEY)
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        for sentinel in raw.exec(select(Setting).where(Setting.key == artifact_location_backfill.SENTINEL_KEY)).all():
-            raw.delete(sentinel)
+        for setting in raw.exec(select(Setting).where(Setting.key.in_(keys))).all():
+            raw.delete(setting)
         raw.commit()
 
 
@@ -412,24 +418,43 @@ async def test_a_desktop_lookup_records_nothing(tmp_path):
         assert raw.exec(select(ArtifactLocation).where(ArtifactLocation.artifact_id == artifact_id)).first() is None
 
 
+@pytest.mark.parametrize("row_names", ["the_deleted_folder", "a_conflicted_id", "another_projects_folder"])
 async def test_deleting_an_artifact_deletes_its_row(
-    tmp_path, org_deployment, granted_product_permissions, no_publish_side_effects,  # noqa: F811
+    tmp_path, org_deployment, granted_product_permissions, no_publish_side_effects, row_names,  # noqa: F811
 ):
-    org_id, creator = str(uuid4()), str(uuid4())
+    """The row goes with the folder it names. A conflicted row stays, since
+    another folder of the project still holds the id: here a copy in a
+    co-member's workspace, which the creator's lookup does not read. So does
+    a row naming another project's folder, which still holds the id."""
+    org_id, creator, member = str(uuid4()), str(uuid4()), str(uuid4())
     project = make_project(tmp_path, org_id)
     source = project_root(project)
     artifact_id, folder = _write(source, "mine")
+    mine = Location(project.id, None, "mine")
+    recorded = [mine]
+    if row_names == "a_conflicted_id":
+        copy_conversation = make_conversation(project, member)
+        _write(legacy_root(project, str(copy_conversation)), "copy", artifact_id)
+        recorded = [mine, Location(project.id, copy_conversation, "copy")]
+    elif row_names == "another_projects_folder":
+        elsewhere = make_project(tmp_path, org_id)
+        _write(project_root(elsewhere), "theirs", artifact_id)
+        recorded = [Location(elsewhere.id, None, "theirs")]
     with scoped(org_id) as session:
-        from cowork.services import artifact_ownership
-
         artifact_ownership.record_artifact_owner(session, project.id, "mine", creator, action="create")
-        record_checked_folders(session, artifact_id=artifact_id, folders=[Location(project.id, None, "mine")])
+        record_checked_folders(session, artifact_id=artifact_id, folders=recorded)
+    before = _stored(org_id, artifact_id)
 
     with scoped(org_id, creator) as session:
         await artifacts_ep.delete_artifact_for_request(session.scope, artifact_id, project_id=project.id)
 
     assert not folder.exists()
-    assert _row(org_id, artifact_id) is None
+    after = _stored(org_id, artifact_id)
+    if row_names == "the_deleted_folder":
+        assert after is None
+    else:
+        assert after is not None
+        assert (_row(org_id, artifact_id), after.conflicted) == (recorded[0], before.conflicted)
 
 
 async def test_a_turns_new_folder_gets_its_row_at_its_first_lookup(tmp_path, org_deployment):
@@ -496,7 +521,7 @@ def test_the_backfill_records_every_artifact_held_by_one_folder(tmp_path, org_de
         for record in caplog.records
         if record.name == artifact_location_backfill.logger.name
         and getattr(record, "event", None) == "artifact_location_backfill_summary"
-    } == {("recorded", 2), ("duplicated", 1), ("conflicts", 0), ("unread", 0)}
+    } == {("recorded", 2), ("duplicated", 1), ("conflicts", 0), ("unread", 0), ("skipped", 0)}
     # Once per environment.
     assert artifact_location_backfill.run_artifact_location_backfill(
         engine, try_lock=_no_lock, project_ids=[project.id]
@@ -574,22 +599,22 @@ async def test_a_folder_planted_after_the_owners_row_marks_the_id_conflicted(
     assert await _refused(plant.org_id, plant.owner, plant.project, plant.artifact_id, entry=entry_point) == 409
 
 
-def _unreadable(monkeypatch, folder_name: str, *, strict_too: bool) -> threading.Event:
-    """Make the folder named ``folder_name`` fail to read with EIO in the
-    lookup's cached identity index and, with ``strict_too``, in strict reads
-    as well, while the returned event is set."""
+def _unreadable(monkeypatch, folder_name: str, *, strict_too: bool, error: int = errno.EIO) -> threading.Event:
+    """Make the folder named ``folder_name`` fail to read with ``error`` in
+    the lookup's cached identity index and, with ``strict_too``, in strict
+    reads as well, while the returned event is set."""
     failing = threading.Event()
     failing.set()
     real_ensure, real_read = artifact_identity.ensure_full_id, artifact_identity.read_full_id
 
     def ensure(path, *args, **kwargs):
         if failing.is_set() and Path(path).name == folder_name:
-            raise OSError(errno.EIO, "Input/output error")
+            raise OSError(error, os.strerror(error))
         return real_ensure(path, *args, **kwargs)
 
     def read(folder, *args, **kwargs):
         if failing.is_set() and strict_too and Path(folder.path).name == folder_name:
-            raise OSError(errno.EIO, "Input/output error")
+            raise OSError(error, os.strerror(error))
         return real_read(folder, *args, **kwargs)
 
     monkeypatch.setattr(artifact_identity, "ensure_full_id", ensure)
@@ -731,27 +756,201 @@ async def test_a_desktop_lookup_counts_no_folder_twice(tmp_path, monkeypatch):
     assert resolved.folder.name == "brief"
 
 
-async def test_a_conflicted_id_with_one_folder_left_counts_no_folder_twice(
+def _strict_counts(monkeypatch) -> list[tuple[str, ...]]:
+    """Record the folder names each strict count of a lookup finds."""
+    counts: list[tuple[str, ...]] = []
+    real = artifact_scope.folders_holding_strictly
+
+    def counted(*args, **kwargs):
+        held = real(*args, **kwargs)
+        counts.append(tuple(found.folder.name for found in held))
+        return held
+
+    monkeypatch.setattr(artifact_scope, "folders_holding_strictly", counted)
+    return counts
+
+
+async def test_a_conflicted_id_with_one_folder_left_clears_its_mark(
     tmp_path, org_deployment, entry_point, monkeypatch,
 ):
-    """The row names the owner's folder and the id is conflicted. Once the
-    plant is gone, one folder holds the id again, but the row keeps its mark
-    while its folder holds the id, so the lookup cannot write a fresh row
-    and reads no root a second time."""
+    """The row names the owner's folder and the id is conflicted. While the
+    plant exists, the owner's lookup answers 409, counts nothing strictly,
+    and the mark stays. Once the plant is gone, the owner's lookup finds the
+    row's folder alone, and a strict count of every root agrees, so the mark
+    clears and the next lookup opens only the row's folder."""
     plant = _owners_artifact(tmp_path)
     await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id, entry=entry_point)
     _plant(plant)
     await _review(plant.org_id, plant.member, plant.project, plant.artifact_id, entry=entry_point)
     assert _conflicted(plant.org_id, plant.artifact_id)
     assert _row(plant.org_id, plant.artifact_id).slug == plant.owners_folder.name
+    strict_counts = _strict_counts(monkeypatch)
+    assert await _refused(plant.org_id, plant.owner, plant.project, plant.artifact_id, entry=entry_point) == 409
+    assert _conflicted(plant.org_id, plant.artifact_id)
+    assert strict_counts == []
     shutil.rmtree(plant.planted)
     artifact_identity._clear_identity_indexes()
-    _no_strict_count(monkeypatch)
 
     seen = await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id, entry=entry_point)
 
     assert seen.folder == plant.owners_folder
+    assert strict_counts == [(plant.owners_folder.name,)]
+    assert not _conflicted(plant.org_id, plant.artifact_id)
+    assert _row(plant.org_id, plant.artifact_id).slug == plant.owners_folder.name
+    calls = _FileCalls(monkeypatch)
+    calls.counting = True
+    again = await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id, entry=entry_point)
+    calls.counting = False
+    assert again.folder == plant.owners_folder
+    assert calls.listings == 0
+
+
+async def test_a_strict_count_that_cannot_read_every_folder_keeps_the_mark(
+    tmp_path, org_deployment, monkeypatch,
+):
+    """The plant is gone from the cached scan's view but fails to read in
+    the strict count, which then cannot say one folder holds the id: the
+    mark stays, and the owner's lookup is still served their folder."""
+    plant = _owners_artifact(tmp_path)
+    await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id)
+    _plant(plant)
+    await _review(plant.org_id, plant.member, plant.project, plant.artifact_id)
     assert _conflicted(plant.org_id, plant.artifact_id)
+    _unreadable(monkeypatch, plant.planted.name, strict_too=True)
+    artifact_identity._clear_identity_indexes()
+
+    seen = await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id)
+
+    assert seen.folder == plant.owners_folder
+    assert _conflicted(plant.org_id, plant.artifact_id)
+
+
+async def test_a_conflicted_mark_clears_where_no_caller_reads_every_root_as_their_own(
+    tmp_path, org_deployment, entry_point, monkeypatch,
+):
+    """The owner and a member each have a legacy root, so neither reads every
+    root of the project as their own. The row names the shared root's
+    folder, and a turn's copy beside it marks the id conflicted, so lookups
+    answer 409. Once the copy is gone, the next lookup finds the row's folder
+    alone among the caller's own roots, a strict count of every root agrees,
+    and the mark clears; the lookup after it opens only the row's folder."""
+    org_id, owner, member = str(uuid4()), str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    _write(legacy_root(project, str(make_conversation(project, owner))), "owners-old")
+    _write(legacy_root(project, str(make_conversation(project, member))), "members-old")
+    artifact_id, brief = _write(project_root(project), "brief")
+    await _review(org_id, owner, project, artifact_id, entry=entry_point)
+    assert _row(org_id, artifact_id) == Location(project.id, None, "brief")
+    copy = brief.with_name("brief-copy")
+    shutil.copytree(brief, copy)
+    with scoped(org_id) as session:
+        record_new_artifacts(
+            session, conversation_id=make_conversation(project, member), project_id=project.id,
+            slugs=[copy.name], creator=member, artifact_ids={copy.name: artifact_id},
+        )
+    artifact_identity._clear_identity_indexes()
+    assert _conflicted(org_id, artifact_id)
+    strict_counts = _strict_counts(monkeypatch)
+    for user in (owner, member):
+        assert await _refused(org_id, user, project, artifact_id, entry=entry_point) == 409
+    assert strict_counts == []
+    shutil.rmtree(copy)
+    artifact_identity._clear_identity_indexes()
+
+    seen = await _review(org_id, owner, project, artifact_id, entry=entry_point)
+
+    assert seen.folder == brief
+    assert strict_counts == [(brief.name,)]
+    assert not _conflicted(org_id, artifact_id)
+    assert _row(org_id, artifact_id) == Location(project.id, None, "brief")
+    calls = _FileCalls(monkeypatch)
+    calls.counting = True
+    again = await _review(org_id, member, project, artifact_id, entry=entry_point)
+    calls.counting = False
+    assert again.folder == brief
+    assert calls.listings == 0
+
+
+async def test_a_lookup_counts_a_conflicted_id_strictly_at_most_once_per_window(
+    tmp_path, org_deployment, monkeypatch,
+):
+    """The row names the owner's legacy folder, and a copy in a co-member's
+    workspace marks the id conflicted. The owner's own roots hold only the
+    row's folder, so the owner's lookup counts every root strictly, finds the
+    copy, and the mark stays. Once the copy is gone, a lookup inside the
+    window counts nothing and the mark stays; the first lookup after the
+    window counts again, and the mark clears."""
+    now = [1000.0]
+    monkeypatch.setattr(
+        artifact_scope,
+        "_recount_times",
+        artifact_scope._RecountTimes(
+            seconds=artifact_scope._RECOUNT_SECONDS, limit=artifact_scope._RECOUNT_IDS, clock=lambda: now[0],
+        ),
+    )
+    plant = _owners_artifact(tmp_path)
+    await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id)
+    members_root = legacy_root(plant.project, str(make_conversation(plant.project, plant.member)))
+    _, copy = _write(members_root, "copy", plant.artifact_id)
+    artifact_identity._clear_identity_indexes()
+    await _review(plant.org_id, plant.member, plant.project, plant.artifact_id)
+    assert _conflicted(plant.org_id, plant.artifact_id)
+    strict_counts = _strict_counts(monkeypatch)
+
+    async def owners_lookup() -> None:
+        seen = await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id)
+        assert seen.folder == plant.owners_folder
+
+    await owners_lookup()
+    assert [sorted(count) for count in strict_counts] == [sorted([plant.owners_folder.name, copy.name])]
+    assert _conflicted(plant.org_id, plant.artifact_id)
+    shutil.rmtree(copy)
+    artifact_identity._clear_identity_indexes()
+
+    now[0] += artifact_scope._RECOUNT_SECONDS - 1
+    await owners_lookup()
+    assert len(strict_counts) == 1
+    assert _conflicted(plant.org_id, plant.artifact_id)
+
+    now[0] += 1
+    await owners_lookup()
+    assert strict_counts[1:] == [(plant.owners_folder.name,)]
+    assert not _conflicted(plant.org_id, plant.artifact_id)
+
+
+def test_recount_times_stay_bounded_and_forget_an_id_once_its_window_ends():
+    now = [0.0]
+    times = artifact_scope._RecountTimes(seconds=10, limit=2, clock=lambda: now[0])
+
+    assert times.take(org_id="o", artifact_id="a")
+    assert not times.take(org_id="o", artifact_id="a")
+    assert times.take(org_id="p", artifact_id="a")
+    now[0] = 5
+    # A third id pushes out the oldest, which may then be counted again.
+    assert times.take(org_id="o", artifact_id="b")
+    assert times.take(org_id="o", artifact_id="a")
+    now[0] = 14
+    assert not times.take(org_id="o", artifact_id="b")
+    now[0] = 15
+    assert times.take(org_id="o", artifact_id="b")
+
+
+def test_a_strict_count_of_the_rows_folder_alone_clears_a_conflicted_mark(tmp_path):
+    """record_checked_folders is also the backfill's writer, whose walk is a
+    strict count of every root."""
+    org_id = str(uuid4())
+    project = make_project(tmp_path, org_id)
+    artifact_id = uuid4().hex
+    brief, copy = Location(project.id, None, "brief"), Location(project.id, None, "brief-copy")
+    with scoped(org_id) as session:
+        record_checked_folders(session, artifact_id=artifact_id, folders=[brief, copy])
+        assert _conflicted(org_id, artifact_id)
+
+        outcome = record_checked_folders(session, artifact_id=artifact_id, folders=[brief])
+
+    assert outcome is artifact_locations.RecordOutcome.RECORDED
+    assert _row(org_id, artifact_id) == brief
+    assert not _conflicted(org_id, artifact_id)
 
 
 async def test_a_turn_end_records_no_row_for_a_planted_folder(
@@ -871,8 +1070,10 @@ async def test_a_backfill_that_cannot_read_a_folder_records_nothing_for_its_proj
 
 
 def test_a_link_or_unparseable_metadata_holds_no_id_for_the_backfill(tmp_path, org_deployment, backfill_pending):
-    """Lookups skip both, so the pass does too, and finishes: a folder an
-    agent links or breaks must not keep it from writing its sentinel."""
+    """Lookups skip each of these, so the pass does too, and finishes: a
+    folder an agent links or breaks must not keep it from writing its
+    sentinel. That includes metadata that parses to something other than an
+    object, and an array nested too deeply to parse."""
     org_id, project, ids = _org_projects(tmp_path, artifacts=1)
     base = project_root(project).base
     (base / "linked").symlink_to(base / "shared-0", target_is_directory=True)
@@ -880,6 +1081,11 @@ def test_a_link_or_unparseable_metadata_holds_no_id_for_the_backfill(tmp_path, o
     (base / "linked-metadata" / "metadata.json").symlink_to(base / "shared-0" / "metadata.json")
     (base / "broken").mkdir()
     (base / "broken" / "metadata.json").write_text("{not json")
+    for name, document in {
+        "array": "[]", "number": "1", "null": "null", "string": '"x"', "nested": "[" * 200_000 + "]" * 200_000,
+    }.items():
+        (base / name).mkdir()
+        (base / name / "metadata.json").write_text(document)
 
     summary = artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=[project.id])
 
@@ -1161,7 +1367,7 @@ def test_moving_a_task_moves_the_rows_of_its_folders(tmp_path, org_deployment):
     assert _row(org_id, artifact_id) == Location(dest.id, None, "mine")
 
 
-async def test_an_in_process_turn_records_the_ids_of_the_folders_it_made(turns, monkeypatch):
+async def test_an_in_process_turn_records_the_ids_of_the_folders_it_made(turns, monkeypatch):  # noqa: F811
     artifact_id = uuid4().hex
     monkeypatch.setattr(
         task_objects, "turn_artifact_changes",
@@ -1190,7 +1396,7 @@ async def test_an_in_process_turn_records_the_ids_of_the_folders_it_made(turns, 
     assert recorded["artifact_ids"] == {"sales-report": artifact_id}
 
 
-async def test_the_lifespan_runs_the_location_backfill_in_org_tenancy_and_stops_it_first(boot, monkeypatch):
+async def test_the_lifespan_runs_the_location_backfill_in_org_tenancy_and_stops_it_first(boot, monkeypatch):  # noqa: F811
     app, _order, _probe = boot(tenancy="org")
     started = asyncio.Event()
     seen = {}
@@ -1213,3 +1419,487 @@ async def test_the_lifespan_runs_the_location_backfill_in_org_tenancy_and_stops_
             await started.wait()
             assert not seen["stop"].is_set()
     assert seen["stopped_before_cancel"] is True
+
+
+async def test_a_folder_the_server_may_not_read_holds_no_id_for_the_strict_count(
+    tmp_path, org_deployment, monkeypatch,
+):
+    """Agent code can make a folder of the shared root unreadable to the
+    server (mode 000). The server can never serve that folder, so the strict
+    count takes it for one holding no id: the first lookup writes the row,
+    and the next one opens only the row's folder."""
+    org_id, user = str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    artifact_id, folder = _write(project_root(project), "brief")
+    _write(project_root(project), "decoy")
+    artifact_identity._clear_identity_indexes()
+    _unreadable(monkeypatch, "decoy", strict_too=True, error=errno.EACCES)
+
+    assert (await _review(org_id, user, project, artifact_id)).folder == folder
+    assert _row(org_id, artifact_id) == Location(project.id, None, "brief")
+
+    calls = _FileCalls(monkeypatch)
+    calls.counting = True
+    assert (await _review(org_id, user, project, artifact_id)).folder == folder
+    calls.counting = False
+    assert calls.listings == 0
+
+
+@pytest.mark.parametrize(("error", "raises"), [(errno.EACCES, False), (errno.EPERM, False), (errno.EIO, True)])
+def test_strict_root_discovery_leaves_out_a_workspace_the_server_may_not_read(
+    tmp_path, org_deployment, monkeypatch, error, raises,
+):
+    """A conversation workspace whose `.anton` the server may not stat is no
+    root of the strict count, since nothing below it can be served; an error
+    that may pass, such as EIO, still fails the count."""
+    org_id, user = str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    readable, locked = make_conversation(project, user), make_conversation(project, user)
+    for conversation in (readable, locked):
+        _write(legacy_root(project, str(conversation)), "old")
+    locked_anton = Path(project.path) / "conversations" / str(locked) / ".anton"
+    real_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == locked_anton:
+            raise OSError(error, os.strerror(error))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    row = artifact_roots.ProjectRow(id=project.id, name=project.name, path=project.path, external=False)
+
+    if raises:
+        with pytest.raises(OSError):
+            artifact_roots.project_roots(row, strict=True)
+        return
+    roots = artifact_roots.project_roots(row, strict=True)
+    assert [root.conversation_id for root in roots if root.legacy] == [readable]
+
+
+def test_a_backfill_walks_again_only_the_project_it_could_not_read(
+    tmp_path, org_deployment, backfill_pending, monkeypatch,
+):
+    """One project of three fails to read. The pass records the other two
+    and keeps the third in its progress; the next start walks only that one,
+    and once it reads, the pass writes its sentinel."""
+    projects = [_org_projects(tmp_path, artifacts=1) for _ in range(3)]
+    ids = [project.id for _org_id, project, _ids in projects]
+    unreadable = ids[1]
+    walked: list[UUID] = []
+    failing = threading.Event()
+    failing.set()
+    real = artifact_location_backfill._found_locations
+
+    def found_locations(project, *, stop):
+        walked.append(project.id)
+        if failing.is_set() and project.id == unreadable:
+            raise OSError(errno.EIO, "Input/output error")
+        return real(project, stop=stop)
+
+    monkeypatch.setattr(artifact_location_backfill, "_found_locations", found_locations)
+
+    def run():
+        walked.clear()
+        return artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=ids)
+
+    first = run()
+    assert sorted(walked) == sorted(ids)
+    assert first is not None and (first.recorded, first.unread) == (2, 1)
+    assert not _sentinel_present()
+
+    second = run()
+    assert walked == [unreadable]
+    assert second is not None and second.unread == 1
+    assert not _sentinel_present()
+
+    failing.clear()
+    third = run()
+    assert walked == [unreadable]
+    assert third is not None and (third.recorded, third.unread) == (1, 0)
+    assert _sentinel_present()
+    for org_id, project, artifact_ids in projects:
+        assert _row(org_id, artifact_ids[0]) == Location(project.id, None, "shared-0")
+
+
+def test_a_stopped_backfill_resumes_after_the_last_project_it_finished(
+    tmp_path, org_deployment, backfill_pending, monkeypatch, caplog,
+):
+    projects = [_org_projects(tmp_path, artifacts=1) for _ in range(3)]
+    ids = sorted(project.id for _org_id, project, _ids in projects)
+    stop = threading.Event()
+    walked: list[UUID] = []
+    real_found, real_save = artifact_location_backfill._found_locations, artifact_location_backfill._save_progress
+
+    def found_locations(project, *, stop):
+        walked.append(project.id)
+        return real_found(project, stop=stop)
+
+    def save_progress(engine, *, progress):
+        # Shutdown lands once the first project is finished.
+        real_save(engine, progress=progress)
+        stop.set()
+
+    monkeypatch.setattr(artifact_location_backfill, "_found_locations", found_locations)
+    monkeypatch.setattr(artifact_location_backfill, "_save_progress", save_progress)
+    with caplog.at_level(logging.WARNING, logger=artifact_location_backfill.logger.name):
+        assert artifact_location_backfill.run_artifact_location_backfill(
+            try_lock=_no_lock, project_ids=ids, stop=stop
+        ) is None
+
+    assert walked == ids[:1]
+    assert not _sentinel_present()
+    [stopped] = [
+        record for record in caplog.records
+        if record.name == artifact_location_backfill.logger.name and record.levelno == logging.WARNING
+        and getattr(record, "event", None) == "artifact_location_backfill_stopped"
+    ]
+    assert "resumes" in stopped.getMessage()
+
+    monkeypatch.setattr(artifact_location_backfill, "_save_progress", real_save)
+    walked.clear()
+    summary = artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=ids)
+
+    assert walked == ids[1:]
+    assert summary is not None and summary.recorded == 2
+    assert _sentinel_present()
+    for org_id, project, artifact_ids in projects:
+        assert _row(org_id, artifact_ids[0]) == Location(project.id, None, "shared-0")
+
+
+@pytest.mark.parametrize("bad_first", [False, True], ids=["good_first", "bad_first"])
+def test_a_folder_name_that_is_not_utf8_counts_toward_a_conflict(tmp_path, bad_first):
+    """Linux hands Python a folder name that is not valid UTF-8 with a lone
+    surrogate, which no row can store. It still counts, so the id is marked
+    conflicted, and the row names the folder whose name it can store,
+    whichever the writer found first."""
+    org_id = str(uuid4())
+    project = make_project(tmp_path, org_id)
+    artifact_id = uuid4().hex
+    good, bad = Location(project.id, None, "brief"), Location(project.id, None, "brief\udcff")
+    with scoped(org_id) as session:
+        outcome = record_checked_folders(
+            session, artifact_id=artifact_id, folders=[bad, good] if bad_first else [good, bad],
+        )
+
+    assert outcome is artifact_locations.RecordOutcome.CONFLICTED
+    assert _row(org_id, artifact_id) == good
+    assert _conflicted(org_id, artifact_id)
+
+
+def test_a_lone_folder_name_that_is_not_utf8_writes_no_row(tmp_path):
+    org_id = str(uuid4())
+    project = make_project(tmp_path, org_id)
+    artifact_id = uuid4().hex
+    with scoped(org_id) as session:
+        outcome = record_checked_folders(
+            session, artifact_id=artifact_id, folders=[Location(project.id, None, "brief\udcff")],
+        )
+
+    assert outcome is artifact_locations.RecordOutcome.NOTHING
+    assert _stored(org_id, artifact_id) is None
+
+
+def test_a_backfill_counts_a_folder_name_that_is_not_utf8_toward_a_conflict(
+    tmp_path, org_deployment, backfill_pending, monkeypatch,
+):
+    """The walk finds the id in a good folder and in one whose name is not
+    valid UTF-8 (APFS cannot hold such a name, so the walk's listing adds
+    it). The id is marked conflicted at the good folder, and the pass
+    finishes."""
+    org_id, project, ids = _org_projects(tmp_path, artifacts=1)
+    real = artifact_location_backfill.identities_below
+
+    def identities_below(source):
+        return {
+            artifact_id: (*names, "shared-0\udcff") if artifact_id == ids[0] else names
+            for artifact_id, names in real(source).items()
+        }
+
+    monkeypatch.setattr(artifact_location_backfill, "identities_below", identities_below)
+
+    summary = artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=[project.id])
+
+    assert summary is not None and summary.duplicated == [ids[0]]
+    assert _row(org_id, ids[0]) == Location(project.id, None, "shared-0")
+    assert _conflicted(org_id, ids[0])
+    assert _sentinel_present()
+
+
+def _progress_present() -> bool:
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        return artifact_location_backfill._progress_row(raw) is not None
+
+
+def test_a_backfill_drops_an_unread_project_deleted_since_and_finishes(
+    tmp_path, org_deployment, backfill_pending, monkeypatch,
+):
+    """A project the pass could not read is deleted before the next start.
+    The query never returns it again, so the pass drops it from its
+    progress, writes its sentinel and deletes the progress row."""
+    projects = [_org_projects(tmp_path, artifacts=1) for _ in range(2)]
+    ids = [project.id for _org_id, project, _ids in projects]
+    # The first in id order, so the kept progress is already past it.
+    unreadable = min(ids)
+    real = artifact_location_backfill._found_locations
+
+    def found_locations(project, *, stop):
+        if project.id == unreadable:
+            raise OSError(errno.EIO, "Input/output error")
+        return real(project, stop=stop)
+
+    monkeypatch.setattr(artifact_location_backfill, "_found_locations", found_locations)
+    first = artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=ids)
+    assert first is not None and (first.recorded, first.unread) == (1, 1)
+    assert not _sentinel_present() and _progress_present()
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        raw.delete(raw.get(Project, unreadable))
+        raw.commit()
+
+    second = artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=ids)
+
+    assert second is not None and second.unread == 0
+    assert _sentinel_present()
+    assert not _progress_present()
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        StaleDataError("UPDATE statement on table 'artifact_locations' expected to update 1 row(s); 0 were matched."),
+        DataError("INSERT INTO artifact_locations", {}, Exception("value too long for type character varying(255)")),
+    ],
+    ids=["deleted_mid_write", "refused_value"],
+)
+def test_a_backfill_skips_an_id_it_cannot_write_and_finishes(
+    tmp_path, org_deployment, backfill_pending, monkeypatch, caplog, refusal,
+):
+    org_id, project, ids = _org_projects(tmp_path, artifacts=3)
+    real = artifact_location_backfill.record_checked_folders
+
+    def record_checked_folders(session, *, artifact_id, **kwargs):
+        if artifact_id == ids[1]:
+            raise refusal
+        return real(session, artifact_id=artifact_id, **kwargs)
+
+    monkeypatch.setattr(artifact_location_backfill, "record_checked_folders", record_checked_folders)
+
+    with caplog.at_level(logging.WARNING, logger=artifact_location_backfill.logger.name):
+        summary = artifact_location_backfill.run_artifact_location_backfill(
+            try_lock=_no_lock, project_ids=[project.id]
+        )
+
+    assert summary is not None and (summary.recorded, summary.skipped) == (2, 1)
+    assert _row(org_id, ids[1]) is None
+    assert _row(org_id, ids[0]) is not None and _row(org_id, ids[2]) is not None
+    assert _sentinel_present()
+    [skipped] = [
+        record for record in caplog.records
+        if record.name == artifact_location_backfill.logger.name
+        and getattr(record, "event", None) == "artifact_location_backfill_skipped"
+    ]
+    assert (skipped.project_id, skipped.error_type) == (str(project.id), type(refusal).__name__)
+    assert ("skipped", 1) in {
+        (record.outcome, record.count)
+        for record in caplog.records
+        if record.name == artifact_location_backfill.logger.name
+        and getattr(record, "event", None) == "artifact_location_backfill_summary"
+    }
+
+
+async def test_an_owners_lookup_of_a_conflicted_id_reads_only_the_owners_roots(
+    tmp_path, org_deployment, monkeypatch,
+):
+    """The owner's legacy artifact has a row. A co-member's agent writes a
+    folder holding its id into the co-member's own workspace, and the
+    co-member's lookup marks the id conflicted. The owner's lookups, which
+    answer from the owner's own roots first, find and read only those once
+    the first has counted every root strictly and found the copy: inside that
+    count's window, 20 more co-member workspaces cost them nothing, not even
+    a stat, and nothing they find can change the row, so no record unit
+    runs."""
+    plant = _owners_artifact(tmp_path)
+    await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id)
+    member_conversation = make_conversation(plant.project, plant.member)
+    _write(legacy_root(plant.project, str(member_conversation)), "copy", plant.artifact_id)
+    members = [member_conversation, *(make_conversation(plant.project, plant.member) for _ in range(20))]
+    for conversation in members[1:]:
+        _write(legacy_root(plant.project, str(conversation)), "other")
+    artifact_identity._clear_identity_indexes()
+    seen = await _review(plant.org_id, plant.member, plant.project, plant.artifact_id)
+    assert (seen.folder.name, seen.is_own) == ("copy", True)
+    assert _conflicted(plant.org_id, plant.artifact_id)
+    # Warm the owner's cached indexes.
+    assert (await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id)).folder == plant.owners_folder
+
+    # The own-first shape, measured here: check the row's project sits in the
+    # caller's partition, open the row's folder, discover the roots, and read
+    # the owner's own.
+    from cowork.services.projects import sits_in_another_partition
+
+    row = _row(plant.org_id, plant.artifact_id)
+    with scoped(plant.org_id, plant.owner) as session:
+        plan = artifact_scope._plan_for_project_ref(session, project_ref=str(plant.project.id))
+    rows_root = legacy_root(plant.project, str(row.conversation_id))
+    calls = _FileCalls(monkeypatch)
+    calls.counting = True
+    sits_in_another_partition(str(rows_root.trusted_anchor), partition=plan.partition)
+    artifact_identity.resolve_recorded_folder(rows_root, row.slug, plant.artifact_id)
+    found = artifact_roots.discover_roots(plan, own_only=True)
+    artifact_identity.artifact_folders_holding(found.sources(), artifact_id=plant.artifact_id)
+    calls.counting = False
+    own_first, calls.count = calls.count, 0
+
+    async def no_record(*_args, **_kwargs):
+        raise AssertionError("an owner's lookup of a conflicted id ran a record unit")
+
+    monkeypatch.setattr(artifact_scope, "_record", no_record)
+    touched = _touched_by_discovery(monkeypatch)
+    calls.counting = True
+    resolved = await _review(plant.org_id, plant.owner, plant.project, plant.artifact_id)
+    calls.counting = False
+
+    assert (resolved.folder, resolved.is_own) == (plant.owners_folder, True)
+    assert calls.count <= own_first, f"{calls.count} filesystem calls against {own_first} for the own-first shape"
+    workspaces = [Path(plant.project.path) / "conversations" / str(conversation) for conversation in members]
+    assert _in_workspaces(touched, workspaces) == []
+    # The co-member's lookup reads the row's folder and their own copy, and
+    # records nothing either: the id is already conflicted.
+    seen = await _review(plant.org_id, plant.member, plant.project, plant.artifact_id)
+    assert (seen.folder.name, seen.is_own) == ("copy", True)
+    assert _conflicted(plant.org_id, plant.artifact_id)
+
+
+@pytest.mark.parametrize("a_folder", ["holds_the_id", "fails_to_read"])
+async def test_a_lookup_from_a_project_the_row_does_not_name_records_nothing(
+    tmp_path, org_deployment, monkeypatch, a_folder,
+):
+    """Projects A and B of one organization both hold a folder naming the
+    id, and the row names A's. A lookup from B is served B's folder from a
+    scan of B's roots and runs no record unit, since the row keeps naming a
+    folder of A whatever B holds; the row stays at A. That holds too when A's
+    folder fails to read during the lookup."""
+    org_id, user = str(uuid4()), str(uuid4())
+    a, b = make_project(tmp_path, org_id), make_project(tmp_path, org_id)
+    artifact_id, _ = _write(project_root(a), "brief-a")
+    _, b_folder = _write(project_root(b), "brief-b", artifact_id)
+    with scoped(org_id) as session:
+        record_checked_folders(session, artifact_id=artifact_id, folders=[Location(a.id, None, "brief-a")])
+    if a_folder == "fails_to_read":
+        _failing_reads(monkeypatch, folder_name="brief-a")
+    hops = _count_hops(monkeypatch, artifact_scope)
+
+    for _ in range(2):
+        assert (await _review(org_id, user, b, artifact_id)).folder == b_folder
+
+    assert hops == ["run_db", "run_efs"] * 2
+    assert _row(org_id, artifact_id) == Location(a.id, None, "brief-a")
+
+
+def _within(seconds: float, *, fifo: Path, call):
+    """``call()`` on a daemon thread, failing the test when it has not
+    returned within ``seconds``; a writer then opens ``fifo`` so a reader
+    stuck on it returns and the suite goes on."""
+    outcome: dict = {}
+
+    def run():
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # noqa: BLE001  (re-raised on the test's thread)
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        # ENXIO when no reader holds the FIFO open: the call is slow, not stuck.
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        thread.join(5)
+        pytest.fail(f"a read of the FIFO had not returned after {seconds}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+def test_a_fifo_in_place_of_metadata_holds_no_id_and_holds_no_thread(tmp_path, org_deployment):
+    """An agent can replace an artifact's metadata.json with a FIFO, which no
+    writer on the server's node ever opens. Each read of it returns at once:
+    the list leaves the artifact out, the row's folder reads as stale, and a
+    cached index that still names the folder drops it."""
+    from cowork.services import artifacts as artifacts_service
+
+    project = make_project(tmp_path, str(uuid4()))
+    source = project_root(project)
+    artifact_id, folder = _write(source, "brief")
+    other_id, _ = _write(source, "other")
+    artifact_identity._clear_identity_indexes()
+    # Warm the index, and the imports the list and its skip warning make on
+    # first use (the log filter imports the provider SDK), so the bounds
+    # below time only the reads.
+    assert len(artifact_identity.artifact_folders_holding([source], artifact_id=artifact_id)) == 1
+    assert len(artifacts_service.list_artifacts([source])) == 2
+    importlib.import_module("anthropic")
+    metadata = folder / "metadata.json"
+    metadata.unlink()
+    os.mkfifo(metadata)
+
+    listed = _within(1, fifo=metadata, call=lambda: artifacts_service.list_artifacts([source]))
+    assert [card["id"] for card in listed] == [other_id]
+    recorded = _within(1, fifo=metadata, call=lambda: artifact_identity.resolve_recorded_folder(source, "brief", artifact_id))
+    assert recorded.check is FolderCheck.STALE
+    held = _within(1, fifo=metadata, call=lambda: artifact_identity.artifact_folders_holding([source], artifact_id=artifact_id))
+    assert held == []
+
+
+def test_a_fifo_in_place_of_metadata_gives_no_provenance_origin_at_once(tmp_path):
+    """The owner backfill and a turn's new-artifact check read a folder's
+    first conversation through provenance_origin. A FIFO in place of its
+    metadata.json, which no writer opens, reads as no origin at once instead
+    of holding the open."""
+    folder = tmp_path / "brief"
+    folder.mkdir()
+    metadata = folder / "metadata.json"
+    os.mkfifo(metadata)
+
+    assert _within(1, fifo=metadata, call=lambda: artifact_ownership.provenance_origin(folder)) is None
+
+
+async def test_shutdown_goes_on_while_the_location_backfill_is_stuck(boot, monkeypatch, caplog):  # noqa: F811
+    """During a file store stall the walk can sit in one root's read when
+    the teardown sets its stop, and a started file store call is never
+    abandoned. The teardown waits at most LOCATION_BACKFILL_SHUTDOWN_SECONDS
+    for it, then goes on to drain the channel turns and close the rest."""
+    app, _order, _probe = boot(tenancy="org")
+    walking, release = threading.Event(), threading.Event()
+
+    def stuck_walk(*_args, **_kwargs):
+        walking.set()
+        # Ignores stop, as a read stuck on the mount does.
+        release.wait(30)
+
+    monkeypatch.setattr(artifact_location_backfill, "run_artifact_location_backfill", stuck_walk)
+    loop = asyncio.get_running_loop()
+    drained: list[float] = []
+
+    async def drain_background_tasks(*_args, **_kwargs):
+        drained.append(loop.time())
+
+    monkeypatch.setattr("cowork.channels.webhooks.drain_background_tasks", drain_background_tasks)
+    try:
+        with caplog.at_level(logging.WARNING, logger=server.logger.name):
+            async with asyncio.timeout(10):
+                async with server.lifespan(app):
+                    assert await asyncio.to_thread(walking.wait, 5)
+                    stopping_at = loop.time()
+        assert len(drained) == 1
+        assert drained[0] - stopping_at <= server.LOCATION_BACKFILL_SHUTDOWN_SECONDS + 1
+        assert [
+            record for record in caplog.records
+            if record.name == server.logger.name
+            and getattr(record, "event", None) == "shutdown_location_backfill_unfinished"
+        ]
+    finally:
+        release.set()
+        backfill = app.state.artifact_location_backfill
+        if backfill is not None:
+            await asyncio.wait({backfill}, timeout=5)

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -29,7 +32,6 @@ from cowork.services.artifact_locations import (
     record_checked_folders,
 )
 from cowork.services.artifact_roots import (
-    DiscoveredRoots,
     RootsPlan,
     discover_roots,
     plan_project_roots,
@@ -302,23 +304,36 @@ def _reviewable_among(
 
 
 def _scan_found(
-    found: DiscoveredRoots,
+    plan: RootsPlan,
     *,
     artifact_id: str,
     org_id: str | None,
     read: Callable[[ResolvedArtifact], T],
+    own_first: bool = False,
 ) -> _Scanned:
-    """A scan of the discovered roots: every folder there that holds the id,
-    a co-member's legacy roots included, the caller's answer from those, then
+    """A scan of the plan's roots: every folder there that holds the id, a
+    co-member's legacy roots included, the caller's answer from those, then
     `read` on it.
 
-    Every root, an owner's scan too, and not the caller's own first: the
-    folders found become the id's location row, which every member's lookup
-    reads. Counted from one member's roots alone, the row would serve the
-    shared folder to a co-member whose own workspace holds a copy, where
-    their own roots answer 409. The scan runs only when no row answers, so a
-    lookup by its row stats no co-member's workspace."""
-    matches = artifact_folders_holding(found.unfiltered(), artifact_id=artifact_id)
+    A scan whose folders may change the row reads every root, an owner's
+    scan too: those folders become the id's location row, which every
+    member's lookup reads. Counted from one member's roots alone, the row
+    would serve the shared folder to a co-member whose own workspace holds a
+    copy, where their own roots answer 409. The scan runs only when no row
+    answers, so a lookup by its row stats no co-member's workspace.
+
+    With `own_first`, the caller's own roots are found and read first
+    (discover_roots' `own_only`, which skips another member's workspaces by
+    name before any stat), and every root only when those hold no folder.
+    The answer is the same, since _reviewable_among answers from the
+    caller's own folders first, but the folders found are then only the
+    caller's own, so they may not change the row (_open_or_scan)."""
+    found = discover_roots(plan, own_only=own_first)
+    matches = artifact_folders_holding(found.sources(), artifact_id=artifact_id) if own_first else []
+    if not matches:
+        if own_first:
+            found = discover_roots(plan)
+        matches = artifact_folders_holding(found.unfiltered(), artifact_id=artifact_id)
     folders = _locations(matches)
     try:
         artifact = _reviewable_among(matches, own=found.sources(), org_id=org_id)
@@ -351,6 +366,47 @@ def _strictly_held(plan: RootsPlan, *, artifact_id: str) -> tuple[Location, ...]
         return None
 
 
+#: How long one replica waits before it counts a conflicted id's folders
+#: strictly again, and how many ids it remembers that for. The count reads
+#: every root of the project, each co-member's legacy roots included, so a
+#: lookup that otherwise reads only the caller's own roots pays for it at
+#: most once per id in that time.
+_RECOUNT_SECONDS = 15 * 60
+_RECOUNT_IDS = 4096
+
+
+class _RecountTimes:
+    """When this replica last counted a conflicted id's folders strictly, per
+    organization and id, oldest first. Lookups run on file store threads, so
+    a lock guards the map; an entry leaves once its time is up, or once the
+    map holds `limit` newer ones."""
+
+    def __init__(self, *, seconds: float, limit: int, clock: Callable[[], float] = time.monotonic) -> None:
+        self._seconds = seconds
+        self._limit = limit
+        self._clock = clock
+        self._times: OrderedDict[tuple[str | None, str], float] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def take(self, *, org_id: str | None, artifact_id: str) -> bool:
+        """Whether the id may be counted now. When it may, now is its last
+        count, so the next lookup inside the window is told no."""
+        now = self._clock()
+        key = (org_id, artifact_id)
+        with self._lock:
+            while self._times and next(iter(self._times.values())) <= now - self._seconds:
+                self._times.popitem(last=False)
+            if key in self._times:
+                return False
+            self._times[key] = now
+            while len(self._times) > self._limit:
+                self._times.popitem(last=False)
+            return True
+
+
+_recount_times = _RecountTimes(seconds=_RECOUNT_SECONDS, limit=_RECOUNT_IDS)
+
+
 def _replaced_row(lookup: _Lookup, opened: _Opened | None) -> Location | None:
     """The row a scan may move or drop: one whose folder is stale, and only
     for a caller who reads the row's root as their own."""
@@ -362,10 +418,18 @@ def _replaced_row(lookup: _Lookup, opened: _Opened | None) -> Location | None:
 class _Found(NamedTuple):
     """What a lookup's file store call found: what opening the row's folder
     found, when the lookup had a row to open, and the scan, which ran unless
-    that folder answered the request (`opened.reviewed`)."""
+    that folder answered the request (`opened.reviewed`).
+
+    `records` is False when the scan read the caller's own roots first
+    (_scan_found's `own_first`), so what it found may not change the row.
+    `clears` is True when a strict count of every root found the conflicted
+    row's folder alone, so recording it clears the mark
+    (record_checked_folders)."""
 
     opened: _Opened | None
     scanned: _Scanned | None = None
+    records: bool = True
+    clears: bool = False
 
 
 def _in_another_partition(lookup: _Lookup) -> bool:
@@ -391,7 +455,17 @@ def _open_or_scan(
     kept and the scan found one folder that would get a fresh unconflicted
     row, because the id has no row or the caller replaces a stale one, the
     folders are counted again strictly (_strictly_held). Runs on a file store
-    thread (run_efs), so the lookup waits for a file store slot once."""
+    thread (run_efs), so the lookup waits for a file store slot once.
+
+    When the row's folder holds the id but the row cannot answer, because
+    the id is conflicted or the row names another project, the scan reads the
+    caller's own roots first and records nothing: no row moves while its
+    folder holds the id, and a co-member's legacy roots are neither statted
+    nor indexed on every lookup. One exception clears a conflicted mark: when that scan
+    found the row's folder alone and a strict count of every root of the
+    project (_strictly_held) finds it alone too. That count reads each
+    co-member's legacy roots as well, so it runs at most once per id every
+    _RECOUNT_SECONDS on this replica (_RecountTimes)."""
     opened = None
     if lookup.source is not None:
         if _in_another_partition(lookup):
@@ -401,7 +475,21 @@ def _open_or_scan(
             opened = _open_recorded(lookup, artifact_id=artifact_id, org_id=org_id, read=read)
             if opened.reviewed is not None:
                 return _Found(opened)
-    scanned = _scan_found(discover_roots(lookup.plan), artifact_id=artifact_id, org_id=org_id, read=read)
+    settled = opened is not None and opened.check is FolderCheck.HOLDS and not lookup.serves
+    scanned = _scan_found(
+        lookup.plan, artifact_id=artifact_id, org_id=org_id, read=read, own_first=settled,
+    )
+    if settled:
+        row = lookup.row
+        clears = (
+            keeps_rows
+            and lookup.in_plan
+            and row.conflicted
+            and scanned.folders == (row.location,)
+            and _recount_times.take(org_id=org_id, artifact_id=artifact_id)
+            and _strictly_held(lookup.plan, artifact_id=artifact_id) == (row.location,)
+        )
+        return _Found(opened, scanned, records=False, clears=clears)
     writes_a_fresh_row = keeps_rows and (lookup.row is None or _replaced_row(lookup, opened) is not None)
     if writes_a_fresh_row and len(scanned.folders) == 1:
         scanned = scanned._replace(folders=_strictly_held(lookup.plan, artifact_id=artifact_id))
@@ -441,7 +529,7 @@ async def _review(
         ),
         scope=scope,
     )
-    opened, scanned = found
+    opened, scanned, records, clears = found
     if scanned is None:
         return opened.reviewed
     seen: tuple[Location, ...] = ()
@@ -453,12 +541,20 @@ async def _review(
     folders = tuple(dict.fromkeys(seen + (scanned.folders or ())))
     # With no stale row to replace, a scan that found no folder, or only the
     # one the row names, leaves the row as it is. So does a scan that could
-    # not read every folder.
+    # not read every folder, and one from a project the row does not name:
+    # without a stale row to replace, record_checked_folders keeps a row
+    # naming another project whatever this one holds.
     unchanged = scanned.folders is None or (
         replaces is None
-        and (not folders or (lookup.row is not None and folders == (lookup.row.location,)))
+        and (
+            not folders
+            or (
+                lookup.row is not None
+                and (not lookup.in_plan or folders == (lookup.row.location,))
+            )
+        )
     )
-    if keeps_rows and not unchanged:
+    if keeps_rows and (clears or (records and not unchanged)):
         await _record(artifact_id, folders=folders, replaces=replaces, scope=scope)
     if scanned.refusal is not None:
         raise scanned.refusal
@@ -482,7 +578,11 @@ async def review_artifact_for_request(
     of the project holding the id and records them
     (cowork.services.artifact_locations.record_checked_folders): a row names
     the id's folder only when one folder holds it, and an id two folders hold
-    is marked conflicted, so its lookups keep listing the roots.
+    is marked conflicted, so its lookups keep listing the roots. While the
+    row's folder holds the id but the row cannot answer (a conflicted id, or
+    a row naming another project), the lookup reads the caller's own roots
+    first and records nothing, except a conflicted mark it clears
+    (_open_or_scan).
 
     One database unit reads the project row, the conversations the caller
     owns and the location row (run_db), then one file store call opens the

@@ -9,13 +9,17 @@ Only a writer that checked every root of a project (a lookup's scan, the
 backfill's walk) writes a row, with record_checked_folders, since a writer
 that saw fewer roots could miss another folder holding the id. A row moves
 with a task's folders and is deleted with its folder. An id the server sees
-held by two folders of one project is marked conflicted, and stays so while
-the folder its row names holds the id: its lookups list the project's roots
-and answer 409 when two of its folders are in the roots that decide the
-lookup (the caller's own, or every member's when the caller's own hold
-none), as before rows existed. A turn end sees only the folders it made, so
-it writes no row; it marks an id conflicted when the id's row names another
-folder of the project (record_made_folder).
+held by two folders of one project is marked conflicted: its lookups list
+the project's roots and answer 409 when two of its folders are in the roots
+that decide the lookup (the caller's own, or every member's when the
+caller's own hold none), as before rows existed. The mark clears once a
+strict count of every root finds the folder the row names alone: a
+lookup's, at most once per id every 15 minutes on each replica
+(cowork.api.v1.artifact_scope._open_or_scan), or the backfill's walk while
+its pass runs. A turn end sees only the folders it made, so it writes no
+row; it marks an id conflicted when the id's row names another folder of
+the project (record_made_folder). A folder whose name is not valid UTF-8
+counts toward a conflict, but no row names it, since no row can store it.
 """
 from __future__ import annotations
 
@@ -114,6 +118,17 @@ def _insert(
         return row
 
 
+def _storable(location: Location) -> bool:
+    """Whether a row can store `location`'s folder name. Linux hands Python a
+    name that is not valid UTF-8 with a lone surrogate, which the row's model
+    refuses."""
+    try:
+        location.slug.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _write(session: ScopedSession, row: ArtifactLocation, *, location: Location, conflicted: bool) -> None:
     if conflicted and not row.conflicted:
         _log_conflicted(location)
@@ -167,17 +182,27 @@ def record_checked_folders(
     when it found nothing. Two folders found also mark a row conflicted when
     it names a folder of the same project. Otherwise the row stays as it was,
     since the folder it names may still hold the id: one in another project,
-    or one the writer could not read. A conflicted row stays conflicted while
-    the folder it names holds the id.
+    or one the writer could not read. A conflicted row whose folder is the
+    one folder found is no longer conflicted, so a writer passes a lone
+    folder that may change a row only from a count that read every root and
+    folder past every cache (the lookup's _strictly_held, the backfill's
+    walk): a folder whose read failed is never taken for one holding no id.
+
+    A folder whose name no row can store (_storable) counts toward a
+    conflict, and a row never names it. When every folder found is such a
+    one, nothing is written.
     """
     if not keeps_locations(session.scope):
         return RecordOutcome.NOTHING
+    storable = [folder for folder in folders if _storable(folder)]
     row = _row(session, artifact_id)
+    if folders and not storable:
+        return RecordOutcome.NOTHING if row is None else RecordOutcome.KEPT
     if row is None:
         if not folders:
             return RecordOutcome.NOTHING
         conflicted = len(folders) > 1
-        row = _insert(session, artifact_id=artifact_id, location=folders[0], conflicted=conflicted)
+        row = _insert(session, artifact_id=artifact_id, location=storable[0], conflicted=conflicted)
         if row is None:
             return RecordOutcome.CONFLICTED if conflicted else RecordOutcome.RECORDED
     current = _location(row)
@@ -190,18 +215,20 @@ def record_checked_folders(
         return RecordOutcome.DROPPED
     if len(folders) > 1:
         if stale:
-            _write(session, row, location=folders[0], conflicted=True)
-        elif current.project_id == folders[0].project_id:
+            _write(session, row, location=storable[0], conflicted=True)
+        elif current.project_id == storable[0].project_id:
             if not row.conflicted:
                 _write(session, row, location=current, conflicted=True)
         else:
             return RecordOutcome.KEPT
         return RecordOutcome.CONFLICTED
-    if current == folders[0]:
-        return RecordOutcome.CONFLICTED if row.conflicted else RecordOutcome.RECORDED
+    if current == storable[0]:
+        if row.conflicted:
+            _write(session, row, location=current, conflicted=False)
+        return RecordOutcome.RECORDED
     if not stale:
         return RecordOutcome.KEPT
-    _write(session, row, location=folders[0], conflicted=False)
+    _write(session, row, location=storable[0], conflicted=False)
     return RecordOutcome.RECORDED
 
 

@@ -38,6 +38,7 @@ from uuid import UUID
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.services.artifact_identity import may_not_read
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _org_mode,
@@ -88,14 +89,16 @@ def project_artifacts_base(project_path: str) -> Path:
 
 def _is_real_directory(path: Path, *, strict: bool = False) -> bool:
     """True only for a directory entry, never a link to one. With `strict`, a
-    stat error other than FileNotFoundError or NotADirectoryError raises
-    instead of answering False."""
+    stat error other than FileNotFoundError, NotADirectoryError or one that
+    says the server may not read the entry (may_not_read) raises instead of
+    answering False: what the server may not read it can never serve, so
+    leaving it out hides nothing a strict count must see."""
     try:
         return stat.S_ISDIR(path.stat(follow_symlinks=False).st_mode)
     except (FileNotFoundError, NotADirectoryError):
         return False
-    except OSError:
-        if strict:
+    except OSError as exc:
+        if strict and not may_not_read(exc=exc):
             raise
         return False
 
@@ -106,8 +109,9 @@ def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool, strict
     This is an early discovery filter.  The identity service repeats the
     guarantee atomically by reopening both components relative to a pinned
     project directory, so replacing either entry after this check is refused at
-    use time too. With `strict`, a stat error other than FileNotFoundError or
-    NotADirectoryError raises instead of answering False.
+    use time too. With `strict`, a stat error other than FileNotFoundError,
+    NotADirectoryError or one that says the server may not read the entry
+    (may_not_read) raises instead of answering False.
     """
     for component in (workspace / _ARTIFACTS_SUBPATH[0], workspace.joinpath(*_ARTIFACTS_SUBPATH)):
         try:
@@ -116,8 +120,8 @@ def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool, strict
             return may_be_absent
         except NotADirectoryError:
             return False
-        except OSError:
-            if strict:
+        except OSError as exc:
+            if strict and not may_not_read(exc=exc):
                 raise
             return False
         if not stat.S_ISDIR(mode):
@@ -253,9 +257,9 @@ def scoped_project_row(session: ScopedSession, *, project_id: UUID) -> ProjectRo
 
 def _rows_in_partition(*, service, projects, partition: str | None) -> tuple[ProjectRow, ...]:
     """`projects`' rows, less one that names a folder in another partition
-    (`_sits_in_another_partition`). Compares paths against the shared root
-    resolved at startup, read once for every project, so a database unit may
-    run it."""
+    (`left_out_for_another_partition`). Compares paths against the shared
+    root resolved at startup, read once for every project, so a database unit
+    may run it."""
     from cowork.services.projects import resolved_shared_root
 
     shared_root = resolved_shared_root() if partition is not None else None
@@ -263,7 +267,7 @@ def _rows_in_partition(*, service, projects, partition: str | None) -> tuple[Pro
     return tuple(
         row
         for row in rows
-        if not _sits_in_another_partition(row, partition=partition, shared_root=shared_root)
+        if not left_out_for_another_partition(row, partition=partition, shared_root=shared_root)
     )
 
 
@@ -383,7 +387,9 @@ def recorded_source(project: ProjectRow, conversation_id: UUID | None) -> Projec
 
 def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
     """The location row for `folder`, found below `source`, or None for a root
-    no row describes (a desktop root, which has no project id)."""
+    no row describes (a desktop root, which has no project id). A folder name
+    that is not valid UTF-8 still gets its location, so it counts toward a
+    conflict; record_checked_folders never stores it in a row."""
     from cowork.services.artifact_locations import Location
 
     if source.project_id is None:
@@ -400,7 +406,7 @@ def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None
     return Location(UUID(source.project_id), conversation_id, folder.name)
 
 
-def _project_roots(
+def project_roots(
     project: ProjectRow, *, owned: frozenset[UUID] | None = None, strict: bool = False
 ) -> list[_FoundRoot]:
     """One project's roots. One on the desktop. In org mode (ENG-2056): the
@@ -492,7 +498,7 @@ def _adopted_root(project: ProjectRow) -> _FoundRoot | None:
     )
 
 
-def _sits_in_another_partition(
+def left_out_for_another_partition(
     project: ProjectRow, *, partition: str | None, shared_root: Path | None
 ) -> bool:
     """Whether `project` names a folder in another person's partition
@@ -519,13 +525,13 @@ def discover_roots(plan: RootsPlan, *, own_only: bool = False, strict: bool = Fa
     on a file store thread (cowork.db.units.run_efs).
 
     With `own_only` and the plan's owner filter, another member's legacy
-    workspaces are skipped by name before any stat (`_project_roots`), for a
+    workspaces are skipped by name before any stat (`project_roots`), for a
     caller that reads only `sources()`; `unfiltered()` then holds no
     co-member's root either. Without it, every workspace is found, for a
     lookup's scan, which reads `unfiltered()`.
 
     With `strict`, a project root that fails to list or stat raises
-    (_project_roots) instead of being left out."""
+    (project_roots) instead of being left out."""
     from cowork.services.projects import resolved_shared_root
 
     owned = plan.owned if own_only and plan.owner_filter else None
@@ -536,9 +542,9 @@ def discover_roots(plan: RootsPlan, *, own_only: bool = False, strict: bool = Fa
         roots += [_FoundRoot(source=source) for source in artifacts_sources_for_scan(scope=plan.scan_scope)]
         roots += [found for project in plan.adopted if (found := _adopted_root(project)) is not None]
     for project in plan.projects:
-        if _sits_in_another_partition(project, partition=plan.partition, shared_root=shared_root):
+        if left_out_for_another_partition(project, partition=plan.partition, shared_root=shared_root):
             continue
-        roots += _project_roots(project, owned=owned, strict=strict)
+        roots += project_roots(project, owned=owned, strict=strict)
     return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter, owned=plan.owned)
 
 

@@ -413,6 +413,31 @@ async def _run_artifact_owner_backfill() -> None:
         logger.exception("artifact owner backfill failed (non-fatal)")
 
 
+# How long the lifespan teardown waits for the location backfill once it sets
+# the walk's stop. A file store call already started is never abandoned
+# (cowork.db.units.run_efs), so during a stall the walk can outlast any wait;
+# the teardown goes on without it, and the walk's thread, which is not a
+# daemon thread, ends at its next root or id, or at the kubelet's SIGKILL.
+# Counted in the grace period (tests/test_chart_values.py).
+LOCATION_BACKFILL_SHUTDOWN_SECONDS = 2
+
+
+async def _stop_location_backfill(*, task: asyncio.Task | None, stop: threading.Event | None) -> None:
+    """Set the location backfill's stop, cancel its task, and wait at most
+    LOCATION_BACKFILL_SHUTDOWN_SECONDS for it to end."""
+    if stop is not None:
+        stop.set()
+    if task is None:
+        return
+    task.cancel()
+    done, _pending = await asyncio.wait({task}, timeout=LOCATION_BACKFILL_SHUTDOWN_SECONDS)
+    if not done:
+        logger.warning(
+            "artifact location backfill still running at shutdown; going on",
+            extra={"event": "shutdown_location_backfill_unfinished"},
+        )
+
+
 async def _run_artifact_location_backfill(stop: threading.Event) -> None:
     """Background, one-time location backfill: one file store call with no
     deadline, so it holds one file store slot for the walk. Never affects
@@ -652,10 +677,10 @@ async def lifespan(app: FastAPI):
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
-        location_backfill_stop = getattr(app.state, "artifact_location_backfill_stop", None)
-        if location_backfill_stop is not None:
-            location_backfill_stop.set()
-        await _cancel_and_wait(getattr(app.state, "artifact_location_backfill", None))
+        await _stop_location_backfill(
+            task=getattr(app.state, "artifact_location_backfill", None),
+            stop=getattr(app.state, "artifact_location_backfill_stop", None),
+        )
         await _cancel_and_wait(getattr(app.state, "router_startup_probe", None))
 
         await app.state.channel_ingress.stop_all()

@@ -25,7 +25,12 @@ class ArtifactLocation(BaseSQLModel, table=True):
     row's project. A lookup never serves such a row: it lists the project's
     roots and answers 409 when two of the id's folders are in the roots that
     decide the lookup (the caller's own, or every member's when the caller's
-    own hold none), as before rows existed.
+    own hold none), as before rows existed. The mark clears once a strict
+    count of every root finds the row's folder alone.
+
+    One row per id means an id held in two projects of one organization
+    names one of them, and each lookup from the other project lists that
+    project's roots.
     """
 
     __tablename__ = "artifact_locations"

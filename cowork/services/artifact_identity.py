@@ -38,6 +38,7 @@ from anton.core.artifacts.models import (
 from cowork.code_sandbox import anchored_below_a_trusted_root
 from cowork.common.paths import (
     O_NOFOLLOW,
+    O_NONBLOCK,
     PinnedDir,
     dir_atomic_write,
     dir_open,
@@ -206,6 +207,11 @@ def _is_migrated(metadata: dict, resolved: str) -> bool:
     return metadata.get("id") == resolved and not metadata.get("stableId")
 
 
+class _NotARegularFile(OSError):
+    """A document an artifact folder names is not a regular file, such as a
+    FIFO an agent left in its place. It holds no id (_holds_no_id)."""
+
+
 def _read_no_follow(folder: PinnedDir, name: str) -> str:
     """Read a direct child, refusing to follow it if it is a symlink.
 
@@ -215,15 +221,34 @@ def _read_no_follow(folder: PinnedDir, name: str) -> str:
     caller here treats an unreadable identity as "skip this folder", which is
     the correct outcome for a link too. `O_NOFOLLOW` raises `ELOOP` (an
     `OSError`) in that case, which every caller of this module already handles.
+
+    The open never waits on a FIFO (`O_NONBLOCK`), and anything but a regular
+    file raises _NotARegularFile, so a FIFO in place of the document cannot
+    hold a file store thread until a writer appears.
     """
-    fd = dir_open(folder, _component(name), os.O_RDONLY | O_NOFOLLOW)
+    fd = dir_open(folder, _component(name), os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _NotARegularFile(errno.EINVAL, "Artifact document is not a regular file", name)
         stream = os.fdopen(fd, "r", encoding="utf-8")
     except BaseException:
         os.close(fd)
         raise
     with stream:
         return stream.read()
+
+
+def _load_metadata(*, folder: PinnedDir, name: str = "metadata.json") -> dict:
+    """Parse the folder's metadata document. A document nested too deeply
+    to parse, or one that is not a JSON object, raises ValueError, which
+    every caller treats as a folder holding no id."""
+    try:
+        metadata = json.loads(_read_no_follow(folder, name))
+    except RecursionError as exc:
+        raise ValueError("Artifact metadata nests too deeply") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("Artifact metadata is not an object")
+    return metadata
 
 
 def read_full_id(folder: PinnedDir) -> tuple[str, dict]:
@@ -236,7 +261,7 @@ def read_full_id(folder: PinnedDir) -> tuple[str, dict]:
     descriptor, derives the canonical id in memory, and returns the normalized
     metadata that callers historically received after a successful migration.
     """
-    metadata = json.loads(_read_no_follow(folder, "metadata.json"))
+    metadata = _load_metadata(folder=folder)
     resolved = _resolved_id(metadata, folder.path)
     if _is_migrated(metadata, resolved):
         return resolved, metadata
@@ -283,7 +308,7 @@ def _ensure_full_id(
     name = "metadata.json"
     path = folder.path / name
     if metadata is None:
-        metadata = json.loads(_read_no_follow(folder, name))
+        metadata = _load_metadata(folder=folder, name=name)
     resolved = _resolved_id(metadata, folder.path)
     if _is_migrated(metadata, resolved):
         return resolved, metadata
@@ -292,7 +317,7 @@ def _ensure_full_id(
     # Merge into the latest durable document instead of writing the stale
     # snapshot back over unrelated metadata fields.
     try:
-        latest = json.loads(_read_no_follow(folder, name))
+        latest = _load_metadata(folder=folder, name=name)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Artifact metadata is unreadable") from exc
     resolved = _resolved_id(latest, folder.path)
@@ -395,9 +420,27 @@ _identity_indexes_lock = RLock()
 
 def _holds_no_id(exc: OSError) -> bool:
     """Whether a read error means the entry holds no artifact id: it is gone,
-    is not a directory, or is a link, which no reader follows (ELOOP from
-    ``O_NOFOLLOW``). Any other error leaves unknown what the entry holds."""
-    return isinstance(exc, (FileNotFoundError, NotADirectoryError)) or exc.errno == errno.ELOOP
+    is not a directory, is a link, which no reader follows (ELOOP from
+    ``O_NOFOLLOW``), or names a document that is not a regular file
+    (_read_no_follow). Any other error leaves unknown what the entry holds."""
+    return (
+        isinstance(exc, (FileNotFoundError, NotADirectoryError, _NotARegularFile))
+        or exc.errno == errno.ELOOP
+    )
+
+
+def may_not_read(*, exc: OSError) -> bool:
+    """Whether a read error says the server may not read the entry at all
+    (EACCES, EPERM). The server can never serve what sits below such an
+    entry, so a strict count leaves it out rather than failing on it."""
+    return exc.errno in (errno.EACCES, errno.EPERM)
+
+
+def _strictly_holds_no_id(*, exc: OSError) -> bool:
+    """_holds_no_id, plus a folder the server may not read (may_not_read):
+    it is no second folder for a row, since no lookup can serve it. A strict
+    read still raises on EIO, ESTALE and the like, which may pass."""
+    return _holds_no_id(exc) or may_not_read(exc=exc)
 
 
 def _build_identity_index(
@@ -411,7 +454,8 @@ def _build_identity_index(
     does not parse holds no id. A folder that fails to read for any other
     reason is left out too, unless ``strict``: then the error raises, for a
     caller that records which folders hold an id and must not take a folder
-    it could not read for one holding none."""
+    it could not read for one holding none. A folder the server may not read
+    at all (EACCES, EPERM) holds no id even then (_strictly_holds_no_id)."""
     matches: dict[str, list[str]] = {}
     try:
         with dir_scandir(base) as entries:
@@ -424,11 +468,11 @@ def _build_identity_index(
                     ):
                         folder_names.append(entry.name)
                 except OSError as exc:
-                    if strict and not _holds_no_id(exc):
+                    if strict and not _strictly_holds_no_id(exc=exc):
                         raise
                     continue
     except OSError as exc:
-        if strict and not _holds_no_id(exc):
+        if strict and not _strictly_holds_no_id(exc=exc):
             raise
         return {}
     # DirEntry's no-follow probe is an early filter; each openat below is the
@@ -448,7 +492,7 @@ def _build_identity_index(
         except (ValueError, json.JSONDecodeError):
             continue
         except OSError as exc:
-            if strict and not _holds_no_id(exc):
+            if strict and not _strictly_holds_no_id(exc=exc):
                 raise
             continue
         matches.setdefault(found, []).append(folder_name)
@@ -638,15 +682,15 @@ def _resolved_from_source(
 
 def identities_below(source: "ProjectArtifacts") -> dict[str, tuple[str, ...]]:
     """Every id found in ``source``'s root, with the folders holding it, read
-    without writing. Empty for a missing root or a link in its chain. Any
-    other error opening the root or reading a folder raises (the index's
-    ``strict``), so the caller never takes a folder it could not read for
-    one holding no id."""
+    without writing. Empty for a missing root, a link in its chain, or a root
+    the server may not read. Any other error opening the root or reading a
+    folder raises (the index's ``strict``), so the caller never takes a
+    folder it could not read for one holding no id."""
     try:
         with opened_artifact_root(source) as base:
             return _build_identity_index(base, widen=False, strict=True)
     except OSError as exc:
-        if _holds_no_id(exc):
+        if _strictly_holds_no_id(exc=exc):
             return {}
         raise
     except ValueError:

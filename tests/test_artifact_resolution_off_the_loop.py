@@ -34,7 +34,7 @@ import anyio
 import httpx
 import pytest
 from fastapi import HTTPException
-from sqlmodel import Session
+from sqlmodel import Session, select
 from starlette.types import ASGIApp
 
 import cowork.db.session as db_session
@@ -44,6 +44,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db import units
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.draft_host import app as draft_app
+from cowork.models.artifact_location import ArtifactLocation
 from cowork.models.project import Project
 from cowork.server import create_app
 from cowork.services import artifact_files, artifact_identity, artifact_roots
@@ -687,11 +688,27 @@ SCANNED_LOOKUP = [*LOOKUP, "record"]
 OWNER_READ = [*LOOKUP, "run_db", "run_efs"]
 
 
+def _own_slug() -> str:
+    """A slug no other test's folder has. An artifact with no id in its
+    metadata takes one from its slug, so a shared slug gives every test's
+    artifact one id, whose location row another module's test may leave
+    naming its own project."""
+    return f"dash-{uuid4().hex[:8]}"
+
+
 @pytest.fixture
 async def owned(session, tmp_path, org_deployment, cleanup_tmp_projects, granted_product_permissions, monkeypatch):
     """USER_A's artifact in an ORG_A project, opened for same-org review.
     Returns (project_id, artifact_id)."""
-    row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch)
+    row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch, slug=_own_slug())
+    with Session(db_session.get_engine(get_app_settings().database.uri)) as raw:
+        location = raw.exec(
+            select(ArtifactLocation).where(
+                ArtifactLocation.org_id == tenancy.ORG_A, ArtifactLocation.artifact_id == card["id"]
+            )
+        ).first()
+    # Opening the review looked the artifact up, which recorded its row here.
+    assert location is not None and location.project_id == row.id, "the artifact's location row names another project"
     return str(row.id), card["id"]
 
 
@@ -936,11 +953,11 @@ async def test_a_non_owner_is_refused_access_before_any_read(
     granted, status_code,
 ):
     if granted:
-        row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch)
+        row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch, slug=_own_slug())
         artifact_id = card["id"]
     else:
         row, folder = tenancy._project_with_artifact(
-            session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug="dash"
+            session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug=_own_slug()
         )
         artifact_id, _metadata = ensure_full_id(folder)
     access_reads = _access_reads(monkeypatch)

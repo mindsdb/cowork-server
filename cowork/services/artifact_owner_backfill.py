@@ -68,7 +68,7 @@ class BackfillSummary:
 
 
 @contextmanager
-def _advisory_try_lock(engine, key: int = _LOCK_KEY):
+def advisory_try_lock(engine, key: int = _LOCK_KEY):
     """One non-blocking cross-replica lock; SQLite (tests, desktop) has none."""
     if engine.dialect.name != "postgresql":
         yield True
@@ -92,13 +92,13 @@ def _advisory_try_lock(engine, key: int = _LOCK_KEY):
             connection.close()
 
 
-def _sentinel_present(engine, key: str = SENTINEL_KEY) -> bool:
+def sentinel_present(engine, key: str = SENTINEL_KEY) -> bool:
     with Session(engine) as raw:
         # No scope: the settings service then reads the global (NULL-scope) row.
         return SettingService(raw)._fetch_row(key) is not None
 
 
-def _write_sentinel(engine, key: str = SENTINEL_KEY) -> None:
+def write_sentinel(engine, key: str = SENTINEL_KEY) -> None:
     with Session(engine) as raw:
         raw.add(Setting(key=key, value="1"))
         try:
@@ -230,11 +230,11 @@ def run_artifact_owner_backfill(
     if get_app_settings().tenancy_mode != "org":
         return None
     engine = engine or get_engine(get_app_settings().database.uri)
-    lock = try_lock or _advisory_try_lock
-    if _sentinel_present(engine):
+    lock = try_lock or advisory_try_lock
+    if sentinel_present(engine):
         return None
     with lock(engine) as acquired:
-        if not acquired or _sentinel_present(engine):
+        if not acquired or sentinel_present(engine):
             return None
         with Session(engine) as raw:
             query = select(Project.id, Project.path, Project.org_id)
@@ -253,5 +253,5 @@ def run_artifact_owner_backfill(
         )
         for project_id, slug in summary.unknown:
             logger.warning("artifact_owner_backfill unknown project=%s slug=%s", project_id, slug)
-        _write_sentinel(engine)
+        write_sentinel(engine)
     return summary
