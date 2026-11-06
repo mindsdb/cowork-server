@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
@@ -29,6 +29,9 @@ RADIUS_MAX = 16
 GREETING_MAX_CHARS = 200
 SIDEBAR_TITLE_MAX_CHARS = 40
 GUIDELINES_MAX_CHARS = 8000
+
+SidebarTitleMode = Literal["company", "custom", "none"]
+SIDEBAR_CUSTOM_NEEDS_TITLE = "A custom sidebar title needs sidebar_title: 1 to 40 characters."
 
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -43,9 +46,10 @@ class OrgAppearanceView(CamelResponse):
     skin: str | None = None
     default_theme: Literal["light", "dark"] | None = None
     greeting: str | None = None
-    # The title an admin set, or null; OrgBrandingView.sidebar_title is the
-    # one to show.
+    # The admin's own title, set only in 'custom' mode; OrgBrandingView's
+    # sidebar_title is the one to show.
     sidebar_title: str | None = None
+    sidebar_title_mode: SidebarTitleMode = "company"
     members_can_choose: bool | None = None
     guidelines: str | None = None
 
@@ -55,8 +59,10 @@ class OrgBrandingView(CamelResponse):
     when Settings opens. Outside hosted org mode ``enabled`` is false and the
     rest is null. The image URLs are auth's (absolute, with ``?v=<hash>``),
     null when unset or when auth couldn't be asked. ``sidebar_title`` is the
-    title to show: the admin's, else the org's name when it is short enough,
-    else the product's (cowork.services.org_branding.resolve_sidebar_title).
+    title to show, by the appearance's ``sidebar_title_mode``: the org's name
+    when it is short enough, else the product's ('company'); the admin's
+    text ('custom'); null for no title, only the logo ('none')
+    (cowork.services.org_branding.resolve_sidebar_title).
     ``org_name`` is the org's display name from auth, null when unknown."""
 
     enabled: bool = False
@@ -88,8 +94,18 @@ class OrgAppearanceUpdate(CamelRequest):
     default_theme: Literal["light", "dark"] | None = None
     greeting: str | None = Field(default=None, max_length=GREETING_MAX_CHARS)
     sidebar_title: str | None = Field(default=None, max_length=SIDEBAR_TITLE_MAX_CHARS)
+    # 'custom' needs a non-blank sidebar_title; 'company' and 'none' clear
+    # it. Left out, a sidebar_title in the body picks the mode as before: a
+    # title means 'custom', null means 'company'.
+    sidebar_title_mode: SidebarTitleMode | None = None
     members_can_choose: bool | None = None
     guidelines: str | None = Field(default=None, max_length=GUIDELINES_MAX_CHARS)
+
+    @model_validator(mode="after")
+    def _custom_needs_a_title(self) -> OrgAppearanceUpdate:
+        if self.sidebar_title_mode == "custom" and not self.sidebar_title:
+            raise ValueError(SIDEBAR_CUSTOM_NEEDS_TITLE)
+        return self
 
     @field_validator("accent", "background", mode="before")
     @classmethod

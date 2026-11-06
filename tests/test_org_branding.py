@@ -220,7 +220,7 @@ def test_a_member_reads_the_images_from_auth_and_the_stock_look(org):
         "appearance": {
             "accent": None, "background": None, "font": None, "radius": None, "skin": None,
             "defaultTheme": None, "greeting": None, "sidebarTitle": None,
-            "membersCanChoose": True, "guidelines": None,
+            "sidebarTitleMode": "company", "membersCanChoose": True, "guidelines": None,
         },
         "canEdit": False,
     }
@@ -262,7 +262,7 @@ def test_an_admin_sets_the_look_and_a_partial_change_keeps_the_rest(org):
     assert out["appearance"] == {
         "accent": "#1a2b3c", "background": "#ffffff", "font": "mono", "radius": 10, "skin": "custom",
         "defaultTheme": "light", "greeting": "Welcome to Acme", "sidebarTitle": "Acme Assist",
-        "membersCanChoose": False, "guidelines": "Write in plain English.",
+        "sidebarTitleMode": "custom", "membersCanChoose": False, "guidelines": "Write in plain English.",
     }
     assert out["sidebarTitle"] == "Acme Assist"
     out = _put(org, ADMIN, greeting=None, members_can_choose=None)
@@ -320,6 +320,65 @@ def test_the_sidebar_title_is_the_admins_then_a_short_org_name_then_mindshub(org
     assert (out["sidebarTitle"], out["appearance"]["sidebarTitle"]) == ("Acme AI", "Acme AI")
     _put(org, ADMIN, sidebar_title="  ")
     assert _get(org, ALICE)["appearance"]["sidebarTitle"] is None
+
+
+def test_the_sidebar_title_has_three_modes(org):
+    out = _put(org, ADMIN, sidebar_title_mode="custom", sidebar_title="Acme AI")
+    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"], out["appearance"]["sidebarTitle"]) == (
+        "Acme AI", "custom", "Acme AI",
+    )
+    # No title, only the logo: the resolved title is null and the text is cleared.
+    out = _put(org, ADMIN, sidebar_title_mode="none")
+    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"], out["appearance"]["sidebarTitle"]) == (
+        None, "none", None,
+    )
+    assert _get(org, ALICE)["sidebarTitle"] is None
+    out = _put(org, ADMIN, sidebar_title_mode="company", sidebar_title="Ignored")
+    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"], out["appearance"]["sidebarTitle"]) == (
+        "Acme", "company", None,
+    )
+    org.set_auth(current={**CURRENT_ORG, "display_name": "Acme Widgets International Holdings"})
+    assert _get(org, ALICE)["sidebarTitle"] == "MindsHub"
+
+
+def test_a_change_without_the_mode_keeps_the_old_meaning(org):
+    out = _put(org, ADMIN, sidebar_title="Acme AI")
+    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"]) == ("Acme AI", "custom")
+    out = _put(org, ADMIN, sidebar_title=None)
+    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"]) == ("Acme", "company")
+    _put(org, ADMIN, sidebar_title_mode="none")
+    # A change to another field keeps the mode.
+    out = _put(org, ADMIN, accent="#0055ff")
+    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"]) == (None, "none")
+
+
+@pytest.mark.parametrize("title", [None, "", "   "])
+def test_a_custom_title_needs_text(title):
+    body = {"sidebar_title_mode": "custom"}
+    if title is not None:
+        body["sidebar_title"] = title
+    with pytest.raises(ValidationError) as caught:
+        OrgAppearanceUpdate(**body)
+    assert "custom sidebar title needs sidebar_title" in str(caught.value)
+
+
+@pytest.mark.parametrize("body", [{"sidebar_title_mode": "logo"}, {"sidebar_title_mode": "custom", "sidebar_title": "x" * 41}])
+def test_a_bad_mode_or_a_long_custom_title_is_refused(body):
+    with pytest.raises(ValidationError):
+        OrgAppearanceUpdate(**body)
+
+
+def test_the_mode_accepts_camel_case():
+    update = OrgAppearanceUpdate(sidebarTitleMode="custom", sidebarTitle="Acme AI")
+    assert (update.sidebar_title_mode, update.sidebar_title) == ("custom", "Acme AI")
+
+
+def test_the_skill_names_a_custom_title_only_in_custom_mode(org):
+    _put(org, ADMIN, accent="#0055ff", sidebar_title_mode="custom", sidebar_title="Acme AI")
+    assert "appears as **Acme AI**" in _skill_md(org)
+    _put(org, ADMIN, sidebar_title_mode="none")
+    text = _skill_md(org)
+    assert "appears as" not in text and "Acme brand guidelines" in text
 
 
 def test_an_unknown_org_name_falls_back_to_mindshub(org):

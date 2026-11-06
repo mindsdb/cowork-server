@@ -33,7 +33,15 @@ class OrgAppearance(BaseSQLModel, table=True):
     default_theme: str | None = Field(default=None, max_length=8, description="'light' or 'dark'")
     greeting: str | None = Field(default=None, max_length=200, description="The new-chat greeting")
     sidebar_title: str | None = Field(
-        default=None, max_length=40, description="The title at the top of the app's sidebar"
+        default=None, max_length=40, description="The admin's own sidebar title, in 'custom' mode"
+    )
+    # 'company' (the org's name), 'custom' (sidebar_title) or 'none' (no
+    # title, only the logo).
+    sidebar_title_mode: str = Field(
+        default="company",
+        max_length=16,
+        sa_column_kwargs={"server_default": "company"},
+        description="Which sidebar title the app shows",
     )
     members_can_choose: bool = Field(
         default=True, description="False: every member gets the org's look"

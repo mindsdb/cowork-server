@@ -77,6 +77,7 @@ _APPEARANCE_FIELDS = (
     "default_theme",
     "greeting",
     "sidebar_title",
+    "sidebar_title_mode",
     "members_can_choose",
     "guidelines",
 )
@@ -100,8 +101,23 @@ def appearance_row(session: ScopedSession) -> OrgAppearance | None:
 
 def appearance_view(row: OrgAppearance | None) -> OrgAppearanceView:
     if row is None:
-        return OrgAppearanceView(members_can_choose=True)
+        return OrgAppearanceView(members_can_choose=True, sidebar_title_mode="company")
     return OrgAppearanceView(**{name: getattr(row, name) for name in _APPEARANCE_FIELDS})
+
+
+def _apply_sidebar_title(row: OrgAppearance, update: OrgAppearanceUpdate) -> None:
+    """The sidebar title's mode and text from ``update``. An explicit mode
+    wins: 'custom' keeps the body's title (the schema required one),
+    'company' and 'none' clear it. With no mode, a title in the body works
+    as before the modes: a title means 'custom', null means 'company'.
+    Neither in the body: both kept."""
+    sent = update.model_fields_set
+    if "sidebar_title_mode" in sent and update.sidebar_title_mode is not None:
+        row.sidebar_title_mode = update.sidebar_title_mode
+        row.sidebar_title = update.sidebar_title if update.sidebar_title_mode == "custom" else None
+    elif "sidebar_title" in sent:
+        row.sidebar_title = update.sidebar_title
+        row.sidebar_title_mode = "custom" if update.sidebar_title else "company"
 
 
 def save_appearance(session: ScopedSession, update: OrgAppearanceUpdate) -> OrgAppearance:
@@ -111,11 +127,12 @@ def save_appearance(session: ScopedSession, update: OrgAppearanceUpdate) -> OrgA
     back before it propagates."""
     try:
         row = appearance_row(session) or OrgAppearance()
-        for name in update.model_fields_set:
+        for name in update.model_fields_set - {"sidebar_title", "sidebar_title_mode"}:
             value = getattr(update, name)
             if name == "members_can_choose" and value is None:
                 value = True
             setattr(row, name, value)
+        _apply_sidebar_title(row, update)
         session.add(row)
         session.commit()
         session.refresh(row)
@@ -131,12 +148,17 @@ DEFAULT_SIDEBAR_TITLE = "MindsHub"
 SIDEBAR_ORG_NAME_MAX_CHARS = 24
 
 
-def resolve_sidebar_title(row: OrgAppearance | None, org_name: str | None) -> str:
-    """The title at the top of the app's sidebar: the admin's, else the org's
-    display name when it fits (SIDEBAR_ORG_NAME_MAX_CHARS), else
-    DEFAULT_SIDEBAR_TITLE, which is also the answer when auth couldn't name
-    the org."""
-    if row is not None and row.sidebar_title:
+def resolve_sidebar_title(row: OrgAppearance | None, org_name: str | None) -> str | None:
+    """The title at the top of the app's sidebar, by the org's
+    ``sidebar_title_mode``: None for 'none' (only the logo); the admin's
+    text for 'custom'; for 'company' (the default, and a 'custom' row with
+    no text) the org's display name when it fits
+    (SIDEBAR_ORG_NAME_MAX_CHARS), else DEFAULT_SIDEBAR_TITLE, which is also
+    the answer when auth couldn't name the org."""
+    mode = row.sidebar_title_mode if row is not None else "company"
+    if mode == "none":
+        return None
+    if mode == "custom" and row is not None and row.sidebar_title:
         return row.sidebar_title
     if org_name and len(org_name) <= SIDEBAR_ORG_NAME_MAX_CHARS:
         return org_name
@@ -310,7 +332,9 @@ def render_brand_skill(images: AuthBranding, row: OrgAppearance | None) -> tuple
         "reports, HTML pages and apps, dashboards and charts. Plain chat answers don't need it. "
         "The user's explicit instructions in the conversation win over these.",
     ]
-    title = row.sidebar_title if row else None
+    # The org's name is used throughout whatever the sidebar shows; an
+    # admin's custom title is only named as the assistant's.
+    title = row.sidebar_title if row is not None and row.sidebar_title_mode == "custom" else None
     if title and title != images.org_name:
         lines += [
             "",

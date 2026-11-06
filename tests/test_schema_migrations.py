@@ -1219,3 +1219,62 @@ def test_sidebar_title_revision_is_a_no_op_where_the_column_already_exists(tmp_p
     assert "sidebar_title" in _org_appearance_columns(db_path)
     _downgrade_to(engine, uri, "c69488788ac7")
     assert not _has_table(db_path, "org_appearance")
+
+
+def test_sidebar_title_mode_is_added_and_an_existing_title_becomes_custom(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-mode.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "5b9e1c7d3a20")
+    assert "sidebar_title_mode" not in _org_appearance_columns(db_path)
+    with sqlite3.connect(db_path) as connection:
+        for org_id, title in (("a" * 32, "Acme AI"), ("b" * 32, None), ("c" * 32, "")):
+            connection.execute(
+                "insert into org_appearance (id, org_id, sidebar_title, members_can_choose) "
+                "values (?, ?, ?, 1)",
+                (uuid.uuid4().hex, org_id, title),
+            )
+        connection.commit()
+
+    run_schema_migrations(engine, uri)
+
+    with sqlite3.connect(db_path) as connection:
+        modes = dict(connection.execute("select org_id, sidebar_title_mode from org_appearance"))
+    assert modes == {"a" * 32: "custom", "b" * 32: "company", "c" * 32: "company"}
+
+    # Run again on an up-to-date database: nothing to add.
+    run_schema_migrations(engine, uri)
+    assert _org_appearance_columns(db_path).count("sidebar_title_mode") == 1
+
+    _downgrade_to(engine, uri, "5b9e1c7d3a20")
+    assert "sidebar_title_mode" not in _org_appearance_columns(db_path)
+    assert "sidebar_title" in _org_appearance_columns(db_path)
+
+
+def test_sidebar_title_mode_revision_is_a_no_op_where_the_column_already_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-mode-present.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "5b9e1c7d3a20")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "alter table org_appearance add column sidebar_title_mode varchar(16) not null default 'none'"
+        )
+        connection.execute(
+            "insert into org_appearance (id, org_id, sidebar_title, members_can_choose) values (?, ?, ?, 1)",
+            (uuid.uuid4().hex, "d" * 32, "Acme AI"),
+        )
+        connection.commit()
+
+    run_schema_migrations(engine, uri)
+
+    assert _org_appearance_columns(db_path).count("sidebar_title_mode") == 1
+    with sqlite3.connect(db_path) as connection:
+        # Left as it was: the revision neither re-adds the column nor rewrites rows.
+        assert connection.execute("select sidebar_title_mode from org_appearance").fetchone()[0] == "none"
