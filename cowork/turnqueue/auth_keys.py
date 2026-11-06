@@ -15,6 +15,8 @@ import httpx
 from cowork.services.mindshub_workspaces import forget_stale_mindshub_workspace
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
+KeyPurpose = Literal["execution", "artifact_publish", "connector_token"]
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,7 +37,7 @@ class MintedTurnKey:
 
 async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
                             ttl_seconds: int, settings,
-                            purpose: Literal["execution", "artifact_publish"],
+                            purpose: KeyPurpose,
                             workspace_id: str | None = None) -> dict:
     expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
     # Cluster-only route: turn-key mint is secret-only (no Bearer factor), so
@@ -79,7 +81,7 @@ async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
 
 
 async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
-                        ttl_seconds: int, settings, purpose: Literal["execution", "artifact_publish"] = "execution",
+                        ttl_seconds: int, settings, purpose: KeyPurpose = "execution",
                         workspace_id: str | None = None) -> str:
     result = await _request_turn_key(
         user_id=user_id,
@@ -95,7 +97,7 @@ async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
 
 async def mint_turn_key_details(*, user_id: str, org_id: str, correlation_id: str,
                                 ttl_seconds: int, settings,
-                                purpose: Literal["execution", "artifact_publish"] = "execution",
+                                purpose: KeyPurpose = "execution",
                                 workspace_id: str | None = None) -> MintedTurnKey:
     result = await _request_turn_key(
         user_id=user_id,

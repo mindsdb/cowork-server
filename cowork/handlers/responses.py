@@ -2223,7 +2223,11 @@ class ResponsesHandler:
             conversation = ConversationService(session).get_conversation(conv_id)
             org_root = projects_root(scope=session.scope).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
-            return RemoteWorkspace(project_id=str(conversation.project.id), workspace_rel_path=rel)
+            return RemoteWorkspace(
+                project_id=str(conversation.project.id),
+                workspace_rel_path=rel,
+                project_name=getattr(conversation.project, "name", None),
+            )
         except Exception:
             logger.exception("[responses] failed to resolve workspace", extra=log_context(conversation_id=conv_id))
             return None

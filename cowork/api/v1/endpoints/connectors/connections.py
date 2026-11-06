@@ -120,7 +120,11 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
         # CustomizeView.jsx's JSON.parse(fields._picked_files) expects that
         # same shape, not the native list auth's Data Vault holds it as.
         fields["_picked_files"] = json.dumps(detail.get("picked_files") or [])
-        return ConnectionDetailResponse(engine=engine, name=name, fields=fields)
+        # Same shape as desktop: `method` at the top, `_access_mode` among the
+        # fields, which the panel's Tool access control reads.
+        if detail.get("_access_mode"):
+            fields["_access_mode"] = detail["_access_mode"]
+        return ConnectionDetailResponse(engine=engine, name=name, method=detail.get("_method"), fields=fields)
     record = ConnectionsService(scope).get(engine, name)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
@@ -341,27 +345,30 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     return {"ok": True, "files": merged}
 
 
-# AuthenticatedInOrgMode, defensive classification: an antontron caller audit
-# confirmed this is reachable from both desktop and hosted web (no isElectron/
-# isWeb guard, see useGoogleDrivePicker.js). This declares the identity floor
-# only — it does NOT fix the actual gap: unlike patch_picked_files above, this
-# route has no org-mode branch and unconditionally hits the local vault via
-# ConnectionsService, and auth_proxy has no "remove one picked file" call to
-# forward to (only proxy_picked_files's merge/union semantics and proxy_delete
-# for the whole connection). TODO: an org-mode caller here likely gets a 404
-# against the wrong (local, non-durable) vault instead of actually un-picking
-# the file — needs a real auth-service endpoint before it can work correctly
-# in org mode, same class of gap as test_providers's stored-key issue.
+# Engines whose picked files auth can untag in org mode.
+_ORG_PICKED_FILE_REMOVAL_ENGINES = frozenset({"notion"})
+
+
+# AuthenticatedInOrgMode: reachable from both desktop and hosted web. In org
+# mode a Notion page is untagged in auth's Data Vault, which checks the
+# forwarded credential itself. Other engines still hit the local vault there,
+# which in org mode is not the connection's real store, so Remove does not
+# stick for them yet (auth has no route for them).
 @router.delete(
     "/{engine}/{name}/picked-files/{file_id}",
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
-def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
+async def delete_picked_file(
+    engine: str, name: str, file_id: str, project: str, scope: ScopeDep, request: Request = None,
+):
     """Untag one file from `project` — the "un-pick" counterpart to
     patch_picked_files, used by the Project files rail's delete action on
-    a Drive reference row. Only removes the file from `project`'s rail;
+    a reference row. Only removes the file from `project`'s rail;
     if the file is tagged to other projects too, it stays visible there
     (see remove_picked_file's docstring)."""
+    if scope.org_mode and engine in _ORG_PICKED_FILE_REMOVAL_ENGINES:
+        remaining = await auth_proxy.proxy_remove_picked_file(engine, name, file_id, project, request, OAuthSettings())
+        return {"ok": True, "files": remaining}
     _refuse_unchangeable(scope, engine, name)
     remaining = ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
     if remaining is None:

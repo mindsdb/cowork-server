@@ -493,6 +493,109 @@ async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(
     }
 
 
+def _purpose_keyed_mint(calls, *, connector="mdb_connector"):
+    async def fake_mint(**kw):
+        calls.append(kw)
+        if kw.get("purpose") == "connector_token":
+            if isinstance(connector, Exception):
+                raise connector
+            return connector
+        return "mdb_turnkey"
+
+    return fake_mint
+
+
+async def _turn_params(monkeypatch, connections, mint):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "mint_turn_key", mint)
+
+    async def fake_list_active_connections(**kw):
+        return connections
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+    return json.loads(fake.added[0][1]["payload"])["params"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["notion", "hubspot"])
+async def test_an_mcp_connection_gets_anton_a_connector_key_and_the_scratchpad_keeps_the_turn_key(
+    monkeypatch, engine,
+):
+    # The auth service hands MCP tokens only to the connector key; the
+    # scratchpad's env comes from the llm block, so cell code can't fetch them.
+    calls = []
+    params = await _turn_params(
+        monkeypatch,
+        [{"engine": engine, "name": "acme"}, {"engine": "gmail", "name": "me"}],
+        _purpose_keyed_mint(calls),
+    )
+    assert params["oauth"]["turn_key"] == "mdb_connector"
+    assert params["llm"]["api_key"] == "mdb_turnkey"
+    assert "mdb_connector" not in json.dumps({k: v for k, v in params.items() if k != "oauth"})
+    connector_calls = [c for c in calls if c.get("purpose") == "connector_token"]
+    assert len(connector_calls) == 1 and connector_calls[0]["correlation_id"] == "r"
+
+
+@pytest.mark.asyncio
+async def test_with_datasource_grants_on_an_mcp_connection_still_gets_a_connector_key(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(
+        return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix"),
+    ))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
+    calls = []
+    params = await _turn_params(monkeypatch, [{"engine": "notion", "name": "acme"}], _purpose_keyed_mint(calls))
+    assert params["oauth"]["turn_key"] == "mdb_connector"
+    assert params["llm"]["api_key"] == "mdb_prefix.secret"
+
+
+@pytest.mark.asyncio
+async def test_a_turn_without_mcp_connections_mints_no_connector_key(monkeypatch):
+    calls = []
+    params = await _turn_params(monkeypatch, [{"engine": "gmail", "name": "me"}], _purpose_keyed_mint(calls))
+    assert params["oauth"]["turn_key"] == "mdb_turnkey"
+    assert not [c for c in calls if c.get("purpose") == "connector_token"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connector_key_mint_falls_back_to_the_turn_key(monkeypatch):
+    # Until the auth service requires the connector key, the turn key still
+    # fetches MCP tokens, so the turn runs rather than fails.
+    calls = []
+    params = await _turn_params(
+        monkeypatch,
+        [{"engine": "notion", "name": "acme"}],
+        _purpose_keyed_mint(calls, connector=prod.product_permissions.ProductPermissionUnavailable()),
+    )
+    assert params["oauth"]["turn_key"] == "mdb_turnkey"
+    assert params["llm"]["api_key"] == "mdb_turnkey"
+
+
+@pytest.mark.asyncio
+async def test_the_connector_key_mint_overlaps_the_turn_key_mint(monkeypatch):
+    started = asyncio.Event()
+    order = []
+
+    async def mint(**kw):
+        if kw.get("purpose") == "connector_token":
+            order.append("connector")
+            started.set()
+            return "mdb_connector"
+        # The turn-key mint finishes only once the connector mint has started.
+        await asyncio.wait_for(started.wait(), timeout=2)
+        order.append("turn")
+        return "mdb_turnkey"
+
+    params = await _turn_params(monkeypatch, [{"engine": "notion", "name": "acme"}], mint)
+    assert order == ["connector", "turn"]
+    assert params["oauth"]["turn_key"] == "mdb_connector"
+
+
 @pytest.mark.asyncio
 async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
@@ -540,6 +643,50 @@ async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch)
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["connectors"] == {"google_drive": {"usage_notes": "NOTE-google_drive"}}
+
+
+_NOTION_PAGES = [
+    {"id": "p1", "name": "Roadmap", "url": "https://www.notion.so/p1", "projects": ["alpha"]},
+    {"id": "p2", "name": "Budget", "url": "https://www.notion.so/p2", "projects": ["beta"]},
+]
+
+
+async def _notion_turn_params(monkeypatch, workspace):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return [{"engine": "notion", "name": "ws-a", "picked_files": _NOTION_PAGES}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+        workspace=workspace,
+    ))
+    return json.loads(fake.added[0][1]["payload"])["params"]
+
+
+@pytest.mark.asyncio
+async def test_a_web_turn_names_the_notion_pages_added_to_its_project(monkeypatch):
+    workspace = prod.RemoteWorkspace(project_id="1", workspace_rel_path="projects/alpha", project_name="alpha")
+    params = await _notion_turn_params(monkeypatch, workspace)
+
+    notes = params["connectors"]["notion"]["usage_notes"]
+    assert "notion__notion-fetch" in notes  # the spec's own notes stay first
+    assert "- Roadmap (url: https://www.notion.so/p1, connection: ws-a)" in notes
+    assert "Budget" not in notes
+    # The pod's vault gets engine and name only.
+    assert params["oauth"]["connections"] == [{"engine": "notion", "name": "ws-a"}]
+
+
+@pytest.mark.asyncio
+async def test_a_web_turn_in_another_project_names_none_of_them(monkeypatch):
+    workspace = prod.RemoteWorkspace(project_id="3", workspace_rel_path="projects/gamma", project_name="gamma")
+    params = await _notion_turn_params(monkeypatch, workspace)
+
+    notes = params["connectors"]["notion"]["usage_notes"]
+    assert "Roadmap" not in notes and "Budget" not in notes
 
 
 def test_connectors_block_is_none_when_nothing_has_notes(monkeypatch):
