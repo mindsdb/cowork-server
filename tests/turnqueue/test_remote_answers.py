@@ -199,3 +199,85 @@ async def test_redis_error_during_ack_wait_is_reported_accepted(r, monkeypatch):
     text = "\n".join(record.getMessage() for record in records)
     assert "Redis error" in text
     assert "pg" not in text  # answer content never logged
+
+
+async def test_an_unblocked_read_during_the_ack_wait_reads_again(r, monkeypatch):
+    """A primary demoted during the wait answers ``-UNBLOCKED``. Read as a Redis
+    error, it would report accepted and lose the pod's rejection."""
+    from redis.exceptions import ResponseError
+
+    real_xread = r.xread
+    reads = 0
+
+    async def xread(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            raise ResponseError(
+                "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)")
+        return await real_xread(*args, **kwargs)
+
+    monkeypatch.setattr(r, "xread", xread)
+    pod = asyncio.create_task(_pod_says(r, "ask_user_answer_rejected", reason="invalid_option"))
+    assert await _submit(r) is RemoteAnswerResult.INVALID_OPTION
+    await pod
+    assert reads >= 2
+
+
+async def test_the_answer_is_queued_at_most_once(r, monkeypatch):
+    """An RPUSH resent after its reply was lost queues the answer twice."""
+    from cowork.turnqueue import answers
+
+    sending_once = False
+    sent: list[bool] = []
+
+    @contextmanager
+    def recording_send_once():
+        nonlocal sending_once
+        sending_once = True
+        try:
+            yield
+        finally:
+            sending_once = False
+
+    real_pipeline = r.pipeline
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_execute = pipe.execute
+
+        async def execute(*a, **kw):
+            sent.append(sending_once)
+            return await real_execute(*a, **kw)
+
+        pipe.execute = execute
+        return pipe
+
+    monkeypatch.setattr(answers, "send_once", recording_send_once)
+    monkeypatch.setattr(r, "pipeline", pipeline)
+    pod = asyncio.create_task(_pod_says(r, "ask_user_answered", status="answered"))
+    assert await _submit(r) is RemoteAnswerResult.ACCEPTED
+    await pod
+
+    assert sent == [True]
+    assert await r.llen(KEY) == 1
+
+
+async def test_the_ack_wait_blocks_for_no_longer_than_the_shared_block(r, monkeypatch):
+    """redis-py cuts a read at the socket timeout, so a longer BLOCK reads an
+    idle stream as a dead socket."""
+    from cowork.turnqueue.redis_client import REDIS_BLOCK_MS
+
+    real_xread = r.xread
+    blocks: list[int] = []
+
+    async def xread(*args, **kwargs):
+        blocks.append(kwargs["block"])
+        return await real_xread(*args, **kwargs)
+
+    monkeypatch.setattr(r, "xread", xread)
+    pod = asyncio.create_task(_pod_says(r, "ask_user_answered", status="answered"))
+    assert await _submit(r, timeout=4.0) is RemoteAnswerResult.ACCEPTED
+    await pod
+
+    assert blocks and max(blocks) <= REDIS_BLOCK_MS

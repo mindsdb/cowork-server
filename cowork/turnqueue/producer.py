@@ -39,7 +39,15 @@ from cowork.turnqueue.auth_keys import (
 )
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_channel_turn
-from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
+from cowork.turnqueue.redis_client import (
+    REDIS_BLOCK_MS,
+    cancel_cause_key,
+    cancel_flag_key,
+    get_redis,
+    reply_stream_key,
+    send_once,
+    xread_blocking,
+)
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
@@ -750,7 +758,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
     await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
-    await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
+    # Sent at most once: an XADD resent after its reply was lost would queue
+    # the turn twice, and the controller would run it twice.
+    with send_once():
+        await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
     # Any replica can now find this turn: its turn_id to open the buffer, its
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator
@@ -766,8 +777,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
+    # The counter of the last reply applied. scratchpad-controller numbers each
+    # turn's replies, and a reply its retried XADD wrote twice repeats a number.
+    last_n: int | None = None
     while True:
-        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
+        resp = await xread_blocking(
+            r=r, streams={reply_stream: last_id}, count=100, block_ms=REDIS_BLOCK_MS,
+        )
         if not resp:
             # Unbounded, this loop spun forever whenever the worker was down:
             # only a terminal reply ends the turn, so the SSE response never
@@ -794,6 +810,18 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     # turn's replies say nothing about ours.
                     continue
                 reply = TurnReply.model_validate_json(fields["payload"])
+                if reply.n is not None:
+                    if last_n is not None and reply.n <= last_n:
+                        logger.warning(
+                            "Dropped a repeated remote turn reply",
+                            extra={
+                                "event": "remote_reply_repeat_dropped",
+                                "conversation_id": conversation_id,
+                                "request_id": corr,
+                            },
+                        )
+                        continue
+                    last_n = reply.n
                 last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}

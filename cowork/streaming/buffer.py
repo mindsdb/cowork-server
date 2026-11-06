@@ -31,7 +31,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import REDIS_BLOCK_MS, get_redis, xread_blocking
 from cowork.streaming.records import (
     REASON_TO_TYPE,
     TerminalReason,
@@ -323,7 +323,9 @@ class RedisStreamBuffer(StreamBuffer):
             self._next_seq += 1
             # One round trip per frame, with the TTL refresh in the same
             # transaction as the write, so a connection lost mid-append cannot
-            # leave a stream with no TTL.
+            # leave a stream with no TTL. The client resends the transaction
+            # when its reply is lost, which can write this seq twice; tail()
+            # yields each seq once.
             async with get_redis().pipeline(transaction=True) as pipe:
                 pipe.xadd(self.key, {
                     "seq": str(seq),
@@ -345,7 +347,7 @@ class RedisStreamBuffer(StreamBuffer):
         await self.append(REASON_TO_TYPE[reason], {"reason": reason, **(extra or {})})
         self._closed = True
 
-    _BLOCK_MS = 5000
+    _BLOCK_MS = REDIS_BLOCK_MS
 
     @staticmethod
     def _record(fields: dict) -> TurnRecord:
@@ -359,13 +361,17 @@ class RedisStreamBuffer(StreamBuffer):
     async def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
         r = get_redis()
         last_id = "0-0"
+        # The highest seq yielded so far. An append the client resent after a
+        # lost reply leaves a second entry with the same seq, skipped here.
+        yielded_seq = -1
         # Replay. Filtered on the seq field rather than sliced by entry id:
         # ids are timestamps and carry no relation to from_seq.
         for entry_id, fields in await r.xrange(self.key):
             last_id = entry_id
             rec = self._record(fields)
-            if rec.seq < from_seq:
+            if rec.seq < from_seq or rec.seq <= yielded_seq:
                 continue
+            yielded_seq = rec.seq
             yield rec
             if rec.is_terminal:
                 return
@@ -373,7 +379,7 @@ class RedisStreamBuffer(StreamBuffer):
         # and the first XREAD is picked up rather than skipped.
         idle_ms = 0
         while True:
-            resp = await r.xread({self.key: last_id}, block=self._BLOCK_MS)
+            resp = await xread_blocking(r=r, streams={self.key: last_id}, block_ms=self._BLOCK_MS)
             if not resp:
                 idle_ms += self._BLOCK_MS
                 if idle_ms >= REDIS_TAIL_IDLE_TIMEOUT_SECONDS * 1000:
@@ -396,8 +402,9 @@ class RedisStreamBuffer(StreamBuffer):
                 for entry_id, fields in entries:
                     last_id = entry_id
                     rec = self._record(fields)
-                    if rec.seq < from_seq:
+                    if rec.seq < from_seq or rec.seq <= yielded_seq:
                         continue
+                    yielded_seq = rec.seq
                     yield rec
                     if rec.is_terminal:
                         return

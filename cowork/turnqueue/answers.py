@@ -19,7 +19,15 @@ import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
 from cowork.turnqueue.models import TurnReply
-from cowork.turnqueue.redis_client import answer_queue_key, get_redis, reply_stream_key
+from cowork.turnqueue.redis_client import (
+    REDIS_BLOCK_MS,
+    answer_queue_key,
+    get_redis,
+    redis_deadline,
+    reply_stream_key,
+    send_once,
+    xread_blocking,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,15 +115,21 @@ async def submit_remote_answer(
     )
     if len(entry.encode("utf-8")) + _WRAP_HEADROOM_BYTES > MAX_ANSWER_BYTES:
         return RemoteAnswerResult.TOO_LARGE
-    async with r.pipeline(transaction=True) as pipe:
-        pipe.rpush(key, entry)
-        pipe.expire(key, ANSWER_TTL_S)
-        await pipe.execute()
+    # Sent at most once: an RPUSH resent after its reply was lost would queue
+    # the answer twice.
+    with send_once():
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.rpush(key, entry)
+            pipe.expire(key, ANSWER_TTL_S)
+            await pipe.execute()
 
     try:
         deadline = time.monotonic() + ack_timeout_s
         while (left := deadline - time.monotonic()) > 0:
-            resp = await r.xread({stream: last_id}, count=50, block=max(1, int(left * 1000)))
+            block_ms = max(1, min(REDIS_BLOCK_MS, int(left * 1000)))
+            # A read's retries end with the wait, not after it.
+            with redis_deadline(budget_s=left):
+                resp = await xread_blocking(r=r, streams={stream: last_id}, count=50, block_ms=block_ms)
             for _stream, entries in resp or []:
                 for entry_id, fields in entries:
                     last_id = entry_id

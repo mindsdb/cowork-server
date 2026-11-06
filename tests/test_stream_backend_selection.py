@@ -100,3 +100,25 @@ async def test_a_new_file_turn_starts_clear_of_an_ended_turn_at_its_number(monke
     await fresh.close("completed")
 
     assert [(record.seq, record.type) async for record in fresh.tail(0)] == [(0, "sse"), (1, "Done")]
+
+
+def test_a_file_backend_conversation_delete_never_calls_redis(monkeypatch, tmp_path):
+    """Desktop and the single-container server have no Redis: each delete would
+    wait out the client's connect retries against a localhost Redis."""
+    from cowork.streaming import discard_conversation, turn_index
+
+    calls: list[str] = []
+
+    def no_redis():
+        calls.append("get_sync_redis")
+        raise AssertionError("the file backend reached for Redis")
+
+    monkeypatch.delenv("COWORK_STREAM_BACKEND", raising=False)
+    monkeypatch.setenv("COWORK_STREAMS_DIR", str(tmp_path))
+    monkeypatch.setattr(turn_index, "get_sync_redis", no_redis)
+    monkeypatch.setattr(backend_mod, "get_sync_redis", no_redis)
+
+    discard_conversation("c9")
+
+    # forget_turn_sync logs and swallows any error, so the call is what to check.
+    assert calls == []
