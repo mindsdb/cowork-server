@@ -110,6 +110,9 @@ class ScheduleService:
 
     def update_schedule(self, schedule_id: UUID, **kwargs) -> Schedule:
         schedule = self.get_schedule(schedule_id)
+        if "project_id" in kwargs and kwargs["project_id"] is None:
+            # No project: the caller's default, as at create.
+            kwargs["project_id"] = self._default_project_id()
         new_project_id = kwargs.get("project_id")
         if new_project_id is not None and self.session.get(Project, new_project_id) is None:
             raise ValueError("Project not found")
