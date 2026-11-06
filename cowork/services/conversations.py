@@ -516,20 +516,19 @@ class ConversationService:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         return self.session.exec(stmt).first()
 
-    def owned_ids(self, conversation_ids: Iterable[UUID]) -> set[UUID]:
-        """The subset of `conversation_ids` the caller owns, in one query.
+    def owned_ids(self) -> set[UUID]:
+        """Every conversation the caller owns, in one query that reads only
+        the ids.
 
-        Same rule as `_owned`, batched. The artifact roots resolver walks one
-        directory per conversation and holds every id at once, so without this
-        a plain list request would issue a SELECT per directory.
+        Same rule as `_owned`, batched. The artifact roots resolver reads it
+        before it walks the file store, so the query can name neither the
+        directories it will find nor their project: a task moved to another
+        project keeps its workspace directory under the old one.
         """
-        ids = list(conversation_ids)
-        if not ids:
-            return set()
-        stmt = self.session.select(Conversation).where(Conversation.id.in_(ids))
+        stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
-        return {row.id for row in self.session.exec(stmt).all()}
+        return set(self.session.exec(stmt).all())
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)

@@ -273,6 +273,8 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
         for index in (
             "ix_projects_org_id",
             "ix_conversations_org_id",
+            # Rides on conversations.created_by (599bf4bf0370).
+            "ix_conversations_org_id_created_by",
             "ix_files_org_id",
             "ix_schedules_org_id",
             "ix_pins_user_id_org_id",
@@ -307,6 +309,28 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
 
     assert "harness" in _message_columns(db_path)
     assert _alembic_version(db_path) == expected_head()
+
+
+def _conversation_indexes(*, path) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        return {row[1] for row in connection.execute("pragma index_list(conversations)")}
+
+
+def test_the_conversations_owner_index_is_added_by_its_migration_and_dropped_on_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "owner-index.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert "ix_conversations_org_id_created_by" in _conversation_indexes(path=db_path)
+
+    _downgrade_to(engine, uri, "2a366c1f4b9f")
+
+    assert "ix_conversations_org_id_created_by" not in _conversation_indexes(path=db_path)
+    assert "ix_conversations_org_id" in _conversation_indexes(path=db_path)
+    assert _alembic_version(db_path) == "2a366c1f4b9f"
 
 
 def test_task_objects_downgrade_drops_table(tmp_path, monkeypatch):
