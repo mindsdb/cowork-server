@@ -64,7 +64,7 @@ async def test_the_remote_turn_end_capture_runs_off_the_loop(monkeypatch):
     monkeypatch.setattr(test_remote_turn.remote_turn_mod, "stream_remote_replies", replies)
 
     await test_remote_turn._drain(test_remote_turn.remote_turn_events(
-        session=test_remote_turn._FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        scope=test_remote_turn._FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
         input_text="run", model="m", turn_rows=[],
     ))
 

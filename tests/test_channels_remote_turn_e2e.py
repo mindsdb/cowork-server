@@ -114,7 +114,7 @@ def test_slack_message_gets_a_reply_via_the_remote_worker(monkeypatch, org_mode_
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
-        staticmethod(lambda session, conv_id, entries: None),
+        staticmethod(lambda session, conv_id, entries, principal: None),
     )
 
     async def fake_replies(**kwargs):
@@ -207,7 +207,7 @@ def test_a_remote_turn_failure_delivers_an_error_message_not_silence(monkeypatch
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
-        staticmethod(lambda session, conv_id, entries: None),
+        staticmethod(lambda session, conv_id, entries, principal: None),
     )
 
     async def fake_replies(**kwargs):

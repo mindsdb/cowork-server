@@ -5,9 +5,9 @@ from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse as FileContentResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.schemas.files import FileListResponse, FileResponse
-from cowork.services.files import FileService
+from cowork.services.files import FileService, file_response, save_upload
 
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -22,7 +22,7 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def upload_file(
     file: UploadFile,
     purpose: Annotated[str, Form()],
-    scoped: ScopedSessionDep,
+    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
 ):
     # The "attachment:" namespace is server-owned: conversation attachments
     # are tagged "attachment:{conversation_id}" by the compat routes, and the
@@ -36,7 +36,7 @@ async def upload_file(
             detail="The 'attachment:' purpose namespace is reserved; upload "
             "conversation attachments via /v1/attachments/… instead.",
         )
-    return await FileService(scoped).create_file(file, purpose)
+    return file_response(await save_upload(file, purpose=purpose, scope=scope))
 
 
 @router.get("/", response_model=FileListResponse)
