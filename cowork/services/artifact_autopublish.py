@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from uuid import UUID
 
 from pydantic import ValidationError
 
@@ -40,6 +41,7 @@ from cowork.services.publish import (
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+    from cowork.services.artifact_identity import ListedIds
     from cowork.services.artifact_ownership import OwnerResolution
 
 logger = logging.getLogger(__name__)
@@ -287,18 +289,13 @@ async def _owned_slugs(
     return OwnedSlugs(owned=owned, not_owner=not_owner, owner_unknown=owner_unknown)
 
 
-def _candidate_slugs(artifacts_base: Path) -> list[str]:
-    try:
-        children = sorted(Path(artifacts_base).iterdir())
-    except OSError:
-        return []
-    return [
-        child.name
-        for child in children
-        if child.is_dir()
-        and child.name != LOCKS_DIRNAME
-        and (child / "metadata.json").is_file()
-    ]
+def _candidate_slugs(*, artifacts_base: Path) -> list[str]:
+    """The artifact folders the reconciler's full pass considers, sorted
+    (artifact_folders_below, which never lists the project's lock folder).
+    One the listing could not read waits for a later pass."""
+    from cowork.services.artifact_identity import artifact_folders_below
+
+    return sorted(artifact_folders_below(base=Path(artifacts_base)).found)
 
 
 def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDecision]]:
@@ -459,8 +456,9 @@ async def autopublish_project_artifacts(
 
     With `only_touched`, the `touched` folders are opened by name
     (artifact_folders_named), the project's folder is not listed, and there is
-    no second phase: the self-heal of the rest is requested from the
-    scheduler's poll loop instead (request_self_heal).
+    no second phase: the turn end asks for the project's scheduled self-heal
+    instead, as its record starts (request_turn_end_self_heal), which
+    publishes the rest.
 
     Never raises — a lost publication is recoverable on the next turn, a lost reply
     is not. The one exception is CancelledError, which propagates.
@@ -505,10 +503,12 @@ async def autopublish_project_artifacts(
         named = await run_efs(
             partial(artifact_folders_named, base=base, slugs=set(touched)), scope=scope, deadline=False,
         )
-        all_slugs = sorted(named.found)
-        request_self_heal(SelfHeal(artifacts_base=base, scope=scope, project_id=project_id))
+        # The project's lock folder is never an artifact, as in a full
+        # listing (artifact_folders_below), even when agent code put a
+        # metadata.json there.
+        all_slugs = sorted(named.found - {LOCKS_DIRNAME})
     else:
-        all_slugs = await run_efs(partial(_candidate_slugs, base), scope=scope, deadline=False)
+        all_slugs = await run_efs(partial(_candidate_slugs, artifacts_base=base), scope=scope, deadline=False)
     owners = await _owned_slugs(
         artifacts_base=base, scope=scope, project_id=project_id, slugs=all_slugs,
     )
@@ -602,16 +602,28 @@ async def autopublish_project_artifacts(
 # ── scheduled self-heal ───────────────────────────────────────────────────
 
 # How long a member's project waits between two of its scheduled self-heals.
-# A remote turn whose pod named its artifacts publishes only those
+# A remote turn whose pod named its artifacts opens and publishes only those
 # (`only_touched`), so this bounds how long the rest of the project waits for
-# a retry, such as an artifact whose publish failed.
+# a retry, such as an artifact whose publish failed, and how long a copy no
+# turn end claims waits for its id to be marked conflicted. A full listing
+# that could not read a folder asks for the next location check alone, with
+# no publish (request_self_heal_for_unread_folders). Each replica keeps its
+# own requests and runs its own poll (scheduler._scheduler_loop calls
+# start_due_self_heals on every replica), and that request stays on the
+# replica that listed. So a folder that stays unreadable costs one listing of
+# the project per interval on each replica that has listed it, for each
+# member and project, and for each project's channel turns, until the folder
+# reads again or the replica restarts.
 SELF_HEAL_INTERVAL_S = 15 * 60.0
 
 
 @dataclass(frozen=True)
 class SelfHeal:
-    """One member's project for a scheduled self-heal: every artifact below
-    `artifacts_base` that the scope's user owns."""
+    """One member's project for a scheduled self-heal: the location of every
+    artifact below `artifacts_base`, then, when the publish was asked for
+    too (request_self_heal), the publish of those the scope's user owns. A
+    channel turn's scope names no user, so its self-heal checks the
+    locations only."""
 
     artifacts_base: Path
     scope: TenantScope
@@ -620,6 +632,9 @@ class SelfHeal:
 
 # Asked for since each one last started, waiting for the poll loop.
 _self_heals_requested: set[SelfHeal] = set()
+# Those of them whose publish was asked for too (request_self_heal). One
+# asked for only by request_location_check checks the locations alone.
+_self_heal_publishes_requested: set[SelfHeal] = set()
 # When each one last started, on time.monotonic().
 _self_heals_started_at: dict[SelfHeal, float] = {}
 # The task of each one started, so a second never runs beside it and a
@@ -628,15 +643,152 @@ _self_heal_tasks: dict[SelfHeal, asyncio.Task] = {}
 
 
 def request_self_heal(heal: SelfHeal) -> None:
-    """Ask for a self-heal of `heal`'s project: the reconciler with nothing
-    touched, so it lists the project's artifacts and publishes what needs it.
-    The scheduler's poll loop starts it (start_due_self_heals) once
-    SELF_HEAL_INTERVAL_S has passed since its last one; asking again before
-    then changes nothing."""
+    """Ask for a self-heal of `heal`'s project: a check of every artifact's
+    location (_record_listed_locations), then the reconciler with nothing
+    touched, so it lists the project's artifacts and publishes what needs it
+    behind its own gates (autopublish_project_artifacts). The scheduler's
+    poll loop starts it (start_due_self_heals) once SELF_HEAL_INTERVAL_S has
+    passed since its last one; asking again before then changes nothing."""
+    _self_heals_requested.add(heal)
+    _self_heal_publishes_requested.add(heal)
+
+
+def request_location_check(heal: SelfHeal) -> None:
+    """Ask for the location half of `heal`'s self-heal alone
+    (_record_listed_locations), for a project whose locations a listing has
+    to check again. The poll starts it as it starts a self-heal
+    (start_due_self_heals), and it publishes nothing unless the publish is
+    asked for too (request_self_heal) before it starts."""
     _self_heals_requested.add(heal)
 
 
+def request_turn_end_self_heal(*, artifacts_base: Path, scope: TenantScope | None, project_id: str | None) -> None:
+    """Ask for the self-heal of the project a remote turn end worked in, when
+    the turn end does not check the locations of the project's artifacts
+    itself. A turn end whose pod named the artifacts its tools touched opens
+    only the turn's own folders and lists nothing, so the self-heal's
+    location check is what finds a copy no turn end claims, such as one a
+    shell `cp -r` makes. Each producer asks for it as its turn end's record
+    starts, before the diff (handlers.responses `record_artifacts`,
+    turnqueue.remote_turn `remote_turn_events`), so a turn end whose diff
+    fails, or that a Stop cuts, still asks. A turn end whose pod sent no
+    list lists the project and checks every id itself, so it asks only when
+    its diff or the record of what the diff listed fails. Asked for wherever
+    artifacts have location rows (artifact_locations.keeps_locations),
+    whether or not the organization's autopublish is on, and for a channel
+    turn too; the publish half keeps the reconciler's own gates, the enable
+    flag among them, and runs only for a scope that names a user
+    (_run_self_heal). Adds an entry to an in-memory set, and makes no file
+    store call."""
+    heal = _project_self_heal(artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    if heal is not None:
+        request_self_heal(heal)
+
+
+def request_self_heal_for_unread_folders(
+    *, listing: ListedIds, artifacts_base: Path, scope: TenantScope | None, project_id: str | None,
+) -> None:
+    """After a full listing of a project's shared root, the self-heal's or a
+    remote turn end's with no pod list, that could not read a folder or the
+    root itself: log one WARNING, and ask for the project's location check
+    alone (request_location_check), so the poll lists the project again
+    once SELF_HEAL_INTERVAL_S has passed since its last self-heal
+    (start_due_self_heals), and publishes nothing for it. A copy no turn end
+    claims, in a folder the listing could not read, is then marked at the
+    first listing that reads it. Asked for even when the listing found no
+    id, and wherever artifacts have location rows, as
+    request_turn_end_self_heal is. The WARNING's `reason` is
+    `artifacts_folder_unreadable` when the listing could not read the root
+    itself, so it read no folder below it, and otherwise
+    `folders_unreadable`, with the `count` of folders it could not read.
+    Makes no file store call."""
+    if not (listing.unreadable or listing.base_unreadable):
+        return
+    heal = _project_self_heal(artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    if heal is None:
+        return
+    unread = (
+        {"reason": "artifacts_folder_unreadable"}
+        if listing.base_unreadable
+        else {"reason": "folders_unreadable", "count": len(listing.unreadable)}
+    )
+    logger.warning(
+        "a full listing of a project's artifacts could not read every folder, so the project's self-heal lists it again",
+        extra={"event": "artifact_location_listing_unreadable", **log_context(project_id=project_id), **unread},
+    )
+    request_location_check(heal)
+
+
+def _project_self_heal(*, artifacts_base: Path, scope: TenantScope | None, project_id: str | None) -> SelfHeal | None:
+    """The self-heal of the project's shared root at `artifacts_base` for
+    `scope`, or None where its artifacts have no location rows
+    (artifact_locations.keeps_locations) or no project is named."""
+    from cowork.services.artifact_locations import keeps_locations
+
+    if scope is None or not keeps_locations(scope) or not project_id:
+        return None
+    return SelfHeal(artifacts_base=Path(artifacts_base), scope=scope, project_id=project_id)
+
+
+def _listed_artifact_ids(*, artifacts_base: Path) -> ListedIds:
+    """The id each artifact folder directly below `artifacts_base` holds, and
+    the folders whose id could not be read, from the same listing the
+    reconciler's full pass makes (artifact_folders_below)."""
+    from cowork.services.artifact_identity import artifact_folders_below, listed_folder_ids
+
+    base = Path(artifacts_base)
+    return listed_folder_ids(base=base, listing=artifact_folders_below(base=base))
+
+
+async def _record_listed_locations(heal: SelfHeal) -> None:
+    """Read the id of every artifact folder in `heal`'s project, and mark an
+    id conflicted when its location row names another folder of the project,
+    unless the listing read the row's folder and found it gone or holding
+    another id, a stale row the id's next lookup moves
+    (artifact_locations.record_listed_folders). A turn end with the pod's
+    list opens only the turn's own folders, so a copy no turn end claims,
+    such as one a shell `cp -r` makes, is found here, at the first
+    self-heal after the turn that asked for one whose listing reads its
+    folder. A listing that could not read a folder, or the root, asks for
+    the next location check (request_self_heal_for_unread_folders), and so
+    does a check that fails outright (request_location_check). Never raises:
+    the publish after it runs either way."""
+    from cowork.db.units import run_db
+    from cowork.services.artifact_locations import keeps_locations, record_listed_folders
+
+    if not keeps_locations(heal.scope):
+        return
+    try:
+        listing = await run_efs(
+            partial(_listed_artifact_ids, artifacts_base=heal.artifacts_base), scope=heal.scope, deadline=False,
+        )
+        # Asked for before the record, so a failed record cannot drop it.
+        request_self_heal_for_unread_folders(
+            listing=listing, artifacts_base=heal.artifacts_base, scope=heal.scope, project_id=heal.project_id,
+        )
+        await run_db(
+            partial(record_listed_folders, project_id=UUID(heal.project_id), listing=listing), scope=heal.scope,
+        )
+    except Exception:
+        logger.warning(
+            "artifact self-heal could not check the locations of the project's artifacts", exc_info=True,
+            extra=log_context(project_id=heal.project_id),
+        )
+        # Nothing checked the project's locations, so the next poll after
+        # the interval does; the publish, if asked for, runs after this
+        # either way.
+        request_location_check(heal)
+
+
 async def _run_self_heal(heal: SelfHeal) -> None:
+    """The location check, which reads no autopublish setting, then, for a
+    scope that names a user, the publish, which returns at once when the
+    organization's autopublish is off. A channel turn's scope names no user,
+    and the reconciler would only record that refusal, so its self-heal
+    checks the locations alone."""
+    await _record_listed_locations(heal)
+    if heal.scope.user_id is None:
+        return
     try:
         await autopublish_project_artifacts(
             heal.artifacts_base, heal.scope, touched=set(), project_id=heal.project_id,
@@ -653,8 +805,10 @@ async def _run_self_heal(heal: SelfHeal) -> None:
 def start_due_self_heals() -> list[asyncio.Task]:
     """Start, each as a task of its own, every requested self-heal whose
     project's last one started at least SELF_HEAL_INTERVAL_S ago and has
-    finished. The scheduler's poll loop calls this once per poll
-    (cowork/scheduler.py). Returns the tasks it started."""
+    finished: the whole self-heal when its publish was asked for
+    (request_self_heal), and otherwise its location check alone
+    (request_location_check). The scheduler's poll loop calls this once per
+    poll (cowork/scheduler.py). Returns the tasks it started."""
     now = time.monotonic()
     started: list[asyncio.Task] = []
     for heal in list(_self_heals_requested):
@@ -665,8 +819,10 @@ def start_due_self_heals() -> list[asyncio.Task]:
         if running is not None and not running.done():
             continue
         _self_heals_requested.discard(heal)
+        publish = heal in _self_heal_publishes_requested
+        _self_heal_publishes_requested.discard(heal)
         _self_heals_started_at[heal] = now
-        task = asyncio.create_task(_run_self_heal(heal))
+        task = asyncio.create_task(_run_self_heal(heal) if publish else _record_listed_locations(heal))
         _self_heal_tasks[heal] = task
         started.append(task)
     # A project with no self-heal running and none for an interval holds

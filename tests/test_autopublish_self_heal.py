@@ -3,17 +3,21 @@ artifacts; the rest of the project waits for its scheduled self-heal.
 
 With the list, the turn end opens the folders the turn touched by name and
 lists nothing, so its cost no longer grows with the project. The full pass
-over the project, which retries a publish that failed, moves to the
-scheduler's poll loop, at most once every SELF_HEAL_INTERVAL_S for each
-member and project. A pod with no list keeps the full pass at the turn end.
+over the project, which checks every artifact's location and retries a
+publish that failed, moves to the scheduler's poll loop, at most once every
+SELF_HEAL_INTERVAL_S for each member and project. The turn end asks for it
+whether or not autopublish is on. A pod with no list keeps the full pass at
+the turn end.
 """
 from __future__ import annotations
 
 import asyncio
 import builtins
 import json
+import logging
 import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import yaml
@@ -62,6 +66,7 @@ pytestmark = pytest.mark.usefixtures("publish_url")
 def no_self_heals_left(monkeypatch):
     """Self-heal state of this test's own, whatever an earlier test left."""
     monkeypatch.setattr(ap, "_self_heals_requested", set())
+    monkeypatch.setattr(ap, "_self_heal_publishes_requested", set())
     monkeypatch.setattr(ap, "_self_heals_started_at", {})
     monkeypatch.setattr(ap, "_self_heal_tasks", {})
 
@@ -158,9 +163,12 @@ class _FileCalls:
 
 
 async def _turn_end(base: Path, *, conversation_id, touched_by_pod: set[str] | None, before, before_mtimes):  # noqa: F811
-    """The file store half of a remote turn end: the diff, then the publish
-    and the cards, as the remote producers run them."""
+    """A remote turn end as the remote producers run it: with the pod's
+    list, the self-heal's request as its record starts, then the file store
+    half, the diff, the publish and the cards."""
     tracked = touched_by_pod
+    if tracked is not None:
+        ap.request_turn_end_self_heal(artifacts_base=base, scope=ORG_SCOPE, project_id=PROJECT_ID)
     changes = turn_artifact_changes(
         conversation_id=conversation_id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
         tracked_new=tracked, tracked_edits=tracked, attribute_by_provenance=True,
@@ -190,7 +198,7 @@ async def _turn_end_editing_one_of(*, base: Path, monkeypatch, published_artifac
     calls = _FileCalls(monkeypatch=monkeypatch, base=base)
     calls.counting = True
     changes, cards = await _turn_end(
-        base, conversation_id="c-1", touched_by_pod={"old-7"}, before=before, before_mtimes=before_mtimes,
+        base, conversation_id=uuid4(), touched_by_pod={"old-7"}, before=before, before_mtimes=before_mtimes,
     )
     calls.counting = False
     return changes, cards, calls
@@ -233,7 +241,7 @@ async def test_without_the_pods_list_the_turn_end_keeps_its_full_self_heal(base,
 
     calls = _FileCalls(monkeypatch=monkeypatch, base=base)
     calls.counting = True
-    await _turn_end(base, conversation_id="c-1", touched_by_pod=None, before=before, before_mtimes=before_mtimes)
+    await _turn_end(base, conversation_id=uuid4(), touched_by_pod=None, before=before, before_mtimes=before_mtimes)
     calls.counting = False
 
     assert [call["folder"].name for call in published] == ["left-behind"]
@@ -245,16 +253,77 @@ async def test_the_self_heal_publishes_what_the_turn_end_left(base, enabled, key
     _make(base, "made", files={"index.html": "<html>new</html>"}, meta={"slug": "made", "type": "html-app"})
     _make(base, "failed-earlier", files={"index.html": "<html>old</html>"}, meta={"slug": "failed-earlier", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(
-        base, ORG_SCOPE, touched={"made"}, project_id=PROJECT_ID, only_touched=True,
+    # As a producer runs a turn end with the pod's list: the request as its
+    # record starts, then the publish.
+    ap.request_turn_end_self_heal(artifacts_base=base, scope=ORG_SCOPE, project_id=PROJECT_ID)
+    cards = await publish_and_card_turn_artifacts(
+        base, new_slugs=["made"], touched_slugs={"made"}, scope=ORG_SCOPE,
+        project_id=PROJECT_ID, project_name="proj", only_touched=True,
     )
-    assert out == {"made"}
+    assert [card["slug"] for card in cards] == ["made"]
+    assert [call["folder"].name for call in published] == ["made"]
 
     started = ap.start_due_self_heals()
     await asyncio.gather(*started)
 
     assert len(started) == 1
     assert [call["folder"].name for call in published] == ["made", "failed-earlier"]
+
+
+@pytest.mark.parametrize(
+    ("scope", "asks"),
+    [
+        (ORG_SCOPE, True),
+        # A channel turn's: its organization's, with no member behind it.
+        (TenantScope(org_mode=True, org_id=ORG_SCOPE.org_id), True),
+        # The desktop's, where artifacts have no location rows.
+        (TenantScope(), False),
+    ],
+    ids=["member", "channel", "desktop"],
+)
+async def test_with_autopublish_off_a_turn_end_with_the_pods_list_still_asks_for_the_location_check(
+    base, published, monkeypatch, scope, asks,  # noqa: F811
+):
+    """The self-heal's listing is the only one such a turn end gets, so the
+    turn end asks for it wherever artifacts have location rows, whether or
+    not autopublish is on, and for a channel turn too. Its run checks the
+    locations and publishes nothing while autopublish is off."""
+    monkeypatch.setattr(ap, "_is_enabled", lambda scope: False)
+    _make(base, "made", files={"index.html": "<html>new</html>"}, meta={"slug": "made", "type": "html-app"})
+    checked: list[ap.SelfHeal] = []
+
+    async def check(heal):
+        checked.append(heal)
+
+    monkeypatch.setattr(ap, "_record_listed_locations", check)
+
+    # As a producer runs a turn end with the pod's list: the request as its
+    # record starts, then the publish.
+    ap.request_turn_end_self_heal(artifacts_base=base, scope=scope, project_id=PROJECT_ID)
+    await publish_and_card_turn_artifacts(
+        base, new_slugs=["made"], touched_slugs={"made"}, scope=scope,
+        project_id=PROJECT_ID, project_name="proj", only_touched=True,
+    )
+    await asyncio.gather(*ap.start_due_self_heals())
+
+    asked = [ap.SelfHeal(artifacts_base=base, scope=scope, project_id=PROJECT_ID)] if asks else []
+    assert checked == asked
+    assert published == []
+
+
+async def test_with_the_pods_list_autopublish_never_publishes_the_lock_folder(base, enabled, key, published):  # noqa: F811
+    """Agent code can write a metadata.json into the project's `.locks`
+    folder and the pod can name it. The full pass never lists that folder
+    (_candidate_slugs), and a turn end with the pod's list skips it too."""
+    _make(base, ".locks", files={"index.html": "<html>locks</html>"}, meta={"slug": ".locks", "type": "html-app"})
+    _make(base, "made", files={"index.html": "<html>new</html>"}, meta={"slug": "made", "type": "html-app"})
+
+    out = await ap.autopublish_project_artifacts(
+        base, ORG_SCOPE, touched={".locks", "made"}, project_id=PROJECT_ID, only_touched=True,
+    )
+
+    assert out == {"made"}
+    assert [call["folder"].name for call in published] == ["made"]
 
 
 async def test_a_projects_self_heal_runs_at_most_once_an_interval(base, enabled, key, published, monkeypatch):  # noqa: F811
@@ -267,6 +336,87 @@ async def test_a_projects_self_heal_runs_at_most_once_an_interval(base, enabled,
 
     monkeypatch.setattr(ap, "SELF_HEAL_INTERVAL_S", 0.0)
     assert len(ap.start_due_self_heals()) == 1
+
+
+@pytest.mark.parametrize("failing_step", ["listing", "record"])
+async def test_a_location_check_that_fails_outright_asks_for_the_next_self_heal(
+    base, monkeypatch, caplog, failing_step,  # noqa: F811
+):
+    """The self-heal's location check raises before it marks anything:
+    its listing, or the database unit that records what the listing found.
+    Nothing checked the project's locations, so it logs that and asks for
+    the project's location check again, with no publish, which the poll
+    starts once the interval has passed."""
+    from cowork.db import units
+    from cowork.services.artifact_identity import ListedIds
+
+    def refused(*args, **kwargs):
+        raise RuntimeError("the step was refused")
+
+    if failing_step == "listing":
+        monkeypatch.setattr(ap, "_listed_artifact_ids", refused)
+    else:
+        monkeypatch.setattr(
+            ap, "_listed_artifact_ids", lambda *, artifacts_base: ListedIds(ids={}, unreadable=frozenset()),
+        )
+        monkeypatch.setattr(units, "run_db", lambda fn, *, scope: refused())
+    heal = ap.SelfHeal(artifacts_base=base, scope=ORG_SCOPE, project_id=str(uuid4()))
+
+    with caplog.at_level(logging.WARNING, logger=ap.logger.name):
+        await ap._record_listed_locations(heal)
+
+    assert [
+        record.getMessage() for record in caplog.records
+        if record.name == ap.logger.name and record.levelno == logging.WARNING
+    ] == [
+        "artifact self-heal could not check the locations of the project's artifacts",
+    ]
+    assert ap._self_heals_requested == {heal}
+    assert ap._self_heal_publishes_requested == set()
+
+
+async def test_a_location_check_asked_for_again_runs_no_publish_pass(base, enabled, monkeypatch):  # noqa: F811
+    """A member's self-heal, with autopublish on, whose listing could not
+    read a folder asks for the next location check alone. Started once the
+    interval has passed, that check lists the project again and runs no
+    publish pass, so a folder that stays unreadable costs one listing per
+    interval, not the reconciler's listing and plan too. A turn end that
+    asks for the self-heal meanwhile gets the publish pass back."""
+    from cowork.db import units
+    from cowork.services.artifact_identity import ListedIds
+
+    listings: list[Path] = []
+    passes: list[str] = []
+
+    def unread_copy(*, artifacts_base):
+        listings.append(artifacts_base)
+        return ListedIds(ids={}, unreadable=frozenset({"brief-copy"}))
+
+    async def reconciler(artifacts_base, scope, *, touched, project_id, **kwargs):
+        passes.append(project_id)
+        return set()
+
+    async def recorded(fn, *, scope):
+        return None
+
+    monkeypatch.setattr(ap, "_listed_artifact_ids", unread_copy)
+    monkeypatch.setattr(ap, "autopublish_project_artifacts", reconciler)
+    monkeypatch.setattr(units, "run_db", recorded)
+    project_id = str(uuid4())
+    ap.request_turn_end_self_heal(artifacts_base=base, scope=ORG_SCOPE, project_id=project_id)
+    heal = ap.SelfHeal(artifacts_base=base, scope=ORG_SCOPE, project_id=project_id)
+
+    await asyncio.gather(*ap.start_due_self_heals())
+    assert (len(listings), passes) == (1, [project_id])
+    assert (ap._self_heals_requested, ap._self_heal_publishes_requested) == ({heal}, set())
+
+    monkeypatch.setattr(ap, "SELF_HEAL_INTERVAL_S", 0.0)
+    await asyncio.gather(*ap.start_due_self_heals())
+    assert (len(listings), passes) == (2, [project_id])
+
+    ap.request_turn_end_self_heal(artifacts_base=base, scope=ORG_SCOPE, project_id=project_id)
+    await asyncio.gather(*ap.start_due_self_heals())
+    assert (len(listings), passes) == (3, [project_id, project_id])
 
 
 async def test_a_self_heal_never_starts_beside_its_running_one(base, monkeypatch):  # noqa: F811

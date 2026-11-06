@@ -24,6 +24,7 @@ import pytest
 
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
+from cowork.services.artifact_identity import ListedIds
 from cowork.streaming.registry import TurnLifecycle
 from cowork.turnqueue.producer import RemoteWorkspace
 
@@ -32,9 +33,13 @@ from _fakes import inline_run_db, opens
 
 class _FakeScope:
     org_id = "org-123"
-    # An organization's scope, which cowork.db.units.run_efs reads for the share.
+    # A partitioned scope, which cowork.db.units.run_efs reads for the share.
     partitioned = True
     user_id = "user-456"
+    # Outside org tenancy, as record_new_artifacts has always read this
+    # scope, so its artifacts keep no location rows and a turn end asks for
+    # no self-heal (artifact_locations.keeps_locations).
+    org_mode = False
 
 
 class _FakeScoped:
@@ -1217,6 +1222,84 @@ async def test_a_record_that_waits_for_the_database_at_shutdowns_last_wait_names
         str(conversation_id), str(project.id), [slug],
     )
     assert buffer.frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+@pytest.mark.parametrize(
+    ("completed", "named"),
+    [({"artifacts_touched": ["summary", "chart"]}, ["chart", "summary"]), ({}, [])],
+    ids=["pod-list", "no-pod-list"],
+)
+async def test_a_record_whose_diff_a_stall_holds_at_shutdowns_last_wait_names_the_pods_list(
+    monkeypatch, tmp_path, caplog, owned_logger, completed, named,
+):
+    """The member's file store share is held by calls stuck on a stalled
+    mount, so the turn end's diff waits for a slot past the teardown's last
+    wait. The diff never answered, so the ERROR names the artifacts the
+    pod's list named, none for a pod that sends no list, on the record and
+    in the line the console prints."""
+    import threading
+
+    import cowork.db.session as db_session
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from cowork.services import task_objects
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
+    from test_remote_turn import _hold_a_share, _until_the_turn_end_waits_for_the_share
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    handler = _remote_handler(monkeypatch, {})
+    _units_on_the_test_database(monkeypatch, scope=scope)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=source.base, project_id=str(project.id), project_name=project.name, creator=creator,
+        )),
+    )
+
+    async def no_publish(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", no_publish)
+    logged = owned_logger(units.logger.name)
+    stall = threading.Event()
+    held: list[asyncio.Task] = []
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        for slug in ("summary", "chart"):
+            write_artifact(source.base, slug, conversation=conversation_id)
+        held.extend(await _hold_a_share(scope=scope, share=db_session.settings.storage.efs_share, stall=stall))
+        yield "turn_completed", completed
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=conversation_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    ))
+    try:
+        await _until_the_turn_end_waits_for_the_share(scope=scope)
+        await units.drain_turn_end_records(timeout=0.1)
+    finally:
+        stall.set()
+    await asyncio.wait_for(task, timeout=10)
+    await asyncio.gather(*held)
+
+    [lost] = [
+        r for r in caplog.records
+        if r.name == units.logger.name and getattr(r, "event", None) == "shutdown_turn_record_lost"
+    ]
+    assert lost.levelno == logging.ERROR
+    assert (lost.conversation_id, lost.project_id, lost.touched) == (str(conversation_id), str(project.id), named)
+    assert_log_fields(
+        logged.output(), event="shutdown_turn_record_lost", conversation_id=str(conversation_id),
+        project_id=str(project.id), touched=named,
+    )
 
 
 @pytest.mark.asyncio
@@ -2879,6 +2962,71 @@ async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lost", ["created_nothing", "check_after_the_created_rows"])
+async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so(
+    monkeypatch, tmp_path, caplog, owned_logger, lost,
+):
+    """The pod sent no list, so the record's unit also checks the folders
+    the diff listed. Either the turn created nothing, so the unit's failure
+    lost only that check, or it created a folder and record_new_artifacts
+    raised at the check, once that folder's rows were written
+    (ListedLocationsUnchecked). The line says the check failed, not that
+    created folders went unrecorded."""
+    from cowork.services import task_objects
+
+    handler = _remote_handler(monkeypatch, {})
+    artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    _artifacts_context_at(monkeypatch, artifacts_base)
+    _no_workspace_or_memory_units(monkeypatch)
+    created = [] if lost == "created_nothing" else ["report"]
+    monkeypatch.setattr(
+        task_objects, "turn_artifact_changes",
+        lambda **_: task_objects.ArtifactChanges(
+            created=created, touched=set(created),
+            listed_ids=ListedIds(ids={"brief": "id-of-brief"}, unreadable=frozenset()),
+        ),
+    )
+    error = (
+        RuntimeError("the listed folders could not be checked")
+        if lost == "created_nothing"
+        else task_objects.ListedLocationsUnchecked()
+    )
+
+    def failing_record(session, **kwargs):
+        raise error
+
+    monkeypatch.setattr(task_objects, "record_new_artifacts", failing_record)
+
+    async def no_publish(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", no_publish)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    owned_logger(responses_mod.logger.name)
+
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+        )
+
+    errors = [
+        r for r in caplog.records
+        if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
+    ]
+    assert [r.getMessage() for r in errors] == [
+        "[responses] could not check the locations of the artifacts a remote turn listed",
+    ]
+    assert errors[0].exc_info[1] is error
+
+
+@pytest.mark.asyncio
 async def test_a_stop_during_publish_records_the_turns_artifacts_once(monkeypatch, tmp_path):
     """The pod finished cleanly and left two new folders: one whose
     provenance names this conversation, and one with none yet, a sibling
@@ -2955,7 +3103,9 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
+    def spy_index_new(
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+    ):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)
@@ -2999,7 +3149,9 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
+    def spy_index_new(
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+    ):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)

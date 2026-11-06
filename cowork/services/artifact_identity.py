@@ -47,6 +47,7 @@ from cowork.common.paths import (
     open_pinned_child,
     pinned_dir,
 )
+from cowork.services.artifact_locks import LOCKS_DIRNAME
 
 if TYPE_CHECKING:
     from cowork.services.artifacts import ProjectArtifacts
@@ -734,23 +735,150 @@ def artifact_folders_named(*, base: Path, slugs: set[str]) -> NamedArtifactFolde
     return NamedArtifactFolders(found=found, unreadable=unreadable)
 
 
-def artifact_ids_below(base: Path, slugs) -> dict[str, str]:
+class ArtifactListing(NamedTuple):
+    """What artifact_folders_below found directly below a folder. An entry
+    in neither set holds no artifact folder."""
+
+    # Folders holding a metadata.json file. A link to the folder or to the
+    # file is followed.
+    found: frozenset[str]
+    # Entries whose stat, the folder's own or its metadata.json's, failed
+    # with an error other than a missing entry, a name that is not a folder,
+    # or a link loop (_holds_no_id).
+    unreadable: frozenset[str]
+    # The error listing the folder itself failed with, when it was such an
+    # error. No entry below it was seen, so both sets are empty.
+    base_error: OSError | None = None
+
+
+def artifact_folders_below(*, base: Path) -> ArtifactListing:
+    """List the artifact folders directly below ``base``, a project's
+    artifacts folder, following links as a full listing always has: each
+    entry is stat'ed, then its ``metadata.json``. A missing ``base``, or one
+    that is not a folder, holds none. The project's lock folder
+    (``LOCKS_DIRNAME``) is never an artifact, even when agent code put a
+    ``metadata.json`` there, so it is in neither set. The listing's errors
+    are sorted by errno rather than left to ``Path.is_dir``, whose answer to
+    an EIO differs between Python versions (it raises on 3.12 and 3.13, and
+    answers False from 3.14). ENOENT, ENOTDIR and ELOOP mean the entry holds
+    no artifact folder; any other error leaves it in ``unreadable``, or, for
+    ``base`` itself, in ``base_error``, so a caller never takes an entry it
+    could not read for one that is gone."""
+    base = Path(base)
+    try:
+        with os.scandir(base) as entries:
+            names = sorted(entry.name for entry in entries if entry.name != LOCKS_DIRNAME)
+    except OSError as exc:
+        return ArtifactListing(found=frozenset(), unreadable=frozenset(), base_error=None if _holds_no_id(exc) else exc)
+    found: set[str] = set()
+    unreadable: set[str] = set()
+    for name in names:
+        folder = base / name
+        try:
+            if not stat.S_ISDIR(os.stat(folder).st_mode):
+                continue
+            if not stat.S_ISREG(os.stat(folder / "metadata.json").st_mode):
+                continue
+        except OSError as exc:
+            if not _holds_no_id(exc):
+                unreadable.add(name)
+            continue
+        found.add(name)
+    return ArtifactListing(found=frozenset(found), unreadable=frozenset(unreadable))
+
+
+class ListedIds(NamedTuple):
+    """What artifact_ids_below read from the folders it was given, or
+    listed_folder_ids from a full listing. A folder in neither holds no id."""
+
+    # The id each folder holding one holds.
+    ids: dict[str, str]
+    # The folders it could not read: opening one or reading its id failed
+    # with an error other than a missing entry, a link or a document that is
+    # not a regular file (_holds_no_id). Every folder when opening ``base``
+    # fails that way. From a full listing, also the entries the listing could
+    # not stat (ArtifactListing.unreadable), less those the id reader refuses
+    # as links (listed_folder_ids).
+    unreadable: frozenset[str]
+    # Whether opening or listing ``base`` itself failed that way, so the
+    # folders below it were not all read, even when ``unreadable`` names none.
+    # Never set for a ``base`` the id reader refuses, such as a link
+    # (listed_folder_ids).
+    base_unreadable: bool = False
+
+
+def artifact_ids_below(*, base: Path, slugs) -> ListedIds:
     """The id each of ``slugs``' folders directly below ``base`` holds, read
-    without writing. A folder that is gone, is a link or holds no readable id
-    is left out, and so is every folder when a folder on the way to ``base``
-    is a link (``_opened_from_trusted_root``)."""
+    without writing. A folder that is gone, is a link, or holds no metadata
+    file or one that does not parse holds no id, and so does every folder
+    when a folder on the way to ``base`` is missing or is a link
+    (``_opened_from_trusted_root``). Any other read error leaves the folder
+    in ``unreadable``, so a caller never takes a folder it could not read
+    for one that is gone or holds no id."""
+    read = _ids_below_pinned_base(base=base, slugs=slugs)
+    return read if read is not None else ListedIds(ids={}, unreadable=frozenset())
+
+
+def _ids_below_pinned_base(*, base: Path, slugs) -> ListedIds | None:
+    """artifact_ids_below's read, or None when ``base`` itself holds no id:
+    it is missing, or a folder on the way to it is a link
+    (``_opened_from_trusted_root``)."""
     ids: dict[str, str] = {}
+    unreadable: set[str] = set()
     try:
         with _opened_from_trusted_root(Path(base)) as root:
             for slug in slugs:
                 try:
                     with _opened_child_directory(root, slug) as folder:
                         ids[slug] = read_full_id(folder)[0]
-                except (OSError, ValueError, json.JSONDecodeError):
+                except ValueError:
+                    # json.JSONDecodeError is a ValueError too.
                     continue
+                except OSError as exc:
+                    if not _holds_no_id(exc):
+                        unreadable.add(slug)
+    except OSError as exc:
+        if _holds_no_id(exc):
+            return None
+        return ListedIds(ids={}, unreadable=frozenset(slugs), base_unreadable=True)
+    return ListedIds(ids=ids, unreadable=frozenset(unreadable))
+
+
+def listed_folder_ids(*, base: Path, listing: ArtifactListing) -> ListedIds:
+    """The id each folder a full listing of ``base`` found holds, read
+    without writing (artifact_ids_below), with the entries the listing could
+    not stat among the unreadable folders, and ``base_unreadable`` when it
+    could not list a plain ``base`` at all.
+
+    The listing follows links and the id reader never does, so an entry the
+    reader refuses as holding no id is left out of the unreadable folders,
+    however the listing's stat of it failed: every entry when ``base`` is
+    missing or a folder on the way to it is a link, and an entry that is a
+    link, or whose ``metadata.json`` is one (_refused_as_a_link). Such an
+    entry can never give an id, so it never asks for a self-heal. The same
+    holds for ``base`` itself: a link the listing could not list, such as one
+    to a folder the server may not read, is refused before its listing's
+    error counts, so only a plain ``base`` sets ``base_unreadable``."""
+    read = _ids_below_pinned_base(base=base, slugs=listing.found)
+    if read is None:
+        return ListedIds(ids={}, unreadable=frozenset())
+    if listing.base_error is not None:
+        return ListedIds(ids={}, unreadable=frozenset(), base_unreadable=True)
+    unstatted = frozenset(name for name in listing.unreadable if not _refused_as_a_link(base=Path(base), name=name))
+    return read._replace(unreadable=read.unreadable | unstatted)
+
+
+def _refused_as_a_link(*, base: Path, name: str) -> bool:
+    """Whether the entry ``name`` directly below ``base``, or its
+    ``metadata.json``, is a link, which the id reader refuses as holding no
+    id (``O_NOFOLLOW``). An entry whose own lstat fails is not known to be
+    one."""
+    try:
+        if stat.S_ISLNK(os.lstat(base / name).st_mode):
+            return True
+        return stat.S_ISLNK(os.lstat(base / name / "metadata.json").st_mode)
     except OSError:
-        return {}
-    return ids
+        return False
 
 
 class FolderCheck(Enum):

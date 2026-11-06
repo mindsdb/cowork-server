@@ -9,6 +9,7 @@ provenance decides what the turn created.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 from collections.abc import Iterable
 from functools import partial
@@ -25,12 +26,14 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.queued_agent_repair import QueuedAgentRepair
 from cowork.services import task_objects
+from cowork.services.artifact_identity import ListedIds
 from cowork.services.queued_repairs import QueuedRepairs
 from cowork.services.task_objects import (
     snapshot_artifact_state,
     tracked_artifacts_from_reply,
     turn_artifact_changes,
 )
+from cowork.turnqueue.models import ARTIFACTS_TOUCHED_KEY, MAX_ARTIFACT_NAME_CHARS, MAX_ARTIFACTS_TOUCHED
 from test_artifact_resolution_off_the_loop import seeded_artifact  # noqa: F401  (a fixture)
 from test_responses_remote_backend import (
     _artifact,
@@ -61,12 +64,30 @@ CASES = TurnDiffCases.model_validate(
         ({"artifacts_touched": "a"}, None),
         ({"artifacts_touched": ["a", 7]}, None),
         ({"artifacts_touched": None}, None),
-        ({"artifacts_touched": [f"a{i}" for i in range(1001)]}, None),
+        (
+            {"artifacts_touched": [f"a{i}" for i in range(MAX_ARTIFACTS_TOUCHED)]},
+            {f"a{i}" for i in range(MAX_ARTIFACTS_TOUCHED)},
+        ),
+        ({"artifacts_touched": [f"a{i}" for i in range(MAX_ARTIFACTS_TOUCHED + 1)]}, None),
+        ({"artifacts_touched": ["a", "n" * MAX_ARTIFACT_NAME_CHARS]}, {"a", "n" * MAX_ARTIFACT_NAME_CHARS}),
+        ({"artifacts_touched": ["a", "n" * (MAX_ARTIFACT_NAME_CHARS + 1)]}, None),
     ],
-    ids=["list", "empty", "older-pod", "string", "non-string", "null", "too-many"],
+    ids=[
+        "list", "empty", "older-pod", "string", "non-string", "null", "at-the-cap", "too-many",
+        "longest-name", "name-too-long",
+    ],
 )
 def test_the_pods_list_is_read_only_when_it_is_a_list_of_names(data, expected):
     assert tracked_artifacts_from_reply(data) == expected
+
+
+def test_the_pods_list_key_and_cap_match_anton_and_scratchpad_controller():
+    """anton's ``anton/cloud_turn/contract.py`` and scratchpad-controller's
+    ``src/scratchpad_controller/anton_turn.py`` hold the same key and cap as
+    ``ARTIFACTS_TOUCHED_KEY`` and ``MAX_ARTIFACTS_TOUCHED``. Change all three
+    repositories together."""
+    assert ARTIFACTS_TOUCHED_KEY == "artifacts_touched"
+    assert MAX_ARTIFACTS_TOUCHED == 1000
 
 
 class _ContentReads:
@@ -161,13 +182,17 @@ ORG_SCOPE = TenantScope(org_mode=True, org_id="org-123", user_id="user-456")
 
 async def _remote_turn(
     *, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, completed: dict, queued: tuple[str, ...] = (),
-    conv_id: UUID | None = None, autopublished: dict | None = None,
+    conv_id: UUID | None = None, autopublished: dict | None = None, sibling: tuple[str, ...] = (),
+    buffer: _FakeBuffer | None = None, writes: tuple[str, ...] = ("mine", "theirs"), recorded: dict | None = None,
 ) -> list[str]:
-    """Run a remote turn whose pod writes `mine` and a sibling's `theirs`,
-    both naming this conversation in their provenance, and return the slugs
-    it indexed. `queued` are folders recorded as holding a repair queued to
-    the conversation. `autopublished` gets the keywords the turn end called
-    the publish with."""
+    """Run a remote turn whose pod writes `writes`, by default `mine` and a
+    sibling's `theirs`, each naming this conversation in its provenance, and
+    return the slugs it indexed. `sibling` are folders a sibling turn makes
+    while this one runs, whose provenance names that other conversation.
+    `queued` are folders recorded as holding a repair queued to the
+    conversation. `autopublished` gets the keywords the turn end called the
+    publish with, `recorded` those it called record_new_artifacts with, and
+    `buffer` the turn's frames."""
     saved: dict = {}
     handler = _remote_handler(monkeypatch, saved)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda principal: ORG_SCOPE)
@@ -186,6 +211,8 @@ async def _remote_turn(
 
     def spy_index(session, **kwargs):
         indexed["slugs"] = kwargs["slugs"]
+        if recorded is not None:
+            recorded.update(kwargs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index)
 
@@ -200,14 +227,16 @@ async def _remote_turn(
 
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
-        _artifact(artifacts_base, "mine", conversation_id=conv_id)
-        _artifact(artifacts_base, "theirs", conversation_id=conv_id)
+        for slug in writes:
+            _artifact(artifacts_base, slug, conversation_id=conv_id)
+        for slug in sibling:
+            _artifact(artifacts_base, slug, conversation_id=uuid4())
         yield "turn_completed", completed
 
     monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
     await handler._produce_remote(
         conv_id=conv_id, input_text="hi", original_content="hi",
-        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        model="anton", harness_id="anton", buffer=buffer or _FakeBuffer(),
     )
     return indexed.get("slugs", [])
 
@@ -223,6 +252,133 @@ async def test_a_remote_turn_claims_only_what_the_pod_named(monkeypatch, tmp_pat
 
 async def test_a_remote_turn_from_an_older_pod_keeps_todays_diff(monkeypatch, tmp_path):
     assert await _remote_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, completed={}) == ["mine", "theirs"]
+
+
+def test_a_listed_sibling_folder_is_not_claimed_as_created(tmp_path):
+    """anton lists a sibling's folder whose files changed during one of this
+    turn's cells, so the pod's list can name a folder a sibling turn made.
+    Its provenance names that turn, so this one does not claim it. A listed
+    folder with no provenance is still this turn's."""
+    conversation = uuid4()
+    base = tmp_path / ".anton" / "artifacts"
+    _artifact(base, "old")
+    before, before_mtimes = snapshot_artifact_state(base)
+    _artifact(base, "dash", conversation_id=uuid4())
+    _artifact(base, "fresh")
+
+    changes = turn_artifact_changes(
+        conversation_id=conversation, artifacts_base=base, before=before, before_mtimes=before_mtimes,
+        tracked_new={"dash", "fresh"}, tracked_edits={"dash", "fresh"}, repair_slugs=set(),
+        attribute_by_provenance=True,
+    )
+
+    assert changes.created == ["fresh"]
+    assert "dash" not in changes.touched
+
+
+async def test_a_remote_turn_never_claims_a_sibling_folder_the_pod_listed(monkeypatch, tmp_path):
+    indexed = await _remote_turn(
+        monkeypatch=monkeypatch, tmp_path=tmp_path, completed={"artifacts_touched": ["mine", "dash"]},
+        sibling=("dash",),
+    )
+
+    assert indexed == ["mine"]
+
+
+def test_a_listed_folder_the_diff_could_not_read_is_logged(tmp_path, monkeypatch, caplog, owned_logger):
+    """A folder the pod named whose open fails is left out of the turn, and
+    in org mode nothing records it later, so the diff says which one. The
+    full listing used before the pod's list raised on the same error, and
+    its caller logged it."""
+    from cowork.services import artifact_identity
+
+    conversation = uuid4()
+    base = tmp_path / ".anton" / "artifacts"
+    _artifact(base, "old")
+    before, before_mtimes = snapshot_artifact_state(base)
+    _artifact(base, "made", conversation_id=conversation)
+    _artifact(base, "fine", conversation_id=conversation)
+    real_open_child = artifact_identity.open_pinned_child
+
+    def flaky_open(parent, name, *args, **kwargs):
+        if name == "made":
+            raise OSError(errno.EIO, "Input/output error")
+        return real_open_child(parent, name, *args, **kwargs)
+
+    monkeypatch.setattr(artifact_identity, "open_pinned_child", flaky_open)
+    owned_logger(task_objects.logger.name, level=logging.WARNING)
+    changes = turn_artifact_changes(
+        conversation_id=conversation, artifacts_base=base, before=before, before_mtimes=before_mtimes,
+        tracked_new={"made", "fine"}, tracked_edits={"made", "fine"}, repair_slugs=set(),
+        attribute_by_provenance=True,
+    )
+
+    assert changes.created == ["fine"]
+    [logged] = [
+        record for record in caplog.records
+        if record.name == task_objects.logger.name and record.levelno == logging.WARNING
+    ]
+    assert (logged.conversation_id, logged.artifact_slugs) == (str(conversation), ("made",))
+
+
+class _Frames(_FakeBuffer):
+    """A turn's buffer that keeps the frames it was given."""
+
+    def __init__(self) -> None:
+        self.frames: list[str] = []
+
+    async def append(self, kind, payload, *args, **kwargs):
+        self.frames.append(payload.get("sse", ""))
+
+
+async def test_a_remote_turn_sends_its_cards_before_it_drops_the_checked_rows(monkeypatch, tmp_path):
+    """With the pool full, the drop of the checked repair rows waits up to
+    POOL_TIMEOUT for a connection and is then refused. The rows only spare
+    the next turn end a folder check, so the drop waits until the turn's
+    cards are out, and its refusal leaves the row for the next turn end."""
+    from cowork.db.units import DatabaseBusy
+    from cowork.services import queued_repairs
+
+    buffer = _Frames()
+    cards_out_at_drop: list[bool] = []
+    real_run_db = queued_repairs.run_db
+
+    async def run_db_with_a_full_pool(fn, *, scope):
+        if getattr(fn, "func", None) is queued_repairs.forget_queued_repairs:
+            cards_out_at_drop.append(any("response.artifact_created" in frame for frame in buffer.frames))
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+        return await real_run_db(fn, scope=scope)
+
+    monkeypatch.setattr(queued_repairs, "run_db", run_db_with_a_full_pool)
+    conv_id = uuid4()
+
+    indexed = await _remote_turn(
+        monkeypatch=monkeypatch, tmp_path=tmp_path, completed={"artifacts_touched": ["mine"]}, queued=("fixme",),
+        conv_id=conv_id, buffer=buffer,
+    )
+
+    assert indexed == ["mine"]
+    assert cards_out_at_drop == [True]
+    assert _queued_slugs(conv_id) == {"fixme"}
+
+
+async def test_an_older_pods_turn_that_made_nothing_checks_every_listed_folders_id(monkeypatch, tmp_path):
+    """Without the pod's list the diff lists the whole folder, so it reads
+    every folder's id, and the turn end records them even when the turn
+    made nothing: a copy no turn end claims then marks its id conflicted
+    (record_listed_folders)."""
+    from cowork.services.artifact_identity import ensure_full_id
+
+    brief = _artifact(tmp_path / "proj" / ".anton" / "artifacts", "brief")
+    artifact_id, _metadata = ensure_full_id(brief)
+    recorded: dict = {}
+
+    indexed = await _remote_turn(
+        monkeypatch=monkeypatch, tmp_path=tmp_path, completed={}, writes=(), recorded=recorded,
+    )
+
+    assert indexed == []
+    assert recorded["listed_ids"] == ListedIds(ids={"brief": artifact_id}, unreadable=frozenset())
 
 
 def _queue_repair(*, folder: Path, conversation_id: UUID) -> str:
@@ -506,9 +662,11 @@ async def test_a_turn_end_that_could_not_open_the_artifacts_keeps_the_rows(monke
     assert _queued_slugs(conv_id) == {"fixme"}
 
 
-async def test_a_channel_turn_end_drops_only_the_rows_of_the_repair_folders_it_read(monkeypatch, tmp_path):
-    """The channel producer drops what the browser one does: the rows of the
-    repair folders its diff read, and not that of one whose open failed."""
+async def test_a_channel_turn_end_rules_only_on_the_repair_folders_it_read(monkeypatch, tmp_path):
+    """The channel producer's record step rules on what the browser one does:
+    the repair folders its diff read, and not one whose open failed. It drops
+    no row itself: remote_turn_events drops the ruled ones once the turn's
+    cards are out."""
     from cowork.handlers.responses import _RemoteArtifactsDir
     from cowork.services import artifact_identity
     from cowork.turnqueue.remote_turn import _record_turn_artifacts
@@ -528,13 +686,14 @@ async def test_a_channel_turn_end_drops_only_the_rows_of_the_repair_folders_it_r
 
     monkeypatch.setattr(artifact_identity, "open_pinned_child", flaky_open)
 
-    await _record_turn_artifacts(
+    changes = await _record_turn_artifacts(
         _RemoteArtifactsDir(base=base, project_id=None, project_name="Project", creator=None),
         conv_id=conv_id, scope=ORG_SCOPE, before_slugs=before, before_mtimes=before_mtimes,
         completed_cleanly=True, touched=set(), repairs=_queued(conversation_id=conv_id),
     )
 
-    assert _queued_slugs(conv_id) == {"flaky"}
+    assert changes.checked_repairs == {"readable"}
+    assert _queued_slugs(conv_id) == {"readable", "flaky"}
 
 
 def test_the_diff_rules_on_a_repair_folder_only_when_it_could_read_it(tmp_path, monkeypatch):
@@ -671,12 +830,13 @@ async def test_a_channel_turn_end_keeps_the_row_of_a_repair_it_could_not_finish(
     before, before_mtimes = snapshot_artifact_state(base)
     _hold_artifact_lock(monkeypatch=monkeypatch, folder=folder)
 
-    await _record_turn_artifacts(
+    changes = await _record_turn_artifacts(
         _RemoteArtifactsDir(base=base, project_id=None, project_name="Project", creator=None),
         conv_id=conv_id, scope=ORG_SCOPE, before_slugs=before, before_mtimes=before_mtimes,
         completed_cleanly=True, touched=set(), repairs=_queued(conversation_id=conv_id),
     )
 
+    assert changes.checked_repairs == set()
     assert _queued_slugs(conv_id) == {"fixme"}
 
 
@@ -728,7 +888,11 @@ def test_a_desktop_folder_keeps_one_row_however_often_it_is_recorded():
 # ── the pod's names ──────────────────────────────────────────────────────
 
 
-def test_a_hostile_name_in_the_pods_list_never_leaves_the_artifacts_folder(tmp_path):
+@pytest.mark.parametrize("repair_slugs", [set(), None], ids=["rows-read", "rows-unreadable"])
+def test_a_hostile_name_in_the_pods_list_never_leaves_the_artifacts_folder(tmp_path, repair_slugs):
+    """With the repair rows unread, the diff lists the folder to find queued
+    repairs, but the pod's names are still opened one folder each, so a link
+    the pod named is never claimed."""
     base = tmp_path / "proj" / ".anton" / "artifacts"
     _artifact(base, "old")
     outside = _artifact(tmp_path / "proj" / ".anton", "outside")
@@ -741,7 +905,7 @@ def test_a_hostile_name_in_the_pods_list_never_leaves_the_artifacts_folder(tmp_p
 
     changes = turn_artifact_changes(
         conversation_id=uuid4(), artifacts_base=base, before=before, before_mtimes=before_mtimes,
-        tracked_new=names, tracked_edits=names, repair_slugs=set(),
+        tracked_new=names, tracked_edits=names, repair_slugs=repair_slugs,
     )
 
     assert changes.created == ["good"]

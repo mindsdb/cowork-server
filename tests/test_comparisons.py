@@ -1803,7 +1803,9 @@ def test_autopublish_skips_a_side(tmp_path, monkeypatch):
 
     monkeypatch.setattr(artifact_autopublish, "_is_enabled", lambda scope: True)
     candidates = []
-    monkeypatch.setattr(artifact_autopublish, "_candidate_slugs", lambda base: candidates.append(base) or [])
+    monkeypatch.setattr(
+        artifact_autopublish, "_candidate_slugs", lambda *, artifacts_base: candidates.append(artifacts_base) or [],
+    )
     scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 
     side_base = tmp_path / f"{COMPARISON_SANDBOX_PREFIX}abc" / ".anton" / "artifacts"

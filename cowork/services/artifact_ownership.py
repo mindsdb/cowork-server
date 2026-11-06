@@ -431,9 +431,12 @@ def turn_created_slugs(
     try:
         expected = UUID(str(conversation_id))
         if after is None:
-            from cowork.services.task_objects import snapshot_artifact_slugs
+            from cowork.services.artifact_identity import artifact_folders_below
 
-            after = snapshot_artifact_slugs(base)
+            listing = artifact_folders_below(base=Path(base))
+            if listing.base_error is not None:
+                raise listing.base_error
+            after = listing.found
         appeared = set(after) - set(before_slugs or ())
         kept: set[str] = set()
         for slug in sorted(appeared):

@@ -742,15 +742,17 @@ def test_a_turn_end_in_a_linked_partition_reads_no_one_elses_artifact_ids(two_pe
     """A turn's end reads the ids of its new folders by name below its
     project's artifacts folder. With B's partition folder a link to A's, B's
     folder yields none of A's ids, while A's own folder still does."""
-    from cowork.services.artifact_identity import artifact_ids_below
+    from cowork.services.artifact_identity import ListedIds, artifact_ids_below
 
     dash, notes = two_people
     bobs_artifacts = _general(BOB) / ".anton" / "artifacts"
     _link_bobs_partition_to_alices()
     slugs = {"dash", "notes"}
 
-    assert artifact_ids_below(bobs_artifacts, slugs) == {}
-    assert artifact_ids_below(dash.parent, slugs) == {"dash": _artifact_id(dash), "notes": _artifact_id(notes)}
+    assert artifact_ids_below(base=bobs_artifacts, slugs=slugs) == ListedIds(ids={}, unreadable=frozenset())
+    assert artifact_ids_below(base=dash.parent, slugs=slugs) == ListedIds(
+        ids={"dash": _artifact_id(dash), "notes": _artifact_id(notes)}, unreadable=frozenset(),
+    )
 
 
 def test_a_turn_end_in_a_linked_partition_names_no_one_elses_artifact_folders(two_people):

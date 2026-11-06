@@ -29,6 +29,7 @@ on the store never hold every connection.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import threading
@@ -47,6 +48,7 @@ from starlette.exceptions import HTTPException
 
 from cowork.db import session as db_session
 from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.turnqueue.models import MAX_ARTIFACT_NAME_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +299,15 @@ async def run_to_completion(work: Coroutine[Any, Any, T]) -> T:
 #: (drain_turn_end_records). The chart's grace period counts it
 #: (tests/test_chart_values.py).
 TURN_END_RECORD_DRAIN_SECONDS = 8.0
+#: The most names the line for a cut turn-end record carries in `touched`,
+#: the first in sorted order; its `count` says how many the record held.
+TURN_END_RECORD_NAMES_LOGGED = 50
+#: The most bytes those names take in the line, each as the JSON console
+#: line encodes it: a multibyte character costs up to 4 bytes and a control
+#: character, which JSON escapes, 6. So the one line an operator searches for
+#: stays under the 16 KiB a container runtime splits a line at, whatever
+#: characters the names hold.
+TURN_END_RECORD_TOUCHED_BYTES = 12 * 1024
 
 
 @dataclass(frozen=True)
@@ -306,8 +317,9 @@ class TurnEndRecord:
 
     conversation_id: UUID
     project_id: str | None
-    # The slugs the record writes rows for. Empty until its diff finds them
-    # (note_turn_end_slugs).
+    # The slugs the record is about: the pod's list of the artifacts the
+    # turn's tools touched, empty for a pod that sends no usable list, until
+    # the diff names the new slugs it writes rows for (note_turn_end_slugs).
     touched: tuple[str, ...]
 
 
@@ -322,6 +334,23 @@ async def run_turn_end_record(*, work: Coroutine[Any, Any, T], record: TurnEndRe
     _turn_end_records[task] = record
     task.add_done_callback(lambda done: _turn_end_records.pop(done, None))
     return await _finish_even_if_cancelled(task)
+
+
+def _logged_names(*, names: list[str]) -> list[str]:
+    """The first of ``names`` while they fit in TURN_END_RECORD_TOUCHED_BYTES,
+    at most TURN_END_RECORD_NAMES_LOGGED of them. Each name counts as the JSON
+    console line encodes it (``ensure_ascii`` off, as
+    structured_logging.make_formatter renders), plus its separator; a lone
+    surrogate, such as a folder name's byte that is not UTF-8, counts as the
+    escape a console writes for it."""
+    kept: list[str] = []
+    size = 0
+    for name in names[:TURN_END_RECORD_NAMES_LOGGED]:
+        size += len(json.dumps(name, ensure_ascii=False).encode("utf-8", "backslashreplace")) + 1
+        if size > TURN_END_RECORD_TOUCHED_BYTES:
+            break
+        kept.append(name)
+    return kept
 
 
 def note_turn_end_slugs(*, slugs: Iterable[str]) -> None:
@@ -339,19 +368,25 @@ async def drain_turn_end_records(*, timeout: float) -> None:
     """Wait up to ``timeout`` for the turn-end records still running, for the
     end of shutdown. Each one still running then is cut by the event loop's
     close, so its rows are lost, and an ERROR names its turn and the slugs
-    its diff found, none when the diff had not answered."""
+    its diff found, or, when the diff had not answered, the pod's list (none
+    for a pod that sends no usable list). The line carries the first of them
+    in sorted order, none longer than MAX_ARTIFACT_NAME_CHARS, at most
+    TURN_END_RECORD_NAMES_LOGGED and TURN_END_RECORD_TOUCHED_BYTES of them
+    (_logged_names), and `count`, how many the record held."""
     if not _turn_end_records:
         return
     _, unfinished = await asyncio.wait(list(_turn_end_records), timeout=timeout)
     for task in unfinished:
         record = _turn_end_records[task]
+        named = sorted(name for name in record.touched if len(name) <= MAX_ARTIFACT_NAME_CHARS)
         logger.error(
             "A turn's artifact record was still running at shutdown; its rows are lost",
             extra={
                 "event": "shutdown_turn_record_lost",
                 "conversation_id": str(record.conversation_id),
                 "project_id": record.project_id,
-                "touched": list(record.touched),
+                "touched": _logged_names(names=named),
+                "count": len(record.touched),
             },
         )
 

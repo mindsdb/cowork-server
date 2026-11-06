@@ -183,12 +183,18 @@ deployment:
   # A stall that clears within the last wait keeps the turn's artifact rows.
   # A record still running after it is cut by the event loop's close, so that
   # turn's artifact rows are lost, and the pod logs shutdown_turn_record_lost
-  # at ERROR with the conversation, the project and the new artifacts' slugs
-  # its diff found (touched). A web answer still streaming at SIGTERM is
-  # saved anyway, marked turn_lost; one whose pod had finished starts its
-  # save once its record ends, and a save that starts as the loop closes may
-  # not finish. A file store call already running on the stuck mount keeps
-  # the process alive until the SIGKILL.
+  # at ERROR with the conversation, the project, touched and count. touched
+  # holds the new artifacts' slugs its diff found, or, when the diff had not
+  # returned, the pod's artifacts_touched list (empty for a pod that sends no
+  # usable list): the first of them in sorted order, none longer than 255
+  # characters, at most 50 (TURN_END_RECORD_NAMES_LOGGED) and only as many as
+  # fit in 12 KiB as the line encodes them (TURN_END_RECORD_TOUCHED_BYTES),
+  # so the line stays under the 16 KiB a container runtime splits a line at;
+  # count says how many the record held. A web answer still streaming at
+  # SIGTERM is saved anyway, marked turn_lost; one whose pod had finished
+  # starts its save once its record ends, and a save that starts as the loop
+  # closes may not finish. A file store call already running on the stuck
+  # mount keeps the process alive until the SIGKILL.
   terminationGracePeriodSeconds: 62
 
   lifecycle:
