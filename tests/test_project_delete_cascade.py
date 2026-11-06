@@ -244,3 +244,33 @@ def test_delete_project_drops_objects_a_moved_task_left_behind_on_postgres(
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
     with Session(postgres_engine) as session:
         _assert_delete_drops_objects_a_moved_task_left_behind(session, tmp_path)
+
+
+def test_delete_project_cleans_every_conversations_streams_under_one_redis_deadline(
+    tmp_path, monkeypatch
+):
+    """On the Redis stream backend each conversation's stream cleanup makes
+    blocking Redis calls (`streaming.discard_conversation`), which retry until
+    their deadline while Redis does not answer. With a deadline per
+    conversation, a project delete holds its request for one budget per
+    conversation."""
+    import cowork.streaming as streaming
+    from cowork.turnqueue import redis_client
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="chatty")
+    for topic in ("one", "two", "three"):
+        session.add(Conversation(project_id=project.id, topic=topic))
+    session.commit()
+    deadlines: list[float | None] = []
+    monkeypatch.setattr(
+        streaming, "discard_conversation", lambda _cid: deadlines.append(redis_client._deadline.get()),
+    )
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert len(deadlines) == 3
+    assert deadlines[0] is not None
+    assert len(set(deadlines)) == 1

@@ -35,6 +35,7 @@ from cowork.db.scoped import (
 )
 from cowork.models.project import Project
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
+from cowork.turnqueue.redis_client import SYNC_CALL_BUDGET_S, redis_deadline
 
 if TYPE_CHECKING:
     from cowork.services.skills import ProjectReferenceRewrite
@@ -1330,11 +1331,16 @@ class ProjectService:
                         extra=log_context(project_id=project_id),
                     )
             raise
-        for conversation_stage in conversation_stages:
-            conv_svc.finalize_staged_conversation_delete(
-                conversation_stage,
-                cleanup_project_files=staged_path is None,
-            )
+        # On the Redis stream backend each conversation's stream cleanup calls
+        # Redis (streaming.discard_conversation). One deadline for them all
+        # holds the delete for one call budget while Redis does not answer,
+        # not one per conversation. Once it passes, each call is tried once.
+        with redis_deadline(budget_s=SYNC_CALL_BUDGET_S):
+            for conversation_stage in conversation_stages:
+                conv_svc.finalize_staged_conversation_delete(
+                    conversation_stage,
+                    cleanup_project_files=staged_path is None,
+                )
         try:
             from cowork.services.memory import remove_project_memory_tiers
 

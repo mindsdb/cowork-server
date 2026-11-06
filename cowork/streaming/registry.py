@@ -32,6 +32,7 @@ from cowork.common.logger import log_context
 from cowork.streaming import turn_claim
 from cowork.streaming.buffer import StreamBuffer
 from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable
+from cowork.turnqueue.redis_client import SYNC_CALL_BUDGET_S, redis_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -996,27 +997,32 @@ def discard_conversation(conversation_id: str) -> None:
     cid = str(conversation_id)
     handle = registry.get(cid)
     registry.discard(cid)
-    # First, and whatever the buffer removal below does: an entry stamped
-    # with a saved question refuses sends at or below its turn number
-    # (TurnIndexEntry.makes_stale), and the truncation brings the next send
-    # back to that number. Left behind, it would also have /in-flight keep
-    # naming a turn whose buffer is gone. Logs its own failure. Only the
-    # Redis backend reads the index, so the file backend has nothing to
-    # forget and reaches no Redis here.
-    if get_backend() == "redis":
-        forget_turn_sync(cid)
-    try:
-        remove_conversation_buffers(cid)
-    except Exception:
-        logger.warning(
-            "Could not remove a deleted conversation's turn buffers.",
-            exc_info=True,
-            extra={"event": "turn_buffers_remove_failed", **log_context(conversation_id=cid)},
-        )
-    if handle is not None and handle.claim is not None:
-        # Its stream is gone, so another replica would read the claim of a
-        # finished turn as one whose first record has not landed yet.
-        _release_claim_sync(conversation_id=cid, claim=handle.claim)
+    # One deadline for every Redis call below, so a Redis that does not
+    # answer holds the deleting thread for one call budget, not one per call.
+    # A caller that discards many conversations opens one around them all
+    # (ProjectService.delete_project), and this one ends no later than it.
+    with redis_deadline(budget_s=SYNC_CALL_BUDGET_S):
+        # First, and whatever the buffer removal below does: an entry stamped
+        # with a saved question refuses sends at or below its turn number
+        # (TurnIndexEntry.makes_stale), and the truncation brings the next
+        # send back to that number. Left behind, it would also have
+        # /in-flight keep naming a turn whose buffer is gone. Logs its own
+        # failure. Only the Redis backend reads the index, so the file
+        # backend has nothing to forget and reaches no Redis here.
+        if get_backend() == "redis":
+            forget_turn_sync(cid)
+        try:
+            remove_conversation_buffers(cid)
+        except Exception:
+            logger.warning(
+                "Could not remove a deleted conversation's turn buffers.",
+                exc_info=True,
+                extra={"event": "turn_buffers_remove_failed", **log_context(conversation_id=cid)},
+            )
+        if handle is not None and handle.claim is not None:
+            # Its stream is gone, so another replica would read the claim of
+            # a finished turn as one whose first record has not landed yet.
+            _release_claim_sync(conversation_id=cid, claim=handle.claim)
 
 
 def _release_claim_sync(*, conversation_id: str, claim: TurnClaim) -> None:

@@ -160,3 +160,63 @@ def test_a_file_backend_conversation_delete_never_calls_redis(monkeypatch, tmp_p
 
     # forget_turn_sync logs and swallows any error, so the call is what to check.
     assert calls == []
+
+
+def test_a_redis_backend_conversation_delete_spends_one_deadline_on_all_its_redis_calls(monkeypatch):
+    """A delete makes several blocking Redis calls in a row: it forgets the
+    turn index entry, walks and deletes the buffers, and releases the claim
+    of a turn this replica runs. With a deadline per call, a Redis that
+    refuses every connect holds the deleting thread for one budget per call."""
+    import importlib
+    import logging
+    import socket
+    import time
+    from types import SimpleNamespace
+
+    from cowork.streaming import discard_conversation, turn_claim, turn_index
+    from cowork.turnqueue.redis_client import build_sync_redis
+
+    # The package exports the registry instance under the module's name.
+    registry_mod = importlib.import_module("cowork.streaming.registry")
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        refused_port = probe.getsockname()[1]
+    client = build_sync_redis(url=f"redis://127.0.0.1:{refused_port}/0", call_budget_s=3.0)
+    for module in (turn_index, backend_mod, turn_claim):
+        monkeypatch.setattr(module, "get_sync_redis", lambda: client)
+    delete_budget_s = 0.5
+    monkeypatch.setattr(registry_mod, "SYNC_CALL_BUDGET_S", delete_budget_s)
+    claim = turn_claim.new_claim(run_id="run-c12", turn_id=1, correlation_id=None, question_id=None)
+
+    class _OneTurn:
+        def get(self, _conversation_id):
+            return SimpleNamespace(claim=claim)
+
+        def discard(self, _conversation_id):
+            return None
+
+    monkeypatch.setattr(registry_mod, "registry", _OneTurn())
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+    released: list[str] = []
+    real_release_sync = turn_claim.release_sync
+
+    def release_sync(**kwargs):
+        released.append(kwargs["run_id"])
+        return real_release_sync(**kwargs)
+
+    monkeypatch.setattr(turn_claim, "release_sync", release_sync)
+
+    # Each failed call logs a warning with its traceback, and the first such
+    # line can take a second to format. That is not what this times.
+    logging.disable(logging.CRITICAL)
+    try:
+        started = time.monotonic()
+        discard_conversation("c12")
+        elapsed = time.monotonic() - started
+    finally:
+        logging.disable(logging.NOTSET)
+
+    assert released == ["run-c12"]
+    assert elapsed < delete_budget_s + 1.0
+    client.close()
