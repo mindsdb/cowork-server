@@ -16,6 +16,12 @@ of a replica that died without releasing it lapses on its own. The run id is
 the owner token: a new one per start, so a restarted process never takes a
 dead run's claim for its own. A hash lists every claim by conversation, so a
 process can find the claims stamped with its pod name without scanning keys.
+A claim that lapses instead of being released (its pod was killed) keeps its
+listing until a boot pass (release_pod_claims) on any pod removes it.
+
+Taking the claim also reads the conversation's turn index entry in the same
+transaction, and refuses a start that entry shows read the history before an
+earlier run saved its question (turn_index.TurnIndexEntry.makes_stale).
 
 Compare-and-set runs as WATCH/MULTI rather than a Lua script: the fakeredis
 the tests use runs no EVAL without lupa, which this repository does not
@@ -29,7 +35,8 @@ writing after its turn's claim is released.
 
 Keys:
     cowork:turn_claim:{conversation_id}   STRING, the holder's TurnClaim JSON, PX CLAIM_TTL_SECONDS
-    cowork:turn_claims                    HASH conversation_id -> TurnClaim JSON
+    cowork:turn_claims                    HASH conversation_id -> TurnClaim JSON, including
+                                          lapsed claims until a boot pass removes them
 """
 from __future__ import annotations
 
@@ -58,19 +65,25 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Longer than the stall the hosted liveness probe forgives (failureThreshold 6
-# times periodSeconds 10, deployment/cowork-server/values.yaml), so a process
-# whose event loop stalls and recovers still holds its claim afterwards.
-# tests/test_turn_claim.py pins the two against each other.
-CLAIM_TTL_SECONDS = 70
+# Longer than the longest stall the hosted liveness probe forgives plus the
+# most a claim can have run down when the stall starts, so a process whose
+# event loop stalls and recovers still holds its claim afterwards. The probe
+# (deployment/cowork-server/values.yaml) forgives up to failureThreshold 6
+# times periodSeconds 10, plus timeoutSeconds 5 for the probe that answers
+# late: 65 s. A claim has run down by up to one renewal interval plus one
+# renewal's Redis bound when the stall starts: 15 s. tests/test_turn_claim.py
+# pins the sum against this. The cost: a send into a conversation whose pod
+# was force-killed is refused for up to this long.
+CLAIM_TTL_SECONDS = 90
 RENEW_INTERVAL_SECONDS = 10
 # Bound on each Redis call here: get_redis() sets no socket timeout.
 REDIS_CALL_SECONDS = 5
 # How long admission waits for a holder that is writing its final client
-# frame. The web UI sends a queued question on that frame, and the frame's
-# terminal record follows within one Redis round trip.
-FINISHING_HOLDER_WAIT_SECONDS = 10
-_FINISHING_HOLDER_POLL_SECONDS = 0.1
+# frame, or whose stream has ended while it still holds the claim, to release
+# it. The web UI sends a queued question on that frame. The terminal record
+# follows within one Redis round trip, and the release a moment after.
+ENDING_HOLDER_WAIT_SECONDS = 10
+_ENDING_HOLDER_POLL_SECONDS = 0.1
 # Tries of one compare-and-set after another client changed a watched key.
 _WATCH_ATTEMPTS = 3
 
@@ -131,12 +144,30 @@ class TurnClaimUnavailable(Exception):
         self.conversation_id = conversation_id
 
 
+class AcquireOutcome(StrEnum):
+    # The caller's run holds the claim.
+    ACQUIRED = "acquired"
+    # Another run holds it.
+    HELD = "held"
+    # No run holds it, and the conversation's turn index entry shows that a
+    # run saved its question at this turn number or a later one: the start
+    # read the history before that save.
+    STALE = "stale"
+
+
 class AcquireResult(NamedTuple):
     """``holder`` is the claim on the conversation after the call: the
-    caller's own when ``acquired``, another run's otherwise."""
+    caller's own when ACQUIRED, another run's when HELD, None when STALE.
+    ``saved_turn_id`` is the turn whose saved question makes a STALE start
+    stale."""
 
-    acquired: bool
-    holder: TurnClaim
+    outcome: AcquireOutcome
+    holder: TurnClaim | None = None
+    saved_turn_id: int | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self.outcome is AcquireOutcome.ACQUIRED
 
 
 class RenewOutcome(StrEnum):
@@ -218,29 +249,46 @@ async def read_claim(*, conversation_id: str, client=None) -> TurnClaim | None:
 
 
 async def acquire(*, claim: TurnClaim, conversation_id: str) -> AcquireResult:
-    """Take the conversation's claim for ``claim`` unless another run holds it.
+    """Take the conversation's claim for ``claim`` unless another run holds it
+    or the start is stale.
+
+    Stale means the conversation's turn index entry shows that an earlier run
+    saved its question at this turn number or a later one
+    (turn_index.TurnIndexEntry.makes_stale), so the start read the history
+    before that save. Read in the same transaction that takes the claim, so
+    no start is admitted past that stamp, however it reached here.
 
     The same transaction deletes the stream at this turn number when that
     stream has ended, which happens when the turn before at this number saved
     no message (backend.new_buffer clears it the same way). Deleted with the
     claim rather than when the buffer opens, so another replica that finds
     this claim never reads the earlier turn's terminal record as this run's.
+    A stale start deletes nothing.
 
     Raises on a Redis error. Unbounded; the caller bounds it, and removes this
     run's claim by compare-and-delete when a call is cut short, since Redis
     may have applied it.
     """
+    # turn_index imports this module.
+    from cowork.streaming.turn_index import TurnIndexEntry, turn_key
+
     r = get_redis()
     key = claim_key(conversation_id)
     stream = stream_key(conversation_id, claim.turn_id)
+    index = turn_key(conversation_id)
     value = claim.model_dump_json()
     for _attempt in range(_WATCH_ATTEMPTS):
         try:
             async with r.pipeline(transaction=True) as pipe:
-                await pipe.watch(key, stream)
+                await pipe.watch(key, stream, index)
                 holder = _parse(await pipe.get(key))
                 if holder is not None:
-                    return AcquireResult(acquired=holder.run_id == claim.run_id, holder=holder)
+                    held = AcquireOutcome.ACQUIRED if holder.run_id == claim.run_id else AcquireOutcome.HELD
+                    return AcquireResult(held, holder)
+                turn = await pipe.hgetall(index)
+                entry = TurnIndexEntry.from_index(turn) if turn else None
+                if entry is not None and entry.makes_stale(turn_id=claim.turn_id):
+                    return AcquireResult(AcquireOutcome.STALE, saved_turn_id=entry.turn_id)
                 ended = _state_of(await pipe.xrevrange(stream, count=1)) is StreamState.ENDED
                 pipe.multi()
                 pipe.set(key, value, px=CLAIM_TTL_SECONDS * 1000)
@@ -248,7 +296,7 @@ async def acquire(*, claim: TurnClaim, conversation_id: str) -> AcquireResult:
                 if ended:
                     pipe.delete(stream)
                 await pipe.execute()
-                return AcquireResult(acquired=True, holder=claim)
+                return AcquireResult(AcquireOutcome.ACQUIRED, claim)
         except WatchError:
             continue
     raise WatchError(f"the turn claim of {conversation_id} kept changing while it was taken")
@@ -387,28 +435,30 @@ async def claim_turn(*, claim: TurnClaim, conversation_id: str) -> AcquireResult
     answers.
 
     A holder whose stream has no record yet or is streaming keeps the claim,
-    and the result says so. A holder writing its final client frame is waited
-    for, up to FINISHING_HOLDER_WAIT_SECONDS: the web UI sends a queued
-    question on that frame, as RunRegistry.start waits for a turn of its own
-    process. A holder whose stream has ended while its claim lingers (its
-    release failed, or it is still unwinding) has that claim deleted by
-    compare-and-delete, and this run tries once more. Nothing here writes to
-    another run's stream.
+    and the result says HELD. A holder writing its final client frame, or
+    whose stream has ended while it still holds the claim, is waited for
+    until it releases the claim, up to ENDING_HOLDER_WAIT_SECONDS. The web UI
+    sends a queued question on that frame, as RunRegistry.start waits for a
+    turn of its own process. A holder's release stamps its saved question in
+    the turn index first (registry._end_claim), so the acquire after the wait
+    refuses a stale start as STALE. A claim still held over an ended stream
+    when the wait runs out (its release failed, or its process died) is
+    deleted by compare-and-delete, and this run tries once more. Nothing here
+    writes to another run's stream.
 
     Raises TurnClaimUnavailable when Redis does not answer. An acquire cut
     short first has this run's claim removed, since Redis may have applied it,
     so a client's retry does not meet the claim of its own refused attempt.
     """
     result = await _acquire_or_undo(claim=claim, conversation_id=conversation_id)
-    if result.acquired:
+    if result.outcome is not AcquireOutcome.HELD:
         return result
     try:
-        ended = await _bounded(_holder_has_ended(holder=result.holder, conversation_id=conversation_id))
-        if not ended:
-            ended = await _wait_for_finishing_holder(holder=result.holder, conversation_id=conversation_id)
-        if not ended:
+        waited = await _wait_for_ending_holder(holder=result.holder, conversation_id=conversation_id)
+        if waited is _HolderWait.ANSWERING:
             return result
-        await _bounded(release(conversation_id=conversation_id, run_id=result.holder.run_id))
+        if waited is _HolderWait.LINGERING:
+            await _bounded(release(conversation_id=conversation_id, run_id=result.holder.run_id))
     except Exception as exc:
         raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
     return await _acquire_or_undo(claim=claim, conversation_id=conversation_id)
@@ -428,32 +478,45 @@ async def _acquire_or_undo(*, claim: TurnClaim, conversation_id: str) -> Acquire
         raise
 
 
-async def _holder_has_ended(*, holder: TurnClaim, conversation_id: str) -> bool:
-    """Whether ``holder`` no longer answers: its claim is gone or names
-    another run, or its stream has a terminal record."""
-    r = get_redis()
-    current = await read_claim(conversation_id=conversation_id, client=r)
-    if current is None or current.run_id != holder.run_id:
-        return True
-    state = await stream_state(conversation_id=conversation_id, turn_id=holder.turn_id, client=r)
-    return state is StreamState.ENDED
+class _HolderWait(StrEnum):
+    """How admission's wait for another run's claim ended."""
+
+    # The holder's stream has no record yet or is streaming, or it was still
+    # writing its final client frame when the wait ran out.
+    ANSWERING = "answering"
+    # The holder's claim is gone, or names another run now.
+    RELEASED = "released"
+    # The holder's stream has ended, and its claim was still there when the
+    # wait ran out.
+    LINGERING = "lingering"
 
 
-async def _wait_for_finishing_holder(*, holder: TurnClaim, conversation_id: str) -> bool:
-    """Wait for a holder writing its final client frame to end, polling until
-    FINISHING_HOLDER_WAIT_SECONDS pass. False at once for a holder that is
-    not finishing, and when the wait runs out."""
+async def _holder_released(*, holder: TurnClaim, conversation_id: str, client) -> bool:
+    """Whether ``holder``'s claim is gone or names another run. Unbounded;
+    the caller bounds it."""
+    current = await read_claim(conversation_id=conversation_id, client=client)
+    return current is None or current.run_id != holder.run_id
+
+
+async def _wait_for_ending_holder(*, holder: TurnClaim, conversation_id: str) -> _HolderWait:
+    """Wait for a holder writing its final client frame, or whose stream has
+    ended, to release its claim, polling until ENDING_HOLDER_WAIT_SECONDS
+    pass. ANSWERING at once for a holder whose stream has no record yet or is
+    streaming."""
     r = get_redis()
+    if await _bounded(_holder_released(holder=holder, conversation_id=conversation_id, client=r)):
+        return _HolderWait.RELEASED
     state = await _bounded(stream_state(conversation_id=conversation_id, turn_id=holder.turn_id, client=r))
-    if state is not StreamState.FINISHING:
-        return False
+    if state in (StreamState.EMPTY, StreamState.LIVE):
+        return _HolderWait.ANSWERING
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + FINISHING_HOLDER_WAIT_SECONDS
+    deadline = loop.time() + ENDING_HOLDER_WAIT_SECONDS
     while loop.time() < deadline:
-        await asyncio.sleep(_FINISHING_HOLDER_POLL_SECONDS)
-        if await _bounded(_holder_has_ended(holder=holder, conversation_id=conversation_id)):
-            return True
-    return False
+        await asyncio.sleep(_ENDING_HOLDER_POLL_SECONDS)
+        if await _bounded(_holder_released(holder=holder, conversation_id=conversation_id, client=r)):
+            return _HolderWait.RELEASED
+    state = await _bounded(stream_state(conversation_id=conversation_id, turn_id=holder.turn_id, client=r))
+    return _HolderWait.LINGERING if state is StreamState.ENDED else _HolderWait.ANSWERING
 
 
 async def live_holder(*, conversation_id: str) -> TurnClaim | None:
@@ -491,10 +554,13 @@ async def keep_claim(
     Stops once the turn's buffer is closed or writing its final client frame,
     as cancellation.watch_cancel does; the claim then stays until the registry
     releases it after the terminal record. Stops for a discarded turn too,
-    whose stream discard_conversation deleted. A renewal that finds another
-    run holding the claim, or the stream ended by someone else, sets
-    ``lifecycle.claim_lost``, logs turn_claim_lost and stops. A Redis error is
-    tried again at the next interval.
+    whose stream discard_conversation deleted. A renewal that was already
+    running when the delete landed can find the key gone and the stream
+    gone with it, and take the claim back; the keeper then releases it
+    again. A renewal that finds another run holding the claim, or the stream
+    ended by someone else, sets ``lifecycle.claim_lost``, logs
+    turn_claim_lost and stops. A Redis error is tried again at the next
+    interval.
 
     Once the producer has saved the question, each renewal writes the claim
     with its id.
@@ -507,6 +573,10 @@ async def keep_claim(
         if lifecycle.question_id is not None and current.question_id != lifecycle.question_id:
             current = current.model_copy(update={"question_id": lifecycle.question_id})
         result = await renew(claim=current, conversation_id=conversation_id)
+        if lifecycle.discarded:
+            if result.outcome in (RenewOutcome.RENEWED, RenewOutcome.REACQUIRED):
+                await release_quietly(conversation_id=conversation_id, run_id=current.run_id)
+            return
         if result.outcome is not RenewOutcome.LOST:
             continue
         if buffer.is_closed or buffer.is_finishing:
@@ -528,26 +598,78 @@ async def keep_claim(
         return
 
 
-async def release_pod_claims(*, pod: str) -> int:
-    """Release every claim stamped with ``pod``, and return how many it
-    deleted.
+class BootPassResult(NamedTuple):
+    # This pod's claims the pass deleted.
+    released: int
+    # Listings of other pods' claims that had lapsed, which the pass removed.
+    pruned: int
+
+
+async def release_pod_claims(*, pod: str) -> BootPassResult:
+    """Release every claim stamped with ``pod``, and remove the listings of
+    claims that lapsed without a release.
 
     For a process that has just started: it holds no turn yet, so a claim
     carrying its pod's name was left by an earlier process in the same pod,
     such as one a liveness restart replaced. That holds only while a pod runs
     one server process, which tests/test_turn_claim.py pins for the hosted
-    command. Unbounded; the caller bounds it.
+    command.
+
+    Only a release removes a listing, so a pod killed mid-turn (a SIGKILL, an
+    OOM kill, a lost node) leaves the listings of its claims behind once they
+    lapse, under a pod name no later process carries. Every boot pass removes
+    the listings whose claim key is gone or names another run. A claim that
+    has not lapsed yet is left to the next boot pass. Unbounded; the caller
+    bounds it.
     """
-    released = 0
-    for conversation_id, raw in (await get_redis().hgetall(CLAIMS_KEY)).items():
+    r = get_redis()
+    listed: dict[str, TurnClaim] = {}
+    for conversation_id, raw in (await r.hgetall(CLAIMS_KEY)).items():
         try:
-            claim = TurnClaim.model_validate_json(raw)
+            listed[conversation_id] = TurnClaim.model_validate_json(raw)
         except ValidationError:
             logger.warning(
                 "A turn claims entry holds no readable claim; the boot pass leaves it.",
                 extra={"event": "turn_claim_unreadable", **log_context(conversation_id=conversation_id)},
             )
+    if not listed:
+        return BootPassResult(released=0, pruned=0)
+    keys = await r.mget([claim_key(conversation_id) for conversation_id in listed])
+    released = pruned = 0
+    for (conversation_id, claim), raw_key in zip(listed.items(), keys, strict=True):
+        if claim.pod == pod:
+            if await release(conversation_id=conversation_id, run_id=claim.run_id):
+                released += 1
+        elif not _held_by(raw=raw_key, run_id=claim.run_id):
+            if await _unlist_lapsed(conversation_id=conversation_id, run_id=claim.run_id):
+                pruned += 1
+    return BootPassResult(released=released, pruned=pruned)
+
+
+async def _unlist_lapsed(*, conversation_id: str, run_id: str) -> bool:
+    """Remove ``run_id``'s listing while its claim key is gone or names
+    another run. True when it removed it.
+
+    The key is watched: every write of a listing writes the key in the same
+    transaction (acquire, renew), so a run that takes the claim meanwhile,
+    or this run taking its own back, aborts the removal. A key that keeps
+    changing through every attempt is being written, so the listing stays
+    for the next boot pass and the answer is False. A Redis error raises.
+    """
+    r = get_redis()
+    key = claim_key(conversation_id)
+    for _attempt in range(_WATCH_ATTEMPTS):
+        try:
+            async with r.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                if _held_by(raw=await pipe.get(key), run_id=run_id):
+                    return False
+                if not _held_by(raw=await pipe.hget(CLAIMS_KEY, conversation_id), run_id=run_id):
+                    return False
+                pipe.multi()
+                pipe.hdel(CLAIMS_KEY, conversation_id)
+                await pipe.execute()
+                return True
+        except WatchError:
             continue
-        if claim.pod == pod and await release(conversation_id=conversation_id, run_id=claim.run_id):
-            released += 1
-    return released
+    return False

@@ -210,8 +210,9 @@ async def _release_own_turn_claims() -> None:
     """On the Redis stream backend, release the turn claims a process of this
     pod left behind (turn_claim.release_pod_claims): one a liveness restart
     replaced, whose claims would otherwise refuse a send to each of its
-    conversations until the claim's TTL passed. Bounded and fail-open; a
-    claim it cannot release lapses with its TTL."""
+    conversations until the claim's TTL passed. The same pass removes the
+    listings of claims that lapsed on pods that are gone. Bounded and
+    fail-open; a claim it cannot release lapses with its TTL."""
     from cowork.streaming.backend import get_backend
     from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, pod_name, release_pod_claims
 
@@ -220,7 +221,7 @@ async def _release_own_turn_claims() -> None:
     pod = pod_name()
     try:
         async with asyncio.timeout(REDIS_CALL_SECONDS):
-            released = await release_pod_claims(pod=pod)
+            result = await release_pod_claims(pod=pod)
     except Exception:
         logger.warning(
             "Could not release the turn claims an earlier process of this pod left; they lapse with their TTL.",
@@ -228,10 +229,15 @@ async def _release_own_turn_claims() -> None:
             extra={"event": "turn_claims_boot_release_failed", "pod": pod},
         )
         return
-    if released:
+    if result.released:
         logger.warning(
             "Released turn claims an earlier process of this pod left behind.",
-            extra={"event": "turn_claims_released_at_boot", "pod": pod, "count": released},
+            extra={"event": "turn_claims_released_at_boot", "pod": pod, "count": result.released},
+        )
+    if result.pruned:
+        logger.warning(
+            "Removed the listings of turn claims that lapsed without a release.",
+            extra={"event": "turn_claim_listings_pruned_at_boot", "pod": pod, "count": result.pruned},
         )
 
 

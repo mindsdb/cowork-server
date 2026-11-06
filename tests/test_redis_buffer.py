@@ -345,7 +345,7 @@ async def test_a_claim_another_turn_number_holds_does_not_keep_a_dead_turn_open(
     await writer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
 
     reader = RedisStreamBuffer(conversation_id="moved-on", turn_id=1)
-    seen = [rec async for rec in reader.tail(from_seq=0)]
+    seen = await asyncio.wait_for(_drain(reader.tail(from_seq=0)), timeout=5)
 
     assert seen[-1].type == "Interrupted"
 

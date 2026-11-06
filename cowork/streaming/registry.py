@@ -343,8 +343,13 @@ async def _stale_turn(
     None. See RunRegistry.start.
 
     With one process the local handle answers. On the Redis backend the turn
-    index answers for every replica. It says a turn saved its question once
-    that turn released its claim; until then the claim refuses on its own.
+    index answers for every replica: a run stamps its entry as soon as it
+    saves its question (mark_question_saved) and again before it releases its
+    claim (_end_claim). This read is the early refusal. A start that passes it
+    while another replica's turn saves its question, writes its final frame
+    or has ended without releasing yet meets the same rule again in
+    turn_claim.acquire, which reads the stamp in the transaction that takes
+    the claim.
 
     The local handle still counts there, unless the index shows another
     replica truncated the conversation since: discard_conversation forgets
@@ -366,36 +371,74 @@ async def _stale_turn(
     if turn is None:
         return None
     entry = TurnIndexEntry.from_index(turn)
-    if entry.run_id is not None and entry.saved_question and turn_id <= entry.turn_id:
+    if entry.makes_stale(turn_id=turn_id):
         return entry.turn_id
     if local and (entry.run_id in (None, existing.run_id) or entry.turn_id >= existing.turn_id):
         return existing.turn_id
     return None
 
 
+def _stale_refusal(*, conversation_id: str, turn_id: int, saved_turn_id: int) -> TurnInProgress:
+    logger.info(
+        "Refused a turn; it read the history before an earlier turn saved its question.",
+        extra={
+            "event": "turn_stale_refused", "turn_id": turn_id, "saved_turn_id": saved_turn_id,
+            **log_context(conversation_id=conversation_id),
+        },
+    )
+    return TurnInProgress(conversation_id=conversation_id, turn_id=saved_turn_id)
+
+
+async def _stamp_saved_question(*, conversation_id: str, run_id: str, question_id: UUID | None) -> None:
+    """Note in ``run_id``'s turn index entry that its turn saved its
+    question (turn_index.stamp_question). Bounded; a failure is logged."""
+    from cowork.streaming.turn_index import stamp_question
+
+    try:
+        async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+            await stamp_question(conversation_id=conversation_id, run_id=run_id, question_id=question_id)
+    except Exception:
+        logger.warning(
+            "Could not note a turn's saved question in the turn index.",
+            exc_info=True,
+            extra={
+                "event": "turn_index_question_failed", "run_id": run_id,
+                **log_context(conversation_id=conversation_id),
+            },
+        )
+
+
+async def mark_question_saved(*, lifecycle: TurnLifecycle, conversation_id: str) -> None:
+    """Note that a turn's question is now in the conversation: sets
+    ``lifecycle.saved_question``.
+
+    On the Redis backend this also stamps the run's turn index entry now, so
+    from the save on every replica refuses a start at this turn's number as
+    stale (turn_claim.acquire), however long this turn takes to end or to
+    release its claim. A failed stamp is logged, and the release stamps
+    again (_end_claim). A discarded turn's entry was forgotten with its
+    conversation's turns, so it is not stamped.
+    """
+    lifecycle.saved_question = True
+    from cowork.streaming.backend import get_backend
+
+    if get_backend() != "redis" or lifecycle.discarded:
+        return
+    await _stamp_saved_question(
+        conversation_id=conversation_id, run_id=lifecycle.identity.run_id, question_id=lifecycle.question_id,
+    )
+
+
 async def _end_claim(*, conversation_id: str, claim: TurnClaim, lifecycle: TurnLifecycle) -> None:
     """Release a turn's claim, once its stream has a terminal record or the
     turn was discarded. First notes in the turn index that the turn saved its
-    question, so another replica's stale-number check (_stale_turn) sees it
-    from the moment the claim is gone. Failures are logged; a claim left
-    behind lapses with its TTL."""
-    from cowork.streaming.turn_index import stamp_question
-
+    question, again if mark_question_saved already did, so the stamp is
+    there from the moment the claim is gone even when the first one failed.
+    Failures are logged; a claim left behind lapses with its TTL."""
     if lifecycle.saved_question and not lifecycle.discarded:
-        try:
-            async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
-                await stamp_question(
-                    conversation_id=conversation_id, run_id=claim.run_id, question_id=lifecycle.question_id,
-                )
-        except Exception:
-            logger.warning(
-                "Could not note a turn's saved question in the turn index.",
-                exc_info=True,
-                extra={
-                    "event": "turn_index_question_failed", "run_id": claim.run_id,
-                    **log_context(conversation_id=conversation_id),
-                },
-            )
+        await _stamp_saved_question(
+            conversation_id=conversation_id, run_id=claim.run_id, question_id=lifecycle.question_id,
+        )
     await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
 
 
@@ -500,10 +543,12 @@ class RunRegistry:
         checks above, start() takes the conversation's turn claim
         (turn_claim.claim_turn) before it opens the buffer, and raises
         TurnInProgress when another live run holds it. The stale-number check
-        reads the turn index there (_stale_turn). Raises TurnClaimUnavailable
-        when Redis cannot answer either. Only the claim's winner writes the
-        turn index, and every start refused after taking the claim releases
-        it.
+        reads the turn index there (_stale_turn), and the claim's acquire
+        reads it again in the transaction that takes the claim, so a start
+        that waited for another replica's turn to end is still refused when
+        that turn saved its question. Raises TurnClaimUnavailable when Redis
+        cannot answer either. Only the claim's winner writes the turn index,
+        and every start refused after taking the claim releases it.
         """
         loop = asyncio.get_running_loop()
         lock = self._start_locks.get(conversation_id)
@@ -526,12 +571,7 @@ class RunRegistry:
                 conversation_id=conversation_id, turn_id=turn_id, existing=existing, shared=published,
             )
             if stale is not None:
-                logger.info(
-                    "Refused turn %d for conversation %s; it read the history before "
-                    "turn %d saved its question.",
-                    turn_id, conversation_id, stale,
-                )
-                raise TurnInProgress(conversation_id=conversation_id, turn_id=stale)
+                raise _stale_refusal(conversation_id=conversation_id, turn_id=turn_id, saved_turn_id=stale)
             if existing is not None and existing.is_running and not existing.buffer.is_closed:
                 # A final client frame is being written. Its reader can send
                 # the next question before the separate terminal record lands.
@@ -547,7 +587,11 @@ class RunRegistry:
                     question_id=lifecycle.question_id,
                 )
                 claimed = await turn_claim.claim_turn(claim=claim, conversation_id=conversation_id)
-                if not claimed.acquired:
+                if claimed.outcome is turn_claim.AcquireOutcome.STALE:
+                    raise _stale_refusal(
+                        conversation_id=conversation_id, turn_id=turn_id, saved_turn_id=claimed.saved_turn_id,
+                    )
+                if claimed.outcome is turn_claim.AcquireOutcome.HELD:
                     logger.info(
                         "Refused a turn; another replica's run holds the conversation.",
                         extra={
@@ -888,10 +932,20 @@ def discard_conversation(conversation_id: str) -> None:
     cid = str(conversation_id)
     handle = registry.get(cid)
     registry.discard(cid)
-    remove_conversation_buffers(cid)
-    # The index outlives the buffers by an hour otherwise, so /in-flight would
-    # keep naming a turn whose buffer has just been deleted.
+    # First, and whatever the buffer removal below does: an entry stamped
+    # with a saved question refuses every send at or below its turn number
+    # (TurnIndexEntry.makes_stale), and the truncation brings the next send
+    # back to that number. Left behind, it would also have /in-flight keep
+    # naming a turn whose buffer is gone. Logs its own failure.
     forget_turn_sync(cid)
+    try:
+        remove_conversation_buffers(cid)
+    except Exception:
+        logger.warning(
+            "Could not remove a deleted conversation's turn buffers.",
+            exc_info=True,
+            extra={"event": "turn_buffers_remove_failed", **log_context(conversation_id=cid)},
+        )
     if handle is not None and handle.claim is not None:
         # Its stream is gone, so another replica would read the claim of a
         # finished turn as one whose first record has not landed yet.

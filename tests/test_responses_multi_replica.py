@@ -8,6 +8,7 @@ the turn had no handle and no buffer, so it reported the turn as missing.
 from __future__ import annotations
 
 import asyncio
+import importlib
 from uuid import uuid4
 
 import fakeredis.aioredis
@@ -22,7 +23,7 @@ from cowork.streaming import backend as backend_mod
 from cowork.streaming import buffer as buffer_mod
 from cowork.streaming import cancellation, turn_claim, turn_index
 from cowork.streaming.buffer import RedisStreamBuffer
-from cowork.streaming.registry import RunRegistry, TurnInProgress, TurnLifecycle, registry
+from cowork.streaming.registry import RunRegistry, TurnInProgress, TurnLifecycle, mark_question_saved, registry
 from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable, claim_key
 
 REFUSAL = {
@@ -440,7 +441,7 @@ async def test_a_follow_up_on_another_replica_waits_for_a_holder_writing_its_las
 
 @pytest.mark.asyncio
 async def test_a_holder_that_never_writes_its_terminal_refuses_after_the_bounded_wait(fake_redis, monkeypatch):
-    monkeypatch.setattr(turn_claim, "FINISHING_HOLDER_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(turn_claim, "ENDING_HOLDER_WAIT_SECONDS", 0.2)
     await fake_redis.set(claim_key("stuck"), _foreign_claim(turn_id=0), px=70_000)
     await RedisStreamBuffer(conversation_id="stuck", turn_id=0).append("sse", COMPLETED)
 
@@ -454,10 +455,11 @@ async def test_a_holder_that_never_writes_its_terminal_refuses_after_the_bounded
 
 
 @pytest.mark.asyncio
-async def test_a_claim_left_over_an_ended_turn_is_cleared_and_the_send_admitted(fake_redis):
+async def test_a_claim_left_over_an_ended_turn_is_cleared_and_the_send_admitted(fake_redis, monkeypatch):
     """A claim whose release failed lingers over a stream that already ended;
-    the next send clears it by compare-and-delete rather than waiting out its
-    TTL."""
+    the next send waits the bounded time for its holder's own release, then
+    clears it by compare-and-delete rather than waiting out its TTL."""
+    monkeypatch.setattr(turn_claim, "ENDING_HOLDER_WAIT_SECONDS", 0.2)
     await fake_redis.set(claim_key("left"), _foreign_claim(turn_id=1), px=70_000)
     ended = RedisStreamBuffer(conversation_id="left", turn_id=1)
     await ended.append("sse", COMPLETED)
@@ -575,6 +577,17 @@ async def test_the_early_refusal_counts_another_replicas_turn_only_for_its_owner
             conversation=conversation_id, scope=TenantScope(org_mode=True, org_id="org", user_id="alice"),
         )
 
+    # An entry another run wrote (an earlier turn, or a holder that has not
+    # published yet) says nothing about who owns the claim's run, even when
+    # it names the caller: start() decides that request.
+    await turn_index.record_turn(
+        conversation_id, turn_id=0, correlation_id="corr-earlier", run_id="run-earlier",
+        org_id="org", user_id="alice",
+    )
+    await responses_ep._refuse_while_answering(
+        conversation=conversation_id, scope=TenantScope(org_mode=True, org_id="org", user_id="alice"),
+    )
+
 
 @pytest.mark.asyncio
 async def test_a_stale_local_handle_after_a_truncation_elsewhere_does_not_refuse(fake_redis):
@@ -664,3 +677,190 @@ async def test_a_channel_turn_does_not_replace_a_claimed_turns_index_entry(fake_
         conversation_id="chan", turn_id=0, correlation_id="corr-channel", org_id=None, user_id=None,
     ) is True
     assert (await turn_index.get_turn("chan"))["correlation_id"] == "corr-channel"
+
+
+# ── the stale-number rule across replicas ────────────────────────────
+#
+# Two questions that read the history at the same moment compute the same
+# turn number. The first saves its question at that number; the second read
+# the history before that save, so it is refused on every replica, whenever
+# it reaches start(), and never deletes the first turn's stream.
+
+
+def _saving(
+    *, conversation_id: str, lifecycle: TurnLifecycle, final_written: asyncio.Event, release: asyncio.Event,
+):
+    """A producer that saves its question as the handler does, writes its
+    final client frame, then writes its terminal record once ``release`` is
+    set."""
+
+    async def produce(buffer):
+        await mark_question_saved(lifecycle=lifecycle, conversation_id=conversation_id)
+        await buffer.append("sse", _sse("A-PARTIAL"))
+        await buffer.append("sse", COMPLETED)
+        final_written.set()
+        await release.wait()
+        await buffer.close("completed")
+
+    return produce
+
+
+async def _stream_records(fake_redis, *, conversation_id: str, turn_id: int) -> list[str]:
+    """Each record's SSE text, or its type for a record with none."""
+    records = [
+        RedisStreamBuffer._record(fields)
+        for _id, fields in await fake_redis.xrange(f"cowork:stream:{conversation_id}:{turn_id}")
+    ]
+    return [(record.data or {}).get("sse", record.type) for record in records]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_send_that_waited_for_a_finishing_turn_on_another_replica_is_refused(fake_redis):
+    """Replica B's start read the history before replica A's turn saved its
+    question at turn 2, and reached start() while A wrote its final frame.
+    The early stale check found no stamp yet, so B waited for A, and used to
+    be admitted at turn 2 once A released: its acquire deleted A's ended
+    stream and wrote its own records there. The acquire now reads the stamp
+    A's release writes, in the transaction that takes the claim.
+
+    The lifecycle starts with saved_question set, so the save leaves no stamp
+    of its own: only the release's stamp can refuse B here."""
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    final_written, release = asyncio.Event(), asyncio.Event()
+
+    async def finishing(buffer):
+        await buffer.append("sse", _sse("A-PARTIAL"))
+        await buffer.append("sse", COMPLETED)
+        final_written.set()
+        await release.wait()
+        await buffer.close("completed")
+
+    first = await replica_a.start(
+        conversation_id="fin", turn_id=2, open_buffer=_opens("fin", 2), produce=finishing,
+        lifecycle=TurnLifecycle(saved_question=True, question_id=uuid4()),
+    )
+    await asyncio.wait_for(final_written.wait(), timeout=2)
+    opened: list[int] = []
+    stale = asyncio.create_task(replica_b.start(
+        conversation_id="fin", turn_id=2, open_buffer=_opens("fin", 2, opened), produce=_answered,
+    ))
+    await asyncio.sleep(0.3)
+    assert not stale.done(), "the stale send must have reached the wait for the finishing turn"
+    release.set()
+    await asyncio.wait_for(first.task, timeout=2)
+
+    with pytest.raises(TurnInProgress) as refused:
+        await asyncio.wait_for(stale, timeout=5)
+
+    assert refused.value.turn_id == 2
+    assert opened == []
+    assert await _stream_records(fake_redis, conversation_id="fin", turn_id=2) == [
+        _sse("A-PARTIAL")["sse"], COMPLETED["sse"], "Done",
+    ]
+    assert await fake_redis.exists(claim_key("fin")) == 0
+    # The next question reads the history with A's question in it.
+    after = await replica_b.start(
+        conversation_id="fin", turn_id=3, open_buffer=_opens("fin", 3), produce=_answered,
+    )
+    await asyncio.wait_for(after.task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_send_over_another_replicas_ended_turn_waits_for_its_release_and_is_refused(
+    fake_redis, monkeypatch,
+):
+    """Replica A's turn at 2 has written its terminal record, and its release
+    (which stamps the saved question first) has not run yet. Replica B used to
+    delete A's claim at once and take it, with no stamp to refuse it. It now
+    waits the bounded time for A's own release, and that release's stamp
+    refuses it."""
+    registry_mod = importlib.import_module("cowork.streaming.registry")
+    gate = asyncio.Event()
+    real_end_claim = registry_mod._end_claim
+
+    async def held_end_claim(**kwargs):
+        await gate.wait()
+        await real_end_claim(**kwargs)
+
+    monkeypatch.setattr(registry_mod, "_end_claim", held_end_claim)
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    first = await replica_a.start(
+        conversation_id="end", turn_id=2, open_buffer=_opens("end", 2), produce=_answered,
+        lifecycle=TurnLifecycle(saved_question=True, question_id=uuid4()),
+    )
+
+    async def ended() -> bool:
+        return (await _stream_records(fake_redis, conversation_id="end", turn_id=2))[-1:] == ["Done"]
+
+    while not await ended():
+        await asyncio.sleep(0.01)
+    assert await fake_redis.exists(claim_key("end")) == 1
+    opened: list[int] = []
+    stale = asyncio.create_task(replica_b.start(
+        conversation_id="end", turn_id=2, open_buffer=_opens("end", 2, opened), produce=_answered,
+    ))
+    await asyncio.sleep(0.3)
+    assert not stale.done(), "the stale send must wait for the ended turn's own release"
+    gate.set()
+    await asyncio.wait_for(first.task, timeout=2)
+
+    with pytest.raises(TurnInProgress) as refused:
+        await asyncio.wait_for(stale, timeout=5)
+
+    assert refused.value.turn_id == 2
+    assert opened == []
+    assert await _stream_records(fake_redis, conversation_id="end", turn_id=2) == [COMPLETED["sse"], "Done"]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_stamps_its_saved_question_when_it_saves_it(fake_redis, monkeypatch):
+    """The stamp lands with the save, while the turn still answers, so a
+    release whose own stamp fails still leaves the conversation refusing a
+    stale send at that turn's number on every replica."""
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    lifecycle = TurnLifecycle(question_id=uuid4())
+    final_written, release = asyncio.Event(), asyncio.Event()
+    first = await replica_a.start(
+        conversation_id="early", turn_id=2, open_buffer=_opens("early", 2),
+        produce=_saving(conversation_id="early", lifecycle=lifecycle, final_written=final_written, release=release),
+        lifecycle=lifecycle,
+    )
+    await asyncio.wait_for(final_written.wait(), timeout=2)
+
+    entry = await turn_index.get_turn("early")
+    assert (entry["run_id"], entry["saved_question"], entry["question_id"]) == (
+        first.run_id, "1", str(lifecycle.question_id),
+    )
+
+    async def failing_stamp(**_kwargs):
+        raise RedisConnectionError("Redis is unreachable")
+
+    monkeypatch.setattr(turn_index, "stamp_question", failing_stamp)
+    release.set()
+    await asyncio.wait_for(first.task, timeout=2)
+    assert await fake_redis.exists(claim_key("early")) == 0
+
+    for runs in (replica_a, replica_b):
+        with pytest.raises(TurnInProgress) as refused:
+            await runs.start(
+                conversation_id="early", turn_id=2, open_buffer=_opens("early", 2), produce=_answered,
+            )
+        assert refused.value.turn_id == 2
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_turn_index_refuses_the_start_as_unavailable(fake_redis, monkeypatch):
+    """Could not read the turn index is not "no entry": read as none, a
+    stale start would be admitted at the number of a turn that saved its
+    question. Only the index is unreachable here; the claim reads fine."""
+    monkeypatch.setattr(turn_index, "get_redis", lambda: _Unreachable())
+    opened: list[int] = []
+
+    with pytest.raises(TurnClaimUnavailable):
+        await RunRegistry().start(
+            conversation_id="index-down", turn_id=2, open_buffer=_opens("index-down", 2, opened),
+            produce=_answered,
+        )
+
+    assert opened == []
+    assert await fake_redis.exists(claim_key("index-down"), turn_claim.CLAIMS_KEY) == 0

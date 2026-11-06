@@ -34,6 +34,9 @@ EVENT_FIELDS = frozenset(
         "project_id",
         "schedule_id",
         "turn_id",
+        # The turn whose saved question refused a stale start
+        # (cowork.streaming.registry).
+        "saved_turn_id",
         # A turn's run, the run holding its conversation's turn claim, and
         # that run's pod (cowork.streaming.turn_claim).
         "run_id",

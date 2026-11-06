@@ -40,7 +40,7 @@ from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, r
 from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, TurnClaimUnavailable, live_holder
-from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
+from cowork.streaming.turn_index import TurnIndexEntry, TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
@@ -212,10 +212,12 @@ async def _refuse_while_answering(*, conversation: str | None, scope: TenantScop
     """Refuse a question into a conversation whose turn is still answering.
 
     Runs before any database read and before the routing gate, so the refusal
-    costs at most one Redis read. RunRegistry.start repeats the check under
-    its lock for a request that gets past this one while the running turn is
-    still in its own gate. Where conversations are partitioned only the
-    caller's own turn counts, so the refusal never reveals someone else's.
+    costs no more than two Redis reads, the claim and its stream's last
+    record, and a third, the turn index entry, where conversations are
+    partitioned. RunRegistry.start repeats the check under its lock for a
+    request that gets past this one while the running turn is still in its
+    own gate. Where conversations are partitioned only the caller's own turn
+    counts, so the refusal never reveals someone else's.
 
     On the Redis backend a turn another replica runs counts too, read from the
     conversation's turn claim (turn_claim.live_holder). Its owner comes from
@@ -245,7 +247,7 @@ async def _refuse_while_answering(*, conversation: str | None, scope: TenantScop
         except Exception as exc:
             raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
         if (
-            turn is None or turn.get("run_id") != holder.run_id
+            turn is None or TurnIndexEntry.from_index(turn).run_id != holder.run_id
             or not _owner_matches(TurnOwner.from_index(turn), scope)
         ):
             return

@@ -181,7 +181,7 @@ second question that reaches another pod is refused with `409` (README.md, the
 `turn_in_progress` refusal). A pod that stops this way releases each claim once
 the answer's stream has its last frame. A pod that never runs the steps above
 (a SIGKILL, an OOM kill, a lost node) releases nothing, so a question sent into
-one of its conversations is refused with `409` until that claim lapses, 70 s
+one of its conversations is refused with `409` until that claim lapses, 90 s
 after the pod's last renewal. A liveness restart keeps the pod's name, and the
 new container releases the claims its pod left as it starts. That relies on one
 uvicorn process per pod, which `tests/test_turn_claim.py` pins for the image's

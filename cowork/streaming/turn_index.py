@@ -8,8 +8,10 @@ is answered by its buffer, whose terminal record any replica can read.
 This exists so a replica that did not start a turn can still find its turn_id,
 to open the right buffer, its correlation_id, to cancel it, and its org, to
 authorize the caller. ``saved_question`` and ``question_id`` say the turn saved
-its question, and which row; RunRegistry.start reads the first to refuse a
-start whose history read predates that save.
+its question, and which row. The run stamps them as soon as it saves the
+question (registry.mark_question_saved) and again before it releases its
+claim. RunRegistry.start and turn_claim.acquire read the stamp to refuse a
+start whose history read predates that save (TurnIndexEntry.makes_stale).
 
 Keys:
     cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at,
@@ -40,7 +42,7 @@ TURN_INDEX_TTL_SECONDS = 3600
 _TURNS_SET = "cowork:turns"
 
 
-def _turn_key(conversation_id: str) -> str:
+def turn_key(conversation_id: str) -> str:
     return f"cowork:turn:{conversation_id}"
 
 
@@ -83,6 +85,13 @@ class TurnIndexEntry(BaseModel):
             question_id=turn.get("question_id") or None,
         )
 
+    def makes_stale(self, *, turn_id: int) -> bool:
+        """Whether a start at ``turn_id`` read the history before this
+        entry's run saved its question: the run saved it at this entry's
+        number, and the start names that number or an earlier one. A channel
+        turn's entry names no run, so it never does."""
+        return self.run_id is not None and self.saved_question and turn_id <= self.turn_id
+
 
 def _queue_record(
     *,
@@ -98,7 +107,7 @@ def _queue_record(
 
     One MULTI, so no reader finds the hash empty between its DELETE and its
     HSET, which list_turns would read as an expired turn."""
-    key = _turn_key(conversation_id)
+    key = turn_key(conversation_id)
     pipe.delete(key)
     pipe.hset(key, mapping={
         "turn_id": str(turn_id),
@@ -153,7 +162,7 @@ async def record_channel_turn(
     what cancel and answer resolve through, so it is left as it is. True when
     it wrote the entry."""
     r = client or get_redis()
-    key = _turn_key(conversation_id)
+    key = turn_key(conversation_id)
     claim = claim_key(conversation_id)
     for _attempt in range(3):
         try:
@@ -179,7 +188,7 @@ async def stamp_question(
     """Note in ``run_id``'s entry that its turn saved its question, and which
     row when known. Leaves another run's entry alone. True when it wrote."""
     r = client or get_redis()
-    key = _turn_key(conversation_id)
+    key = turn_key(conversation_id)
     fields = {"saved_question": "1", **({"question_id": str(question_id)} if question_id is not None else {})}
     for _attempt in range(3):
         try:
@@ -197,20 +206,20 @@ async def stamp_question(
 
 
 async def get_turn(conversation_id: str) -> dict | None:
-    turn = await get_redis().hgetall(_turn_key(conversation_id))
+    turn = await get_redis().hgetall(turn_key(conversation_id))
     return dict(turn) if turn else None
 
 
 async def forget_turn(conversation_id: str) -> None:
     r = get_redis()
-    await r.delete(_turn_key(conversation_id))
+    await r.delete(turn_key(conversation_id))
     await r.srem(_TURNS_SET, conversation_id)
 
 
 async def forget_run(conversation_id: str, run_id: str) -> None:
     """Remove abandoned admission without deleting a successor's index entry."""
     r = get_redis()
-    key = _turn_key(conversation_id)
+    key = turn_key(conversation_id)
     try:
         async with r.pipeline(transaction=True) as pipe:
             await pipe.watch(key)
@@ -233,10 +242,17 @@ def forget_turn_sync(conversation_id: str) -> None:
     """
     try:
         r = get_sync_redis()
-        r.delete(_turn_key(conversation_id))
+        r.delete(turn_key(conversation_id))
         r.srem(_TURNS_SET, conversation_id)
     except Exception:
-        logger.warning("Could not forget the turn index entry for %s", conversation_id, exc_info=True)
+        # The entry stays until its TTL. One its turn stamped with a saved
+        # question refuses sends at or below its turn number until then
+        # (TurnIndexEntry.makes_stale); deleting the key clears it.
+        logger.warning(
+            "Could not forget a deleted conversation's turn index entry.",
+            exc_info=True,
+            extra={"event": "turn_index_forget_failed", "conversation_id": conversation_id},
+        )
 
 
 async def list_turns() -> list[dict]:
@@ -251,7 +267,7 @@ async def list_turns() -> list[dict]:
         return []
     async with r.pipeline(transaction=False) as pipe:
         for conversation_id in members:
-            pipe.hgetall(_turn_key(conversation_id))
+            pipe.hgetall(turn_key(conversation_id))
         turns = await pipe.execute()
     out: list[dict] = []
     expired: list[str] = []
@@ -274,7 +290,7 @@ async def _prune(r: Redis, conversation_ids: list[str]) -> None:
     turn. So the SREM runs only while every hash is still missing, under a
     WATCH that aborts it if one is written before it lands. A prune that does
     not run leaves its members to the next list."""
-    keys = [_turn_key(conversation_id) for conversation_id in conversation_ids]
+    keys = [turn_key(conversation_id) for conversation_id in conversation_ids]
     try:
         async with r.pipeline(transaction=True) as pipe:
             await pipe.watch(*keys)

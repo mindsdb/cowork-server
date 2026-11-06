@@ -25,6 +25,8 @@ from cowork.streaming.buffer import FileStreamBuffer, RedisStreamBuffer, stream_
 from cowork.streaming.registry import RunRegistry, TurnInProgress, TurnLifecycle
 from cowork.streaming.turn_claim import (
     CLAIMS_KEY,
+    AcquireOutcome,
+    BootPassResult,
     RenewOutcome,
     StreamState,
     TurnClaim,
@@ -98,8 +100,8 @@ async def test_a_claim_is_taken_once_and_names_its_holder(redis):
     first = await turn_claim.acquire(claim=_claim("run-a"), conversation_id="c")
     second = await turn_claim.acquire(claim=_claim("run-b", pod="pod-b"), conversation_id="c")
 
-    assert first == (True, _claim("run-a"))
-    assert second == (False, _claim("run-a"))
+    assert first == (AcquireOutcome.ACQUIRED, _claim("run-a"), None)
+    assert second == (AcquireOutcome.HELD, _claim("run-a"), None)
     assert await _stored(redis) == _claim("run-a")
     assert await _listed(redis) == _claim("run-a")
     assert 60_000 < await redis.pttl(claim_key("c")) <= turn_claim.CLAIM_TTL_SECONDS * 1000
@@ -121,6 +123,26 @@ async def test_taking_a_claim_clears_an_ended_stream_at_its_number_and_leaves_an
 
     assert await redis.exists(stream_key("c", 1)) == 0
     assert await redis.xlen(stream_key("d", 1)) == 1
+
+
+async def test_a_start_the_turn_index_shows_is_stale_is_refused_and_deletes_nothing(redis):
+    """The index names a run that saved its question at turn 2, whose stream
+    has ended and whose claim is gone. A start at 2 read the history before
+    that save: it takes no claim and leaves that turn's stream alone. A start
+    at 3 read it after, and is admitted."""
+    await turn_index.record_turn("c", turn_id=2, correlation_id="corr-a", org_id=None, user_id=None, run_id="run-a")
+    assert await turn_index.stamp_question(conversation_id="c", run_id="run-a", question_id=None) is True
+    ended = RedisStreamBuffer(conversation_id="c", turn_id=2)
+    await ended.append("sse", COMPLETED)
+    await ended.close("completed")
+
+    stale = await turn_claim.acquire(claim=_claim("run-b", turn_id=2), conversation_id="c")
+
+    assert stale == (AcquireOutcome.STALE, None, 2)
+    assert await _stored(redis) is None and await _listed(redis) is None
+    assert await redis.xlen(stream_key("c", 2)) == 2
+    admitted = await turn_claim.acquire(claim=_claim("run-c", turn_id=3), conversation_id="c")
+    assert admitted.outcome is AcquireOutcome.ACQUIRED
 
 
 # ── renew ────────────────────────────────────────────────────────────
@@ -433,6 +455,37 @@ async def test_a_redis_outage_while_keeping_a_claim_does_not_lose_it(redis, quic
     assert await _stored(redis) == _claim("run-a")
 
 
+async def test_a_renewal_that_takes_back_a_deleted_turns_claim_releases_it(redis, quick_renewals, monkeypatch):
+    """A delete landed while a renewal ran: it removed the turn's stream and
+    then its claim, so the renewal found both gone and took the claim back.
+    Kept, that claim would refuse sends into the truncated conversation until
+    the producer finished unwinding."""
+    buffer = RedisStreamBuffer(conversation_id="c", turn_id=1)
+    await buffer.append("sse", {"sse": "partial"})
+    lifecycle = TurnLifecycle()
+    await turn_claim.acquire(claim=_claim("run-a"), conversation_id="c")
+    real_renew = turn_claim.renew
+    outcomes: list[RenewOutcome] = []
+
+    async def renew_during_a_delete(*, claim, conversation_id):
+        lifecycle.discarded = True
+        await redis.delete(stream_key("c", 1))
+        await turn_claim.release(conversation_id="c", run_id=claim.run_id)
+        result = await real_renew(claim=claim, conversation_id=conversation_id)
+        outcomes.append(result.outcome)
+        return result
+
+    monkeypatch.setattr(turn_claim, "renew", renew_during_a_delete)
+
+    await asyncio.wait_for(turn_claim.keep_claim(
+        claim=_claim("run-a"), conversation_id="c", buffer=buffer, lifecycle=lifecycle,
+    ), timeout=2)
+
+    assert outcomes == [RenewOutcome.REACQUIRED]
+    assert await redis.exists(claim_key("c"), CLAIMS_KEY) == 0
+    assert lifecycle.claim_lost is False
+
+
 # ── the registry's release ───────────────────────────────────────────
 
 
@@ -509,21 +562,120 @@ async def test_a_turn_ended_at_shutdown_with_its_stream_open_is_released_only_af
 
 
 async def test_a_deleted_conversations_turn_releases_its_claim(redis, monkeypatch):
+    """The delete releases the claim itself, before the producer has
+    unwound: a cancelled producer can wait on a save for seconds, and its
+    task's own release would come only then."""
     registry_mod = importlib.import_module("cowork.streaming.registry")
     runs = RunRegistry()
     monkeypatch.setattr(registry_mod, "registry", runs)
-    started, release = asyncio.Event(), asyncio.Event()
+    started, unwound = asyncio.Event(), asyncio.Event()
+
+    async def slow_to_unwind(buffer):
+        await buffer.append("sse", {"sse": "partial"})
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await unwound.wait()
+            raise
+
     handle = await runs.start(
         conversation_id="c", turn_id=1, open_buffer=lambda: backend_mod.new_buffer("c", 1),
-        produce=_waiting_producer(started, release),
+        produce=slow_to_unwind,
     )
     await asyncio.wait_for(started.wait(), timeout=2)
 
     await asyncio.to_thread(registry_mod.discard_conversation, "c")
-    await asyncio.gather(handle.task, return_exceptions=True)
 
     assert handle.lifecycle.discarded is True
+    assert not handle.task.done()
     assert await redis.exists(claim_key("c"), CLAIMS_KEY) == 0
+    unwound.set()
+    await asyncio.gather(handle.task, return_exceptions=True)
+
+
+async def _saved_turn(runs: RunRegistry, *, conversation_id: str, turn_id: int):
+    """A turn that saved its question and has ended, as the handler runs one."""
+    from cowork.streaming.registry import mark_question_saved
+
+    lifecycle = TurnLifecycle(question_id=uuid4())
+
+    async def answer(buffer):
+        await mark_question_saved(lifecycle=lifecycle, conversation_id=conversation_id)
+        await buffer.append("sse", COMPLETED)
+        await buffer.close("completed")
+
+    handle = await runs.start(
+        conversation_id=conversation_id, turn_id=turn_id,
+        open_buffer=lambda: backend_mod.new_buffer(conversation_id, turn_id),
+        produce=answer, lifecycle=lifecycle,
+    )
+    await asyncio.wait_for(handle.task, timeout=2)
+    assert (await turn_index.get_turn(conversation_id))["saved_question"] == "1"
+    return handle
+
+
+async def test_a_delete_whose_buffer_removal_fails_still_admits_the_next_send(
+    redis, monkeypatch, caplog, owned_logger,
+):
+    """Turn 3 saved its question, so its index entry refuses a start at 3.
+    The user deletes it: the history is back to three messages, so the next
+    send is turn 3 again. A Redis error while the buffers were removed used
+    to skip the index forget, and every replica then refused that send with
+    409 until the entry expired."""
+    registry_mod = importlib.import_module("cowork.streaming.registry")
+    logged = owned_logger(registry_mod.logger.name, level=logging.WARNING)
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    monkeypatch.setattr(registry_mod, "registry", replica_a)
+    await _saved_turn(replica_a, conversation_id="d", turn_id=3)
+
+    def failing_removal(_conversation_id):
+        raise RedisConnectionError("Redis is unreachable")
+
+    monkeypatch.setattr(backend_mod, "_remove_redis_buffers", failing_removal)
+
+    await asyncio.to_thread(registry_mod.discard_conversation, "d")
+
+    assert await turn_index.get_turn("d") is None
+    records = [r for r in _warnings(caplog, registry_mod.logger.name) if r.event == "turn_buffers_remove_failed"]
+    assert [r.conversation_id for r in records] == ["d"]
+    assert_log_fields(logged.output(), event="turn_buffers_remove_failed", conversation_id="d")
+    for runs in (replica_a, replica_b):
+        admitted = await runs.start(
+            conversation_id="d", turn_id=3, open_buffer=lambda: backend_mod.new_buffer("d", 3),
+            produce=_waiting_producer(asyncio.Event(), asyncio.Event()),
+        )
+        admitted.task.cancel()
+        await asyncio.gather(admitted.task, return_exceptions=True)
+        await turn_claim.release(conversation_id="d", run_id=admitted.run_id)
+
+
+async def test_a_delete_whose_index_forget_fails_logs_it_and_still_releases(
+    redis, monkeypatch, caplog, owned_logger,
+):
+    """A forget that cannot reach Redis leaves a stamp that refuses sends at
+    or below the deleted turn's number until the entry expires, so it is
+    logged with an event an operator can find. The buffers and the claim are
+    still removed."""
+    registry_mod = importlib.import_module("cowork.streaming.registry")
+    logged = owned_logger(turn_index.logger.name, level=logging.WARNING)
+    runs = RunRegistry()
+    monkeypatch.setattr(registry_mod, "registry", runs)
+    started, release = asyncio.Event(), asyncio.Event()
+    handle = await runs.start(
+        conversation_id="f", turn_id=1, open_buffer=lambda: backend_mod.new_buffer("f", 1),
+        produce=_waiting_producer(started, release),
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    monkeypatch.setattr(turn_index, "get_sync_redis", lambda: _Unreachable())
+
+    await asyncio.to_thread(registry_mod.discard_conversation, "f")
+    await asyncio.gather(handle.task, return_exceptions=True)
+
+    records = [r for r in _warnings(caplog, turn_index.logger.name) if r.event == "turn_index_forget_failed"]
+    assert [r.conversation_id for r in records] == ["f"]
+    assert_log_fields(logged.output(), event="turn_index_forget_failed", conversation_id="f")
+    assert await redis.exists(stream_key("f", 1), claim_key("f"), CLAIMS_KEY) == 0
 
 
 # ── the boot pass ────────────────────────────────────────────────────
@@ -536,10 +688,32 @@ async def test_the_boot_pass_releases_only_this_pods_claims(redis):
 
     released = await turn_claim.release_pod_claims(pod="pod-a")
 
-    assert released == 2
+    assert released == BootPassResult(released=2, pruned=0)
     assert await _stored(redis, "c1") is None and await _stored(redis, "c2") is None
     assert await _stored(redis, "c3") == _claim("run-c", pod="pod-b")
     assert await redis.hkeys(CLAIMS_KEY) == ["c3"]
+
+
+async def test_the_boot_pass_removes_the_listings_of_claims_that_lapsed_on_gone_pods(redis):
+    """A pod killed mid-turn leaves its claims' listings behind once the
+    keys lapse, under a pod name no later process carries. Only a release
+    removed a listing, so they piled up and every boot read them all."""
+    await turn_claim.acquire(claim=_claim("run-dead", pod="cowork-server-old"), conversation_id="lapsed")
+    await redis.delete(claim_key("lapsed"))
+    await turn_claim.acquire(claim=_claim("run-gone", pod="cowork-server-old"), conversation_id="taken")
+    await redis.set(claim_key("taken"), _claim("run-new", pod="cowork-server-xyz").model_dump_json())
+    await turn_claim.acquire(claim=_claim("run-live", pod="cowork-server-xyz"), conversation_id="live")
+
+    result = await turn_claim.release_pod_claims(pod="cowork-server-new")
+
+    assert result == BootPassResult(released=0, pruned=2)
+    assert await redis.hkeys(CLAIMS_KEY) == ["live"]
+    assert await _stored(redis, "taken") == _claim("run-new", pod="cowork-server-xyz")
+    assert await _stored(redis, "live") == _claim("run-live", pod="cowork-server-xyz")
+    # A claim re-taken after the pass read the keys (a stalled run's renewal
+    # takes back its lapsed key) keeps its listing.
+    assert await turn_claim._unlist_lapsed(conversation_id="live", run_id="run-live") is False
+    assert await _listed(redis, "live") == _claim("run-live", pod="cowork-server-xyz")
 
 
 async def test_the_server_releases_the_claims_its_pod_left_on_boot(redis, monkeypatch, caplog, owned_logger):
@@ -549,16 +723,21 @@ async def test_the_server_releases_the_claims_its_pod_left_on_boot(redis, monkey
     monkeypatch.setenv("POD_NAME", "cowork-server-abc")
     await turn_claim.acquire(claim=_claim("run-a", pod="cowork-server-abc"), conversation_id="c1")
     await turn_claim.acquire(claim=_claim("run-b", pod="cowork-server-xyz"), conversation_id="c2")
+    await turn_claim.acquire(claim=_claim("run-c", pod="cowork-server-old"), conversation_id="c3")
+    await redis.delete(claim_key("c3"))
 
     await server._release_own_turn_claims()
 
     assert await _stored(redis, "c1") is None
     assert await _stored(redis, "c2") is not None
+    assert await redis.hkeys(CLAIMS_KEY) == ["c2"]
     records = _warnings(caplog, server.logger.name)
     assert [(r.event, r.pod, r.count) for r in records] == [
         ("turn_claims_released_at_boot", "cowork-server-abc", 1),
+        ("turn_claim_listings_pruned_at_boot", "cowork-server-abc", 1),
     ]
     assert_log_fields(logged.output(), event="turn_claims_released_at_boot", pod="cowork-server-abc", count=1)
+    assert_log_fields(logged.output(), event="turn_claim_listings_pruned_at_boot", pod="cowork-server-abc", count=1)
 
 
 def test_the_pod_name_falls_back_to_the_host_name(monkeypatch):
@@ -586,12 +765,19 @@ def test_a_hosted_pod_runs_one_server_process():
 def test_the_claim_outlasts_the_stall_the_liveness_probe_forgives():
     """A stalled event loop renews nothing. The kubelet restarts a pod whose
     loop stalls longer than the liveness window, so a claim that outlasts it
-    lapses only for a process that is gone or about to be."""
+    lapses only for a process that is gone or about to be.
+
+    The window is failureThreshold probes apart, plus the timeoutSeconds the
+    last of them waits for an answer: a stall that ends inside that wait is
+    forgiven. When the stall starts, the claim has run down by up to one
+    renewal interval, and the last renewal may have taken its whole Redis
+    bound to land."""
     deployment = yaml.safe_load(CHART_VALUES.read_text())["deployment"]
     probe = deployment["livenessProbe"]
-    window = probe["failureThreshold"] * probe["periodSeconds"]
+    forgiven = probe["failureThreshold"] * probe["periodSeconds"] + probe["timeoutSeconds"]
+    run_down = turn_claim.RENEW_INTERVAL_SECONDS + turn_claim.REDIS_CALL_SECONDS
 
-    assert turn_claim.CLAIM_TTL_SECONDS > window
+    assert turn_claim.CLAIM_TTL_SECONDS > forgiven + run_down
     # Two renewals, each waiting out its bound, still land inside one TTL.
     assert 2 * (turn_claim.RENEW_INTERVAL_SECONDS + turn_claim.REDIS_CALL_SECONDS) < turn_claim.CLAIM_TTL_SECONDS
 
@@ -632,12 +818,20 @@ async def test_the_file_backend_never_reaches_redis(monkeypatch, tmp_path):
         conversation=conversation_id, scope=TenantScope(org_mode=False),
     )
     started, release = asyncio.Event(), asyncio.Event()
+    lifecycle = TurnLifecycle(question_id=uuid4())
+    waiting = _waiting_producer(started, release)
+
+    async def saves_then_waits(buffer):
+        await registry_mod.mark_question_saved(lifecycle=lifecycle, conversation_id=conversation_id)
+        await waiting(buffer)
+
     handle = await runs.start(
         conversation_id=conversation_id, turn_id=0,
         open_buffer=opens(FileStreamBuffer(tmp_path / "turn.jsonl")),
-        produce=_waiting_producer(started, release),
+        produce=saves_then_waits, lifecycle=lifecycle,
     )
     await asyncio.wait_for(started.wait(), timeout=2)
+    assert lifecycle.saved_question is True
     release.set()
     await asyncio.wait_for(handle.task, timeout=2)
     second = await runs.start(

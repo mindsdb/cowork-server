@@ -268,3 +268,35 @@ def test_the_owner_check_reads_the_typed_owner_and_fails_closed():
     # A hash missing its user denies the real owner rather than opening up.
     assert not _owner_matches(owner({"org_id": "o1"}), person)
     assert _owner_matches(owner({}), LOCAL_SCOPE)
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_lands_only_on_its_own_runs_entry(fake_redis):
+    """Run A's claim lingered and another replica cleared it, so run B's
+    entry replaced A's. A's late stamp used to be able to land on B's entry,
+    and a start at B's number would then be refused as stale on every
+    replica until the entry expired, although B saved nothing."""
+    from uuid import uuid4
+
+    await turn_index.record_turn(
+        "c1", turn_id=6, correlation_id="corr-b", org_id=None, user_id=None, run_id="run-b")
+
+    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-a", question_id=uuid4()) is False
+    entry = await turn_index.get_turn("c1")
+    assert "saved_question" not in entry and "question_id" not in entry
+    assert turn_index.TurnIndexEntry.from_index(entry).makes_stale(turn_id=6) is False
+
+    question_id = uuid4()
+    assert await turn_index.stamp_question(conversation_id="c1", run_id="run-b", question_id=question_id) is True
+    entry = await turn_index.get_turn("c1")
+    assert (entry["saved_question"], entry["question_id"]) == ("1", str(question_id))
+    assert turn_index.TurnIndexEntry.from_index(entry).makes_stale(turn_id=6) is True
+
+
+def test_only_a_run_that_saved_its_question_makes_a_start_at_or_below_its_number_stale():
+    entry = turn_index.TurnIndexEntry(turn_id=3, run_id="run-a", saved_question=True, question_id=None)
+
+    assert [entry.makes_stale(turn_id=n) for n in (2, 3, 4)] == [True, True, False]
+    assert entry.model_copy(update={"saved_question": False}).makes_stale(turn_id=3) is False
+    # A channel turn's entry names no run.
+    assert entry.model_copy(update={"run_id": None}).makes_stale(turn_id=3) is False

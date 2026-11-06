@@ -469,8 +469,11 @@ class RedisStreamBuffer(StreamBuffer):
         the registry the turn had ended while its producer still writes.
         """
         logger.warning(
-            "Turn buffer %s went quiet for %ss with no terminal record; ending it",
-            self.key, REDIS_TAIL_IDLE_TIMEOUT_SECONDS,
+            "A turn stream went quiet past the tail's idle cut with no terminal record; ending it.",
+            extra={
+                "event": "turn_tail_idle_cut",
+                "conversation_id": self._conversation_id, "turn_id": self._turn_id,
+            },
         )
         r = get_redis()
         entries = await r.xrevrange(self.key, count=1)

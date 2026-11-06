@@ -19,7 +19,7 @@ import redis.asyncio as aioredis
 from cowork.streaming import turn_index
 from cowork.streaming.backend import new_buffer
 from cowork.streaming.buffer import RedisStreamBuffer
-from cowork.streaming.registry import RunRegistry, TurnInProgress
+from cowork.streaming.registry import RunRegistry, TurnInProgress, TurnLifecycle
 from cowork.streaming.turn_claim import CLAIMS_KEY, claim_key
 from tests.integration.prereq import missing_prerequisite
 
@@ -141,5 +141,50 @@ async def test_a_duplicate_send_on_the_other_replica_is_refused(redis_url):
             produce=answer,
         )
         await asyncio.wait_for(after.task, timeout=10)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_send_that_waited_for_the_other_replicas_turn_is_refused(redis_url):
+    """Replica B's send read the history before replica A's turn 2 saved its
+    question, and reached B while A wrote its final frame. B waits for A to
+    release, and the stamp A's release writes refuses it in the transaction
+    that would take the claim, so A's stream keeps its records."""
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    final_written, release = asyncio.Event(), asyncio.Event()
+
+    async def finishing(buffer):
+        await buffer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+        await buffer.append("sse", {"sse": "event: response.completed\ndata: {}\n\n"})
+        final_written.set()
+        await release.wait()
+        await buffer.close("completed")
+
+    async def answer(buffer):
+        await buffer.close("completed")
+
+    first = await replica_a.start(
+        conversation_id="conv-stale", turn_id=2, open_buffer=lambda: new_buffer("conv-stale", 2),
+        produce=finishing, lifecycle=TurnLifecycle(saved_question=True),
+    )
+    await asyncio.wait_for(final_written.wait(), timeout=10)
+    stale = asyncio.create_task(replica_b.start(
+        conversation_id="conv-stale", turn_id=2, open_buffer=lambda: new_buffer("conv-stale", 2),
+        produce=answer,
+    ))
+    await asyncio.sleep(0.3)
+    assert not stale.done()
+    release.set()
+    await asyncio.wait_for(first.task, timeout=10)
+
+    with pytest.raises(TurnInProgress) as refused:
+        await asyncio.wait_for(stale, timeout=15)
+
+    client = aioredis.from_url(redis_url, decode_responses=True)
+    try:
+        assert refused.value.turn_id == 2
+        assert await client.xlen("cowork:stream:conv-stale:2") == 3
+        assert await client.exists(claim_key("conv-stale"), CLAIMS_KEY) == 0
     finally:
         await client.aclose()
