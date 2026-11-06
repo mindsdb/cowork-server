@@ -121,6 +121,12 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.schemas.connectors import DisabledConnection
+from cowork.services.comparisons import (
+    COMPARISON_HARNESS,
+    ComparisonService,
+    blocked_connections,
+)
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
@@ -129,7 +135,7 @@ from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
-from cowork.services.projects import ProjectNotFoundError, ProjectService
+from cowork.services.projects import ProjectNotFoundError, ProjectService, is_comparison_sandbox
 from cowork.services.settings import SettingService
 from cowork.schemas.turn_skills import TurnSkills
 from cowork.services.skill_sharing import SkillViewer, sharing_applies
@@ -376,6 +382,15 @@ class _TurnStart:
     # Whether an always-on skill reaches the turn (has_always_on_skills),
     # which sends it to the agent: the gate's answer would not follow it.
     always_on_skills: bool = False
+    # Set when the conversation is a contained model-comparison side: what it
+    # was set up with, read here because the side row stays in the unit.
+    comparison_pin: "_ComparisonPin | None" = None
+
+
+@dataclass(frozen=True)
+class _ComparisonPin:
+    model: str
+    reasoning_effort: str | None
 
 
 @dataclass(frozen=True)
@@ -704,6 +719,10 @@ def _start_first_take(
 
 
 class ResponsesHandler:
+    # Also the class default, so a producer reached without __init__ reads
+    # the common case: a person watching who can answer a card.
+    interactive: bool = True
+
     def __init__(
         self,
         *,
@@ -789,6 +808,34 @@ class ResponsesHandler:
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
+        # A model-comparison side runs on what it was set up with, whatever
+        # the client sent: a stale composer pick or a second tab must not
+        # change what is being compared. Its messaging connectors are off, so
+        # two agents doing the same task don't each send the message.
+        if start.comparison_pin is not None:
+            self.harness_name = COMPARISON_HARNESS
+            try:
+                blocked = await blocked_connections(self.scope)
+            except Exception:
+                # Fail closed: running without the list could reach a
+                # messaging app the side must not use.
+                logger.exception(
+                    "[responses] could not list connections for comparison side %s", start.conversation_id
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Couldn't check this comparison's connections. Try again in a moment.",
+                )
+            request = request.model_copy(update={
+                "model": start.comparison_pin.model,
+                "reasoning_effort": start.comparison_pin.reasoning_effort,
+                "disabled_connections": [
+                    *(request.disabled_connections or []),
+                    *(DisabledConnection(**entry) for entry in blocked),
+                ] or None,
+            })
+            disabled = [dc.model_dump() for dc in request.disabled_connections] if request.disabled_connections else None
+
         # Every settings read for this turn, in the gate and in the producer
         # task created below (create_task copies this context), is served from
         # the snapshot the unit loaded. A question with "memory": "off" gets a
@@ -808,6 +855,7 @@ class ResponsesHandler:
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
+                    is_comparison_side=start.comparison_pin is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -1111,6 +1159,8 @@ class ResponsesHandler:
             )
 
         conversation_id = conversation.id
+        side = ComparisonService(session).contained_side(conversation)
+        comparison_pin = _ComparisonPin(side.model, side.reasoning_effort) if side is not None else None
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
@@ -1125,6 +1175,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
+            is_comparison_side=comparison_pin is not None,
         ) is None:
             reaches = self._reads_always_on_skills(session, conversation=conversation)
             if reaches is None:
@@ -1144,6 +1195,7 @@ class ResponsesHandler:
             turn_id=turn_id,
             gate_rows=gate_rows,
             always_on_skills=always_on_skills,
+            comparison_pin=comparison_pin,
         )
 
     def _reads_always_on_skills(self, session: ScopedSession, *, conversation: Conversation) -> bool | None:
@@ -1202,6 +1254,7 @@ class ResponsesHandler:
         has_attachments: bool,
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
+        is_comparison_side: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -1228,6 +1281,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
+            is_comparison_side=is_comparison_side,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -2319,6 +2373,14 @@ class ResponsesHandler:
                 if project is None:
                     raise ValueError("Project not found")
                 session.refresh(project)
+                if is_comparison_sandbox(getattr(project, "name", None)):
+                    # A comparison side reads memory but never writes it,
+                    # same as the in-process harness's Cortex in "off" mode.
+                    logger.info(
+                        "[responses] dropped %d memory entr(ies) from comparison side %s",
+                        len(entries), conv_id,
+                    )
+                    return
                 applied = apply_turn_memory(
                     session.scope,
                     project.path,
@@ -3286,6 +3348,7 @@ class ResponsesHandler:
                 # tool's message to the user, as on the remote path.
                 tool_messages=True,
                 model_wait=model_wait,
+                interactive=self.interactive,
             )
             event_count = 0
             completed_frame: str | None = None

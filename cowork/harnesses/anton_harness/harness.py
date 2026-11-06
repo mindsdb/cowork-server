@@ -26,7 +26,7 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import current_settings_scope
+from cowork.common.settings.user_settings import current_settings_scope, effective_turn_limits
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
@@ -62,7 +62,7 @@ from cowork.services.live_apps import (
     stop_time_text,
     turn_live_apps,
 )
-from cowork.services.projects import display_label
+from cowork.services.projects import display_label, is_comparison_sandbox
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
@@ -175,10 +175,8 @@ def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
 #: Settings copied from the Cowork DB onto anton's own settings object, in
 #: order. The last three are non-nullable ints with defaults — unlike the
 #: entries above them, ``db_val`` is never None, so they ALWAYS override anton's
-#: own 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
-#: ``max_turn_tokens`` is the per-turn spend ceiling (ENG-1286); it overlays the
-#: SAME value anton defaults to rather than a looser one, because the
-#: distribution that sized it was measured on this traffic.
+#: own defaults (and any ANTON_* env value) for Cowork sessions.
+#: ``max_turn_tokens`` is the per-turn spend ceiling.
 _OVERLAID_SETTINGS: tuple[str, ...] = (
     "planning_provider", "planning_model",
     "coding_provider", "coding_model",
@@ -199,6 +197,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
 
     Returns the attrs actually applied, so a caller or test can assert on it.
 
+    The three budgets come from ``effective_turn_limits``, so the
+    ``limits_enabled`` switch decides them.
+
     **The skew guard is the load-bearing part.** uv.lock pins anton to a
     release, and a PyPI-channel install takes any release at or above the
     floor in ``pyproject.toml``, so cowork-server can ship a setting whose
@@ -210,8 +211,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     missing setting.
     """
     applied: list[str] = []
+    limits = effective_turn_limits(user)._asdict()
     for attr in _OVERLAID_SETTINGS:
-        db_val = getattr(user, attr, None)
+        db_val = limits[attr] if attr in limits else getattr(user, attr, None)
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):
@@ -497,6 +499,15 @@ def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
         "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
         "resourceKey=<resourceKey> as a query parameter."
     )
+
+
+def _learns_this_turn(conversation, learns: bool) -> bool:
+    """Whether the turn may write memory: its layout's say, except on a
+    model-comparison side, which reads memory like any task but never writes
+    it, since two agents on the same task would each record the same lessons."""
+    if is_comparison_sandbox(getattr(getattr(conversation, "project", None), "name", None)):
+        return False
+    return learns
 
 
 def _turn_style_context(channel: ChannelContext | None) -> str:
@@ -907,6 +918,7 @@ class AntonHarness:
         tool_messages: bool = False,
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
+        interactive: bool = True,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1055,6 +1067,7 @@ class AntonHarness:
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                interactive=interactive,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1358,6 +1371,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
+        interactive: bool = True,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1371,6 +1385,7 @@ class AntonHarness:
                 disabled_connections=disabled_connections,
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                interactive=interactive,
                 live_app_notices=notices,
             )
         except BaseException:
@@ -1398,6 +1413,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None,
         channel_context: ChannelContext | None,
         tool_messages: bool,
+        interactive: bool,
         live_app_notices: list[UUID],
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
@@ -1423,6 +1439,7 @@ class AntonHarness:
             build_cowork_create_skill_draft_tool,
             scope_usage_notes,
         )
+        from .schedule_tools import build_schedule_tools
         CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
@@ -1474,6 +1491,16 @@ class AntonHarness:
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
+        elicitor = build_elicitor(str(conversation.id))
+        # Every change to a scheduled task waits on a card the user confirms,
+        # so the tools exist only where someone can: not in a scheduled run
+        # (a task must not rewrite itself unattended), a channel bot, or a
+        # deployment with questions off.
+        schedule_tools = (
+            build_schedule_tools(project_id=conversation.project_id)
+            if interactive and elicitor is not None and channel_context is None
+            else []
+        )
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -1580,8 +1607,11 @@ class AntonHarness:
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
         # app slots outside this server for a turn with a launcher, the only
-        # turn that gets a host (live_app_host_for_turn).
-        launcher = current_live_app_launcher() if live_apps_on() else None
+        # turn that gets a host (live_app_host_for_turn). A model-comparison
+        # side gets neither: a live app is shareable and holds a capped slot,
+        # and nothing leaves a comparison until the user continues with a side.
+        comparison_side = is_comparison_sandbox(conversation.project.name)
+        launcher = current_live_app_launcher() if live_apps_on() and not comparison_side else None
         offers_live_apps = launcher is not None
         turn_apps = (
             await turn_live_apps(
@@ -1782,7 +1812,8 @@ class AntonHarness:
                 layout=memory_layout,
                 mode=(
                     anton_settings.memory_mode
-                    if anton_settings.memory_enabled and memory_layout.learns
+                    if anton_settings.memory_enabled
+                    and _learns_this_turn(conversation, memory_layout.learns)
                     else "off"
                 ),
                 llm_client=llm_client,
@@ -1888,9 +1919,11 @@ class AntonHarness:
             cell_sandbox = await asyncio.to_thread(
                 build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
             )
-            # None with live apps off, or for a turn that names nobody with an
-            # email, and then not passed at all.
-            live_app_host = live_app_host_for_turn(project_id=conversation.project.id)
+            # None with live apps off, for a turn that names nobody with an
+            # email, or on a comparison side, and then not passed at all.
+            live_app_host = (
+                None if comparison_side else live_app_host_for_turn(project_id=conversation.project.id)
+            )
 
             deployment = identity_for_turn()
             deployment_kwargs = {} if deployment is None else {
@@ -1912,7 +1945,7 @@ class AntonHarness:
                 # either. Passed directly, as _turn_cortex passes managed_hc:
                 # every anton the floor admits has the field, and a dropped
                 # one would silently bring the memory passes back.
-                background_memory=memory_layout.learns,
+                background_memory=_learns_this_turn(conversation, memory_layout.learns),
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
@@ -1934,7 +1967,7 @@ class AntonHarness:
                 initial_history=initial_history,
                 # history_store=history_store,
                 session_id=str(conversation.id),
-                elicitor=build_elicitor(str(conversation.id)),
+                elicitor=elicitor,
                 # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
                 # are attributed to the active harness. self.id == "anton".
                 harness=self.id,
@@ -1975,6 +2008,7 @@ class AntonHarness:
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
+                    *schedule_tools,
                     *mcp_tool_defs,
                 ],
                 # Same gate as the discovery call above, not a second one:

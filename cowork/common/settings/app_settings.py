@@ -457,6 +457,28 @@ class CodingSettings(Settings):
             "so it is not partitioned per organization there."
         ),
     )  # COWORK_CODING_DIR
+    workspace_retention_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_RETENTION"),
+        description=(
+            "Also release the workspaces of long-idle, unarchived coding tasks "
+            "to reclaim disk, beyond the most recent few. Archiving a task "
+            "releases its workspace either way. A released workspace is "
+            "rebuilt with its changes when the task is next used."
+        ),
+    )  # COWORK_CODING_WORKSPACE_RETENTION
+    workspace_keep_count: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_KEEP_COUNT"),
+        description="Most recently active task workspaces that are never released automatically.",
+    )  # COWORK_CODING_WORKSPACE_KEEP_COUNT
+    workspace_min_idle_hours: float = Field(
+        default=14 * 24,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS"),
+        description="How long a task must be idle before its workspace can be released automatically.",
+    )  # COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS
 
 
 class StorageSettings(Settings):
@@ -719,6 +741,15 @@ class TurnQueueSettings(Settings):
         repr=False,
         description="Secret for the dedicated datasource producer service role.",
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
+    datasource_gateway_base_url: str = Field(
+        default="",
+        description=(
+            "In-cluster base URL of the datasource gateway, used to validate a captured "
+            "connection. The Service name, as auth is addressed (http://mindshub-inference): "
+            "the public datasource ingress admits execution alone. Empty means no validation "
+            "runs and a captured connection stays pending."
+        ),
+    )  # COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
 
 
 # The OpenAI API an openai_compatible provider's planning, coding and router roles call.
@@ -800,6 +831,20 @@ class AppSettings(Settings):
                 f"http://127.0.0.1:{self.renderer_port}",
             ]
         return self
+
+    # Which connector methods this deployment may run as a cloud datasource:
+    # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,
+    # not a dict: pydantic-settings parses a dict field from the environment
+    # while the settings object is built, so malformed JSON would raise before
+    # any policy code runs and crash the process at import. Parsed, and failed
+    # closed, in services/connectors/datasource_capabilities.py instead.
+    # One spelling only: a second alias would also become an unprefixed
+    # environment name for a policy that decides what this deployment stores.
+    datasource_capabilities: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DATASOURCE_CAPABILITIES"),
+        description="Versioned datasource capability manifest as JSON; empty means nothing is enabled.",
+    )
 
     require_auth: bool = Field(
         default=False,
@@ -1280,27 +1325,28 @@ class AppSettings(Settings):
     # NOTE: get_app_settings() is @lru_cache'd, so changing the COWORK_DEFAULT_*
     # env requires a process restart — "I changed the env and nothing happened"
     # means the old value is cached for the life of the process.
+    #
+    # The defaults are safety limits for a turn that never finishes, the values
+    # anton's own defaults move to: 30 days of production had no runaway turn,
+    # and the largest legitimate one used 34.4M tokens, 171 tool rounds and 6
+    # continuations.
+    # Users who want a tighter limit set their own.
     default_max_tool_rounds: int = Field(
-        default=50,
+        default=250,
         ge=5,
         le=500,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TOOL_ROUNDS"),
         description="Default for the per-user 'Max Steps per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TOOL_ROUNDS
     default_max_continuations: int = Field(
-        default=5,
+        default=10,
         ge=0,
         le=25,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_CONTINUATIONS"),
         description="Default for the per-user 'Max Auto-Continues' agent budget.",
     )  # COWORK_DEFAULT_MAX_CONTINUATIONS
-    # Unlike the two above, this one does NOT deliberately run looser than
-    # anton's own default — it matches it (ENG-1286's 1,250,000). The measured
-    # per-turn distribution that set that number came from Cowork traffic, so
-    # it already reflects these looser round budgets; raising it here would
-    # loosen a ceiling against the very population it was sized on.
     default_max_turn_tokens: int = Field(
-        default=1_250_000,
+        default=25_000_000,
         # Deployment-level default. Kept at ge=750_000 rather than mirroring
         # UserSettings' "0 = unlimited": an operator turning the guard off for a
         # whole org silently is exactly the outcome the per-user sentinel exists

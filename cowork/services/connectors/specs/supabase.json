@@ -41,7 +41,10 @@
           "auth_url": "https://api.supabase.com/v1/oauth/authorize",
           "token_url": "https://api.supabase.com/v1/oauth/token",
           "revoke_url": "https://api.supabase.com/v1/oauth/revoke",
-          "scopes": ["projects:read", "organizations:read"],
+          "scopes": [
+            "projects:read",
+            "organizations:read"
+          ],
           "service_id": "supabase",
           "token_auth_style": "basic",
           "supports_refresh": true,
@@ -147,7 +150,73 @@
               }
             ]
           }
-        ]
+        ],
+        "cloud": {
+          "available": false,
+          "engine": "postgres:host-port",
+          "description": "Enter the host, port, database, username and password. Saved and read as a PostgreSQL connection.",
+          "how_to": "## Connect Supabase\n\nCloud saves this connection in your encrypted connection store and reads it through the hosted gateway.\n\n### Where to find each value\n\n1. In your Supabase project, choose **Connect** and pick the **Session pooler**. The direct connection host answers over IPv6 only unless your project has the IPv4 add-on.\n2. **Host**: the session pooler host, such as `aws-0-<region>.pooler.supabase.com`.\n3. **Port**: `5432`.\n4. **Database**: `postgres` unless you created another.\n5. **Username**: `postgres.<project-ref>`, the user the session pooler shows.\n6. **Password**: your database password.\n\nUse a database user that can read only the data you want to query.",
+          "fields": [
+            {
+              "name": "host",
+              "label": "Host",
+              "type": "text",
+              "required": true,
+              "placeholder": "db.example.com",
+              "description": "Hostname of your PostgreSQL server. Must resolve to a public address."
+            },
+            {
+              "name": "port",
+              "label": "Port",
+              "type": "text",
+              "required": true,
+              "placeholder": "5432",
+              "default": "5432",
+              "description": "Whatever your server listens on, 5432 unless it was changed."
+            },
+            {
+              "name": "database",
+              "label": "Database name",
+              "type": "text",
+              "required": true,
+              "placeholder": "mydb",
+              "description": "The name of the specific database (schema container) to connect to."
+            },
+            {
+              "name": "schema",
+              "label": "Schema",
+              "type": "text",
+              "required": false,
+              "placeholder": "public",
+              "description": "Optional. The schema unqualified table names resolve in. It does not limit what can be read."
+            },
+            {
+              "name": "username",
+              "label": "Username",
+              "type": "text",
+              "required": true,
+              "placeholder": "readonly",
+              "description": "A PostgreSQL role with CONNECT on the database and USAGE plus SELECT on the schemas to be read."
+            },
+            {
+              "name": "password",
+              "label": "Password",
+              "type": "password",
+              "required": true,
+              "secret": true,
+              "placeholder": "••••••••",
+              "description": "Password for the above role. Stored encrypted and never shown again."
+            },
+            {
+              "name": "tls_verify",
+              "label": "Certificate",
+              "type": "boolean",
+              "required": false,
+              "checkbox_label": "Only connect if the certificate is signed by a public authority",
+              "description": "Off by default, because a self-hosted server usually presents a certificate it generated for itself, which no public authority signed. The connection is still encrypted whenever the server offers it. Turn this on for a managed provider, whose certificate a public authority signed."
+            }
+          ]
+        }
       },
       {
         "id": "service-role-api-key",

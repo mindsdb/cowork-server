@@ -5,6 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import set_attribute
 
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
@@ -51,6 +52,31 @@ class ScheduleService:
             raise ValueError("Schedule not found")
         return schedule
 
+    def lock_schedule(self, schedule_id: UUID) -> "Schedule | None":
+        """The schedule as stored now, locked until the unit commits, so a
+        check made on it still holds when the unit writes.
+
+        SQLite ignores FOR UPDATE, so a write that changes nothing comes
+        first: it takes SQLite's database write lock (and the row lock on
+        Postgres), and the read after it sees whatever committed before.
+        The write is `SET title = title`, done in the database, so a rename
+        saved since `_owned` read the row is kept rather than written over.
+        """
+        schedule = self._owned(schedule_id)
+        if schedule is None:
+            return None
+        # Through the ORM's instrumentation: SQLModel's own setattr would
+        # validate the SQL expression as a string and refuse it.
+        set_attribute(schedule, "title", Schedule.title)
+        self.session.add(schedule)
+        self.session.flush()
+        return self.session.exec(
+            self._owned_select()
+            .where(Schedule.id == schedule_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+
     def create_schedule(
         self,
         title: str,
@@ -84,6 +110,9 @@ class ScheduleService:
 
     def update_schedule(self, schedule_id: UUID, **kwargs) -> Schedule:
         schedule = self.get_schedule(schedule_id)
+        if "project_id" in kwargs and kwargs["project_id"] is None:
+            # No project: the caller's default, as at create.
+            kwargs["project_id"] = self._default_project_id()
         new_project_id = kwargs.get("project_id")
         if new_project_id is not None and self.session.get(Project, new_project_id) is None:
             raise ValueError("Project not found")

@@ -11,6 +11,13 @@ from cowork.schemas.schedules import Cadence
 
 logger = get_logger(__name__)
 
+# Cadences a fixed elapsed time apart, whatever the zone or the date.
+FIXED_INTERVALS = {
+    Cadence.every_15_minutes: timedelta(minutes=15),
+    Cadence.every_30_minutes: timedelta(minutes=30),
+    Cadence.hourly: timedelta(hours=1),
+}
+
 
 def resolve_timezone(name: str | None) -> ZoneInfo:
     if not name:
@@ -42,8 +49,9 @@ def advance_occurrence(cadence: str, at: datetime, timezone_name: str) -> dateti
     if current is None:
         raise ValueError("at must be a datetime")
 
-    if cadence == Cadence.hourly:
-        return current + timedelta(hours=1)
+    interval = FIXED_INTERVALS.get(cadence)
+    if interval is not None:
+        return current + interval
 
     tz = resolve_timezone(timezone_name)
     local = current.astimezone(tz)
